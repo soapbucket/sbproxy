@@ -43,6 +43,8 @@ pub mod admin_payments;
 pub mod admin_playground;
 /// Admin browser sessions + operator identity (WOR-1714 / WOR-1716).
 pub mod admin_session;
+/// Authenticated and tenant-scoped AI toolkit operator routes.
+pub mod admin_toolkit;
 /// Static-asset surface for the built-in admin
 /// dashboard at `/admin/ui/*`. Embedded via `include_dir!` when the
 /// `embed-admin-ui` feature is on; serves a one-line operator hint
@@ -54,6 +56,8 @@ pub mod admin_ui;
 pub mod agent_class;
 /// Generation-pinned dispatch for provider-neutral AI extension events.
 pub mod ai_extensions;
+/// Generation-pinned assembly for the bounded AI toolkit runtime.
+pub(crate) mod ai_toolkit_runtime;
 /// Boot wiring for the alert evaluation loop (dispatcher + engine + drain).
 pub mod alerting;
 /// Lowering `proxy.attestation` into the metering vocabulary the
@@ -80,6 +84,9 @@ pub mod billing_runtime;
 pub mod builtin_enforcers;
 /// P0 edge capture wired into the request pipeline.
 pub mod capture_envelope;
+/// Stock classifier-backed intent and quality hooks, including the optional
+/// in-process intent fallback adapter used by embedders.
+pub mod classifier_hooks;
 /// Process owner for the shared local or distributed cluster handle.
 pub mod cluster;
 /// WOR-1721: fleet-wide metric aggregation over the mesh.
@@ -138,6 +145,12 @@ pub mod hooks;
 pub mod identity;
 /// Extraction of a minted virtual key from configured inbound headers.
 pub mod inbound_key;
+/// WOR-2672: port of `sbproxy-enterprise-ai::intent_detection`. Coarse
+/// keyword-heuristic prompt classification, dispatched from
+/// `server::ai_dispatch` as the fallback when no
+/// [`hooks::IntentDetectionHook`] is registered or the registered one
+/// declines to decide.
+pub mod intent_detection;
 /// WOR-2306: resolve one RFC 6901 JSON Pointer against a request body
 /// without materializing the document, for body-field route matching.
 pub mod json_pointer;
@@ -206,7 +219,16 @@ pub mod policy_bus;
 /// in its own module so the helpers can be exercised by
 /// integration tests in `crates/sbproxy-core/tests/`.
 pub mod policy_dispatch;
+/// Bounded observability and fail-closed/degraded decision state for an
+/// unavailable `prompt_injection_v2` classifier.
+pub(crate) mod prompt_injection_runtime;
 mod proxy_wasm_http;
+/// WOR-2672: port of `sbproxy-enterprise-ai::quality_routing`. Provider
+/// selection by quality score via an optional
+/// [`hooks::QualityScoringHook`], falling back to the first candidate on
+/// any failure. Dispatched live from `server::ai_dispatch` (see the
+/// module docs for exactly where).
+pub mod quality_routing;
 pub(crate) mod request_body_plan;
 /// WOR-1130: module-owned workspace rate-limit budget state machine.
 ///

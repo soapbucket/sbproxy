@@ -1,0 +1,39 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Stable, scoped weighted prompt selection through the live AI toolkit admin
+# plane. The example uses a static origin so it needs no model provider.
+
+# sbproxy-docs:begin
+proxy:
+  http_bind_port: 8080
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    password: ${SB_ADMIN_PASSWORD:-change-this-before-running}
+  ai_toolkit:
+    limits:
+      max_rollouts: 16
+      max_rollout_versions: 8
+    agents: []
+    workflows: []
+    datasets: []
+    prompt_rollouts:
+      - origin: ai.local
+        name: support-system
+        salt: support-rollout-2026-08
+        versions:
+          - version: 1
+            content: You are a helpful support assistant.
+            weight: 90.0
+          - version: 2
+            content: You are a concise support assistant. Give the next action first.
+            weight: 10.0
+
+origins:
+  "ai.local":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: AI toolkit control-plane scope
+# sbproxy-docs:end

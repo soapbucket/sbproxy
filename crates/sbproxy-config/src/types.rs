@@ -451,11 +451,12 @@ pub enum AuditSinkKind {
 ///
 /// Every sub-block is independently optional. A purpose whose sub-block is
 /// omitted stays legacy ungated: `AiClient`'s documented `None` contract,
-/// the usage sinks' unauthenticated dispatch, the model-artifact fetcher's
-/// unauthenticated download, the non-MCP token-exchange resolver, and the
-/// OTLP exporters all keep behaving exactly as they did before this
-/// section existed. `compile_config` compiles each configured sub-block
-/// into a [`sbproxy_security::egress::EgressAuthorizer`] once, on
+/// the classifier hooks' legacy ungated dispatch, the usage sinks'
+/// unauthenticated dispatch, the model-artifact fetcher's unauthenticated
+/// download, the non-MCP token-exchange resolver, and the OTLP exporters
+/// all keep behaving exactly as they did before this section existed.
+/// `compile_config` compiles each configured sub-block into a
+/// [`sbproxy_security::egress::EgressAuthorizer`] once, on
 /// [`crate::snapshot::CompiledConfig::egress`]; nothing downstream parses
 /// this raw struct directly.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
@@ -465,6 +466,15 @@ pub struct EgressTopLevelConfig {
     /// dispatch the AI gateway's client makes.
     #[serde(default)]
     pub ai_providers: Option<EgressPurposeConfig>,
+    /// Arms `EgressPurpose::AgentOrchestration`: HTTP invocations made by
+    /// configured AI toolkit workflows. Agent endpoints fail closed unless
+    /// this purpose is configured with `mode: deny_by_default`.
+    #[serde(default)]
+    pub agent_orchestration: Option<EgressPurposeConfig>,
+    /// Arms `EgressPurpose::ClassifierHook`: the stock intent and
+    /// prompt-aware provider-quality classifier RPCs.
+    #[serde(default)]
+    pub classifier_hooks: Option<EgressPurposeConfig>,
     /// Arms Langfuse, Datadog, and object-store usage-sink deliveries
     /// under `EgressPurpose::UsageSink`, and webhook deliveries under
     /// `EgressPurpose::Webhook` (a separate, pre-existing purpose the
@@ -1150,6 +1160,522 @@ config_history:
     }
 }
 
+const fn default_classifier_hook_timeout_ms() -> u64 {
+    500
+}
+
+const fn default_quality_minimum_score() -> f64 {
+    0.75
+}
+
+fn default_classifier_hook_auth_header() -> String {
+    "authorization".to_string()
+}
+
+fn default_classifier_hook_auth_scheme() -> String {
+    "Bearer".to_string()
+}
+
+/// Classifier-sidecar hooks installed into the stock proxy runtime.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClassifierHooksConfig {
+    /// HTTP(S) gRPC endpoint of the minimal or rich classifier sidecar.
+    pub endpoint: String,
+    /// End-to-end deadline for one hook decision.
+    #[serde(default = "default_classifier_hook_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Optional transport-level TLS configuration for HTTPS endpoints.
+    #[serde(default)]
+    pub tls: Option<ClassifierHooksTlsConfig>,
+    /// Optional request authentication presented to the classifier service.
+    #[serde(default)]
+    pub authentication: Option<ClassifierHooksAuthenticationConfig>,
+    /// Optional classifier-backed prompt intent detection.
+    #[serde(default)]
+    pub intent: Option<ClassifierIntentHookConfig>,
+    /// Optional classifier-backed provider quality routing.
+    #[serde(default)]
+    pub quality: Option<ClassifierQualityHookConfig>,
+}
+
+/// TLS material for a classifier-hook gRPC endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClassifierHooksTlsConfig {
+    /// Optional CA bundle used to verify the remote classifier.
+    ///
+    /// Resolved through the process secret resolver so the value may be a
+    /// provider URI, `${ENV}`, `env:NAME`, or `file:/path`.
+    #[serde(default)]
+    pub ca_pem: Option<String>,
+    /// Override for the TLS server name / SNI. Defaults to the endpoint host.
+    #[serde(default)]
+    pub server_name: Option<String>,
+    /// Optional client certificate presented to the classifier for mTLS.
+    #[serde(default)]
+    pub client_identity: Option<ClassifierHooksClientIdentityConfig>,
+}
+
+/// Client certificate + private key for classifier-hook mTLS.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClassifierHooksClientIdentityConfig {
+    /// Client certificate chain in PEM format, supplied via a secret reference.
+    pub cert_pem: String,
+    /// Client private key in PEM format, supplied via a secret reference.
+    pub key_pem: String,
+}
+
+/// Request authentication presented to the classifier hook service.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub enum ClassifierHooksAuthenticationConfig {
+    /// Bearer-style metadata authentication on every gRPC request.
+    Bearer {
+        /// Secret reference for the bearer token value.
+        credential: String,
+        /// Metadata key that carries the token. Defaults to `authorization`.
+        #[serde(default = "default_classifier_hook_auth_header")]
+        header: String,
+        /// Optional value prefix. Defaults to `Bearer`.
+        #[serde(default = "default_classifier_hook_auth_scheme")]
+        scheme: String,
+    },
+}
+
+/// Model used to classify a prompt into the five stock intent labels.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClassifierIntentHookConfig {
+    /// Logical classifier model id loaded by the sidecar.
+    pub model: String,
+}
+
+impl Default for ClassifierIntentHookConfig {
+    fn default() -> Self {
+        Self {
+            model: "intent".to_string(),
+        }
+    }
+}
+
+/// Classifier-backed provider scorer for prompt-aware routing.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClassifierQualityHookConfig {
+    /// Minimum positive-label score eligible to win provider selection.
+    #[serde(default = "default_quality_minimum_score")]
+    pub minimum_score: f64,
+    /// Per-provider classifier model and positive-label contract.
+    pub provider_models: HashMap<String, ClassifierProviderModelConfig>,
+}
+
+impl Default for ClassifierQualityHookConfig {
+    fn default() -> Self {
+        Self {
+            minimum_score: default_quality_minimum_score(),
+            provider_models: HashMap::new(),
+        }
+    }
+}
+
+/// One provider's prompt-quality classifier contract.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClassifierProviderModelConfig {
+    /// Logical classifier model id loaded by the sidecar.
+    pub model: String,
+    /// Label whose score represents this provider's suitability.
+    pub label: String,
+}
+
+impl ClassifierHooksConfig {
+    /// Validate all sidecar hook resource and scoring bounds.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        const MAX_ENDPOINT_BYTES: usize = 2_048;
+        const MAX_IDENTIFIER_BYTES: usize = 256;
+        const MAX_PROVIDER_MODELS: usize = 64;
+        const MAX_SECRET_REFERENCE_BYTES: usize = 2_048;
+        if self.endpoint.trim().is_empty() || self.endpoint.len() > MAX_ENDPOINT_BYTES {
+            anyhow::bail!("classifier_hooks.endpoint must contain 1..={MAX_ENDPOINT_BYTES} bytes");
+        }
+        let endpoint = self.endpoint.trim().parse::<http::Uri>().map_err(|_| {
+            anyhow::anyhow!("classifier_hooks.endpoint must be an absolute http:// or https:// URI")
+        })?;
+        let scheme = endpoint.scheme_str().ok_or_else(|| {
+            anyhow::anyhow!("classifier_hooks.endpoint must include an http:// or https:// scheme")
+        })?;
+        if !matches!(scheme, "http" | "https") {
+            anyhow::bail!("classifier_hooks.endpoint must use http:// or https://");
+        }
+        let host = endpoint
+            .host()
+            .ok_or_else(|| anyhow::anyhow!("classifier_hooks.endpoint must include a host"))?;
+        let local_endpoint = endpoint_host_is_local(host);
+        if !(1..=30_000).contains(&self.timeout_ms) {
+            anyhow::bail!("classifier_hooks.timeout_ms must be between 1 and 30000");
+        }
+        if self.tls.is_some() && scheme != "https" {
+            anyhow::bail!("classifier_hooks.tls requires an https:// endpoint");
+        }
+        if !local_endpoint && scheme != "https" {
+            anyhow::bail!("classifier_hooks.endpoint must use https:// for nonlocal destinations");
+        }
+        if !local_endpoint
+            && self.authentication.is_none()
+            && self
+                .tls
+                .as_ref()
+                .and_then(|tls| tls.client_identity.as_ref())
+                .is_none()
+        {
+            anyhow::bail!(
+                "classifier_hooks requires bearer authentication or mTLS for nonlocal destinations"
+            );
+        }
+        if let Some(tls) = self.tls.as_ref() {
+            if let Some(ca_pem) = tls.ca_pem.as_deref() {
+                validate_classifier_secret_reference(
+                    ca_pem,
+                    "classifier_hooks.tls.ca_pem",
+                    MAX_SECRET_REFERENCE_BYTES,
+                )?;
+            }
+            if let Some(server_name) = tls.server_name.as_deref() {
+                validate_classifier_identifier(
+                    server_name,
+                    "classifier_hooks.tls.server_name",
+                    MAX_IDENTIFIER_BYTES,
+                )?;
+            }
+            if let Some(identity) = tls.client_identity.as_ref() {
+                validate_classifier_secret_reference(
+                    &identity.cert_pem,
+                    "classifier_hooks.tls.client_identity.cert_pem",
+                    MAX_SECRET_REFERENCE_BYTES,
+                )?;
+                validate_classifier_secret_reference(
+                    &identity.key_pem,
+                    "classifier_hooks.tls.client_identity.key_pem",
+                    MAX_SECRET_REFERENCE_BYTES,
+                )?;
+            }
+        }
+        if let Some(authentication) = self.authentication.as_ref() {
+            match authentication {
+                ClassifierHooksAuthenticationConfig::Bearer {
+                    credential,
+                    header,
+                    scheme,
+                } => {
+                    validate_classifier_secret_reference(
+                        credential,
+                        "classifier_hooks.authentication.credential",
+                        MAX_SECRET_REFERENCE_BYTES,
+                    )?;
+                    validate_classifier_identifier(
+                        header,
+                        "classifier_hooks.authentication.header",
+                        MAX_IDENTIFIER_BYTES,
+                    )?;
+                    if http::header::HeaderName::from_bytes(header.as_bytes()).is_err() {
+                        anyhow::bail!(
+                            "classifier_hooks.authentication.header must be a valid HTTP metadata name"
+                        );
+                    }
+                    validate_classifier_identifier(
+                        scheme,
+                        "classifier_hooks.authentication.scheme",
+                        MAX_IDENTIFIER_BYTES,
+                    )?;
+                }
+            }
+        }
+        if self.intent.is_none() && self.quality.is_none() {
+            anyhow::bail!("classifier_hooks must enable intent, quality, or both");
+        }
+        if let Some(intent) = self.intent.as_ref() {
+            validate_classifier_identifier(
+                &intent.model,
+                "classifier_hooks.intent.model",
+                MAX_IDENTIFIER_BYTES,
+            )?;
+        }
+        if let Some(quality) = self.quality.as_ref() {
+            if !quality.minimum_score.is_finite() || !(0.0..=1.0).contains(&quality.minimum_score) {
+                anyhow::bail!(
+                    "classifier_hooks.quality.minimum_score must be finite and in [0, 1]"
+                );
+            }
+            if quality.provider_models.is_empty()
+                || quality.provider_models.len() > MAX_PROVIDER_MODELS
+            {
+                anyhow::bail!(
+                    "classifier_hooks.quality.provider_models must contain 1..={MAX_PROVIDER_MODELS} entries"
+                );
+            }
+            for (provider, model) in &quality.provider_models {
+                validate_classifier_identifier(
+                    provider,
+                    "classifier_hooks.quality.provider_models provider name",
+                    MAX_IDENTIFIER_BYTES,
+                )?;
+                validate_classifier_identifier(
+                    &model.model,
+                    "classifier_hooks.quality.provider_models.model",
+                    MAX_IDENTIFIER_BYTES,
+                )?;
+                validate_classifier_identifier(
+                    &model.label,
+                    "classifier_hooks.quality.provider_models.label",
+                    MAX_IDENTIFIER_BYTES,
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_classifier_identifier(value: &str, path: &str, maximum: usize) -> anyhow::Result<()> {
+    if value.trim().is_empty() || value.len() > maximum {
+        anyhow::bail!("{path} must contain 1..={maximum} bytes");
+    }
+    Ok(())
+}
+
+fn validate_classifier_secret_reference(
+    value: &str,
+    path: &str,
+    maximum: usize,
+) -> anyhow::Result<()> {
+    if value.trim().is_empty() || value.len() > maximum {
+        anyhow::bail!("{path} must contain 1..={maximum} bytes");
+    }
+    if !is_secret_reference(value) {
+        anyhow::bail!(
+            "{path} must be a secret reference (`env:NAME`, `${{NAME}}`, `file:/path`, or `secret://backend/name`), not inline material"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn endpoint_host_is_local(host: &str) -> bool {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.to_canonical().is_loopback())
+}
+
+/// Bounded, generation-pinned AI workflow and evaluation configuration.
+///
+/// The runtime resolves agent credentials only while constructing a candidate
+/// pipeline. This parsed form therefore retains secret references, never the
+/// referenced secret material itself.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct AiToolkitConfig {
+    /// Optional overrides for the runtime's conservative public limits.
+    pub limits: AiToolkitLimitsConfig,
+    /// Governed agent endpoints available to workflows.
+    pub agents: Vec<AiToolkitAgentConfig>,
+    /// Finite-state workflows compiled into this pipeline generation.
+    pub workflows: Vec<AiToolkitWorkflowConfig>,
+    /// Immutable evaluation dataset versions seeded at publication.
+    pub datasets: Vec<AiToolkitDatasetConfig>,
+    /// Stable weighted prompt rollouts selected on the live request path.
+    pub prompt_rollouts: Vec<AiToolkitPromptRolloutConfig>,
+}
+
+/// Optional overrides for AI toolkit resource and deadline limits.
+///
+/// An omitted field inherits the runtime default. Keeping these overrides
+/// optional avoids copying runtime defaults into the config compiler, where
+/// the two sets of values could drift.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct AiToolkitLimitsConfig {
+    /// Maximum configured agents.
+    pub max_agents: Option<usize>,
+    /// Maximum capabilities advertised by one agent.
+    pub max_capabilities_per_agent: Option<usize>,
+    /// Maximum configured workflows.
+    pub max_workflows: Option<usize>,
+    /// Maximum distinct dataset names retained per scope.
+    pub max_datasets: Option<usize>,
+    /// Maximum immutable versions retained per dataset.
+    pub max_dataset_versions: Option<usize>,
+    /// Maximum immutable dataset versions retained across all scopes (hard maximum 16,384).
+    pub max_dataset_versions_total: Option<usize>,
+    /// Maximum entries in one dataset version.
+    pub max_dataset_entries: Option<usize>,
+    /// Maximum serialized dataset-entry bytes retained across all scopes (hard maximum 512 MiB).
+    pub max_dataset_bytes_total: Option<usize>,
+    /// Maximum configured prompt rollouts.
+    pub max_rollouts: Option<usize>,
+    /// Maximum versions in one prompt rollout.
+    pub max_rollout_versions: Option<usize>,
+    /// Maximum recent operation summaries retained per scope.
+    pub max_retained_operations: Option<usize>,
+    /// Maximum serialized request bytes accepted by a toolkit operation.
+    pub max_request_bytes: Option<usize>,
+    /// Maximum serialized response bytes accepted from an agent or retained.
+    pub max_response_bytes: Option<usize>,
+    /// Maximum bytes in a public identifier.
+    pub max_identifier_bytes: Option<usize>,
+    /// Maximum bytes in a public description.
+    pub max_description_bytes: Option<usize>,
+    /// Maximum bytes in one serialized JSON schema.
+    pub max_schema_bytes: Option<usize>,
+    /// Maximum bytes resolved from one agent credential reference.
+    pub max_secret_bytes: Option<usize>,
+    /// Maximum cases evaluated by one run.
+    pub max_evaluation_cases: Option<usize>,
+    /// Maximum custom metrics evaluated by one run.
+    pub max_metrics: Option<usize>,
+    /// Maximum offline-judge criteria evaluated by one run.
+    pub max_judge_criteria: Option<usize>,
+    /// Maximum concurrent governed agent calls.
+    pub agent_concurrency: Option<usize>,
+    /// Maximum concurrent evaluation cases.
+    pub evaluation_concurrency: Option<usize>,
+    /// Default workflow deadline when a run does not supply one.
+    pub default_workflow_timeout_ms: Option<u64>,
+    /// Hard ceiling for every workflow deadline.
+    pub max_workflow_timeout_ms: Option<u64>,
+}
+
+/// One governed agent endpoint available within an origin's tenant scope.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AiToolkitAgentConfig {
+    /// Stable configured origin id (or hostname) that owns this agent.
+    pub origin: String,
+    /// Stable agent id within the origin scope.
+    pub id: String,
+    /// HTTP endpoint invoked through the agent-orchestration egress gate.
+    pub endpoint: String,
+    /// Authentication material expressed only as a secret reference.
+    pub auth: AiToolkitAgentAuthConfig,
+    /// Capabilities advertised by this agent.
+    #[serde(default)]
+    pub capabilities: Vec<AiToolkitCapabilityConfig>,
+}
+
+/// Agent authentication configuration retained as an unresolved reference.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AiToolkitAgentAuthConfig {
+    /// Secret reference used to derive the agent bearer credential.
+    pub shared_secret: String,
+}
+
+/// One discoverable agent capability and its request/response schemas.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AiToolkitCapabilityConfig {
+    /// Stable capability name used by workflow actions.
+    pub name: String,
+    /// Bounded operator-facing description.
+    #[serde(default)]
+    pub description: String,
+    /// JSON Schema for the agent request body.
+    pub input_schema: serde_json::Value,
+    /// JSON Schema for the agent response body.
+    pub output_schema: serde_json::Value,
+}
+
+/// One finite-state workflow owned by an origin scope.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AiToolkitWorkflowConfig {
+    /// Stable configured origin id (or hostname) that owns this workflow.
+    pub origin: String,
+    /// Stable workflow name within the origin scope.
+    pub name: String,
+    /// State entered first.
+    pub initial_state: String,
+    /// Maximum transitions in one execution.
+    pub max_steps: usize,
+    /// Whole-workflow deadline in milliseconds.
+    pub timeout_ms: u64,
+    /// Bounded workflow graph.
+    pub states: Vec<AiToolkitWorkflowStateConfig>,
+}
+
+/// One state in a configured AI toolkit workflow.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AiToolkitWorkflowStateConfig {
+    /// Stable state name.
+    pub name: String,
+    /// Capability name discovered and invoked when this state runs.
+    pub action: String,
+    /// Outcome label to next-state name. An absent match completes the run.
+    #[serde(default)]
+    pub transitions: HashMap<String, String>,
+}
+
+/// One immutable evaluation dataset version seeded from configuration.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AiToolkitDatasetConfig {
+    /// Stable configured origin id (or hostname) that owns this dataset.
+    pub origin: String,
+    /// Dataset name within the origin scope.
+    pub name: String,
+    /// Explicit immutable version; zero is invalid.
+    pub version: u32,
+    /// Bounded evaluation cases.
+    #[serde(default)]
+    pub entries: Vec<AiToolkitDatasetEntryConfig>,
+}
+
+/// One input/expected-output pair in a configured evaluation dataset.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AiToolkitDatasetEntryConfig {
+    /// Input supplied to the evaluated model or offline response set.
+    pub input: String,
+    /// Optional expected output used by correctness metrics.
+    #[serde(default)]
+    pub expected_output: Option<String>,
+    /// Bounded caller metadata retained with the case.
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+/// One stable weighted prompt rollout owned by an origin scope.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AiToolkitPromptRolloutConfig {
+    /// Stable configured origin id (or hostname) that owns this rollout.
+    pub origin: String,
+    /// Prompt name used by bare request references.
+    pub name: String,
+    /// Stable operator-controlled cohort salt.
+    pub salt: String,
+    /// Weighted immutable prompt versions.
+    pub versions: Vec<AiToolkitPromptRolloutVersionConfig>,
+}
+
+/// One immutable member of a weighted prompt rollout.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AiToolkitPromptRolloutVersionConfig {
+    /// Positive numeric prompt version.
+    pub version: u32,
+    /// Prompt template/content selected for this version.
+    pub content: String,
+    /// Finite non-negative relative weight.
+    pub weight: f64,
+}
+
 /// Server-level proxy configuration parsed from the top-level `proxy:`
 /// block of sb.yml.
 ///
@@ -1247,6 +1773,12 @@ pub struct ProxyServerConfig {
     /// Canonical desired state and lifecycle policy for models hosted by SBproxy.
     #[serde(default)]
     pub model_host: Option<crate::model_host::ModelHostControlConfig>,
+    /// Optional classifier-sidecar hooks for intent and quality routing.
+    #[serde(default)]
+    pub classifier_hooks: Option<ClassifierHooksConfig>,
+    /// Optional bounded AI workflow, evaluation, and rollout runtime.
+    #[serde(default)]
+    pub ai_toolkit: Option<AiToolkitConfig>,
     /// Optional shared cluster substrate for keys, metrics, and managed models.
     #[serde(default)]
     pub cluster: Option<crate::cluster::ClusterConfig>,
@@ -2114,6 +2646,8 @@ impl Default for ProxyServerConfig {
             alerting: None,
             admin: None,
             model_host: None,
+            classifier_hooks: None,
+            ai_toolkit: None,
             cluster: None,
             config_authority: None,
             secrets: None,

@@ -1,6 +1,6 @@
 # Request flow
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-25*
 
 Every request SBproxy accepts runs through one pipeline, implemented as a
 sequence of Pingora `ProxyHttp` callbacks: `request_filter`,
@@ -169,11 +169,13 @@ The actual origin call branches by traffic type:
 - **Plain HTTP (`proxy`, `load_balancer`)** - an ordinary reverse-proxy
   call. See [api-gateway.md](api-gateway.md) and [routing.md](routing.md).
 - **AI (`ai_proxy`)** - a request to a hosted provider or local model.
-  Guardrail mesh hooks (`ai_guardrail_input`, `ai_guardrail_output`) and,
-  for streaming tool calls, an `ai_tool_call` hook can each return
-  `release`, `flag`, `block`, or (where the manifest declares
-  `execution.mutates: true`) `mutate` to rewrite the content in place
-  before the next hook runs. See [ai-gateway.md](ai-gateway.md),
+  Guardrail mesh hooks (`ai_guardrail_input`, `ai_guardrail_output`) and
+  `ai_tool_call` can each return `release`, `flag`, `block`, or (where the
+  manifest declares `execution.mutates: true`) `mutate` to rewrite the
+  content in place before the next hook runs. Output and tool-call hooks
+  run on both buffered and streamed completions. A streamed `mutate` that
+  cannot be written back as the client's wire shape is refused rather than
+  shipping the original. See [ai-gateway.md](ai-gateway.md),
   [ai-guardrail-mesh.md](ai-guardrail-mesh.md), and
   [extension-bundles.md's AI stream hooks section](extension-bundles.md).
 - **MCP / A2A** - a JSON-RPC tool call or an agent-to-agent envelope. See
@@ -213,7 +215,7 @@ see [cache-reserve.md](cache-reserve.md) and [degradation.md](degradation.md).
 ## 9. Logging and the typed event bus
 
 Metrics emission, the structured access log, and event publication close
-out the pipeline. `ProxyEvent` has nineteen variants; seventeen of them
+out the pipeline. `EventType` has twenty-two variants; twenty of them
 ship a production emitter in the OSS binary today: `request_started`,
 `request_completed`, `request_error` (the `request_events:` lane),
 `auth_denied`, `policy_denied`, `config_reloaded`, `egress_refused`
@@ -227,8 +229,11 @@ credential resolution, never per request),
 and `provider_selected`,
 `budget_exceeded`, `guardrail_triggered` (verdict-level: a provider
 fallback, a budget cap denial, or a guardrail block, never a
-per-request or per-chunk line). `cache_hit` and `cache_miss` are the
-two enum variants left unwired on purpose: firing on every cacheable request would put an
+per-request or per-chunk line), `ai_workflow_operation` (one terminal
+governed workflow execution), `ai_evaluation_operation` (one terminal
+offline evaluation run), and `ai_prompt_rollout_selected` (an admin dry-run
+or live AI request selected a weighted prompt version). `cache_hit` and
+`cache_miss` are the two enum variants left unwired on purpose: firing on every cacheable request would put an
 NDJSON line on every configured `events:` sink per cache lookup. Cache
 admission already reports through `DecisionEvent::CacheAdmit`/`CacheKey`
 and the access log's `cache_status` column; naming either in
@@ -248,7 +253,7 @@ and the access log's `cache_status` column; naming either in
 | Inspect/mutate an AI guardrail or tool call | AI origin call | `ai_guardrail_*`/`ai_tool_call` hooks | [ai-guardrail-mesh.md](ai-guardrail-mesh.md) |
 | Reshape a response | `response_body_filter` | A transform, or a scripting transform (CEL/Lua/JS/WASM) | [transforms.md](transforms.md) |
 | Detect anomalous behavior after the fact | `response_filter` | `AnomalyDetectorHook` (Rust trait) | [plugins.md](plugins.md) |
-| React to a lifecycle event | `logging` (mostly) | Typed event bus (11 of 13 variants emitted) | [events.md](events.md) |
+| React to a lifecycle event | `logging` (mostly) | Typed event bus (20 of 22 event types emitted) | [events.md](events.md) |
 
 ## Who reads this page for what
 

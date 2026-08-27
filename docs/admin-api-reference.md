@@ -1,6 +1,6 @@
 # Admin API reference
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-26*
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
@@ -28,6 +28,7 @@ built-in dashboard over this same API, see [admin-ui.md](admin-ui.md).
 - [Read routes](#read-routes-authenticated) - request log + stream + report + export, routing decisions, extension inventory, alerts, health, spend, attested-metering, audit, egress inventory, rate-limit budget, UI settings, OpenAPI
 - [AI compression session state](#ai-compression-session-state)
 - [Config and control routes](#config-and-control-routes-authenticated) - reload, drift, config read/write, config history, log level, the owasp_api_top10 pack manifest, AI provider data posture
+- [AI toolkit admin](#ai-toolkit-admin) - scoped agents, workflows, immutable datasets, offline evaluation, and prompt selection
 - [Model host admin](#model-host-admin) - catalog, deployments, lifecycle, artifact cache
 - [Cache admin](#cache-admin) - response cache and key-policy cache
 - [Cluster control plane](#cluster-control-plane) - status, deployments, enrollment, replicated state
@@ -1450,7 +1451,7 @@ rollup store is configured is `503` naming the config knob.
 
 ### `GET /api/meter/summary`, `GET /api/meter/receipts`, `POST /api/meter/verify`
 
-The attested-metering operator surface (WOR-2131): units by tenant against
+The attested-metering operator surface: units by tenant against
 the hash-chained receipt ledger `proxy.attestation` writes, a cursor-paged
 read of the chain itself, and a chain-integrity check. All three sit behind
 the same operator gate as the rest of this page and are read-only except
@@ -1678,13 +1679,13 @@ gateway has reached (or attempted to reach) since process start, with its
 most recent authorization outcome. Both `admin` and `read_only` operators
 may call the route.
 
-Every one of the eleven wired egress purposes below goes through the same
-authorizer and lands in the same inventory and, on denial, the same
+Every one of the thirteen wired egress purposes below goes through the
+same authorizer and lands in the same inventory and, on denial, the same
 event:
 
 ```mermaid
 flowchart TD
-    A["Egress call site: AI provider, judge, MCP upstream,\nOpenAPI tool, token exchange, webhook, usage sink,\nmodel/engine artifact, bundle hook, telemetry"] --> B[EgressAuthorizer authorizes the destination]
+    A["Egress call site: AI provider, judge, agent orchestration,\nclassifier hook, MCP upstream, OpenAPI tool, token exchange,\nwebhook, usage sink, model/engine artifact, bundle hook, telemetry"] --> B[EgressAuthorizer authorizes the destination]
     B -->|no authorizer armed for this purpose| C[ungated]
     B -->|authorizer armed| D{Destination allowed?}
     D -->|yes| E[allowed]
@@ -1736,21 +1737,33 @@ The inventory is process-lifetime and in-memory: it clears on restart and
 is capped at 1,024 tracked destinations, after which a new destination
 stops being tracked while every already-tracked one keeps updating. Every
 wired egress purpose writes here: AI providers, the dual-LLM quarantine
-judge, OpenAPI-backed MCP tools, token exchange, webhooks, usage sinks,
-model and engine artifact downloads, extension bundle hooks, and the
-OTLP telemetry exporters. `mcp_upstream` covers the base MCP connect
-for a plain `type: mcp` federated server, gated and DNS-pinned at the
-dial.
+judge, agent endpoints invoked by AI toolkit workflows, stock classifier
+hooks, OpenAPI-backed MCP tools, token exchange, webhooks, usage sinks,
+model and engine artifact downloads, extension bundle hooks, and the OTLP
+telemetry exporters. `mcp_upstream` covers the base MCP connect for a
+plain `type: mcp` federated server, gated and DNS-pinned at the dial.
+
+The thirteen purpose labels, exactly as they appear in
+`endpoints[].purpose`, in `sbproxy_egress_refused_total{purpose}`, and in
+the `egress_refused` event, are `ai_provider`, `ai_judge`,
+`agent_orchestration`, `classifier_hook`, `mcp_upstream`, `openapi_tool`,
+`token_exchange`, `webhook`, `usage_sink`, `model_artifact`,
+`engine_artifact`, `bundle_hook`, and `telemetry`.
 
 The top-level `egress:` section (see
-[Egress allowlists](configuration.md#egress-allowlists)) arms six of
-the purposes above through five sub-blocks: `ai_providers` (AI
-providers), `usage_sinks` (usage sinks and webhooks, one allowlist for
-both, including the `events:` webhook sink), `model_artifacts`,
-`token_exchange` (both the non-MCP outbound-credential resolver and the
-MCP run-as-user token exchange), and `telemetry`. Until a sub-block sets
-`mode: deny_by_default`, its purpose stays `ungated`: reached, but
-nothing was ever denied because nothing was armed.
+[Egress allowlists](configuration.md#egress-allowlists)) arms eight of
+the purposes above through seven sub-blocks: `ai_providers` (AI
+providers), `agent_orchestration` (agent endpoints invoked by configured
+AI toolkit workflows), `classifier_hooks` (stock intent and
+provider-quality classifier RPCs), `usage_sinks` (usage sinks and
+webhooks, one allowlist for both, including the `events:` webhook sink),
+`model_artifacts`, `token_exchange` (both the non-MCP
+outbound-credential resolver and the MCP run-as-user token exchange),
+and `telemetry`. Until a sub-block sets `mode: deny_by_default`, its
+purpose stays `ungated`: reached, but nothing was ever denied because
+nothing was armed. `agent_orchestration` is the exception in the other
+direction: a configured agent fails closed unless that sub-block arms it
+with `mode: deny_by_default`.
 
 Three more purposes arm outside that section, per-tool or per-action:
 MCP upstream connects and OpenAPI-backed MCP tools take a per-server
@@ -1759,7 +1772,9 @@ dual-LLM quarantine judge takes a per-action `egress:` block. A
 per-server `egress:` block does not reach the token-exchange purpose;
 that one is armed by `egress.token_exchange` and nothing else.
 Extension bundle hooks are armed automatically from the bundle's own
-outbound grant and never appear as `ungated`.
+outbound grant and never appear as `ungated`. `engine_artifact` is the
+one purpose no config knob arms today: engine downloads are stamped into
+the inventory and always report `ungated`.
 
 No purpose lets its HTTP client follow a redirect on its own. Each `3xx`
 `Location` is re-authorized from scratch, against the same purpose, with
@@ -2361,6 +2376,48 @@ Read-only operators may call this; it has no write path.
 
 ---
 
+### `GET /admin/prompt-injection-v2`
+
+Returns the process-wide deterministic classification-cache counters and a
+bounded snapshot of unavailable prompt-injection classifier stages. The route
+uses the normal admin authentication gate and accepts only `GET`.
+
+```json
+{
+  "classification_cache": {
+    "size": 42,
+    "hits": 180,
+    "misses": 51,
+    "hit_ratio": 0.779
+  },
+  "classifier_failures": {
+    "max_entries": 256,
+    "evicted_keys": 0,
+    "entries": [
+      {
+        "origin_id": "chat-prod",
+        "stage": "local_fallback",
+        "reason": "deadline",
+        "failures_total": 3,
+        "blocked_total": 0,
+        "degraded_total": 3,
+        "warnings_emitted": 1,
+        "warnings_suppressed": 2,
+        "last_seen_unix_ms": 1787539200000,
+        "last_scan_path": "ai_body",
+        "last_action": "log",
+        "last_outcome": "degraded"
+      }
+    ]
+  }
+}
+```
+
+Rows are keyed only by the configured origin identifier and closed
+stage/reason values. Prompt text, classifier endpoints, model paths,
+credentials, and dependency error strings are not retained. At most 256 keys
+are retained; `evicted_keys` shows pressure on that bound.
+
 ### `GET /admin/ai-data-posture`
 
 Per AI origin, each provider's declared data-handling posture next to
@@ -2418,6 +2475,89 @@ Read-only operators may call this; it has no write path.
 | Status | When |
 |---|---|
 | `200` | Always, once authenticated. |
+| `401` | Missing or invalid credentials. |
+| `405` | Any method other than `GET`. |
+
+---
+
+### `GET /admin/ai-chargeback` and `GET /admin/ai-chargeback.csv`
+
+Read the bounded chargeback sink instances attached to the live AI
+pipeline. The JSON form is a process-local view of recent raw entries,
+workspace/team rollups, configured capacities, and retention
+counters. `schema_version` defaults to `1`; `schema_version=2` keeps the
+typed tracker shape. JSON raw rows page with `?limit=` (default 100 when
+pagination is requested; max 1000) and `?cursor=` (opaque
+continuation from the prior page). Rollups and tracker counters remain
+whole on every page while only the retained `entries` arrays page. The
+top-level `limit` and `next_cursor` fields appear only on paged JSON
+responses. The CSV form borrows only the workspace/team rollup maps and
+exports one rollup per row for finance tools; it does not snapshot the raw
+entry window. Both formats are written once into a 512 KiB capped response
+buffer. Caller-supplied literal names equal to the internal legacy
+bucket labels (`unattributed`, `__other__`) are escaped with a
+deterministic digest suffix so they cannot impersonate the missing or
+overflow buckets on schema v1 or CSV.
+A hot reload replaces the view with the new pipeline's trackers.
+
+Both routes require an operator whose `proxy.admin.operators` entry has
+no `tenant` restriction. The team and project rollups aggregate usage
+across tenants, so a tenant-restricted operator receives `403` rather
+than a silently narrowed or mixed export; the unrestricted export's
+`workspace` dimension already breaks usage down per tenant.
+
+```json
+{
+  "schema_version": 1,
+  "origins": {
+    "ai.local": [{
+      "max_entries": 10000,
+      "max_workspaces": 1000,
+      "max_teams": 1000,
+      "entries": [],
+      "workspace_totals": {
+        "workspace-a": {"tokens": 150, "cost_usd": 0.25, "request_count": 1}
+      },
+      "team_totals": {
+        "team-a": {"tokens": 150, "cost_usd": 0.25, "request_count": 1}
+      },
+      "recorded_entries": 1,
+      "evicted_entries": 0,
+      "collapsed_workspace_events": 0,
+      "collapsed_team_events": 0
+    }]
+  }
+}
+```
+
+Origins without a configured `type: chargeback` sink are omitted. Config
+load rejects a second chargeback sink on the same AI origin, so each
+origin contributes at most one array entry. The CSV header is
+`origin,tracker,dimension,name,request_count,tokens,cost_usd`; caller-derived
+names are quoted and spreadsheet-formula prefixes are neutralized.
+
+Both endpoints are process-local and read-only. They do not claim durable
+or cross-replica totals. Use the JSON retention counters and the
+`sbproxy_ai_chargeback_entries_evicted_total{origin}` /
+`sbproxy_ai_chargeback_rollups_collapsed_total{dimension,origin}` metrics
+to tell when raw history or named rollup cardinality exceeded its
+configured window. `sbproxy_ai_chargeback_refusals_total{reason,origin}`
+counts rows the tracker refused before exact accounting could commit,
+`sbproxy_ai_chargeback_incomplete_total{reason,origin}` records the
+bounded set of completeness poisons that occurred on the live path, and
+`sbproxy_admin_chargeback_export_refusals_total{format,reason}` counts
+request-shape and response-budget refusals on this authenticated admin
+boundary. An oversized JSON or CSV export is refused as
+`413 {"code":"chargeback_response_too_large", ...}` without a second
+serialization or a raw-row snapshot. Retry JSON with a smaller `limit`; use
+the paged JSON route when the all-rollup CSV export is too large. See
+[ai-chargeback.md](ai-chargeback.md).
+
+| Status | When |
+|---|---|
+| `200` | The export fits the response budget. With no configured tracker, JSON returns an empty `origins` map and CSV returns only its header. |
+| `400` | Unsupported `schema_version`, malformed `cursor`, or an invalid/non-positive `limit`. Unsupported schema versions return `{"code":"unsupported_schema_version","requested_schema_version":...,"supported_schema_versions":[1,2]}`. |
+| `413` | The requested JSON page or CSV export would exceed the bounded admin response budget. |
 | `401` | Missing or invalid credentials. |
 | `405` | Any method other than `GET`. |
 
@@ -2722,6 +2862,176 @@ file** against the last-loaded content hash, which is narrower than
 A node whose repository moved is not "drifted" by this measure, and a
 node serving a stale bundle because the authority is unreachable is not
 either. Alert on the age gauge for those.
+
+---
+
+## AI toolkit admin
+
+These protected routes operate on the bounded AI toolkit generation published
+from `proxy.ai_toolkit`. Read routes accept `admin` and `read_only`; mutation
+and execution routes require `admin`. Tenant/origin scope is resolved on the
+server from the requested configured origin and the authenticated principal;
+clients never submit a tenant id to widen that scope.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/admin/ai-toolkit/snapshot?origin=&limit=` | Bounded, redacted inventory and recent aggregate operation summaries. `origin` is required; `limit` is optional. |
+| GET | `/admin/ai-toolkit/agents?origin=&capability=` | Discover scoped agents, optionally filtered by one exact capability. |
+| POST | `/admin/ai-toolkit/workflows/validate` | Validate a bounded workflow document without publishing or invoking it. |
+| POST | `/admin/ai-toolkit/workflows/run` | Execute one configured finite-state workflow. |
+| POST | `/admin/ai-toolkit/datasets/register` | Atomically register one exact immutable dataset version. |
+| POST | `/admin/ai-toolkit/evaluations/run` | Evaluate already-recorded responses against an exact dataset version. |
+| POST | `/admin/ai-toolkit/prompts/select` | Select a stable weighted prompt version for one scoped cohort. |
+
+All toolkit POST bodies are capped at 256 KiB before allocation and then checked against the
+stricter operation limits in `proxy.ai_toolkit.limits`. JSON responses are
+capped at 1 MiB. Error bodies carry a
+closed reason, limit, or status where applicable; they do not echo submitted
+workflow input, dataset content, model or judge responses, prompt content,
+agent endpoints, credentials, tokens, or secret references.
+
+### Snapshot and discovery
+
+`GET /admin/ai-toolkit/snapshot?origin=ai.local` returns only bounded, redacted runtime state:
+scoped agent/capability names, workflow names and limits, dataset name/version
+and entry count, rollout version/weight pairs, aggregate experiment summaries,
+closed operation/outcome rows, and a `truncated` flag. Agent endpoints and
+secrets, workflow inputs and outputs, dataset entries and responses, prompt
+content and rollout salt, and raw cohort keys are excluded.
+
+Discover agents for one existing configured origin:
+
+```http
+GET /admin/ai-toolkit/agents?origin=ai.local&capability=research HTTP/1.1
+Authorization: Basic ...
+```
+
+`origin` is required; `capability` is optional. A successful response is a
+sorted list of agent ids and sorted capability names. It does not expose agent
+descriptions, schemas, endpoints, or authentication material.
+
+### Validate and run a workflow
+
+Validation accepts the origin separately from the document:
+
+```json
+{
+  "origin": "ai.local",
+  "workflow": {
+    "name": "research-flow",
+    "initial_state": "research",
+    "max_steps": 2,
+    "timeout_ms": 2000,
+    "states": [
+      {"name": "research", "action": "research", "transitions": {}}
+    ]
+  }
+}
+```
+
+`POST /admin/ai-toolkit/workflows/validate` compiles schemas and graph
+invariants but does not mutate the running generation. Execute a workflow that
+is already present in the published config with:
+
+```json
+{
+  "origin": "ai.local",
+  "workflow": "research-flow",
+  "input": {"question": "Summarize the release notes."}
+}
+```
+
+The run response contains workflow id, completion/final-state metadata,
+bounded step summaries, and the final schema-validated agent output. The
+typed event and retained snapshot exclude that output.
+
+### Register and evaluate an immutable dataset
+
+Registration accepts one explicit non-zero version:
+
+```json
+{
+  "origin": "ai.local",
+  "name": "support-answers",
+  "version": 1,
+  "entries": [
+    {
+      "input": "When can I request a refund?",
+      "expected_output": "Refunds are available within 30 days.",
+      "metadata": {"case": "refund-window"}
+    }
+  ]
+}
+```
+
+The tuple `(authenticated scope, name, version)` is immutable. A duplicate is
+refused atomically. Evaluation always names that exact tuple and never selects
+a latest version implicitly:
+
+```json
+{
+  "origin": "ai.local",
+  "experiment_id": "support-v1-run-1",
+  "experiment_name": "support-v1-baseline",
+  "dataset": {"name": "support-answers", "version": 1},
+  "model": "recorded-model",
+  "prompt_version": "support-v1",
+  "parameters": {},
+  "responses": ["Refunds are available within 30 days."],
+  "judge": null,
+  "metrics": [
+    {"type": "length_range", "min": 1, "max": 512},
+    {"type": "contains_keywords", "keywords": ["refund"]}
+  ]
+}
+```
+
+Responses and optional judge results are already-recorded inputs. The route
+makes no model or judge network call. Its response and the retained snapshot
+contain aggregate counts and scores only; raw case material is discarded.
+
+### Select a prompt rollout
+
+```json
+{
+  "origin": "ai.local",
+  "name": "support-system",
+  "cohort": "stable-caller-key"
+}
+```
+
+Selection is stable for the same scoped rollout generation and cohort. The
+admin response identifies the selected name/version/weight and a lowercase
+SHA-256 cohort digest. It never returns prompt content, rollout salt, or the raw
+cohort. The request's raw cohort is not retained or emitted.
+
+### Status and observability contract
+
+| Status | Meaning |
+|---|---|
+| `200` | Read, validation, execution, registration, evaluation, or selection completed. |
+| `400` | Invalid document, schema, graph, metric, version, count, or other typed input. |
+| `401` / `403` | Authentication failed or the operator role/scope is insufficient. |
+| `404` | The scoped origin, agent, workflow, dataset version, or rollout does not exist. |
+| `409` | An immutable dataset version already exists. |
+| `413` | The request or an operation-specific count/byte limit is exceeded. |
+| `429` | A bounded workflow or evaluation concurrency permit is unavailable. |
+| `502` | Governed agent egress or the agent operation failed. |
+| `504` | A workflow deadline elapsed. |
+| `500` | A closed internal failure or the 1 MiB response cap prevented a safe result. |
+
+Discovery, workflow validation/execution, dataset registration, evaluation,
+and prompt selection increment
+`sbproxy_ai_toolkit_operations_total{capability,outcome}`; authenticated POSTs
+also enter the admin audit channel. Typed terminal payloads are narrower:
+workflow execution publishes `ai_workflow_operation`, an evaluation run
+publishes `ai_evaluation_operation`, and a successful admin or live prompt
+selection publishes `ai_prompt_rollout_selected`. Discovery, validation, and
+dataset registration have no typed payload kind. The three event payloads
+carry only scoped identifiers, closed outcomes, counts, durations, and the
+prompt selection digest. See [Agent orchestration](agent-orchestration.md),
+[AI evaluation harness](ai-evaluation-harness.md), and
+[Weighted prompt versioning](prompt-versioning.md).
 
 ---
 

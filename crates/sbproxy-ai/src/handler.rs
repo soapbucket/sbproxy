@@ -417,6 +417,13 @@ pub struct AiHandlerConfig {
     /// shared across requests for the lifetime of this per-origin config.
     #[serde(skip)]
     pub(crate) usage_sinks_built: OnceLock<Vec<std::sync::Arc<dyn crate::usage_sink::UsageSink>>>,
+    /// Compiled origin that owns this handler, named by the host before the
+    /// first request. Not a config key: the value is the compiled origin
+    /// identity, never operator-written. Sinks that accumulate per-origin
+    /// finance state read it so their operator-facing signals can say
+    /// whose data they are about.
+    #[serde(skip)]
+    pub(crate) origin_id: OnceLock<String>,
     /// Lazy-compiled AI policy plane (WOR-1542). `None` inside the OnceLock
     /// means no policy is configured or it failed to compile; the request
     /// path treats both as "no policy".
@@ -523,13 +530,30 @@ impl AiHandlerConfig {
             .as_ref()
     }
 
+    /// Name the compiled origin that owns this handler.
+    ///
+    /// Call this once, when the pipeline pairs a compiled origin with its
+    /// `ai_proxy` action and before the first request builds the sinks.
+    /// A second call is ignored, so a reload cannot re-label a tracker
+    /// that is already accumulating. Without it the chargeback sink's
+    /// warnings and counters are unattributable across a deployment that
+    /// runs several `ai_proxy` origins.
+    pub fn attribute_origin(&self, origin: &str) {
+        let _ = self.origin_id.set(origin.to_string());
+    }
+
     /// Return the shared usage sinks for this handler, building them once.
     /// Empty when none are configured. Sinks are best-effort and never fail a
     /// request.
     pub fn usage_sinks(&self) -> &[std::sync::Arc<dyn crate::usage_sink::UsageSink>] {
         self.usage_sinks_built
             .get_or_init(|| {
-                let mut sinks = crate::usage_sink::build_sinks(&self.usage_sinks);
+                let origin = self
+                    .origin_id
+                    .get()
+                    .map_or(crate::billing::chargeback::UNATTRIBUTED, String::as_str);
+                let mut sinks =
+                    crate::usage_sink::build_sinks_for_origin(&self.usage_sinks, origin);
                 // WOR-1913: a served model that declares a `reference:` cloud
                 // price gets a value recorder that prices each of its
                 // completions at that reference, so the admin value route and
@@ -1466,6 +1490,19 @@ impl AiHandlerConfig {
              the `resilience:` block rather than a sibling of it"
         );
         let mut config: Self = serde_json::from_value(value)?;
+        let mut chargeback_sink_index = None;
+        for (index, sink) in config.usage_sinks.iter().enumerate() {
+            sink.validate()
+                .map_err(|error| anyhow::anyhow!("ai usage_sinks[{index}]: {error}"))?;
+            if matches!(sink, crate::usage_sink::UsageSinkConfig::Chargeback { .. }) {
+                if let Some(first_index) = chargeback_sink_index {
+                    anyhow::bail!(
+                        "ai usage_sinks[{index}]: only one `type: chargeback` sink is allowed per ai_proxy action (first at usage_sinks[{first_index}])"
+                    );
+                }
+                chargeback_sink_index = Some(index);
+            }
+        }
         // WOR-2556: a typed fallback list is an aimed allowlist. A name
         // matching no provider would leave the trigger configured and
         // the reroute unreachable, so it fails the load instead.
@@ -3035,6 +3072,55 @@ mod tests {
     }
 
     #[test]
+    fn chargeback_sink_is_queryable_and_its_limits_are_validated() {
+        let action = serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "k", "models": ["gpt-4o-mini"]}],
+            "usage_sinks": [{
+                "type": "chargeback",
+                "max_entries": 3,
+                "max_workspaces": 2,
+                "max_teams": 2
+            }]
+        });
+        let config = AiHandlerConfig::from_config(action.clone()).expect("valid chargeback sink");
+        let snapshot = config.usage_sinks()[0]
+            .chargeback_snapshot()
+            .expect("configured chargeback remains queryable after trait erasure");
+        assert_eq!(snapshot.max_entries, 3);
+        assert_eq!(snapshot.max_workspaces, 2);
+        assert_eq!(snapshot.max_teams, 2);
+
+        let mut invalid = action;
+        invalid["usage_sinks"][0]["max_entries"] = serde_json::json!(0);
+        let error = AiHandlerConfig::from_config(invalid)
+            .expect_err("zero retention must fail at config load")
+            .to_string();
+        assert!(error.contains("usage_sinks[0]"), "{error}");
+        assert!(error.contains("max_entries"), "{error}");
+    }
+
+    #[test]
+    fn second_chargeback_sink_is_rejected_at_config_load() {
+        let action = serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "k", "models": ["gpt-4o-mini"]}],
+            "usage_sinks": [
+                {"type": "chargeback"},
+                {"type": "chargeback"}
+            ]
+        });
+
+        let error = AiHandlerConfig::from_config(action)
+            .expect_err("a second chargeback sink must fail before sinks are built")
+            .to_string();
+        assert!(error.contains("usage_sinks[1]"), "{error}");
+        assert!(
+            error.contains("only one `type: chargeback` sink"),
+            "{error}"
+        );
+        assert!(error.contains("usage_sinks[0]"), "{error}");
+    }
+
+    #[test]
     fn value_sink_initialization_keeps_the_winning_facade_on_path_conflict() {
         let dir = tempfile::tempdir().expect("tempdir");
         let winning_path = dir.path().join("winning.redb");
@@ -3097,6 +3183,7 @@ mod tests {
             router: OnceLock::new(),
             usage_sinks: vec![],
             usage_sinks_built: OnceLock::new(),
+            origin_id: OnceLock::new(),
             ai_policy: None,
             ai_routing_policy: None,
             model_prices: std::collections::HashMap::new(),
@@ -3153,6 +3240,7 @@ mod tests {
             router: OnceLock::new(),
             usage_sinks: vec![],
             usage_sinks_built: OnceLock::new(),
+            origin_id: OnceLock::new(),
             ai_policy: None,
             ai_routing_policy: None,
             model_prices: std::collections::HashMap::new(),
@@ -3209,6 +3297,7 @@ mod tests {
             router: OnceLock::new(),
             usage_sinks: vec![],
             usage_sinks_built: OnceLock::new(),
+            origin_id: OnceLock::new(),
             ai_policy: None,
             ai_routing_policy: None,
             model_prices: std::collections::HashMap::new(),
@@ -3266,6 +3355,7 @@ mod tests {
             router: OnceLock::new(),
             usage_sinks: vec![],
             usage_sinks_built: OnceLock::new(),
+            origin_id: OnceLock::new(),
             ai_policy: None,
             ai_routing_policy: None,
             model_prices: std::collections::HashMap::new(),

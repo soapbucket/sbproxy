@@ -127,6 +127,18 @@ const gatewayRejectionRate = computed(() =>
     : 0,
 );
 
+// --- Classifier and quality-hook degradation (WOR-2672) ---
+const intentSource = computed(() =>
+  fam("sbproxy_ai_intent_detection_source_total"),
+);
+const qualityRouting = computed(() =>
+  fam("sbproxy_ai_quality_routing_decisions_total"),
+);
+const intentSourceRows = computed(() => groupByLabel(intentSource.value, "source"));
+const qualityRoutingRows = computed(() =>
+  groupByLabel(qualityRouting.value, "outcome"),
+);
+
 // --- Pre-provider admission refusals (WOR-2595) ---
 // A refusal at the inbound native-format shim or the stored-prompt
 // resolver happens before a provider is chosen, so it leaves no trace
@@ -149,6 +161,8 @@ const hasAiTraffic = computed(
     sumSamples(attributedRequests.value) > 0 ||
     gatewayDecisionTotal.value > 0 ||
     providerHealth.value.length > 0 ||
+    intentSourceRows.value.length > 0 ||
+    qualityRoutingRows.value.length > 0 ||
     // A deployment whose only AI activity so far is refusals still has
     // something to show, and it is the thing an operator came to find.
     // Gated on the family's whole total rather than on the denied slice:
@@ -307,6 +321,30 @@ const hasCompression = computed(() => compressionTotalRequests.value > 0);
         published on its first increment, so it is absent until one request is
         refused at an inbound AI surface. This is not a zero.
       </p>
+    </section>
+
+    <section
+      class="panel"
+      v-if="intentSourceRows.length || qualityRoutingRows.length"
+    >
+      <h2>Classifier and quality routing</h2>
+      <p class="hint">
+        <span class="sb-mono">heuristic</span> means no intent hook is
+        configured; <span class="sb-mono">heuristic_degraded</span>
+        means a configured sidecar failed open.
+        A quality outcome of <span class="sb-mono">hook_unavailable</span>
+        preserves the configured router instead of pinning a guessed provider.
+      </p>
+      <div class="subgrid">
+        <div v-if="intentSourceRows.length">
+          <h3>Intent detection source</h3>
+          <MiniBars :items="intentSourceRows" :format="formatNumber" />
+        </div>
+        <div v-if="qualityRoutingRows.length">
+          <h3>Quality-hook routing outcomes</h3>
+          <MiniBars :items="qualityRoutingRows" :format="formatNumber" />
+        </div>
+      </div>
     </section>
 
     <section class="panel">

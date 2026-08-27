@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-25*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -270,7 +270,7 @@ origins:
 | `agent_classes` | object | unset | Agent catalog selection and resolver tuning. |
 | `rate_limits` | object | unset | Workspace-wide budget and auto-suspend state. Separate from per-origin policies. |
 | `audit` | object | unset | Admin-action and security/config/key audit trail. `sink: memory` (default) keeps rows in an in-memory ring and on the `tracing` targets; `sink: chain` additionally hash-chains and Ed25519-signs `security_audit` (plus `config_audit`/`key_audit`/admin-action rows when `config_path`/`key_path`/`admin_path` are set) to a durable file `sbproxy audit verify` can check. See [audit-log.md](audit-log.md). |
-| `egress` | object | unset | Per-purpose outbound allowlists (AI providers, usage sinks, model artifacts, token exchange, telemetry). See [Egress allowlists](#egress-allowlists). |
+| `egress` | object | unset | Per-purpose outbound allowlists (AI providers, agent orchestration, classifier hooks, usage sinks, model artifacts, token exchange, telemetry). See [Egress allowlists](#egress-allowlists). |
 | `session_ledger` | object | unset | MCP tool-call session-ledger emission. |
 | `request_events` | object | unset | Where completed request events go: `none` (default), `logging`, or `file`. See [Request-event egress](observability.md#request-event-egress). |
 | `events` | object | unset | Where typed lifecycle events go: `none` (default), `file`, or `webhook`. Delivery is off the request path through a bounded queue. See [events.md](events.md). |
@@ -347,6 +347,15 @@ egress:
   ai_providers:
     mode: deny_by_default
     hosts: ["api.openai.com", "api.anthropic.com"]
+  agent_orchestration:
+    mode: deny_by_default
+    hosts: ["agents.internal"]
+    ports: [443]
+  classifier_hooks:
+    mode: deny_by_default
+    hosts: ["classifier.internal"]
+    ports: [50051]
+    allow_private: true
   usage_sinks:
     mode: deny_by_default
     hosts: ["cloud.langfuse.com"]
@@ -362,6 +371,8 @@ egress:
 | Sub-block | Purpose(s) armed | Gates |
 |---|---|---|
 | `ai_providers` | `ai_provider` | Every upstream AI provider dispatch the AI gateway client makes. |
+| `agent_orchestration` | `agent_orchestration` | Every outbound invocation made by a configured `proxy.ai_toolkit` workflow. Configured agents require this block with `mode: deny_by_default`; omission does not create an ungated compatibility path for them. |
+| `classifier_hooks` | `classifier_hook` | Stock intent-classification and prompt-aware provider-quality gRPC calls. The two hooks share this one purpose-scoped gate. Nonlocal `proxy.classifier_hooks.endpoint` destinations must already be `https://` and authenticated with bearer metadata, client mTLS, or both; see [intent-detection.md](intent-detection.md). |
 | `usage_sinks` | `usage_sink`, `webhook` | Langfuse, Datadog, and object-store usage-sink deliveries (`usage_sink`), plus webhook usage-sink deliveries and the `events:` webhook sink (`webhook`, a separate purpose the same sub-block arms with one allowlist). |
 | `model_artifacts` | `model_artifact` | The model-host artifact fetcher's HTTP downloads. |
 | `token_exchange` | `token_exchange` | Every OAuth token-endpoint call this proxy makes: the non-MCP outbound-credential resolver's, and the MCP run-as-user token exchange's. A per-server `egress:` block gates that server's upstream connects and OpenAPI tool calls; it does not reach this purpose, so this sub-block is the only way to arm a token endpoint. |
@@ -424,6 +435,7 @@ proxy:
 | `observability` | object | | Log sinks, redaction, custom fields, OTLP export, and usage rollups, plus the process logger's `log.level` and `log.format`. Those two sit below `--log-level`/`SB_LOG_LEVEL`, `RUST_LOG`, and `--log-format`/`SB_LOG_FORMAT`; see [observability.md](observability.md). `log.sampling` is config-only and drops nothing. |
 | `alerting` | object | | Alert notification channels. |
 | `admin` | object | | Embedded authenticated admin API and UI. |
+| `ai_toolkit` | object | unset | Bounded, generation-pinned agents, workflows, immutable evaluation datasets, and weighted prompt rollouts. See [AI toolkit fields](#ai-toolkit-fields). |
 | `secrets` | object | | Secrets management backend. See [Secrets](#secrets). |
 | `cluster` | object | unset | Canonical local or distributed cluster identity, membership, mTLS, enrollment, snapshot, and signed deployment-authority settings. |
 | `model_host` | object | unset | Canonical managed-model authority, cache, engines, deployments, placement, and rollout policy. |
@@ -597,6 +609,167 @@ Failure modes:
   the absolute path scrubbed so the response does not leak the
   operator's filesystem layout.
 * `405` - any verb other than `GET`.
+
+### AI toolkit fields
+
+`proxy.ai_toolkit` publishes bounded agent, workflow, evaluation, and prompt
+rollout state with the same immutable generation as the origins it references.
+Omitting the block creates an empty runtime. It does not require Redis.
+
+```yaml
+proxy:
+  ai_toolkit:
+    limits:
+      max_agents: 64
+      max_workflows: 64
+      agent_concurrency: 8
+      evaluation_concurrency: 2
+    agents:
+      - origin: ai.example
+        id: researcher
+        endpoint: https://agents.internal/invoke
+        auth:
+          shared_secret: env:SB_AGENT_SECRET
+        capabilities:
+          - name: research
+            description: Produce a research summary
+            input_schema: {type: object}
+            output_schema: {type: object}
+    workflows:
+      - origin: ai.example
+        name: research-flow
+        initial_state: collect
+        max_steps: 4
+        timeout_ms: 2000
+        states:
+          - name: collect
+            action: research
+            transitions: {}
+    datasets:
+      - origin: ai.example
+        name: support-answers
+        version: 1
+        entries:
+          - input: When can I request a refund?
+            expected_output: Refunds are available within 30 days.
+            metadata: {case: refund-window}
+```
+
+Every configured `origin` value must match a key in the top-level `origins`
+map. The compiled origin supplies the tenant/origin scope: an authenticated caller can
+discover, execute, evaluate, select, and inspect only resources in that scope.
+
+`agents[].auth.shared_secret` accepts a secret reference only. Examples include
+`env:SB_AGENT_SECRET`, `file:...`, and the supported secret-manager URI forms.
+Inline material is a compile error. The configured endpoint is dialed only
+through `egress.agent_orchestration`, which must be present with
+`mode: deny_by_default` when agents are configured.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `limits` | object | runtime defaults | Optional overrides for bounded counts, bytes, concurrency, and deadlines. |
+| `agents` | list | `[]` | Governed endpoints and the capabilities they advertise. |
+| `workflows` | list | `[]` | Finite-state workflows whose state `action` names a configured capability. |
+| `datasets` | list | `[]` | Immutable, explicitly versioned evaluation datasets seeded at publication. |
+| `prompt_rollouts` | list | `[]` | Stable weighted prompt versions selected for a scoped cohort. See [Weighted prompt versioning](prompt-versioning.md). |
+
+Agent fields:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `origin` | string | required | Existing origin hostname or stable origin id that owns the resource. |
+| `id` | string | required | Stable agent identifier inside the scope. |
+| `endpoint` | absolute URL | required | Governed invocation endpoint. Redirects do not escape the egress policy. |
+| `auth.shared_secret` | secret reference | required | Shared agent credential; inline material is refused. |
+| `capabilities` | list | `[]` | Capability name, bounded description, and JSON Schema input/output contracts. |
+| `capabilities[].name` | string | required | Exact label workflow states use in `action`. |
+| `capabilities[].input_schema` | JSON Schema | required | Compiled before publication and enforced before dispatch. |
+| `capabilities[].output_schema` | JSON Schema | required | Compiled before publication and enforced before a response advances the FSM. |
+
+Workflow fields:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `origin` | string | required | Existing origin that owns the workflow. |
+| `name` | string | required | Stable workflow identifier inside the scope. |
+| `initial_state` | string | required | Name of the first state to invoke. |
+| `max_steps` | int | required | Maximum state invocations in one run. |
+| `timeout_ms` | int | required | Whole-workflow deadline, no greater than `limits.max_workflow_timeout_ms`. |
+| `states` | list | required | Bounded finite-state graph. |
+| `states[].name` | string | required | State identifier, unique inside the workflow. |
+| `states[].action` | string | required | Capability to discover, validate, and invoke. |
+| `states[].transitions` | map | `{}` | Outcome-to-next-state mapping. No match completes the run. |
+
+Dataset fields:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `origin` | string | required | Existing origin that owns the dataset. |
+| `name` | string | required | Dataset identifier inside the scope. |
+| `version` | positive int | required | Exact immutable version; zero is refused. |
+| `entries` | list | `[]` | Bounded input/expected-output cases. |
+| `entries[].input` | string | required | Recorded evaluation input. |
+| `entries[].expected_output` | string | unset | Optional exact answer used for correctness scoring. |
+| `entries[].metadata` | JSON | `{}` | Bounded caller metadata retained with the case. |
+
+Prompt-rollout fields:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `origin` | string | required | Existing origin key that owns the rollout. |
+| `name` | string | required | Stable prompt/rollout identifier inside the scope. |
+| `salt` | string | required | Stable cohort salt; changing it intentionally reshuffles assignments. Excluded from snapshots and events. |
+| `versions` | list | required | Bounded immutable prompt versions. |
+| `versions[].version` | positive int | required | Numeric prompt version, unique inside the rollout. |
+| `versions[].content` | string | required | Selected prompt template/content. Excluded from admin responses, snapshots, events, and metrics. |
+| `versions[].weight` | float | required | Finite non-negative relative weight; the rollout's exact total must be positive and finite. |
+
+Limit overrides are optional; omission inherits the runtime default:
+
+| Limit | Default |
+|---|---:|
+| `max_agents` | 64 |
+| `max_capabilities_per_agent` | 32 |
+| `max_workflows` | 64 |
+| `max_datasets` | 32 |
+| `max_dataset_versions` | 8 |
+| `max_dataset_versions_total` | 256 |
+| `max_dataset_entries` | 1,000 |
+| `max_dataset_bytes_total` | 67,108,864 |
+| `max_rollouts` | 128 |
+| `max_rollout_versions` | 16 |
+| `max_retained_operations` | 256 |
+| `max_request_bytes` | 262,144 |
+| `max_response_bytes` | 1,048,576 |
+| `max_identifier_bytes` | 128 |
+| `max_description_bytes` | 512 |
+| `max_schema_bytes` | 65,536 |
+| `max_secret_bytes` | 256 |
+| `max_evaluation_cases` | 1,000 |
+| `max_metrics` | 16 |
+| `max_judge_criteria` | 16 |
+| `agent_concurrency` | 8 |
+| `evaluation_concurrency` | 2 |
+| `default_workflow_timeout_ms` | 10,000 |
+| `max_workflow_timeout_ms` | 60,000 |
+
+All string and serialized-body limits are UTF-8 byte limits.
+`max_dataset_versions_total` and `max_dataset_bytes_total` bound the complete
+live runtime generation across every origin/tenant scope; the byte ceiling is
+the sum of serialized dataset-entry arrays. Their accepted hard maxima are
+16,384 versions and 536,870,912 bytes (512 MiB), respectively. Dynamic
+registration accepts only origin/tenant scopes compiled into that same
+generation and atomically checks the per-scope, per-dataset, and
+generation-wide ceilings before insertion.
+Invalid schemas, duplicate immutable keys, unknown origins, missing secret
+references, unsafe egress, and zero or inconsistent limits refuse publication.
+The current generation remains live when a reload candidate fails.
+
+The authenticated routes and request shapes are documented under
+[AI toolkit admin](admin-api-reference.md#ai-toolkit-admin). Task-oriented
+guides are [Agent orchestration](agent-orchestration.md),
+[AI evaluation harness](ai-evaluation-harness.md), and
+[Weighted prompt versioning](prompt-versioning.md).
 
 ### Cluster fields
 
@@ -3462,6 +3635,9 @@ policies:
 | `detector_config.signature_public_key` | string | none | Ed25519 key as 64 hex characters or a `PUBLIC KEY` PEM block. All three signature fields are required together. |
 | `detector_config.max_model_bytes` | integer | `209715200` | Model size budget checked before parsing. |
 | `detector_config.max_tokenizer_bytes` | integer | `209715200` | Tokenizer size budget checked before parsing. |
+| `detector_config.max_concurrent` | integer | `2` | Running in-process evaluations. Must be in `1..=64`. |
+| `detector_config.max_queued` | integer | `16` | Waiting in-process evaluations. Must be in `1..=1024`; later work is refused as `queue_full`. |
+| `detector_config.inference_timeout_ms` | integer | `500` | End-to-end local admission and inference deadline. Must be in `1..=30000`. |
 | `threshold` | float | `0.5` | Score threshold in `[0.0, 1.0]`; the policy fires when `score >= threshold`. |
 | `action` | string | `tag` | `tag` stamps the score / label headers on the upstream. `block` returns `403` with `block_body`. `log` writes a structured warn under `sbproxy::prompt_injection_v2`. |
 | `enforcement` | string | none | Optional override for the did-decide axis, shared vocabulary. `block` forces a hit to refuse whatever observe flavor `action` names. `observe` admits every hit: `action: block` downgrades to `log`, `tag` keeps tagging, and the `a2a` depth escalation is downgraded too, so this one key is the whole-policy rollout switch. An explicit `a2a.root_action: log` survives `enforcement: block`. Absent leaves `action` in charge. |
@@ -3474,6 +3650,16 @@ policies:
 | `a2a.block_above_delegation_depth` | integer or null | `0` | Delegation depth above which an agent-to-agent hit blocks regardless of `a2a.root_action`. Depth 0 is the chain root, so the default blocks any delegated hop. `null` disables the escalation. |
 
 The generic policy scans the request URI + non-auth headers (`Authorization`, `Cookie`, `Set-Cookie` are excluded so tokens carried by design don't self-flag) at request-filter time. Tag mode stamps the score / label headers via the existing trust-headers channel before `upstream_request_filter` builds the upstream request; block mode rejects with `403` immediately. Set `enable_body_aware: true` after measuring false positives to scan buffered request bodies as well; on a plain origin pair it with `block` or `log`, since a body hit arrives after the upstream request is assembled and cannot tag (`tag` + body-aware is refused at config compile there). A body-borne block honors `block_content_type`. See [prompt-injection-v2.md](prompt-injection-v2.md) for the phase table, auto-selection failure boundaries, the eval harness, and custom detector registration.
+
+An unavailable detector is never `clean` and is never cached. Effective
+`action: block` fails closed with a generic `503 service unavailable`, ignoring
+`block_body` so classifier internals cannot reach the client. `tag` and `log`
+continue with the typed `degraded` outcome; tag writes `degraded` to
+`label_header` without inventing a numeric score. Deterministic local cache
+entries are namespaced by complete model semantics. Remote and composite
+detectors bypass that cache. Operational state is available through the
+authenticated `GET /admin/prompt-injection-v2` route and
+`sbproxy_prompt_injection_classifier_failures_total`.
 
 The `a2a.*` keys apply only when an `a2a` policy is configured on the same origin and the request is detected as A2A 1.0. There is no `tag` in the agent-boundary vocabulary: the scan runs at the request-body phase, after the upstream request header has been built, so there is no header left to stamp. See [prompt-injection-v2.md](prompt-injection-v2.md#the-agent-boundary).
 
@@ -6376,7 +6562,7 @@ source:
 | `path` | string | required for `git` | Path to the config file inside the repository. Relative, and `..` components are refused: this names a file in the repository, not a file on the proxy host. |
 | `credential` | secret ref | | `env:NAME`, `${NAME}`, `file:/path`, or `secret://backend/name`. An inline literal is refused. |
 | `verify_signature` | bool | `false` | Require a verifiable signature on the resolved tag or commit. |
-| `timeout_secs` | int | `60` | Hard timeout for one fetch, 1 to 3600. The `git` child process is killed when it expires. |
+| `timeout_secs` | int | `60` | Hard timeout for one fetch, 1 to 3600. A `git` child, or the in-process clone, is stopped when it expires. |
 | `refresh_interval_secs` | int | `60` | How often to re-resolve while running. `0` resolves at boot and on ordinary reloads only. |
 
 ### What a git source proves, and what it does not
@@ -6388,14 +6574,16 @@ Two settings close most of that gap, and both are yours to choose:
 - **Pin `revision` to a full commit sha.** After fetching, SBproxy resolves `HEAD` and refuses the document when it is not the commit you named. A branch moving underneath a pinned node cannot be followed silently, and a pinned node never reloads on someone else's push.
 - **Set `verify_signature: true`.** The resolved tag is checked first, then the commit, and a missing or unverifiable signature refuses the document. The signing key has to be in the git trust store on the proxy host.
 
-### `git` is a runtime dependency
+### How a git source is fetched
 
-Resolution shells out to the `git` binary, so every host that resolves a git source needs `git` installed, container images included. A missing binary is a named failure that says so rather than a confusing clone error, and `sbproxy doctor` reports it in the `tooling` block:
+Resolution prefers the `git` binary on `PATH` and falls back to an in-process clone when that binary is missing. Distroless images have no git and no shell; the fallback is what a git-sourced config uses there. `sbproxy doctor` still reports the binary so you can see which path a host will take:
 
 ```text
 tooling
   git         /usr/bin/git (git version 2.43.0)
 ```
+
+`verify_signature: true` always needs `git`, because GPG and SSH signature verification are not in the in-process path. A missing binary with signature verification set is a named failure rather than a confusing clone error.
 
 One implementation note, because it changes what your git server has to allow: `git clone --depth 1` cannot fetch an arbitrary commit sha unless the server sets `uploadpack.allowReachableSHA1InWant`. Pinning to a sha therefore fetches the single commit when the server allows it and falls back to a full fetch when it does not. Pinning works either way; on a server without that setting it costs a full clone.
 
@@ -6407,8 +6595,8 @@ The interval carries jitter, so a fleet that restarts together does not hit your
 
 | Situation | Behavior |
 |---|---|
-| Remote unreachable, or `git` missing | Keep serving the document already applied. Error log, `unreachable` counter. |
-| Fetch exceeded `timeout_secs` | Child process killed. Keep serving. `timeout`. |
+| Remote unreachable | Keep serving the document already applied. Error log, `unreachable` counter. |
+| Fetch exceeded `timeout_secs` | The fetch is cancelled (the `git` child is killed; the in-process fallback stops cooperatively). Keep serving. `timeout`. |
 | `revision` pins a sha and `HEAD` is a different commit | Refuse the document. `revision_mismatch`. |
 | `verify_signature` set and no verifiable signature | Refuse the document. `verify_failed`. |
 | Resolved document does not compile or cannot be constructed | Refuse the document. `compile_failed`. |
@@ -6526,7 +6714,7 @@ sbproxy validate /etc/sbproxy/sb.yml --no-fetch
 
 ### Not in this version
 
-No write-back: nothing here commits to a repository. Be aware that on a git-sourced node the admin config editor still writes the local pointer file, which the next refresh then resolves past, so the repository is the only place a configuration change sticks. Making that editor read-only is not part of this version. No `db` source kind, no submodule or LFS support, and no in-process git implementation; the `git` binary stays the transport.
+No write-back: nothing here commits to a repository. Be aware that on a git-sourced node the admin config editor still writes the local pointer file, which the next refresh then resolves past, so the repository is the only place a configuration change sticks. Making that editor read-only is not part of this version. No `db` source kind, and no submodule or LFS support. Fetch prefers the `git` binary on `PATH` and falls back to an in-process clone when that binary is missing (the official distroless image has neither a shell nor git). `verify_signature: true` still requires `git`, because GPG and SSH signature verification are not in the in-process path.
 
 ---
 

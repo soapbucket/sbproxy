@@ -12,7 +12,7 @@ The successor to the legacy `injection` / `prompt_injection` guardrail names. Th
 sbproxy serve -f sb.yml
 ```
 
-The example wires three hostnames (`tag.local`, `block.local`, `log.local`) so you can see all three actions side by side. To swap to a probabilistic detector, run the classifier sidecar and set `detector: sidecar` (see the [prompt-injection-sidecar](../prompt-injection-sidecar/) example).
+The example wires three hostnames (`tag.local`, `block.local`, `log.local`) so you can see all three actions side by side. To swap to a probabilistic detector, run the classifier sidecar and set `detector: sidecar` with its mandatory pinned local ONNX fallback (see the [prompt-injection-sidecar](../prompt-injection-sidecar/) example).
 
 ## Try it
 

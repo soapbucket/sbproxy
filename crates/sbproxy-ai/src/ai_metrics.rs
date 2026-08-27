@@ -253,6 +253,175 @@ static AI_LB_DECISIONS: LazyLock<CounterVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// WOR-2672: intent-detection dispatch outcomes by which path answered.
+///
+/// `source` is `"hook"` when a registered classifier-sidecar hook
+/// (`IntentDetectionHook`) returned a category, `"heuristic"` when no hook
+/// exists, or `"heuristic_degraded"` when a configured hook
+/// failed open; see
+/// `sbproxy_core::intent_detection::detect_intent_with_source`. A rising
+/// `heuristic` share on a deployment that configured a sidecar hook is a
+/// degradation signal: the sidecar is not answering and every request is
+/// paying for keyword matching instead of real classification.
+static AI_INTENT_DETECTION_SOURCE: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_intent_detection_source_total",
+            "Intent-detection dispatches by healthy classifier hook, unconfigured heuristic, or degraded heuristic fallback"
+        ),
+        &["source"]
+    )
+    // The name, help text, and label set are fixed string literals above,
+    // so the only way this ever fails is registering the same family name
+    // twice under a different type, which is a programming error to catch
+    // at startup, not a runtime condition to recover from.
+    .expect("sbproxy_ai_intent_detection_source_total is a fixed, unique metric family")
+});
+
+/// Record one intent-detection dispatch outcome (WOR-2672).
+///
+/// `source` is normalized to a closed vocabulary; anything else folds into
+/// `"unknown"` so a caller cannot mint new label values.
+pub fn record_intent_detection_source(source: &str) {
+    let source = match source {
+        "hook" | "heuristic" | "heuristic_degraded" => source,
+        _ => "unknown",
+    };
+    AI_INTENT_DETECTION_SOURCE
+        .with_label_values(&[source])
+        .inc();
+}
+
+/// Quality-hook routing outcomes from the live AI request path (WOR-2672).
+static AI_QUALITY_ROUTING_DECISIONS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_quality_routing_decisions_total",
+            "Quality-hook routing decisions by selected or fallback outcome"
+        ),
+        &["outcome"]
+    )
+    .expect("sbproxy_ai_quality_routing_decisions_total is a fixed, unique metric family")
+});
+
+/// Record one live quality-hook routing outcome.
+///
+/// The closed label set prevents a hook or provider name from creating an
+/// unbounded metric series.
+pub fn record_quality_routing_decision(outcome: &str) {
+    let outcome = match outcome {
+        "selected" | "hook_unavailable" | "target_ineligible" | "prompt_too_large" => outcome,
+        _ => "unknown",
+    };
+    AI_QUALITY_ROUTING_DECISIONS
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+/// Live AI-toolkit capability recorded by
+/// `sbproxy_ai_toolkit_operations_total`.
+///
+/// This enum is the metric's cardinality boundary. Workflow names, dataset
+/// names, prompt names, and run identifiers belong in bounded operation
+/// records, never in Prometheus labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiToolkitCapability {
+    /// A governed multi-agent workflow operation.
+    Workflow,
+    /// A governed evaluation operation.
+    Evaluation,
+    /// A weighted prompt-rollout selection from either the admin or live path.
+    PromptRollout,
+}
+
+impl AiToolkitCapability {
+    /// Closed Prometheus label value for this capability.
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Workflow => "workflow",
+            Self::Evaluation => "evaluation",
+            Self::PromptRollout => "prompt_rollout",
+        }
+    }
+}
+
+/// Terminal outcome of a live AI-toolkit operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiToolkitOutcome {
+    /// The operation completed successfully.
+    Success,
+    /// Typed input or stored configuration was invalid.
+    Invalid,
+    /// The caller did not authenticate or lacked permission.
+    Unauthorized,
+    /// The requested workflow, dataset, run, prompt, or version was absent.
+    NotFound,
+    /// Purpose-scoped egress governance refused an outbound call.
+    EgressRefused,
+    /// The operation exceeded its configured deadline.
+    Timeout,
+    /// The request body exceeded its operation-specific limit.
+    BodyTooLarge,
+    /// The bounded response could not fit its response-byte limit.
+    ResponseTooLarge,
+    /// Concurrency admission refused the operation; the caller retries
+    /// later. Kept distinct from `Internal` so capacity exhaustion can be
+    /// alerted on without paging for internal faults.
+    Busy,
+    /// The configured downstream agent failed: it returned a non-success
+    /// status, or the governed hop to it could not complete. Kept distinct
+    /// from `Internal` for the same reason `Busy` is: the HTTP surface
+    /// already answers 502 `agent_operation_failed` here, so a customer's
+    /// broken agent must not page the proxy team.
+    AgentFailed,
+    /// An internal failure prevented a closed public outcome.
+    Internal,
+}
+
+impl AiToolkitOutcome {
+    /// Closed Prometheus label value for this outcome.
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Invalid => "invalid",
+            Self::Unauthorized => "unauthorized",
+            Self::NotFound => "not_found",
+            Self::EgressRefused => "egress_refused",
+            Self::Timeout => "timeout",
+            Self::BodyTooLarge => "body_too_large",
+            Self::ResponseTooLarge => "response_too_large",
+            Self::Busy => "busy",
+            Self::AgentFailed => "agent_failed",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+/// Workflow, evaluation, and weighted-rollout operations by closed
+/// capability and terminal outcome.
+static AI_TOOLKIT_OPERATIONS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_toolkit_operations_total",
+            "AI toolkit operations by capability (workflow, evaluation, prompt_rollout) and terminal outcome (success, invalid, unauthorized, not_found, egress_refused, timeout, body_too_large, response_too_large, busy, agent_failed, internal)"
+        ),
+        &["capability", "outcome"]
+    )
+    // Same contract as the sibling families above: every input is a fixed
+    // literal, so the only possible failure is a same-name/different-type
+    // double registration, a programming error to catch at first use. The
+    // earlier `.ok()` form would have turned that error into a counter
+    // that silently reads zero forever.
+    .expect("sbproxy_ai_toolkit_operations_total is a fixed, unique metric family")
+});
+
+/// Record one terminal AI-toolkit operation.
+pub fn record_ai_toolkit_operation(capability: AiToolkitCapability, outcome: AiToolkitOutcome) {
+    AI_TOOLKIT_OPERATIONS
+        .with_label_values(&[capability.as_label(), outcome.as_label()])
+        .inc();
+}
+
 /// AI routing decisions that intentionally use a fallback path.
 ///
 /// `strategy` comes from the closed routing enum. `reason` is normalized by
@@ -2726,9 +2895,278 @@ pub(crate) fn replica_selection_excluded_value(stage: &str) -> f64 {
         .get()
 }
 
+// --- Chargeback retention metrics ---
+
+/// Closed reasons a chargeback tracker can become incomplete on the
+/// production record/retention path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChargebackIncompleteReason {
+    /// At least one chargeback row was refused.
+    RefusedRow,
+    /// An evicted retained row carried an untrustworthy timestamp, so the
+    /// eviction watermark interval is poisoned.
+    EvictionWatermarkPoisoned,
+}
+
+impl ChargebackIncompleteReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::RefusedRow => "refused_row",
+            Self::EvictionWatermarkPoisoned => "eviction_watermark_poisoned",
+        }
+    }
+}
+
+/// Raw chargeback rows evicted from bounded in-memory retention.
+///
+/// `origin` is the compiled origin whose `type: chargeback` sink owns the
+/// tracker. A deployment runs one tracker per such origin, and every
+/// counter in this family is otherwise unattributable: the operator can
+/// see that finance data went incomplete but not whose. Cardinality is the
+/// configured origin roster, the same bound
+/// `sbproxy_egress_refused_total{origin}` already carries.
+static AI_CHARGEBACK_ENTRIES_EVICTED: LazyLock<Option<CounterVec>> = LazyLock::new(|| {
+    match register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_chargeback_entries_evicted_total",
+            "Raw chargeback entries evicted from bounded in-memory retention, by owning origin"
+        ),
+        &["origin"]
+    ) {
+        Ok(counter) => Some(counter),
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                metric = "sbproxy_ai_chargeback_entries_evicted_total",
+                "failed to register chargeback metric"
+            );
+            None
+        }
+    }
+});
+
+/// Chargeback assignments folded into a bounded overflow rollup.
+static AI_CHARGEBACK_ROLLUPS_COLLAPSED: LazyLock<Option<CounterVec>> = LazyLock::new(|| {
+    match register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_chargeback_rollups_collapsed_total",
+            "Chargeback events folded into an overflow rollup by dimension and owning origin"
+        ),
+        &["dimension", "origin"]
+    ) {
+        Ok(counter) => Some(counter),
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                metric = "sbproxy_ai_chargeback_rollups_collapsed_total",
+                "failed to register chargeback metric"
+            );
+            None
+        }
+    }
+});
+
+/// Chargeback rows refused before exact accounting could commit.
+static AI_CHARGEBACK_REFUSALS: LazyLock<Option<CounterVec>> = LazyLock::new(|| {
+    match register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_chargeback_refusals_total",
+            "Chargeback rows refused before exact accounting could commit, by closed reason and owning origin"
+        ),
+        &["reason", "origin"]
+    ) {
+        Ok(counter) => Some(counter),
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                metric = "sbproxy_ai_chargeback_refusals_total",
+                "failed to register chargeback metric"
+            );
+            None
+        }
+    }
+});
+
+/// Chargeback incompleteness causes observed on the live record path.
+static AI_CHARGEBACK_INCOMPLETE: LazyLock<Option<CounterVec>> = LazyLock::new(|| {
+    match register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_chargeback_incomplete_total",
+            "Chargeback incompleteness causes observed on the live record and retention path, by owning origin"
+        ),
+        &["reason", "origin"]
+    ) {
+        Ok(counter) => Some(counter),
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                metric = "sbproxy_ai_chargeback_incomplete_total",
+                "failed to register chargeback metric"
+            );
+            None
+        }
+    }
+});
+
+pub(crate) fn record_chargeback_entry_evicted(origin: &str) {
+    if let Some(counter) = AI_CHARGEBACK_ENTRIES_EVICTED.as_ref() {
+        counter.with_label_values(&[origin]).inc();
+    }
+}
+
+pub(crate) fn record_chargeback_rollup_collapsed(dimension: &'static str, origin: &str) {
+    debug_assert!(matches!(dimension, "workspace" | "team"));
+    if let Some(counter) = AI_CHARGEBACK_ROLLUPS_COLLAPSED.as_ref() {
+        counter.with_label_values(&[dimension, origin]).inc();
+    }
+}
+
+/// Count one chargeback record refusal on
+/// `sbproxy_ai_chargeback_refusals_total{reason,origin}`.
+///
+/// `origin` names the compiled origin whose `type: chargeback` sink owns
+/// the tracker, so an operator running several `ai_proxy` origins can tell
+/// whose finance data went incomplete. It is bounded by the configured
+/// origin roster.
+///
+/// The `reason` label is derived from the closed
+/// [`crate::billing::chargeback::ChargebackRecordError`] vocabulary. The
+/// current label set is:
+/// `invalid_cost`, `invalid_timestamp`,
+/// `tracker_recorded_entries_overflow`, `tracker_request_count_overflow`,
+/// `tracker_tokens_overflow`, `tracker_cost_overflow`,
+/// `workspace_recorded_entries_overflow`,
+/// `workspace_request_count_overflow`, `workspace_tokens_overflow`,
+/// `workspace_cost_overflow`, `team_recorded_entries_overflow`,
+/// `team_request_count_overflow`,
+/// `team_tokens_overflow`, and `team_cost_overflow`.
+pub fn record_chargeback_refusal(
+    error: crate::billing::chargeback::ChargebackRecordError,
+    origin: &str,
+) {
+    let reason = chargeback_refusal_reason(error);
+    if let Some(counter) = AI_CHARGEBACK_REFUSALS.as_ref() {
+        counter.with_label_values(&[reason, origin]).inc();
+    }
+}
+
+fn chargeback_refusal_reason(
+    error: crate::billing::chargeback::ChargebackRecordError,
+) -> &'static str {
+    use crate::billing::chargeback::{
+        ChargebackOverflowField, ChargebackOverflowScope, ChargebackRecordError,
+    };
+
+    match error {
+        ChargebackRecordError::InvalidCost => "invalid_cost",
+        ChargebackRecordError::InvalidTimestamp => "invalid_timestamp",
+        ChargebackRecordError::ArithmeticOverflow {
+            scope: ChargebackOverflowScope::Tracker,
+            field: ChargebackOverflowField::RecordedEntries,
+        } => "tracker_recorded_entries_overflow",
+        ChargebackRecordError::ArithmeticOverflow {
+            scope: ChargebackOverflowScope::Tracker,
+            field: ChargebackOverflowField::RequestCount,
+        } => "tracker_request_count_overflow",
+        ChargebackRecordError::ArithmeticOverflow {
+            scope: ChargebackOverflowScope::Tracker,
+            field: ChargebackOverflowField::Tokens,
+        } => "tracker_tokens_overflow",
+        ChargebackRecordError::ArithmeticOverflow {
+            scope: ChargebackOverflowScope::Tracker,
+            field: ChargebackOverflowField::Cost,
+        } => "tracker_cost_overflow",
+        ChargebackRecordError::ArithmeticOverflow {
+            scope: ChargebackOverflowScope::Workspace,
+            field: ChargebackOverflowField::RecordedEntries,
+        } => "workspace_recorded_entries_overflow",
+        ChargebackRecordError::ArithmeticOverflow {
+            scope: ChargebackOverflowScope::Workspace,
+            field: ChargebackOverflowField::RequestCount,
+        } => "workspace_request_count_overflow",
+        ChargebackRecordError::ArithmeticOverflow {
+            scope: ChargebackOverflowScope::Workspace,
+            field: ChargebackOverflowField::Tokens,
+        } => "workspace_tokens_overflow",
+        ChargebackRecordError::ArithmeticOverflow {
+            scope: ChargebackOverflowScope::Workspace,
+            field: ChargebackOverflowField::Cost,
+        } => "workspace_cost_overflow",
+        ChargebackRecordError::ArithmeticOverflow {
+            scope: ChargebackOverflowScope::Team,
+            field: ChargebackOverflowField::RecordedEntries,
+        } => "team_recorded_entries_overflow",
+        ChargebackRecordError::ArithmeticOverflow {
+            scope: ChargebackOverflowScope::Team,
+            field: ChargebackOverflowField::RequestCount,
+        } => "team_request_count_overflow",
+        ChargebackRecordError::ArithmeticOverflow {
+            scope: ChargebackOverflowScope::Team,
+            field: ChargebackOverflowField::Tokens,
+        } => "team_tokens_overflow",
+        ChargebackRecordError::ArithmeticOverflow {
+            scope: ChargebackOverflowScope::Team,
+            field: ChargebackOverflowField::Cost,
+        } => "team_cost_overflow",
+    }
+}
+
+/// Count one chargeback incompleteness observation on
+/// `sbproxy_ai_chargeback_incomplete_total{reason,origin}`.
+///
+/// Wire this at the transition that makes a tracker incomplete, not at
+/// every later read of an already-incomplete snapshot. `origin` names the
+/// compiled origin whose sink owns the tracker; incompleteness is sticky,
+/// so an unattributed count says a bill will be refused without saying
+/// whose.
+pub fn record_chargeback_incomplete(reason: ChargebackIncompleteReason, origin: &str) {
+    if let Some(counter) = AI_CHARGEBACK_INCOMPLETE.as_ref() {
+        counter.with_label_values(&[reason.as_str(), origin]).inc();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::billing::chargeback::{
+        ChargebackOverflowField, ChargebackOverflowScope, ChargebackRecordError,
+    };
+
+    #[test]
+    fn ai_toolkit_metric_uses_only_the_closed_capability_and_outcome_labels() {
+        let capabilities = [
+            (AiToolkitCapability::Workflow, "workflow"),
+            (AiToolkitCapability::Evaluation, "evaluation"),
+            (AiToolkitCapability::PromptRollout, "prompt_rollout"),
+        ];
+        let outcomes = [
+            (AiToolkitOutcome::Success, "success"),
+            (AiToolkitOutcome::Invalid, "invalid"),
+            (AiToolkitOutcome::Unauthorized, "unauthorized"),
+            (AiToolkitOutcome::NotFound, "not_found"),
+            (AiToolkitOutcome::EgressRefused, "egress_refused"),
+            (AiToolkitOutcome::Timeout, "timeout"),
+            (AiToolkitOutcome::BodyTooLarge, "body_too_large"),
+            (AiToolkitOutcome::ResponseTooLarge, "response_too_large"),
+            (AiToolkitOutcome::Internal, "internal"),
+        ];
+
+        for (capability, label) in capabilities {
+            assert_eq!(capability.as_label(), label);
+        }
+        for (outcome, label) in outcomes {
+            assert_eq!(outcome.as_label(), label);
+        }
+
+        let before = AI_TOOLKIT_OPERATIONS
+            .with_label_values(&["workflow", "success"])
+            .get();
+        record_ai_toolkit_operation(AiToolkitCapability::Workflow, AiToolkitOutcome::Success);
+        let after = AI_TOOLKIT_OPERATIONS
+            .with_label_values(&["workflow", "success"])
+            .get();
+        assert_eq!(after, before + 1.0);
+    }
 
     #[test]
     fn bedrock_inline_verdict_is_labeled_separately_from_apply_guardrail() {
@@ -2749,6 +3187,102 @@ mod tests {
             "unknown",
             "the set stays closed; only the exact spelling is admitted"
         );
+    }
+
+    #[test]
+    fn chargeback_refusal_reason_labels_cover_the_closed_error_vocabulary() {
+        let cases = [
+            (ChargebackRecordError::InvalidCost, "invalid_cost"),
+            (ChargebackRecordError::InvalidTimestamp, "invalid_timestamp"),
+            (
+                ChargebackRecordError::ArithmeticOverflow {
+                    scope: ChargebackOverflowScope::Tracker,
+                    field: ChargebackOverflowField::RecordedEntries,
+                },
+                "tracker_recorded_entries_overflow",
+            ),
+            (
+                ChargebackRecordError::ArithmeticOverflow {
+                    scope: ChargebackOverflowScope::Tracker,
+                    field: ChargebackOverflowField::RequestCount,
+                },
+                "tracker_request_count_overflow",
+            ),
+            (
+                ChargebackRecordError::ArithmeticOverflow {
+                    scope: ChargebackOverflowScope::Tracker,
+                    field: ChargebackOverflowField::Tokens,
+                },
+                "tracker_tokens_overflow",
+            ),
+            (
+                ChargebackRecordError::ArithmeticOverflow {
+                    scope: ChargebackOverflowScope::Tracker,
+                    field: ChargebackOverflowField::Cost,
+                },
+                "tracker_cost_overflow",
+            ),
+            (
+                ChargebackRecordError::ArithmeticOverflow {
+                    scope: ChargebackOverflowScope::Workspace,
+                    field: ChargebackOverflowField::RecordedEntries,
+                },
+                "workspace_recorded_entries_overflow",
+            ),
+            (
+                ChargebackRecordError::ArithmeticOverflow {
+                    scope: ChargebackOverflowScope::Workspace,
+                    field: ChargebackOverflowField::RequestCount,
+                },
+                "workspace_request_count_overflow",
+            ),
+            (
+                ChargebackRecordError::ArithmeticOverflow {
+                    scope: ChargebackOverflowScope::Workspace,
+                    field: ChargebackOverflowField::Tokens,
+                },
+                "workspace_tokens_overflow",
+            ),
+            (
+                ChargebackRecordError::ArithmeticOverflow {
+                    scope: ChargebackOverflowScope::Workspace,
+                    field: ChargebackOverflowField::Cost,
+                },
+                "workspace_cost_overflow",
+            ),
+            (
+                ChargebackRecordError::ArithmeticOverflow {
+                    scope: ChargebackOverflowScope::Team,
+                    field: ChargebackOverflowField::RecordedEntries,
+                },
+                "team_recorded_entries_overflow",
+            ),
+            (
+                ChargebackRecordError::ArithmeticOverflow {
+                    scope: ChargebackOverflowScope::Team,
+                    field: ChargebackOverflowField::RequestCount,
+                },
+                "team_request_count_overflow",
+            ),
+            (
+                ChargebackRecordError::ArithmeticOverflow {
+                    scope: ChargebackOverflowScope::Team,
+                    field: ChargebackOverflowField::Tokens,
+                },
+                "team_tokens_overflow",
+            ),
+            (
+                ChargebackRecordError::ArithmeticOverflow {
+                    scope: ChargebackOverflowScope::Team,
+                    field: ChargebackOverflowField::Cost,
+                },
+                "team_cost_overflow",
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(chargeback_refusal_reason(error), expected);
+        }
     }
 
     #[test]

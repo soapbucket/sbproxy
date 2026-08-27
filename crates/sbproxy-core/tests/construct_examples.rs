@@ -164,6 +164,10 @@ fn export_example_env_dummies_once() {
         // The extension-bundles HMAC auth hook resolves its shared secret
         // at pipeline construction, so building that example needs a value.
         ("SBPROXY_HMAC_SECRET", "worked-example-secret"),
+        // The AI toolkit resolves every agent shared secret through the
+        // same bounded resolver in validation as at runtime, so the
+        // agent-orchestration example needs a value here too.
+        ("SB_AGENT_SECRET", "agent-example-dummy"),
     ];
     for (k, v) in DUMMIES {
         std::env::set_var(k, v);
@@ -176,6 +180,32 @@ fn export_example_env_dummies_once() {
 
     let (_directory, signing_key) = config_authority_signing_key();
     std::env::set_var("SB_CONFIG_AUTHORITY_SIGNING_KEY", signing_key);
+
+    // The two classifier-sidecar examples require a real, verified local
+    // ONNX fallback. Published configs take operator-supplied absolute
+    // paths and pins; the construction sweep supplies the repository's
+    // deliberately tiny real-ONNX fixture pair instead.
+    let classifier_fixtures = workspace_root()
+        .join("crates")
+        .join("sbproxy-classifiers")
+        .join("tests")
+        .join("fixtures");
+    std::env::set_var(
+        "SBPROXY_PROMPT_INJECTION_FALLBACK_MODEL_PATH",
+        classifier_fixtures.join("tiny_classifier.onnx"),
+    );
+    std::env::set_var(
+        "SBPROXY_PROMPT_INJECTION_FALLBACK_TOKENIZER_PATH",
+        classifier_fixtures.join("tiny_tokenizer.json"),
+    );
+    std::env::set_var(
+        "SBPROXY_PROMPT_INJECTION_FALLBACK_MODEL_SHA256",
+        "ad7fcdb89a7ae4c926e132ce8bc9c4fc27aa6c87df1ebf1aab42c5fe6bec23ba",
+    );
+    std::env::set_var(
+        "SBPROXY_PROMPT_INJECTION_FALLBACK_TOKENIZER_SHA256",
+        "cbcbc48e5d42dd6c9166cecbaebeb397a51552f91599daa6076b8a78d112769b",
+    );
 }
 
 #[test]

@@ -2734,6 +2734,86 @@ pub fn record_prompt_injection_block(scan_path: &str, tenant: &str) {
         .inc();
 }
 
+/// Record one closed stage of a `prompt_injection_v2` classifier failure.
+///
+/// Every free-form input is collapsed onto a fixed fallback before it reaches
+/// Prometheus. The caller records both stages when a primary sidecar and its
+/// mandatory local fallback fail, so the outage is attributable without
+/// exposing an endpoint, model path, prompt, or dependency error.
+pub fn record_prompt_injection_classifier_failure(
+    scan_path: &str,
+    action: &str,
+    stage: &str,
+    reason: &str,
+    outcome: &str,
+    tenant: &str,
+) {
+    use prometheus::{register_counter_vec, CounterVec};
+    use std::sync::OnceLock;
+
+    let scan_path = match scan_path {
+        "header_scan" => "header_scan",
+        "body_scan" => "body_scan",
+        "ai_body" => "ai_body",
+        "a2a" => "a2a",
+        _ => "unknown",
+    };
+    let action = match action {
+        "block" => "block",
+        "tag" => "tag",
+        "log" => "log",
+        _ => "unknown",
+    };
+    let stage = match stage {
+        "detector" => "detector",
+        "primary_sidecar" => "primary_sidecar",
+        "local_fallback" => "local_fallback",
+        _ => "unknown",
+    };
+    let reason = match reason {
+        "queue_full" => "queue_full",
+        "deadline" => "deadline",
+        "worker" => "worker",
+        "runtime" => "runtime",
+        "inference" => "inference",
+        "sidecar" => "sidecar",
+        _ => "unknown",
+    };
+    let outcome = match outcome {
+        "blocked" => "blocked",
+        "degraded" => "degraded",
+        _ => "unknown",
+    };
+
+    static C: OnceLock<CounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_counter_vec!(
+            "sbproxy_prompt_injection_classifier_failures_total",
+            "Unavailable prompt-injection classifier stages by action and request outcome",
+            &[
+                "scan_path",
+                "action",
+                "stage",
+                "reason",
+                "outcome",
+                "tenant"
+            ],
+        )
+        .expect("counter vec registers")
+    });
+    let tenant_san = sanitize_label("tenant", tenant);
+    counter
+        .with_label_values(&[
+            scan_path,
+            action,
+            stage,
+            reason,
+            outcome,
+            tenant_san.as_str(),
+        ])
+        .inc();
+}
+
 /// Record one Content-Security-Policy header emitted by the
 /// `security_headers` policy, by `mode` (`enforce` or `report_only`).
 ///
@@ -4498,6 +4578,84 @@ pub fn record_admin_request_export(format: &'static str, rows: u64) {
     });
     if let Some(counter) = row_counter {
         counter.with_label_values(&[format]).inc_by(rows);
+    }
+}
+
+/// Closed export formats for the live admin chargeback route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminChargebackExportFormat {
+    /// The JSON admin route (`GET /admin/ai-chargeback`).
+    Json,
+    /// The CSV admin route (`GET /admin/ai-chargeback.csv`).
+    Csv,
+}
+
+impl AdminChargebackExportFormat {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::Csv => "csv",
+        }
+    }
+}
+
+/// Closed refusal reasons for admin chargeback exports and pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminChargebackExportRefusalReason {
+    /// The supplied `cursor` did not decode to a valid page offset.
+    InvalidCursor,
+    /// The supplied `limit` was absent, non-numeric, or not positive.
+    InvalidLimit,
+    /// The caller requested an unsupported `schema_version`.
+    UnsupportedSchemaVersion,
+    /// The response would exceed the bounded admin byte budget.
+    ResponseTooLarge,
+}
+
+impl AdminChargebackExportRefusalReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidCursor => "invalid_cursor",
+            Self::InvalidLimit => "invalid_limit",
+            Self::UnsupportedSchemaVersion => "unsupported_schema_version",
+            Self::ResponseTooLarge => "response_too_large",
+        }
+    }
+}
+
+/// Count one live admin chargeback-export refusal on
+/// `sbproxy_admin_chargeback_export_refusals_total{format, reason}`.
+///
+/// This covers request-shape and page/response-admission refusals on the
+/// authenticated chargeback export boundary. Both labels are closed
+/// vocabularies selected in Rust, never caller input.
+pub fn record_admin_chargeback_export_refusal(
+    format: AdminChargebackExportFormat,
+    reason: AdminChargebackExportRefusalReason,
+) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static REFUSALS: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let warn_failed = |name: &'static str, error: &prometheus::Error| {
+        tracing::warn!(
+            metric = name,
+            %error,
+            "admin chargeback export refusal counter failed to register; refusal volume is not scrapeable"
+        );
+    };
+    let refusals = REFUSALS.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_admin_chargeback_export_refusals_total",
+            "Admin chargeback export refusals, by format and closed reason",
+            &["format", "reason"],
+        )
+        .inspect_err(|error| warn_failed("sbproxy_admin_chargeback_export_refusals_total", error))
+        .ok()
+    });
+    if let Some(counter) = refusals {
+        counter
+            .with_label_values(&[format.as_str(), reason.as_str()])
+            .inc();
     }
 }
 
@@ -8566,6 +8724,56 @@ mod tests {
             }),
             "sbproxy_mcp_flow_total did not carry flow_pair_block: {counted:?}"
         );
+    }
+
+    #[test]
+    fn prompt_injection_classifier_failures_use_closed_attributable_labels() {
+        record_prompt_injection_classifier_failure(
+            "ai_body",
+            "block",
+            "primary_sidecar",
+            "sidecar",
+            "blocked",
+            "prompt-health-tenant",
+        );
+        record_prompt_injection_classifier_failure(
+            "https://secret.example/internal",
+            "bearer-secret",
+            "127.0.0.1:50051",
+            "prompt bytes",
+            "clean",
+            "prompt-health-tenant",
+        );
+
+        let counted = gathered_series("sbproxy_prompt_injection_classifier_failures_total");
+        assert!(counted.iter().any(|(labels, value)| {
+            labels.contains("scan_path=ai_body")
+                && labels.contains("action=block")
+                && labels.contains("stage=primary_sidecar")
+                && labels.contains("reason=sidecar")
+                && labels.contains("outcome=blocked")
+                && *value >= 1.0
+        }));
+        assert!(counted.iter().any(|(labels, value)| {
+            labels.contains("scan_path=unknown")
+                && labels.contains("action=unknown")
+                && labels.contains("stage=unknown")
+                && labels.contains("reason=unknown")
+                && labels.contains("outcome=unknown")
+                && *value >= 1.0
+        }));
+        let rendered = format!("{counted:?}");
+        for secret in [
+            "secret.example",
+            "bearer-secret",
+            "127.0.0.1:50051",
+            "prompt bytes",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "closed labels leaked {secret:?}"
+            );
+        }
     }
 
     /// WOR-2560: the target-health gauge is a scrape-time sample of the

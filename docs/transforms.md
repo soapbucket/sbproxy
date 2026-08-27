@@ -1,6 +1,6 @@
 # Transforms
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-22*
 
 A transform edits a response body before it reaches the client. Reach for one when the shape an upstream returns is not the shape a caller needs: trimming fields from a JSON payload, converting HTML to Markdown for an LLM, capping a body size, or running a sandboxed script or WASM module over the bytes. Transforms never touch the request; for that, see the request modifier and forward-rule sections of [configuration.md](configuration.md).
 
@@ -21,6 +21,8 @@ response_body_filter:
 ```
 
 So a transform chain runs after `on_response` callbacks and response header shaping have already happened, and after the response-cache write decision for that request. Each origin's chain is compiled once, at config load or reload, into an ordered `Vec` of compiled transforms; per-request execution walks that list with no allocation in the chain-construction path.
+
+An origin whose action is `ai_proxy` never reaches this stage. Config load refuses `transforms:` on those origins and names `ai_guardrail_output` and `ai_tool_call` as the bundle hooks that inspect model output instead.
 
 ## A transform entry
 

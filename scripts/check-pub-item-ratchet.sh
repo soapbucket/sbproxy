@@ -127,6 +127,8 @@ UNREFERENCED_BASELINE_FILE="$ROOT_DIR/scripts/pub-item-unreferenced-baseline.cou
 
 cd "$ROOT_DIR"
 
+python3 scripts/tests/test_scan_pub_item_usage.py
+
 # Read a one-line integer baseline, or explain what is wrong with it and
 # fail. `$bucket` is the `--count` mode whose recompute command the
 # error messages should suggest.

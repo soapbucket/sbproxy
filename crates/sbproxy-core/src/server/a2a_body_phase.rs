@@ -107,6 +107,21 @@ pub(crate) struct A2ABodyRejection {
     pub deny_policy_type: &'static str,
 }
 
+/// Result of the prompt-injection scan at the A2A request-body seam.
+///
+/// `Degraded` is intentionally distinct from `Pass`: callers must retain the
+/// unavailable-classifier decision even though the configured advisory action
+/// permits the request to continue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum A2ABodyScanOutcome {
+    /// Classification completed without a blocking hit.
+    Pass,
+    /// Classification was unavailable and the effective action was advisory.
+    Degraded,
+    /// The request must be refused before provider egress.
+    Reject(A2ABodyRejection),
+}
+
 /// Validate an A2A 1.0 push-notification registration and record the
 /// method metric.
 ///
@@ -166,8 +181,8 @@ pub(crate) fn check_push_notification(
 /// With `enable_body_aware: true` the scan runs over
 /// `V1Request::message_parts`, one classification per part, through
 /// `evaluate_body_with_audit`. That path is worst-of-N across parts,
-/// caches per-part scores keyed by SHA-256, and emits the structured
-/// audit record.
+/// caches per-part scores under the detector's opaque semantic namespace,
+/// and emits the structured audit record.
 ///
 /// With `enable_body_aware: false`, the default, the scan stays a
 /// single classification of the whole envelope. This is the documented
@@ -197,38 +212,73 @@ pub(crate) fn scan_message_parts(
     parsed: &V1Request,
     collected: &[u8],
     audit: BodyAwareAuditContext<'_>,
-) -> Option<A2ABodyRejection> {
+    configured_origin_id: Option<&str>,
+) -> A2ABodyScanOutcome {
     let delegation_depth = a2a.delegation_depth();
     let action = policy.a2a_action_for_depth(delegation_depth);
 
-    let hit = if policy.body_aware_enabled() {
+    let scan = if policy.body_aware_enabled() {
         // Structured: one segment per message part, worst-of-N, cached,
         // audited. Non-text parts were already dropped by the parser.
         if parsed.message_parts.is_empty() {
-            return None;
+            return A2ABodyScanOutcome::Pass;
         }
-        matches!(
-            sbproxy_modules::evaluate_body_with_audit(
-                policy,
-                &parsed.message_parts,
-                audit,
-                false,
-                &BodyAwareConfig::default(),
-            ),
-            BodyAwareOutcome::Hit { .. }
-        )
+        match sbproxy_modules::evaluate_body_with_audit(
+            policy,
+            &parsed.message_parts,
+            audit,
+            false,
+            &BodyAwareConfig::default(),
+        ) {
+            BodyAwareOutcome::Hit { .. } => Ok(true),
+            BodyAwareOutcome::Unavailable { failure } => Err(failure),
+            BodyAwareOutcome::Clean | BodyAwareOutcome::Bypassed => Ok(false),
+        }
     } else {
         // Unstructured fallback: the pre-existing single-shot scan of
         // the whole envelope, kept so the default cost per hop does not
         // change under operators who never opted into body-aware.
-        matches!(
-            policy.evaluate(&String::from_utf8_lossy(collected)),
-            sbproxy_modules::PromptInjectionV2Outcome::Hit { .. }
-        )
+        match policy.evaluate(&String::from_utf8_lossy(collected)) {
+            sbproxy_modules::PromptInjectionV2Outcome::Hit { .. } => Ok(true),
+            sbproxy_modules::PromptInjectionV2Outcome::Unavailable { failure } => Err(failure),
+            sbproxy_modules::PromptInjectionV2Outcome::Clean => Ok(false),
+        }
     };
 
-    if !hit {
-        return None;
+    match scan {
+        Ok(false) => return A2ABodyScanOutcome::Pass,
+        Ok(true) => {}
+        Err(failure) => {
+            let (policy_action, outcome) = match action {
+                A2AInjectionAction::Block => (
+                    sbproxy_modules::PromptInjectionAction::Block,
+                    crate::prompt_injection_runtime::UnavailableDecision::Blocked,
+                ),
+                A2AInjectionAction::Log => (
+                    sbproxy_modules::PromptInjectionAction::Log,
+                    crate::prompt_injection_runtime::UnavailableDecision::Degraded,
+                ),
+            };
+            crate::prompt_injection_runtime::record_unavailable(
+                configured_origin_id,
+                audit.tenant_id.unwrap_or("__default__"),
+                audit.request_id,
+                "a2a",
+                policy_action,
+                outcome,
+                failure,
+            );
+            return match action {
+                A2AInjectionAction::Log => A2ABodyScanOutcome::Degraded,
+                A2AInjectionAction::Block => A2ABodyScanOutcome::Reject(A2ABodyRejection {
+                    status: crate::prompt_injection_runtime::UNAVAILABLE_STATUS,
+                    body: crate::prompt_injection_runtime::UNAVAILABLE_BODY.to_string(),
+                    content_type: crate::prompt_injection_runtime::UNAVAILABLE_CONTENT_TYPE
+                        .to_string(),
+                    deny_policy_type: "prompt_injection_unavailable",
+                }),
+            };
+        }
     }
 
     match action {
@@ -245,7 +295,7 @@ pub(crate) fn scan_message_parts(
                 "prompt injection detected in an agent-to-agent message; \
                  forwarding per the configured action"
             );
-            None
+            A2ABodyScanOutcome::Pass
         }
         A2AInjectionAction::Block => {
             tracing::warn!(
@@ -261,7 +311,7 @@ pub(crate) fn scan_message_parts(
                 "deny:prompt_injection",
             );
             sbproxy_observe::metrics::record_a2a_denied(route, PROMPT_INJECTION_REASON);
-            Some(A2ABodyRejection {
+            A2ABodyScanOutcome::Reject(A2ABodyRejection {
                 status: 403,
                 body: policy.block_body().to_string(),
                 content_type: policy.block_content_type().to_string(),
@@ -307,6 +357,28 @@ mod tests {
             "detector": "heuristic-v1",
             "threshold": 0.5,
             "enable_body_aware": true,
+        }))
+    }
+
+    fn unavailable_policy(action: &str) -> PromptInjectionV2Policy {
+        let fixture = |name: &str| {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../sbproxy-classifiers/tests/fixtures")
+                .join(name)
+        };
+        policy_from(serde_json::json!({
+            "detector": "inprocess",
+            "threshold": 0.5,
+            "enable_body_aware": true,
+            "action": action,
+            "detector_config": {
+                "model_path": fixture("tiny_classifier.onnx"),
+                "tokenizer_path": fixture("tiny_tokenizer.json"),
+                "model_sha256": "ad7fcdb89a7ae4c926e132ce8bc9c4fc27aa6c87df1ebf1aab42c5fe6bec23ba",
+                "tokenizer_sha256": "cbcbc48e5d42dd6c9166cecbaebeb397a51552f91599daa6076b8a78d112769b",
+                "labels": ["class_0", "class_1"],
+                "injection_label": "class_1"
+            }
         }))
     }
 
@@ -467,15 +539,17 @@ mod tests {
         let parsed = sbproxy_modules::a2a_v1::parse_request(&body).expect("parses");
         let policy = heuristic_policy();
 
-        let rejection = scan_message_parts(
+        let A2ABodyScanOutcome::Reject(rejection) = scan_message_parts(
             &policy,
             "agent.localhost",
             &a2a_ctx(3),
             &parsed,
             &body,
             audit(),
-        )
-        .expect("a delegated hop with an injection must block");
+            Some("origin-a"),
+        ) else {
+            panic!("a delegated hop with an injection must block");
+        };
 
         assert_eq!(rejection.status, 403);
         assert_eq!(rejection.deny_policy_type, "prompt_injection");
@@ -487,15 +561,18 @@ mod tests {
         let parsed = sbproxy_modules::a2a_v1::parse_request(&body).expect("parses");
         let policy = heuristic_policy();
 
-        assert!(scan_message_parts(
-            &policy,
-            "agent.localhost",
-            &a2a_ctx(3),
-            &parsed,
-            &body,
-            audit()
-        )
-        .is_none());
+        assert_eq!(
+            scan_message_parts(
+                &policy,
+                "agent.localhost",
+                &a2a_ctx(3),
+                &parsed,
+                &body,
+                audit(),
+                Some("origin-a")
+            ),
+            A2ABodyScanOutcome::Pass
+        );
     }
 
     #[test]
@@ -511,15 +588,18 @@ mod tests {
         let parsed = sbproxy_modules::a2a_v1::parse_request(&body).expect("parses");
         let policy = heuristic_policy();
 
-        assert!(scan_message_parts(
-            &policy,
-            "agent.localhost",
-            &a2a_ctx(3),
-            &parsed,
-            &body,
-            audit()
-        )
-        .is_none());
+        assert_eq!(
+            scan_message_parts(
+                &policy,
+                "agent.localhost",
+                &a2a_ctx(3),
+                &parsed,
+                &body,
+                audit(),
+                Some("origin-a")
+            ),
+            A2ABodyScanOutcome::Pass
+        );
     }
 
     // --- depth-aware defaulting ---
@@ -533,30 +613,34 @@ mod tests {
         let policy = heuristic_policy();
 
         // chain_depth 1 == delegation depth 0 == the chain root.
-        assert!(
+        assert_eq!(
             scan_message_parts(
                 &policy,
                 "agent.localhost",
                 &a2a_ctx(1),
                 &parsed,
                 &body,
-                audit()
-            )
-            .is_none(),
+                audit(),
+                Some("origin-a")
+            ),
+            A2ABodyScanOutcome::Pass,
             "the chain root falls through to the baseline action"
         );
 
         // chain_depth 2 == delegation depth 1 == delegated once.
         assert!(
-            scan_message_parts(
-                &policy,
-                "agent.localhost",
-                &a2a_ctx(2),
-                &parsed,
-                &body,
-                audit()
-            )
-            .is_some(),
+            matches!(
+                scan_message_parts(
+                    &policy,
+                    "agent.localhost",
+                    &a2a_ctx(2),
+                    &parsed,
+                    &body,
+                    audit(),
+                    Some("origin-a")
+                ),
+                A2ABodyScanOutcome::Reject(_)
+            ),
             "a delegated hop blocks by default"
         );
     }
@@ -577,15 +661,18 @@ mod tests {
             "a2a": { "block_above_delegation_depth": null },
         }));
 
-        assert!(scan_message_parts(
-            &policy,
-            "agent.localhost",
-            &a2a_ctx(9),
-            &parsed,
-            &body,
-            audit()
-        )
-        .is_none());
+        assert_eq!(
+            scan_message_parts(
+                &policy,
+                "agent.localhost",
+                &a2a_ctx(9),
+                &parsed,
+                &body,
+                audit(),
+                Some("origin-a")
+            ),
+            A2ABodyScanOutcome::Pass
+        );
     }
 
     #[test]
@@ -602,15 +689,18 @@ mod tests {
             "action": "block",
         }));
 
-        assert!(scan_message_parts(
-            &policy,
-            "agent.localhost",
-            &a2a_ctx(1),
-            &parsed,
-            &body,
-            audit()
-        )
-        .is_some());
+        assert!(matches!(
+            scan_message_parts(
+                &policy,
+                "agent.localhost",
+                &a2a_ctx(1),
+                &parsed,
+                &body,
+                audit(),
+                Some("origin-a")
+            ),
+            A2ABodyScanOutcome::Reject(_)
+        ));
     }
 
     // --- the unstructured fallback ---
@@ -627,14 +717,57 @@ mod tests {
             "enable_body_aware": false,
         }));
 
-        assert!(scan_message_parts(
-            &policy,
+        assert!(matches!(
+            scan_message_parts(
+                &policy,
+                "agent.localhost",
+                &a2a_ctx(3),
+                &parsed,
+                &body,
+                audit(),
+                Some("origin-a")
+            ),
+            A2ABodyScanOutcome::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn unavailable_a2a_classifier_blocks_or_degrades_by_effective_action() {
+        let body = send_message(&["ordinary agent message"]);
+        let parsed = sbproxy_modules::a2a_v1::parse_request(&body).expect("parses");
+
+        let A2ABodyScanOutcome::Reject(rejection) = scan_message_parts(
+            &unavailable_policy("block"),
             "agent.localhost",
-            &a2a_ctx(3),
+            &a2a_ctx(1),
             &parsed,
             &body,
-            audit()
-        )
-        .is_some());
+            audit(),
+            Some("a2a-unavailable-origin"),
+        ) else {
+            panic!("mandatory classifier failure must fail closed");
+        };
+        assert_eq!(rejection.status, 503);
+        assert_eq!(rejection.body, "service unavailable");
+        assert_eq!(rejection.deny_policy_type, "prompt_injection_unavailable");
+
+        assert_eq!(
+            scan_message_parts(
+                &unavailable_policy("log"),
+                "agent.localhost",
+                &a2a_ctx(1),
+                &parsed,
+                &body,
+                audit(),
+                Some("a2a-unavailable-origin"),
+            ),
+            A2ABodyScanOutcome::Degraded
+        );
+        let snapshot = crate::prompt_injection_runtime::snapshot();
+        assert!(snapshot.entries.iter().any(|entry| {
+            entry.origin_id == "a2a-unavailable-origin"
+                && entry.last_outcome == "degraded"
+                && entry.last_scan_path == "a2a"
+        }));
     }
 }

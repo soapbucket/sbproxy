@@ -46,6 +46,8 @@
         "alerting": null,
         "admin": null,
         "model_host": null,
+        "classifier_hooks": null,
+        "ai_toolkit": null,
         "cluster": null,
         "config_authority": null,
         "secrets": null,
@@ -595,6 +597,30 @@
           "anyOf": [
             {
               "$ref": "#/definitions/ModelHostControlConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "classifier_hooks": {
+          "description": "Optional classifier-sidecar hooks for intent and quality routing.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ClassifierHooksConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ai_toolkit": {
+          "description": "Optional bounded AI workflow, evaluation, and rollout runtime.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AiToolkitConfig"
             },
             {
               "type": "null"
@@ -2544,6 +2570,811 @@
           ],
           "format": "uint64",
           "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "ClassifierHooksConfig": {
+      "description": "Classifier-sidecar hooks installed into the stock proxy runtime.",
+      "type": "object",
+      "required": [
+        "endpoint"
+      ],
+      "properties": {
+        "endpoint": {
+          "description": "HTTP(S) gRPC endpoint of the minimal or rich classifier sidecar.",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "description": "End-to-end deadline for one hook decision.",
+          "default": 500,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "tls": {
+          "description": "Optional transport-level TLS configuration for HTTPS endpoints.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ClassifierHooksTlsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "authentication": {
+          "description": "Optional request authentication presented to the classifier service.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ClassifierHooksAuthenticationConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "intent": {
+          "description": "Optional classifier-backed prompt intent detection.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ClassifierIntentHookConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "quality": {
+          "description": "Optional classifier-backed provider quality routing.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ClassifierQualityHookConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ClassifierHooksTlsConfig": {
+      "description": "TLS material for a classifier-hook gRPC endpoint.",
+      "type": "object",
+      "properties": {
+        "ca_pem": {
+          "description": "Optional CA bundle used to verify the remote classifier.\n\nResolved through the process secret resolver so the value may be a provider URI, `${ENV}`, `env:NAME`, or `file:/path`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "server_name": {
+          "description": "Override for the TLS server name / SNI. Defaults to the endpoint host.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_identity": {
+          "description": "Optional client certificate presented to the classifier for mTLS.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ClassifierHooksClientIdentityConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ClassifierHooksClientIdentityConfig": {
+      "description": "Client certificate + private key for classifier-hook mTLS.",
+      "type": "object",
+      "required": [
+        "cert_pem",
+        "key_pem"
+      ],
+      "properties": {
+        "cert_pem": {
+          "description": "Client certificate chain in PEM format, supplied via a secret reference.",
+          "type": "string"
+        },
+        "key_pem": {
+          "description": "Client private key in PEM format, supplied via a secret reference.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ClassifierHooksAuthenticationConfig": {
+      "description": "Request authentication presented to the classifier hook service.",
+      "oneOf": [
+        {
+          "description": "Bearer-style metadata authentication on every gRPC request.",
+          "type": "object",
+          "required": [
+            "credential",
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "bearer"
+              ]
+            },
+            "credential": {
+              "description": "Secret reference for the bearer token value.",
+              "type": "string"
+            },
+            "header": {
+              "description": "Metadata key that carries the token. Defaults to `authorization`.",
+              "default": "authorization",
+              "type": "string"
+            },
+            "scheme": {
+              "description": "Optional value prefix. Defaults to `Bearer`.",
+              "default": "Bearer",
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ClassifierIntentHookConfig": {
+      "description": "Model used to classify a prompt into the five stock intent labels.",
+      "type": "object",
+      "properties": {
+        "model": {
+          "description": "Logical classifier model id loaded by the sidecar.",
+          "default": "intent",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ClassifierQualityHookConfig": {
+      "description": "Classifier-backed provider scorer for prompt-aware routing.",
+      "type": "object",
+      "properties": {
+        "minimum_score": {
+          "description": "Minimum positive-label score eligible to win provider selection.",
+          "default": 0.75,
+          "type": "number",
+          "format": "double"
+        },
+        "provider_models": {
+          "description": "Per-provider classifier model and positive-label contract.",
+          "default": {},
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/ClassifierProviderModelConfig"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "ClassifierProviderModelConfig": {
+      "description": "One provider's prompt-quality classifier contract.",
+      "type": "object",
+      "required": [
+        "label",
+        "model"
+      ],
+      "properties": {
+        "model": {
+          "description": "Logical classifier model id loaded by the sidecar.",
+          "type": "string"
+        },
+        "label": {
+          "description": "Label whose score represents this provider's suitability.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "AiToolkitConfig": {
+      "description": "Bounded, generation-pinned AI workflow and evaluation configuration.\n\nThe runtime resolves agent credentials only while constructing a candidate pipeline. This parsed form therefore retains secret references, never the referenced secret material itself.",
+      "type": "object",
+      "properties": {
+        "limits": {
+          "description": "Optional overrides for the runtime's conservative public limits.",
+          "default": {
+            "max_agents": null,
+            "max_capabilities_per_agent": null,
+            "max_workflows": null,
+            "max_datasets": null,
+            "max_dataset_versions": null,
+            "max_dataset_versions_total": null,
+            "max_dataset_entries": null,
+            "max_dataset_bytes_total": null,
+            "max_rollouts": null,
+            "max_rollout_versions": null,
+            "max_retained_operations": null,
+            "max_request_bytes": null,
+            "max_response_bytes": null,
+            "max_identifier_bytes": null,
+            "max_description_bytes": null,
+            "max_schema_bytes": null,
+            "max_secret_bytes": null,
+            "max_evaluation_cases": null,
+            "max_metrics": null,
+            "max_judge_criteria": null,
+            "agent_concurrency": null,
+            "evaluation_concurrency": null,
+            "default_workflow_timeout_ms": null,
+            "max_workflow_timeout_ms": null
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/AiToolkitLimitsConfig"
+            }
+          ]
+        },
+        "agents": {
+          "description": "Governed agent endpoints available to workflows.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/AiToolkitAgentConfig"
+          }
+        },
+        "workflows": {
+          "description": "Finite-state workflows compiled into this pipeline generation.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/AiToolkitWorkflowConfig"
+          }
+        },
+        "datasets": {
+          "description": "Immutable evaluation dataset versions seeded at publication.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/AiToolkitDatasetConfig"
+          }
+        },
+        "prompt_rollouts": {
+          "description": "Stable weighted prompt rollouts selected on the live request path.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/AiToolkitPromptRolloutConfig"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "AiToolkitLimitsConfig": {
+      "description": "Optional overrides for AI toolkit resource and deadline limits.\n\nAn omitted field inherits the runtime default. Keeping these overrides optional avoids copying runtime defaults into the config compiler, where the two sets of values could drift.",
+      "type": "object",
+      "properties": {
+        "max_agents": {
+          "description": "Maximum configured agents.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "max_capabilities_per_agent": {
+          "description": "Maximum capabilities advertised by one agent.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "max_workflows": {
+          "description": "Maximum configured workflows.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "max_datasets": {
+          "description": "Maximum distinct dataset names retained per scope.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "max_dataset_versions": {
+          "description": "Maximum immutable versions retained per dataset.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "max_dataset_versions_total": {
+          "description": "Maximum immutable dataset versions retained across all scopes (hard maximum 16,384).",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "max_dataset_entries": {
+          "description": "Maximum entries in one dataset version.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "max_dataset_bytes_total": {
+          "description": "Maximum serialized dataset-entry bytes retained across all scopes (hard maximum 512 MiB).",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "max_rollouts": {
+          "description": "Maximum configured prompt rollouts.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "max_rollout_versions": {
+          "description": "Maximum versions in one prompt rollout.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "max_retained_operations": {
+          "description": "Maximum recent operation summaries retained per scope.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "max_request_bytes": {
+          "description": "Maximum serialized request bytes accepted by a toolkit operation.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "max_response_bytes": {
+          "description": "Maximum serialized response bytes accepted from an agent or retained.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "max_identifier_bytes": {
+          "description": "Maximum bytes in a public identifier.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "max_description_bytes": {
+          "description": "Maximum bytes in a public description.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "max_schema_bytes": {
+          "description": "Maximum bytes in one serialized JSON schema.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "max_secret_bytes": {
+          "description": "Maximum bytes resolved from one agent credential reference.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "max_evaluation_cases": {
+          "description": "Maximum cases evaluated by one run.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "max_metrics": {
+          "description": "Maximum custom metrics evaluated by one run.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "max_judge_criteria": {
+          "description": "Maximum offline-judge criteria evaluated by one run.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "agent_concurrency": {
+          "description": "Maximum concurrent governed agent calls.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "evaluation_concurrency": {
+          "description": "Maximum concurrent evaluation cases.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "default_workflow_timeout_ms": {
+          "description": "Default workflow deadline when a run does not supply one.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "max_workflow_timeout_ms": {
+          "description": "Hard ceiling for every workflow deadline.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "AiToolkitAgentConfig": {
+      "description": "One governed agent endpoint available within an origin's tenant scope.",
+      "type": "object",
+      "required": [
+        "auth",
+        "endpoint",
+        "id",
+        "origin"
+      ],
+      "properties": {
+        "origin": {
+          "description": "Stable configured origin id (or hostname) that owns this agent.",
+          "type": "string"
+        },
+        "id": {
+          "description": "Stable agent id within the origin scope.",
+          "type": "string"
+        },
+        "endpoint": {
+          "description": "HTTP endpoint invoked through the agent-orchestration egress gate.",
+          "type": "string"
+        },
+        "auth": {
+          "description": "Authentication material expressed only as a secret reference.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/AiToolkitAgentAuthConfig"
+            }
+          ]
+        },
+        "capabilities": {
+          "description": "Capabilities advertised by this agent.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/AiToolkitCapabilityConfig"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "AiToolkitAgentAuthConfig": {
+      "description": "Agent authentication configuration retained as an unresolved reference.",
+      "type": "object",
+      "required": [
+        "shared_secret"
+      ],
+      "properties": {
+        "shared_secret": {
+          "description": "Secret reference used to derive the agent bearer credential.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "AiToolkitCapabilityConfig": {
+      "description": "One discoverable agent capability and its request/response schemas.",
+      "type": "object",
+      "required": [
+        "input_schema",
+        "name",
+        "output_schema"
+      ],
+      "properties": {
+        "name": {
+          "description": "Stable capability name used by workflow actions.",
+          "type": "string"
+        },
+        "description": {
+          "description": "Bounded operator-facing description.",
+          "default": "",
+          "type": "string"
+        },
+        "input_schema": {
+          "description": "JSON Schema for the agent request body."
+        },
+        "output_schema": {
+          "description": "JSON Schema for the agent response body."
+        }
+      },
+      "additionalProperties": false
+    },
+    "AiToolkitWorkflowConfig": {
+      "description": "One finite-state workflow owned by an origin scope.",
+      "type": "object",
+      "required": [
+        "initial_state",
+        "max_steps",
+        "name",
+        "origin",
+        "states",
+        "timeout_ms"
+      ],
+      "properties": {
+        "origin": {
+          "description": "Stable configured origin id (or hostname) that owns this workflow.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Stable workflow name within the origin scope.",
+          "type": "string"
+        },
+        "initial_state": {
+          "description": "State entered first.",
+          "type": "string"
+        },
+        "max_steps": {
+          "description": "Maximum transitions in one execution.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "timeout_ms": {
+          "description": "Whole-workflow deadline in milliseconds.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "states": {
+          "description": "Bounded workflow graph.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/AiToolkitWorkflowStateConfig"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "AiToolkitWorkflowStateConfig": {
+      "description": "One state in a configured AI toolkit workflow.",
+      "type": "object",
+      "required": [
+        "action",
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "description": "Stable state name.",
+          "type": "string"
+        },
+        "action": {
+          "description": "Capability name discovered and invoked when this state runs.",
+          "type": "string"
+        },
+        "transitions": {
+          "description": "Outcome label to next-state name. An absent match completes the run.",
+          "default": {},
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "AiToolkitDatasetConfig": {
+      "description": "One immutable evaluation dataset version seeded from configuration.",
+      "type": "object",
+      "required": [
+        "name",
+        "origin",
+        "version"
+      ],
+      "properties": {
+        "origin": {
+          "description": "Stable configured origin id (or hostname) that owns this dataset.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Dataset name within the origin scope.",
+          "type": "string"
+        },
+        "version": {
+          "description": "Explicit immutable version; zero is invalid.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "entries": {
+          "description": "Bounded evaluation cases.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/AiToolkitDatasetEntryConfig"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "AiToolkitDatasetEntryConfig": {
+      "description": "One input/expected-output pair in a configured evaluation dataset.",
+      "type": "object",
+      "required": [
+        "input"
+      ],
+      "properties": {
+        "input": {
+          "description": "Input supplied to the evaluated model or offline response set.",
+          "type": "string"
+        },
+        "expected_output": {
+          "description": "Optional expected output used by correctness metrics.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metadata": {
+          "description": "Bounded caller metadata retained with the case.",
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
+    "AiToolkitPromptRolloutConfig": {
+      "description": "One stable weighted prompt rollout owned by an origin scope.",
+      "type": "object",
+      "required": [
+        "name",
+        "origin",
+        "salt",
+        "versions"
+      ],
+      "properties": {
+        "origin": {
+          "description": "Stable configured origin id (or hostname) that owns this rollout.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Prompt name used by bare request references.",
+          "type": "string"
+        },
+        "salt": {
+          "description": "Stable operator-controlled cohort salt.",
+          "type": "string"
+        },
+        "versions": {
+          "description": "Weighted immutable prompt versions.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/AiToolkitPromptRolloutVersionConfig"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "AiToolkitPromptRolloutVersionConfig": {
+      "description": "One immutable member of a weighted prompt rollout.",
+      "type": "object",
+      "required": [
+        "content",
+        "version",
+        "weight"
+      ],
+      "properties": {
+        "version": {
+          "description": "Positive numeric prompt version.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "content": {
+          "description": "Prompt template/content selected for this version.",
+          "type": "string"
+        },
+        "weight": {
+          "description": "Finite non-negative relative weight.",
+          "type": "number",
+          "format": "double"
         }
       },
       "additionalProperties": false
@@ -11158,11 +11989,35 @@
       ]
     },
     "EgressTopLevelConfig": {
-      "description": "Top-level `egress:` section: operator-authored allowlists that arm the per-purpose egress gates (WOR-2476), plus the OTLP exporter gate (WOR-2481).\n\nReuses the mode/hosts/allow_private vocabulary the per-tool MCP/OpenAPI `egress:` block already ships (`sbproxy_extension::mcp::egress::EgressPolicy`); this crate cannot depend on `sbproxy-extension` (that dependency runs the other way), so the shape is redeclared here rather than shared by type.\n\nEvery sub-block is independently optional. A purpose whose sub-block is omitted stays legacy ungated: `AiClient`'s documented `None` contract, the usage sinks' unauthenticated dispatch, the model-artifact fetcher's unauthenticated download, the non-MCP token-exchange resolver, and the OTLP exporters all keep behaving exactly as they did before this section existed. `compile_config` compiles each configured sub-block into a [`sbproxy_security::egress::EgressAuthorizer`] once, on [`crate::snapshot::CompiledConfig::egress`]; nothing downstream parses this raw struct directly.",
+      "description": "Top-level `egress:` section: operator-authored allowlists that arm the per-purpose egress gates (WOR-2476), plus the OTLP exporter gate (WOR-2481).\n\nReuses the mode/hosts/allow_private vocabulary the per-tool MCP/OpenAPI `egress:` block already ships (`sbproxy_extension::mcp::egress::EgressPolicy`); this crate cannot depend on `sbproxy-extension` (that dependency runs the other way), so the shape is redeclared here rather than shared by type.\n\nEvery sub-block is independently optional. A purpose whose sub-block is omitted stays legacy ungated: `AiClient`'s documented `None` contract, the classifier hooks' legacy ungated dispatch, the usage sinks' unauthenticated dispatch, the model-artifact fetcher's unauthenticated download, the non-MCP token-exchange resolver, and the OTLP exporters all keep behaving exactly as they did before this section existed. `compile_config` compiles each configured sub-block into a [`sbproxy_security::egress::EgressAuthorizer`] once, on [`crate::snapshot::CompiledConfig::egress`]; nothing downstream parses this raw struct directly.",
       "type": "object",
       "properties": {
         "ai_providers": {
           "description": "Arms `EgressPurpose::AiProvider`: every upstream AI provider dispatch the AI gateway's client makes.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/EgressPurposeConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "agent_orchestration": {
+          "description": "Arms `EgressPurpose::AgentOrchestration`: HTTP invocations made by configured AI toolkit workflows. Agent endpoints fail closed unless this purpose is configured with `mode: deny_by_default`.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/EgressPurposeConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "classifier_hooks": {
+          "description": "Arms `EgressPurpose::ClassifierHook`: the stock intent and prompt-aware provider-quality classifier RPCs.",
           "default": null,
           "anyOf": [
             {

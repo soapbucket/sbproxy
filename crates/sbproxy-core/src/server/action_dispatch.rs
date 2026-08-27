@@ -6,7 +6,7 @@
 //! `use` aliases, so the moved code needs no rewiring.
 
 use super::downstream_body::{
-    buffered_body_limit, read_capped_request_body, settle_buffered_policy_plan, BufferedPolicyGate,
+    buffered_body_limit, read_capped_request_body, settle_buffered_policy_plan,
     PLAN_STAGE_BUFFERED, PLAN_STAGE_DECLARED,
 };
 use super::*;
@@ -42,7 +42,7 @@ fn declared_body_length(headers: &http::HeaderMap) -> Option<usize> {
 /// before the handler sees content it would have denied.
 ///
 /// Returns `Ok(false)` once it has written the deny itself.
-async fn run_deferred_body_policies(
+pub(crate) async fn run_deferred_body_policies(
     session: &mut Session,
     ctx: &mut RequestContext,
     pipeline: &CompiledPipeline,
@@ -1252,8 +1252,6 @@ pub(super) async fn handle_action(
                     let Some(chunk) = session.read_request_body().await? else {
                         break;
                     };
-                    ctx.request_body_bytes =
-                        ctx.request_body_bytes.saturating_add(chunk.len() as u64);
                     if let Some(cap) = ctx.body_size_limit {
                         ctx.body_bytes_seen = ctx.body_bytes_seen.saturating_add(chunk.len());
                         if ctx.body_bytes_seen > cap {
@@ -1288,6 +1286,15 @@ pub(super) async fn handle_action(
                             buffered.extend_from_slice(&chunk);
                         }
                     }
+
+                    // Count only bytes this action accepted. A single
+                    // chunk may be larger than a buffered policy's cap;
+                    // recording it before the plan settles makes a
+                    // rejected upload look admitted in access logs and
+                    // usage metering, and makes the result depend on TCP
+                    // chunk coalescing.
+                    ctx.request_body_bytes =
+                        ctx.request_body_bytes.saturating_add(chunk.len() as u64);
 
                     must_read = action_buffers
                         || ctx.dynamic_request_body_plan.has_active_buffered_policies()
@@ -1337,14 +1344,8 @@ pub(super) async fn handle_action(
                 // that asked to hold 1 KiB must not have the whole host
                 // cap streamed past it before anyone consults its
                 // number.
-                let Some(body) = read_capped_request_body(
-                    session,
-                    ctx,
-                    cap,
-                    "request entity too large",
-                    BufferedPolicyGate::SettlePerChunk,
-                )
-                .await?
+                let Some(body) =
+                    read_capped_request_body(session, ctx, cap, "request entity too large").await?
                 else {
                     return Ok(true);
                 };
@@ -1872,39 +1873,21 @@ mod plugin_action_tests {
         exchange_with(action, pipeline, origin_idx, DEFAULT_TEST_REQUEST, |_| {}).await
     }
 
-    /// Whether `buffer` holds a complete HTTP/1.1 response: a terminated
-    /// header block plus at least `content-length` body bytes.
-    fn http_response_is_complete(buffer: &[u8]) -> bool {
-        let Some(header_end) = buffer
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .map(|position| position + 4)
-        else {
-            return false;
-        };
-        let headers = String::from_utf8_lossy(&buffer[..header_end]);
-        let declared = headers.lines().find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.trim()
-                .eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<usize>().ok())
-                .flatten()
-        });
-        match declared {
-            Some(length) => buffer.len() - header_end >= length,
-            None => true,
-        }
+    fn http_response_headers_are_complete(buffer: &[u8]) -> bool {
+        buffer.windows(4).any(|window| window == b"\r\n\r\n")
     }
 
-    /// Read a response, treating a reset as EOF once the response is
-    /// whole.
+    /// Read a response, treating a reset as EOF once the response
+    /// headers are whole.
     ///
     /// A refusal answers before it has read the rest of the request, so
     /// the server closes with unread bytes still in the socket buffer
     /// and the FIN becomes an RST. The RST can land between the
     /// response headers and the response body, and a plain
     /// `read_to_end` then either panics or hands back a truncated
-    /// response, which is a flake rather than a failure.
+    /// response. Preserve any complete header block so status-only
+    /// refusal assertions remain deterministic; a body-sensitive
+    /// assertion will still reject the truncated bytes it receives.
     async fn read_http_response(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
         let mut response = Vec::new();
         let mut chunk = [0_u8; 4096];
@@ -1914,7 +1897,7 @@ mod plugin_action_tests {
                 Ok(read) => response.extend_from_slice(&chunk[..read]),
                 Err(error)
                     if error.kind() == std::io::ErrorKind::ConnectionReset
-                        && http_response_is_complete(&response) =>
+                        && http_response_headers_are_complete(&response) =>
                 {
                     break;
                 }
@@ -3689,9 +3672,11 @@ origins:
         // it counts what the host actually accepted before refusing.
         let (action, calls) = counting_linked_action();
         let pipeline = pipeline_with_buffered_policy(1024);
-        let payload = vec![b'x'; 512];
-        let chunks = vec![payload.as_slice(); 8];
-        let request = chunked_request(&chunks);
+        // One wire chunk larger than the policy cap makes this
+        // independent of how the kernel coalesces several smaller TCP
+        // writes under suite load.
+        let payload = vec![b'x'; 4096];
+        let request = chunked_request(&[payload.as_slice()]);
 
         let (result, wire, context) =
             exchange_with_ctx(&action, &pipeline, Some(0), &request, |ctx| {

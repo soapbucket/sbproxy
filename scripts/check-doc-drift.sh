@@ -97,14 +97,10 @@ GENERATED_CORPUS="llms-full.txt"
 # One record per line, `needle :: reason`, so the scan and the audit
 # cannot disagree about what is exempt.
 CORPUS_LAG=(
-  "90+ AI provider :: MIGRATION.md carried this from the initial commit and WOR-2627 fixed it there; the corpus still embeds the pre-fix page"
-  "18 x 8 x 7 :: docs/observability.md's cardinality product moved to 19 events when WOR-2595 added ai.admission; the corpus still embeds the pre-fix page"
-  "1008 before tenancy :: the same product's total, fixed in docs/observability.md by WOR-2595 and not yet regenerated into the corpus"
-  "rewrites the first matching tag per selector :: docs/transforms.md described the html transform's rewrite_attributes first-match bug as behavior and WOR-2533 fixed both the code and the page; the corpus still embeds the pre-fix table row"
 )
 corpus_lag_reason() {
   local entry
-  for entry in "${CORPUS_LAG[@]}"; do
+  for entry in ${CORPUS_LAG[@]+"${CORPUS_LAG[@]}"}; do
     if [ "${entry%% :: *}" = "$1" ]; then
       printf '%s' "${entry#* :: }"
       return 0
@@ -183,7 +179,7 @@ done
 # Reverse audit on the lag list, the same way NOT_OUR_CATALOG is audited
 # below. A lag entry that matches nothing means the regen happened, so
 # the entry is now a standing exemption for a string that is gone.
-for entry in "${CORPUS_LAG[@]}"; do
+for entry in ${CORPUS_LAG[@]+"${CORPUS_LAG[@]}"}; do
   needle="${entry%% :: *}"
   case "$corpus_lag_seen" in
     *"|$needle|"*) ;;

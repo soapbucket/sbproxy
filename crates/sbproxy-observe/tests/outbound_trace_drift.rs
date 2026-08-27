@@ -213,6 +213,16 @@ const EXEMPT: &[Exemption] = &[
                  live. WOR-2318.",
     },
     Exemption {
+        file: "crates/sbproxy-ai/src/toolkit/runtime.rs",
+        reason: "Constructor only, and the send site it feeds already injects. This file \
+                 builds the toolkit's no-redirect agent client and never sends through \
+                 it; every governed agent hop is built and dispatched in \
+                 `crates/sbproxy-ai/src/toolkit/workflow.rs`, which attaches the context \
+                 with `inject_reqwest_trace_context`. The scan classifies on the client \
+                 constructor, so the owning file needs a row even when nothing leaves \
+                 untraced. WOR-2318.",
+    },
+    Exemption {
         file: "crates/sbproxy-ai/src/usage_sink.rs",
         reason: "The span is lost at a spawn boundary. Usage records post from a \
                  `tokio::spawn` so the hot path is not blocked, and the spawn is not \

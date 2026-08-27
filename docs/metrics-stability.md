@@ -1,5 +1,5 @@
 # Metrics stability
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-26*
 
 *Generated from the executable metric registry. Do not hand-edit; run `cargo run -q -p sbproxy-observe --bin generate-metrics-stability > docs/metrics-stability.md`.*
 
@@ -87,6 +87,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_active_connections` | Gauge | `stable` | `stable` | none | Current active connections. |
 | `sbproxy_admin_request_export_rows_total` | Counter | `stable` | `beta` | `format` | Rows written by admin request-log exports, by format. |
 | `sbproxy_admin_request_exports_total` | Counter | `stable` | `beta` | `format` | Admin request-log exports served, by format. |
+| `sbproxy_admin_chargeback_export_refusals_total` | Counter | `stable` | `beta` | `format`, `reason` | Admin chargeback export refusals, by format and closed reason. |
 | `sbproxy_agent_budget_decisions_total` | Counter | `stable` | `beta` | `agent_id`, `outcome` | agent_budget policy verdicts, labeled by agent and outcome. |
 | `sbproxy_agent_detect_inference_seconds` | Histogram | `stable` | `stable` | none | Agent-detect scorer inference latency in seconds. |
 | `sbproxy_agent_detect_score` | Histogram | `stable` | `stable` | none | Agent-detect scorer output score, scaled 0-100. |
@@ -111,6 +112,10 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_ai_compression_tokens_total` | Counter | `stable` | `beta` | `tenant_id`, `api_key_id`, `lever`, `direction` | SBproxy model-aware token estimates before and after an applied AI context compression lever. |
 | `sbproxy_ai_compression_value_cost_saved_micros_total` | Counter | `stable` | `beta` | `tenant_id`, `origin`, `model`, `lever`, `token_count_precision` | Gross known-price target-model input cost avoided by successful AI context compression, in micro-USD. |
 | `sbproxy_ai_compression_value_tokens_saved_total` | Counter | `stable` | `beta` | `tenant_id`, `origin`, `model`, `lever`, `token_count_precision` | Estimated target-model input tokens avoided by successful AI context compression. |
+| `sbproxy_ai_chargeback_entries_evicted_total` | Counter | `stable` | `beta` | `origin` | Raw chargeback entries evicted from bounded in-memory retention, by owning origin. |
+| `sbproxy_ai_chargeback_rollups_collapsed_total` | Counter | `stable` | `beta` | `dimension`, `origin` | Chargeback events folded into a bounded overflow rollup by workspace or team dimension, by owning origin. |
+| `sbproxy_ai_chargeback_refusals_total` | Counter | `stable` | `beta` | `reason`, `origin` | Chargeback rows refused before exact accounting could commit, by closed reason and owning origin. |
+| `sbproxy_ai_chargeback_incomplete_total` | Counter | `stable` | `beta` | `reason`, `origin` | Chargeback incompleteness causes observed on the live record and retention path, by owning origin. |
 | `sbproxy_ai_context_poisoning_findings_total` | Counter | `stable` | `beta` | `rule_id`, `action` | Context-poisoning guardrail findings. |
 | `sbproxy_ai_context_poisoning_blocked_total` | Counter | `stable` | `beta` | none | Requests blocked by the context-poisoning guardrail (a finding whose configured action is deny). |
 | `sbproxy_ai_cost_dollars_attributed_total` | Counter | `stable` | `stable` | `origin`, `provider`, `model`, `surface`, `project`, `feature`, `team`, `agent_type`, `environment`, `tenant_id`, `api_key_id`, `agent_id` | AI cost in USD, partitioned by attribution tag. |
@@ -123,6 +128,21 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_ai_safety_guardrail_verdicts_total` | Counter | `stable` | `beta` | `guardrail`, `class`, `backend`, `verdict` | Built-in safety guardrail evaluations by class, backend, and verdict. |
 | `sbproxy_ai_external_guardrail_verdicts_total` | Counter | `stable` | `beta` | `provider`, `phase`, `outcome` | External guardrail evaluations by provider, phase, and outcome. |
 | `sbproxy_ai_inter_token_latency_seconds` | Histogram | `stable` | `beta` | `provider`, `model` | AI streaming average inter-token latency (TPOT). |
+| `sbproxy_ai_intent_detection_source_total` | Counter | `stable` | `beta` | `source` | Intent-detection dispatches by healthy classifier hook, unconfigured heuristic, or degraded heuristic fallback. |
+| `sbproxy_ai_quality_routing_decisions_total` | Counter | `stable` | `beta` | `outcome` | Quality-hook routing decisions by selected or fallback outcome. |
+| `sbproxy_ai_toolkit_operations_total` | Counter | `stable` | `beta` | `capability`, `outcome` | AI toolkit operations by capability (workflow, evaluation, prompt_rollout) and terminal outcome (success, invalid, unauthorized, not_found, egress_refused, timeout, body_too_large, response_too_large, busy, agent_failed, internal). |
+| `sbproxy_classifier_admission_queue` | Gauge | `stable` | `beta` | `cmd` | Rich-sidecar requests currently waiting for a bounded inference slot, by command. |
+| `sbproxy_classifier_admission_refusals_total` | Counter | `stable` | `beta` | `cmd`, `reason` | Rich-sidecar requests refused by bounded admission, by command and closed reason. |
+| `sbproxy_classifier_attempts_total` | Counter | `stable` | `beta` | `transport`, `cmd` | Rich classifier sidecar request attempts observed at a typed transport boundary. |
+| `sbproxy_classifier_client_fallback_total` | Counter | `stable` | `beta` | `reason` | Classifier calls served by the in-process fallback because the configured sidecar did not answer, by closed reason (connect, timeout, rpc, protocol, invalid_request, empty_response). |
+| `sbproxy_classifier_completions_total` | Counter | `stable` | `beta` | `transport`, `cmd` | Rich classifier sidecar requests whose successful response reached the transport completion boundary. |
+| `sbproxy_classifier_errors_total` | Counter | `stable` | `beta` | `transport`, `cmd`, `reason` | Rich classifier sidecar requests that could not complete, by transport, command, and bounded reason. |
+| `sbproxy_classifier_quality_score` | Histogram | `stable` | `beta` | `transport` | Heuristic quality scores returned by the rich classifier sidecar, by transport. |
+| `sbproxy_classifier_requests_total` | Counter | `stable` | `beta` | `transport`, `cmd` | Successful rich classifier sidecar requests, by transport and command; an error rate needs `sbproxy_classifier_attempts_total` as its denominator, not this. |
+| `sbproxy_classifier_safety_verdicts_total` | Counter | `stable` | `beta` | `verdict` | Per-token streaming safety verdicts emitted by the rich classifier sidecar (`safe`, `blocked`, or `unsafe_continued`). |
+| `sbproxy_classifier_startup_owner_info` | Gauge | `stable` | `beta` | `entrypoint`, `owner` | Release entrypoint ownership of the prepared rich-classifier runtime capability. |
+| `sbproxy_classifier_terminal_outcomes_total` | Counter | `stable` | `beta` | `transport`, `cmd`, `stage`, `reason` | Rich classifier sidecar requests finalized unsuccessfully, by typed transport, command, stage, and bounded reason. |
+| `sbproxy_classifier_tenants` | Gauge | `stable` | `beta` | none | Tenants currently registered with the rich classifier sidecar. |
 | `sbproxy_ai_key_fallbacks_total` | Counter | `stable` | `beta` | `provider`, `outcome` | AI provider-key fallback decisions, by the provider entry whose own key was refused and the outcome (`engaged` when the operator's `fallback_credential_id` resolved and the retry was queued, `unavailable` when it did not and the provider's rejection stands). `unavailable` is the alertable one: it means the house credential is broken and the only other evidence is a `401` that reads like the tenant's fault. |
 | `sbproxy_ai_lb_decisions_total` | Counter | `stable` | `beta` | `strategy`, `provider` | AI router provider selections by strategy. |
 | `sbproxy_ai_model_group_selections_total` | Counter | `stable` | `alpha` | `group`, `provider` | Named model group member selections: which group a request addressed and which provider's deployment served it. Both labels are operator-declared config names. |
@@ -341,6 +361,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_policy_panic_total` | Counter | `stable` | `beta` | `policy` | Policy enforcer panics contained on the serving path, by policy type. |
 | `sbproxy_policy_triggers_total` | Counter | `stable` | `stable` | `origin`, `policy_type`, `action`, `agent_id`, `agent_class` | Policy enforcement results. |
 | `sbproxy_prompt_injection_blocks_total` | Counter | `stable` | `beta` | `scan_path`, `tenant` | Requests blocked by the prompt_injection_v2 policy, by scan path (header_scan, body_scan, ai_body, a2a). |
+| `sbproxy_prompt_injection_classifier_failures_total` | Counter | `stable` | `alpha` | `scan_path`, `action`, `stage`, `reason`, `outcome`, `tenant` | Unavailable prompt-injection classifier stages, with closed failure and policy-outcome labels. |
 | `sbproxy_prompt_injection_v2_results_total` | Counter | `stable` | `alpha` | `action`, `label`, `detector` | Body-aware prompt-injection detector results, by action taken, detection label, and detector name. |
 | `sbproxy_projection_render_failures_total` | Counter | `stable` | `alpha` | `projection` | Well-known projection render failures, by projection. |
 | `sbproxy_rate_limit_cluster_peer_denials_total` | Counter | `stable` | `alpha` | none | Mesh rate-limit denials that needed peer counts, so the approximation is observable. |

@@ -1680,6 +1680,13 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
     // example sweeps all inherit it without touching a backend.
     crate::secret_refs::check_secret_backend_references(&yaml, config_file.proxy.secrets.as_ref())?;
 
+    if let Some(classifier_hooks) = config_file.proxy.classifier_hooks.as_ref() {
+        classifier_hooks
+            .validate()
+            .context("config compile: proxy.classifier_hooks")?;
+    }
+    validate_ai_toolkit_config(&config_file)?;
+
     {
         let mut names = std::collections::HashSet::with_capacity(config_file.flags.len());
         for flag in &config_file.flags {
@@ -2696,6 +2703,16 @@ fn compile_egress_gates(cfg: Option<&EgressTopLevelConfig>) -> Result<CompiledEg
             cfg.ai_providers.as_ref(),
             "ai_providers",
         )?,
+        agent_orchestration: compile_egress_purpose(
+            &[EgressPurpose::AgentOrchestration],
+            cfg.agent_orchestration.as_ref(),
+            "agent_orchestration",
+        )?,
+        classifier_hooks: compile_egress_purpose(
+            &[EgressPurpose::ClassifierHook],
+            cfg.classifier_hooks.as_ref(),
+            "classifier_hooks",
+        )?,
         // WOR-2476 fix: `usage_sinks:` has to arm the Webhook sink too,
         // not just the three sinks that already share
         // `EgressPurpose::UsageSink` internally (Langfuse, Datadog,
@@ -2730,6 +2747,100 @@ fn compile_egress_gates(cfg: Option<&EgressTopLevelConfig>) -> Result<CompiledEg
             "telemetry",
         )?,
     })
+}
+
+/// Validate the security properties the config compiler owns without
+/// resolving a secret or constructing the runtime candidate.
+fn validate_ai_toolkit_config(config_file: &ConfigFile) -> Result<()> {
+    const DEFAULT_MAX_SECRET_BYTES: usize = 256;
+
+    let Some(cfg) = config_file.proxy.ai_toolkit.as_ref() else {
+        return Ok(());
+    };
+    let max_secret_bytes = cfg
+        .limits
+        .max_secret_bytes
+        .unwrap_or(DEFAULT_MAX_SECRET_BYTES);
+    for (index, agent) in cfg.agents.iter().enumerate() {
+        let endpoint = agent.endpoint.trim().parse::<http::Uri>().map_err(|_| {
+            anyhow::anyhow!(
+                "config compile: proxy.ai_toolkit.agents[{index}].endpoint must be an absolute \
+                 http:// or https:// URI"
+            )
+        })?;
+        let scheme = endpoint.scheme_str().ok_or_else(|| {
+            anyhow::anyhow!(
+                "config compile: proxy.ai_toolkit.agents[{index}].endpoint must include an \
+                 http:// or https:// scheme"
+            )
+        })?;
+        if !matches!(scheme, "http" | "https") {
+            anyhow::bail!(
+                "config compile: proxy.ai_toolkit.agents[{index}].endpoint must use http:// or \
+                 https://"
+            );
+        }
+        let host = endpoint.host().ok_or_else(|| {
+            anyhow::anyhow!(
+                "config compile: proxy.ai_toolkit.agents[{index}].endpoint must include a host"
+            )
+        })?;
+        if scheme == "http" && !crate::types::endpoint_host_is_local(host) {
+            anyhow::bail!(
+                "config compile: proxy.ai_toolkit.agents[{index}].endpoint must use https:// for \
+                 nonlocal destinations"
+            );
+        }
+        if agent.auth.shared_secret.len() > max_secret_bytes {
+            anyhow::bail!(
+                "config compile: proxy.ai_toolkit.agents[{index}].auth.shared_secret exceeds the \
+                 configured {max_secret_bytes}-byte reference limit"
+            );
+        }
+        if !crate::types::is_secret_reference(&agent.auth.shared_secret) {
+            anyhow::bail!(
+                "config compile: proxy.ai_toolkit.agents[{index}].auth.shared_secret must be a \
+                 secret reference (`env:NAME`, `${{NAME}}`, `file:/path`, or \
+                 `secret://backend/name`), not inline material"
+            );
+        }
+    }
+    if !cfg.agents.is_empty()
+        && !config_file
+            .egress
+            .as_ref()
+            .and_then(|egress| egress.agent_orchestration.as_ref())
+            .is_some_and(|purpose| purpose.mode.is_enforce())
+    {
+        anyhow::bail!(
+            "config compile: proxy.ai_toolkit.agents requires \
+             egress.agent_orchestration.mode: deny_by_default so every agent invocation is \
+             governed by an explicit destination allowlist"
+        );
+    }
+    let validate_origin = |resource: &str, index: usize, origin: &str| -> Result<()> {
+        if !config_file.origins.contains_key(origin) {
+            let bounded: String = origin.chars().take(128).collect();
+            anyhow::bail!(
+                "config compile: proxy.ai_toolkit.{resource}[{index}].origin references unknown \
+                 configured origin {bounded:?}"
+            );
+        }
+        Ok(())
+    };
+    for (index, agent) in cfg.agents.iter().enumerate() {
+        validate_origin("agents", index, &agent.origin)?;
+    }
+    for (index, workflow) in cfg.workflows.iter().enumerate() {
+        validate_origin("workflows", index, &workflow.origin)?;
+    }
+    for (index, dataset) in cfg.datasets.iter().enumerate() {
+        validate_origin("datasets", index, &dataset.origin)?;
+    }
+    for (index, rollout) in cfg.prompt_rollouts.iter().enumerate() {
+        validate_origin("prompt_rollouts", index, &rollout.origin)?;
+    }
+    Ok(())
 }
 
 /// Compile one sub-block into a real authorizer keyed under every purpose
@@ -6047,6 +6158,226 @@ origins:
         );
     }
 
+    #[test]
+    fn ai_toolkit_config_is_preserved_under_proxy() {
+        let yaml = r#"
+proxy:
+  ai_toolkit:
+    limits:
+      max_agents: 8
+      max_dataset_versions_total: 24
+      max_dataset_bytes_total: 1048576
+      max_request_bytes: 4096
+    agents:
+      - origin: ai.example.test
+        id: researcher
+        endpoint: https://agents.example.test/invoke
+        auth:
+          shared_secret: env:SB_AGENT_SECRET
+        capabilities:
+          - name: research
+            description: bounded research
+            input_schema: {type: object}
+            output_schema: {type: object}
+    prompt_rollouts:
+      - origin: ai.example.test
+        name: system
+        salt: stable-salt
+        versions:
+          - version: 1
+            content: concise system prompt
+            weight: 1.0
+    workflows:
+      - origin: ai.example.test
+        name: research-flow
+        initial_state: collect
+        max_steps: 4
+        timeout_ms: 2000
+        states:
+          - name: collect
+            action: research
+            transitions: {}
+    datasets:
+      - origin: ai.example.test
+        name: quality
+        version: 1
+        entries:
+          - input: hello
+            expected_output: world
+            metadata: {source: fixture}
+origins:
+  ai.example.test:
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: ok
+egress:
+  agent_orchestration:
+    mode: deny_by_default
+    hosts: ["agents.example.test"]
+"#;
+        let compiled = compile_config(yaml).expect("toolkit config compiles");
+        let toolkit = compiled
+            .server
+            .ai_toolkit
+            .as_ref()
+            .expect("compiled server keeps the toolkit declaration");
+        assert_eq!(toolkit.agents[0].id, "researcher");
+        assert_eq!(toolkit.limits.max_dataset_versions_total, Some(24));
+        assert_eq!(toolkit.limits.max_dataset_bytes_total, Some(1_048_576));
+        assert_eq!(toolkit.workflows[0].states[0].action, "research");
+        assert_eq!(toolkit.datasets[0].version, 1);
+        assert_eq!(toolkit.prompt_rollouts[0].versions[0].version, 1);
+    }
+
+    #[test]
+    fn ai_toolkit_agents_require_deny_by_default_agent_egress() {
+        let yaml = r#"
+proxy:
+  ai_toolkit:
+    agents:
+      - origin: ai.example.test
+        id: researcher
+        endpoint: https://agents.example.test/invoke
+        auth:
+          shared_secret: env:SB_AGENT_SECRET
+        capabilities: []
+origins:
+  ai.example.test:
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: ok
+"#;
+        let error = compile_config(yaml)
+            .err()
+            .expect("agent endpoints without an explicit egress gate must be refused");
+        let message = format!("{error:#}");
+        assert!(message.contains("egress.agent_orchestration"), "{message}");
+        assert!(message.contains("deny_by_default"), "{message}");
+    }
+
+    #[test]
+    fn ai_toolkit_config_rejects_plaintext_agents_off_loopback() {
+        let yaml = r#"
+proxy:
+  ai_toolkit:
+    agents:
+      - origin: ai.example.test
+        id: researcher
+        endpoint: http://agents.example.test/invoke
+        auth:
+          shared_secret: env:SB_AGENT_SECRET
+        capabilities: []
+origins:
+  ai.example.test:
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: ok
+egress:
+  agent_orchestration:
+    mode: deny_by_default
+    hosts: ["agents.example.test"]
+"#;
+
+        let error = compile_config(yaml)
+            .err()
+            .expect("plaintext agent credentials must not leave loopback");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("endpoint must use https:// for nonlocal destinations"),
+            "{message}"
+        );
+        assert!(!message.contains("agents.example.test"), "{message}");
+    }
+
+    #[test]
+    fn ai_toolkit_config_allows_https_and_plaintext_loopback_agents() {
+        for endpoint in [
+            "http://127.0.0.1/invoke",
+            "http://[::1]/invoke",
+            "http://localhost/invoke",
+            "https://agents.example.test/invoke",
+        ] {
+            let yaml = format!(
+                r#"
+proxy:
+  ai_toolkit:
+    agents:
+      - origin: ai.example.test
+        id: researcher
+        endpoint: "{endpoint}"
+        auth:
+          shared_secret: env:SB_AGENT_SECRET
+        capabilities: []
+origins:
+  ai.example.test:
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: ok
+egress:
+  agent_orchestration:
+    mode: deny_by_default
+    hosts: ["127.0.0.1", "::1", "localhost", "agents.example.test"]
+    allow_private: true
+"#
+            );
+            compile_config(&yaml)
+                .unwrap_or_else(|error| panic!("{endpoint} must remain valid: {error:#}"));
+        }
+    }
+
+    #[test]
+    fn ai_toolkit_rejects_inline_agent_shared_secret() {
+        let yaml = r#"
+proxy:
+  ai_toolkit:
+    agents:
+      - origin: ai-origin
+        id: researcher
+        endpoint: https://agents.example.test/invoke
+        auth:
+          shared_secret: plaintext-is-not-a-reference
+        capabilities: []
+"#;
+        let error = compile_config(yaml)
+            .err()
+            .expect("inline agent credential must be refused");
+        let message = format!("{error:#}");
+        assert!(message.contains("proxy.ai_toolkit.agents[0].auth.shared_secret"));
+        assert!(message.contains("secret reference"));
+        assert!(!message.contains("plaintext-is-not-a-reference"));
+    }
+
+    #[test]
+    fn ai_toolkit_bounds_agent_secret_reference_before_resolution() {
+        let yaml = r#"
+proxy:
+  ai_toolkit:
+    limits:
+      max_secret_bytes: 8
+    agents:
+      - origin: ai-origin
+        id: researcher
+        endpoint: https://agents.example.test/invoke
+        auth:
+          shared_secret: env:VERY_LONG_SECRET_REFERENCE
+        capabilities: []
+"#;
+        let error = compile_config(yaml)
+            .err()
+            .expect("an oversized secret reference must be refused before resolution");
+        let message = format!("{error:#}");
+        assert!(message.contains("8-byte reference limit"), "{message}");
+        assert!(!message.contains("VERY_LONG_SECRET_REFERENCE"));
+    }
+
     // WOR-2476/WOR-2481: the top-level `egress:` section.
 
     #[test]
@@ -6111,6 +6442,8 @@ origins:
 "#;
         let compiled = compile_config(yaml).expect("config with no egress: block compiles");
         assert!(compiled.egress.ai_providers.is_none());
+        assert!(compiled.egress.agent_orchestration.is_none());
+        assert!(compiled.egress.classifier_hooks.is_none());
         assert!(compiled.egress.usage_sinks.is_none());
         assert!(compiled.egress.model_artifacts.is_none());
         assert!(compiled.egress.token_exchange.is_none());
@@ -6119,7 +6452,7 @@ origins:
 
     #[test]
     fn egress_purpose_omitted_from_the_section_stays_ungated() {
-        // Only `ai_providers` is configured; the other four purposes must
+        // Only `ai_providers` is configured; the other five sub-blocks must
         // still compile to `None` even though `egress:` itself is present.
         let yaml = r#"
 proxy:
@@ -6136,6 +6469,8 @@ origins:
 "#;
         let compiled = compile_config(yaml).expect("config compiles");
         assert!(compiled.egress.ai_providers.is_some());
+        assert!(compiled.egress.agent_orchestration.is_none());
+        assert!(compiled.egress.classifier_hooks.is_none());
         assert!(compiled.egress.usage_sinks.is_none());
         assert!(compiled.egress.model_artifacts.is_none());
         assert!(compiled.egress.token_exchange.is_none());
@@ -6163,6 +6498,102 @@ origins:
         assert!(
             compiled.egress.ai_providers.is_none(),
             "allow_by_default (the default) must compile to no authorizer"
+        );
+    }
+
+    #[test]
+    fn egress_classifier_hooks_preserves_legacy_ungated_default() {
+        let yaml = r#"
+proxy: {}
+egress:
+  classifier_hooks:
+    hosts: ["127.0.0.1"]
+    ports: [50051]
+    allow_private: true
+"#;
+        let compiled = compile_config(yaml).expect("config compiles");
+        assert!(
+            compiled.egress.classifier_hooks.is_none(),
+            "an omitted classifier_hooks mode must remain legacy ungated"
+        );
+    }
+
+    #[test]
+    fn egress_classifier_hooks_compiles_an_exact_purpose_authorizer() {
+        let yaml = r#"
+proxy: {}
+egress:
+  classifier_hooks:
+    mode: deny_by_default
+    hosts: ["127.0.0.1"]
+    ports: [50051]
+    allow_private: true
+"#;
+        let compiled = compile_config(yaml).expect("config compiles");
+        let authorizer = compiled
+            .egress
+            .classifier_hooks
+            .expect("deny_by_default must compile a classifier-hook authorizer");
+
+        use sbproxy_security::egress::{EgressDenied, EgressPurpose, SystemHostResolver};
+        assert!(
+            authorizer
+                .authorize(
+                    EgressPurpose::ClassifierHook,
+                    "http://127.0.0.1:50051",
+                    &SystemHostResolver,
+                )
+                .is_ok(),
+            "the configured destination must authorize under ClassifierHook"
+        );
+        assert_eq!(
+            authorizer
+                .authorize(
+                    EgressPurpose::AiProvider,
+                    "http://127.0.0.1:50051",
+                    &SystemHostResolver,
+                )
+                .unwrap_err(),
+            EgressDenied::UnlistedPurpose,
+            "the classifier-hooks block must not grant another purpose"
+        );
+    }
+
+    #[test]
+    fn egress_agent_orchestration_compiles_an_exact_purpose_authorizer() {
+        let yaml = r#"
+proxy: {}
+egress:
+  agent_orchestration:
+    mode: deny_by_default
+    hosts: ["127.0.0.1"]
+    ports: [18777]
+    allow_private: true
+"#;
+        let compiled = compile_config(yaml).expect("config compiles");
+        let authorizer = compiled
+            .egress
+            .agent_orchestration
+            .expect("deny_by_default must compile an agent-workflow authorizer");
+
+        use sbproxy_security::egress::{EgressDenied, EgressPurpose, SystemHostResolver};
+        assert!(authorizer
+            .authorize(
+                EgressPurpose::AgentOrchestration,
+                "http://127.0.0.1:18777/invoke",
+                &SystemHostResolver,
+            )
+            .is_ok());
+        assert_eq!(
+            authorizer
+                .authorize(
+                    EgressPurpose::AiProvider,
+                    "http://127.0.0.1:18777/invoke",
+                    &SystemHostResolver,
+                )
+                .unwrap_err(),
+            EgressDenied::UnlistedPurpose,
+            "the agent-orchestration block must not grant another purpose"
         );
     }
 
@@ -12849,5 +13280,116 @@ origins:
              \"({store: true})\"\n",
         );
         compile_config(&yaml).expect("lua and js decision events must compile");
+    }
+
+    #[test]
+    fn classifier_hooks_are_a_validated_stock_proxy_config_surface() {
+        let valid = r#"
+proxy:
+  http_bind_port: 8080
+  classifier_hooks:
+    endpoint: http://127.0.0.1:9440
+    timeout_ms: 250
+    intent:
+      model: intent-v1
+    quality:
+      minimum_score: 0.8
+      provider_models:
+        primary:
+          model: quality-primary-v1
+          label: preferred
+origins:
+  ai.example.com:
+    action:
+      type: ai_proxy
+      providers:
+        - name: primary
+          provider_type: openai
+          api_key: test
+"#;
+        compile_config(valid).expect("classifier-backed hooks compile from stock config");
+
+        for invalid_block in [
+            "timeout_ms: 0\n    intent: {}",
+            "timeout_ms: 250\n    quality:\n      minimum_score: 1.1\n      provider_models:\n        primary: { model: q, label: preferred }",
+            "timeout_ms: 250\n    quality:\n      minimum_score: 0.8\n      provider_models: {}",
+        ] {
+            let yaml = format!(
+                "proxy:\n  http_bind_port: 8080\n  classifier_hooks:\n    endpoint: http://127.0.0.1:9440\n    {invalid_block}\norigins:\n  x.example.com:\n    action:\n      type: static\n      status_code: 200\n      content_type: text/plain\n      body: ok\n"
+            );
+            assert!(
+                compile_config(&yaml).is_err(),
+                "invalid classifier hook block compiled: {invalid_block}"
+            );
+        }
+    }
+
+    #[test]
+    fn classifier_hooks_reject_nonlocal_plaintext_and_inline_credentials() {
+        let insecure_plaintext = r#"
+proxy:
+  http_bind_port: 8080
+  classifier_hooks:
+    endpoint: http://classifier.example:9440
+    intent:
+      model: intent-v1
+origins:
+  x.example.com:
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: ok
+"#;
+        assert!(
+            compile_config(insecure_plaintext).is_err(),
+            "nonlocal classifier hooks must not allow plaintext transport"
+        );
+
+        let inline_bearer = r#"
+proxy:
+  http_bind_port: 8080
+  classifier_hooks:
+    endpoint: https://classifier.example:9440
+    authentication:
+      type: bearer
+      credential: inline-token
+    intent:
+      model: intent-v1
+origins:
+  x.example.com:
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: ok
+"#;
+        assert!(
+            compile_config(inline_bearer).is_err(),
+            "nonlocal classifier hooks must not accept inline bearer material"
+        );
+
+        let valid_secret_backed = r#"
+proxy:
+  http_bind_port: 8080
+  classifier_hooks:
+    endpoint: https://classifier.example:9440
+    authentication:
+      type: bearer
+      credential: env:SB_CLASSIFIER_TOKEN
+    tls:
+      ca_pem: file:/etc/sbproxy/classifier-ca.pem
+    intent:
+      model: intent-v1
+origins:
+  x.example.com:
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: ok
+"#;
+        compile_config(valid_secret_backed)
+            .expect("secret-backed nonlocal classifier hook transport must compile");
     }
 }

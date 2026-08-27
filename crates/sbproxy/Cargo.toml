@@ -202,3 +202,11 @@ clap_complete = "4"
 # is `#![forbid(unsafe_code)]`, so no raw libc); dual MIT/Apache-2.0, no
 # NOTICE entry required.
 rlimit = "0.10"
+
+[dev-dependencies]
+# Process-boundary classifier-hook egress tests serve the exact generated
+# contracts the shipped client calls. These are test-only because the binary
+# reaches the same types transitively through sbproxy-core.
+sbproxy-classifier-proto = { path = "../sbproxy-classifier-proto" }
+tonic.workspace = true
+tokio-stream = { version = "0.1", features = ["net"] }

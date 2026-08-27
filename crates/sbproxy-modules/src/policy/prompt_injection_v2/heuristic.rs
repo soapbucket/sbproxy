@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use sbproxy_ai::guardrails::injection as v1_patterns;
 
-use super::detector::{DetectionLabel, DetectionResult, Detector};
+use super::detector::{DetectionLabel, DetectionResult, Detector, DetectorCacheNamespace};
 
 /// Stable name reported by [`HeuristicDetector::name`].
 pub const HEURISTIC_DETECTOR_NAME: &str = "heuristic-v1";
@@ -62,6 +62,17 @@ impl Detector for HeuristicDetector {
 
     fn name(&self) -> &str {
         HEURISTIC_DETECTOR_NAME
+    }
+
+    fn cache_namespace(&self) -> Option<DetectorCacheNamespace> {
+        // Bump the explicit semantics version whenever the imported common
+        // or suspicious pattern vocabulary, score mapping, or normalization
+        // behavior changes. The namespace itself never reaches an operator
+        // surface.
+        Some(DetectorCacheNamespace::derive(&[
+            HEURISTIC_DETECTOR_NAME.as_bytes(),
+            b"semantic-version-1",
+        ]))
     }
 }
 

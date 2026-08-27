@@ -25,10 +25,12 @@ it, and only one of them is a deletion:
 2. Over-exposed rather than dead: used inside its own file, so the fix is
    narrowing visibility, which also hands the item back to `dead_code`.
    Read the caller before believing this one. An integration test under
-   `crates/<name>/tests/` compiles as its own crate and links against the
-   library's public API, so an item it reaches cannot be narrowed at all:
-   `pub` is the only visibility that compiles. That is most of this list,
-   and the scan now says so rather than proposing an impossible narrowing.
+   `crates/<name>/tests/`, or a `cargo run --example` demo under
+   `crates/<name>/examples/`, compiles as its own crate and links against
+   the library's public API, so an item either reaches cannot be narrowed
+   at all: `pub` is the only visibility that compiles. That is most of
+   this list, and the scan now says so rather than proposing an
+   impossible narrowing.
 3. Reachable through serde or schemars rather than a Rust caller. Config
    types are named in YAML and built by deserialization. `--json` carries
    a `derives` field so a reviewer can spot these.
@@ -88,11 +90,28 @@ NOISE = {"new", "default", "from", "into", "get", "set", "len", "is_empty", "fmt
 
 
 def is_test_path(path: Path) -> bool:
-    """Whether a whole file is test-only by its location."""
+    """Whether a whole file is non-shipping by its location: a test, a
+    bench, or a `cargo run --example` demo.
+
+    An `examples/*.rs` file compiles as its own binary target and links
+    against the crate's public API exactly like an integration test
+    under `tests/` does, and it is exercised the same way: a human runs
+    it, nothing in CI does. Before this included `examples`, a `pub` item
+    named only from its own crate's example file counted as a genuine
+    production reference and cleared both ratchet buckets entirely,
+    which is precisely the "wire it to a test/demo, not a caller" gap
+    this scan exists to catch. WOR-2672 shipped roughly 60 new `pub`
+    items across five unwired modules this way: each module's example
+    was extended to name every new item at least once, which read as
+    "no test-only items added" and moved `pub-item-unreferenced-baseline.count`
+    down instead of up. See the note dated the day this changed in
+    `scripts/pub-item-ratchet-baseline.txt` for the corrected count.
+    """
     parts = path.parts
     return (
         "tests" in parts
         or "benches" in parts
+        or "examples" in parts
         or path.name.startswith("test_")
         or path.name.endswith("_test.rs")
     )

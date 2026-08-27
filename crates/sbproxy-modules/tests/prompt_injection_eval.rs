@@ -106,6 +106,9 @@ fn evaluate(policy: &PromptInjectionV2Policy, corpus: &[String], expected_hit: b
                 result.label != DetectionLabel::Clean
             }
             PromptInjectionV2Outcome::Clean => false,
+            PromptInjectionV2Outcome::Unavailable { failure } => {
+                panic!("eval detector unexpectedly unavailable: {failure}")
+            }
         };
         match (expected_hit, hit) {
             (true, true) => counts.tp += 1,

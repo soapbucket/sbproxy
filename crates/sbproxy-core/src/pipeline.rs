@@ -11,8 +11,9 @@
 //!   response cache: whichever backend `proxy.response_cache_store`
 //!   selects, or, when that block is absent, Redis if `config.l2_store`
 //!   is set and an in-memory LRU otherwise,
-//! * an optional [`Hooks`](crate::hooks::Hooks) bundle of traits populated by a
-//!   [`PipelineLifecycleHook`](crate::hooks::PipelineLifecycleHook) when registered.
+//! * an optional [`Hooks`](crate::hooks::Hooks) bundle populated from stock
+//!   classifier-hook config and/or a linked
+//!   [`PipelineLifecycleHook`](crate::hooks::PipelineLifecycleHook).
 //!
 //! This struct lives in `sbproxy-core` to avoid a circular dependency:
 //! config -> modules -> config would be circular, but core depends on both.
@@ -1999,6 +2000,9 @@ pub struct CompiledPipeline {
     pub(crate) extension_registry: Arc<DynamicBundleRegistry>,
     /// Awaited AI hook chain prepared with this exact generation.
     pub(crate) ai_extension_chain: Arc<sbproxy_extension::bundle::AiExtensionChain>,
+    /// Bounded workflow/evaluation/rollout runtime prepared and published with
+    /// this exact pipeline generation.
+    pub(crate) ai_toolkit: Arc<sbproxy_ai::toolkit::AiToolkitRuntime>,
     /// Prepared payment hook chain selected by this generation's config.
     #[cfg(feature = "payments")]
     pub(crate) payment_extension_chain: Option<sbproxy_extension::bundle::PaymentExtensionChain>,
@@ -2164,10 +2168,10 @@ pub struct CompiledPipeline {
     pub(crate) cache_reserve_health: Arc<CacheReserveHealthState>,
     /// Optional pipeline hooks bundle.
     ///
-    /// All fields default to `None`. A lifecycle extension registers
-    /// implementations (classifier, semantic cache, etc.) via the
-    /// `PipelineLifecycleHook` pattern. Request-path code invokes these
-    /// optionally and no-ops when they are `None`.
+    /// All fields default to `None`. Stock classifier config can install the
+    /// intent and quality slots; a lifecycle extension can install or replace
+    /// implementations via the `PipelineLifecycleHook` pattern. Request-path
+    /// code invokes these optionally and no-ops when they are `None`.
     pub hooks: crate::hooks::Hooks,
     /// Pre-parsed CIDRs from `proxy.trusted_proxies`. When the immediate
     /// TCP peer's IP falls inside one of these networks, the proxy honors
@@ -2321,6 +2325,7 @@ impl Default for CompiledPipeline {
             federation_issuer: None,
             extension_registry,
             ai_extension_chain,
+            ai_toolkit: sbproxy_ai::toolkit::AiToolkitRuntime::disabled(),
             #[cfg(feature = "payments")]
             payment_extension_chain: None,
             extension_inventory,
@@ -2747,6 +2752,10 @@ impl CompiledPipeline {
         extension_registry: Arc<DynamicBundleRegistry>,
         start_background_tasks: bool,
     ) -> anyhow::Result<Self> {
+        let hooks = crate::classifier_hooks::hooks_from_config(
+            config.server.classifier_hooks.as_ref(),
+            config.egress.classifier_hooks.as_ref(),
+        )?;
         // WOR-2084: async twin of the shared L2 store. The rate-limit
         // policy's hot path awaits `AsyncKVStore::incr_with_ttl`
         // directly when this is attached, instead of bridging every
@@ -2836,6 +2845,16 @@ impl CompiledPipeline {
             };
             proxy_wasm_filters.push(proxy_wasm_filter);
             let origin_action_is_mcp = matches!(&action, Action::Mcp(_));
+            let origin_action_is_ai_proxy = matches!(&action, Action::AiProxy(_));
+            // Chargeback signals are per-origin, and `AiHandlerConfig` has
+            // no identity of its own: the compiled origin and its AI action
+            // are one binding only here. Stamped before the first request,
+            // because `usage_sinks()` builds its trackers once on first use
+            // and a tracker built unattributed stays that way. The same
+            // hostname the chargeback admin export keys by.
+            if let Action::AiProxy(ai) = &action {
+                ai.config.attribute_origin(origin.hostname.as_str());
+            }
             actions.push(action);
 
             // Compile auth (optional per origin). Route through the
@@ -2957,6 +2976,21 @@ impl CompiledPipeline {
             // request-dependent transform on a cached origin is
             // refused here, where the compiled variant can answer for
             // itself, rather than trusted to an operator promise.
+            // WOR-2680: `handle_ai_proxy` writes the response itself and
+            // never reaches Pingora's `response_body_filter`, which is
+            // the only stage that runs the transform chain. A transform
+            // on an `ai_proxy` origin would load as `active` and then
+            // silently no-op. Refuse the pairing at compile, the same
+            // way Proxy-Wasm filters already refuse a non-proxy action.
+            // Use the AI-specific hooks (`ai_guardrail_output`,
+            // `ai_tool_call`, `ai_stream_event`) to inspect or rewrite
+            // model output instead.
+            if origin_action_is_ai_proxy && !origin_transforms.is_empty() {
+                anyhow::bail!(
+                    "origin `{}`: transforms require a proxy action; `ai_proxy` never reaches the transform pipeline. Use AI bundle hooks (`ai_guardrail_output`, `ai_tool_call`) instead",
+                    origin.origin_id
+                );
+            }
             if origin
                 .response_cache
                 .as_ref()
@@ -3439,12 +3473,17 @@ impl CompiledPipeline {
                     .filter(|chain| !chain.is_empty()),
             },
         )?;
+        let ai_toolkit = crate::ai_toolkit_runtime::build(
+            &config,
+            matches!(mode, PipelineConstructionMode::Runtime),
+        )?;
 
         let pipeline = Self {
             config,
             federation_issuer,
             extension_registry,
             ai_extension_chain,
+            ai_toolkit,
             #[cfg(feature = "payments")]
             payment_extension_chain,
             extension_inventory,
@@ -3485,7 +3524,7 @@ impl CompiledPipeline {
             cache_reserve,
             cache_reserve_admission,
             cache_reserve_health,
-            hooks: crate::hooks::Hooks::default(),
+            hooks,
             trusted_proxy_cidrs,
             tls_fingerprint_config,
             agent_detect_config,
@@ -6313,6 +6352,29 @@ origins:
     }
 
     #[test]
+    fn pipeline_rejects_transforms_on_ai_proxy_origins() {
+        let config = make_config_with_transforms(
+            "ai.example",
+            serde_json::json!({
+                "type": "ai_proxy",
+                "providers": [{
+                    "name": "openai",
+                    "provider_type": "openai",
+                    "api_key": "fixture"
+                }]
+            }),
+            vec![serde_json::json!({"type": "json", "set": {"x": 1}})],
+        );
+        let error = match CompiledPipeline::from_config(config) {
+            Ok(_) => panic!("ai_proxy must refuse a transform attachment"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(error.contains("ai.example"), "{error}");
+        assert!(error.contains("ai_proxy"), "{error}");
+        assert!(error.contains("transform"), "{error}");
+    }
+
+    #[test]
     fn pipeline_no_transforms_gives_empty_vec() {
         let config = make_config(
             "api.example.com",
@@ -6335,6 +6397,184 @@ origins:
         assert!(pipeline.forward_rules.is_empty());
         assert!(pipeline.fallbacks.is_empty());
         assert!(pipeline.config.origins.is_empty());
+        let scope = sbproxy_ai::toolkit::ToolkitScope::new("default", "__default__")
+            .expect("bounded scope");
+        let snapshot = pipeline
+            .ai_toolkit
+            .snapshot(sbproxy_ai::toolkit::ToolkitSnapshotRequest {
+                scope,
+                limit: Some(1),
+            })
+            .expect("disabled runtime has an empty snapshot");
+        assert!(snapshot.agents.is_empty());
+        assert!(snapshot.workflows.is_empty());
+    }
+
+    // One toolkit agent whose shared secret is the caller's reference.
+    fn toolkit_agent_config(shared_secret_reference: &str) -> String {
+        format!(
+            r#"
+proxy:
+  ai_toolkit:
+    agents:
+      - origin: ai.example.test
+        id: worker
+        endpoint: https://agents.example.test/invoke
+        auth:
+          shared_secret: {shared_secret_reference}
+        capabilities:
+          - name: answer
+            input_schema: {{type: object}}
+            output_schema: {{type: object}}
+origins:
+  ai.example.test:
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: ok
+egress:
+  agent_orchestration:
+    mode: deny_by_default
+    hosts: ["agents.example.test"]
+"#
+        )
+    }
+
+    /// The validation gate has to be exactly as wide as the runtime
+    /// constructor. `sbproxy validate`, `PUT /admin/config`, and the reload
+    /// pre-check all build in validation mode, so a reference the runtime
+    /// will refuse must be refused here rather than persisted to `sb.yml`
+    /// and discovered by the next boot.
+    // One cell of a chargeback counter family, by label pairs.
+    fn chargeback_counter(name: &str, labels: &[(&str, &str)]) -> f64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.name() == name)
+            .map(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .filter(|metric| {
+                        labels.iter().all(|(key, value)| {
+                            metric
+                                .get_label()
+                                .iter()
+                                .any(|label| label.name() == *key && label.value() == *value)
+                        })
+                    })
+                    .map(|metric| metric.get_counter().value())
+                    .sum()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `AiHandlerConfig` has no identity of its own, and the compiled
+    /// origin is paired with its AI action only here, so the chargeback
+    /// tracker is attributable only if the pipeline stamps the origin at
+    /// build. Without the call every chargeback series in a running proxy
+    /// reads `origin="unattributed"`, which is the one value that cannot
+    /// tell an operator whose billing went wrong.
+    #[test]
+    fn ai_proxy_chargeback_signals_carry_the_compiled_origin() {
+        const ORIGIN: &str = "chargeback-attribution.example";
+        let compiled = sbproxy_config::compile_config(
+            r#"
+origins:
+  chargeback-attribution.example:
+    action:
+      type: ai_proxy
+      usage_sinks:
+        - type: chargeback
+          max_entries: 8
+          max_workspaces: 8
+          max_teams: 8
+      providers:
+        - name: openai
+          api_key: "k"
+"#,
+        )
+        .expect("chargeback fixture config compiles");
+        let pipeline = CompiledPipeline::from_config(compiled).expect("pipeline compiles");
+
+        let sbproxy_modules::Action::AiProxy(ai) = &pipeline.actions[0] else {
+            panic!("the fixture origin compiles to an ai_proxy action");
+        };
+        let tracker = ai
+            .config
+            .usage_sinks()
+            .iter()
+            .find_map(|sink| sink.chargeback_tracker())
+            .expect("the configured chargeback sink is built");
+        assert_eq!(tracker.origin(), ORIGIN);
+
+        let before = chargeback_counter(
+            "sbproxy_ai_chargeback_refusals_total",
+            &[("reason", "invalid_cost"), ("origin", ORIGIN)],
+        );
+        let refused = tracker.try_record(
+            Some("workspace-a"),
+            sbproxy_ai::billing::ChargebackEntry {
+                team: "team-a".to_string(),
+                project: String::new(),
+                provider: "openai".to_string(),
+                model: "gpt-4o-mini".to_string(),
+                tokens: 10,
+                cost: -1.0,
+                timestamp: "2026-08-26T00:00:00Z".to_string(),
+            },
+        );
+        assert!(refused.is_err(), "a negative cost is refused");
+        assert_eq!(
+            chargeback_counter(
+                "sbproxy_ai_chargeback_refusals_total",
+                &[("reason", "invalid_cost"), ("origin", ORIGIN)]
+            ),
+            before + 1.0,
+            "the refusal has to be attributable to the origin that configured the sink"
+        );
+    }
+
+    #[test]
+    fn toolkit_validation_refuses_an_agent_secret_it_cannot_resolve() {
+        let compiled = sbproxy_config::compile_config(&toolkit_agent_config(
+            "file:/definitely/not/present-during-validation",
+        ))
+        .expect("declaration parses without resolving its secret");
+        // `CompiledPipeline` is deliberately not `Debug`, so `expect_err`
+        // is unavailable here.
+        let Err(error) = CompiledPipeline::from_config_for_validation(compiled) else {
+            panic!("validation must resolve the reference the runtime resolves");
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("proxy.ai_toolkit.agents[0].auth.shared_secret"),
+            "the refusal names the field an operator has to fix: {message}"
+        );
+    }
+
+    #[test]
+    fn toolkit_validation_admits_a_resolvable_agent_secret() {
+        let directory = tempfile::tempdir().expect("create agent secret fixture directory");
+        let path = directory.path().join("agent.key");
+        std::fs::write(&path, "agent-shared-secret").expect("write agent secret fixture");
+        let compiled = sbproxy_config::compile_config(&toolkit_agent_config(&format!(
+            "file:{}",
+            path.display()
+        )))
+        .expect("declaration parses");
+        let pipeline = CompiledPipeline::from_config_for_validation(compiled)
+            .expect("a resolvable reference validates");
+        let scope = sbproxy_ai::toolkit::ToolkitScope::new("ai.example.test", "__default__")
+            .expect("bounded scope");
+        let agents = pipeline
+            .ai_toolkit
+            .discover_agents(sbproxy_ai::toolkit::AgentDiscoveryRequest {
+                scope,
+                capability: None,
+            })
+            .expect("agent inventory is valid");
+        assert_eq!(agents.agents.len(), 1);
     }
 
     #[test]
@@ -6345,6 +6585,44 @@ origins:
         assert!(pipeline.hooks.intent_detection.is_none());
         assert!(pipeline.hooks.quality_scoring.is_none());
         assert!(pipeline.hooks.stream_safety.is_none());
+    }
+
+    #[test]
+    fn stock_classifier_hook_config_installs_both_runtime_hooks_without_a_tokio_runtime() {
+        let config = sbproxy_config::compile_config(
+            r#"
+proxy:
+  classifier_hooks:
+    endpoint: http://127.0.0.1:9440
+    timeout_ms: 250
+    intent:
+      model: intent-v1
+    quality:
+      minimum_score: 0.8
+      provider_models:
+        primary:
+          model: quality-primary-v1
+          label: preferred
+origins:
+  ai.example.com:
+    action:
+      type: ai_proxy
+      providers:
+        - name: primary
+          provider_type: openai
+          api_key: test
+"#,
+        )
+        .expect("stock classifier hook config compiles");
+
+        let pipeline = CompiledPipeline::from_config_for_validation(config)
+            .expect("hook construction validates but does not dial the sidecar");
+        assert!(pipeline.hooks.intent_detection.is_some());
+        let quality = pipeline
+            .hooks
+            .quality_scoring
+            .expect("quality config installs the stock scoring hook");
+        assert_eq!(quality.minimum_score(), 0.8);
     }
 
     /// A default pipeline must carry an empty semantic-cache registry.

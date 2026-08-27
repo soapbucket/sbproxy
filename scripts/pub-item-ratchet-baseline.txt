@@ -642,6 +642,154 @@ this backend was ported from kept its equivalent constructor test-only.
 # already logged above for `fallback_trigger` and `sweep_expired`.
 # Lowering to hold the ground rather than leaving it unclaimed.
 
+2026-08-22 (WOR-2665): stayed at 295, and worth a note because it
+briefly looked like it had to move. `sbproxy-classifier` is a new
+binary crate with zero external consumers, so its wire-format structs
+(`protocol::TenantLabel`, `TenantClassification`, `TenantNormalization`,
+`TenantNormRule`) only need to be visible to the rest of the crate, not
+truly `pub`: `rmp_serde` derives against `pub(crate)` fields exactly as
+well as `pub` ones, since deserialization happens inside the same
+crate. Narrowing all four (plus `quality::QualityResult`, same
+reasoning) held the count at 295 instead of raising it to 297.
+
+2026-08-22 (WOR-2672): 295 -> 293. Six sbproxy-enterprise-ai submodules
+ported into `sbproxy-ai` (`agent_orchestration`, `evaluation`,
+`prompt_versioning`, `billing`) and `sbproxy-core`
+(`intent_detection`, `quality_routing`; the hook types they consume
+live there, and `sbproxy-ai` cannot depend on `sbproxy-core` without a
+cycle). Every new pub item ships with a runnable `cargo run --example`
+consumer outside `#[cfg(test)]` in the same commit
+(`crates/sbproxy-ai/examples/agent_orchestration_workflow.rs`,
+`ai_evaluation_harness.rs`, `prompt_versioning_rollout.rs`,
+`ai_chargeback_billing.rs`; `crates/sbproxy-core/examples/
+intent_detection_fallback.rs`), so none of the roughly 60 new pub
+items across the six modules were added as test-only; a direct grep of
+the scanner's output against these six modules' paths confirms zero
+hits. The net count moved down rather than staying flat, which the
+scanner's own `--list` did not attribute to a single named item worth
+narrating further here; lower the baseline, not raise it, since down is
+the ground-gained direction the ratchet exists to lock in.
+
+The unreferenced-outside-its-own-file count (a separate axis, tracked
+in `scripts/pub-item-unreferenced-baseline.count`) moved 1424 -> 1418
+in the same commit for the same reason: each of the five new runnable
+examples (`crates/sbproxy-ai/examples/*.rs`,
+`crates/sbproxy-core/examples/intent_detection_fallback.rs`) was
+extended until it named every new pub item at least once from outside
+the file that defines it, rather than leaving some of the roughly 60
+new items to be exercised only by their own file's `#[cfg(test)]`
+block (`AgentRegistry::list_agents`, `ChargebackTracker::entries_count`,
+`ExperimentStore::{list_all, get_by_id}`, `JudgeResult::compute_composite`,
+`PromptScorer::{average_score, observation_count}`,
+`WeightedPromptStore::list_names`, `detect_intent_heuristic`,
+`IntentSource`, `select_by_quality`, `top_providers`, and
+`select_by_quality_async` all needed an explicit example call site
+before this dropped). Lower this baseline too.
+
+2026-08-22 (WOR-2672 review follow-up): 293 -> 320 (tests-only),
+1418 -> 1445 (unreferenced), and both moves are corrections, not new
+debt. `scripts/scan-pub-item-usage.py`'s `is_test_path` treated
+`crates/<name>/examples/*.rs` as ordinary production source, so the
+2026-08-22 entry two paragraphs up was wrong about what it measured: a
+`cargo run --example` demo compiles as its own binary and links against
+the crate's public API exactly like an integration test under `tests/`
+does, and it is exercised the same way (a human runs it; nothing in CI
+does), but the scanner counted a name appearing in one as a real
+production caller. That is the exact "guard narrower than its claim"
+failure this ratchet exists to catch, and it is now closed:
+`is_test_path` treats `examples/` the same as `tests/` and `benches/`.
+
+Recomputing against the corrected scanner puts 24 of the moved items
+back where they belong: `AgentRegistry::{find_by_capability,
+list_agents}`, `AgentState::{current_state, is_completed}`,
+`ChargebackTracker::{total_by_team, entries_count}`,
+`Dataset::with_expected`, `ExperimentStore::{list_by_name, list_all,
+get_by_id}`, `JudgeResult::compute_composite`,
+`PromptScorer::{average_score, rank_prompts, observation_count}`,
+`WeightedPromptVersion`, `WeightedPromptStore`, `WeightedPromptStore::{
+add_version, get_latest, select_by_weight, list_versions, list_names}`,
+`IntentSource`, `select_by_quality`, and `top_providers`. Every one of
+those is still named only by its module's example, not by any
+production call site; nothing about the underlying code changed, only
+whether the scanner tells the truth about it.
+
+The other +3 / +27 respectively (296 vs the prior 293 "everything
+else" baseline; the wider delta on the unreferenced side) are
+pre-existing instances of the same pattern elsewhere in the tree that
+this correction also now catches for the first time, not anything this
+branch introduced; they are exactly the kind of finding the corrected
+detector is supposed to surface, and are left for a separate cleanup
+pass rather than triaged here.
+
+Two items partly offset the rise: this same follow-up gave
+`select_by_quality_async` (`crates/sbproxy-core/src/quality_routing.rs`)
+a real caller in `crates/sbproxy-core/src/server/ai_dispatch.rs`
+(quality-based provider routing is now dispatched from the POST
+request path, guarded on a registered `QualityScoringHook`), and gave
+`sbproxy-classifier-client`'s `FallbackClassifier` a real caller via
+the new `crate::classifier_hooks::ClassifierIntentHook`, an
+`IntentDetectionHook` implementation. Both are referenced from outside
+their own files by genuine library/call-site code, not by an example,
+so neither recurs in the corrected count.
+
+2026-08-22 (WOR-2661 main reconciliation): tests-only stays 320 and
+unreferenced moves 1445 -> 1446 after rebasing onto Cedar commit
+708ff4a8. This is the merged tree's measured count, not either side's
+pre-rebase baseline. The net +1 is the Cedar change already explained
+above: `ValidationFinding` and `McpCedarPolicyConfig` enter the corrected
+unreferenced scan while a separate textual name overlap offsets one of
+the two. No AI item was added to either bucket during reconciliation.
+
+2026-08-22 (WOR-2672 review correction): tests-only 320 -> 321 and
+unreferenced 1446 -> 1447. The quality-routing production comment named
+`select_by_quality_async`, although the live request path actually calls
+`select_from_quality_hook_async`. Correcting the stale comment removed the
+only production-tree textual occurrence that had hidden
+`select_by_quality_async` from both scans. The function remains public for
+its example and unit-test consumers; this records that lane-owned item
+explicitly instead of retaining a false comment to hold the baselines down.
+
+2026-08-22 (WOR-2661 review fix round 1): tests-only 321 -> 318 and
+unreferenced stays 1447 on the main-reconciled tree. Six former
+example-only items left both buckets: `FsmExecution::{current_state,
+is_completed}` and `WeightedPrompt{Store,Version}` plus
+`WeightedPromptStore::{add_version,select_by_weight}`. The stock CLI now
+names the first five on supported orchestration and prompt-rollout paths;
+the wall-clock `select_by_weight` API was replaced by cohort-stable
+selection. Three lane-owned items entered the tests-only slice:
+`ChargebackTracker::{entries_snapshot,workspace_totals_snapshot}` remain
+example-accessible export helpers, and `ClassifierIntentHook` remains named
+by its fallback example while stock configuration constructs it in its own
+module behind the trait seam. Eight lane-owned items initially entered the
+wider unreferenced slice, offset by the six removals. The two avoidable
+same-file-only constants (`DEFAULT_IO_TIMEOUT` and
+`SIDECAR_ONNX_DETECTOR_NAME`) were narrowed before recording the result.
+The remaining six additions are required typed errors/configuration or
+documented query surfaces: `PromptVersionError`, both classifier hook config
+types, `ClassifierIntentHook`, and the two chargeback snapshot helpers.
+
+2026-08-25 (WOR-2661 Group D, live toolkit product seams): tests-only
+322 -> 314 and unreferenced 1447 -> 1462 on the D tree. Eight sbproxy-ai
+items gained live production callers through the toolkit runtime and left
+their buckets: agent discovery (`find_by_capability`, `list_agents`), the
+evaluation dataset builder (`with_expected`), and five prompt-rollout
+surfaces (`PromptSelectionError`, `replace_versions`,
+`select_for_cohort_typed`, `list_versions`, `list_names`), plus
+`PromptError` in `prompts.rs`. The additions are: ten `AiToolkit*Config`
+structs in `sbproxy-config/src/types.rs`, which are pub because they are
+field types of the pub config tree and are constructed by serde and the
+schema generator rather than by name; `AiToolkitEventDataError` in
+`sbproxy-observe/src/events.rs`, returned by the pub bounded-event
+constructor; and `WeightedPromptStore::{add_version,select_for_cohort}`,
+which lost their last outside-file callers when the toolkit switched the
+CLI and request path to `replace_versions` and `select_for_cohort_typed`.
+Both stay pub deliberately: their optimistic-concurrency and selection
+contracts are pinned by dedicated in-file tests, and narrowing them to
+pub(crate) would leave items whose only callers are cfg(test) code, which
+`-D warnings` reports as dead code (the #757 shape). The avoidable
+same-file constant `AI_TOOLKIT_EVENT_ID_MAX_BYTES` was narrowed to
+pub(crate) before recording this result.
+
 2026-08-22 (WOR-2661 merge reconciliation): the two parent branches measured
 the unreferenced bucket independently at 1458 and 1425. The merged tree is
 1459, one above the infra branch alone because Cedar's public types remain
@@ -652,3 +800,44 @@ tree rather than either parent so both ratchets continue to reject regressions.
 1457. The live MCP action now consumes the gateway runtime, resource-server
 provider, and verified certificate identity across crate boundaries. Lowering
 the ratchet keeps those integration gains.
+
+2026-08-27 (WOR-2661 infra cluster merged with main at 074a980f): tests-only
+296 -> 322 and unreferenced 1457 -> 1508, both recomputed against the merged
+tree rather than carried from either parent.
+
+Most of the move is not new debt, it is the corrected scanner arriving. This
+branch recorded 296 and 1457 while `is_test_path` still read
+`crates/<name>/examples/*.rs` as production source. Re-measuring this
+branch's own pre-merge tree with the merged scanner gives 306 and 1474, so 10
+and 17 of the deltas are the same "guard narrower than its claim" correction
+the 2026-08-22 WOR-2672 entry above describes, landing on a branch that was
+measured before it. Main's side of the merge accounts for the rest of the
+ground: main itself measures 314 and 1462 at 074a980f, exactly its own
+recorded baselines.
+
+What the infra cluster contributes over main is +9/-1 in the tests-only
+bucket and +50/-4 in the wider one, and every addition sits in one of the
+three ported crates or in the two seams they reach:
+
+  * Named only by an integration test under `crates/<name>/tests/`, so `pub`
+    is the only visibility that compiles and there is no narrowing to do:
+    `S3Reserve::with_clients`, `TrustChainResolver::from_anchors`,
+    `MasterKey`, `router_full_with_par`,
+    `McpResourceServerProvider::{metadata_document_json, rfc6750_error_code}`,
+    `MockStorage::exists_call_count`, and the two DPoP TTL defaults in
+    `sbproxy-mcp-gateway/src/config.rs`.
+  * Field types of the pub config tree, constructed by serde and the schema
+    generator rather than by name: `FederationSigningKeyConfig`.
+  * The rest are `sbproxy-mcp-gateway`, `sbproxy-federation`, and
+    `sbproxy-licensing` items that make up the standalone embedding API each
+    crate's doc page publishes (`docs/mcp-oauth-gateway.md`,
+    `docs/federation.md`, `docs/comp-marketplace.md`), reached today only
+    from inside their own file because the OSS request path mounts one seam
+    per crate: `action: mcp`'s verifier, `proxy.federation`'s entity
+    statement, and the CoMP OLP bridge. Narrowing them is a real cleanup and
+    a real API decision for each item, not a merge-time edit, so it is left
+    to a pass of its own rather than done in the dark here.
+
+`OlpLicenseClaims`, `OLP_JWS_TYP`, `InMemorySessionStore`, and
+`ConfigBundle::is_expired_at` left the wider bucket, the first two because
+the CoMP bridge now names the OSS OLP wire format from outside `olp.rs`.

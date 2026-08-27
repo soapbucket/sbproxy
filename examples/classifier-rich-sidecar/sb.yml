@@ -1,0 +1,62 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# prompt_injection_v2 against the rich classifier sidecar.
+#
+# `sbproxy-classifier` implements the same `InferenceService` gRPC
+# contract as the minimal `sbproxy-classifier-sidecar`, so this config is
+# byte-for-byte the same shape as examples/prompt-injection-sidecar/ - only
+# the port differs (9500, this sidecar's default, instead of 9440).
+# Switching between the two sidecars is a deployment change, not a config
+# change; see docs/classifier-sidecar.md#6-the-rich-sidecar-sbproxy-classifier-and-the-optional-degrade-architecture
+# for the additional capability this sidecar carries beyond Classify
+# (quality scoring, streaming safety, multi-tenant heuristic classify over
+# its TCP + MessagePack port 9400) that this single-policy example does not
+# exercise.
+#
+# Run the rich sidecar (supply your own ONNX model + tokenizer; OSS does
+# not ship weights):
+#   cargo run -p sbproxy-classifier -- \
+#     --listen 127.0.0.1:9500 \
+#     --default-model prompt-injection \
+#     --model prompt-injection=/models/model.onnx:/models/tokenizer.json
+#
+# Export the four SBPROXY_PROMPT_INJECTION_FALLBACK_* variables described
+# in this example's README before starting the proxy. The pinned local
+# model is mandatory so a sidecar failure cannot silently admit a prompt.
+#
+# Run the proxy:
+#   make run CONFIG=examples/classifier-rich-sidecar/sb.yml
+#
+# See docs/prompt-injection-v2.md for the fallback contract and
+# docs/classifier-sidecar.md for the rich sidecar's full capability list.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "tag.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    policies:
+      - type: prompt_injection_v2
+        action: tag
+        detector: sidecar
+        threshold: 0.5
+        detector_config:
+          # gRPC endpoint of the rich sidecar. Only the port differs from
+          # the minimal sidecar's default (9440); the client's wire
+          # contract is identical either way.
+          endpoint: http://127.0.0.1:9500
+          model: prompt-injection
+          injection_label: injection
+          timeout_ms: 250
+          # Every sidecar transport, timeout, RPC, admission, or response
+          # validation failure is classified by this verified local model.
+          fallback:
+            model_path: "${SBPROXY_PROMPT_INJECTION_FALLBACK_MODEL_PATH}"
+            tokenizer_path: "${SBPROXY_PROMPT_INJECTION_FALLBACK_TOKENIZER_PATH}"
+            model_sha256: "${SBPROXY_PROMPT_INJECTION_FALLBACK_MODEL_SHA256}"
+            tokenizer_sha256: "${SBPROXY_PROMPT_INJECTION_FALLBACK_TOKENIZER_SHA256}"
+            labels: [safe, injection]
+            injection_label: injection

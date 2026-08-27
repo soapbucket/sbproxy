@@ -246,19 +246,25 @@ pub struct CompiledOrigin {
 /// Each field is `None` when its sub-block was omitted from `egress:`
 /// (or `egress:` itself was omitted), or when the sub-block's `mode` is
 /// the default `allow_by_default`. Consumers treat `None` as the purpose's
-/// legacy ungated contract: `AiClient`'s documented `None`, the usage
-/// sinks' and model-artifact fetcher's `with_egress` builders left
-/// unset, the outbound-credential resolver's unauthenticated token
-/// exchange, and the OTLP exporters dialing without a boot-time check.
+/// legacy ungated contract: `AiClient`'s documented `None`, the classifier
+/// hooks' ungated dispatch, the usage sinks' and model-artifact fetcher's
+/// `with_egress` builders left unset, the outbound-credential resolver's
+/// unauthenticated token exchange, and the OTLP exporters dialing without
+/// a boot-time check.
 /// `sbproxy_core::server::lifecycle` installs each `Some` value into
 /// `sbproxy_security::egress`'s process-wide configured-gate registry so
-/// consumers reached well past config compile (a lazily-built usage
-/// sink, an artifact fetcher, a per-request token exchange) read the
-/// same authorizer with no parameter threaded through the layers between.
+/// consumers reached well past config compile (a classifier hook, a
+/// lazily-built usage sink, an artifact fetcher, a per-request token
+/// exchange) read the same authorizer with no parameter threaded through
+/// the layers between.
 #[derive(Clone, Default)]
 pub struct CompiledEgressGates {
     /// Arms `EgressPurpose::AiProvider`.
     pub ai_providers: Option<sbproxy_security::egress::EgressAuthorizer>,
+    /// Arms `EgressPurpose::AgentOrchestration`.
+    pub agent_orchestration: Option<sbproxy_security::egress::EgressAuthorizer>,
+    /// Arms `EgressPurpose::ClassifierHook`.
+    pub classifier_hooks: Option<sbproxy_security::egress::EgressAuthorizer>,
     /// Arms `EgressPurpose::UsageSink`.
     pub usage_sinks: Option<sbproxy_security::egress::EgressAuthorizer>,
     /// Arms `EgressPurpose::ModelArtifact`.
@@ -415,6 +421,7 @@ mod tests {
         assert!(cfg.decision_audit.is_empty());
         // WOR-2476/WOR-2481: an absent `egress:` block arms nothing.
         assert!(cfg.egress.ai_providers.is_none());
+        assert!(cfg.egress.classifier_hooks.is_none());
         assert!(cfg.egress.usage_sinks.is_none());
         assert!(cfg.egress.model_artifacts.is_none());
         assert!(cfg.egress.token_exchange.is_none());

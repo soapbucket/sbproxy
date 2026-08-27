@@ -78,8 +78,49 @@ impl PolicyEnforcer for PromptInjectionV2Enforcer {
                 prompt.push_str(v);
             }
         }
-        if let PromptInjectionV2Outcome::Hit { result } = policy.evaluate(&prompt) {
-            match policy.action() {
+        match policy.evaluate(&prompt) {
+            PromptInjectionV2Outcome::Clean => {}
+            PromptInjectionV2Outcome::Unavailable { failure } => {
+                let action = policy.action();
+                let outcome = if matches!(action, PromptInjectionAction::Block) {
+                    crate::prompt_injection_runtime::UnavailableDecision::Blocked
+                } else {
+                    crate::prompt_injection_runtime::UnavailableDecision::Degraded
+                };
+                crate::prompt_injection_runtime::record_for_request(
+                    ctx,
+                    "header_scan",
+                    action,
+                    outcome,
+                    failure,
+                );
+                match action {
+                    PromptInjectionAction::Block => {
+                        ctx.deny_policy_type = Some("prompt_injection_unavailable");
+                        let message = crate::prompt_injection_runtime::UNAVAILABLE_BODY.to_string();
+                        ctx.deny_payload = Some((
+                            "prompt_injection_unavailable",
+                            message.clone(),
+                            crate::prompt_injection_runtime::UNAVAILABLE_CONTENT_TYPE.to_string(),
+                        ));
+                        return Box::pin(async move {
+                            Ok(PolicyDecision::Deny {
+                                status: crate::prompt_injection_runtime::UNAVAILABLE_STATUS,
+                                message,
+                            })
+                        });
+                    }
+                    PromptInjectionAction::Tag => {
+                        let degraded = (policy.label_header().to_string(), "degraded".to_string());
+                        match ctx.trust_headers.as_mut() {
+                            Some(headers) => headers.push(degraded),
+                            None => ctx.trust_headers = Some(vec![degraded]),
+                        }
+                    }
+                    PromptInjectionAction::Log => {}
+                }
+            }
+            PromptInjectionV2Outcome::Hit { result } => match policy.action() {
                 PromptInjectionAction::Block => {
                     sbproxy_observe::metrics::record_prompt_injection_block(
                         "header_scan",
@@ -145,7 +186,7 @@ impl PolicyEnforcer for PromptInjectionV2Enforcer {
                         "prompt injection detected (log mode)"
                     );
                 }
-            }
+            },
         }
         Box::pin(async move { Ok(PolicyDecision::Allow) })
     }
@@ -154,6 +195,12 @@ impl PolicyEnforcer for PromptInjectionV2Enforcer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn classifier_fixture(name: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../sbproxy-classifiers/tests/fixtures")
+            .join(name)
+    }
 
     fn enforce(policy: PromptInjectionV2Policy, ctx: &mut RequestContext) -> PolicyDecision {
         let enforcer = PromptInjectionV2Enforcer(Arc::new(policy));
@@ -165,7 +212,7 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("runtime builds");
-        rt.block_on(enforcer.enforce(&req, ctx))
+        rt.block_on(async { enforcer.enforce(&req, ctx).await })
             .expect("enforce runs")
     }
 
@@ -189,8 +236,54 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("runtime builds");
-        rt.block_on(enforcer.enforce(&req, ctx))
+        rt.block_on(async { enforcer.enforce(&req, ctx).await })
             .expect("enforce runs")
+    }
+
+    fn enforce_prompt_on_multithread_runtime(
+        policy: PromptInjectionV2Policy,
+        ctx: &mut RequestContext,
+        prompt: &str,
+    ) -> PolicyDecision {
+        let enforcer = PromptInjectionV2Enforcer(Arc::new(policy));
+        let req = http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("x-prompt", prompt)
+            .body(Bytes::new())
+            .expect("request builds");
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime builds");
+        rt.block_on(async { enforcer.enforce(&req, ctx).await })
+            .expect("enforce runs")
+    }
+
+    fn assert_generic_unavailable_denial(decision: PolicyDecision, ctx: &RequestContext) {
+        let PolicyDecision::Deny { status, message } = decision else {
+            panic!("mandatory classifier failure must fail closed");
+        };
+        assert_eq!(status, 503);
+        assert_eq!(message, "service unavailable");
+        assert_eq!(ctx.deny_policy_type, Some("prompt_injection_unavailable"));
+        assert!(!message.contains("Tokio"));
+        assert!(!message.contains("onnx"));
+        assert!(!message.contains("127.0.0.1"));
+        assert!(!message.contains("oops"));
+        assert!(ctx
+            .policy_decisions
+            .iter()
+            .any(|decision| decision == "prompt_injection_v2:blocked_unavailable"));
+        assert_eq!(
+            ctx.deny_payload,
+            Some((
+                "prompt_injection_unavailable",
+                "service unavailable".to_string(),
+                "text/plain".to_string(),
+            ))
+        );
     }
 
     fn policy(enable_body_aware: bool) -> PromptInjectionV2Policy {
@@ -199,6 +292,133 @@ mod tests {
             "enable_body_aware": enable_body_aware,
         }))
         .expect("policy compiles")
+    }
+
+    /// A current-thread runtime cannot execute the verified in-process ONNX
+    /// detector. That is a typed classifier-unavailable condition, not a
+    /// clean verdict. With `action: block`, the stock enforcer must refuse
+    /// before provider dispatch and must not reveal runtime/model detail.
+    #[test]
+    fn block_policy_fails_closed_when_the_mandatory_local_detector_cannot_run() {
+        let policy = PromptInjectionV2Policy::from_config(serde_json::json!({
+            "detector": "inprocess",
+            "action": "block",
+            "detector_config": {
+                "model_path": classifier_fixture("tiny_classifier.onnx"),
+                "tokenizer_path": classifier_fixture("tiny_tokenizer.json"),
+                "model_sha256": "ad7fcdb89a7ae4c926e132ce8bc9c4fc27aa6c87df1ebf1aab42c5fe6bec23ba",
+                "tokenizer_sha256": "cbcbc48e5d42dd6c9166cecbaebeb397a51552f91599daa6076b8a78d112769b",
+                "labels": ["class_0", "class_1"],
+                "injection_label": "class_1"
+            }
+        }))
+        .expect("verified fixture policy compiles");
+        let mut ctx = RequestContext::new();
+
+        let decision = enforce(policy, &mut ctx);
+
+        assert_generic_unavailable_denial(decision, &ctx);
+    }
+
+    /// The model and tokenizer both pass the production artifact checks, but
+    /// this fixture maps `oops` outside the model's embedding range so tract
+    /// returns a real inference error. A mandatory block policy must not turn
+    /// that error into a clean verdict.
+    #[test]
+    fn block_policy_fails_closed_on_verified_onnx_inference_error() {
+        let policy = PromptInjectionV2Policy::from_config(serde_json::json!({
+            "detector": "inprocess",
+            "action": "block",
+            "detector_config": {
+                "model_path": classifier_fixture("tiny_classifier.onnx"),
+                "tokenizer_path": classifier_fixture("tiny_tokenizer_out_of_range.json"),
+                "model_sha256": "ad7fcdb89a7ae4c926e132ce8bc9c4fc27aa6c87df1ebf1aab42c5fe6bec23ba",
+                "tokenizer_sha256": "99ee23c0dd0f5d4c19dfdb373cdd0f2a7e49bb16e1d016b38487c0c5e6f8d130",
+                "labels": ["class_0", "class_1"],
+                "injection_label": "class_1"
+            }
+        }))
+        .expect("verified fixture policy compiles");
+        let mut ctx = RequestContext::new();
+
+        let decision = enforce_prompt_on_multithread_runtime(policy, &mut ctx, "oops");
+
+        assert_generic_unavailable_denial(decision, &ctx);
+    }
+
+    /// The shipping composite must preserve both sides of a double failure:
+    /// the primary sidecar refuses its connection, then the verified local
+    /// ONNX fallback returns a real inference error. Neither failure may be
+    /// represented to the enforcer as clean, and neither endpoint nor prompt
+    /// may reach the client refusal.
+    #[test]
+    fn block_policy_fails_closed_when_primary_and_verified_fallback_both_fail() {
+        let policy = PromptInjectionV2Policy::from_config(serde_json::json!({
+            "detector": "sidecar",
+            "action": "block",
+            "detector_config": {
+                "endpoint": "http://127.0.0.1:1",
+                "timeout_ms": 100,
+                "injection_label": "class_1",
+                "fallback": {
+                    "model_path": classifier_fixture("tiny_classifier.onnx"),
+                    "tokenizer_path": classifier_fixture("tiny_tokenizer_out_of_range.json"),
+                    "model_sha256": "ad7fcdb89a7ae4c926e132ce8bc9c4fc27aa6c87df1ebf1aab42c5fe6bec23ba",
+                    "tokenizer_sha256": "99ee23c0dd0f5d4c19dfdb373cdd0f2a7e49bb16e1d016b38487c0c5e6f8d130",
+                    "labels": ["class_0", "class_1"],
+                    "injection_label": "class_1"
+                }
+            }
+        }))
+        .expect("shipping composite policy compiles");
+        let mut ctx = RequestContext::new();
+
+        let decision = enforce_prompt_on_multithread_runtime(policy, &mut ctx, "oops");
+
+        assert_generic_unavailable_denial(decision, &ctx);
+    }
+
+    #[test]
+    fn tag_and_log_continue_as_explicitly_degraded_when_classifier_is_unavailable() {
+        for action in ["tag", "log"] {
+            let policy = PromptInjectionV2Policy::from_config(serde_json::json!({
+                "detector": "inprocess",
+                "action": action,
+                "detector_config": {
+                    "model_path": classifier_fixture("tiny_classifier.onnx"),
+                    "tokenizer_path": classifier_fixture("tiny_tokenizer.json"),
+                    "model_sha256": "ad7fcdb89a7ae4c926e132ce8bc9c4fc27aa6c87df1ebf1aab42c5fe6bec23ba",
+                    "tokenizer_sha256": "cbcbc48e5d42dd6c9166cecbaebeb397a51552f91599daa6076b8a78d112769b",
+                    "labels": ["class_0", "class_1"],
+                    "injection_label": "class_1"
+                }
+            }))
+            .expect("verified fixture policy compiles");
+            let label_header = policy.label_header().to_string();
+            let mut ctx = RequestContext::new();
+
+            let decision = enforce(policy, &mut ctx);
+
+            assert!(matches!(decision, PolicyDecision::Allow));
+            assert!(ctx
+                .policy_decisions
+                .iter()
+                .any(|decision| decision == "prompt_injection_v2:degraded"));
+            let labels: Vec<_> = ctx
+                .trust_headers
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .filter(|(name, _)| name == &label_header)
+                .map(|(_, value)| value.as_str())
+                .collect();
+            if action == "tag" {
+                assert_eq!(labels, vec!["degraded"]);
+            } else {
+                assert!(labels.is_empty());
+            }
+            assert!(!labels.contains(&"clean"));
+        }
     }
 
     #[test]

@@ -74,6 +74,21 @@ uuid = { workspace = true }
 # and format the RFC 8594 `Sunset` HTTP-date at config compile. Already
 # a workspace dependency; dual MIT/Apache-2.0, so NOTICE is unaffected.
 chrono = { workspace = true }
+# WOR-2679: in-process git fetch when the `git` binary is missing
+# (distroless has none). Dual MIT OR Apache-2.0, so NOTICE is unaffected.
+# 0.84 is the newest line whose graph resolves on crates.io and that
+# carries gix-date >= 0.12 (RUSTSEC-2025-0140). `sha1` is required once
+# default-features are off; `blocking-http-transport-reqwest-rust-tls`
+# is the file:// / git:// / ssh:// client plus HTTPS via rustls;
+# `worktree-mutation` is the checkout after fetch; `max-performance-safe`
+# and `revision` decode packs and peel a pinned sha without zlib-ng.
+gix = { version = "0.84", default-features = false, features = [
+    "blocking-http-transport-reqwest-rust-tls",
+    "worktree-mutation",
+    "max-performance-safe",
+    "revision",
+    "sha1",
+] }
 
 [dev-dependencies]
 rcgen = { workspace = true }

@@ -8,10 +8,19 @@ description = "Resilient gRPC client for the classifier sidecar InferenceService
 
 [dependencies]
 sbproxy-classifier-proto = { path = "../sbproxy-classifier-proto" }
-tonic = { workspace = true }
+sbproxy-security.workspace = true
+tonic = { workspace = true, features = ["tls-native-roots"] }
 tokio = { workspace = true, features = ["net", "process", "sync", "time", "macros", "rt"] }
+# WOR-2665: `open_stream_safety`'s outbound half is a `ReceiverStream`
+# wrapping a `Streaming` request body for `ClassifierService::StreamSafety`.
+tokio-stream = { version = "0.1", features = ["sync"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# `sbproxy_classifier_client_fallback_total`: the one counter an operator can
+# alert on for "we are running on the in-process fallback". Same `prometheus`
+# crate the rest of the workspace uses, registered in the default registry the
+# proxy already scrapes, rather than a second metrics stack for one family.
+prometheus = { workspace = true }
 # WOR-705 UDS transport: `tower::service_fn` is the tonic-recommended
 # adapter for `Endpoint::connect_with_connector`. tonic 0.12 already
 # pulls `tower` in transitively but does not re-export `service_fn`,
@@ -22,7 +31,13 @@ tower = "0.5"
 hyper-util = { version = "0.1", features = ["tokio"] }
 
 [dev-dependencies]
+sbproxy-classifiers = { path = "../sbproxy-classifiers" }
+rcgen = { workspace = true }
 tokio = { workspace = true, features = ["full", "macros"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 # UDS test: bind in a tempdir so parallel test runs do not collide.
 tempfile = "3"
+
+[[example]]
+name = "fallback"
+path = "examples/fallback.rs"

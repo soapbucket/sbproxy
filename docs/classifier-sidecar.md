@@ -1,10 +1,15 @@
 # Classifier Sidecar
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-26*
 
-SBproxy heavily invests in out-of-process AI safety via the `sbproxy-classifier-sidecar` and `sbproxy-classifier-client` crates. These components allow you to run remote or local Machine Learning safety classifiers (e.g., prompt injection detection, PII detection, toxicity) outside of the main proxy process using gRPC.
+SBproxy heavily invests in out-of-process AI safety via the `sbproxy-classifier-sidecar`, `sbproxy-classifier`, and `sbproxy-classifier-client` crates. These components allow you to run remote or local Machine Learning safety classifiers (e.g., prompt injection detection, PII detection, toxicity) outside of the main proxy process using gRPC, plus (for `sbproxy-classifier`) TCP + MessagePack.
 
-By running classifiers in a sidecar, you achieve strict process isolation: if a learned classifier or its ONNX engine crashes, it does not take down the main proxy serving traffic.
+Two sidecar binaries exist, both built from this OSS tree, and a caller reaches either through the same `sbproxy-classifier-client`:
+
+- **`sbproxy-classifier-sidecar`** - minimal: `InferenceService` only (`Classify`, `Embed`, `Compress`, backed by ONNX), with hardened per-RPC admission control (request-byte budgets, running/queued semaphores, a bounded deadline). Sections 1-5 below cover it.
+- **`sbproxy-classifier`** - rich: the same ONNX-backed `InferenceService` contract with bounded admission and deadlines, plus multi-tenant heuristic classification, quality scoring, intent/content-type detection, and bounded per-token streaming safety checks. Section 6 covers it, including the optional-degrade architecture every caller of either sidecar should use.
+
+Running the primary classifier in a sidecar isolates its process: if that model or ONNX engine crashes, it does not take down the main proxy serving traffic. A `prompt_injection_v2` sidecar policy also loads a small verified local ONNX fallback so loss of that isolated primary cannot silently bypass classification.
 
 ## 1. The `InferenceService` Contract
 
@@ -40,6 +45,56 @@ cargo run -p sbproxy-classifier-sidecar -- \
   --model prompt-injection=/opt/models/deberta-injection.onnx:/opt/models/tokenizer.json
 ```
 
+### Optional bearer auth and TLS on the gRPC listener
+
+Both sidecar binaries can harden their gRPC listener with the same controls:
+
+| Flag | Meaning |
+|---|---|
+| `--inference-token-file` | Require `authorization: Bearer <token>` on every gRPC RPC on that listener. |
+| `--listen-tls-cert-file` + `--listen-tls-key-file` | Serve the gRPC listener over TLS. Both flags are required together. |
+| `--listen-tls-client-ca-file` | Verify client certificates against this CA bundle and, by default, require one on every TLS connection. |
+| `--listen-tls-client-auth-optional` | Only with `--listen-tls-client-ca-file`: verify any presented client certificate but do not require one. |
+
+The token file is JSON shaped like:
+
+```json
+{"tokens":["secret-token-a","secret-token-b"]}
+```
+
+The sidecars validate these files before the first bind:
+
+- the inference-token file must be a regular file, no-follow, at most 256 KiB,
+  with at least one token, at most 1024 tokens total, and each token at most
+  256 bytes;
+- on Unix, the inference-token file and the TLS private-key file are refused
+  if any group/other permission bit is set;
+- TLS certificate, key, and optional client-CA PEM files are each capped at
+  256 KiB;
+- inconsistent TLS flag sets and invalid PEM fail startup before the listener
+  binds or publishes readiness.
+
+Secret material is not echoed back in diagnostics: the sidecars' debug output
+and client-side debug output redact bearer credentials and PEM contents, while
+startup errors identify the flag or file path rather than printing the secret
+itself.
+
+Example: minimal sidecar with bearer auth plus mutually authenticated TLS:
+
+```bash
+cargo run -p sbproxy-classifier-sidecar -- \
+  --listen 127.0.0.1:9440 \
+  --model prompt-injection=/opt/models/deberta-injection.onnx:/opt/models/tokenizer.json \
+  --inference-token-file /etc/sbproxy/classifier-auth.json \
+  --listen-tls-cert-file /etc/sbproxy/classifier-server-cert.pem \
+  --listen-tls-key-file /etc/sbproxy/classifier-server-key.pem \
+  --listen-tls-client-ca-file /etc/sbproxy/classifier-client-ca.pem
+```
+
+Bearer auth works on TCP or UDS. TLS is TCP-only:
+`sbproxy-classifier-sidecar` rejects the TLS flags when `--listen-uds` is
+used.
+
 ## 3. Request Limits and Load Shedding
 
 The sidecar accepts caller-supplied text and hands it to a synchronous,
@@ -71,10 +126,9 @@ classification is CPU-bound work: one forward pass holds one thread until
 it returns, so how many a box can genuinely run at once is its core count,
 and any literal is wrong on every box but the one it was chosen on. Being
 wrong low is the expensive direction. A sidecar that sheds below what the
-hardware can serve does not show up as latency an operator can watch; the
-detector gives up after 250 ms and treats the refusal exactly like a
-sidecar that is down, so the shed lands as a `failure_posture` decision on
-live traffic.
+hardware can serve does not show up only as latency an operator can watch;
+the detector gives up after its configured timeout and routes the request
+through the policy's mandatory verified local ONNX fallback.
 
 Queue depth follows the running set for the same reason in reverse. What
 matters about a queue slot is how long its occupant waits, and a request
@@ -181,10 +235,11 @@ sampling is on purpose: a refusal storm is exactly the load these bounds
 exist to shed, and a line per refusal would turn it into a log flood.
 The counts stay exact regardless of what is logged.
 
-The sidecar has no `/metrics` endpoint of its own yet, so those counters
-are process-local today. On the proxy side, a refused call is a failed
-call: it takes the `failure_posture` path of whatever policy dialed the
-sidecar, the same as a sidecar that is down.
+The minimal sidecar has no `/metrics` endpoint of its own yet, so those
+counters are process-local today. On the proxy side, a refused call is a
+failed primary call: `prompt_injection_v2` classifies the prompt with its
+mandatory verified local ONNX fallback, the same as when the sidecar is
+down.
 
 ## 4. Configuring the Proxy
 
@@ -201,10 +256,26 @@ policies:
       model: prompt-injection
       injection_label: INJECTION
       timeout_ms: 250
-      failure_posture: open  # a sidecar outage degrades to "clean" (allow)
+      fallback:
+        model_path: /var/lib/sbproxy/models/injection/model.onnx
+        tokenizer_path: /var/lib/sbproxy/models/injection/tokenizer.json
+        model_sha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+        tokenizer_sha256: abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
+        labels: ["SAFE", "INJECTION"]
+        injection_label: INJECTION
 ```
 
-`model` selects the loaded classifier by the id used on `--model` above (`prompt-injection` in the example). See [local-inference.md](local-inference.md#enable-first-class-onnx-prompt-injection) for the full field reference and auto-selection behavior.
+`model` selects the sidecar classifier by the id used on `--model` above
+(`prompt-injection` in the example). `fallback` is required and is verified
+and loaded at config construction, before traffic can be served. It handles
+transport, timeout, RPC, admission, and response-validation failures from the
+primary. See
+[local-inference.md](local-inference.md#enable-first-class-onnx-prompt-injection)
+for the full local artifact field reference.
+
+This detector surface is still loopback/plain-HTTP only. The authenticated
+remote-sidecar path is `proxy.classifier_hooks`, which can dial either sidecar
+over `https://` with bearer metadata, a custom CA, and optional client mTLS.
 
 See [`examples/prompt-injection-sidecar/`](../examples/prompt-injection-sidecar/) for a complete working config, including both a `tag` and a `block` origin against the same sidecar.
 
@@ -218,11 +289,215 @@ When SBproxy encounters an AI request with a sidecar-backed guardrail, it automa
 1. Buffers and canonicalizes the request (e.g. assembling all messages into a unified prompt).
 2. Connects to your sidecar via the `sbproxy-classifier-client` (which handles lazy connection and, for the supervised co-located pattern, UDS dialing).
 3. Invokes `Classify` with the text payload.
-4. Compares the returned score against `threshold` and either allows the request or applies the policy's `action` (`tag` or `block`).
+4. On any sidecar failure, classifies the same text with the configured verified local ONNX fallback.
+5. If the local fallback also fails, preserves both closed failure stages. `block` returns a generic `503`; `tag` or `log` continues as explicitly degraded. The failure is never cached or reported as clean.
+6. Otherwise, compares the resulting score against `threshold` and either allows the request or applies the policy's action.
 
 See [guardrails.md](guardrails.md) and [prompt-injection-v2.md](prompt-injection-v2.md) for more details on wiring guardrails into your AI pipelines.
+
+## 6. The Rich Sidecar (`sbproxy-classifier`) and the Optional-Degrade Architecture
+
+`sbproxy-classifier` (port to OSS) is the superset sidecar the `InferenceService` proto comment refers to: same `Classify` / `Embed` / `ModelInfo` / `Version` contract as the minimal sidecar (so `prompt_injection_v2`'s `detector: sidecar` config, unchanged, works against either binary), plus additional capability the minimal sidecar does not carry.
+
+### What it adds
+
+| Capability | Transport | Notes |
+|---|---|---|
+| Multi-tenant heuristic classification | TCP + MessagePack, port 9400 | Per-tenant regex-pattern label sets, registered at runtime via the `register` command (no config file, no hostname pattern matching); `delete` and `list` manage the registry. |
+| Quality scoring | gRPC `ClassifierService.Quality`, and TCP `quality_score` | Heuristic AI-response quality score: refusal-phrase detection, length, repetition, formatting, casing. Sub-100us, no model. |
+| Text normalization / PII redaction | TCP, applied to `classify` text before scoring | Unicode NFKC plus a regex substitution pipeline per tenant; an operator registers `email` / `phone` / `credit_card` rules (or its own) with a `<REDACTED>`-style replacement in `normalization.rules`. |
+| Intent / content-type detection | TCP `intent_detect` / `content_type_detect` | Coarse heuristic categories (coding / vision / analysis / summarization / general; image / audio / video / text). |
+| Per-token streaming safety, session-aware | gRPC `ClassifierService.StreamSafety` (bidi) | Checks accumulated streamed tokens against a rule set as they arrive, so a caller can cut a response short instead of waiting for the full body. The stream retains a tail across messages, so a rule spanning two tokens still matches. After the first match, `safe` remains false and carries the matching reason; `blocked` is true only on the message that first caused that transition. |
+| Per-token streaming safety, stateless | TCP `streaming_safety` | Scores one frame's `streaming_tokens` against that frame's `safety_rules` and nothing else. There is no retained tail, so a rule spanning two frames never matches, and there is no sticky state: `blocked` is always `!safe`, and `safe` returns to true on the next frame. A caller that wants the session semantics above accumulates the tokens itself, or uses the gRPC stream. |
+
+`Compress` (token-classification pruning) is not ported and returns `UNIMPLEMENTED` on this binary; run the minimal sidecar for that RPC. See the crate's module docs (`crates/sbproxy-classifier/src/*.rs`) for the full scope note, including what this port deliberately leaves out (LLM-judge backends, license-leak detection, the Wave 5 agent-classifier ML path, Ed25519 model-signing, OpenTelemetry).
+
+### Running it
+
+```bash
+cargo run -p sbproxy-classifier -- \
+  --listen 127.0.0.1:9500 \
+  --listen-tcp 127.0.0.1:9400 \
+  --metrics-addr 127.0.0.1:9402 \
+  --model prompt-injection=/models/model.onnx:/models/tokenizer.json
+```
+
+`--model` / `--embed-model` / `--default-model` / `--default-embed-model`
+mirror the minimal sidecar's flags of the same name. `/healthz`, `/readyz`,
+`/metrics` (Prometheus text), and `/tenants` are served on `--metrics-addr`.
+`/tenants` is an authenticated, bounded paging endpoint: send
+`Authorization: Bearer <admin-token>` and use `page_size` (default 32) plus
+the returned tenant-id `cursor` to traverse the registry. The response
+includes only tenants visible to that token; malformed, duplicate, or unknown
+query parameters are rejected.
+
+The gRPC listener on `--listen` accepts the same `--inference-token-file` and
+`--listen-tls-*` hardening flags described in section 2. On the rich binary
+they protect both the shared `InferenceService` RPCs and the rich-only
+`ClassifierService` RPCs (`Quality`, `StreamSafety`). These controls are
+independent of `--admin-token-file`, which still applies only to the admin TCP
+listener and `/tenants` on `--metrics-addr`.
+
+The rich sidecar validates its configurable refusal limits before binding any
+listener or publishing readiness:
+
+| Flag | Default | Accepted maximum |
+|---|---:|---:|
+| `--inference-max-running` | `4` | `64` |
+| `--inference-max-queued` | `32` | `1024` |
+| `--inference-deadline-ms` | `5000` | `30000` |
+| `--tcp-max-connections` | `128` | `128` |
+| `--tcp-io-timeout-ms` | `5000` | `60000` |
+| `--tcp-frame-timeout-ms` | `15000` | `300000` |
+| `--tcp-connection-timeout-ms` | `300000` | `3600000` |
+
+Running connections and every deadline must be at least one; the inference
+queue alone may be zero. `--tcp-frame-timeout-ms` must be at least
+`--tcp-io-timeout-ms`, and `--tcp-connection-timeout-ms` at least
+`--tcp-frame-timeout-ms`. The TCP connection limit applies independently to
+the public and optional admin listeners.
+
+The two listeners draw on one 16 MiB in-flight frame-byte budget, but not
+symmetrically. The public listener may hold at most 12 MiB of it at once; the
+remaining 4 MiB, one full-size frame, is reserved for the admin listener and
+the public listener can never take it. Admin frames draw on the whole budget,
+so a quiet public listener costs the admin path nothing.
+
+The reserve exists because the public listener needs no credential. Without
+it, four unauthenticated sockets that each declare a 4 MiB frame pin the
+entire budget, and every admin `register`, `delete`, and `list` frame is
+refused with an exhausted-budget close. The whole-frame deadline above bounds
+any one such hold, but not the lockout: a client that reconnects the moment
+its frame expires takes the budget straight back, so the operator stays locked
+out for all but a sliver of each cycle. The reserve is what keeps the registry
+reachable.
+
+Each frame remains capped at 4 MiB, and the process acquires its share of the
+budget before allocating the caller-declared body. A client that exhausts the
+share available to it is disconnected.
+
+The three deadlines nest, and they nest for a reason. `--tcp-io-timeout-ms`
+bounds one `read()`, `--tcp-frame-timeout-ms` bounds the length prefix plus
+the declared body, and `--tcp-connection-timeout-ms` bounds the span from
+accept, or from the last answered frame, to close. Without the middle one a
+client that sends a byte just inside every per-read window holds its share of
+the shared frame budget for as long as it likes, and a handful of such sockets
+lock every other connection, the admin listener included, out of that budget.
+
+The connection deadline is refreshed by progress: every answered frame moves
+it one full `--tcp-connection-timeout-ms` further out, so a client that pools
+a connection and keeps it busy is never cut mid-exchange, while a socket that
+stops answering is closed on schedule and gives up its connection slot. It
+covers the whole exchange, not just the reading, so it is also the bound on a
+command that never comes back from the inference executor. Both listeners are
+covered, the loopback admin one included: a stalled admin socket holds a slot
+and draws on the same frame budget a public one does, and an admin client that
+is working refreshes the deadline like any other.
+
+The public TCP listener authenticates nothing, encrypts nothing, and takes
+the `tenant` field verbatim from each frame. It therefore binds to loopback
+only unless you pass `--tcp-allow-nonlocal`, which is the operator saying, in
+writing, that a network boundary outside this process is what protects the
+port. A non-loopback bind logs one warning at startup naming what is exposed:
+anything that can route to it can enumerate registered tenants, classify
+against any of them, and read back that tenant's normalized text, which is
+the redaction pipeline section 6 tells you to configure for PII.
+
+Every CPU-bound public command (`classify`, `quality_score`, `intent_detect`,
+`content_type_detect`, `streaming_safety`) runs behind the same bounded
+executor the gRPC RPCs use, under the same `--inference-max-running`,
+`--inference-max-queued`, and `--inference-deadline-ms` bounds, and enforces
+the same per-request budgets listed below.
+
+Other rich-sidecar refusal limits are fixed:
+
+| Surface | Limit |
+|---|---:|
+| gRPC text in one `Classify`, `Quality`, or `Embed` request | 1 MiB |
+| gRPC `Embed` batch | 64 items and 1 MiB aggregate text |
+| gRPC `StreamSafety` stream | 4096 chunks and 1 MiB aggregate token text |
+| gRPC `StreamSafety` first-message rules | 64 rules and 64 KiB aggregate rule text |
+| TCP text in one `classify`, `quality_score`, `intent_detect`, or `content_type_detect` frame | 1 MiB |
+| TCP `streaming_safety` frame | 1 MiB of token text, 64 rules, 64 KiB aggregate rule text |
+| TCP MessagePack frame | 4 MiB per frame; 16 MiB in flight process-wide |
+| TCP in-flight frame bytes, public listener | 12 MiB, the process budget less the admin reserve |
+| TCP in-flight frame bytes, admin reserve | 4 MiB, one full-size frame, never available to the public listener |
+| Normalization output | 4 MiB after every rule has run |
+| Tenant id | 128 bytes, `[A-Za-z0-9._-]` only |
+| Tenant registry | 64 tenants |
+| Tenant config | 64 aggregate patterns, 64 normalization rules, 4096 bytes per pattern |
+| Tenant config bytes | 256 KiB of pattern and rule source; 256 KiB encoded |
+| Compiled tenant programs | 48 KiB per pattern, 64 KiB per enabled rule, 32 MiB process-wide |
+| Tenant list page | 32 entries; 256 KiB serialized on either the admin TCP or the HTTP boundary |
+| HTTP health/metrics connections | 128, each with a 5-second whole-connection deadline |
+| HTTP request line plus headers | 8192 bytes, including the required blank header terminator |
+| Admin token file | 256 KiB and 1024 token grants |
+| Admin token grant | 256-byte token and 1024 tenant scopes |
+| Admin tenant scope | 128 bytes |
+| Inference token file | 256 KiB and 1024 bearer tokens |
+| Inference bearer token | 256 bytes |
+| Listener TLS certificate, key, and client-CA files | 256 KiB each |
+
+The compiled-program ceilings are what a pattern costs after compilation, not
+how long it is, and a pattern well inside the 4096-byte source limit can
+exceed one. The usual cause is a Unicode-aware shorthand inside a bounded
+repeat: `\b(?:\d[ -]?){13,16}\b` compiles past 64 KiB, where the same rule
+written `\b(?:[0-9][ -]?){13,16}\b` compiles in a fraction of it. A pattern
+past its budget is refused at registration with a message naming the budget
+and the number of bytes, so it is diagnosable without guessing at syntax.
+
+An admin token path must open as a regular file. On Unix the sidecar opens it
+nonblocking and with no-follow enabled, then checks file type, group/other
+permission bits, size, and contents through that same descriptor. It does not
+follow a final symlink and refuses FIFOs, sockets, devices, and directories;
+this prevents a no-writer FIFO from blocking startup. Use mode `0600` for the
+file (the enforced rule is that no group or other permission bit may be set).
+The optional `--listen-admin` address must be loopback and requires
+`--admin-token-file`.
+
+### The optional-degrade architecture
+
+Per the epic's rule that a sidecar a deployment must run and keep running is the same category of hard dependency as an external database: **nothing in this OSS workspace may require either classifier sidecar to be up.** The shipping `prompt_injection_v2` compiler enforces this directly: selecting `detector: sidecar` requires a pinned real-ONNX fallback and constructs one composite detector. `sbproxy-classifier-client`'s `FallbackClassifier` offers the same primary/fallback control flow to custom callers, but those callers remain responsible for supplying and bounding a real fallback implementation.
+
+- No sidecar configured (the common OSS case: an operator who never deploys one) - every call goes straight to a caller-supplied in-process classifier. No connection is ever attempted.
+- A sidecar is configured but unreachable, times out, or returns a malformed response - the call degrades to the in-process classifier for that request. Every degraded call increments `sbproxy_classifier_client_fallback_total{reason}` on the proxy's own `/metrics`, over a closed reason set (`connect`, `timeout`, `rpc`, `protocol`, `invalid_request`, `empty_response`), so an operator can alert on running on the fallback. The warning is held to one line per reason per 60 seconds and carries the count it speaks for, because an outage that writes one WARN per request is its own log flood.
+- A sidecar is configured and healthy - its verdict is used, and the in-process classifier is not invoked at all.
+
+For `prompt_injection_v2`, the fallback is not an arbitrary stub: config construction verifies the model and tokenizer paths, mandatory SHA-256 pins, size limits, and any configured detached signatures, then uses the same bounded admission/deadline mechanism as the explicit in-process detector. A local queue, deadline, worker, runtime, or inference failure remains unavailable and follows the policy's blocked/degraded action; it never becomes a clean verdict.
+
+The rich sidecar holds the same line on its own side. A model id that a validated manifest names but no `--model` or `--embed-model` actually loaded is `FAILED_PRECONDITION` on `Classify` and `Embed`, never a descriptor-shaped answer: no label from the manifest at score 1.0, and no zero vector at the declared width. A missing model reads as a missing model.
+
+```rust,ignore
+use sbproxy_classifier_client::{ClassifierClient, FallbackClassifier, InProcessClassifier, Verdict};
+
+struct MyOnnxWrapper(sbproxy_classifiers::OnnxClassifier);
+
+impl InProcessClassifier for MyOnnxWrapper {
+    fn classify(&self, text: &str) -> Verdict {
+        let out = self.0.classify(text).unwrap_or_default();
+        Verdict { label: out.label, score: out.score as f64 }
+    }
+}
+
+// `sidecar` is `None` when the operator never configured one; `Some(..)`
+// when they did, whether or not it turns out to be reachable.
+let classifier = FallbackClassifier::new(sidecar, "prompt-injection", MyOnnxWrapper(onnx));
+let verdict = classifier.classify(&prompt).await;
+```
+
+Run `cargo run -p sbproxy-classifier-client --example fallback` for a live demonstration of all three cases.
+
+### Shipping deployment contract
+
+The two tiers coexist: local ONNX is the zero-extra-process baseline and verified fallback, while either sidecar is an optional isolated primary. Deploying a sidecar adds capability and isolation; losing it does not remove the configured prompt-injection classification policy.
+
+### Metrics
+
+`sbproxy-classifier` exposes eleven Prometheus families on `--metrics-addr`'s `/metrics` (see `crates/sbproxy-classifier/src/metrics.rs`). The typed lifecycle families are `sbproxy_classifier_attempts_total{transport,cmd}`, `sbproxy_classifier_completions_total{transport,cmd}`, and `sbproxy_classifier_terminal_outcomes_total{transport,cmd,stage,reason}`; together they distinguish accepted work, responses that reached their completion boundary, and every non-success terminal outcome. `sbproxy_classifier_startup_owner_info{entrypoint,owner}` attests that the shipped release entrypoint owns the prepared runtime capability used by all three listener owners. Compatibility and domain-specific families remain `sbproxy_classifier_requests_total{transport,cmd}`, `sbproxy_classifier_errors_total{transport,cmd,reason}`, `sbproxy_classifier_admission_queue{cmd}`, `sbproxy_classifier_admission_refusals_total{cmd,reason}`, `sbproxy_classifier_tenants`, `sbproxy_classifier_quality_score{transport}`, and `sbproxy_classifier_safety_verdicts_total{verdict}`. All eleven are in the central [metric stability catalog](metrics-stability.md) and graphed by `dashboards/grafana/sbproxy-classifier.json`, even though this standalone process serves them from its own scrape endpoint. Import the dashboard alongside `sbproxy-model-host.json` and `sbproxy-mesh-storage.json`, which chart their own similarly out-of-process binaries the same way.
 
 ## See also
 
 - [`examples/prompt-injection-sidecar/`](../examples/prompt-injection-sidecar/) - the `prompt_injection_v2` policy against an out-of-process classifier sidecar, `tag` and `block` variants.
+- [`examples/classifier-rich-sidecar/`](../examples/classifier-rich-sidecar/) - the same policy pointed at the rich sidecar's gRPC port, plus a note on its additional TCP capabilities.
+- [`crates/sbproxy-classifier-client/examples/fallback.rs`](../crates/sbproxy-classifier-client/examples/fallback.rs) - runnable demonstration of the optional-degrade architecture (`cargo run -p sbproxy-classifier-client --example fallback`).
 - [`examples/sidecar/`](../examples/sidecar/) - a different sense of "sidecar": sbproxy itself deployed per-pod as a workload sidecar rather than a classifier process. Relevant if the classifier sidecar above is going to run alongside a proxy deployed this way.

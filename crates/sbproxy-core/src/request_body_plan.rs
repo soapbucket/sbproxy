@@ -47,6 +47,17 @@ impl DynamicRequestBodyPlan {
         self.policies.iter().any(|policy| policy.active)
     }
 
+    /// Mark every buffered policy as already dispatched for this request.
+    ///
+    /// The header phase defers `BundleBodyMode::Buffered` policies to a
+    /// later body-complete call. After that call runs, the same request
+    /// must not run them again if a later phase also notices the plan.
+    pub(crate) fn mark_buffered_policies_dispatched(&mut self) {
+        for policy in &mut self.policies {
+            policy.active = false;
+        }
+    }
+
     /// Return active policy indexes in configured chain order.
     pub(crate) fn active_policy_indexes(&self) -> Vec<usize> {
         self.policies

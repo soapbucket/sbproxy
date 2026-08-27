@@ -73,6 +73,7 @@ smallvec.workspace = true
 regex.workspace = true
 dashmap.workspace = true
 parking_lot.workspace = true
+zeroize.workspace = true
 arc-swap.workspace = true
 # WOR-1913: durable per-model local-vs-cloud savings tallies. redb is the
 # workspace embedded KV store (also used by the platform keystore, cache,
@@ -85,6 +86,15 @@ tracing.workspace = true
 chrono.workspace = true
 sha2.workspace = true
 hex.workspace = true
+# Exact binary-weight accounting for weighted rollout validation and selection.
+# Every finite f64 is represented in subnormal units so positive bands cannot
+# disappear through rounding and mathematical sums above f64::MAX are refused.
+num-bigint = "0.4.6"
+# Constant-time comparison for the A2A bearer token in
+# `agent_orchestration::auth`, the same crate `sbproxy-config`,
+# `sbproxy-middleware`, and `sbproxy-modules` already use for
+# secret-equivalent comparisons.
+subtle.workspace = true
 # WOR-1540: Ed25519-signed entries for the verifiable usage ledger. The
 # signing itself moved to sbproxy-meter in WOR-2125; what is left here is the
 # key type in the `ledger verify` surface. Same major as the RFC 9421 verifier
@@ -136,3 +146,7 @@ tiktoken-rs = "0.11"
 [dev-dependencies]
 tempfile = "3"
 tracing-subscriber.workspace = true
+# Test-only, thread-local allocation observation for the finance validator.
+# Its safe API preserves this crate's `forbid(unsafe_code)` policy while making
+# a caller-sized scratch allocation before refusal mutation-visible.
+allocation-counter = "0.8.1"

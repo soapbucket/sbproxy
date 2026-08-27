@@ -536,8 +536,33 @@ const AI_TOOL_CALL_EVENTS_MAX: usize = 16;
 /// `choices[].message.tool_calls[]` and Anthropic-style `content[]`
 /// blocks with `type == "tool_use"`. Returns `(id, name, arguments)`
 /// tuples with arguments as the raw provider text.
-fn extract_tool_calls(value: &serde_json::Value) -> Vec<(String, String, String)> {
+///
+/// Truncates at [`AI_TOOL_CALL_EVENTS_MAX`]. That cap is a telemetry
+/// bound (WOR-1877); the enforcement path must use
+/// [`extract_tool_calls_with_overflow`] and refuse when it overflows
+/// rather than skip leftover calls.
+pub(super) fn extract_tool_calls(value: &serde_json::Value) -> Vec<(String, String, String)> {
+    extract_tool_calls_with_overflow(value).0
+}
+
+/// Like [`extract_tool_calls`], but reports when the completion carried
+/// more calls than the telemetry cap. Enforcement must fail closed on
+/// overflow; observation keeps the truncated prefix.
+pub(super) fn extract_tool_calls_with_overflow(
+    value: &serde_json::Value,
+) -> (Vec<(String, String, String)>, bool) {
     let mut calls = Vec::new();
+    let mut overflow = false;
+    let mut push = |id: String, name: String, args: String| {
+        if overflow {
+            return;
+        }
+        if calls.len() >= AI_TOOL_CALL_EVENTS_MAX {
+            overflow = true;
+            return;
+        }
+        calls.push((id, name, args));
+    };
     if let Some(choices) = value.get("choices").and_then(|v| v.as_array()) {
         for choice in choices {
             if let Some(tool_calls) = choice
@@ -559,7 +584,7 @@ fn extract_tool_calls(value: &serde_json::Value) -> Vec<(String, String, String)
                         .unwrap_or("")
                         .to_string();
                     if !name.is_empty() {
-                        calls.push((id.to_string(), name.to_string(), args));
+                        push(id.to_string(), name.to_string(), args);
                     }
                 }
             }
@@ -575,13 +600,12 @@ fn extract_tool_calls(value: &serde_json::Value) -> Vec<(String, String, String)
                     .map(|v| v.to_string())
                     .unwrap_or_default();
                 if !name.is_empty() {
-                    calls.push((id.to_string(), name.to_string(), args));
+                    push(id.to_string(), name.to_string(), args);
                 }
             }
         }
     }
-    calls.truncate(AI_TOOL_CALL_EVENTS_MAX);
-    calls
+    (calls, overflow)
 }
 
 /// WOR-1877: emit tool-call span events on the AI request span when a
@@ -4778,6 +4802,11 @@ mod budget_window_tests {
         }
         let flood = serde_json::json!({"choices": [{"message": {"tool_calls": many}}]});
         assert_eq!(extract_tool_calls(&flood).len(), AI_TOOL_CALL_EVENTS_MAX);
+        let (_, overflow) = super::extract_tool_calls_with_overflow(&flood);
+        assert!(
+            overflow,
+            "enforcement must see the leftover calls the telemetry cap dropped"
+        );
     }
 
     // --- WOR-2212: one request, one debit ---

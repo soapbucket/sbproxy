@@ -34,14 +34,16 @@
 //! * Set `verify_signature: true`. The loader then requires a good
 //!   signature on the resolved tag or commit.
 //!
-//! ## The `git` binary is a runtime dependency
+//! ## How a git source is fetched
 //!
-//! [`crate::source::GitBinaryCloner`] shells out, so every host resolving
-//! a git source needs `git` installed, container images included. A
-//! missing binary is reported as
-//! [`crate::source::ConfigSourceError::MissingGitBinary`], which names the
-//! dependency rather than surfacing a confusing clone error, and
-//! `sbproxy doctor` reports the same thing before anyone boots.
+//! Production resolution prefers the `git` binary on `PATH` and falls
+//! back to an in-process clone (`gix`) when that binary is missing. The
+//! official distroless image has neither a shell nor git, so the
+//! fallback is what a git-sourced config uses there. A host that pins
+//! the binary with [`FetchContext::with_git_binary_at`] still fails as
+//! [`crate::source::ConfigSourceError::MissingGitBinary`] when that path
+//! cannot be run. `verify_signature: true` always needs `git`: the
+//! in-process path cannot verify GPG or SSH signatures.
 //!
 //! ## Recursion
 //!
@@ -52,6 +54,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -871,13 +875,286 @@ impl GitBinaryCloner {
     }
 }
 
+/// Production cloner: `git` on PATH, then an in-process `gix` fetch.
+///
+/// [`FetchContext::with_git_binary_at`] stays on [`GitBinaryCloner`]
+/// alone so a deliberately missing path still names the dependency.
+struct GitOrGixCloner {
+    git: GitBinaryCloner,
+}
+
+impl Cloner for GitOrGixCloner {
+    fn preflight(&self) -> Result<(), ConfigSourceError> {
+        Ok(())
+    }
+
+    fn fetch(&self, request: &FetchRequest<'_>) -> Result<ResolvedRevision, ConfigSourceError> {
+        if self.git.preflight().is_ok() {
+            return self.git.fetch(request);
+        }
+        fetch_with_gix(request)
+    }
+}
+
+fn gix_clone_error(error: impl std::fmt::Display) -> ConfigSourceError {
+    ConfigSourceError::Clone(format!(
+        "in-process git clone failed: {}",
+        scrub_credentials(&error.to_string())
+    ))
+}
+
+/// Map a gix failure to [`ConfigSourceError::Timeout`] when the deadline
+/// thread has already flipped the interrupt flag. Otherwise the failure
+/// stays a clone/unreachable error. Pin fetch and pin checkout used to
+/// miss this remap, so a distroless timeout after a slow all-heads clone
+/// incremented the wrong metric.
+fn gix_timeout_or(
+    interrupt: &AtomicBool,
+    repo: &str,
+    timeout: Duration,
+    what: &str,
+    error: impl std::fmt::Display,
+) -> ConfigSourceError {
+    if interrupt.load(Ordering::SeqCst) {
+        ConfigSourceError::Timeout(format!(
+            "in-process git {what} of {} did not finish within {}s",
+            redact_repo(repo),
+            timeout.as_secs_f64()
+        ))
+    } else {
+        gix_clone_error(error)
+    }
+}
+
+fn fetch_with_gix(request: &FetchRequest<'_>) -> Result<ResolvedRevision, ConfigSourceError> {
+    if request.verify_signature {
+        return Err(ConfigSourceError::Signature(
+            "`verify_signature: true` requires the `git` binary; the in-process fallback cannot \
+             verify GPG or SSH signatures. Install git, or clear verify_signature"
+                .to_string(),
+        ));
+    }
+
+    let pinned = request.revision.is_some_and(is_full_commit_sha);
+    let http_auth = GitHttpAuth::new(
+        request.credential_username,
+        request.credential,
+        request.repo,
+    );
+    let dest = request.dest;
+    if dest.exists() {
+        let is_empty = std::fs::read_dir(dest)
+            .map_err(|error| ConfigSourceError::Clone(format!("read clone dest: {error}")))?
+            .next()
+            .is_none();
+        if is_empty {
+            std::fs::remove_dir(dest)
+                .map_err(|error| ConfigSourceError::Clone(format!("reset clone dest: {error}")))?;
+        }
+    }
+
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let timeout_flag = Arc::clone(&interrupt);
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let timeout = request.timeout;
+    std::thread::spawn(move || {
+        if stop_rx.recv_timeout(timeout).is_err() {
+            timeout_flag.store(true, Ordering::SeqCst);
+        }
+    });
+
+    let result = (|| {
+        let mut prepare = gix::clone::PrepareFetch::new(
+            request.repo,
+            dest,
+            gix::create::Kind::WithWorktree,
+            gix::create::Options::default(),
+            gix::open::Options::isolated(),
+        )
+        .map_err(gix_clone_error)?;
+
+        if let Some(header) = http_auth.as_ref() {
+            prepare = prepare
+                .with_in_memory_config_overrides([format!("http.extraHeader={}", header.header)]);
+        }
+
+        if let Some(revision) = request.revision.filter(|value| !is_full_commit_sha(value)) {
+            prepare = prepare
+                .with_ref_name(Some(revision))
+                .map_err(gix_clone_error)?;
+        }
+        if pinned {
+            // Fetch every advertised head, not just default-branch HEAD,
+            // so a pin on another branch is in the object database.
+            prepare = prepare.configure_remote(|mut remote| {
+                remote
+                    .replace_refspecs(
+                        std::iter::once("+refs/heads/*:refs/remotes/origin/*"),
+                        gix::remote::Direction::Fetch,
+                    )
+                    .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
+                Ok(remote)
+            });
+        } else {
+            prepare = prepare.with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(
+                std::num::NonZeroU32::MIN,
+            ));
+        }
+
+        let (mut checkout, _outcome) = prepare
+            .fetch_then_checkout(gix::progress::Discard, interrupt.as_ref())
+            .map_err(|error| {
+                gix_timeout_or(
+                    interrupt.as_ref(),
+                    request.repo,
+                    request.timeout,
+                    "clone",
+                    error,
+                )
+            })?;
+        let (repo, _outcome) = checkout
+            .main_worktree(gix::progress::Discard, interrupt.as_ref())
+            .map_err(|error| {
+                gix_timeout_or(
+                    interrupt.as_ref(),
+                    request.repo,
+                    request.timeout,
+                    "checkout",
+                    error,
+                )
+            })?;
+
+        let mut commit = repo.head_id().map_err(gix_clone_error)?.to_string();
+        if pinned {
+            let sha = request.revision.unwrap_or_default();
+            if !commit.eq_ignore_ascii_case(sha) {
+                if repo
+                    .rev_parse_single(gix::bstr::ByteSlice::as_bstr(sha.as_bytes()))
+                    .is_err()
+                {
+                    fetch_gix_sha(
+                        &repo,
+                        sha,
+                        request.repo,
+                        request.timeout,
+                        interrupt.as_ref(),
+                    )?;
+                }
+                commit = checkout_gix_commit(
+                    &repo,
+                    sha,
+                    request.repo,
+                    request.timeout,
+                    interrupt.as_ref(),
+                )?;
+            }
+        }
+        Ok(ResolvedRevision {
+            repo: redact_repo(request.repo),
+            reference: request.revision.unwrap_or("HEAD").to_string(),
+            commit,
+        })
+    })();
+    let _ = stop_tx.send(());
+    result
+}
+
+fn checkout_gix_commit(
+    repo: &gix::Repository,
+    sha: &str,
+    repo_url: &str,
+    timeout: Duration,
+    interrupt: &AtomicBool,
+) -> Result<String, ConfigSourceError> {
+    let id = repo
+        .rev_parse_single(gix::bstr::ByteSlice::as_bstr(sha.as_bytes()))
+        .map_err(|_| {
+            ConfigSourceError::RevisionMismatch(format!(
+                "commit {sha} is not present in {} after an in-process fetch; the pin names a \
+                 commit this repository does not contain",
+                redact_repo(repo_url)
+            ))
+        })?;
+    let hex = id.to_string();
+    let object = repo
+        .find_object(id)
+        .map_err(|error| gix_timeout_or(interrupt, repo_url, timeout, "checkout", error))?;
+    let tree = object
+        .peel_to_tree()
+        .map_err(|error| gix_timeout_or(interrupt, repo_url, timeout, "checkout", error))?;
+    let mut index = repo
+        .index_from_tree(&tree.id())
+        .map_err(|error| gix_timeout_or(interrupt, repo_url, timeout, "checkout", error))?;
+    let workdir = repo.workdir().ok_or_else(|| {
+        ConfigSourceError::Clone("in-process git clone produced a bare repository".to_string())
+    })?;
+    let objects = repo.objects.clone();
+    gix::worktree::state::checkout(
+        &mut index,
+        workdir,
+        objects,
+        &gix::progress::Discard,
+        &gix::progress::Discard,
+        interrupt,
+        Default::default(),
+    )
+    .map_err(|error| gix_timeout_or(interrupt, repo_url, timeout, "checkout", error))?;
+    Ok(hex)
+}
+
+/// Fetch one commit by sha into an already-cloned repository.
+///
+/// Mirrors `GitBinaryCloner::fetch_pinned_sha`: a targeted want-sha, used
+/// when the pin is not on any advertised branch (a dangling or
+/// otherwise-unadvertised commit). Servers without
+/// `uploadpack.allowReachableSHA1InWant` fail this the same way `git fetch
+/// origin <sha>` does.
+fn fetch_gix_sha(
+    repo: &gix::Repository,
+    sha: &str,
+    repo_url: &str,
+    timeout: Duration,
+    interrupt: &AtomicBool,
+) -> Result<(), ConfigSourceError> {
+    let mut remote = repo
+        .find_remote(gix::bstr::ByteSlice::as_bstr("origin".as_bytes()))
+        .map_err(|error| gix_timeout_or(interrupt, repo_url, timeout, "clone", error))?;
+    let spec = format!("+{sha}:refs/sbproxy/pin");
+    remote
+        .replace_refspecs(
+            std::iter::once(spec.as_str()),
+            gix::remote::Direction::Fetch,
+        )
+        .map_err(|error| {
+            if interrupt.load(Ordering::SeqCst) {
+                gix_timeout_or(interrupt, repo_url, timeout, "clone", &error)
+            } else {
+                ConfigSourceError::Clone(format!(
+                    "in-process git pin refspec failed: {}",
+                    scrub_credentials(&error.to_string())
+                ))
+            }
+        })?;
+    let connection = remote
+        .connect(gix::remote::Direction::Fetch)
+        .map_err(|error| gix_timeout_or(interrupt, repo_url, timeout, "clone", error))?;
+    let prepared = connection
+        .prepare_fetch(gix::progress::Discard, Default::default())
+        .map_err(|error| gix_timeout_or(interrupt, repo_url, timeout, "clone", error))?;
+    prepared
+        .receive(gix::progress::Discard, interrupt)
+        .map_err(|error| gix_timeout_or(interrupt, repo_url, timeout, "clone", error))?;
+    Ok(())
+}
+
 /// Inputs the loader needs to resolve a [`ConfigSource`].
 ///
 /// The temp-dir root is the parent directory git clones land under;
 /// each `Git` invocation creates its own [`TempDir`] inside it so
 /// cleanup is automatic on drop. The cloner is the strategy actually
-/// used to populate that directory; production code wires
-/// [`GitBinaryCloner`], tests wire a fixture-copying stub.
+/// used to populate that directory; production code prefers the `git`
+/// binary and falls back to an in-process clone, and tests wire a
+/// fixture-copying stub.
 pub struct FetchContext {
     /// Optional override for the temp-dir parent. When `None`, the
     /// OS temp dir is used.
@@ -906,14 +1183,16 @@ impl std::fmt::Debug for FetchContext {
 }
 
 impl FetchContext {
-    /// Build a production fetch context that shells out to `git` on
-    /// `PATH`.
+    /// Build a production fetch context that prefers `git` on `PATH`
+    /// and falls back to an in-process clone when that binary is missing.
     #[must_use]
     pub fn with_git_binary() -> Self {
         Self {
             temp_root: None,
-            cloner: Box::new(GitBinaryCloner {
-                git: PathBuf::from("git"),
+            cloner: Box::new(GitOrGixCloner {
+                git: GitBinaryCloner {
+                    git: PathBuf::from("git"),
+                },
             }),
             credentials: std::collections::HashMap::new(),
         }
@@ -956,8 +1235,10 @@ impl FetchContext {
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigSourceError::MissingGitBinary`] when the `git`
-    /// binary this context was built around cannot be run.
+    /// Returns [`ConfigSourceError::MissingGitBinary`] when this context
+    /// was built with [`Self::with_git_binary_at`] and that binary cannot
+    /// be run. [`Self::with_git_binary`] succeeds without `git`; fetch
+    /// then uses the in-process fallback.
     pub fn preflight(&self) -> Result<(), ConfigSourceError> {
         self.cloner.preflight()
     }
@@ -1972,6 +2253,231 @@ exit 0
         assert!(err.to_string().contains("git"), "{err}");
         assert!(err.is_unreachable());
         assert_eq!(err.metric_label(), "unreachable");
+    }
+
+    #[test]
+    fn production_preflight_succeeds_without_a_git_binary() {
+        let cloner = GitOrGixCloner {
+            git: GitBinaryCloner {
+                git: PathBuf::from("/nonexistent/sbproxy-test-git"),
+            },
+        };
+        cloner
+            .preflight()
+            .expect("the in-process fallback keeps preflight green");
+        FetchContext::with_git_binary()
+            .preflight()
+            .expect("production preflight does not require git on PATH");
+    }
+
+    #[test]
+    fn in_process_git_clones_a_local_repository_when_git_is_missing() {
+        if !Command::new("git")
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+        {
+            eprintln!("skipping: need git to create the fixture");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let work = dir.path().join("repo");
+        std::fs::create_dir_all(&work).expect("mkdir");
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(&work)
+                .output()
+                .expect("spawn git");
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "--quiet"]);
+        git(&["symbolic-ref", "HEAD", "refs/heads/main"]);
+        git(&["config", "user.email", "fixture@example.test"]);
+        git(&["config", "user.name", "Fixture"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(work.join("sb.yml"), "proxy: {}\n").expect("write");
+        git(&["add", "sb.yml"]);
+        git(&["commit", "--quiet", "-m", "initial"]);
+        let url = format!("file://{}", work.display());
+        let dest = dir.path().join("dest");
+        std::fs::create_dir_all(&dest).expect("mkdir dest");
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir_all(&scratch).expect("mkdir scratch");
+        let cloner = GitOrGixCloner {
+            git: GitBinaryCloner {
+                git: PathBuf::from("/nonexistent/sbproxy-test-git"),
+            },
+        };
+        let resolved = cloner
+            .fetch(&FetchRequest {
+                repo: &url,
+                credential: None,
+                credential_username: None,
+                revision: Some("main"),
+                timeout: Duration::from_secs(30),
+                verify_signature: false,
+                dest: &dest,
+                scratch: &scratch,
+            })
+            .expect("gix clone");
+        assert!(
+            dest.join("sb.yml").is_file(),
+            "worktree must be checked out"
+        );
+        assert_eq!(resolved.reference, "main");
+        assert!(!resolved.commit.is_empty());
+    }
+
+    #[test]
+    fn in_process_git_fetches_a_pin_that_is_not_on_the_default_branch() {
+        if !Command::new("git")
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+        {
+            eprintln!("skipping: need git to create the fixture");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let work = dir.path().join("repo");
+        std::fs::create_dir_all(&work).expect("mkdir");
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(&work)
+                .output()
+                .expect("spawn git");
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "--quiet"]);
+        git(&["symbolic-ref", "HEAD", "refs/heads/main"]);
+        git(&["config", "user.email", "fixture@example.test"]);
+        git(&["config", "user.name", "Fixture"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(work.join("sb.yml"), "on: main\n").expect("write");
+        git(&["add", "sb.yml"]);
+        git(&["commit", "--quiet", "-m", "main"]);
+        git(&["checkout", "--quiet", "-b", "other"]);
+        std::fs::write(work.join("sb.yml"), "on: other\n").expect("write");
+        git(&["add", "sb.yml"]);
+        git(&["commit", "--quiet", "-m", "other"]);
+        let pin = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&work)
+                .output()
+                .expect("rev-parse")
+                .stdout,
+        )
+        .expect("utf8")
+        .trim()
+        .to_string();
+        git(&["checkout", "--quiet", "main"]);
+        let url = format!("file://{}", work.display());
+        let dest = dir.path().join("dest");
+        std::fs::create_dir_all(&dest).expect("mkdir dest");
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir_all(&scratch).expect("mkdir scratch");
+        let cloner = GitOrGixCloner {
+            git: GitBinaryCloner {
+                git: PathBuf::from("/nonexistent/sbproxy-test-git"),
+            },
+        };
+        let resolved = cloner
+            .fetch(&FetchRequest {
+                repo: &url,
+                credential: None,
+                credential_username: None,
+                revision: Some(&pin),
+                timeout: Duration::from_secs(30),
+                verify_signature: false,
+                dest: &dest,
+                scratch: &scratch,
+            })
+            .expect("gix clone of a non-default-branch pin");
+        assert_eq!(
+            std::fs::read_to_string(dest.join("sb.yml")).expect("read checkout"),
+            "on: other\n"
+        );
+        assert!(resolved.commit.eq_ignore_ascii_case(&pin), "{resolved:?}");
+    }
+
+    #[test]
+    fn in_process_git_refuses_signature_verification() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("dest");
+        std::fs::create_dir_all(&dest).expect("mkdir dest");
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir_all(&scratch).expect("mkdir scratch");
+        let cloner = GitOrGixCloner {
+            git: GitBinaryCloner {
+                git: PathBuf::from("/nonexistent/sbproxy-test-git"),
+            },
+        };
+        let err = cloner
+            .fetch(&FetchRequest {
+                repo: "file:///does/not/matter",
+                credential: None,
+                credential_username: None,
+                revision: None,
+                timeout: Duration::from_secs(5),
+                verify_signature: true,
+                dest: &dest,
+                scratch: &scratch,
+            })
+            .expect_err("signature verification needs git");
+        assert!(matches!(err, ConfigSourceError::Signature(_)), "{err:?}");
+    }
+
+    #[test]
+    fn in_process_git_maps_interrupt_to_timeout_not_clone() {
+        let interrupt = AtomicBool::new(true);
+        let timed_out = gix_timeout_or(
+            &interrupt,
+            "https://user:secret@example.test/repo.git",
+            Duration::from_secs(12),
+            "clone",
+            "cancelled by interrupt",
+        );
+        assert!(
+            matches!(timed_out, ConfigSourceError::Timeout(_)),
+            "{timed_out:?}"
+        );
+        assert_eq!(timed_out.metric_label(), "timeout");
+        let detail = timed_out.to_string();
+        assert!(detail.contains("12"), "{detail}");
+        assert!(
+            !detail.contains("secret"),
+            "timeout text must redact credentials: {detail}"
+        );
+
+        let interrupt = AtomicBool::new(false);
+        let clone = gix_timeout_or(
+            &interrupt,
+            "https://example.test/repo.git",
+            Duration::from_secs(12),
+            "clone",
+            "network down",
+        );
+        assert!(matches!(clone, ConfigSourceError::Clone(_)), "{clone:?}");
+        assert_eq!(clone.metric_label(), "unreachable");
     }
 
     #[test]

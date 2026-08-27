@@ -256,6 +256,26 @@ pub trait UsageSink: Send + Sync + std::fmt::Debug {
     fn record(&self, event: &LlmUsageEvent);
     /// A short, stable label for logs and metrics.
     fn name(&self) -> &str;
+
+    /// Return the current chargeback view when this sink owns one.
+    ///
+    /// The default keeps non-chargeback sinks object-safe and avoids
+    /// downcasting erased trait objects. Configured chargeback sinks override
+    /// it so the live admin/export path can query the same instance requests
+    /// record into.
+    fn chargeback_snapshot(&self) -> Option<crate::billing::ChargebackSnapshot> {
+        None
+    }
+
+    /// Return the live chargeback tracker when this sink owns one.
+    ///
+    /// This keeps the authenticated admin export on the same in-process
+    /// tracker instances the hot path records into, without forcing a full
+    /// `snapshot()` clone before the route can apply page and response-byte
+    /// admission.
+    fn chargeback_tracker(&self) -> Option<&crate::billing::ChargebackTracker> {
+        None
+    }
 }
 
 /// A sink that appends one JSON object per line to a file.
@@ -1332,6 +1352,26 @@ pub enum UsageSinkConfig {
     },
     /// Emit events through the process OTel / OpenInference seam.
     Otel,
+    /// Accumulate bounded in-memory per-workspace/team chargeback totals
+    /// (WOR-2672).
+    ///
+    /// See [`crate::billing::ChargebackTracker`] and `docs/ai-chargeback.md`.
+    /// The live instance is queryable through [`UsageSink::chargeback_snapshot`]
+    /// and the authenticated admin JSON/CSV endpoints. Raw entries evict
+    /// oldest-first; workspace and team rollups fold excess cardinality into
+    /// `__other__` without dropping its spend. Config load rejects a second
+    /// chargeback sink on the same AI origin.
+    Chargeback {
+        /// Number of recent raw usage entries retained for billing exports.
+        #[serde(default = "default_chargeback_max_entries")]
+        max_entries: usize,
+        /// Maximum workspace rollup rows, including the overflow row.
+        #[serde(default = "default_chargeback_max_dimensions")]
+        max_workspaces: usize,
+        /// Maximum team rollup rows, including the overflow row.
+        #[serde(default = "default_chargeback_max_dimensions")]
+        max_teams: usize,
+    },
     /// Write events as JSON objects to an S3 bucket.
     S3 {
         /// Destination bucket name.
@@ -1351,6 +1391,35 @@ pub enum UsageSinkConfig {
 }
 
 impl UsageSinkConfig {
+    /// Validate resource bounds for sinks whose shape is configurable.
+    pub fn validate(&self) -> Result<(), String> {
+        const MAX_ENTRIES: usize = 1_000_000;
+        const MAX_DIMENSIONS: usize = 100_000;
+        if let Self::Chargeback {
+            max_entries,
+            max_workspaces,
+            max_teams,
+        } = self
+        {
+            if !(1..=MAX_ENTRIES).contains(max_entries) {
+                return Err(format!(
+                    "chargeback max_entries must be in 1..={MAX_ENTRIES}, got {max_entries}"
+                ));
+            }
+            for (name, value) in [
+                ("max_workspaces", *max_workspaces),
+                ("max_teams", *max_teams),
+            ] {
+                if !(1..=MAX_DIMENSIONS).contains(&value) {
+                    return Err(format!(
+                        "chargeback {name} must be in 1..={MAX_DIMENSIONS}, got {value}"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Build the runtime sink for this config entry. Returned as an `Arc` so a
     /// single instance is shared across every request for the origin.
     ///
@@ -1361,6 +1430,16 @@ impl UsageSinkConfig {
     /// `JsonlFile`, `Ledger`, and `Otel` never reach the network, so
     /// there is nothing here for an authorizer to gate.
     pub fn build(&self) -> std::sync::Arc<dyn UsageSink> {
+        self.build_for_origin(crate::billing::chargeback::UNATTRIBUTED)
+    }
+
+    /// Build the runtime sink, naming the compiled origin that owns it.
+    ///
+    /// Only the chargeback sink reads `origin` today: its tracker is the
+    /// one sink that accumulates finance state whose invalidation is
+    /// permanent, so its warnings and counters have to say which origin's
+    /// bill is affected.
+    fn build_for_origin(&self, origin: &str) -> std::sync::Arc<dyn UsageSink> {
         let egress = configured_gate(EgressPurpose::UsageSink);
         match self {
             UsageSinkConfig::JsonlFile { path } => std::sync::Arc::new(JsonlFileSink::new(path)),
@@ -1402,6 +1481,18 @@ impl UsageSinkConfig {
                 std::sync::Arc::new(sink)
             }
             UsageSinkConfig::Otel => std::sync::Arc::new(OtelSink::new()),
+            UsageSinkConfig::Chargeback {
+                max_entries,
+                max_workspaces,
+                max_teams,
+            } => std::sync::Arc::new(
+                crate::billing::ChargebackTracker::with_limits(
+                    *max_entries,
+                    *max_workspaces,
+                    *max_teams,
+                )
+                .with_origin(origin),
+            ),
             UsageSinkConfig::S3 { bucket, prefix } => {
                 let mut sink = ObjectStoreSink::s3(bucket, prefix);
                 if let Some(authorizer) = &egress {
@@ -1420,9 +1511,33 @@ impl UsageSinkConfig {
     }
 }
 
+fn default_chargeback_max_entries() -> usize {
+    crate::billing::chargeback::DEFAULT_MAX_ENTRIES
+}
+
+fn default_chargeback_max_dimensions() -> usize {
+    crate::billing::chargeback::DEFAULT_MAX_DIMENSIONS
+}
+
 /// Build the runtime sinks for a list of configs.
 pub fn build_sinks(configs: &[UsageSinkConfig]) -> Vec<std::sync::Arc<dyn UsageSink>> {
-    configs.iter().map(UsageSinkConfig::build).collect()
+    build_sinks_for_origin(configs, crate::billing::chargeback::UNATTRIBUTED)
+}
+
+/// Build the runtime sinks for a list of configs, naming the compiled
+/// origin that owns them.
+///
+/// Prefer this wherever the caller knows its origin. `build_sinks` is the
+/// same thing with the origin left unattributed, which costs the operator
+/// the ability to tell whose chargeback data went incomplete.
+pub fn build_sinks_for_origin(
+    configs: &[UsageSinkConfig],
+    origin: &str,
+) -> Vec<std::sync::Arc<dyn UsageSink>> {
+    configs
+        .iter()
+        .map(|config| config.build_for_origin(origin))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1881,6 +1996,29 @@ mod tests {
         assert_eq!(sinks[0].name(), "otel");
         assert_eq!(sinks[1].name(), "s3");
         assert_eq!(sinks[2].name(), "gcs");
+    }
+
+    #[test]
+    fn chargeback_config_builds_the_recording_sink() {
+        // Seam: serde-tagged config through `UsageSinkConfig::build`.
+        // Returning an arbitrary local sink from the new match arm would
+        // still compile and accept the YAML, but it would silently drop the
+        // workspace/team aggregation this option promises.
+        let configs: Vec<UsageSinkConfig> =
+            serde_json::from_str(r#"[{"type":"chargeback"}]"#).unwrap();
+        assert_eq!(configs.len(), 1);
+        let sinks = build_sinks(&configs);
+        assert_eq!(sinks.len(), 1);
+        assert_eq!(sinks[0].name(), "chargeback");
+        sinks[0].record(&sample_event());
+        let snapshot = sinks[0]
+            .chargeback_snapshot()
+            .expect("configured chargeback sink remains queryable");
+        assert_eq!(snapshot.recorded_entries, 1);
+        assert_eq!(
+            snapshot.max_entries,
+            crate::billing::chargeback::DEFAULT_MAX_ENTRIES
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! embedded in config string values.  Plain strings are passed through
 //! unchanged.
 
+use std::io::Read as _;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
@@ -117,30 +118,55 @@ impl SecretResolver {
     /// (which dispatches the work to a blocking thread pool) so the
     /// caller does not stall a Tokio worker.
     pub fn resolve(&self, value: &str) -> Result<String> {
+        self.resolve_with_limit(value, None)
+    }
+
+    /// Resolve a config value while enforcing a whole-value byte ceiling.
+    ///
+    /// `file:` input is read through a `max_bytes + 1` adapter, so an
+    /// oversized file is refused before it can be materialized in memory.
+    /// Environment and provider-backed values are checked immediately after
+    /// their authoritative resolver returns.
+    pub fn resolve_bounded(&self, value: &str, max_bytes: usize) -> Result<String> {
+        self.resolve_with_limit(value, Some(max_bytes))
+    }
+
+    fn resolve_with_limit(&self, value: &str, max_bytes: Option<usize>) -> Result<String> {
         // Legacy `vault://env/NAME` alias -> env var (compat window). Checked
         // before the provider-URI parse so the alias keeps its env semantics.
         if let Some(var) = legacy_vault_env_name(value) {
             let replacement =
                 legacy_vault_reference_replacement(value).unwrap_or_else(|| format!("${{{var}}}"));
             warn_legacy_vault_reference_once(value, &replacement);
-            return std::env::var(var).with_context(|| format!("env var {} not set", var));
+            let resolved =
+                std::env::var(var).with_context(|| format!("env var {} not set", var))?;
+            return enforce_resolved_limit(resolved, max_bytes);
         }
         // Whole-value `${VAR}` -> env var.
         if value.starts_with("${") && value.ends_with('}') {
             let var = &value[2..value.len() - 1];
-            return std::env::var(var).with_context(|| format!("env var {} not set", var));
+            let resolved =
+                std::env::var(var).with_context(|| format!("env var {} not set", var))?;
+            return enforce_resolved_limit(resolved, max_bytes);
         }
         // `env:NAME` -> env var. Same lookup and missing-var error behavior
         // as the `${VAR}` form above, so either spelling fails the same way
         // when the variable is not set.
         if let Some(var) = value.strip_prefix("env:") {
-            return std::env::var(var).with_context(|| format!("env var {} not set", var));
+            let resolved =
+                std::env::var(var).with_context(|| format!("env var {} not set", var))?;
+            return enforce_resolved_limit(resolved, max_bytes);
         }
         // `file:/path` -> file contents.
         if let Some(path) = value.strip_prefix("file:") {
-            return std::fs::read_to_string(path)
-                .with_context(|| format!("failed to read secret file: {}", path))
-                .map(|s| s.trim().to_string());
+            let resolved = match max_bytes {
+                Some(max_bytes) => read_bounded_secret_file(path, max_bytes)?,
+                None => std::fs::read_to_string(path)
+                    .with_context(|| format!("failed to read secret file: {}", path))?
+                    .trim()
+                    .to_string(),
+            };
+            return enforce_resolved_limit(resolved, max_bytes);
         }
         // Provider-URI schemes: vault:// awssm:// gcpsm:// k8ssecret://
         // secretfile:// secret://. Resolve through the backend manager.
@@ -150,7 +176,7 @@ impl SecretResolver {
         // Checked before the deprecated `secret:` colon form so `secret://`
         // is routed to the manager, not mis-parsed as a `secret:` name.
         if let Ok(reference) = VaultRef::parse(value) {
-            return match &self.manager {
+            let resolved = match &self.manager {
                 Some(manager) => manager
                     .get_from_ref(&reference)?
                     .ok_or_else(|| anyhow::anyhow!("secret not found for reference: {value}")),
@@ -158,7 +184,8 @@ impl SecretResolver {
                     "no secret backend configured to resolve {value}; declare it under \
                      proxy.secrets.backends"
                 ),
-            };
+            }?;
+            return enforce_resolved_limit(resolved, max_bytes);
         }
         // The Go-era `secret:<name>` (colon) form is gone (WOR-1785).
         // `VaultRef::parse` above already claimed every `secret://` URI,
@@ -179,7 +206,7 @@ impl SecretResolver {
                  `${{VAR}}` wrapper is expanded; this value is passed through literally"
             );
         }
-        Ok(value.to_string())
+        enforce_resolved_limit(value.to_string(), max_bytes)
     }
 
     /// Async wrapper around [`Self::resolve`] that dispatches the call to
@@ -212,6 +239,47 @@ impl SecretResolver {
                 .chars()
                 .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
     }
+}
+
+fn enforce_resolved_limit(value: String, max_bytes: Option<usize>) -> Result<String> {
+    if let Some(maximum) = max_bytes {
+        if value.len() > maximum {
+            anyhow::bail!("resolved secret exceeds the {maximum}-byte limit");
+        }
+    }
+    Ok(value)
+}
+
+fn read_bounded_secret_file(path: &str, max_bytes: usize) -> Result<String> {
+    let file =
+        std::fs::File::open(path).with_context(|| format!("failed to read secret file: {path}"))?;
+    let mut bytes = Vec::with_capacity(max_bytes.min(4096));
+    let read_limit = u64::try_from(max_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    file.take(read_limit)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read secret file: {path}"))?;
+    let value = String::from_utf8(bytes)
+        .with_context(|| format!("secret file is not valid UTF-8 text: {path}"))?;
+    // `resolve` trims before it measures, so this path has to as well:
+    // otherwise `echo "$TOKEN" > token` refuses a secret that is exactly at
+    // the limit, for its trailing newline alone, with a message naming the
+    // byte count rather than the whitespace.
+    //
+    // Trimming cannot smuggle an oversized secret through. The read window
+    // is one byte past the limit, so only a value that filled it can have
+    // been truncated, and truncation moves bytes off the end: trailing
+    // whitespace inside a full window means the value already ended. A
+    // leading run of whitespace is the one shape that would push real bytes
+    // past the window, and that is refused rather than silently shortened.
+    let trimmed = value.trim();
+    let truncated_by_leading_whitespace =
+        value.len() > max_bytes && value.starts_with(char::is_whitespace);
+    if trimmed.len() > max_bytes || truncated_by_leading_whitespace {
+        anyhow::bail!("resolved secret exceeds the {max_bytes}-byte limit");
+    }
+    Ok(trimmed.to_string())
 }
 
 #[cfg(test)]
@@ -342,6 +410,50 @@ mod tests {
     fn resolve_file_missing_returns_error() {
         let resolver = resolver_no_backend();
         assert!(resolver.resolve("file:/does/not/exist/xyzzy").is_err());
+    }
+
+    #[test]
+    fn bounded_file_resolution_accepts_exact_and_refuses_max_plus_one() {
+        let exact = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(exact.path(), b"12345678").unwrap();
+        let exact_reference = format!("file:{}", exact.path().display());
+        let resolver = resolver_no_backend();
+        assert_eq!(
+            resolver.resolve_bounded(&exact_reference, 8).unwrap(),
+            "12345678"
+        );
+
+        let oversized = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(oversized.path(), b"123456789").unwrap();
+        let oversized_reference = format!("file:{}", oversized.path().display());
+        let error = resolver
+            .resolve_bounded(&oversized_reference, 8)
+            .expect_err("the ninth byte must be refused");
+        assert!(error.to_string().contains("8-byte limit"), "{error:#}");
+    }
+
+    /// `echo "$TOKEN" > token` writes a trailing newline, so the bounded
+    /// path has to measure what it returns, the way `resolve` already does.
+    /// Trimming must not turn into a way past the ceiling: a value that
+    /// filled the read window behind leading whitespace is refused rather
+    /// than handed back silently truncated.
+    #[test]
+    fn bounded_file_resolution_measures_the_trimmed_value() {
+        let resolver = resolver_no_backend();
+
+        let newline_terminated = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(newline_terminated.path(), b"12345678\n").unwrap();
+        let reference = format!("file:{}", newline_terminated.path().display());
+        assert_eq!(resolver.resolve_bounded(&reference, 8).unwrap(), "12345678");
+        assert_eq!(resolver.resolve(&reference).unwrap(), "12345678");
+
+        let leading_whitespace = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(leading_whitespace.path(), b"   123456789012").unwrap();
+        let reference = format!("file:{}", leading_whitespace.path().display());
+        let error = resolver
+            .resolve_bounded(&reference, 8)
+            .expect_err("a value the read window truncated must never be returned");
+        assert!(error.to_string().contains("8-byte limit"), "{error:#}");
     }
 
     // --- plain string ---

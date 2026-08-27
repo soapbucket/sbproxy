@@ -92,6 +92,10 @@ pub enum EgressPurpose {
     AiProvider,
     /// AI judge / evaluation endpoint.
     AiJudge,
+    /// Agent endpoint invoked by the governed AI workflow runner.
+    AgentOrchestration,
+    /// Stock intent and provider-quality classifier hook RPC.
+    ClassifierHook,
     /// Federated MCP upstream.
     McpUpstream,
     /// OpenAPI tool HTTP call.
@@ -124,6 +128,8 @@ impl EgressPurpose {
         match self {
             Self::AiProvider => "ai_provider",
             Self::AiJudge => "ai_judge",
+            Self::AgentOrchestration => "agent_orchestration",
+            Self::ClassifierHook => "classifier_hook",
             Self::McpUpstream => "mcp_upstream",
             Self::OpenApiTool => "openapi_tool",
             Self::TokenExchange => "token_exchange",
@@ -283,7 +289,7 @@ impl EgressAuthorizer {
     /// between authorization and connect is refused with
     /// [`EgressDenied::DnsPinMismatch`] instead of being dialled
     /// (WOR-2080).
-    pub fn verify_pinned(
+    fn verify_pinned(
         &self,
         destination: &AuthorizedDestination,
         dial: &SocketAddr,
@@ -300,7 +306,7 @@ impl EgressAuthorizer {
     ///
     /// Re-resolves the destination host through `resolver` and checks
     /// every returned address against the pin set recorded at authorize
-    /// time via [`Self::verify_pinned`]. All addresses must be pinned:
+    /// time by `verify_pinned`. All addresses must be pinned:
     /// a connector may pick any address it is handed, so one unpinned
     /// address in the answer refuses the whole dial rather than
     /// trusting the connector's choice. On success the verified
@@ -1037,11 +1043,12 @@ pub fn egress_inventory_snapshot() -> Vec<EgressSighting> {
 // (`sbproxy_config::types::EgressTopLevelConfig`) compiles one
 // [`EgressAuthorizer`] per purpose it configures. `sbproxy-config` has no
 // business owning process-wide mutable state, and the consumers that need
-// the compiled authorizer (`AiClient`, the usage sinks, the model-artifact
-// fetcher, the outbound-credential resolver, the OTLP exporters) are spread
-// across five crates, several of them reached lazily, well past the config
-// compile call site. Rather than thread a parameter through every layer in
-// between, this registry mirrors [`egress_inventory`]'s shape: a
+// the compiled authorizer (`AiClient`, the classifier hooks, the usage sinks,
+// the model-artifact fetcher, the outbound-credential resolver, the OTLP
+// exporters) are spread across five crates, several of them reached lazily,
+// well past the config compile call site. Rather than thread a parameter
+// through every layer in between, this registry mirrors
+// [`egress_inventory`]'s shape: a
 // process-wide slot behind a free-function API, so any call site that
 // wants the currently configured authorizer for a purpose reads it with no
 // plumbing. `sbproxy_core::server::lifecycle::arm_egress_gates_from_config`
@@ -1651,8 +1658,23 @@ mod tests {
                 "label must be a bounded identifier, got {label}"
             );
         }
-        assert_eq!(EgressPurpose::AiProvider.as_label(), "ai_provider");
-        assert_eq!(EgressPurpose::ModelArtifact.as_label(), "model_artifact");
+        for (purpose, expected) in [
+            (EgressPurpose::AiProvider, "ai_provider"),
+            (EgressPurpose::AiJudge, "ai_judge"),
+            (EgressPurpose::AgentOrchestration, "agent_orchestration"),
+            (EgressPurpose::ClassifierHook, "classifier_hook"),
+            (EgressPurpose::McpUpstream, "mcp_upstream"),
+            (EgressPurpose::OpenApiTool, "openapi_tool"),
+            (EgressPurpose::TokenExchange, "token_exchange"),
+            (EgressPurpose::Webhook, "webhook"),
+            (EgressPurpose::UsageSink, "usage_sink"),
+            (EgressPurpose::ModelArtifact, "model_artifact"),
+            (EgressPurpose::EngineArtifact, "engine_artifact"),
+            (EgressPurpose::BundleHook, "bundle_hook"),
+            (EgressPurpose::Telemetry, "telemetry"),
+        ] {
+            assert_eq!(purpose.as_label(), expected);
+        }
     }
 
     #[test]

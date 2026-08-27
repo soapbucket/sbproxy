@@ -849,13 +849,31 @@ class DocDriftCatalogTests(unittest.TestCase):
         self.assertIn("llms-full.txt", result.stderr)
 
     def test_a_corpus_lag_entry_that_covers_nothing_is_reported(self) -> None:
+        # The real CORPUS_LAG list is empty whenever the corpus is fresh, so
+        # the fixture runs a copy of the script with one entry seeded whose
+        # needle the corpus does not carry.
         root = self._root()
+        needle = "The 90+ AI provider catalog"
         corpus = root / "docs" / "llms-full.txt"
-        corpus.write_text(
-            corpus.read_text().replace("The 90+ AI provider catalog", "The 72-provider AI catalog")
+        self.assertNotIn(needle, corpus.read_text())
+        script = REPOSITORY / "scripts" / "check-doc-drift.sh"
+        seeded = root / "scripts" / "check-doc-drift.sh"
+        seeded.parent.mkdir()
+        text = script.read_text()
+        self.assertEqual(text.count("CORPUS_LAG=(\n"), 1)
+        seeded.write_text(
+            text.replace(
+                "CORPUS_LAG=(\n",
+                f'CORPUS_LAG=(\n  "{needle} :: seeded by the test; the corpus never carried it"\n',
+                1,
+            )
         )
-        result = self._run(root)
-        self.assertEqual(result.returncode, 1)
+        result = subprocess.run(
+            ["bash", str(seeded), "--root", str(root)],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("drop it from", result.stderr)
 
 

@@ -3169,13 +3169,22 @@ Fitting an oversized prompt to the model's window is what the compression pipeli
 ## Stored prompts and offline optimization
 
 The prompt store keeps named, versioned prompts. A request can refer to
-`"prompt": "name@version"` or use a bare name. A bare name resolves to the
-pinned default, or to the highest numeric version label when no version is
-pinned. SBproxy renders that version, prepends it as a system message, removes
-the gateway-only `prompt` field, and records the resolved name and version in
-run metadata. Runtime versions are added, replaced, and pinned through the
-authenticated Admin API. Use a new version label when you need immutable
-history.
+`"prompt": "name@version"` or use a bare name. An explicit version resolves
+only through the stored-prompt layers. A bare name uses this precedence:
+
+1. the mutable runtime prompt overlay;
+2. a scoped generation-owned `proxy.ai_toolkit.prompt_rollouts` rollout;
+3. the config-declared prompt store's pinned default, or its highest numeric
+   version label when no version is pinned.
+
+Stored-prompt content is rendered, prepended as a system message, and removed
+from the gateway-only `prompt` field. Rollout content is inserted verbatim; it
+does not interpolate stored-prompt variables. Both paths record the resolved
+name and version in run metadata before provider dispatch. Runtime stored-prompt
+versions are added, replaced, and pinned through the authenticated Admin API.
+Use a new version label when you need immutable history. See
+[Weighted prompt versioning](prompt-versioning.md) for rollout config, stable
+cohort assignment, the dry-run CLI, and content-safe observability.
 
 ### Which surfaces resolve a reference
 
@@ -3184,9 +3193,9 @@ happens to it depends on which inbound surface the request arrived on:
 
 | Inbound surface | `"prompt": "name@version"` (string) | `"prompt": {"id": ...}` (object) |
 |---|---|---|
-| `POST /v1/chat/completions` | Resolved, prepended as a system turn, key stripped. A name a configured store does not hold is a 400. On an origin with no prompt store at all the key passes through untouched, because `prompt` is also a legacy completions field a provider may accept. | Not the reference form. Passed through as-is. |
-| `POST /v1/messages` | Resolved, prepended as a system turn, key stripped before translation. A name a configured store does not hold is a 400; an origin with no prompt store at all answers 404 rather than forwarding the key. | Not the reference form. Dropped in translation and counted on `sbproxy_ai_translation_dropped_total`. |
-| `POST /v1/responses` | As `/v1/messages`. | Resolved against the same store and prepended to `instructions`. An unknown reference is a 404, a malformed object a 400. |
+| `POST /v1/chat/completions` | Runtime overlay, then a configured rollout for a bare name, then the config prompt store. Selected content is prepended as a system turn and the key is stripped. An explicit `name@version` bypasses rollout selection. On an origin with none of these layers the key passes through untouched because `prompt` is also a legacy completions field a provider may accept. | Not the reference form. Passed through as-is. |
+| `POST /v1/messages` | The same precedence, with the selected content prepended as a system turn and the key stripped before translation. An unresolved reference is refused rather than forwarded. | Not the reference form. Dropped in translation and counted on `sbproxy_ai_translation_dropped_total`. |
+| `POST /v1/responses` | As `/v1/messages`. | A valid bare `id` uses runtime overlay, then a configured rollout, then the config prompt store and is prepended to `instructions`. An explicit `version` bypasses rollout selection. An unknown reference is a 404, a malformed object a 400. |
 
 The last column of the middle row is the difference worth knowing. On the two
 native surfaces `prompt` cannot be anything but a gateway reference, so a
