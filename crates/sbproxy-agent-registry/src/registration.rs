@@ -237,6 +237,13 @@ impl ApprovalState {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RegistrationRecord {
     agent_id: String,
+    /// Tenant this registration belongs to. Absent in records written
+    /// before tenant scoping landed, which read back as
+    /// [`DEFAULT_TENANT`]: an existing single-tenant deployment keeps
+    /// working and its records stay visible to its deployment-wide
+    /// operator.
+    #[serde(default = "default_tenant")]
+    tenant: String,
     client_id: String,
     client_secret_hash: String,
     previous_client_secret_hash: Option<String>,
@@ -250,6 +257,90 @@ struct RegistrationRecord {
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     rotated_at: Option<DateTime<Utc>>,
+}
+
+/// Tenant a registration is recorded under when the acting operator is
+/// deployment-wide.
+///
+/// Matches the capture envelope's `workspace_id` default, so a
+/// single-tenant deployment reads the same word in both places.
+pub const DEFAULT_TENANT: &str = "default";
+
+/// Which registrations an operator may see and act on.
+///
+/// The enterprise queue scoped every operation by `workspace_id` and keyed
+/// its records on `(workspace_id, agent_id)`; this port had dropped that
+/// dimension entirely, which gave a tenant-scoped admin operator read and
+/// write over every tenant's registrations. This is that dimension back,
+/// named for the thing this workspace already calls it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TenantScope {
+    /// A deployment-wide operator. Sees and acts on every tenant, and
+    /// records its own submissions under [`DEFAULT_TENANT`].
+    All,
+    /// An operator narrowed to one tenant by `proxy.admin.operators`.
+    Only(String),
+}
+
+impl TenantScope {
+    /// Build a scope from the resolved principal's tenant.
+    pub fn from_principal(tenant: Option<&str>) -> Self {
+        match tenant {
+            Some(tenant) => Self::Only(tenant.to_string()),
+            None => Self::All,
+        }
+    }
+
+    /// Whether this scope covers `tenant`.
+    pub fn admits(&self, tenant: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only(scoped) => scoped == tenant,
+        }
+    }
+
+    /// The tenant a submission made under this scope is recorded against.
+    pub fn owning_tenant(&self) -> &str {
+        match self {
+            Self::All => DEFAULT_TENANT,
+            Self::Only(tenant) => tenant.as_str(),
+        }
+    }
+
+    /// Whether this scope is narrowed to one tenant.
+    pub fn is_scoped(&self) -> bool {
+        matches!(self, Self::Only(_))
+    }
+}
+
+fn default_tenant() -> String {
+    DEFAULT_TENANT.to_string()
+}
+
+/// Collapse a tenant name into something that cannot reshape a composed
+/// store key.
+///
+/// Tenants come from `proxy.admin.operators[].tenant`, so this guards a
+/// config mistake rather than an attacker, but the key it composes is the
+/// boundary between two tenants' replay indexes and a `:` in a tenant name
+/// would move it.
+fn sanitize_tenant(tenant: &str) -> String {
+    let sanitized: String = tenant
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' || character == '-' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .take(128)
+        .collect();
+    if sanitized.is_empty() {
+        DEFAULT_TENANT.to_string()
+    } else {
+        sanitized
+    }
 }
 
 /// One decided metadata fingerprint, and what was decided about it.
@@ -273,6 +364,8 @@ struct MetadataIndexEntry {
 pub struct RegistrationView {
     /// The minted slug.
     pub agent_id: String,
+    /// Tenant this registration belongs to.
+    pub tenant: String,
     /// The OAuth-style identifier, stable across secret rotations.
     pub client_id: String,
     /// What the submitter said about the agent.
@@ -295,6 +388,7 @@ impl From<&RegistrationRecord> for RegistrationView {
     fn from(record: &RegistrationRecord) -> Self {
         Self {
             agent_id: record.agent_id.clone(),
+            tenant: record.tenant.clone(),
             client_id: record.client_id.clone(),
             metadata: record.metadata.clone(),
             state: record.state,
@@ -472,6 +566,7 @@ pub struct RegistrationQueue {
 /// reject, and revoke travel together instead of as a row of positional
 /// arguments nobody can read at the call site.
 struct DecisionRequest<'a> {
+    scope: &'a TenantScope,
     agent_id: &'a str,
     action: &'static str,
     target: ApprovalState,
@@ -518,16 +613,25 @@ impl RegistrationQueue {
         })
     }
 
-    async fn load(&self, agent_id: &str) -> Result<(RegistrationRecord, u64)> {
+    /// Read one record, refusing one another tenant owns.
+    ///
+    /// A record outside the scope answers `NotFound` rather than a
+    /// forbidden, on purpose: a distinct refusal would make this route an
+    /// oracle for which agent ids exist in other tenants, and the caller
+    /// cannot act on the difference either way.
+    async fn load(&self, scope: &TenantScope, agent_id: &str) -> Result<(RegistrationRecord, u64)> {
         let entry = self
             .store
             .get(&self.registrations, agent_id)
             .await
             .map_err(|error| RegistryError::Backend(error.to_string()))?
             .ok_or_else(|| RegistryError::NotFound(agent_id.to_string()))?;
-        let record = serde_json::from_slice(&entry.value).map_err(|error| {
+        let record: RegistrationRecord = serde_json::from_slice(&entry.value).map_err(|error| {
             RegistryError::Backend(format!("stored registration is unreadable: {error}"))
         })?;
+        if !scope.admits(&record.tenant) {
+            return Err(RegistryError::NotFound(agent_id.to_string()));
+        }
         Ok((record, entry.revision))
     }
 
@@ -562,6 +666,16 @@ impl RegistrationQueue {
     /// Record what a reviewer decided about this metadata, keyed on the
     /// fingerprint, so the decision outlives the record's own key and the
     /// process.
+    /// Compose the metadata index key.
+    ///
+    /// Tenant-qualified, so one tenant's rejection does not refuse another
+    /// tenant's identical description. The fingerprint is hex, so a `:`
+    /// cannot appear in it and the tenant is always the part before the
+    /// first one.
+    fn index_key(tenant: &str, fingerprint: &str) -> String {
+        format!("{}:{fingerprint}", sanitize_tenant(tenant))
+    }
+
     async fn index_decision(&self, record: &RegistrationRecord) -> Result<()> {
         let entry = MetadataIndexEntry {
             agent_id: record.agent_id.clone(),
@@ -571,7 +685,11 @@ impl RegistrationQueue {
             RegistryError::Backend(format!("could not encode metadata index entry: {error}"))
         })?;
         self.store
-            .put(&self.metadata_index, &record.metadata_hash, &bytes)
+            .put(
+                &self.metadata_index,
+                &Self::index_key(&record.tenant, &record.metadata_hash),
+                &bytes,
+            )
             .await
             .map(|_| ())
             .map_err(|error| RegistryError::Backend(error.to_string()))
@@ -579,10 +697,14 @@ impl RegistrationQueue {
 
     /// What a reviewer has already decided about this metadata, if
     /// anything.
-    async fn indexed_decision(&self, fingerprint: &str) -> Result<Option<MetadataIndexEntry>> {
+    async fn indexed_decision(
+        &self,
+        tenant: &str,
+        fingerprint: &str,
+    ) -> Result<Option<MetadataIndexEntry>> {
         let Some(entry) = self
             .store
-            .get(&self.metadata_index, fingerprint)
+            .get(&self.metadata_index, &Self::index_key(tenant, fingerprint))
             .await
             .map_err(|error| RegistryError::Backend(error.to_string()))?
         else {
@@ -622,13 +744,15 @@ impl RegistrationQueue {
     /// resubmission then takes a fresh slot.
     pub async fn register(
         &self,
+        scope: &TenantScope,
         metadata: AgentMetadata,
         now: DateTime<Utc>,
     ) -> Result<(RegistrationSecrets, RegistrationView)> {
         metadata.validate()?;
+        let tenant = scope.owning_tenant().to_string();
         let fingerprint = metadata_fingerprint(&metadata)?;
 
-        if let Some(decided) = self.indexed_decision(&fingerprint).await? {
+        if let Some(decided) = self.indexed_decision(&tenant, &fingerprint).await? {
             match decided.state {
                 ApprovalState::Rejected | ApprovalState::Revoked => {
                     return Err(RegistryError::MetadataBurned {
@@ -649,7 +773,7 @@ impl RegistrationQueue {
 
         if let Some(existing) = self
             .dedup
-            .get(&self.dedup_window, &fingerprint)
+            .get(&self.dedup_window, &Self::index_key(&tenant, &fingerprint))
             .await
             .map_err(|error| RegistryError::Backend(error.to_string()))?
         {
@@ -658,7 +782,7 @@ impl RegistrationQueue {
             // a duplicate: fall through and let the resubmission take a
             // fresh slot. A decided record is the index's business, not
             // this one's, and the index was already consulted above.
-            if let Ok((record, _)) = self.load(&agent_id).await {
+            if let Ok((record, _)) = self.load(scope, &agent_id).await {
                 if record.state == ApprovalState::Pending {
                     return Err(RegistryError::DuplicateMetadata(agent_id));
                 }
@@ -671,6 +795,7 @@ impl RegistrationQueue {
         let registration_access_token = mint_secret(REGISTRATION_ACCESS_TOKEN_PREFIX);
         let record = RegistrationRecord {
             agent_id: agent_id.clone(),
+            tenant: tenant.clone(),
             client_id: Ulid::new().to_string(),
             client_secret_hash: hash_credential(&client_secret)?,
             previous_client_secret_hash: None,
@@ -706,7 +831,7 @@ impl RegistrationQueue {
             self.dedup
                 .put_with_ttl(
                     &self.dedup_window,
-                    &fingerprint,
+                    &Self::index_key(&tenant, &fingerprint),
                     agent_id.as_bytes(),
                     window,
                 )
@@ -728,13 +853,17 @@ impl RegistrationQueue {
     }
 
     /// Read one registration.
-    pub async fn get(&self, agent_id: &str) -> Result<RegistrationView> {
-        Ok(RegistrationView::from(&self.load(agent_id).await?.0))
+    pub async fn get(&self, scope: &TenantScope, agent_id: &str) -> Result<RegistrationView> {
+        Ok(RegistrationView::from(&self.load(scope, agent_id).await?.0))
     }
 
     /// List every registration, newest submission last, optionally filtered
     /// to one state.
-    pub async fn list(&self, state: Option<ApprovalState>) -> Result<Vec<RegistrationView>> {
+    pub async fn list(
+        &self,
+        scope: &TenantScope,
+        state: Option<ApprovalState>,
+    ) -> Result<Vec<RegistrationView>> {
         let stored = self
             .store
             .list(&self.registrations)
@@ -745,7 +874,7 @@ impl RegistrationQueue {
             let record: RegistrationRecord = serde_json::from_slice(&entry.value).map_err(|e| {
                 RegistryError::Backend(format!("stored registration is unreadable: {e}"))
             })?;
-            if state.is_none_or(|wanted| wanted == record.state) {
+            if scope.admits(&record.tenant) && state.is_none_or(|wanted| wanted == record.state) {
                 out.push(RegistrationView::from(&record));
             }
         }
@@ -769,7 +898,7 @@ impl RegistrationQueue {
         if let Some(reason) = request.reason.as_deref() {
             bounded("reason", reason, 0, MAX_REASON_BYTES)?;
         }
-        let (mut record, revision) = self.load(request.agent_id).await?;
+        let (mut record, revision) = self.load(request.scope, request.agent_id).await?;
         if !request.from.contains(&record.state) {
             return Err(RegistryError::InvalidTransition {
                 action: request.action,
@@ -792,12 +921,14 @@ impl RegistrationQueue {
     /// Approve a pending registration.
     pub async fn approve(
         &self,
+        scope: &TenantScope,
         agent_id: &str,
         reason: Option<String>,
         decided_by: Option<String>,
         now: DateTime<Utc>,
     ) -> Result<RegistrationView> {
         self.decide(DecisionRequest {
+            scope,
             agent_id,
             action: "approve",
             target: ApprovalState::Approved,
@@ -812,12 +943,14 @@ impl RegistrationQueue {
     /// Reject a pending registration. The description is refused for good.
     pub async fn reject(
         &self,
+        scope: &TenantScope,
         agent_id: &str,
         reason: String,
         decided_by: Option<String>,
         now: DateTime<Utc>,
     ) -> Result<RegistrationView> {
         self.decide(DecisionRequest {
+            scope,
             agent_id,
             action: "reject",
             target: ApprovalState::Rejected,
@@ -832,12 +965,14 @@ impl RegistrationQueue {
     /// Revoke a registration. The description is refused for good.
     pub async fn revoke(
         &self,
+        scope: &TenantScope,
         agent_id: &str,
         reason: Option<String>,
         decided_by: Option<String>,
         now: DateTime<Utc>,
     ) -> Result<RegistrationView> {
         self.decide(DecisionRequest {
+            scope,
             agent_id,
             action: "revoke",
             target: ApprovalState::Revoked,
@@ -858,11 +993,12 @@ impl RegistrationQueue {
     /// rotate: there is nothing yet for the secret to authenticate against.
     pub async fn rotate_secret(
         &self,
+        scope: &TenantScope,
         agent_id: &str,
         registration_access_token: &str,
         now: DateTime<Utc>,
     ) -> Result<RotatedSecret> {
-        let (mut record, revision) = match self.load(agent_id).await {
+        let (mut record, revision) = match self.load(scope, agent_id).await {
             Ok(loaded) => loaded,
             // An unknown id and a wrong token answer identically, so the
             // endpoint is not an oracle for which slugs exist.
@@ -907,11 +1043,12 @@ impl RegistrationQueue {
     /// either as valid would make the approval gate decorative.
     pub async fn verify_client_secret(
         &self,
+        scope: &TenantScope,
         agent_id: &str,
         presented: &str,
         now: DateTime<Utc>,
     ) -> Result<bool> {
-        let Ok((record, _)) = self.load(agent_id).await else {
+        let Ok((record, _)) = self.load(scope, agent_id).await else {
             return Ok(false);
         };
         if record.state != ApprovalState::Approved {
@@ -933,8 +1070,8 @@ impl RegistrationQueue {
 
     /// How many registrations sit in each state, for the admin summary and
     /// the gauge.
-    pub async fn counts(&self) -> Result<Vec<(ApprovalState, usize)>> {
-        let all = self.list(None).await?;
+    pub async fn counts(&self, scope: &TenantScope) -> Result<Vec<(ApprovalState, usize)>> {
+        let all = self.list(scope, None).await?;
         let mut counts = Vec::new();
         for state in [
             ApprovalState::Pending,
@@ -1054,19 +1191,38 @@ mod tests {
     async fn a_minted_secret_is_stored_only_as_a_hash() {
         let path = temp_path();
         let queue = queue(&path);
-        let (secrets, _) = queue.register(metadata(), now()).await.expect("register");
+        let (secrets, _) = queue
+            .register(&TenantScope::All, metadata(), now())
+            .await
+            .expect("register");
 
         queue
-            .approve(&secrets.agent_id, None, Some("casey".into()), now())
+            .approve(
+                &TenantScope::All,
+                &secrets.agent_id,
+                None,
+                Some("casey".into()),
+                now(),
+            )
             .await
             .expect("approve");
 
         assert!(queue
-            .verify_client_secret(&secrets.agent_id, &secrets.client_secret, now())
+            .verify_client_secret(
+                &TenantScope::All,
+                &secrets.agent_id,
+                &secrets.client_secret,
+                now()
+            )
             .await
             .expect("verify"));
         assert!(!queue
-            .verify_client_secret(&secrets.agent_id, "sk_agent_wrong", now())
+            .verify_client_secret(
+                &TenantScope::All,
+                &secrets.agent_id,
+                "sk_agent_wrong",
+                now()
+            )
             .await
             .expect("verify"));
 
@@ -1091,9 +1247,12 @@ mod tests {
     async fn an_identical_resubmission_inside_the_window_is_refused() {
         let path = temp_path();
         let queue = queue(&path);
-        let (first, _) = queue.register(metadata(), now()).await.expect("first");
+        let (first, _) = queue
+            .register(&TenantScope::All, metadata(), now())
+            .await
+            .expect("first");
 
-        match queue.register(metadata(), now()).await {
+        match queue.register(&TenantScope::All, metadata(), now()).await {
             Err(RegistryError::DuplicateMetadata(existing)) => {
                 assert_eq!(existing, first.agent_id);
             }
@@ -1104,11 +1263,17 @@ mod tests {
         // decided, the durable index owns the answer, and it is the same
         // answer forever.
         queue
-            .reject(&first.agent_id, "not a real crawler".into(), None, now())
+            .reject(
+                &TenantScope::All,
+                &first.agent_id,
+                "not a real crawler".into(),
+                None,
+                now(),
+            )
             .await
             .expect("reject");
         assert!(matches!(
-            queue.register(metadata(), now()).await,
+            queue.register(&TenantScope::All, metadata(), now()).await,
             Err(RegistryError::MetadataBurned { .. })
         ));
 
@@ -1124,14 +1289,19 @@ mod tests {
             Duration::days(30),
         )
         .expect("queue");
-        let (pending, _) = short.register(fresh.clone(), now()).await.expect("first");
+        let (pending, _) = short
+            .register(&TenantScope::All, fresh.clone(), now())
+            .await
+            .expect("first");
         assert!(matches!(
-            short.register(fresh.clone(), now()).await,
+            short
+                .register(&TenantScope::All, fresh.clone(), now())
+                .await,
             Err(RegistryError::DuplicateMetadata(_))
         ));
         tokio::time::sleep(std::time::Duration::from_millis(60)).await;
         let (second, _) = short
-            .register(fresh, now())
+            .register(&TenantScope::All, fresh, now())
             .await
             .expect("an undecided submission expires out of the window");
         assert_ne!(second.agent_id, pending.agent_id);
@@ -1150,12 +1320,13 @@ mod tests {
         let path = temp_path();
         let first_boot = queue(&path);
         let (first, _) = first_boot
-            .register(metadata(), now())
+            .register(&TenantScope::All, metadata(), now())
             .await
             .expect("register");
 
         first_boot
             .reject(
+                &TenantScope::All,
                 &first.agent_id,
                 "unverifiable".into(),
                 Some("casey".into()),
@@ -1164,7 +1335,10 @@ mod tests {
             .await
             .expect("reject");
 
-        match first_boot.register(metadata(), now()).await {
+        match first_boot
+            .register(&TenantScope::All, metadata(), now())
+            .await
+        {
             Err(RegistryError::MetadataBurned { agent_id, decision }) => {
                 assert_eq!(agent_id, first.agent_id);
                 assert_eq!(decision, "rejected");
@@ -1177,7 +1351,9 @@ mod tests {
         drop(first_boot);
         let reopened = queue(&path);
         assert!(matches!(
-            reopened.register(metadata(), now()).await,
+            reopened
+                .register(&TenantScope::All, metadata(), now())
+                .await,
             Err(RegistryError::MetadataBurned { .. })
         ));
 
@@ -1185,7 +1361,10 @@ mod tests {
         // question and is still accepted.
         let mut other = metadata();
         other.expected_user_agents = vec!["AcmeBot/2.0".into()];
-        assert!(reopened.register(other, now()).await.is_ok());
+        assert!(reopened
+            .register(&TenantScope::All, other, now())
+            .await
+            .is_ok());
 
         std::fs::remove_file(&path).ok();
     }
@@ -1198,13 +1377,22 @@ mod tests {
     async fn an_approved_description_cannot_be_registered_twice() {
         let path = temp_path();
         let queue = queue(&path);
-        let (first, _) = queue.register(metadata(), now()).await.expect("register");
+        let (first, _) = queue
+            .register(&TenantScope::All, metadata(), now())
+            .await
+            .expect("register");
         queue
-            .approve(&first.agent_id, None, Some("casey".into()), now())
+            .approve(
+                &TenantScope::All,
+                &first.agent_id,
+                None,
+                Some("casey".into()),
+                now(),
+            )
             .await
             .expect("approve");
 
-        match queue.register(metadata(), now()).await {
+        match queue.register(&TenantScope::All, metadata(), now()).await {
             Err(RegistryError::DuplicateMetadata(agent_id)) => {
                 assert_eq!(agent_id, first.agent_id);
             }
@@ -1215,11 +1403,17 @@ mod tests {
         // agent's operator does not get to re-onboard the same one by
         // resubmitting.
         queue
-            .revoke(&first.agent_id, Some("key compromised".into()), None, now())
+            .revoke(
+                &TenantScope::All,
+                &first.agent_id,
+                Some("key compromised".into()),
+                None,
+                now(),
+            )
             .await
             .expect("revoke");
         assert!(matches!(
-            queue.register(metadata(), now()).await,
+            queue.register(&TenantScope::All, metadata(), now()).await,
             Err(RegistryError::MetadataBurned {
                 decision: "revoked",
                 ..
@@ -1235,22 +1429,35 @@ mod tests {
     async fn a_terminal_registration_refuses_every_further_transition() {
         let path = temp_path();
         let queue = queue(&path);
-        let (secrets, _) = queue.register(metadata(), now()).await.expect("register");
+        let (secrets, _) = queue
+            .register(&TenantScope::All, metadata(), now())
+            .await
+            .expect("register");
 
         queue
-            .reject(&secrets.agent_id, "unverifiable".into(), None, now())
+            .reject(
+                &TenantScope::All,
+                &secrets.agent_id,
+                "unverifiable".into(),
+                None,
+                now(),
+            )
             .await
             .expect("reject");
 
         assert!(matches!(
-            queue.approve(&secrets.agent_id, None, None, now()).await,
+            queue
+                .approve(&TenantScope::All, &secrets.agent_id, None, None, now())
+                .await,
             Err(RegistryError::InvalidTransition {
                 action: "approve",
                 state: "rejected"
             })
         ));
         assert!(matches!(
-            queue.revoke(&secrets.agent_id, None, None, now()).await,
+            queue
+                .revoke(&TenantScope::All, &secrets.agent_id, None, None, now())
+                .await,
             Err(RegistryError::InvalidTransition { .. })
         ));
 
@@ -1264,15 +1471,27 @@ mod tests {
     async fn a_second_reviewer_cannot_overwrite_a_decision_it_did_not_see() {
         let path = temp_path();
         let queue = queue(&path);
-        let (secrets, _) = queue.register(metadata(), now()).await.expect("register");
+        let (secrets, _) = queue
+            .register(&TenantScope::All, metadata(), now())
+            .await
+            .expect("register");
 
         // Both reviewers read the pending record.
-        let (record, stale_revision) = queue.load(&secrets.agent_id).await.expect("load");
+        let (record, stale_revision) = queue
+            .load(&TenantScope::All, &secrets.agent_id)
+            .await
+            .expect("load");
         assert_eq!(record.state, ApprovalState::Pending);
 
         // The first decision lands.
         queue
-            .reject(&secrets.agent_id, "unverifiable".into(), None, now())
+            .reject(
+                &TenantScope::All,
+                &secrets.agent_id,
+                "unverifiable".into(),
+                None,
+                now(),
+            )
             .await
             .expect("reject");
 
@@ -1284,7 +1503,11 @@ mod tests {
             Err(RegistryError::Conflict(_))
         ));
         assert_eq!(
-            queue.get(&secrets.agent_id).await.expect("get").state,
+            queue
+                .get(&TenantScope::All, &secrets.agent_id)
+                .await
+                .expect("get")
+                .state,
             ApprovalState::Rejected
         );
 
@@ -1298,49 +1521,77 @@ mod tests {
     async fn rotation_needs_the_registration_access_token_and_keeps_the_old_secret_working() {
         let path = temp_path();
         let queue = queue(&path);
-        let (secrets, _) = queue.register(metadata(), now()).await.expect("register");
+        let (secrets, _) = queue
+            .register(&TenantScope::All, metadata(), now())
+            .await
+            .expect("register");
         queue
-            .approve(&secrets.agent_id, None, None, now())
+            .approve(&TenantScope::All, &secrets.agent_id, None, None, now())
             .await
             .expect("approve");
 
         assert!(matches!(
             queue
-                .rotate_secret(&secrets.agent_id, "rat_wrong", now())
+                .rotate_secret(&TenantScope::All, &secrets.agent_id, "rat_wrong", now())
                 .await,
             Err(RegistryError::Unauthorized)
         ));
         assert!(matches!(
             queue
-                .rotate_secret("no-such-agent", "rat_wrong", now())
+                .rotate_secret(&TenantScope::All, "no-such-agent", "rat_wrong", now())
                 .await,
             Err(RegistryError::Unauthorized)
         ));
 
         let rotated = queue
-            .rotate_secret(&secrets.agent_id, &secrets.registration_access_token, now())
+            .rotate_secret(
+                &TenantScope::All,
+                &secrets.agent_id,
+                &secrets.registration_access_token,
+                now(),
+            )
             .await
             .expect("rotate");
         assert_ne!(rotated.client_secret, secrets.client_secret);
 
         // Inside the grace window both secrets authenticate.
         assert!(queue
-            .verify_client_secret(&secrets.agent_id, &rotated.client_secret, now())
+            .verify_client_secret(
+                &TenantScope::All,
+                &secrets.agent_id,
+                &rotated.client_secret,
+                now()
+            )
             .await
             .expect("new secret"));
         assert!(queue
-            .verify_client_secret(&secrets.agent_id, &secrets.client_secret, now())
+            .verify_client_secret(
+                &TenantScope::All,
+                &secrets.agent_id,
+                &secrets.client_secret,
+                now()
+            )
             .await
             .expect("old secret inside grace"));
 
         // Past it, only the new one does.
         let after = rotated.previous_secret_valid_until + Duration::seconds(1);
         assert!(queue
-            .verify_client_secret(&secrets.agent_id, &rotated.client_secret, after)
+            .verify_client_secret(
+                &TenantScope::All,
+                &secrets.agent_id,
+                &rotated.client_secret,
+                after
+            )
             .await
             .expect("new secret"));
         assert!(!queue
-            .verify_client_secret(&secrets.agent_id, &secrets.client_secret, after)
+            .verify_client_secret(
+                &TenantScope::All,
+                &secrets.agent_id,
+                &secrets.client_secret,
+                after
+            )
             .await
             .expect("old secret past grace"));
 
@@ -1353,27 +1604,41 @@ mod tests {
     async fn only_an_approved_registration_authenticates() {
         let path = temp_path();
         let queue = queue(&path);
-        let (secrets, _) = queue.register(metadata(), now()).await.expect("register");
+        let (secrets, _) = queue
+            .register(&TenantScope::All, metadata(), now())
+            .await
+            .expect("register");
 
         assert!(
             !queue
-                .verify_client_secret(&secrets.agent_id, &secrets.client_secret, now())
+                .verify_client_secret(
+                    &TenantScope::All,
+                    &secrets.agent_id,
+                    &secrets.client_secret,
+                    now()
+                )
                 .await
                 .expect("pending"),
             "a pending registration must not authenticate"
         );
 
         queue
-            .approve(&secrets.agent_id, None, None, now())
+            .approve(&TenantScope::All, &secrets.agent_id, None, None, now())
             .await
             .expect("approve");
         assert!(queue
-            .verify_client_secret(&secrets.agent_id, &secrets.client_secret, now())
+            .verify_client_secret(
+                &TenantScope::All,
+                &secrets.agent_id,
+                &secrets.client_secret,
+                now()
+            )
             .await
             .expect("approved"));
 
         queue
             .revoke(
+                &TenantScope::All,
                 &secrets.agent_id,
                 Some("key compromised".into()),
                 None,
@@ -1383,7 +1648,12 @@ mod tests {
             .expect("revoke");
         assert!(
             !queue
-                .verify_client_secret(&secrets.agent_id, &secrets.client_secret, now())
+                .verify_client_secret(
+                    &TenantScope::All,
+                    &secrets.agent_id,
+                    &secrets.client_secret,
+                    now()
+                )
                 .await
                 .expect("revoked"),
             "a revoked registration must stop authenticating immediately"
@@ -1399,9 +1669,13 @@ mod tests {
         let path = temp_path();
         let agent_id = {
             let queue = queue(&path);
-            let (secrets, _) = queue.register(metadata(), now()).await.expect("register");
+            let (secrets, _) = queue
+                .register(&TenantScope::All, metadata(), now())
+                .await
+                .expect("register");
             queue
                 .approve(
+                    &TenantScope::All,
                     &secrets.agent_id,
                     Some("looks real".into()),
                     Some("casey".into()),
@@ -1413,19 +1687,22 @@ mod tests {
         };
 
         let queue = queue(&path);
-        let view = queue.get(&agent_id).await.expect("get after restart");
+        let view = queue
+            .get(&TenantScope::All, &agent_id)
+            .await
+            .expect("get after restart");
         assert_eq!(view.state, ApprovalState::Approved);
         assert_eq!(view.decided_by.as_deref(), Some("casey"));
         assert_eq!(
             queue
-                .list(Some(ApprovalState::Approved))
+                .list(&TenantScope::All, Some(ApprovalState::Approved))
                 .await
                 .expect("list")
                 .len(),
             1
         );
         assert!(queue
-            .list(Some(ApprovalState::Pending))
+            .list(&TenantScope::All, Some(ApprovalState::Pending))
             .await
             .expect("list")
             .is_empty());
@@ -1437,7 +1714,10 @@ mod tests {
     async fn a_view_carries_no_credential_material() {
         let path = temp_path();
         let queue = queue(&path);
-        let (secrets, view) = queue.register(metadata(), now()).await.expect("register");
+        let (secrets, view) = queue
+            .register(&TenantScope::All, metadata(), now())
+            .await
+            .expect("register");
         let json = serde_json::to_string(&view).expect("serialize view");
         assert!(!json.contains("hash"), "no hash field reaches a read path");
         assert!(!json.contains(&secrets.client_secret));

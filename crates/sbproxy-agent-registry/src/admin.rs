@@ -30,7 +30,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::error::RegistryError;
-use crate::registration::{AgentMetadata, ApprovalState};
+use crate::registration::{AgentMetadata, ApprovalState, TenantScope};
 use crate::service::AgentRegistry;
 
 /// What a handler answers with: an HTTP status, a content type, and a body.
@@ -106,23 +106,34 @@ pub const ADMIN_PREFIX: &str = "/admin/agent-registry";
 /// `actor` is the admin operator the session resolved, which lands on the
 /// decision event and in the stored record. `None` is honest rather than a
 /// placeholder: an admin token with no operator behind it decided.
+///
+/// `tenant` is that operator's scope, from `proxy.admin.operators[].tenant`.
+/// `None` is a deployment-wide operator. A scoped operator sees and acts
+/// only inside its own tenant, and the two deployment-wide routes, the
+/// catalog listing and the feed refresh, are refused to it outright rather
+/// than silently narrowed. That is `dispatch_ai_chargeback`'s rule, for the
+/// same reason it gives: a quietly filtered answer reads as a fact about
+/// the deployment rather than about the caller's permissions.
 pub async fn dispatch(
     registry: &AgentRegistry,
     method: &str,
     path: &str,
     body: Option<&[u8]>,
     actor: Option<&str>,
+    tenant: Option<&str>,
     now: DateTime<Utc>,
 ) -> Option<AdminResponse> {
     let path_only = path.split('?').next().unwrap_or(path);
     let query = path.split_once('?').map(|(_, query)| query).unwrap_or("");
     let rest = path_only.strip_prefix(ADMIN_PREFIX)?;
+    let scope = TenantScope::from_principal(tenant);
 
     Some(match (method, rest) {
-        ("GET", "") => match registry.summary(now).await {
+        ("GET", "") => match registry.summary(&scope, now).await {
             Ok(summary) => AdminResponse::encode(200, &summary),
             Err(error) => AdminResponse::from_refusal(&error),
         },
+        ("GET", "/catalog") if scope.is_scoped() => deployment_wide_refusal("read the catalog"),
         ("GET", "/catalog") => {
             let catalog = registry.catalog();
             let entries = catalog.sorted_entries();
@@ -136,6 +147,7 @@ pub async fn dispatch(
                 }),
             )
         }
+        ("POST", "/refresh") if scope.is_scoped() => deployment_wide_refusal("refresh the feed"),
         ("POST", "/refresh") => match registry.refresh(now).await {
             Ok(applied) => AdminResponse::encode(200, &serde_json::json!({"entries": applied})),
             Err(error) => AdminResponse::from_refusal(&error),
@@ -145,7 +157,7 @@ pub async fn dispatch(
                 Ok(state) => state,
                 Err(response) => return Some(response),
             };
-            match registry.list(state).await {
+            match registry.list(&scope, state).await {
                 Ok(items) => AdminResponse::encode(200, &serde_json::json!({"items": items})),
                 Err(error) => AdminResponse::from_refusal(&error),
             }
@@ -155,7 +167,10 @@ pub async fn dispatch(
                 Ok(parsed) => parsed,
                 Err(response) => return Some(response),
             };
-            match registry.register(parsed.agent_metadata, now).await {
+            match registry
+                .register(&scope, parsed.agent_metadata, actor, now)
+                .await
+            {
                 Ok((secrets, view)) => AdminResponse::encode(
                     201,
                     &serde_json::json!({"secrets": secrets, "registration": view}),
@@ -173,7 +188,7 @@ pub async fn dispatch(
                 return Some(AdminResponse::error(404, "not_found", "no such route"));
             }
             match (method, action) {
-                ("GET", "") => match registry.get(agent_id).await {
+                ("GET", "") => match registry.get(&scope, agent_id).await {
                     Ok(view) => AdminResponse::encode(200, &view),
                     Err(error) => AdminResponse::from_refusal(&error),
                 },
@@ -183,7 +198,13 @@ pub async fn dispatch(
                         Err(response) => return Some(response),
                     };
                     match registry
-                        .approve(agent_id, parsed.reason, actor.map(str::to_owned), now)
+                        .approve(
+                            &scope,
+                            agent_id,
+                            parsed.reason,
+                            actor.map(str::to_owned),
+                            now,
+                        )
                         .await
                     {
                         Ok(view) => AdminResponse::encode(200, &view),
@@ -204,7 +225,7 @@ pub async fn dispatch(
                         ));
                     };
                     match registry
-                        .reject(agent_id, reason, actor.map(str::to_owned), now)
+                        .reject(&scope, agent_id, reason, actor.map(str::to_owned), now)
                         .await
                     {
                         Ok(view) => AdminResponse::encode(200, &view),
@@ -217,7 +238,13 @@ pub async fn dispatch(
                         Err(response) => return Some(response),
                     };
                     match registry
-                        .revoke(agent_id, parsed.reason, actor.map(str::to_owned), now)
+                        .revoke(
+                            &scope,
+                            agent_id,
+                            parsed.reason,
+                            actor.map(str::to_owned),
+                            now,
+                        )
                         .await
                     {
                         Ok(view) => AdminResponse::encode(200, &view),
@@ -230,7 +257,7 @@ pub async fn dispatch(
                         Err(response) => return Some(response),
                     };
                     match registry
-                        .rotate_secret(agent_id, &parsed.registration_access_token, now)
+                        .rotate_secret(&scope, agent_id, &parsed.registration_access_token, now)
                         .await
                     {
                         Ok(rotated) => AdminResponse::encode(200, &rotated),
@@ -242,6 +269,15 @@ pub async fn dispatch(
         }
         _ => AdminResponse::error(404, "not_found", "no such route"),
     })
+}
+
+/// The refusal a tenant-scoped operator gets on a deployment-wide route.
+fn deployment_wide_refusal(what: &str) -> AdminResponse {
+    AdminResponse::error(
+        403,
+        "forbidden",
+        &format!("the agent catalog is deployment-wide; a tenant-scoped operator cannot {what}"),
+    )
 }
 
 fn parse_state_filter(query: &str) -> std::result::Result<Option<ApprovalState>, AdminResponse> {
@@ -367,9 +403,263 @@ mod tests {
         path: &str,
         body: Option<&[u8]>,
     ) -> AdminResponse {
-        dispatch(registry, method, path, body, Some("casey"), now())
+        dispatch(registry, method, path, body, Some("casey"), None, now())
             .await
             .expect("route exists")
+    }
+
+    async fn call_as(
+        registry: &AgentRegistry,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+        tenant: Option<&str>,
+    ) -> AdminResponse {
+        dispatch(registry, method, path, body, Some("casey"), tenant, now())
+            .await
+            .expect("route exists")
+    }
+
+    /// A tenant-scoped operator must not be able to revoke another
+    /// tenant's approved agent. The port had dropped the workspace
+    /// dimension the enterprise queue scoped every operation by, and the
+    /// dispatcher read only the operator's username off the principal, so
+    /// a `tenant: acme` operator could revoke `globex`'s agents and the
+    /// audit trail would show only that they had.
+    #[tokio::test]
+    async fn a_tenant_scoped_operator_cannot_reach_another_tenants_registration() {
+        let path = temp_path();
+        let registry = registry(&path);
+
+        // Globex submits and is approved by a deployment-wide operator.
+        let created = call_as(
+            &registry,
+            "POST",
+            "/admin/agent-registry/registrations",
+            Some(&register_body()),
+            Some("globex"),
+        )
+        .await;
+        assert_eq!(created.status, 201);
+        let created: serde_json::Value = serde_json::from_str(&created.body).expect("json");
+        assert_eq!(
+            created["registration"]["tenant"],
+            serde_json::json!("globex")
+        );
+        let agent_id = created["registration"]["agent_id"]
+            .as_str()
+            .expect("agent id")
+            .to_string();
+        assert_eq!(
+            call_as(
+                &registry,
+                "POST",
+                &format!("/admin/agent-registry/registrations/{agent_id}/approve"),
+                None,
+                Some("globex"),
+            )
+            .await
+            .status,
+            200
+        );
+
+        // Acme cannot see it, read it, or revoke it.
+        let listed = call_as(
+            &registry,
+            "GET",
+            "/admin/agent-registry/registrations",
+            None,
+            Some("acme"),
+        )
+        .await;
+        assert_eq!(listed.status, 200);
+        assert!(
+            !listed.body.contains(&agent_id),
+            "another tenant's registration must not appear in the listing: {}",
+            listed.body
+        );
+
+        let read = call_as(
+            &registry,
+            "GET",
+            &format!("/admin/agent-registry/registrations/{agent_id}"),
+            None,
+            Some("acme"),
+        )
+        .await;
+        assert_eq!(
+            read.status, 404,
+            "and reading it is indistinguishable from absent"
+        );
+
+        let revoked = call_as(
+            &registry,
+            "POST",
+            &format!("/admin/agent-registry/registrations/{agent_id}/revoke"),
+            Some(br#"{"reason":"not mine"}"#),
+            Some("acme"),
+        )
+        .await;
+        assert_eq!(revoked.status, 404);
+
+        // The agent is still approved, which is the property the 404 is
+        // there to protect.
+        let still = call_as(
+            &registry,
+            "GET",
+            &format!("/admin/agent-registry/registrations/{agent_id}"),
+            None,
+            Some("globex"),
+        )
+        .await;
+        assert_eq!(still.status, 200);
+        assert!(
+            still.body.contains("\"state\":\"approved\""),
+            "{}",
+            still.body
+        );
+
+        // A deployment-wide operator still sees everything.
+        let all = call(
+            &registry,
+            "GET",
+            "/admin/agent-registry/registrations",
+            None,
+        )
+        .await;
+        assert!(all.body.contains(&agent_id));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The catalog is one signed feed for the whole proxy, so a
+    /// tenant-scoped operator is refused outright rather than handed a
+    /// silently narrowed answer. That is `dispatch_ai_chargeback`'s rule
+    /// and it is here for the reason that one gives: a quietly filtered
+    /// result reads as a fact about the deployment.
+    #[tokio::test]
+    async fn a_tenant_scoped_operator_is_refused_the_deployment_wide_catalog() {
+        let path = temp_path();
+        let registry = registry(&path);
+
+        let refused = call_as(
+            &registry,
+            "GET",
+            "/admin/agent-registry/catalog",
+            None,
+            Some("acme"),
+        )
+        .await;
+        assert_eq!(refused.status, 403);
+        assert!(refused.body.contains("deployment-wide"), "{}", refused.body);
+
+        let refused = call_as(
+            &registry,
+            "POST",
+            "/admin/agent-registry/refresh",
+            None,
+            Some("acme"),
+        )
+        .await;
+        assert_eq!(refused.status, 403);
+
+        // Deployment-wide operators are not refused.
+        assert_eq!(
+            call(&registry, "GET", "/admin/agent-registry/catalog", None)
+                .await
+                .status,
+            200
+        );
+
+        // The summary is allowed for both and says which scope it covers.
+        let scoped = call_as(
+            &registry,
+            "GET",
+            "/admin/agent-registry",
+            None,
+            Some("acme"),
+        )
+        .await;
+        assert_eq!(scoped.status, 200);
+        assert!(
+            scoped.body.contains("\"scope\":\"acme\""),
+            "{}",
+            scoped.body
+        );
+        assert!(
+            scoped.body.contains("\"catalog_writable\":false"),
+            "{}",
+            scoped.body
+        );
+
+        let global = call(&registry, "GET", "/admin/agent-registry", None).await;
+        assert!(global.body.contains("\"scope\":\"all\""), "{}", global.body);
+        assert!(
+            global.body.contains("\"catalog_writable\":true"),
+            "{}",
+            global.body
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// One tenant's refusal must not refuse another tenant's identical
+    /// description: the durable replay index is keyed per tenant.
+    #[tokio::test]
+    async fn a_refusal_in_one_tenant_does_not_burn_another_tenants_description() {
+        let path = temp_path();
+        let registry = registry(&path);
+
+        let created = call_as(
+            &registry,
+            "POST",
+            "/admin/agent-registry/registrations",
+            Some(&register_body()),
+            Some("acme"),
+        )
+        .await;
+        let created: serde_json::Value = serde_json::from_str(&created.body).expect("json");
+        let agent_id = created["registration"]["agent_id"].as_str().expect("id");
+        assert_eq!(
+            call_as(
+                &registry,
+                "POST",
+                &format!("/admin/agent-registry/registrations/{agent_id}/reject"),
+                Some(br#"{"reason":"no"}"#),
+                Some("acme"),
+            )
+            .await
+            .status,
+            200
+        );
+
+        // Acme is refused for good; globex is not.
+        assert_eq!(
+            call_as(
+                &registry,
+                "POST",
+                "/admin/agent-registry/registrations",
+                Some(&register_body()),
+                Some("acme"),
+            )
+            .await
+            .status,
+            409
+        );
+        assert_eq!(
+            call_as(
+                &registry,
+                "POST",
+                "/admin/agent-registry/registrations",
+                Some(&register_body()),
+                Some("globex"),
+            )
+            .await
+            .status,
+            201
+        );
+
+        std::fs::remove_file(&path).ok();
     }
 
     /// The seam this whole surface hangs off: a path outside the prefix has
@@ -380,7 +670,7 @@ mod tests {
         let path = temp_path();
         let registry = registry(&path);
         assert!(
-            dispatch(&registry, "GET", "/admin/keys", None, None, now())
+            dispatch(&registry, "GET", "/admin/keys", None, None, None, now())
                 .await
                 .is_none(),
             "an unrelated admin route must fall through"
@@ -390,6 +680,7 @@ mod tests {
                 &registry,
                 "GET",
                 "/admin/agent-registry/nope",
+                None,
                 None,
                 None,
                 now()

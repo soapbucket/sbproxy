@@ -6952,6 +6952,12 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
             path,
             body_owned.as_deref().map(str::as_bytes),
             Some(operator.username.as_str()),
+            // WOR-2664 review: the resolved principal's tenant, so a scoped
+            // operator sees and acts only inside it. The dispatcher runs on
+            // the connection task, which is the only place the principal is
+            // available, which is why the meter and chargeback routes make
+            // this same decision here rather than deeper.
+            operator.tenant.as_deref(),
             chrono::Utc::now(),
         )
         .await
@@ -8037,6 +8043,97 @@ mod tests {
             approved.contains("\"decided_by\":\"admin\""),
             "the authenticated operator has to reach the stored decision: {approved}"
         );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// WOR-2664 review: the dispatcher read only the operator's username
+    /// off the resolved principal, so a `tenant: acme` operator had read
+    /// and write over every tenant's registrations. This drives the real
+    /// connection with a tenant-scoped operator and asserts the deployment
+    /// -wide catalog route refuses it, which is the same rule
+    /// `dispatch_ai_chargeback` states two thousand lines up.
+    #[tokio::test]
+    async fn a_tenant_scoped_operator_is_refused_the_deployment_wide_catalog_route() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let path = format!(
+            "{}/sbproxy_core_registry_tenant_{}_{}.redb",
+            std::env::temp_dir().display(),
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let store = sbproxy_platform::storage::EmbeddedKvStore::open(&path, "agent_registry")
+            .expect("open store");
+        let registry = std::sync::Arc::new(
+            sbproxy_agent_registry::AgentRegistry::new(
+                std::sync::Arc::new(store),
+                std::sync::Arc::new(sbproxy_platform::storage::MemoryKv::new("agent_registry")),
+                sbproxy_agent_registry::AgentRegistryOptions::default(),
+            )
+            .expect("registry"),
+        );
+
+        let config = AdminConfig {
+            username: "admin".to_string(),
+            password: "secret".to_string(),
+            operators: vec![AdminOperator {
+                username: "casey".to_string(),
+                password_hash: sbproxy_keystore::crypto::hash_secret(
+                    "hunter2",
+                    &crate::key_plane::default_admin_operator_pepper(),
+                ),
+                role: AdminRole::Admin,
+                tenant: Some("acme".to_string()),
+            }],
+            ..AdminConfig::default()
+        };
+        let state = std::sync::Arc::new(
+            AdminState::new(config).with_agent_registry(std::sync::Arc::clone(&registry)),
+        );
+        // An operator's tenant is resolved from `proxy.admin.operators` on
+        // every request, and only a session principal carries one: the
+        // top-level Basic credential is the deployment's own operator and
+        // is never narrowed.
+        let (token, _) = state
+            .session_signer
+            .mint("casey", AdminRole::Admin, 3600, unix_now());
+
+        let refused = admin_connection_roundtrip(
+            std::sync::Arc::clone(&state),
+            "10.0.0.46",
+            &format!(
+                "GET /admin/agent-registry/catalog HTTP/1.1\r\nCookie: sb_admin_session={token}\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(refused.starts_with("HTTP/1.1 403"), "{refused}");
+        assert!(refused.contains("deployment-wide"), "{refused}");
+
+        // The summary is allowed and reports the scope it covers, so the
+        // console can hide what the operator cannot reach.
+        let summary = admin_connection_roundtrip(
+            std::sync::Arc::clone(&state),
+            "10.0.0.46",
+            &format!(
+                "GET /admin/agent-registry HTTP/1.1\r\nCookie: sb_admin_session={token}\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(summary.starts_with("HTTP/1.1 200"), "{summary}");
+        assert!(summary.contains("\"scope\":\"acme\""), "{summary}");
+
+        // The deployment-wide credential is not refused.
+        let allowed = admin_connection_roundtrip(
+            state,
+            "10.0.0.46",
+            &format!(
+                "GET /admin/agent-registry/catalog HTTP/1.1\r\nAuthorization: {}\r\n\r\n",
+                synthesize_basic("admin", "secret")
+            ),
+        )
+        .await;
+        assert!(allowed.starts_with("HTTP/1.1 200"), "{allowed}");
 
         std::fs::remove_file(&path).ok();
     }

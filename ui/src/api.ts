@@ -2521,6 +2521,7 @@ export interface AgentMetadata {
 /** One row of the approval queue. */
 export interface AgentRegistration {
   agent_id: string;
+  tenant: string;
   client_id: string;
   metadata: AgentMetadata;
   state: AgentRegistrationState;
@@ -2554,6 +2555,10 @@ export interface AgentCatalogResponse {
 /** `GET /admin/agent-registry`. `feed_configured` and `bootstrap_keys` are
  *  what separate "the publisher sent nothing" from "no feed is wired up". */
 export interface AgentRegistrySummary {
+  /** The tenant the queue counts cover: a tenant name, or `all`. */
+  scope: string;
+  /** Whether this operator may read the catalog and refresh the feed. */
+  catalog_writable: boolean;
   catalog_entries: number;
   catalog_generated_at: string | null;
   catalog_expires_at: string | null;

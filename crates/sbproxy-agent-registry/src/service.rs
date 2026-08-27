@@ -24,7 +24,7 @@ use crate::feed::{verify_feed, verify_key_directory, BootstrapKeys};
 use crate::metrics::{record_registry_op, set_registry_entries};
 use crate::registration::{
     AgentMetadata, ApprovalState, RegistrationQueue, RegistrationSecrets, RegistrationView,
-    RotatedSecret,
+    RotatedSecret, TenantScope,
 };
 
 /// How the registry was configured.
@@ -62,6 +62,16 @@ impl Default for AgentRegistryOptions {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct RegistrySummary {
+    /// The tenant these queue counts cover: a tenant name for a scoped
+    /// operator, or `all` for a deployment-wide one. The catalog fields
+    /// below are always deployment-wide, because the catalog is one signed
+    /// feed for the whole proxy; a scoped operator sees its size here and
+    /// is refused its contents.
+    pub scope: String,
+    /// Whether this operator may read the catalog listing and refresh the
+    /// feed. False for a tenant-scoped operator, which is what the console
+    /// hides those controls on.
+    pub catalog_writable: bool,
     /// How many agents the live catalog names.
     pub catalog_entries: usize,
     /// When the publisher built the catalog in memory, if there is one.
@@ -200,14 +210,16 @@ impl AgentRegistry {
     /// Accept a submission into the queue.
     pub async fn register(
         &self,
+        scope: &TenantScope,
         metadata: AgentMetadata,
+        actor: Option<&str>,
         now: DateTime<Utc>,
     ) -> Result<(RegistrationSecrets, RegistrationView)> {
-        let outcome = self.queue.register(metadata, now).await;
+        let outcome = self.queue.register(scope, metadata, now).await;
         match &outcome {
             Ok((_, view)) => {
                 record_registry_op("register", "applied");
-                self.emit_decision(&view.agent_id, "submitted", view.state, None);
+                self.emit_decision(&view.agent_id, "submitted", view.state, actor);
             }
             Err(error) => record_registry_op("register", error.outcome()),
         }
@@ -220,13 +232,17 @@ impl AgentRegistry {
     /// Approve a pending registration.
     pub async fn approve(
         &self,
+        scope: &TenantScope,
         agent_id: &str,
         reason: Option<String>,
         decided_by: Option<String>,
         now: DateTime<Utc>,
     ) -> Result<RegistrationView> {
         let actor = decided_by.clone();
-        let outcome = self.queue.approve(agent_id, reason, decided_by, now).await;
+        let outcome = self
+            .queue
+            .approve(scope, agent_id, reason, decided_by, now)
+            .await;
         self.after_decision("approve", agent_id, actor, outcome)
             .await
     }
@@ -234,13 +250,17 @@ impl AgentRegistry {
     /// Reject a pending registration, burning its slug.
     pub async fn reject(
         &self,
+        scope: &TenantScope,
         agent_id: &str,
         reason: String,
         decided_by: Option<String>,
         now: DateTime<Utc>,
     ) -> Result<RegistrationView> {
         let actor = decided_by.clone();
-        let outcome = self.queue.reject(agent_id, reason, decided_by, now).await;
+        let outcome = self
+            .queue
+            .reject(scope, agent_id, reason, decided_by, now)
+            .await;
         self.after_decision("reject", agent_id, actor, outcome)
             .await
     }
@@ -248,13 +268,17 @@ impl AgentRegistry {
     /// Revoke a registration, burning its slug.
     pub async fn revoke(
         &self,
+        scope: &TenantScope,
         agent_id: &str,
         reason: Option<String>,
         decided_by: Option<String>,
         now: DateTime<Utc>,
     ) -> Result<RegistrationView> {
         let actor = decided_by.clone();
-        let outcome = self.queue.revoke(agent_id, reason, decided_by, now).await;
+        let outcome = self
+            .queue
+            .revoke(scope, agent_id, reason, decided_by, now)
+            .await;
         self.after_decision("revoke", agent_id, actor, outcome)
             .await
     }
@@ -303,13 +327,14 @@ impl AgentRegistry {
     /// registration access token.
     pub async fn rotate_secret(
         &self,
+        scope: &TenantScope,
         agent_id: &str,
         registration_access_token: &str,
         now: DateTime<Utc>,
     ) -> Result<RotatedSecret> {
         let outcome = self
             .queue
-            .rotate_secret(agent_id, registration_access_token, now)
+            .rotate_secret(scope, agent_id, registration_access_token, now)
             .await;
         match &outcome {
             Ok(_) => record_registry_op("rotate", "applied"),
@@ -321,13 +346,14 @@ impl AgentRegistry {
     /// Whether `presented` authenticates as this agent right now.
     pub async fn verify_client_secret(
         &self,
+        scope: &TenantScope,
         agent_id: &str,
         presented: &str,
         now: DateTime<Utc>,
     ) -> Result<bool> {
         let outcome = self
             .queue
-            .verify_client_secret(agent_id, presented, now)
+            .verify_client_secret(scope, agent_id, presented, now)
             .await;
         match &outcome {
             Ok(true) => record_registry_op("verify", "applied"),
@@ -338,19 +364,27 @@ impl AgentRegistry {
     }
 
     /// Read one registration.
-    pub async fn get(&self, agent_id: &str) -> Result<RegistrationView> {
-        self.queue.get(agent_id).await
+    pub async fn get(&self, scope: &TenantScope, agent_id: &str) -> Result<RegistrationView> {
+        self.queue.get(scope, agent_id).await
     }
 
     /// List registrations, optionally filtered to one state.
-    pub async fn list(&self, state: Option<ApprovalState>) -> Result<Vec<RegistrationView>> {
-        self.queue.list(state).await
+    pub async fn list(
+        &self,
+        scope: &TenantScope,
+        state: Option<ApprovalState>,
+    ) -> Result<Vec<RegistrationView>> {
+        self.queue.list(scope, state).await
     }
 
     /// The operator summary.
-    pub async fn summary(&self, now: DateTime<Utc>) -> Result<RegistrySummary> {
+    pub async fn summary(
+        &self,
+        scope: &TenantScope,
+        now: DateTime<Utc>,
+    ) -> Result<RegistrySummary> {
         let catalog = self.catalog.snapshot();
-        let counts = self.queue.counts().await?;
+        let counts = self.queue.counts(scope).await?;
         let count_of = |wanted: ApprovalState| {
             counts
                 .iter()
@@ -359,6 +393,11 @@ impl AgentRegistry {
                 .unwrap_or(0)
         };
         Ok(RegistrySummary {
+            scope: match scope {
+                TenantScope::All => "all".to_string(),
+                TenantScope::Only(tenant) => tenant.clone(),
+            },
+            catalog_writable: !scope.is_scoped(),
             catalog_entries: catalog.len(),
             catalog_generated_at: catalog.generated_at(),
             catalog_expires_at: catalog.expires_at(),
@@ -375,7 +414,7 @@ impl AgentRegistry {
 
     async fn publish_gauges(&self) -> Result<()> {
         set_registry_entries("catalog", self.catalog.snapshot().len() as i64);
-        for (state, count) in self.queue.counts().await? {
+        for (state, count) in self.queue.counts(&TenantScope::All).await? {
             let collection = match state {
                 ApprovalState::Pending => "pending",
                 ApprovalState::Approved => "approved",
@@ -468,17 +507,23 @@ mod tests {
         let registry = registry(&path, AgentRegistryOptions::default());
         registry.boot().await.expect("boot");
 
-        let summary = registry.summary(now()).await.expect("summary");
+        let summary = registry
+            .summary(&TenantScope::All, now())
+            .await
+            .expect("summary");
         assert_eq!(summary.catalog_entries, 0);
         assert!(!summary.feed_configured, "no feed path means no refresh");
         assert_eq!(summary.bootstrap_keys, 0);
         assert_eq!(summary.pending, 0);
 
         registry
-            .register(metadata(), now())
+            .register(&TenantScope::All, metadata(), None, now())
             .await
             .expect("register");
-        let summary = registry.summary(now()).await.expect("summary");
+        let summary = registry
+            .summary(&TenantScope::All, now())
+            .await
+            .expect("summary");
         assert_eq!(summary.pending, 1);
         assert_eq!(summary.approved, 0);
 

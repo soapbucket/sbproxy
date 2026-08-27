@@ -214,6 +214,48 @@ as valid would make the approval gate decorative. A wrong token and an
 unknown agent id return the identical `401`, so the route cannot be used to
 find out which slugs exist.
 
+## Tenancy
+
+The queue is tenant-scoped. The catalog is not.
+
+A registration is recorded against the tenant of the operator who
+submitted it, taken from `proxy.admin.operators[].tenant`. An operator with
+no tenant is deployment-wide: they see and act on every tenant, and their
+own submissions are recorded under `default`.
+
+A tenant-scoped operator sees and acts only inside their own tenant.
+Another tenant's registration answers `404` on read, on decide, and on
+rotate, and does not appear in a listing. The `404` is deliberate: a
+distinct `403` would make the route an oracle for which agent ids exist in
+other tenants, and there is nothing the caller can do differently either
+way.
+
+The durable replay index is tenant-qualified too, so one tenant refusing a
+description does not refuse another tenant's identical one.
+
+The catalog is one signed feed for the whole proxy, so there is no
+per-tenant answer to give. A tenant-scoped operator is refused the catalog
+listing and the feed refresh outright rather than handed a silently
+narrowed one:
+
+```json
+{"error":"the agent catalog is deployment-wide; a tenant-scoped operator cannot read the catalog","code":"forbidden"}
+```
+
+That is the same rule the chargeback export and the meter routes follow,
+and it is here for the reason those give: a quietly filtered answer reads
+as a fact about the deployment rather than about the caller's permissions.
+
+`GET /admin/agent-registry` is allowed for both, and says which scope its
+queue counts cover:
+
+```json
+{"scope":"acme","catalog_writable":false,"pending":2,"approved":7,"catalog_entries":41}
+```
+
+`catalog_entries` and the two catalog timestamps are deployment-wide in
+both answers. They are a size and two dates, not catalog contents.
+
 ## The signed catalog
 
 The catalog half needs two files, and SBproxy verifies both rather than

@@ -1,0 +1,4 @@
+{
+  "type": "fixed",
+  "message": "The agent registry admin surface now honors the operator tenant from `proxy.admin.operators`: a tenant-scoped operator sees and acts only inside its own tenant, and the deployment-wide catalog listing and feed refresh are refused rather than silently narrowed."
+}

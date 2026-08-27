@@ -70,6 +70,6 @@ pub use error::{RegistryError, Result};
 pub use feed::{AgentFeed, BootstrapKeys, FeedEntry};
 pub use registration::{
     AgentMetadata, ApprovalState, Purpose, RegistrationSecrets, RegistrationView, RequestedScope,
-    RotatedSecret,
+    RotatedSecret, TenantScope, DEFAULT_TENANT,
 };
 pub use service::{AgentRegistry, AgentRegistryOptions, RegistrySummary};

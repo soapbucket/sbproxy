@@ -163,6 +163,7 @@ async function refreshFeed() {
         <thead>
           <tr>
             <th>Agent</th>
+            <th>Tenant</th>
             <th>Vendor</th>
             <th>Purpose</th>
             <th>State</th>
@@ -173,6 +174,7 @@ async function refreshFeed() {
         <tbody>
           <tr v-for="row in rows" :key="row.agent_id">
             <td class="sb-mono">{{ row.agent_id }}</td>
+            <td class="sb-mono">{{ row.tenant }}</td>
             <td>{{ row.metadata.vendor }}</td>
             <td class="sb-mono">{{ row.metadata.purpose }}</td>
             <td>
@@ -226,6 +228,14 @@ async function refreshFeed() {
 
     <h2 class="section">Verified catalog</h2>
 
+    <p v-if="stats && !stats.catalog_writable" class="note">
+      The catalog is one signed feed for the whole proxy, so there is no
+      per-tenant answer to give. This operator is scoped to
+      <code class="sb-mono">{{ stats.scope }}</code> and the catalog is
+      deployment-wide, so the listing and the reverify button are not
+      available here.
+    </p>
+    <template v-else>
     <p v-if="stats && !stats.feed_configured" class="note">
       No feed is configured, so the catalog can only hold what the store last
       cached. Set <code class="sb-mono">agent_registry.feed_path</code>,
@@ -273,6 +283,7 @@ async function refreshFeed() {
         </tbody>
       </table>
     </div>
+    </template>
   </template>
 </template>
 

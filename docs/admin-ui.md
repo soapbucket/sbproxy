@@ -230,6 +230,10 @@ to see one was a curl against the admin API.
   `.../reject`, `.../revoke`, and `POST /admin/agent-registry/refresh` to
   reverify the feed on disk. The reject button stays disabled until a reason
   is typed, because a rejection refuses that description for good.
+- **Tenancy:** the queue is scoped to the operator's own tenant when
+  `proxy.admin.operators[].tenant` names one; the catalog and the reverify
+  button are deployment-wide and the page hides both for a scoped operator,
+  matching the `403` the routes answer.
 - **Empty/error notes:** every route answers `404` when
   `proxy.agent_registry` is absent or disabled, and the page renders that as
   "not configured" rather than as an error. A configured registry with no
