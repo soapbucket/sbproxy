@@ -121,6 +121,27 @@ pub fn extract_type(value: &serde_json::Value) -> Result<String> {
 /// over a documented form. Exact names only - a `:-` default is not
 /// part of `resolve_var`'s syntax, so `${method:-GET}` keeps its env
 /// treatment.
+/// The access-log `custom_fields` DOTTED interpolation vocabulary, the
+/// prefixes `sbproxy-core`'s `custom_log::resolve_var` answers from the
+/// per-request context rather than from the process environment
+/// (`crates/sbproxy-core/src/server/custom_log.rs:274-286`, documented
+/// in docs/access-log.md).
+///
+/// Same reasoning as [`ACCESS_LOG_BARE_VARS`], which covered only the
+/// bare names: substituting a process variable would bake a boot-time
+/// constant into a per-request log field, and reporting one as
+/// unresolved would make a config authority refuse a whole bundle over
+/// a documented form. Missing these two cost the confined fragment pass
+/// a false refusal against a `fields:` block written exactly as
+/// documented (WOR-2433 review).
+///
+/// `env.` is deliberately absent: `resolve_var` answers `${env.NAME}`
+/// from `std::env::var`, so it is a real environment reference on both
+/// sides. Prefixes are matched exactly as `resolve_var` matches them,
+/// `request.header.` and not the wider `request.`, so the carve-out
+/// cannot be wider than the runtime resolver it mirrors.
+const ACCESS_LOG_DOTTED_PREFIXES: &[&str] = &["request.header.", "attribution."];
+
 const ACCESS_LOG_BARE_VARS: &[&str] = &[
     "method",
     "path",
@@ -158,10 +179,28 @@ const ACCESS_LOG_BARE_VARS: &[&str] = &[
 /// by exact match for the same reason: they are per-request vocabulary
 /// resolved by `custom_log.rs`, never env references.
 pub(crate) fn placeholder_is_env_reference(var_name: &str) -> bool {
+    // `${}` names nothing. `interpolate_env_vars` guards on
+    // `!var_name.is_empty()` and never looks it up, so calling it an
+    // environment reference is a false positive in both directions: the
+    // hazard scan told an operator to export a variable with no name,
+    // and a config authority subscriber refuses a whole bundle over a
+    // literal `${}` that could never have resolved. Excluded so this
+    // predicate is exactly as wide as the pass it describes, which is
+    // what the confined pass's biconditional test asserts
+    // (WOR-2433 review).
+    if var_name.is_empty() {
+        return false;
+    }
     if ACCESS_LOG_BARE_VARS.contains(&var_name) {
         return false;
     }
     let name = var_name.split_once(":-").map_or(var_name, |(name, _)| name);
+    if ACCESS_LOG_DOTTED_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    {
+        return false;
+    }
     !(name.starts_with("args.") || name.starts_with("steps."))
 }
 
@@ -249,10 +288,19 @@ pub fn interpolate_env_vars(input: &str) -> String {
                         },
                     }
                 } else {
+                    // Either an empty name (`${}`) or an unterminated
+                    // `${`. Both are left literal, byte for byte: the
+                    // closing brace is re-emitted when the input had
+                    // one, so `${}` round-trips instead of coming back
+                    // as `${`. The CLI's deleted private copy got this
+                    // right and this one did not, and `sbproxy config
+                    // print` is the command an operator runs precisely
+                    // to see the value the box will actually use
+                    // (WOR-2433 review).
                     result.push_str("${");
                     result.push_str(&var_name);
-                    if !found_close {
-                        // Unterminated ${, just push what we have
+                    if found_close {
+                        result.push('}');
                     }
                 }
             } else {
