@@ -1,0 +1,4 @@
+{
+  "type": "fixed",
+  "message": "**`resilience.outlier_detection` now sees `race` routing outcomes.** The race fan-out recorded the per-attempt metric and the provider's quota headers, but never fed the router's health axes, so the circuit breaker and the outlier detector never learned that a racing provider had failed and a provider that lost every race by failing was never ejected. Each settled leg is now recorded the way the sequential path records one: a 5xx or a transport error is a failure, a 4xx is the caller's error and counts as a success, and a leg the winner cancelled or a quota-pool refusal that never reached an upstream records nothing."
+}

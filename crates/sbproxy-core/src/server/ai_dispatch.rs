@@ -254,6 +254,129 @@ fn update_router_quota_from_response(
     router.update_quota_from_headers(provider_name, &headers, status);
 }
 
+/// Feed one settled race leg's outcome to the router's provider health
+/// axes: the circuit breaker and the outlier detector.
+///
+/// The raced fan-out used to record the attempt metric and the quota
+/// headers and stop there, so `resilience.outlier_detection` never saw
+/// a race outcome: a provider that lost every race by failing stayed
+/// eligible forever, in exactly the routing mode where a consistently
+/// losing provider wastes the most upstream calls per request
+/// (WOR-2532).
+///
+/// The classification matches the sequential path in
+/// `sbproxy_ai::client` and Envoy's outlier detector: a 5xx is the
+/// upstream's failure, a 4xx is the caller's and counts as a success,
+/// and a leg that never produced a response at all is a failure. Two
+/// things deliberately record nothing. A loser the winner cancelled
+/// never settles, so this is never reached for it, the same way a
+/// cancelled Envoy hedge contributes no outlier sample. A quota-pool
+/// refusal is local admission control that never reached an upstream,
+/// so it is not an upstream health signal either.
+///
+/// Synchronous on purpose: `handle_ai_proxy` sits at the 2 MB Pingora
+/// worker stack limit, so the drain loop that calls this cannot afford
+/// another await point.
+fn record_raced_leg_health(
+    router: &sbproxy_ai::Router,
+    provider_idx: usize,
+    provider_name: &str,
+    status: Option<u16>,
+) {
+    let upstream_failed = match status {
+        Some(status) => (500..600).contains(&status),
+        None => true,
+    };
+    if upstream_failed {
+        router.record_provider_failure(provider_idx, provider_name);
+    } else {
+        router.record_provider_success(provider_idx, provider_name);
+    }
+}
+
+#[cfg(test)]
+mod raced_leg_health_tests {
+    use super::*;
+
+    /// A two-provider `race` pool whose outlier detector ejects on the
+    /// second sample, matching the fixture the sequential path's own
+    /// ejection test uses in `sbproxy-ai::handler`.
+    fn raced_pool() -> sbproxy_ai::AiHandlerConfig {
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "openai", "api_key": "k"},
+                {"name": "anthropic", "api_key": "k"}
+            ],
+            "routing": {"strategy": "race"},
+            "resilience": {
+                "outlier_detection": {
+                    "threshold": 0.5,
+                    "window_secs": 60,
+                    "min_requests": 2,
+                    "ejection_duration_secs": 300
+                }
+            }
+        }))
+        .expect("a race pool with outlier detection compiles")
+    }
+
+    #[test]
+    fn a_racing_leg_that_answers_5xx_reaches_outlier_detection() {
+        // WOR-2532: the race fan-out recorded the attempt metric and the
+        // quota headers and stopped there, so a provider that lost every
+        // race by failing stayed eligible forever.
+        let config = raced_pool();
+        let router = config.router();
+
+        record_raced_leg_health(&router, 1, "anthropic", Some(503));
+        assert_eq!(
+            router.eligible_indices(&config.providers),
+            vec![0, 1],
+            "one sample is under min_requests, so nothing is ejected yet"
+        );
+        record_raced_leg_health(&router, 1, "anthropic", Some(500));
+        assert_eq!(
+            router.eligible_indices(&config.providers),
+            vec![0],
+            "a racing provider that keeps answering 5xx has to leave the pool"
+        );
+    }
+
+    #[test]
+    fn a_racing_leg_that_never_reached_an_upstream_counts_as_a_failure() {
+        let config = raced_pool();
+        let router = config.router();
+
+        record_raced_leg_health(&router, 0, "openai", None);
+        record_raced_leg_health(&router, 0, "openai", None);
+        assert_eq!(
+            router.eligible_indices(&config.providers),
+            vec![1],
+            "a transport error is the upstream's failure, not the caller's"
+        );
+    }
+
+    #[test]
+    fn a_racing_leg_that_answers_4xx_is_not_an_upstream_failure() {
+        // Envoy's `consecutive_5xx` detector counts a 4xx as a success:
+        // the caller sent a bad request and the upstream answered it
+        // correctly. Ejecting on it would take a healthy provider out of
+        // the pool for someone else's malformed prompt.
+        let config = raced_pool();
+        let router = config.router();
+
+        for _ in 0..8 {
+            record_raced_leg_health(&router, 0, "openai", Some(429));
+            record_raced_leg_health(&router, 0, "openai", Some(400));
+        }
+        assert_eq!(
+            router.eligible_indices(&config.providers),
+            vec![0, 1],
+            "client errors must not eject the provider that reported them"
+        );
+    }
+}
+
 /// Run one selected provider attempt with shared load-balancer observation.
 ///
 /// The in-flight guard is cancellation-safe. Successful response-header
@@ -11796,6 +11919,16 @@ pub(super) async fn handle_ai_proxy(
                         &config.providers[idx].name,
                         outcome,
                     );
+                    // WOR-2532: the same settled leg has to reach the
+                    // router's health axes, or `resilience.outlier_detection`
+                    // never sees a race outcome and a provider that loses
+                    // every race by failing is never ejected.
+                    record_raced_leg_health(
+                        &router,
+                        idx,
+                        &config.providers[idx].name,
+                        Some(status),
+                    );
                     if (200..300).contains(&status) {
                         winner = Some((idx, resp));
                         break;
@@ -11808,6 +11941,7 @@ pub(super) async fn handle_ai_proxy(
                         &config.providers[idx].name,
                         "error",
                     );
+                    record_raced_leg_health(&router, idx, &config.providers[idx].name, None);
                     last_error_type = ai_transport_error_type(&e);
                     last_error = Some(e);
                 }
