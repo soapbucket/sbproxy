@@ -8772,6 +8772,10 @@ impl ProxyHttp for SbProxy {
                 // double-count a cached prefix.
                 tokens_cached: ctx.ai_tokens_cached,
                 tokens_cache_write: ctx.ai_tokens_cache_write,
+                // WOR-2658: the tier that priced them, beside the
+                // tokens. Always the operator's; the caller's own
+                // `service_tier` field never survives dispatch.
+                service_tier: ctx.ai_service_tier.as_ref().map(ToString::to_string),
                 cost_usd_micros: ctx.ai_cost_usd_micros,
                 guardrail_category: ctx.ai_guardrail_category.clone(),
                 guardrail_action: ctx.ai_guardrail_action.clone(),

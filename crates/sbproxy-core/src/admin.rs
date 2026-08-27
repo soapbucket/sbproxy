@@ -434,6 +434,21 @@ pub struct RequestLogEntry {
     /// only cache reads. Also a subset of `tokens_in`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_cache_write: Option<u64>,
+    /// Operator service tier the AI attempt was served under (WOR-2652),
+    /// as the value written on the wire (`flex`, `priority`, and so on).
+    ///
+    /// WOR-2658: the fifth fact this row owes an operator, beside the
+    /// provider, the model, the credential that paid, and the cache
+    /// tokens. The tier reached only
+    /// `sbproxy_ai_service_tier_decisions_total{disposition}` and the
+    /// outbound body, so the row could show a bill without showing the
+    /// tier that priced it. Absent when the surface has no tier axis,
+    /// when the provider declares none, and on rows the AI gateway did
+    /// not dispatch. It is always the operator's tier: a caller's own
+    /// `service_tier` field is stripped before dispatch and never
+    /// reaches this row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
     /// Derived AI cost in micro-USD (WOR-1874).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_usd_micros: Option<u64>,
@@ -4417,7 +4432,7 @@ impl ExportFormat {
 /// the column index a spreadsheet or a billing importer has already
 /// bound to. Unlike the JSONL shape, a CSV row is positional, so the
 /// order is part of the contract.
-const EXPORT_CSV_COLUMNS: [&str; 39] = [
+const EXPORT_CSV_COLUMNS: [&str; 40] = [
     "timestamp",
     "origin",
     "method",
@@ -4462,6 +4477,9 @@ const EXPORT_CSV_COLUMNS: [&str; 39] = [
     // of `tokens_in` rather than additions to it.
     "tokens_cached",
     "tokens_cache_write",
+    // WOR-2658, appended last for the same reason again: the tier that
+    // priced the row, beside the tokens it priced.
+    "service_tier",
 ];
 
 /// One row's value in `column`, as text.
@@ -4506,6 +4524,7 @@ fn export_csv_cell(entry: &RequestLogEntry, column: &str) -> String {
         "key_mode" => entry.key_mode.clone(),
         "key_provider" => text(&entry.key_provider),
         "credential_source" => text(&entry.credential_source),
+        "service_tier" => text(&entry.service_tier),
         "tenant_id" => entry.tenant_id.clone(),
         "user_id" => text(&entry.user_id),
         "error_class" => text(&entry.error_class),
@@ -9423,7 +9442,7 @@ mod tests {
         // panics if the name is missing, and indexing panics if the row
         // is short, which is the pair this asserts.
         assert_eq!(header.len(), row.len(), "{header:?} vs {row:?}");
-        // The three columns appended since the original contract, in
+        // The four columns appended since the original contract, in
         // append order. An importer keyed on position keeps working
         // because nothing before them moved.
         assert_eq!(
@@ -9431,11 +9450,22 @@ mod tests {
                 col("credential_source"),
                 col("tokens_cached"),
                 col("tokens_cache_write"),
+                col("service_tier"),
             ],
-            [header.len() - 3, header.len() - 2, header.len() - 1],
+            [
+                header.len() - 4,
+                header.len() - 3,
+                header.len() - 2,
+                header.len() - 1,
+            ],
             "the appended columns keep their append order: {header:?}"
         );
-        for column in ["credential_source", "tokens_cached", "tokens_cache_write"] {
+        for column in [
+            "credential_source",
+            "tokens_cached",
+            "tokens_cache_write",
+            "service_tier",
+        ] {
             assert_eq!(
                 row[col(column)],
                 "",

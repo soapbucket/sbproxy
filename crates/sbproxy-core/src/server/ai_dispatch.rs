@@ -5835,6 +5835,24 @@ fn apply_operator_service_tier(
     }
 }
 
+/// The service tier a request was served under, as the admin request
+/// row records it.
+///
+/// Same two conditions [`apply_operator_service_tier`] applies, read
+/// off a provider rather than a returned pair, because the raced
+/// dispatch resolves its winner after the loop that applied the tier
+/// has ended.
+fn served_service_tier(
+    provider: &sbproxy_ai::provider::ProviderConfig,
+    surface: &sbproxy_ai::handler::AiSurface,
+) -> Option<compact_str::CompactString> {
+    surface
+        .supports_service_tier()
+        .then(|| sbproxy_ai::service_tier::resolved_wire_tier(provider))
+        .flatten()
+        .map(|(_, value)| compact_str::CompactString::new(value))
+}
+
 /// Derive one caller-scoped prompt-cache lease identity for a request.
 ///
 /// Reads the caller's own cache key: `prompt_cache_key` first, then `user`,
@@ -12120,6 +12138,11 @@ pub(super) async fn handle_ai_proxy(
                 provider.map_model(&model)
             };
             ctx.ai_provider = Some(provider.name.to_string());
+            // WOR-2658: the tier is read off the winner rather than
+            // from inside the racing loop, which cannot borrow `ctx`
+            // and would in any case stamp the last candidate built
+            // rather than the one that served.
+            ctx.ai_service_tier = served_service_tier(provider, &surface);
             if !resolved_model.is_empty() {
                 ctx.ai_model = Some(resolved_model.clone());
             }
@@ -12320,6 +12343,13 @@ pub(super) async fn handle_ai_proxy(
         // Map model name for this provider.
         let mut attempt_body = body.clone();
         let operator_tier = apply_operator_service_tier(provider, &surface, &mut attempt_body);
+        // WOR-2658: the row's fifth fact, beside provider, model,
+        // credential source and the cache tokens. Overwritten per
+        // attempt, so a failover leaves the tier of the provider that
+        // actually served rather than the one that did not.
+        ctx.ai_service_tier = operator_tier
+            .as_ref()
+            .map(|(_, value)| compact_str::CompactString::new(value));
         let resolved_model = if !model.is_empty() {
             let mapped = provider.map_model(&model);
             if mapped != model {
@@ -21592,6 +21622,16 @@ origins:
     }
 
     async fn dispatch_chat_request(config: &sbproxy_ai::AiHandlerConfig, body: serde_json::Value) {
+        dispatch_chat_request_context(config, body).await;
+    }
+
+    /// [`dispatch_chat_request`], handing back the request context the
+    /// dispatch stamped, for the tests that assert what reached the
+    /// admin request row rather than what reached the upstream.
+    async fn dispatch_chat_request_context(
+        config: &sbproxy_ai::AiHandlerConfig,
+        body: serde_json::Value,
+    ) -> crate::context::RequestContext {
         let (mut session, client) = downstream_session(body).await;
         let mut context = crate::context::RequestContext::new();
         context.tenant_id = "tenant-a".into();
@@ -21608,6 +21648,7 @@ origins:
         drop(session);
         let response = live_downstream_body(client).await;
         assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+        context
     }
 
     /// WOR-2651: the control for the affinity test below.
@@ -21857,6 +21898,80 @@ origins:
             1.0,
             "overwriting a caller's tier must be scrapeable"
         );
+    }
+
+    /// WOR-2658: the per-request record has to name the tier, not only
+    /// the metric. `sbproxy_ai_service_tier_decisions_total` counts
+    /// dispositions across the deployment and cannot answer what one
+    /// request was priced at, which is the question the admin request
+    /// row exists for.
+    #[tokio::test]
+    async fn the_request_context_records_the_tier_the_attempt_was_served_under() {
+        let (upstream_url, hits, _captured) = capturing_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+        )
+        .await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai-flex",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key",
+                "service_tier": "flex"
+            }]
+        }))
+        .expect("service tier proxy config");
+
+        let context = dispatch_chat_request_context(
+            &config,
+            serde_json::json!({
+                "model": "fixture-model",
+                "service_tier": "priority",
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }),
+        )
+        .await;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            context.ai_service_tier.as_deref(),
+            Some("flex"),
+            "the row records the operator's tier, never the caller's"
+        );
+    }
+
+    /// A provider declaring no tier leaves the field absent rather than
+    /// inventing one, so a row reading `service_tier` empty means the
+    /// request was priced at the vendor's default.
+    #[tokio::test]
+    async fn a_provider_with_no_tier_leaves_the_row_field_absent() {
+        let (upstream_url, hits, _captured) = capturing_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+        )
+        .await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai-plain",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key"
+            }]
+        }))
+        .expect("plain proxy config");
+
+        let context = dispatch_chat_request_context(
+            &config,
+            serde_json::json!({
+                "model": "fixture-model",
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }),
+        )
+        .await;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(context.ai_service_tier, None);
     }
 
     /// One `sbproxy_ai_service_tier_decisions_total` disposition. Absent
