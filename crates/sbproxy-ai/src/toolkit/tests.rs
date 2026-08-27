@@ -1103,8 +1103,7 @@ fn successful_prompt_selection_stays_out_of_the_bounded_operations_ring() {
     assert_eq!(
         operations
             .iter()
-            .filter(|(candidate, row)| candidate == &scope()
-                && row.operation == "prompt_selection")
+            .filter(|(candidate, row)| candidate == &scope() && row.operation == "prompt_selection")
             .count(),
         1,
         "a refused selection is still worth a row"

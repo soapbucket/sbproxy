@@ -232,7 +232,10 @@ impl AiToolkitRuntime {
             // at `validate_config`; they are accounted per scope here so a
             // later admin registration measures the share it is really
             // left with rather than an empty one.
-            let scope_bytes = datasets.scope_bytes.entry(configured.scope.clone()).or_insert(0);
+            let scope_bytes = datasets
+                .scope_bytes
+                .entry(configured.scope.clone())
+                .or_insert(0);
             *scope_bytes = scope_bytes.saturating_add(dataset_bytes);
             let key = (
                 configured.scope,
