@@ -639,13 +639,18 @@ origins:
             timeout_ms: 5000
             task_timeout_ms: 5000
             model: {MODEL_STANDARD}
-  # The two streaming claims need a strategy that defines a *next*
-  # candidate, and `fallback_chain`'s declared priority order is also
-  # what makes "the first one" deterministic in a test. Measured against
-  # this same binary: with `round_robin` a pre-header elapse refuses the
-  # request with 502 naming the budget rather than handing it on, and
-  # with `fallback_chain` it is handed to the declared successor. Same
-  # `pre_header_timeout_ms`, same stubs, different strategy.
+  # The two streaming claims need an origin whose attempt budget lets a
+  # request reach a second candidate, and a candidate order that makes
+  # "the first one" deterministic in a test. The budget is the rule, not
+  # the strategy: the loop runs the whole provider order when the
+  # strategy is `fallback_chain`, when `resilience.content_policy_fallback`
+  # is on, or when a typed fallback list is configured, and otherwise it
+  # gets one attempt and a pre-header elapse refuses the request with a
+  # 502 naming the budget. Both origins here open it, by different
+  # doors: `sota.local` with `content_policy_fallback` above, this one
+  # with `fallback_chain`. This origin also gets the deterministic
+  # declared order the streaming assertions need, which `round_robin`
+  # does not define.
   "stream.local":
     tenant_id: acme
     action:
