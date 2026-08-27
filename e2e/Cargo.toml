@@ -111,11 +111,12 @@ futures-util = "0.3"
 #   * `sbproxy-observe` exports through `opentelemetry-otlp 0.32`,
 #     whose own manifest requires `opentelemetry-proto = "0.32"`
 #     exactly. There is no 0.32-compatible proto release on tonic 0.12:
-#     `opentelemetry-proto` moved to `tonic 0.14.1` at 0.31 and stayed
-#     there; the last release on `tonic 0.12.3` / `prost 0.13` is 0.28,
-#     which would put a second opentelemetry / opentelemetry_sdk /
-#     opentelemetry-proto major back in the lock and return the fixture
-#     to decoding a different generated type than the product emits.
+#     the last `opentelemetry-proto` release on `tonic ^0.12.3` /
+#     `prost ^0.13` is 0.29.0, after which 0.30.0 moved to `tonic ^0.13`
+#     and 0.30.1 to `tonic ^0.14.1`. Pinning 0.29 here would put a
+#     second opentelemetry / opentelemetry_sdk / opentelemetry-proto
+#     major back in the lock and return the fixture to decoding a
+#     different generated type than the product emits.
 #
 # So the win here is correctness rather than crate count: the mock
 # collector now shares the proxy's own generated OTLP type instead of
@@ -136,16 +137,28 @@ prost = "0.14"
 # OTLP proto's TraceServiceServer) receives the proxy's AI spans, and the
 # test asserts the gen_ai / OpenInference vocabulary arrives intact.
 #
-# The five `otlp_*_e2e.rs` files stay five binaries. They were proposed
-# as the WOR-2066 consolidation pilot because they already share
+# The five `otlp_*_e2e.rs` files were proposed as the WOR-2066
+# consolidation pilot because they already share
 # `otlp_span_arrival_common`, but sharing a helper is not the predicate
-# consolidation needs. `assert_complete_ai_span_exports` calls
+# consolidation needs, and the five do not answer that predicate the
+# same way.
+#
+# `otlp_span_arrival_e2e.rs` and `otlp_span_arrival_http_e2e.rs` must
+# stay separate binaries. They are the only two that call
+# `assert_complete_ai_span_exports`, which calls
 # `LoggingConfig::init_with_resolved_filter_and_telemetry`, the
 # process-global tracing subscriber and OTel tracer provider, inside the
-# test process; the gRPC and HTTP cases are separate binaries precisely
-# so each process initializes it once. Merging them would leave the
-# second transport's collector receiving nothing, and the test would
-# pass or fail on which module ran first.
+# test process. One binary would initialize it once and leave the second
+# transport's collector receiving nothing, so the result would depend on
+# which module ran first. Both files say so in their own module docs.
+#
+# `otlp_metrics_export_e2e.rs`, `otlp_shutdown_flush_e2e.rs` and
+# `otlp_trace_id_propagation_e2e.rs` do not touch that helper: each
+# spawns the real binary through `ProxyHarness` and keeps its telemetry
+# in the child process, which is the same shape as the five streaming
+# files that were consolidated. Nothing here rules them out; they are an
+# open candidate for the next WOR-2066 slice, and whoever takes it owes
+# the three checks `e2e/tests/streaming/main.rs` lists.
 # WOR-2549: pinned to the 0.32 major `sbproxy-observe` already exports
 # through `opentelemetry-otlp`, so the collector shares one
 # opentelemetry / opentelemetry_sdk / opentelemetry-proto compile with
