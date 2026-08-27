@@ -95,10 +95,37 @@ futures-util = "0.3"
 
 # gRPC end-to-end coverage for action_grpc.rs, and the transport under
 # the mock OTLP collector below. Pinned to the 0.14 major that
-# `opentelemetry-proto` 0.32 generates against (WOR-2549). The
-# production crates still build on the workspace's tonic 0.12 / prost
-# 0.13, so both majors are in the lock either way; matching the OTLP
-# major here is what retires the whole opentelemetry 0.27 chain.
+# `opentelemetry-proto` 0.32 generates against (WOR-2549).
+#
+# WOR-2549's acceptance sketch asked for one major per family across
+# opentelemetry, opentelemetry-proto, opentelemetry_sdk, tonic and
+# prost. Three of the five collapse; the tonic/prost half cannot be met
+# from here, and the premise that these dev-dependencies are what keep
+# the old majors alive is stale:
+#
+#   * The workspace pins `tonic = "0.12"` / `prost = "0.13"` for the
+#     classifier cluster (root Cargo.toml), and `sbproxy`,
+#     `sbproxy-core`, `sbproxy-billing` and the four classifier crates
+#     build on them. Both tonic majors are in the lock whichever one
+#     this crate picks.
+#   * `sbproxy-observe` exports through `opentelemetry-otlp 0.32`,
+#     whose own manifest requires `opentelemetry-proto = "0.32"`
+#     exactly. There is no 0.32-compatible proto release on tonic 0.12:
+#     `opentelemetry-proto` moved to `tonic 0.14.1` at 0.31 and stayed
+#     there; the last release on `tonic 0.12.3` / `prost 0.13` is 0.28,
+#     which would put a second opentelemetry / opentelemetry_sdk /
+#     opentelemetry-proto major back in the lock and return the fixture
+#     to decoding a different generated type than the product emits.
+#
+# So the win here is correctness rather than crate count: the mock
+# collector now shares the proxy's own generated OTLP type instead of
+# decoding 0.27 protos from a 0.32 exporter and working only because
+# OTLP is wire-stable. The cost is honest and is paid in the build
+# graph, not the runtime one: `tonic-build`, `prost-build`, `petgraph`
+# and `pulldown-cmark` each carry two majors while both tonic majors
+# exist. Collapsing tonic to one major means moving the workspace pins
+# to 0.14, which is a production-crate change and a separate ticket.
+#
 # `tonic-prost` carries the codec the generated stubs name, which tonic
 # 0.14 split out of the core crate.
 tonic = "0.14"
@@ -108,6 +135,17 @@ prost = "0.14"
 # WOR-1233: span-arrival e2e. A mock OTLP gRPC collector (built from the
 # OTLP proto's TraceServiceServer) receives the proxy's AI spans, and the
 # test asserts the gen_ai / OpenInference vocabulary arrives intact.
+#
+# The five `otlp_*_e2e.rs` files stay five binaries. They were proposed
+# as the WOR-2066 consolidation pilot because they already share
+# `otlp_span_arrival_common`, but sharing a helper is not the predicate
+# consolidation needs. `assert_complete_ai_span_exports` calls
+# `LoggingConfig::init_with_resolved_filter_and_telemetry`, the
+# process-global tracing subscriber and OTel tracer provider, inside the
+# test process; the gRPC and HTTP cases are separate binaries precisely
+# so each process initializes it once. Merging them would leave the
+# second transport's collector receiving nothing, and the test would
+# pass or fail on which module ran first.
 # WOR-2549: pinned to the 0.32 major `sbproxy-observe` already exports
 # through `opentelemetry-otlp`, so the collector shares one
 # opentelemetry / opentelemetry_sdk / opentelemetry-proto compile with
