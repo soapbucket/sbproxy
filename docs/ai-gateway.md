@@ -1,6 +1,6 @@
 # SBproxy AI gateway guide
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-27*
 
 ![the same OpenAI-shape request answered by OpenAI, Claude, and Gemini, switched only by Host header](assets/ai-gateway.gif)
 
@@ -380,7 +380,7 @@ A request can tighten (never relax) the origin's constraint with the headers `x-
 
 The filter runs where the credential `allowed_providers` / `blocked_providers` policy runs, ahead of every selection path: model listing, surface-capability checks, primary selection under every routing strategy, fallback order, race fan-out, shadow dispatch, and the semantic cache's embedding call all see only the eligible set. With the config above, the fallback chain serves from `openai` and `mistral` is not a fallback, because it was never a candidate.
 
-Two paths deserve naming because a narrower filter would miss them. `/v1/messages` and `/v1/responses` are rewritten into the canonical chat body before routing, so an Anthropic-SDK or Responses-API caller is gated exactly like a Chat Completions one. And a confidence cascade does not route over the candidate order at all: each tier names its own provider, so tiers are filtered by name, an ineligible tier is skipped, and a cascade whose every tier is ineligible is refused with the same message rather than exhausting into a generic dispatch failure.
+Two paths deserve naming because a narrower filter would miss them. `/v1/messages` and `/v1/responses` are rewritten into the canonical chat body before routing, so an Anthropic-SDK or Responses-API caller is gated exactly like a Chat Completions one. And a confidence cascade does not route over the candidate order at all: each tier names its own provider, so tiers are filtered by name, an ineligible tier is skipped, and a cascade whose every tier is ineligible is refused with the same message rather than exhausting into a generic dispatch failure. A cascade with at least one posture-eligible tier proceeds, and a tier the posture constraint removed is reported as `data_posture` in the cascade's own diagnostics below, never as the calling credential's provider lock: the two are different knobs and the constraint here is the request's, not the credential's.
 
 ### When nothing qualifies
 
@@ -642,6 +642,10 @@ routing:
       quality_threshold: 0.85
       cost_cap: 80000
 ```
+
+**When no tier dispatches.** Every tier can be excluded before it is sent: by the calling credential's `provider` allow/block policy, by the request's [data-handling posture](#provider-data-posture), by a cost cap, by `enabled: false`, by the resilience layer (unhealthy, ejected, or breaker-open), or by naming a provider the config does not carry. Each skipped tier is counted on `sbproxy_ai_cascade_tier_outcomes_total{tier, outcome}` under its own closed reason (`credential_lock`, `data_posture`, `cost_cap`, `disabled`, `unhealthy`, `not_found`), and the exhaustion error names each tier's reason rather than collapsing them: `cascade exhausted without dispatching any tier (skipped: openai (data_posture), anthropic (credential_lock))`. `retry` on that metric stays reserved for a tier that did dispatch and did not produce an accepted response, so an alert on it is unaffected by any of these.
+
+One of those reasons is a policy refusal rather than a dispatch failure. When the calling credential's provider policy is the only reason nothing dispatched, the refusal is represented everywhere the gateway's other refusals are, not only in a log line. The log line (`event="ai.cascade.credential_lock"`) names the credential's allow and block lists and the providers the routing plan asked for. The request carries the closed `credential_provider_lock` value on the `outcome` label of `sbproxy_ai_requests_attributed_total` and on the rejection `reason` of `sbproxy_ai_gateway_decisions_total`, rather than the `upstream_5xx` a bare 502 would otherwise read as, so a credential whose policy drifted away from its routing plan does not wake whoever pages on provider outages; the durable spend rollups count it as blocked rather than errored; a metered call bills as `policy_blocked` rather than `origin_5xx`; the admin Routing Decisions row carries `credential_provider_lock: <providers>`; and a `security_audit` record (`event_type: credential_provider_policy`) reaches a configured [`events:` sink](events.md) as a `policy_denied` event. The caller gets a 502 whose `Proxy-Status` `error` token is `credential_provider_locked` where the origin sets `proxy_status.enabled: true`, and whose problem document's `detail` is that same token where it sets `problem_details.enabled: true`. The token is the whole of what the caller learns: which providers this credential may reach, and which exist behind the gateway at all, stay server-side.
 
 Grading looks for a top-level `confidence_score` JSON number (`[0.0, 1.0]`) in the tier's response. A score at or above `quality_threshold` accepts the response. When the field is absent, the response is treated as quality `1.0` and accepted outright: a tier only actually gets graded against `quality_threshold` when the provider (or a policy in front of it) returns a `confidence_score`, which plain OpenAI- and Anthropic-shaped completions do not. Without one, `cascade` still retries on a 5xx or an empty/refused response, but otherwise behaves like `fallback_chain` ordered cheapest-first, not like a quality-scored router.
 
@@ -1184,6 +1188,55 @@ The retry keeps the provider, the model, the base URL, and the price the request
 A request that arrived carrying a caller-owned native provider key never falls back, whatever the entry says: the caller presented their own credential and the provider refused it, so spending yours would bill you for their authorization failure.
 
 `credential_source` on the admin request row (`provider_entry`, `native_caller`, `fallback`) says which secret paid, one `credential_fallback` event lands on the typed feed per swap, and `sbproxy_ai_key_fallbacks_total{provider,outcome}` counts the same decision for anyone alerting off the scrape rather than off the feed. Full decision path, the `fail_closed` argument, and a runnable walkthrough are in [multi-tenant.md](multi-tenant.md#when-a-tenants-provider-key-is-refused) and [examples/tenant-key-fallback](../examples/tenant-key-fallback/).
+
+### When a broken connection stops the meter
+
+A non-streaming completion spends nearly all of its wall clock waiting on the provider's response header, and the caller is on the other end of that wait. When that caller's connection breaks first, the gateway drops the provider call instead of paying for a response nobody will read. The connection to the provider closes, and the request settles on a `client_disconnected` receipt whose usage is whatever the provider had reported, which for a call abandoned before its response header is none.
+
+There is no timer in this. No deadline, no "the caller has been quiet for N seconds", no heuristic about how long a model ought to take. A slow client is still a client and a slow provider is still worth waiting for, so the gateway watches the downstream connection itself and acts only on an unambiguous break.
+
+```mermaid
+flowchart TD
+    A[non-streaming request waiting on a provider] --> B{downstream connection}
+    B -->|quiet, still open| C[keep waiting<br/>however long the provider takes]
+    B -->|HTTP/1 half-close: FIN, still writable| C
+    B -->|TCP reset or read error| D[provider call dropped<br/>connection to the provider closed]
+    B -->|HTTP/2 RST_STREAM or GOAWAY| D
+    D --> E[receipt outcome: client_disconnected<br/>usage: none]
+    D --> F[counted on sbproxy_ai_provider_attempts_total<br/>under outcome client_disconnected]
+    C --> G[response relayed<br/>receipt outcome: delivered]
+```
+
+**What cancels.** A TCP reset or any read failure on an HTTP/1 connection, and an `RST_STREAM` or `GOAWAY` on an HTTP/2 stream. Each of those says the connection is broken: no response can reach the caller whatever the gateway does next, so continuing to pay for one is pure waste. HTTP/2 is the exact case, because a client that cancels sends a frame that says so.
+
+**What does not, and the gap that leaves.** A bare HTTP/1 half-close does not cancel. RFC 9112 section 9.6 lets a client shut down its write side and go on reading the response, and on the wire that polite half-close is byte-for-byte identical to a client that walked away: both are one FIN, and nothing distinguishes them without writing to the socket. Cancelling on it would abort live callers, so the gateway treats it as "this client has finished sending" and carries on.
+
+The residual is worth stating plainly rather than hiding behind the guarantee: **a client that half-closes its write side and then silently vanishes keeps its generation running until a write to it fails.** For an HTTP/1 client that simply closes its socket while waiting, that is what happens, and the disconnect is caught at the response write instead of during the generation. That request's receipt is not `client_disconnected`. The relay's write failure is not attributed to the caller today, so the call prices as `delivered` when a 200 header was already committed and `origin_5xx` when it was not. Attributing those write errors downstream is a planned follow-up, and it has to reach the streaming relay too. What the gateway will not do is guess, because the guess it would have to make cannot be made from a FIN.
+
+**The opt-in, where a half-close really does mean gone.** If you know your callers never half-close after sending, set `cancel_on_half_close: true` on the `ai_proxy` action and the FIN is read as the departure it usually is:
+
+```yaml
+origins:
+  ai.example.com:
+    action:
+      type: ai_proxy
+      cancel_on_half_close: true    # default false
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+```
+
+That is what makes the ordinary HTTP/1 abandonment reachable: a caller whose own deadline fired and closed its socket sends a FIN and nothing else, so with the flag off the generation runs to completion and is billed, and with it on the provider call is dropped where it stands.
+
+Enable it only on that knowledge, because the cost of being wrong is paid by a live caller: a client that half-closes and is still reading has its request cancelled and receives an error instead of the completion it was waiting for. Plain HTTP client libraries do not half-close; hand-rolled tools, some load generators, and a fronting proxy configured to shut the request side down do. The scope is the origin, so it applies to every caller and tenant routed to that action, and it changes exactly one answer: a reset, a read error, an `RST_STREAM` and a `GOAWAY` all cancel with the flag off, and a client that keeps its connection whole is never cancelled with it on. There is still no timer.
+
+**Scope.** The wait for the provider's response header on the sequential non-streaming dispatch path. A streaming response already learns the caller left, from its own per-chunk write failing, and the upstream body is dropped there on the way out. A hedged (`strategy: race`) dispatch and a confidence `cascade` resolve on their own paths and are not watched. A caller who leaves after the response header has arrived is past the window; the generation is already paid for.
+
+**Watching a request never changes how it is billed.** The watch reads the downstream connection without recording anything about it, so a request that was not cancelled is priced exactly as it was before this existed. That matters more than it sounds: the receipt classifier treats a recorded half-close plus a failed delivery as a client disconnect, so a watch that recorded what it saw would have turned provider outages into partially billable client departures on signed documents.
+
+**The `on_error` fallback does not run for a cancelled call.** An origin's `fallback_origin: {on_error: true}` exists to give a waiting caller something rather than a 502, and a cancelled call has no waiting caller; on an `ai_proxy` fallback it would also dispatch a second paid provider call and hand back the spend the cancellation saved. Every other failure, including one Pingora attributes to the client such as a malformed request header, still serves the fallback exactly as before. See [routing.md](routing.md#failing-over-fallback-origin).
+
+Operators see a cancellation three ways: on `sbproxy_ai_provider_attempts_total{outcome="client_disconnected"}`, on the request's span as `error.type=client_disconnected`, and on the consumption receipt, whose outcome is `client_disconnected` and whose billable treatment is whatever the origin's `billable:` table says for it. See [metering.md](metering.md#billable-the-outcome-table) for the table.
 
 ## Shadow eval
 

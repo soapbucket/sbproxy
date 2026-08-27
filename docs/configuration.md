@@ -564,9 +564,17 @@ startup. Full auth, RBAC, remote-access, and endpoint reference is in
 | `POST /admin/reload` | Re-read the on-disk config file and hot-swap the pipeline. Single-flight; concurrent calls return 409. |
 | `GET /admin/drift` | Compare the on-disk config file against the loaded baseline. See below. |
 
-Unauthenticated requests get a 401 with a `WWW-Authenticate: Basic`
-header. Requests from outside `127.0.0.1` are dropped at the
-socket level.
+Unauthenticated requests get a 401. For a script that 401 carries the
+RFC 7235 challenge, `WWW-Authenticate: Basic realm="sbproxy admin"`. For
+a browser it does not, so the console's own sign-in page is what asks
+for credentials rather than the browser's native dialog; the two markers
+that identify a browser, and what a browser sees instead, are in
+[admin-api-guide.md](admin-api-guide.md#what-a-refused-request-gets-back).
+
+A peer outside `allow_ips` is refused before a single request byte is
+read, with a 403 and `{"error":"Forbidden"}`. With `allow_ips` unset,
+and with an entry that parses as neither an address nor a CIDR, the
+allowlist is loopback only.
 
 #### `GET /admin/drift`
 
@@ -1823,6 +1831,7 @@ origins:
 | `resilience` | object | | Per-provider circuit breaker, outlier detection, and active health probes. Also hosts the LLM-aware knobs (`retry_policy`, `cooldown_policy`, `llm_aware`, `content_policy_fallback`) and the streaming `pre_header_timeout_ms` budget; see [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md). |
 | `allow_request_timeout_override` | bool | `false` | Honor a caller's `x-sbproxy-timeout-ms` in place of the selected provider's `timeout_ms`. Off means the header is ignored rather than refused. Requires `max_request_timeout_ms`; the flag alone is refused at config load. Scope is the origin, so it applies to every caller and tenant routed here. |
 | `max_request_timeout_ms` | int | unset | Ceiling in milliseconds on a caller's `x-sbproxy-timeout-ms`. A header above it is refused with 400 naming the accepted range, not clamped. Must be above zero. Bounds one attempt, so `max_retries` multiplies it. An honored header replaces the gateway's 30-second HTTP client default too, so a ceiling above 30000 does lengthen an attempt. |
+| `cancel_on_half_close` | bool | `false` | Treat a downstream HTTP/1 half-close before any response byte as the client having left, and cancel the in-flight provider call. Off, the gateway declines to guess: RFC 9112 section 9.6 makes a polite half-close byte-for-byte identical to a client that walked away, and such a client keeps its generation until a write to it fails. Enable only when your clients never half-close after sending, since a half-closing client would then be cancelled falsely. HTTP/2 and reset detection are unaffected and always cancel. Scope is the origin. See [ai-gateway.md](ai-gateway.md#when-a-broken-connection-stops-the-meter). |
 | `compression` | object | unset | Ordered AI context-compression policy. See [AI context compression](#ai-context-compression) and [ai-context-compression.md](ai-context-compression.md). |
 | `reasoning` | string or object | `off` | Route policy for concise reasoning. Use `concise`, `off`, or `{budget: N}` with `N` greater than zero. |
 | `shadow` | object | | Side-by-side eval: mirror each request to one or more shadow targets and log metrics. |
@@ -5051,7 +5060,7 @@ origins:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `on_error` | bool | false | Trigger the fallback on transport-level upstream failures (DNS, connect, TLS, timeout). |
+| `on_error` | bool | false | Trigger the fallback on transport-level upstream failures (DNS, connect, TLS, timeout). Not triggered for an AI request the gateway cancelled because the caller's connection broke: there is no caller left to serve, and on an `ai_proxy` fallback the substitute action would be a second paid provider call. See [ai-gateway.md](ai-gateway.md#when-a-broken-connection-stops-the-meter). |
 | `on_status` | list[int] | `[]` | Trigger the fallback when the upstream responds with one of these status codes. Pair with `on_error` for full coverage. |
 | `add_debug_header` | bool | false | When true, the proxy sets `X-Fallback-Trigger` on the response so callers can tell the fallback path served the request. |
 | `origin` | object | required | Inline origin spec used to serve the request when a trigger fires. Must contain an `action` block. `id` is optional and is used to name the rule in emitted OpenAPI operation ids. `hostname`, `workspace_id`, and `version` are refused at config compile: nothing read them. |
@@ -5429,8 +5438,12 @@ anything below that no authored page matches renders as problem+json:
   Pingora's `fail_to_proxy` path. The `detail` field carries the
   RFC 9209 error token (`connection_refused`,
   `connection_timeout`, `tls_protocol_error`, `connection_terminated`,
-  `http_request_error`) so downstream tooling can break down by
-  failure mode without scraping the body.
+  `http_request_error`, `credential_provider_locked`) so downstream
+  tooling can break down by failure mode without scraping the body.
+  `credential_provider_locked` is the one token that is not an upstream
+  failure: it means the calling credential's provider policy excluded
+  every tier of an AI cascade. It carries no policy contents, so a
+  caller cannot learn from it which providers exist behind the gateway.
 
 ### What it does not cover
 

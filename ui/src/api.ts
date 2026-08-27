@@ -12,7 +12,22 @@
  * and holds the returned CSRF token in memory (WOR-1758), sent as
  * `X-CSRF-Token` on every mutating request. Basic auth (no token) still
  * works for CI / scripting, where mutations are CSRF-exempt.
+ *
+ * Every call also carries `X-Requested-With: XMLHttpRequest` (WOR-2688).
+ * The admin server reads it on a 401 and answers without the
+ * `WWW-Authenticate: Basic` challenge, so a session that lapses mid-use
+ * drops the operator on this app's sign-in page instead of the browser's
+ * own credential dialog, whose Cancel button leaves the console wedged
+ * until a hard reload. It marks the caller and nothing else: the server
+ * resolves credentials the same way with or without it, so a request
+ * carrying the header and no session is refused exactly as before.
  */
+
+/**
+ * Marks a request as this app's own, so the server suppresses the Basic
+ * challenge on a 401 (WOR-2688). Sent on every call, safe and unmutating.
+ */
+const CLIENT_MARKER_HEADERS = { "X-Requested-With": "XMLHttpRequest" } as const;
 
 // In-memory CSRF token for the current session; null when unauthenticated
 // Called when the server rejects a request as unauthenticated, so the app
@@ -200,7 +215,7 @@ async function request(
   const init: RequestInit = {
     method,
     credentials: "same-origin",
-    headers: { Accept: "application/json" },
+    headers: { Accept: "application/json", ...CLIENT_MARKER_HEADERS },
   };
   // Send the CSRF token on mutations under a browser session. Basic-auth
   // callers hold no token and are CSRF-exempt server-side.
@@ -277,7 +292,11 @@ async function sendRaw(
   const init: RequestInit = {
     method,
     credentials: "same-origin",
-    headers: { Accept: "application/json", "Content-Type": contentType },
+    headers: {
+      Accept: "application/json",
+      "Content-Type": contentType,
+      ...CLIENT_MARKER_HEADERS,
+    },
   };
   if (csrfToken && MUTATING.has(method.toUpperCase())) {
     init.headers = { ...init.headers, "X-CSRF-Token": csrfToken };

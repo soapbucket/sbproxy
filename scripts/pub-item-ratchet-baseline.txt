@@ -743,3 +743,9 @@ question the bucket asks is "does anything but a test name this", and
 a file large enough to contain both the declaration and every caller
 answers it wrongly by construction. Splitting the file is a real fix
 for that; adding a caller would not have been.
+
+2026-08-27 (WOR-2690): unreferenced baseline 1462 -> 1461. Ground gained,
+not given. `pipeline::CompiledFallback` had only ever been named inside
+`pipeline.rs`; the AI client-disconnect work moved `fail_to_proxy`'s
+`on_error` condition into a named function that takes one, so the type is
+now referenced from `server/proxy_http.rs` and leaves the bucket.

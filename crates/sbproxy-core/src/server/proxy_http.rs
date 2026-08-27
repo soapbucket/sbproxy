@@ -580,6 +580,226 @@ pub(super) fn enforce_upstream_subprotocol_selection(
     ))
 }
 
+/// Re-raise a body-phase refusal the upstream answered anyway (WOR-2687).
+///
+/// Every refusal decided in `request_body_filter` stashes its typed
+/// response on [`RequestContext::validator_failed`] and returns `Err`,
+/// and `fail_to_proxy` writes that response. Against an HTTP/1 upstream
+/// that holds: pingora's h1 duplex loop propagates the body filter's
+/// error out of `proxy_handle_downstream` with `?`. Against an HTTP/2
+/// upstream it does not. `pingora-proxy`'s h2 loop logs
+/// `Upstream h2 body send error` and continues, so the upstream's own
+/// answer to the request whose body we refused to forward is filtered
+/// and written downstream, `fail_to_proxy` never runs, and the client
+/// receives the backend's response with the refusal recorded nowhere it
+/// can act on. `tune_peer` sets `ALPN::H2H1` on every peer, so h2 is the
+/// negotiated protocol for any `https://` backend that offers it: the
+/// broken path was the default one, not an exotic configuration.
+///
+/// This runs at the top of `response_filter`, the last hook before an
+/// upstream response reaches the client. Returning the error here hands
+/// the request to the same `fail_to_proxy` writer the h1 path already
+/// uses (one rejection writer for both protocols, not two that can
+/// drift), and pingora discards the upstream response task before
+/// `write_response_tasks` can send any of it downstream. It also lets
+/// the proxy loop disable the cache for the request, which a rewrite of
+/// the response header in place would not.
+///
+/// It covers every policy that funnels through `validator_failed`, which
+/// is every body-phase refusal in this file: `openapi_validation`,
+/// `request_validator`, `content_digest`, `body_threat_protection`,
+/// `prompt_injection_v2`'s body scan, and the A2A push-notification
+/// check.
+///
+/// What it cannot see or fix:
+///
+/// * A refusal that never sets `validator_failed`. Everything in
+///   `request_body_filter` does today, and every write site in this
+///   file refuses the request immediately, either with an `Err` on the
+///   next line or, in the idempotency-conflict case, by signalling the
+///   caller that returns one. That is what makes reading the field
+///   here unambiguous: it is only ever set by a phase that has already
+///   refused the request, so a response arriving with it set is a
+///   response to a request the proxy said no to.
+/// * The upstream having received the request at all. The peer is
+///   dialed and the request head is sent before `request_body_filter`
+///   runs, so a backend that answers without reading the body has
+///   already acted on the head. That is inherent to deciding on the
+///   body and predates this guard; the refusal it fixes is what the
+///   *client* is told.
+/// * An upstream that never answers. Then no response header arrives,
+///   this hook never runs, and the request ends on the read timeout with
+///   `fail_to_proxy` rendering the same stashed refusal.
+/// * An upstream response that reached the client before the body phase
+///   decided. The refusal is decided on the last body chunk, so a
+///   response the proxy has already written downstream is past every
+///   hook. In practice the downstream body is buffered locally and its
+///   select branch is ready before an upstream round trip can complete,
+///   which is why the h1 path has never been observed to lose this
+///   race either; it is a property of deciding on the body, not of
+///   this guard, and it is the same on both protocols.
+fn body_phase_refusal(ctx: &RequestContext) -> Option<Box<pingora_error::Error>> {
+    let (status, _, _) = ctx.validator_failed.as_ref()?;
+    // Deliberately not `take()`: `fail_to_proxy` is the one writer, and
+    // it takes the slot when it renders. Taking it here would leave that
+    // writer with nothing and fall through to the generic 502.
+    Some(pingora_error::Error::explain(
+        pingora_error::ErrorType::HTTPStatus(*status),
+        "request body refused; upstream response withheld",
+    ))
+}
+
+/// One refusal decided in the request-body phase, in the shape the
+/// terminal surfaces need it (WOR-2687).
+struct BodyPhaseDeny<'a> {
+    /// The id the enforcer registers under, which is the `policy`
+    /// metric label, the audit record's `event_type`, and the
+    /// `policy_id` on the verdict event.
+    policy_id: &'a str,
+    /// Status the configured refusal renders.
+    status: u16,
+    /// Stable, bounded label for why the policy refused.
+    ///
+    /// Never the validator's own message. A schema error quotes the
+    /// offending value out of the request body, and this string reaches
+    /// four sinks at once: the `security_audit` tracing target, the
+    /// admin console's audit ring, the hash-chained file under
+    /// `audit.sink: chain`, and the `events:` egress as a
+    /// `policy_denied` event. The detail an operator needs to debug the
+    /// request is already in the rejection body the client receives and
+    /// in the policy's own `warn!`, neither of which is an evidence
+    /// feed. `content_digest` passes an outcome label here for the same
+    /// reason.
+    reason: &'a str,
+    /// Request method, for the audit record.
+    method: &'a str,
+    /// Where this policy compiled to, read off the compiled enforcer so
+    /// the body-phase record and the header-phase record for the same
+    /// policy cannot disagree about who decided.
+    surface: sbproxy_observe::events::PolicySurface,
+    /// Which engine decided, from the same lookup.
+    engine: sbproxy_observe::decision::DecisionEngine,
+    /// When the evaluation that produced this verdict started, so
+    /// `decision_latency_ms` is the real number rather than a zero.
+    started: std::time::Instant,
+}
+
+/// Record a body-phase policy refusal on every surface a proxy-level
+/// refusal is supposed to reach (WOR-2687).
+///
+/// The convention this file states at the top of `check_policies`' call
+/// site: a refusal lands as the access log's policy column, the shared
+/// policy counter, and a `SecurityAuditEntry::policy_violation` record.
+/// `openapi_validation` reached the first two and nothing else, so an
+/// operator running `audit.sink: chain` for tamper-evident evidence saw
+/// `content_digest` and `body_threat_protection` refusals and zero
+/// `openapi_validation` refusals, forever, with no error to explain the
+/// hole.
+///
+/// A free function taking `&mut RequestContext` rather than more lines
+/// inside `request_body_filter`, which is fifteen levels of nesting
+/// deep and reachable only with a live Pingora `Session`: this shape is
+/// unit-testable on the gate, and the e2e suite this workspace does not
+/// run in CI is then proving the wiring rather than the emission.
+fn record_body_phase_policy_deny(
+    ctx: &mut RequestContext,
+    verdict_ctx: &PolicyVerdictCtx,
+    deny: BodyPhaseDeny<'_>,
+) {
+    sbproxy_observe::metrics::record_policy(ctx.hostname.as_str(), deny.policy_id, "deny");
+    ctx.record_policy_decision(deny.policy_id, "deny");
+    // `meter_runtime` gates `BillableOutcome::PolicyBlocked` entirely on
+    // this field, so a refusal that leaves it `None` is invoiced to the
+    // buyer as ordinary work. It is also the one column the admin
+    // request ring shows to answer "why was this refused".
+    if ctx.deny_reason.is_none() {
+        ctx.deny_reason = Some(format!("{}: {}", deny.policy_id, deny.reason));
+    }
+    sbproxy_observe::SecurityAuditEntry::policy_violation(
+        deny.policy_id,
+        deny.reason,
+        deny.status,
+        Some(ctx.hostname.to_string()),
+        ctx.client_ip,
+        Some(ctx.request_id.to_string()),
+        Some(deny.method.to_string()),
+    )
+    .with_tenant_id(ctx.tenant_id.to_string())
+    .with_key_context(
+        ctx.native_key_provider.clone(),
+        ctx.inbound_key_mode.as_str(),
+    )
+    .with_api_key_id(ctx.accountable_key_id())
+    .emit();
+    emit_policy_verdict(
+        verdict_ctx,
+        deny.policy_id,
+        deny.surface,
+        deny.engine,
+        sbproxy_observe::events::VerdictTag::Deny,
+        deny.started,
+    );
+}
+
+/// Record a body-phase policy's `allow` (WOR-2687).
+///
+/// The counterpart to [`record_body_phase_policy_deny`] for a policy
+/// whose header-phase `allow` is suppressed because it defers its real
+/// decision to this phase. Emits the verdict and mirrors it onto the
+/// admin ring, and deliberately touches no metric that a header-phase
+/// `allow` did not: `sbproxy_policy_triggers_total` is a refusal
+/// counter here and on every sibling arm in this file, so an allow
+/// recording one would invent a series operators do not have today.
+fn record_body_phase_policy_allow(
+    ctx: &mut RequestContext,
+    verdict_ctx: &PolicyVerdictCtx,
+    policy_id: &str,
+    surface: sbproxy_observe::events::PolicySurface,
+    engine: sbproxy_observe::decision::DecisionEngine,
+    started: std::time::Instant,
+) {
+    emit_policy_verdict(
+        verdict_ctx,
+        policy_id,
+        surface,
+        engine,
+        sbproxy_observe::events::VerdictTag::Allow,
+        started,
+    );
+    ctx.record_policy_decision(policy_id, "allow");
+}
+
+/// Surface and engine the compiled chain resolved for `policy_id`.
+///
+/// The header-phase record for a policy reads these off the
+/// `CompiledEnforcer` (`check_policies`), so a body-phase record that
+/// hardcodes them starts disagreeing with its own header-phase sibling
+/// the moment the registry routes that `Policy` variant through a
+/// different constructor, and `PolicyVerdictEvent::engine` exists
+/// precisely to prevent that drift.
+///
+/// Falls back to `BuiltIn`/`BuiltIn` when the id is not in the chain,
+/// which is what every body-phase-refusing policy in this file compiles
+/// to today. Reached by lookup rather than asserted: a chain that no
+/// longer carries the policy that just refused should record the
+/// refusal, not panic a Pingora worker.
+fn compiled_policy_attribution(
+    enforcers: &[crate::builtin_enforcers::CompiledEnforcer],
+    policy_id: &str,
+) -> (
+    sbproxy_observe::events::PolicySurface,
+    sbproxy_observe::decision::DecisionEngine,
+) {
+    enforcers
+        .iter()
+        .find(|compiled| compiled.enforcer.policy_type() == policy_id)
+        .map(|compiled| (compiled.surface, compiled.engine))
+        .unwrap_or((
+            sbproxy_observe::events::PolicySurface::BuiltIn,
+            sbproxy_observe::decision::DecisionEngine::BuiltIn,
+        ))
+}
+
 /// Whether this request is riding an upgraded tunnel, and whether the
 /// gateway's own frame scanner already tore it down (WOR-2551).
 ///
@@ -693,7 +913,17 @@ pub(super) fn websocket_teardown_response(
     })
 }
 
-fn downstream_half_closed(session: &Session) -> bool {
+/// Whether the client has shut down its write half of an HTTP/1
+/// connection.
+///
+/// Reports Pingora's `half_closed` flag, which is set by the session's
+/// own body and idle reads and by nothing else. `pub(super)` because the
+/// AI dispatcher's downstream watch (WOR-2690) has to prove it does not
+/// set that flag: doing so would silently reprice the receipt of every
+/// failed AI request from a half-closing client, through the
+/// `downstream_half_closed && delivery_failed` arm of
+/// [`client_disconnected`] below.
+pub(super) fn downstream_half_closed(session: &Session) -> bool {
     match session.as_downstream() {
         pingora_core::protocols::http::ServerSession::H1(session) => session.is_half_closed(),
         _ => false,
@@ -802,7 +1032,16 @@ async fn lingering_drain_downstream_body(session: &mut Session, ctx: &RequestCon
     }
 }
 
-fn client_disconnected(
+/// Whether this request's failure was the client going away, which is
+/// the one question the receipt's `client_disconnected` outcome asks.
+///
+/// `pub(super)` rather than private because the AI dispatcher's
+/// cancellation path (WOR-2690) is answerable only against this
+/// function: it abandons a paid provider call by returning a
+/// `Downstream`-sourced error, and "does that error price as a
+/// disconnect" is a claim about this classifier rather than about the
+/// dispatcher.
+pub(super) fn client_disconnected(
     error_source: Option<pingora_error::ErrorSource>,
     downstream_half_closed: bool,
 ) -> bool {
@@ -820,6 +1059,33 @@ fn client_disconnected(
     let delivery_failed = error_source.is_some();
     error_source.is_some_and(|source| source == pingora_error::ErrorSource::Downstream)
         || (downstream_half_closed && delivery_failed)
+}
+
+/// Whether the origin's `on_error` fallback should run for this failure.
+///
+/// The whole condition, not half of it, so that the call site in
+/// [`ProxyHttp::fail_to_proxy`] is a call and nothing else and this
+/// function is the thing a test can hold to account.
+///
+/// `on_error` is the operator's answer to "the upstream broke, serve
+/// this instead", and it is worth running for every failure with a
+/// caller still on the line. The one exception is a request the AI
+/// dispatcher cancelled itself because that caller's connection was
+/// already gone (WOR-2690): there is nobody to serve, and on an
+/// `ai_proxy` fallback the substitute action is a second paid provider
+/// call, which hands straight back the spend the cancellation saved.
+///
+/// Keyed on the request's own cancellation marker rather than on the
+/// error's `ErrorSource`. Pingora stamps `Downstream` on request
+/// sanitization failures too, for instance a `Connection` header
+/// nominating a protected field (`proxy_h1.rs`'s
+/// `sanitize_h1_upstream_request`), and that caller is alive, reading,
+/// and entitled to the fallback it configured.
+fn on_error_fallback_applies(
+    fallback: &crate::pipeline::CompiledFallback,
+    ctx: &RequestContext,
+) -> bool {
+    fallback.on_error && !ctx.ai_upstream_cancelled_on_client_disconnect
 }
 
 fn should_record_proxy_request_metrics(path: &str) -> bool {
@@ -944,14 +1210,21 @@ fn oversized_body_refusal<'t>(
 /// buffering exists, and an earlier version gated on it missed exactly
 /// the single-chunk delivery that small caps see most.
 ///
-/// Exempt states: a pending fallback or replacement body discards the
-/// upstream body entirely, so nothing oversized remains to refuse; and
-/// a response the all-open pass-through already committed to raw
-/// delivery must not be aborted after its raw prefix reached the
+/// Exempt states: a triggered fallback or a pending replacement body
+/// discards the upstream body entirely, so nothing oversized remains to
+/// refuse; and a response the all-open pass-through already committed
+/// to raw delivery must not be aborted after its raw prefix reached the
 /// client.
+///
+/// `fallback_triggered` covers `on_status` (WOR-2686 onward the real
+/// upstream body is discarded before this function is ever reached, in
+/// `response_body_filter`'s own early return, so this is a second,
+/// redundant guard) as well as `on_error`, which never reaches this
+/// function's caller at all since it fires before any upstream response
+/// exists.
 fn closed_refusal_before_capture(ctx: &RequestContext, chunk_len: usize) -> Option<String> {
     if ctx.transform_passthrough_committed
-        || ctx.fallback_body.is_some()
+        || ctx.fallback_triggered
         || ctx.response_body_replacement.is_some()
     {
         return None;
@@ -2632,6 +2905,104 @@ pub(super) fn evaluate_cache_admit_for(
     plan
 }
 
+/// Serve the `fallback_origin.on_status` response when the primary
+/// upstream's status is one the operator listed.
+///
+/// # Why this runs here and not in `response_filter`
+///
+/// A fallback response has to be *written*, header and body together,
+/// which means an `await`, and WOR-2686 originally put that await in
+/// `response_filter`. That is the one place on this request path where an
+/// added await is known to be dangerous: `response_filter` inlines every
+/// response stage the proxy has and is the largest future on the path,
+/// and this workspace has already had a single added await grow a
+/// request-path future past the 2 MiB Pingora worker stack and kill every
+/// AI request while 13006 unit tests stayed green. `upstream_response_decision`
+/// is the hook next door, it runs once per upstream response before any
+/// byte reaches the client, it already awaits `maybe_retry_upstream_status`,
+/// and its own future is a handful of locals. The status-retry decision
+/// already lives here, and an `on_status` fallback is that decision's
+/// sibling: both look at the primary's status and decide not to serve it.
+///
+/// # What Pingora does with the primary's response afterwards
+///
+/// This returns without aborting, so Pingora goes on forwarding the
+/// original, untouched upstream response. By then a response has already
+/// been written to the session, so the second header write hits
+/// `Http1Session::prepare_response_header`'s documented "Respond header
+/// is already sent, cannot send again" guard and is a no-op (one benign
+/// `warn!` from pingora-core), and `H2Session` drops it on `ended` for an
+/// HTTP/2 downstream. Real body bytes still in flight are nulled by
+/// `response_body_filter`'s `fallback_triggered` early return, and would
+/// be dropped by the finished content-length body writer even without it.
+///
+/// # Why the two translated gRPC paths are excluded
+///
+/// `response_body_filter`'s `transcode_active` / `grpc_web_active`
+/// branches build the client-facing gRPC-JSON envelope or gRPC-Web frame
+/// out of the buffered translated body, a construction `on_status` has
+/// never been taught to interact with. Serving the fallback there would
+/// now be correct on its own terms, since the fallback response is
+/// written directly and completely, but it would silently skip the
+/// translation those two paths exist to produce, and that is a separate
+/// decision this fix does not make. `on_error` is untouched: it fires in
+/// `fail_to_proxy`, before any upstream response exists, so there is no
+/// translated body to conflict with. `docs/routing.md` states the limit.
+async fn maybe_serve_status_fallback(
+    session: &mut Session,
+    upstream_response: &ResponseHeader,
+    ctx: &mut RequestContext,
+) -> Result<()> {
+    // Once is the contract. Pingora calls the hook that reaches here for
+    // every upstream header task, and an upstream that sends `100
+    // Continue` or `103 Early Hints` ahead of its real status produces
+    // more than one, so a fallback listed against an informational status
+    // could otherwise write a second complete response onto a session
+    // that already carries one.
+    if ctx.fallback_triggered || ctx.transcode_active || ctx.grpc_web_active {
+        return Ok(());
+    }
+    let Some(origin_idx) = ctx.origin_idx else {
+        return Ok(());
+    };
+    let upstream_status = upstream_response.status.as_u16();
+    let pipeline = ctx.pipeline.clone();
+    let Some(fallback) = pipeline
+        .fallbacks
+        .get(origin_idx)
+        .and_then(|entry| entry.as_ref())
+    else {
+        return Ok(());
+    };
+    if fallback.on_status.is_empty() || !fallback.on_status.contains(&upstream_status) {
+        return Ok(());
+    }
+
+    debug!(
+        hostname = %ctx.hostname,
+        upstream_status = %upstream_status,
+        "upstream status matched on_status fallback, serving fallback response"
+    );
+    ctx.fallback_triggered = true;
+    let (status, body_len) = serve_fallback_action(
+        session,
+        ctx,
+        &fallback.action,
+        fallback.add_debug_header,
+        "status",
+        Some(upstream_status),
+    )
+    .await?;
+    ctx.response_status = Some(status);
+    ctx.response_body_bytes = body_len;
+    sbproxy_observe::metrics::record_fallback_served(
+        "status",
+        ctx.hostname.as_str(),
+        ctx.tenant_id.as_str(),
+    );
+    Ok(())
+}
+
 #[async_trait]
 impl ProxyHttp for SbProxy {
     type CTX = RequestContext;
@@ -4209,7 +4580,18 @@ impl ProxyHttp for SbProxy {
             // Never let a generic status retry multiply it.
             return None;
         }
-        maybe_retry_upstream_status(session, upstream_response, ctx).await
+        if let Some(error) = maybe_retry_upstream_status(session, upstream_response, ctx).await {
+            return Some(error);
+        }
+        // WOR-2686: `fallback_origin.on_status` is served from here, not
+        // from `response_filter`. A retry outranks it, which is why this
+        // sits below the retry decision: a status the operator asked us
+        // to retry gets another upstream attempt before it gets a canned
+        // response. See `maybe_serve_status_fallback` for why the write
+        // is not in `response_filter`.
+        maybe_serve_status_fallback(session, upstream_response, ctx)
+            .await
+            .err()
     }
 
     /// Modify the response header before it is sent to the downstream client.
@@ -4235,6 +4617,16 @@ impl ProxyHttp for SbProxy {
         // Set unconditionally because a single request only enters
         // this hook once per upstream response.
         ctx.upstream_first_byte_at = Some(std::time::Instant::now());
+
+        // WOR-2687: a body-phase policy already refused this request and
+        // the upstream answered anyway, which only happens on an h2
+        // upstream (see `body_phase_refusal`). Ahead of every rewrite
+        // below, including `capture_origin_headers`: none of them should
+        // run on, meter, or attest a response that is not going to the
+        // client.
+        if let Some(refusal) = body_phase_refusal(ctx) {
+            return Err(refusal);
+        }
 
         // WOR-2145: snapshot the response headers the attestation config
         // meters, before this hook starts rewriting headers of its own.
@@ -4591,7 +4983,16 @@ impl ProxyHttp for SbProxy {
         // Snapshot the upstream status and headers here so
         // `response_body_filter` can pair them with the accumulated
         // body and call `record_response` once the stream ends.
-        if ctx.idempotency_miss.is_some() {
+        //
+        // Skipped on a fallback (WOR-2686): the paired body capture and
+        // `record_response` live below `response_body_filter`'s
+        // `fallback_triggered` early return and can never run, so the
+        // snapshot would be dead state describing a response the client
+        // never received. An idempotent request whose upstream answered a
+        // listed status records nothing under its key and replays against
+        // the upstream, which is the honest outcome while the fallback
+        // body is not itself recorded.
+        if ctx.idempotency_miss.is_some() && !ctx.fallback_triggered {
             ctx.idempotency_response_status = Some(upstream_response.status.as_u16());
             let headers: Vec<(String, String)> = upstream_response
                 .headers
@@ -4700,73 +5101,44 @@ impl ProxyHttp for SbProxy {
             }
         }
 
-        // --- On-status fallback: rewrite response if upstream status matches ---
+        // WOR-2686: record the upstream's status before any stage below
+        // can replace it. `ctx.response_status` ends up holding the
+        // status the client actually sees (a fallback's, a `status`
+        // response modifier's, the metering refusal's), so it cannot also
+        // answer "what did the upstream say". The access log's
+        // `upstream_status` reads this field instead and surfaces it only
+        // when the two differ; before this it read `ctx.response_status`
+        // and filtered it against a number computed from
+        // `ctx.response_status`, so it was unreachable on every request.
         //
-        // Skipped on the two translated gRPC paths, which own the
-        // response body outright. `response_body_filter` returns from its
-        // `transcode_active` / `grpc_web_active` branch before it reaches
-        // the `ctx.fallback_body` swap below, so a fallback that fired
-        // here would send the fallback's status and its `content-length`
-        // over a body that is still the translated one (or, on a
-        // trailers-only response, no body at all). A body that does not
-        // match its declared length desynchronizes a keep-alive
-        // connection, which is worse than not applying the fallback.
-        //
-        // The mismatch is not new, but its reach is. Until the
-        // gRPC-status-to-HTTP-status mapping above, only a genuine
-        // non-gRPC HTTP status from the upstream could land here on a
-        // translated origin, since a transcoded RPC carried the
-        // upstream's own 200 whatever its outcome. Mapping the status
-        // makes 503 and 429 ordinary values at this point, so the
-        // exclusion has to be explicit. `on_error` is untouched: it fires
-        // in `fail_to_proxy`, before any upstream response exists, so
-        // there is no translated body to conflict with.
-        // docs/routing.md states the limit.
-        if !ctx.transcode_active && !ctx.grpc_web_active {
-            let upstream_status = upstream_response.status.as_u16();
-            if let Some(origin_idx) = ctx.origin_idx {
-                let pipeline = ctx.pipeline.clone();
-                if let Some(fallback) = &pipeline.fallbacks[origin_idx] {
-                    if !fallback.on_status.is_empty()
-                        && fallback.on_status.contains(&upstream_status)
-                    {
-                        debug!(
-                            hostname = %ctx.hostname,
-                            upstream_status = %upstream_status,
-                            "upstream status matched on_status fallback, rewriting response"
-                        );
-                        ctx.fallback_triggered = true;
+        // "Before any stage below", not "before any stage": two stages
+        // above this line translate a status on purpose, and this
+        // records the translated value. `filter_response_headers` above
+        // applies a Proxy-Wasm filter's `:status` back onto the header,
+        // and the gRPC branch above maps `grpc-status` onto an HTTP
+        // status through `apply_response_status_override`. The mapped
+        // gRPC status is what every other surface reads (docs/routing.md
+        // says so), and a wasm filter's rewrite is the response as far
+        // as this proxy is concerned, so translating first and recording
+        // second is the behavior wanted. It is documented rather than
+        // left implicit because a stage inserted above this line would
+        // otherwise change what the field means with nothing going red.
+        ctx.upstream_status = Some(upstream_response.status.as_u16());
 
-                        // Rewrite response headers with the fallback action's response.
-                        if let Action::Static(s) = &fallback.action {
-                            let ct = s.content_type.as_deref().unwrap_or("text/plain");
-                            upstream_response.set_status(s.status).map_err(|e| {
-                                Error::because(
-                                    ErrorType::InternalError,
-                                    "failed to set fallback status",
-                                    e,
-                                )
-                            })?;
-                            let _ = upstream_response.insert_header("content-type", ct);
-                            let _ = upstream_response
-                                .insert_header("content-length", s.body.len().to_string());
-                            upstream_response.remove_header("transfer-encoding");
-                            for (k, v) in &s.headers {
-                                let _ = upstream_response.insert_header(k.clone(), v.clone());
-                            }
-                            if fallback.add_debug_header {
-                                let _ =
-                                    upstream_response.insert_header("X-Fallback-Trigger", "status");
-                            }
-                            // Store the fallback body for response_body_filter to swap in.
-                            ctx.fallback_body =
-                                Some(bytes::Bytes::copy_from_slice(s.body.as_bytes()));
-                            ctx.response_status = Some(s.status);
-                            return Ok(());
-                        }
-                    }
-                }
-            }
+        // --- On-status fallback ---
+        //
+        // The decision and the write both happen in
+        // `upstream_response_decision`, which runs before this hook; see
+        // `maybe_serve_status_fallback` for why the await is not here.
+        // Nothing below this point may run for a fallback. The response
+        // the client gets was written in full before this hook was
+        // called, and `upstream_response` is the primary's header, which
+        // Pingora forwards into `prepare_response_header`'s already-sent
+        // no-op guard. Every header sbproxy owns is stamped onto the
+        // fallback response by `stamp_fallback_gateway_headers` instead,
+        // and `docs/routing.md` lists exactly which ones those are.
+        if ctx.fallback_triggered {
+            return Ok(());
         }
 
         // Collect all header modifications into owned Vecs, then drop the pipeline
@@ -6584,14 +6956,67 @@ impl ProxyHttp for SbProxy {
                                         OpenApiValidationMode, OpenApiValidationResult,
                                     };
                                     let req = session.req_header();
-                                    let method = req.method.as_str();
-                                    let path = req.uri.path();
-                                    match oa.validate(
-                                        method,
-                                        path,
+                                    let method = req.method.as_str().to_string();
+                                    let path = req.uri.path().to_string();
+                                    // WOR-2687: this phase publishes the
+                                    // `openapi_validation` verdict for this
+                                    // request, and `check_policies` no longer
+                                    // publishes the premature header-phase
+                                    // `allow` for it (see
+                                    // `emits_own_verdict_in_body_phase`). The
+                                    // header phase always returned `Allow`
+                                    // because the body this policy validates
+                                    // is not buffered yet, which put an
+                                    // `allow` on the audit bus before the
+                                    // check that decides had run.
+                                    //
+                                    // The clock starts before `validate`, not
+                                    // at the emission site: `emit_policy_verdict`
+                                    // feeds this instant into three shared
+                                    // histograms, so an `Instant::now()` taken
+                                    // after the work injects a guaranteed 0.0
+                                    // sample into the built-in surface's
+                                    // decision-latency percentiles and into
+                                    // the per-verdict series.
+                                    let started = std::time::Instant::now();
+                                    let result = oa.validate(
+                                        &method,
+                                        &path,
                                         content_type.as_deref(),
                                         &collected,
-                                    ) {
+                                    );
+                                    // Reached by lookup rather than by index.
+                                    // `action_dispatch` states the rule for
+                                    // this exact pair: a policy chain that
+                                    // outlives its origin should fail this
+                                    // request closed rather than the process.
+                                    // A missing origin costs the record its
+                                    // two id labels and changes nothing about
+                                    // whether the request is refused.
+                                    let origin = pipeline.config.origins.get(origin_idx);
+                                    let verdict_ctx = PolicyVerdictCtx {
+                                        request_id: ctx.request_id.to_string(),
+                                        workspace_id: origin
+                                            .map(|o| o.workspace_id.to_string())
+                                            .unwrap_or_default(),
+                                        origin: origin
+                                            .map(|o| o.origin_id.to_string())
+                                            .unwrap_or_default(),
+                                        tenant: ctx.tenant_id.to_string(),
+                                        record_format: pipeline
+                                            .config
+                                            .decision_audit
+                                            .policy_record_format(),
+                                    };
+                                    let (surface, engine) = compiled_policy_attribution(
+                                        pipeline
+                                            .enforcers
+                                            .get(origin_idx)
+                                            .map(Vec::as_slice)
+                                            .unwrap_or_default(),
+                                        "openapi_validation",
+                                    );
+                                    match result {
                                         OpenApiValidationResult::Failed(msg) => match oa.mode {
                                             OpenApiValidationMode::Enforce => {
                                                 let body_str =
@@ -6602,6 +7027,25 @@ impl ProxyHttp for SbProxy {
                                                         })
                                                         .to_string()
                                                     });
+                                                tracing::warn!(
+                                                    target: "sbproxy::openapi_validation",
+                                                    detail = %msg,
+                                                    status = oa.status,
+                                                    "openapi validation refused the request body"
+                                                );
+                                                record_body_phase_policy_deny(
+                                                    ctx,
+                                                    &verdict_ctx,
+                                                    BodyPhaseDeny {
+                                                        policy_id: "openapi_validation",
+                                                        status: oa.status,
+                                                        reason: "schema_violation",
+                                                        method: &method,
+                                                        surface,
+                                                        engine,
+                                                        started,
+                                                    },
+                                                );
                                                 failed = Some((
                                                     oa.status,
                                                     body_str,
@@ -6615,10 +7059,43 @@ impl ProxyHttp for SbProxy {
                                                     detail = %msg,
                                                     "openapi validation failed (log mode)"
                                                 );
+                                                // `mode: log` admits the
+                                                // request, so the verdict this
+                                                // policy reached is `allow`.
+                                                // The `warn!` above is what
+                                                // says the body would have
+                                                // been refused under
+                                                // `enforce`; the verdict
+                                                // vocabulary has no monitor
+                                                // tag to say it with.
+                                                record_body_phase_policy_allow(
+                                                    ctx,
+                                                    &verdict_ctx,
+                                                    "openapi_validation",
+                                                    surface,
+                                                    engine,
+                                                    started,
+                                                );
                                             }
                                         },
                                         OpenApiValidationResult::Passed
-                                        | OpenApiValidationResult::OutOfScope => {}
+                                        | OpenApiValidationResult::OutOfScope => {
+                                            // Both admit the request, and both
+                                            // need the record: with the header
+                                            // phase's terminal `allow`
+                                            // suppressed for this policy, a
+                                            // silent arm here would delete the
+                                            // policy from the audit trail of
+                                            // every request it admits.
+                                            record_body_phase_policy_allow(
+                                                ctx,
+                                                &verdict_ctx,
+                                                "openapi_validation",
+                                                surface,
+                                                engine,
+                                                started,
+                                            );
+                                        }
                                     }
                                 }
                                 Policy::A2A(p) => {
@@ -7114,6 +7591,20 @@ impl ProxyHttp for SbProxy {
             return Ok(None);
         }
 
+        // WOR-2686: once an `on_status` fallback has fired in
+        // `upstream_response_decision`, the real upstream response's body
+        // (if the upstream sent one) is discarded outright, not swapped
+        // for. The fallback body was already written directly to the
+        // session before that hook returned, so anything still arriving
+        // here from the real upstream is the response being replaced,
+        // not the response being served; scanning, transforming, or
+        // buffering it would be wasted work on bytes the client is never
+        // meant to see.
+        if ctx.fallback_triggered {
+            *body = None;
+            return Ok(None);
+        }
+
         crate::proxy_wasm_http::filter_response_body(body, end_of_stream, ctx)?;
 
         // Track outbound body bytes for the access log. Counts what
@@ -7325,9 +7816,12 @@ impl ProxyHttp for SbProxy {
         // size is whatever is buffered so far (zero on the first chunk)
         // plus this chunk.
         //
-        // Two states are exempt. A pending fallback or replacement body
-        // (consumed just below) discards the upstream body entirely, so
-        // there is nothing oversized left to refuse. And once the
+        // Two states are exempt. A triggered fallback discards the
+        // upstream body entirely (WOR-2686 returns from this function
+        // above, before this point is reached, so the exemption is a
+        // second and redundant guard), and so does a replacement body
+        // consumed just below, so in neither case is there anything
+        // oversized left to refuse. And once the
         // all-open pass-through has committed this response to raw
         // delivery, aborting a later chunk would truncate a stream
         // whose raw prefix the client already holds, which is worse
@@ -7459,12 +7953,6 @@ impl ProxyHttp for SbProxy {
                     });
                 }
             }
-        }
-
-        // If a fallback body was prepared (on_status fallback), replace the upstream body.
-        if let Some(fb_body) = ctx.fallback_body.take() {
-            *body = Some(fb_body);
-            return Ok(None);
         }
 
         // If a response modifier specified a body replacement, swap it in.
@@ -8077,6 +8565,42 @@ impl ProxyHttp for SbProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // WOR-2686: a `fallback_origin` response is already on the wire,
+        // complete, header and body, written by the `on_status` trigger
+        // in `upstream_response_decision`. Whatever failed afterwards -
+        // the primary resetting mid-body is the ordinary case, since
+        // this proxy stopped reading its body the moment the fallback
+        // fired - failed on a response the client is no longer
+        // receiving. There is nothing here to write and nothing to
+        // record.
+        //
+        // An early return rather than `&& !ctx.fallback_triggered` on
+        // the `on_error` arm below, which was the narrow shape. That
+        // stops the second `serve_fallback_action` and its second
+        // `sbproxy_fallback_total` increment, and then falls through to
+        // the default upstream-error handling, which writes a
+        // synthesized error body and overwrites `ctx.response_status`
+        // with a 502 the client never saw. Trading a double-counted
+        // metric for a wrong status on the access-log row is not a fix.
+        // Returning here leaves `ctx.response_status`,
+        // `ctx.response_body_bytes` and the counter exactly as the
+        // served fallback left them.
+        //
+        // Placed above the Proxy-Wasm blocks below, whose `take()`s it
+        // therefore skips: a `fallback_origin` and a Proxy-Wasm filter
+        // chain are refused together at config compile
+        // (`pipeline.rs`), so there can be no pending local response to
+        // drop. `can_reuse_downstream` is true because the fallback was
+        // written with a declared length and finished, so the
+        // downstream stream is complete and clean whatever the upstream
+        // did.
+        if ctx.fallback_triggered {
+            return FailToProxy {
+                error_code: ctx.response_status.unwrap_or(502),
+                can_reuse_downstream: true,
+            };
+        }
+
         if let Some(local_response) = crate::proxy_wasm_http::take_pending_local_response(ctx) {
             let status = local_response.status;
             let _ = crate::proxy_wasm_http::send_terminal_local_response(session, &local_response)
@@ -8179,7 +8703,7 @@ impl ProxyHttp for SbProxy {
         if let Some(origin_idx) = ctx.origin_idx {
             let pipeline = ctx.pipeline.clone();
             if let Some(fallback) = &pipeline.fallbacks[origin_idx] {
-                if fallback.on_error {
+                if on_error_fallback_applies(fallback, ctx) {
                     debug!(
                         hostname = %ctx.hostname,
                         error = %e,
@@ -8190,14 +8714,27 @@ impl ProxyHttp for SbProxy {
                     // Serve the fallback action's response directly.
                     let result = serve_fallback_action(
                         session,
+                        ctx,
                         &fallback.action,
                         fallback.add_debug_header,
                         "error",
+                        None,
                     )
                     .await;
 
-                    if let Ok(status) = result {
+                    if let Ok((status, body_len)) = result {
                         ctx.response_status = Some(status);
+                        // WOR-2686: keep bytes_out (access log + billing
+                        // meter evidence) honest for this fallback
+                        // response too; it never reaches
+                        // `response_body_filter`'s own accounting since
+                        // `fail_to_proxy` is a terminal path.
+                        ctx.response_body_bytes = body_len;
+                        sbproxy_observe::metrics::record_fallback_served(
+                            "error",
+                            ctx.hostname.as_str(),
+                            ctx.tenant_id.as_str(),
+                        );
                         return FailToProxy {
                             error_code: status,
                             can_reuse_downstream: true,
@@ -9171,7 +9708,9 @@ mod idempotency_publish_seam_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pingora_core::protocols::l4::stream::Stream;
     use pingora_error::ErrorSource;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// A downstream `GET` asking for a WebSocket upgrade.
     fn upgrade_request() -> pingora_http::RequestHeader {
@@ -9541,6 +10080,574 @@ origins:
         }
     }
 
+    // --- WOR-2686: the `fallback_origin` response ---
+    //
+    // The regression this pins shipped once and was found in production,
+    // and the only coverage the first fix carried was an e2e conformance
+    // case. This repository never runs e2e in CI, so an identical
+    // regression would have merged with a fully green gate and a fully
+    // green CI, which is exactly how it shipped the first time. These run
+    // under `cargo nextest run -p sbproxy-core --lib`.
+
+    const FALLBACK_ORIGIN_CONFIG: &str = r#"
+origins:
+  "fb.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:19999
+    cors:
+      allow_origins:
+        - https://app.example.com
+      allow_methods:
+        - GET
+    fallback_origin:
+      on_status: [503]
+      add_debug_header: true
+      origin:
+        id: fb
+        hostname: fb
+        workspace_id: test
+        version: "1.0.0"
+        action:
+          type: static
+          status_code: 200
+          content_type: application/json
+          body: '{"source":"fallback"}'
+"#;
+
+    /// A context resolved onto the single origin in `yaml`.
+    ///
+    /// `CompiledFallback` is not `Clone`, so callers reach it by holding
+    /// their own `Arc` of the pipeline and borrowing out of that.
+    fn fallback_fixture(yaml: &str) -> RequestContext {
+        let config = sbproxy_config::compile_config(yaml).expect("fixture config");
+        let pipeline =
+            crate::pipeline::CompiledPipeline::from_config(config).expect("fixture pipeline");
+        let mut ctx = RequestContext::new();
+        ctx.pipeline = std::sync::Arc::new(pipeline);
+        ctx.origin_idx = Some(0);
+        ctx.hostname = "fb.test".into();
+        ctx
+    }
+
+    fn get_request(path: &str) -> pingora_http::RequestHeader {
+        pingora_http::RequestHeader::build("GET", path.as_bytes(), None).expect("request")
+    }
+
+    /// The fallback's own `Content-Length` matches the body it hands
+    /// over, on the arm both `fallback_origin` triggers now share.
+    #[test]
+    fn a_fallback_declares_the_length_of_the_body_it_carries() {
+        let ctx = fallback_fixture(FALLBACK_ORIGIN_CONFIG);
+        let pipeline = ctx.pipeline.clone();
+        let fallback = pipeline.fallbacks[0]
+            .as_ref()
+            .expect("fixture declares a fallback_origin");
+
+        let built = build_fallback_response(&fallback.action, true, "status", &http::Method::GET)
+            .expect("fallback response builds");
+
+        let declared = built
+            .header
+            .headers
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<usize>().ok())
+            .expect("a 200 fallback declares its length");
+        assert_eq!(declared, built.body.len());
+        assert!(!built.body.is_empty(), "the operator configured a body");
+        assert_eq!(
+            built
+                .header
+                .headers
+                .get("x-fallback-trigger")
+                .and_then(|v| v.to_str().ok()),
+            Some("status")
+        );
+    }
+
+    /// A `204` fallback declares no length at all.
+    ///
+    /// RFC 9110 section 8.6 forbids `Content-Length` on a `204`, and
+    /// Pingora's `init_body_writer` forces a zero-length body writer for
+    /// `204`/`304` whatever the header said, so a declared length is a
+    /// promise of bytes that never arrive: an HTTP/1.1 keep-alive client
+    /// frames the next response on the connection by that length and eats
+    /// its head. `action_dispatch.rs` carved this out for the `static` and
+    /// `mock` arms under WOR-2599; this arm is the one both
+    /// `fallback_origin` triggers depend on. Red before the fix: the
+    /// builder declared `content-length` for every status.
+    #[test]
+    fn a_204_fallback_declares_no_content_length() {
+        let yaml = FALLBACK_ORIGIN_CONFIG.replace("status_code: 200", "status_code: 204");
+        let ctx = fallback_fixture(&yaml);
+        let pipeline = ctx.pipeline.clone();
+        let fallback = pipeline.fallbacks[0]
+            .as_ref()
+            .expect("fixture declares a fallback_origin");
+
+        let built = build_fallback_response(&fallback.action, false, "status", &http::Method::GET)
+            .expect("fallback response builds");
+
+        assert_eq!(built.status, 204);
+        assert!(
+            built.header.headers.get("content-length").is_none(),
+            "a 204 that declares a length desynchronizes a keep-alive connection"
+        );
+        assert!(
+            built.body.is_empty(),
+            "Pingora writes no body for a 204, so none may be handed to it"
+        );
+    }
+
+    /// A `HEAD` keeps the declared length and loses only the bytes.
+    ///
+    /// The opposite carve-out to the `204` one, and the reason the rule
+    /// is not simply "no length when no body": the length a `HEAD`
+    /// declares is the length the matching `GET` would return, which is
+    /// what the header is for, and `HEAD` framing tells the client not to
+    /// read a body regardless.
+    #[test]
+    fn a_head_fallback_declares_the_length_and_writes_no_body() {
+        let ctx = fallback_fixture(FALLBACK_ORIGIN_CONFIG);
+        let pipeline = ctx.pipeline.clone();
+        let fallback = pipeline.fallbacks[0]
+            .as_ref()
+            .expect("fixture declares a fallback_origin");
+
+        let built = build_fallback_response(&fallback.action, false, "status", &http::Method::HEAD)
+            .expect("fallback response builds");
+
+        assert!(
+            built.header.headers.get("content-length").is_some(),
+            "a HEAD declares the length its GET would return"
+        );
+        assert!(
+            built.body.is_empty(),
+            "Pingora drops body bytes written for a HEAD"
+        );
+    }
+
+    /// The gateway's own headers survive onto a fallback response.
+    ///
+    /// A fallback is built from nothing, which is what stops the
+    /// primary's headers leaking onto it. Built from nothing also means
+    /// built without the headers sbproxy would have set on the response
+    /// it replaced, and CORS is the one that reaches real users: every
+    /// CORS stage in `response_filter` runs below the fallback's early
+    /// return, so before this a browser `fetch()` against a `cors` origin
+    /// met a fallback carrying no `access-control-allow-origin` and
+    /// reported an opaque network error instead of rendering the
+    /// fallback's own JSON. Red before the fix: the fresh header carried
+    /// nothing but the action's own fields.
+    ///
+    /// This pins the *set*. That the set reaches the wire at all is
+    /// `a_fallback_writes_only_its_own_header_block_and_body`'s job: this
+    /// one calls the stamping directly and would stay green if nothing
+    /// called it.
+    #[test]
+    fn a_fallback_response_carries_the_gateway_owned_headers() {
+        let mut ctx = fallback_fixture(FALLBACK_ORIGIN_CONFIG);
+        let pipeline = ctx.pipeline.clone();
+        let fallback = pipeline.fallbacks[0]
+            .as_ref()
+            .expect("fixture declares a fallback_origin");
+        ctx.request_id = "req-2686".into();
+        ctx.flags.debug = true;
+        let mut request = get_request("/anything");
+        request
+            .insert_header("origin", "https://app.example.com")
+            .expect("origin header");
+
+        let mut built =
+            build_fallback_response(&fallback.action, true, "status", &http::Method::GET)
+                .expect("fallback response builds");
+        stamp_fallback_gateway_headers(&request, &ctx, &mut built.header, Some(503));
+
+        assert_eq!(
+            built
+                .header
+                .headers
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("https://app.example.com"),
+            "a browser drops a fallback with no CORS decision on it"
+        );
+        assert_eq!(
+            built
+                .header
+                .headers
+                .get("x-sbproxy-debug-request-id")
+                .and_then(|v| v.to_str().ok()),
+            Some("req-2686"),
+            "the request id is how an operator finds this exchange in the log"
+        );
+        assert_eq!(
+            built
+                .header
+                .headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+            "the fallback still owns what it says about its own body"
+        );
+    }
+
+    /// Nothing the primary upstream set reaches the client, and the
+    /// declared length is followed by exactly that many bytes.
+    ///
+    /// The wire-level half: `serve_fallback_action` builds and writes the
+    /// whole response, so the assertion is on the bytes a real downstream
+    /// client reads off a real socket rather than on a header struct.
+    /// Red before the fix in both halves: the primary's `ResponseHeader`
+    /// was edited in place, so every header it set that the fallback did
+    /// not overwrite survived, and the body was stashed on the context
+    /// for a `response_body_filter` call that a bodyless primary never
+    /// produces.
+    #[tokio::test]
+    async fn a_fallback_writes_only_its_own_header_block_and_body() {
+        let ctx = fallback_fixture(FALLBACK_ORIGIN_CONFIG);
+        let pipeline = ctx.pipeline.clone();
+        let fallback = pipeline.fallbacks[0]
+            .as_ref()
+            .expect("fixture declares a fallback_origin");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind downstream fixture");
+        let address = listener.local_addr().expect("downstream address");
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect downstream fixture");
+            stream
+                .write_all(
+                    b"GET /anything HTTP/1.1\r\nHost: fb.test\r\n\
+                      Origin: https://app.example.com\r\n\r\n",
+                )
+                .await
+                .expect("write request");
+            let mut response = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                match stream.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(read) => response.extend_from_slice(&chunk[..read]),
+                    Err(_) => break,
+                }
+            }
+            response
+        });
+        let (stream, _) = listener.accept().await.expect("accept downstream");
+        let mut session = Session::new_h1(Box::new(Stream::from(stream)));
+        session
+            .as_downstream_mut()
+            .read_request()
+            .await
+            .expect("parse downstream request");
+
+        let (status, body_len) = serve_fallback_action(
+            &mut session,
+            &ctx,
+            &fallback.action,
+            fallback.add_debug_header,
+            "status",
+            Some(503),
+        )
+        .await
+        .expect("fallback serves");
+        drop(session);
+
+        let wire = tokio::time::timeout(std::time::Duration::from_secs(5), client)
+            .await
+            .expect("downstream response timeout")
+            .expect("downstream client task");
+        let wire = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        let (head, body) = wire
+            .split_once("\r\n\r\n")
+            .expect("a complete header block");
+
+        assert_eq!(status, 200);
+        assert!(head.starts_with("HTTP/1.1 200"), "wire: {wire}");
+        let declared = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .expect("the fallback declares a length");
+        assert_eq!(
+            declared,
+            body.len(),
+            "declared length and delivered bytes must agree: {wire}"
+        );
+        assert_eq!(
+            declared as u64, body_len,
+            "the reported bytes_out is what went out"
+        );
+        assert!(body.contains("\"source\":\"fallback\""), "wire: {wire}");
+        // The seam, not just the helper: a covered function is not a
+        // wired one, so this asserts the gateway-owned headers reached
+        // the wire through `serve_fallback_action` rather than asserting
+        // that `stamp_fallback_gateway_headers` can compute them.
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("access-control-allow-origin: https://app.example.com"),
+            "wire: {wire}"
+        );
+        // The header block is the fallback's own. Nothing on it can have
+        // come from a primary response, because none was ever read.
+        assert!(
+            !head.to_ascii_lowercase().contains("x-primary-marker"),
+            "wire: {wire}"
+        );
+        assert_eq!(
+            head.lines()
+                .filter(|line| line.to_ascii_lowercase().starts_with("content-length:"))
+                .count(),
+            1,
+            "exactly one length is declared: {wire}"
+        );
+    }
+
+    /// A body chunk from the primary is dropped once a fallback has
+    /// fired, rather than reaching the client behind the fallback's own
+    /// declared length.
+    ///
+    /// The other half of the framing guarantee: the fallback response is
+    /// complete and finished by the time `response_body_filter` sees
+    /// anything, so a primary that did send a body must not add bytes
+    /// after it. Red before the fix: the filter swapped in
+    /// `ctx.fallback_body` and forwarded it, and the accounting below the
+    /// swap ran over the upstream chunk.
+    #[tokio::test]
+    async fn the_primary_body_is_dropped_once_a_fallback_has_fired() {
+        let mut ctx = fallback_fixture(FALLBACK_ORIGIN_CONFIG);
+        ctx.fallback_triggered = true;
+        ctx.response_body_bytes = 21;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind downstream fixture");
+        let address = listener.local_addr().expect("downstream address");
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect downstream fixture");
+            stream
+                .write_all(b"GET /anything HTTP/1.1\r\nHost: fb.test\r\n\r\n")
+                .await
+                .expect("write request");
+            let mut sink = Vec::new();
+            let _ = stream.read_to_end(&mut sink).await;
+        });
+        let (stream, _) = listener.accept().await.expect("accept downstream");
+        let mut session = Session::new_h1(Box::new(Stream::from(stream)));
+        session
+            .as_downstream_mut()
+            .read_request()
+            .await
+            .expect("parse downstream request");
+
+        let mut body = Some(Bytes::from_static(
+            b"primary body the client must never see",
+        ));
+        let delay = SbProxy
+            .response_body_filter(&mut session, &mut body, true, &mut ctx)
+            .expect("the filter returns");
+
+        assert!(delay.is_none());
+        assert!(
+            body.is_none(),
+            "the primary's bytes would land behind the fallback's declared length"
+        );
+        assert_eq!(
+            ctx.response_body_bytes, 21,
+            "bytes_out stays what the fallback actually wrote"
+        );
+        drop(session);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), client).await;
+    }
+
+    /// A request whose `on_status` fallback already went out is not
+    /// served a second time when the primary's failure reaches
+    /// `fail_to_proxy`.
+    ///
+    /// The shape that reaches this: an origin configured with both
+    /// triggers, whose primary answers a listed status and then resets
+    /// the connection. The `on_status` fallback is written and counted,
+    /// the primary's body task then errors, and `error_while_proxy`
+    /// drives `fail_to_proxy` with `on_error: true` still configured.
+    /// The wire survives it either way, because Pingora's already-sent
+    /// header guard and the finished content-length writer swallow the
+    /// second response, so the damage is entirely in the records: one
+    /// degraded response counted twice by `sbproxy_fallback_total`,
+    /// once under each trigger label, on exactly the alert that counter
+    /// exists to carry.
+    ///
+    /// Asserted on the wire rather than on the counter because a
+    /// process-global Prometheus registry cannot be read back per test,
+    /// and the second `write_response_*` pair is the same event the
+    /// second increment rides on.
+    #[tokio::test]
+    async fn a_served_fallback_is_not_served_again_by_fail_to_proxy() {
+        let yaml = FALLBACK_ORIGIN_CONFIG.replace(
+            "      on_status: [503]",
+            "      on_status: [503]\n      on_error: true",
+        );
+        let mut ctx = fallback_fixture(&yaml);
+        assert!(
+            ctx.pipeline.fallbacks[0]
+                .as_ref()
+                .expect("fixture declares a fallback_origin")
+                .on_error,
+            "the fixture must arm the other trigger or this proves nothing"
+        );
+        // The state `upstream_response_decision` leaves behind after
+        // serving the `on_status` fallback. `response_body_bytes` is a
+        // sentinel rather than the real body length so a re-serve is
+        // visible on the context too.
+        ctx.fallback_triggered = true;
+        ctx.response_status = Some(200);
+        ctx.response_body_bytes = 999;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind downstream fixture");
+        let address = listener.local_addr().expect("downstream address");
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect downstream fixture");
+            stream
+                .write_all(b"GET /anything HTTP/1.1\r\nHost: fb.test\r\n\r\n")
+                .await
+                .expect("write request");
+            let mut response = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                match stream.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(read) => response.extend_from_slice(&chunk[..read]),
+                    Err(_) => break,
+                }
+            }
+            response
+        });
+        let (stream, _) = listener.accept().await.expect("accept downstream");
+        let mut session = Session::new_h1(Box::new(Stream::from(stream)));
+        session
+            .as_downstream_mut()
+            .read_request()
+            .await
+            .expect("parse downstream request");
+
+        let error = Error::new(ErrorType::ReadError);
+        let outcome = SbProxy.fail_to_proxy(&mut session, &error, &mut ctx).await;
+        drop(session);
+
+        let wire = tokio::time::timeout(std::time::Duration::from_secs(5), client)
+            .await
+            .expect("downstream response timeout")
+            .expect("downstream client task");
+
+        assert!(
+            wire.is_empty(),
+            "a second response was written over a complete one: {}",
+            String::from_utf8_lossy(&wire)
+        );
+        assert_eq!(
+            outcome.error_code, 200,
+            "the outcome reports the status the client actually received"
+        );
+        assert!(outcome.can_reuse_downstream);
+        assert_eq!(
+            ctx.response_status,
+            Some(200),
+            "the access log must keep the status that went out, not a synthesized 502"
+        );
+        assert_eq!(
+            ctx.response_body_bytes, 999,
+            "bytes_out must not be recomputed from a fallback body served once"
+        );
+    }
+
+    /// `response_filter` gains no `await` from the fallback work.
+    ///
+    /// WOR-2686's first shape put a `serve_fallback_action(..).await`
+    /// inside `response_filter`. That hook inlines every response stage
+    /// the proxy has and is the largest future on the request path, and
+    /// this workspace has already had one added await grow a
+    /// request-path future past the 2 MiB Pingora worker stack and kill
+    /// every AI request in production while 13006 unit tests stayed
+    /// green. Nothing in the gate, in CI, or in `cargo test` can see that
+    /// happen, so the constraint is pinned as a property of the source
+    /// instead.
+    ///
+    /// What this cannot see: an `await` added inside a function
+    /// `response_filter` calls, and any growth in the two call sites it
+    /// does allow. It sees the shape of the hook's own body, which is
+    /// where the regression was.
+    #[test]
+    fn response_filter_takes_no_new_await() {
+        let source = include_str!("proxy_http.rs");
+        let lines: Vec<&str> = source.lines().collect();
+        let start = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("async fn response_filter("))
+            .expect("response_filter is declared in this file");
+        let mut depth = 0usize;
+        let mut opened = false;
+        let mut end = None;
+        for (offset, line) in lines[start..].iter().enumerate() {
+            for ch in line.chars() {
+                match ch {
+                    '{' => {
+                        depth += 1;
+                        opened = true;
+                    }
+                    '}' => {
+                        depth = depth.saturating_sub(1);
+                        if opened && depth == 0 {
+                            end = Some(start + offset);
+                        }
+                    }
+                    _ => {}
+                }
+                if end.is_some() {
+                    break;
+                }
+            }
+            if end.is_some() {
+                break;
+            }
+        }
+        let end = end.expect("response_filter's body closes");
+        let awaits: Vec<&str> = lines[start..=end]
+            .iter()
+            .copied()
+            .filter(|line| line.contains(".await"))
+            .map(str::trim)
+            .collect();
+
+        assert_eq!(
+            awaits.len(),
+            2,
+            "response_filter has exactly two await points, both older than \
+             WOR-2686: the anomaly-detector hook dispatch and the on_response \
+             callbacks. Serving a response from this hook needs a third and \
+             must not be added here; see maybe_serve_status_fallback. Found: \
+             {awaits:?}"
+        );
+        assert!(
+            awaits.iter().any(|line| line.contains("hook.analyze")),
+            "found: {awaits:?}"
+        );
+    }
+
     fn refusal_test_ctx(config_yaml: &str) -> RequestContext {
         let config = sbproxy_config::compile_config(config_yaml).expect("fixture config");
         let pipeline =
@@ -9591,10 +10698,16 @@ origins:
 
     #[test]
     fn the_refusal_respects_the_exempt_states() {
-        // A pending replacement discards the upstream body, so there is
-        // nothing oversized left to refuse; and a response committed to
-        // raw delivery must not be aborted after its raw prefix reached
-        // the client.
+        // A triggered fallback or a pending replacement discards the
+        // upstream body, so there is nothing oversized left to refuse;
+        // and a response committed to raw delivery must not be aborted
+        // after its raw prefix reached the client.
+        //
+        // All three arms are asserted. WOR-2686 re-keyed the fallback arm
+        // from `fallback_body.is_some()` to `fallback_triggered` and this
+        // test, which names "the exempt states", covered only two of the
+        // three: the arm it changed could have been deleted or inverted
+        // and this would have stayed green.
         let mut ctx = refusal_test_ctx(CLOSED_CAP_CONFIG);
         ctx.transform_passthrough_committed = true;
         assert_eq!(closed_refusal_before_capture(&ctx, 45), None);
@@ -9602,6 +10715,14 @@ origins:
         let mut ctx = refusal_test_ctx(CLOSED_CAP_CONFIG);
         ctx.response_body_replacement = Some(bytes::Bytes::from_static(b"replacement"));
         assert_eq!(closed_refusal_before_capture(&ctx, 45), None);
+
+        let mut ctx = refusal_test_ctx(CLOSED_CAP_CONFIG);
+        ctx.fallback_triggered = true;
+        assert_eq!(
+            closed_refusal_before_capture(&ctx, 45),
+            None,
+            "a fallback has already replaced this response; the upstream body is discarded"
+        );
     }
 
     #[test]
@@ -9696,6 +10817,68 @@ origins:
             Some(pingora_error::ErrorSource::Upstream),
             false
         ));
+    }
+
+    /// The seam, not the fragment: this is the whole condition
+    /// `fail_to_proxy` now evaluates before serving `fallback.on_error`,
+    /// so inverting either half of it fails here.
+    #[test]
+    fn the_on_error_fallback_declines_only_a_cancelled_client_disconnect() {
+        fn fallback(on_error: bool) -> crate::pipeline::CompiledFallback {
+            crate::pipeline::CompiledFallback {
+                on_error,
+                on_status: Vec::new(),
+                add_debug_header: false,
+                action: sbproxy_modules::Action::Noop,
+            }
+        }
+
+        let mut ctx = RequestContext::new();
+        assert!(
+            on_error_fallback_applies(&fallback(true), &ctx),
+            "an ordinary upstream failure still serves the configured fallback"
+        );
+        assert!(
+            !on_error_fallback_applies(&fallback(false), &ctx),
+            "an origin that did not ask for on_error still gets none"
+        );
+
+        // WOR-2690: the AI dispatcher cancels a provider call when the
+        // client's connection is gone. Serving a fallback action to a
+        // caller who left cannot deliver anything, and on an `ai_proxy`
+        // fallback that action is a second paid provider call, which
+        // hands straight back the spend the cancellation saved.
+        ctx.ai_upstream_cancelled_on_client_disconnect = true;
+        assert!(
+            !on_error_fallback_applies(&fallback(true), &ctx),
+            "a cancelled client disconnect has nobody left to answer"
+        );
+    }
+
+    /// The narrowing has to stay narrow. Pingora stamps `Downstream` on
+    /// request sanitization failures, where the caller is alive and
+    /// reading, and an earlier revision of this guard keyed on that
+    /// source and silently took those callers' fallback away.
+    #[test]
+    fn a_live_client_keeps_its_fallback_on_a_downstream_sourced_failure() {
+        let sanitization_failure = Error::new_down(ErrorType::InvalidHTTPHeader);
+        assert_eq!(
+            *sanitization_failure.esource(),
+            pingora_error::ErrorSource::Downstream,
+            "the fixture has to be the shape the old guard misread"
+        );
+
+        let ctx = RequestContext::new();
+        let fallback = crate::pipeline::CompiledFallback {
+            on_error: true,
+            on_status: Vec::new(),
+            add_debug_header: false,
+            action: sbproxy_modules::Action::Noop,
+        };
+        assert!(
+            on_error_fallback_applies(&fallback, &ctx),
+            "a malformed request header must not cost a live caller its fallback"
+        );
     }
 
     #[test]
@@ -12091,6 +13274,245 @@ origins:
         assert_eq!(
             websocket_teardown_count("subprotocol_violation", "none", ORIGIN),
             before + 1
+        );
+    }
+
+    // --- WOR-2687: a body-phase refusal an h2 upstream answered anyway ---
+
+    /// A request context as the body phase leaves one, plus the
+    /// identifiers every terminal surface stamps on a record.
+    fn body_phase_ctx(origin: &str) -> RequestContext {
+        let mut ctx = RequestContext::new();
+        ctx.hostname = origin.into();
+        ctx.tenant_id = "acme".into();
+        ctx.request_id = "req-openapi-1".into();
+        ctx.client_ip = Some("203.0.113.9".parse().expect("test ip"));
+        ctx
+    }
+
+    /// The dispatcher correlation the body phase rebuilds for its own
+    /// emission.
+    fn body_phase_verdict_ctx(origin: &str) -> PolicyVerdictCtx {
+        PolicyVerdictCtx {
+            request_id: "req-openapi-1".to_string(),
+            workspace_id: String::new(),
+            origin: origin.to_string(),
+            tenant: "acme".to_string(),
+            record_format: sbproxy_config::types::PolicyRecordFormat::default(),
+        }
+    }
+
+    /// WOR-2687, red-first: the guard that stops an h2 upstream's
+    /// response from reaching a client whose request a body-phase
+    /// policy already refused.
+    ///
+    /// Pingora's h1 duplex loop propagates `request_body_filter`'s
+    /// `Err` with `?` and `fail_to_proxy` renders the refusal. Its h2
+    /// loop logs `Upstream h2 body send error` and keeps going, so the
+    /// upstream's own response was filtered and written downstream and
+    /// the client got the backend's answer to a request the proxy had
+    /// refused. `tune_peer` sets `ALPN::H2H1` on every peer, so that
+    /// was the default for any `https://` backend.
+    #[test]
+    fn wor_2687_a_refused_body_withholds_the_upstream_response() {
+        let mut ctx = body_phase_ctx("openapi-guard.example.com");
+        assert!(
+            body_phase_refusal(&ctx).is_none(),
+            "a request nothing refused forwards its upstream response untouched"
+        );
+
+        ctx.validator_failed = Some((
+            422,
+            "{\"error\":\"openapi validation failed\"}".to_string(),
+            "application/json".to_string(),
+        ));
+        let refusal = body_phase_refusal(&ctx)
+            .expect("a stashed refusal withholds the upstream response on every protocol");
+        assert_eq!(
+            refusal.etype(),
+            &pingora_error::ErrorType::HTTPStatus(422),
+            "the error carries the status the policy configured, not a generic 502"
+        );
+        assert!(
+            ctx.validator_failed.is_some(),
+            "the guard leaves the slot for fail_to_proxy, the one writer: taking it here \
+             would leave that writer with nothing and fall through to the generic 502"
+        );
+    }
+
+    /// WOR-2687, red-first: the refusal reaches every surface a
+    /// proxy-level refusal is supposed to reach.
+    ///
+    /// Before this change the `openapi_validation` arm reached the
+    /// policy counter and the access log's policy column and nothing
+    /// else, so an operator running `audit.sink: chain` for
+    /// tamper-evident evidence saw `content_digest` refusals and zero
+    /// `openapi_validation` refusals, forever, and a metered origin
+    /// billed the refusal as ordinary work because
+    /// `BillableOutcome::PolicyBlocked` is gated entirely on
+    /// `deny_reason`.
+    #[test]
+    fn wor_2687_a_body_phase_deny_records_on_every_refusal_surface() {
+        const ORIGIN: &str = "openapi-deny.example.com";
+        let before = counter_value(
+            "sbproxy_policy_triggers_total",
+            &[
+                ("origin", ORIGIN),
+                ("policy_type", "openapi_validation"),
+                ("action", "deny"),
+            ],
+        );
+        let mut ctx = body_phase_ctx(ORIGIN);
+        let verdict_ctx = body_phase_verdict_ctx(ORIGIN);
+
+        let records = capture_security_audit(|| {
+            record_body_phase_policy_deny(
+                &mut ctx,
+                &verdict_ctx,
+                BodyPhaseDeny {
+                    policy_id: "openapi_validation",
+                    status: 422,
+                    reason: "schema_violation",
+                    method: "POST",
+                    surface: sbproxy_observe::events::PolicySurface::BuiltIn,
+                    engine: sbproxy_observe::decision::DecisionEngine::BuiltIn,
+                    started: std::time::Instant::now(),
+                },
+            );
+        });
+
+        assert_eq!(
+            counter_value(
+                "sbproxy_policy_triggers_total",
+                &[
+                    ("origin", ORIGIN),
+                    ("policy_type", "openapi_validation"),
+                    ("action", "deny"),
+                ],
+            ),
+            before + 1,
+            "the shared policy counter sees the refusal"
+        );
+        assert_eq!(
+            ctx.policy_decisions,
+            vec!["openapi_validation:deny".to_string()],
+            "the admin ring row explains what applied"
+        );
+        assert_eq!(
+            ctx.deny_reason.as_deref(),
+            Some("openapi_validation: schema_violation"),
+            "the refusal is billed as a policy block and the admin row can say why"
+        );
+
+        assert_eq!(
+            records.len(),
+            1,
+            "exactly one policy_violation record, the shape that bridges to the \
+             security_audit target, the audit ring, the hash-chained file, and the \
+             events: egress: {records:?}"
+        );
+        let record = &records[0];
+        assert_eq!(record["event_type"], "openapi_validation");
+        assert_eq!(record["reason"], "schema_violation");
+        assert_eq!(record["status_code"], 422);
+        assert_eq!(record["hostname"], ORIGIN);
+        assert_eq!(record["tenant_id"], "acme");
+        assert_eq!(record["method"], "POST");
+        assert_eq!(record["request_id"], "req-openapi-1");
+    }
+
+    /// WOR-2687: the reason on that record is a stable label, never the
+    /// validator's own message.
+    ///
+    /// A JSON Schema error quotes the offending value out of the
+    /// request body (`"30" is not of type "string"`), and this record
+    /// reaches four sinks at once, one of them a tamper-evident file an
+    /// operator keeps as evidence. The detail belongs in the rejection
+    /// body the client receives and in the policy's `warn!`, neither of
+    /// which is an evidence feed.
+    #[test]
+    fn wor_2687_the_deny_record_carries_no_request_body_content() {
+        const ORIGIN: &str = "openapi-redaction.example.com";
+        let mut ctx = body_phase_ctx(ORIGIN);
+        let verdict_ctx = body_phase_verdict_ctx(ORIGIN);
+        let records = capture_security_audit(|| {
+            record_body_phase_policy_deny(
+                &mut ctx,
+                &verdict_ctx,
+                BodyPhaseDeny {
+                    policy_id: "openapi_validation",
+                    status: 422,
+                    reason: "schema_violation",
+                    method: "POST",
+                    surface: sbproxy_observe::events::PolicySurface::BuiltIn,
+                    engine: sbproxy_observe::decision::DecisionEngine::BuiltIn,
+                    started: std::time::Instant::now(),
+                },
+            );
+        });
+        let rendered = serde_json::to_string(&records).expect("records serialize");
+        for probe in ["ssn", "not of type", "additionalProperties", "required"] {
+            assert!(
+                !rendered.contains(probe),
+                "a schema message reached the audit record: {rendered}"
+            );
+        }
+        assert!(
+            ctx.deny_reason
+                .as_deref()
+                .is_some_and(|reason| reason == "openapi_validation: schema_violation"),
+            "the billing and admin reason is the same bounded label"
+        );
+    }
+
+    /// WOR-2687: attribution is read off the compiled chain, not
+    /// hardcoded at the emission site.
+    ///
+    /// The header-phase record for a policy reads `surface` and
+    /// `engine` off its `CompiledEnforcer`. A body-phase record that
+    /// hardcodes them starts disagreeing with its own header-phase
+    /// sibling the moment the registry routes that variant through a
+    /// different constructor, which is the drift
+    /// `PolicyVerdictEvent::engine` exists to prevent.
+    #[test]
+    fn wor_2687_body_phase_attribution_comes_from_the_compiled_chain() {
+        let config = sbproxy_config::compile_config(
+            r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "api.localhost":
+    action: {type: static, status_code: 200, body: "ok"}
+    policies:
+      - type: openapi_validation
+        mode: enforce
+        status: 422
+        spec:
+          openapi: "3.0.3"
+          info: {title: t, version: "1"}
+          paths: {}
+"#,
+        )
+        .expect("fixture config");
+        let mut pipeline =
+            crate::pipeline::CompiledPipeline::from_config(config).expect("fixture pipeline");
+        let chain = pipeline.enforcers.remove(0);
+        assert_eq!(
+            compiled_policy_attribution(&chain, "openapi_validation"),
+            (
+                sbproxy_observe::events::PolicySurface::BuiltIn,
+                sbproxy_observe::decision::DecisionEngine::BuiltIn,
+            ),
+            "today's registry compiles this policy as a plain built-in"
+        );
+        assert_eq!(
+            compiled_policy_attribution(&[], "openapi_validation"),
+            (
+                sbproxy_observe::events::PolicySurface::BuiltIn,
+                sbproxy_observe::decision::DecisionEngine::BuiltIn,
+            ),
+            "a chain that no longer carries the policy records the refusal rather than \
+             panicking a Pingora worker"
         );
     }
 }

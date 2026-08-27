@@ -1317,16 +1317,30 @@ pub(crate) fn shadow_calls_value(target: &str, status_class: &str, finish_reason
 
 /// Per-tier outcome counter for the [`RoutingStrategy::Cascade`]
 /// dispatch path. `tier` is the 0-based tier index as a decimal
-/// string; `outcome` is one of `accepted`, `retry`, or `cost_cap`.
-/// Cardinality is bounded by the number of configured tiers (in
-/// practice 2 to 5) times the three outcome labels.
+/// string; `outcome` is one of `accepted`, `retry`, `cost_cap`,
+/// `credential_lock`, `data_posture`, `disabled`, `not_found`, or
+/// `unhealthy`. Cardinality is bounded by the number of configured
+/// tiers (in practice 2 to 5) times the eight outcome labels.
+///
+/// WOR-2685 split the five pre-dispatch exclusions out of `retry`,
+/// where none of them belonged: nothing was retried, and a credential
+/// provider lock misconfigured across a fleet was indistinguishable
+/// from a burst of upstream 5xx. `retry` keeps its two post-dispatch
+/// meanings (a tier that dispatched and failed, and a tier whose
+/// response was refused or scored below threshold), so an existing
+/// alert on it still counts what it always counted.
 ///
 /// [`RoutingStrategy::Cascade`]: crate::routing::RoutingStrategy::Cascade
 static AI_CASCADE_TIER_OUTCOMES: LazyLock<CounterVec> = LazyLock::new(|| {
     register_counter_vec!(
         Opts::new(
             "sbproxy_ai_cascade_tier_outcomes_total",
-            "Cascade routing tier outcomes (accepted | retry | cost_cap)"
+            // Comma-separated, not pipe-separated: this help string is
+            // rendered into a Markdown table cell in
+            // `docs/metrics-stability.md`, where an unescaped pipe
+            // opens a new column.
+            "Cascade routing tier outcomes (accepted, retry, cost_cap, credential_lock, \
+             data_posture, disabled, not_found, unhealthy)"
         ),
         &["tier", "outcome"]
     )
@@ -1334,8 +1348,11 @@ static AI_CASCADE_TIER_OUTCOMES: LazyLock<CounterVec> = LazyLock::new(|| {
 });
 
 /// Record one cascade tier outcome. `tier_index` is converted to a
-/// decimal label; `outcome` should be a low-cardinality stable
-/// string from the closed set `{accepted, retry, cost_cap}`.
+/// decimal label; `outcome` should be a low-cardinality stable string
+/// from the closed set `{accepted, retry, cost_cap, credential_lock,
+/// data_posture, disabled, not_found, unhealthy}`. The cascade
+/// executor passes `CascadeSkipReason::metric_label`, which is that
+/// set minus `accepted`.
 pub fn record_cascade_tier_outcome(tier_index: usize, outcome: &str) {
     AI_CASCADE_TIER_OUTCOMES
         .with_label_values(&[tier_index.to_string().as_str(), outcome])

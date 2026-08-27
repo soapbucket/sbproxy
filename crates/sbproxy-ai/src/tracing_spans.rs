@@ -521,6 +521,14 @@ pub mod error_type {
     /// [`BUDGET_EXCEEDED`], which is the gateway declining a
     /// well-formed request on spend grounds.
     pub const INVALID_REQUEST: &str = "invalid_request";
+    /// The client closed its connection while the provider was still
+    /// generating, and the gateway cancelled the call rather than pay
+    /// for a response nobody would read. Neither the provider nor the
+    /// gateway failed, so this is deliberately not folded into
+    /// [`PROVIDER_ERROR`]: a trace backend filtering on `error.type`
+    /// should be able to keep abandoned calls out of a provider's
+    /// reliability numbers.
+    pub const CLIENT_DISCONNECTED: &str = "client_disconnected";
 }
 
 /// Mark an AI span as failed (WOR-1231).

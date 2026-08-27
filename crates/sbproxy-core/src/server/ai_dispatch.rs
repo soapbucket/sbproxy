@@ -276,6 +276,283 @@ async fn run_routed_provider_attempt<T, E>(
     result
 }
 
+/// What one look at the downstream connection said about the client.
+///
+/// The two answers are deliberately not symmetric. `Gone` is a fact:
+/// the connection is broken and no response can reach the caller
+/// whatever the gateway does next. `Inconclusive` is the absence of
+/// that fact, and it covers a shape that genuinely looks like a
+/// departure without being one, so it must never cancel a paid call.
+enum DownstreamLiveness {
+    /// The connection is broken past repair. On HTTP/1 that is a read
+    /// error, which is what a TCP reset (`ECONNRESET`) or a torn-down
+    /// TLS session looks like from this side. On HTTP/2 it is the
+    /// client resetting the stream (`RST_STREAM`) or closing the
+    /// connection (`GOAWAY`), which is an explicit cancellation rather
+    /// than an inference drawn from a socket.
+    Gone(Box<Error>),
+    /// Something happened on the connection that is not a departure.
+    ///
+    /// Two shapes land here, and neither may cancel:
+    ///
+    /// - An HTTP/1 half-close: a FIN with the write side still open.
+    ///   RFC 9112 section 9.6 lets a client shut down its write half and
+    ///   go on reading the response, and at the TCP layer that polite
+    ///   half-close is byte-for-byte the same event as a client that
+    ///   walked away. There is no way to tell them apart without
+    ///   writing to the socket, so this signal is not acted on. The
+    ///   residual is documented rather than papered over: a client that
+    ///   half-closes and then silently vanishes keeps its generation
+    ///   until a write to it fails.
+    /// - Bytes arriving after the request body, which on a keep-alive
+    ///   connection are the next request rather than a departure.
+    ///   Cancelling on those would charge one caller for another's
+    ///   impatience.
+    Inconclusive,
+}
+
+/// Watch the downstream connection for a disconnect, and resolve only
+/// when there is one (WOR-2690).
+///
+/// `half_close_is_departure` is the origin's `cancel_on_half_close`. Off
+/// (the default) only an unambiguous break counts, and a bare HTTP/1 FIN
+/// does not: RFC 9112 section 9.6 makes it byte-for-byte identical to a
+/// client that has simply finished sending, and cancelling on it would
+/// abort live callers. On, the operator has told us their callers never
+/// half-close after sending, and the FIN is read as the departure it
+/// usually is.
+///
+/// The flag changes which answers count, never how or when the
+/// connection is read. There is no separate pre-dispatch look and no
+/// timing rule: this is a real await, so a FIN already queued when the
+/// race arms resolves on the first poll and one that lands mid-generation
+/// resolves when it lands. Both are the same code path, and neither
+/// depends on winning a scheduler race.
+///
+/// Deliberately built on Pingora's `idle()` rather than on
+/// `read_body_or_idle()`, and the difference is not stylistic. On
+/// HTTP/1, `read_body_or_idle` sets the session's `half_closed` flag
+/// when its probe reads zero, and that flag is the sole input to
+/// `proxy_http::downstream_half_closed`, which is in turn one of the two
+/// inputs `logging()` hands `client_disconnected` (WOR-2335). Nothing on
+/// the AI path had ever called it, so setting that flag here would have
+/// silently reclassified the receipt of every *failed* AI request from a
+/// half-closing client: a provider outage that priced `origin_5xx`
+/// would price `client_disconnected` instead, turning a free outcome
+/// into a partially billable one on a signed document. `idle()` reads
+/// the same byte and touches no flag, so watching a request cannot
+/// change how a request that was never cancelled is billed. That holds
+/// with `cancel_on_half_close` on as well: a request this cancels is
+/// classified by the error it returns, never by session state.
+///
+/// Never resolves while the client is merely slow: a connected caller
+/// that is sending nothing leaves this pending for as long as the
+/// provider takes, whatever the flag says.
+async fn downstream_hard_disconnect(
+    session: &mut Session,
+    half_close_is_departure: bool,
+) -> DownstreamLiveness {
+    use pingora_core::protocols::http::ServerSession;
+
+    match session.as_downstream_mut() {
+        ServerSession::H1(h1) => match h1.idle().await {
+            // A FIN. Ambiguous by construction, so it is a departure
+            // only where the operator has said it is one.
+            Ok(0) if half_close_is_departure => DownstreamLiveness::Gone(Error::explain(
+                ErrorType::ConnectionClosed,
+                "downstream half-closed before any response byte, and this origin sets \
+                 cancel_on_half_close",
+            )),
+            // `Ok(0)` without the opt-in is the half-close the gateway
+            // declines to read as a departure; `Ok(n)` is a pipelined
+            // byte, which is the next request rather than a departure
+            // whatever the flag says.
+            Ok(_) => DownstreamLiveness::Inconclusive,
+            Err(error) => DownstreamLiveness::Gone(error),
+        },
+        // `Idle` is `poll_reset`, so it resolves on `RST_STREAM` or
+        // `GOAWAY` and on a connection-level error. HTTP/2 has no
+        // half-close to confuse this with: a client that is done sending
+        // ends its stream without ending the response, and that does not
+        // resolve here. `cancel_on_half_close` is therefore irrelevant
+        // to an HTTP/2 caller, which is why the flag's documentation
+        // says so.
+        ServerSession::H2(h2) => match h2.idle().await {
+            Ok(reason) => DownstreamLiveness::Gone(Error::explain(
+                ErrorType::H2Error,
+                format!("client reset the HTTP/2 stream: {reason}"),
+            )),
+            Err(error) => DownstreamLiveness::Gone(error),
+        },
+        // A subrequest and a custom transport have no downstream socket
+        // of their own to watch, so there is nothing to say and the
+        // request runs exactly as it did before this existed.
+        _ => std::future::pending().await,
+    }
+}
+
+#[cfg(test)]
+mod downstream_liveness_tests {
+    use super::*;
+    use pingora_core::protocols::l4::stream::Stream;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt as _;
+
+    /// One live HTTP/1 session with its request already parsed, plus the
+    /// client socket, so a test can do to it what a real client would.
+    ///
+    /// Deliberately a real socket rather than a mock. The whole point of
+    /// these tests is what Pingora's session does with a FIN and with a
+    /// reset, and a fixture that answered those questions itself would
+    /// prove nothing about the thing being relied on.
+    async fn live_h1_session() -> (Session, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind liveness fixture");
+        let address = listener.local_addr().expect("liveness fixture address");
+        let connect = tokio::spawn(async move {
+            let mut client = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect liveness fixture");
+            client
+                .write_all(b"POST /v1/chat/completions HTTP/1.1\r\nHost: ai.test\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .expect("write request");
+            client
+        });
+        let (server, _) = listener.accept().await.expect("accept liveness fixture");
+        let client = connect.await.expect("liveness fixture client");
+        let mut session = Session::new_h1(Box::new(Stream::from(server)));
+        session
+            .as_downstream_mut()
+            .read_request()
+            .await
+            .expect("parse request");
+        (session, client)
+    }
+
+    /// The Blocker's invariant, at the level it actually lives on: the
+    /// watch must observe a half-close without recording one. Pingora's
+    /// `read_body_or_idle` sets `half_closed` on the same read, and that
+    /// flag is what `proxy_http::downstream_half_closed` reports into
+    /// `client_disconnected`, so setting it here would reprice the
+    /// receipt of every failed AI request from a half-closing client.
+    #[tokio::test]
+    async fn a_half_close_is_inconclusive_and_does_not_mark_the_session() {
+        let (mut session, mut client) = live_h1_session().await;
+        client.shutdown().await.expect("half-close the client");
+
+        let observed = tokio::time::timeout(
+            Duration::from_secs(2),
+            downstream_hard_disconnect(&mut session, false),
+        )
+        .await
+        .expect("a queued FIN resolves the watch");
+
+        assert!(
+            matches!(observed, DownstreamLiveness::Inconclusive),
+            "a half-close is not a departure by default"
+        );
+        assert!(
+            !crate::server::proxy_http::downstream_half_closed(&session),
+            "watching a request must not change how that request is billed"
+        );
+    }
+
+    /// A reset is the unambiguous half of the signal: the connection is
+    /// broken, no response can reach the caller, and there is nothing to
+    /// weigh.
+    #[tokio::test]
+    async fn a_reset_connection_is_gone() {
+        let (mut session, client) = live_h1_session().await;
+        // Zero-timeout linger turns the close into an RST rather than a
+        // FIN, which is what an abandoned connection looks like once the
+        // peer's socket is fully gone.
+        // Deprecated for the blocking-on-drop hazard of a *non-zero*
+        // linger; a zero linger resets at once and blocks on nothing.
+        #[allow(deprecated)]
+        client
+            .set_linger(Some(Duration::ZERO))
+            .expect("set linger on the fixture client");
+        drop(client);
+
+        let observed = tokio::time::timeout(
+            Duration::from_secs(2),
+            downstream_hard_disconnect(&mut session, false),
+        )
+        .await
+        .expect("a reset resolves the watch");
+
+        assert!(
+            matches!(observed, DownstreamLiveness::Gone(_)),
+            "a reset connection is a departure"
+        );
+    }
+
+    /// The other half of "no timers": a client that is connected and
+    /// simply quiet must leave the watch pending for as long as the
+    /// provider takes, however slow that is.
+    #[tokio::test]
+    async fn a_connected_client_leaves_the_watch_pending() {
+        let (mut session, _client) = live_h1_session().await;
+
+        let observed = tokio::time::timeout(
+            Duration::from_millis(250),
+            downstream_hard_disconnect(&mut session, false),
+        )
+        .await;
+
+        assert!(
+            observed.is_err(),
+            "a live client must never resolve the watch"
+        );
+    }
+
+    /// `cancel_on_half_close` changes exactly one answer: the FIN. The
+    /// operator has asserted their callers do not half-close after
+    /// sending, so the ambiguity the default declines to resolve is
+    /// resolved their way.
+    #[tokio::test]
+    async fn a_half_close_is_a_departure_under_the_opt_in() {
+        let (mut session, mut client) = live_h1_session().await;
+        client.shutdown().await.expect("half-close the client");
+
+        let observed = tokio::time::timeout(
+            Duration::from_secs(2),
+            downstream_hard_disconnect(&mut session, true),
+        )
+        .await
+        .expect("a queued FIN resolves the watch");
+
+        assert!(
+            matches!(observed, DownstreamLiveness::Gone(_)),
+            "with the opt-in on, a half-close is the client leaving"
+        );
+        assert!(
+            !crate::server::proxy_http::downstream_half_closed(&session),
+            "the opt-in changes which answers cancel, never what the watch records"
+        );
+    }
+
+    /// The opt-in must not turn a quiet client into a departure. Only the
+    /// FIN moves.
+    #[tokio::test]
+    async fn a_connected_client_stays_pending_under_the_opt_in() {
+        let (mut session, _client) = live_h1_session().await;
+
+        let observed = tokio::time::timeout(
+            Duration::from_millis(250),
+            downstream_hard_disconnect(&mut session, true),
+        )
+        .await;
+
+        assert!(
+            observed.is_err(),
+            "a live client must never resolve the watch, opt-in or not"
+        );
+    }
+}
+
 #[cfg(test)]
 mod routed_provider_observation_tests {
     use super::*;
@@ -3353,6 +3630,222 @@ fn record_posture_refusal(
         excluded_count = posture_excluded.len(),
         "AI proxy: no provider satisfies the data-posture constraint; failing closed"
     );
+}
+
+/// The provider ids a failed cascade dispatch was locked out of by the
+/// calling credential's provider policy, or `None` when the cascade
+/// exhausted for any other reason (WOR-2685).
+///
+/// A named function rather than an inline `downcast_ref` chain so the
+/// disposition can be tested against an error the real cascade
+/// executor built, rather than against a hand-made one that could
+/// disagree with it.
+fn cascade_credential_lock_providers(error: &anyhow::Error) -> Option<String> {
+    error
+        .downcast_ref::<sbproxy_ai::CascadeExhausted>()
+        .filter(|exhausted| exhausted.is_credential_lock())
+        .map(|exhausted| exhausted.locked_providers().join(", "))
+}
+
+/// Stamp every operator-facing surface for a cascade that dispatched
+/// no tier because the credential's provider policy excluded all of
+/// them (WOR-2685).
+///
+/// The `Err` arm this serves used to write nothing to `ctx`, so the
+/// admin console's Routing Decisions row read the same blank it read
+/// before the diagnosis existed and the SIEM feed never learned a
+/// credential policy denied the request. The five surfaces here are
+/// the same ones [`record_posture_refusal`] stamps for the adjacent
+/// refusal class, for the same reason: a refusal that is not recorded
+/// is a refusal an operator cannot alert on.
+///
+/// A free function rather than an inline block because the cascade
+/// arm's frame sits on the Pingora worker's 2 MB stack; its locals
+/// belong in a frame of their own. `locked` is a rendered list of
+/// config-derived provider names, never caller-supplied text.
+fn record_cascade_credential_lock(
+    locked: &str,
+    method: &str,
+    ctx: &mut crate::context::RequestContext,
+) {
+    let detail = format!("credential_provider_lock: {locked}");
+    ctx.ai_outcome = Some("credential_provider_lock".to_string());
+    ctx.record_policy_decision("credential_provider_policy", "deny");
+    ctx.deny_reason = Some(detail.clone());
+    append_ai_route_reason(ctx, detail.clone());
+    sbproxy_observe::SecurityAuditEntry::policy_violation(
+        "credential_provider_policy",
+        detail,
+        502,
+        Some(ctx.hostname.to_string()),
+        ctx.client_ip,
+        Some(ctx.request_id.to_string()),
+        Some(method.to_string()),
+    )
+    .with_tenant_id(ctx.tenant_id.as_str())
+    .with_key_context(
+        ctx.native_key_provider.clone(),
+        ctx.inbound_key_mode.as_str(),
+    )
+    .with_api_key_id(ctx.accountable_key_id())
+    .emit();
+}
+
+#[cfg(test)]
+mod cascade_credential_lock_tests {
+    use super::*;
+
+    fn locked_cascade_config(allowed_to_dispatch: bool) -> sbproxy_ai::AiHandlerConfig {
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "anthropic",
+                "provider_type": "anthropic",
+                "api_key": "test-key",
+                "base_url": "http://127.0.0.1:9",
+                "allow_private_base_url": allowed_to_dispatch
+            }],
+            "routing": {
+                "strategy": "cascade",
+                "tiers": [{
+                    "provider_id": "anthropic",
+                    "model": "claude-3-5-sonnet",
+                    "quality_threshold": 0.5
+                }]
+            }
+        }))
+        .expect("cascade fixture")
+    }
+
+    /// Exhaust a cascade through the entry point the `Err` arm under
+    /// test dispatches on, rather than through a simpler wrapper: the
+    /// classification this asserts on lives in the executor, and a
+    /// test that entered it by another door would not prove the door
+    /// production uses reaches the same place.
+    async fn exhaust_cascade(
+        config: &sbproxy_ai::AiHandlerConfig,
+        allowed_providers: &[String],
+    ) -> anyhow::Error {
+        let cascade = config.router().cascade_config().cloned().expect("cascade");
+        let body = serde_json::json!({
+            "model": "claude-3-5-sonnet",
+            "messages": [{"role": "user", "content": "ping"}]
+        });
+        let admission = sbproxy_ai::quota_pool::QuotaPoolAdmission::new(
+            None,
+            Ok(None),
+            Ok("virtual-key-a".to_string()),
+        );
+        sbproxy_ai::AiClient::new()
+            .forward_cascade_with_policy_and_quota_with_reasoning_eligibility(
+                config,
+                &cascade,
+                allowed_providers,
+                sbproxy_ai::CascadeBlockLists::credential_only(&[]),
+                "/v1/messages",
+                &body,
+                &sbproxy_ai::attribution::AttributionTags::default(),
+                "messages",
+                &admission,
+                "wor-2685:quota-pool:cascade",
+                sbproxy_ai::reasoning_eligibility(&body),
+            )
+            .await
+            .expect_err("this cascade cannot dispatch")
+    }
+
+    /// WOR-2685: the disposition seam. The cascade `Err` arm treats a
+    /// credential provider lock as a policy refusal and every other
+    /// exhaustion as an upstream failure, so this drives the real
+    /// executor across the crate boundary and asks the same question
+    /// the arm asks, rather than asserting against a hand-built error
+    /// that could disagree with what the executor returns.
+    #[tokio::test]
+    async fn a_credential_locked_cascade_is_dispositioned_as_a_refusal() {
+        let config = locked_cascade_config(true);
+
+        let error = exhaust_cascade(&config, &["openai".to_string()]).await;
+
+        assert_eq!(
+            cascade_credential_lock_providers(&error).as_deref(),
+            Some("anthropic"),
+            "the credential's lock is the whole reason nothing dispatched, so the arm has to \
+             see it: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cascade_exhausted_for_another_reason_is_not_a_refusal() {
+        let config = locked_cascade_config(true);
+        // Unhealthy, not locked: the credential allows this provider.
+        config.router().set_provider_health(0, false);
+
+        let error = exhaust_cascade(&config, &[]).await;
+
+        assert_eq!(
+            cascade_credential_lock_providers(&error),
+            None,
+            "an unhealthy provider is an upstream failure; calling it a policy refusal would \
+             stamp a deny reason on a request no policy denied: {error}"
+        );
+    }
+
+    /// WOR-2685: the refusal-surface seam, the same five surfaces
+    /// [`posture_refusal_body`] stamps for the adjacent refusal class.
+    /// The `Err` arm used to write none of them, so the admin console's
+    /// Routing Decisions row stayed blank and the SIEM feed never
+    /// learned a credential policy denied the request.
+    #[test]
+    fn a_credential_lock_stamps_every_refusal_surface() {
+        let mut ctx = crate::context::RequestContext::new();
+        ctx.tenant_id = "cascade-lock-test-tenant".into();
+        ctx.request_id = "cascade-lock-test-rid".into();
+        ctx.ai_route_reason = Some("price_ceiling: 0.02".to_string());
+
+        record_cascade_credential_lock("anthropic", "POST", &mut ctx);
+
+        assert_eq!(
+            ctx.ai_outcome.as_deref(),
+            Some("credential_provider_lock"),
+            "the closed outcome label the access log breaks down by"
+        );
+        assert_eq!(
+            ctx.deny_reason.as_deref(),
+            Some("credential_provider_lock: anthropic"),
+            "metering must classify this as policy_blocked, never origin_5xx"
+        );
+        assert!(
+            ctx.policy_decisions
+                .iter()
+                .any(|decision| decision == "credential_provider_policy:deny"),
+            "the admin ring explainability column carries the deny: {:?}",
+            ctx.policy_decisions
+        );
+        let reason = ctx
+            .ai_route_reason
+            .as_deref()
+            .expect("the admin routing-decisions row reads this column");
+        assert!(
+            reason.contains("credential_provider_lock: anthropic"),
+            "the row has to name the lock, not just that something narrowed: {reason}"
+        );
+        assert!(
+            reason.starts_with("price_ceiling: 0.02"),
+            "an earlier narrowing on the same request is appended to, not overwritten: {reason}"
+        );
+        let audited = sbproxy_observe::audit_ring::recent_audit_events(
+            64,
+            Some("security"),
+            Some("credential_provider_policy"),
+            None,
+        );
+        assert!(
+            audited
+                .iter()
+                .any(|event| event.request_id.as_deref() == Some("cascade-lock-test-rid")),
+            "the refusal must land on the security-audit channel, which is what reaches an \
+             `events:` sink as policy_denied"
+        );
+    }
 }
 
 /// WOR-2557: the typed fail-closed refusal for a candidate set the
@@ -11422,7 +11915,21 @@ pub(super) async fn handle_ai_proxy(
                     config,
                     cascade_cfg,
                     allowed_providers,
-                    blocked_providers,
+                    // WOR-2685: the executor skips a tier on
+                    // `effective` and diagnoses it on
+                    // `credential_only`, so a tier the data-posture
+                    // constraint excluded is never reported as the
+                    // credential's provider lock. `blocked_providers`
+                    // is the posture-widened binding from the narrowing
+                    // above; `blocked_without_posture` is what it was
+                    // before that. Named fields because the two are
+                    // both `&[String]` and repeating one of them here
+                    // would silently reinstate the misattribution with
+                    // every test still green.
+                    sbproxy_ai::CascadeBlockLists {
+                        effective: blocked_providers,
+                        credential_only: blocked_without_posture,
+                    },
                     &path,
                     &body,
                     &ctx.attribution_tags,
@@ -11645,6 +12152,28 @@ pub(super) async fn handle_ai_proxy(
                             send_error(session, status, message).await?;
                             return Ok(());
                         }
+                    }
+                    // WOR-2685: a cascade that never dispatched because
+                    // the credential's provider policy excluded every
+                    // tier is a policy refusal, not an upstream
+                    // failure, and every surface an operator reads has
+                    // to say so. The detailed message stays here in the
+                    // server log; the caller gets the closed
+                    // `credential_provider_locked` token and nothing
+                    // about the credential's policy contents.
+                    if let Some(locked) = cascade_credential_lock_providers(&e) {
+                        warn!(
+                            event = "ai.cascade.credential_lock",
+                            error = %e,
+                            "AI proxy: cascade refused; the credential's provider policy \
+                             excluded every tier"
+                        );
+                        record_cascade_credential_lock(&locked, &method_str, ctx);
+                        return Err(Error::because(
+                            ErrorType::Custom(CREDENTIAL_PROVIDER_LOCKED_TOKEN),
+                            "AI cascade refused by the credential's provider policy",
+                            e,
+                        ));
                     }
                     warn!(
                         error = %e,
@@ -11893,6 +12422,42 @@ pub(super) async fn handle_ai_proxy(
     // spend the operator's `max_retries` budget. One, at most, per
     // request.
     let mut key_fallback_extra_attempts = 0usize;
+    // --- WOR-2690: cancel the provider call when the client leaves ---
+    //
+    // A non-streaming AI request spends nearly all of its wall clock in
+    // one await on the provider's response header, and until now nothing
+    // watched the client during it. A caller that gave up left the
+    // generation running to completion and the invoice arrived seconds
+    // after the connection did not. Racing that await against the
+    // downstream connection closes the gap: the provider call is dropped
+    // the moment that connection is known to be broken, which closes the
+    // connection to the provider and stops the meter.
+    //
+    // What counts as "known to be broken" is deliberately narrow, and
+    // `downstream_hard_disconnect` owns the rule: a reset or read error
+    // on HTTP/1, an `RST_STREAM` or `GOAWAY` on HTTP/2. A bare HTTP/1
+    // half-close never cancels, because RFC 9112 section 9.6 makes it
+    // indistinguishable from a client that has simply finished sending
+    // and is waiting to read. There is no timer anywhere in this: a
+    // slow client is still a client, and a slow provider is still worth
+    // waiting for.
+    //
+    // Two conditions arm it, each one a case where the watch would
+    // answer a question it was not asked:
+    //
+    //   * Only when the request body is finished. The watch reads a byte
+    //     off the downstream connection, and a body still arriving is
+    //     that byte. Every AI request buffers its body before dispatch,
+    //     so this holds in practice and fails closed if it ever stops.
+    //   * Only for a non-streaming request. A stream already learns the
+    //     client left, from its own per-chunk write failing, and it owns
+    //     the downstream connection while it does.
+    //
+    // A raced (hedged) dispatch and a cascade both resolve before this
+    // point and set `last_resp`; the sequential loop below is the one
+    // that owns the await this guards.
+    let cancel_on_client_disconnect =
+        !is_stream && !race_mode && last_resp.is_none() && session.as_mut().is_body_done();
     for attempt in 0..max_provider_visits {
         let Some(&provider_idx) = provider_order.get(attempt) else {
             break;
@@ -12234,7 +12799,7 @@ pub(super) async fn handle_ai_proxy(
         let pre_header_budget = pre_header_timeout.filter(|_| is_stream);
         let result: anyhow::Result<reqwest::Response> =
             {
-                let attempt_future =
+                let mut attempt_future =
                     Box::pin(run_routed_provider_attempt(&router, provider_idx, async {
                         if distributed_managed {
                             let managed_body = serde_json::to_vec(&attempt_body)
@@ -12348,6 +12913,69 @@ pub(super) async fn handle_ai_proxy(
                             budget_ms: u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
                         })),
                     },
+                    // WOR-2690: the same await, now watched. `select!`
+                    // polls its branches one after another rather than
+                    // nesting them, so the deepest stack this reaches is
+                    // still the provider call's own; the idle probe is a
+                    // one-byte socket read polled through a `Box`, and
+                    // this frame grows by two pointers and a
+                    // discriminant. That matters here and nowhere else:
+                    // `handle_ai_proxy` runs on a Pingora worker with the
+                    // std 2MB stack and has already overflowed it once,
+                    // on a single nested `.await` added to this path,
+                    // while every unit test stayed green.
+                    None if cancel_on_client_disconnect => {
+                        let mut watch = Box::pin(downstream_hard_disconnect(
+                            session,
+                            config.cancel_on_half_close,
+                        ));
+                        // Biased so a provider response that is already
+                        // in hand wins a tie. Having paid for the answer,
+                        // the cheapest thing left to do with it is try to
+                        // deliver it.
+                        let raced = tokio::select! {
+                            biased;
+                            attempted = &mut attempt_future => Ok(attempted),
+                            observed = &mut watch => Err(observed),
+                        };
+                        match raced {
+                            Ok(attempted) => attempted,
+                            Err(DownstreamLiveness::Gone(cause)) => {
+                                // Dropping the attempt future is the
+                                // cancellation: it drops the in-flight
+                                // `reqwest` call, which closes the
+                                // connection the provider is generating
+                                // into. It also releases the
+                                // shared-quota reservation and the
+                                // router's in-flight slot, both of which
+                                // are documented cancellation-safe, and
+                                // it releases the borrow of `ctx` that
+                                // the record below needs.
+                                drop(attempt_future);
+                                let cancelled = cancel_upstream_for_client_disconnect(
+                                    ctx,
+                                    &ai_span,
+                                    &provider.name,
+                                    attempt,
+                                    attempt_start.elapsed(),
+                                    &cause,
+                                );
+                                return Err(cancelled);
+                            }
+                            // A half-close, or a byte arriving after the
+                            // request body. Neither is a departure, so
+                            // the provider call carries on, unwatched
+                            // from here: the watch cannot be re-armed
+                            // without spinning, because both of those
+                            // signals stay readable once they arrive.
+                            //
+                            // The residual is real and is documented in
+                            // `docs/ai-gateway.md`: a client that
+                            // half-closed and then vanished keeps its
+                            // generation until a write to it fails.
+                            Err(DownstreamLiveness::Inconclusive) => attempt_future.await,
+                        }
+                    }
                     None => attempt_future.await,
                 }
             };
@@ -13264,6 +13892,64 @@ fn mcp_inject_denial_first_seen(config_revision: &str, tenant: &str, reference: 
     ))
 }
 
+/// Abandon an in-flight provider call because the client went away, and
+/// report it (WOR-2690).
+///
+/// The cancellation itself is the caller dropping the attempt future
+/// before this runs; what this adds is the record, the marker, and the
+/// error the request terminates on.
+///
+/// That error's *source* is the load-bearing part. `logging()` decides
+/// the billing outcome by asking `client_disconnected` whether the
+/// failure came from downstream (WOR-2335), so returning a
+/// `Downstream`-sourced error is what makes this request's receipt say
+/// `client_disconnected` rather than `delivered` or an origin failure,
+/// with no second classification to keep in step with the first. The
+/// usage the receipt carries is whatever the provider reported, which
+/// for a call abandoned before its response header is nothing: the
+/// context has no token counts to hand the usage sinks.
+///
+/// The marker is separate from the error source on purpose. It says
+/// "this request, specifically, was cancelled here", which is what
+/// `fail_to_proxy` needs to decline the `on_error` fallback without also
+/// declining it for every other failure Pingora happens to attribute
+/// downstream.
+///
+/// The attempt counter is the operator's view. It is the same family the
+/// transport-failure arm ticks a few lines below, under its own
+/// `outcome`, so "how often are we paying for calls nobody waited for"
+/// is a label selector on a series that already exists rather than a
+/// metric that has to be discovered.
+fn cancel_upstream_for_client_disconnect(
+    ctx: &mut RequestContext,
+    span: &tracing::Span,
+    provider: &str,
+    attempt: usize,
+    waited: std::time::Duration,
+    observed: &pingora_error::Error,
+) -> Box<Error> {
+    ctx.ai_upstream_cancelled_on_client_disconnect = true;
+    sbproxy_observe::metrics::record_provider_attempt(provider, "client_disconnected");
+    sbproxy_ai::tracing_spans::record_error(
+        span,
+        sbproxy_ai::tracing_spans::error_type::CLIENT_DISCONNECTED,
+        "client disconnected before the provider responded",
+    );
+    warn!(
+        request_id = %ctx.request_id,
+        provider = %provider,
+        attempt = %attempt,
+        waited_ms = %waited.as_millis(),
+        downstream = %observed,
+        "AI proxy: client disconnected while the provider was generating; upstream call cancelled"
+    );
+    Error::explain(
+        ErrorType::ConnectionClosed,
+        "AI upstream call cancelled: the client disconnected before the provider responded",
+    )
+    .into_down()
+}
+
 fn record_ai_transport_failure(
     span: &tracing::Span,
     provider: Option<&str>,
@@ -13527,9 +14213,31 @@ fn record_ai_admission_refusal(ctx: &RequestContext, surface: &str, reason: &'st
 /// never constructs one, so `ai.close` publishes nothing there even
 /// with `decision_audit` enabled. See `DecisionEvent::coverage`'s doc
 /// on the `AiClose` arm and `docs/events.md`.
+///
+/// `refusal_code` is the `ai_close` hook's refusal code when the hook
+/// blocked the close, and `None` for a clean one. It decides the
+/// outcome, the way [`record_guardrail_decision`] takes one: `Deny` for
+/// a refusal, `Allow` otherwise. `DecisionDetails` does not change
+/// shape for it, because `verdict` is contracted as the stream's
+/// terminal `finish_reason` (see `decision_contract`), and putting a
+/// second vocabulary in that field would break every rule selecting on
+/// it.
+///
+/// The code, never the hook's `message`. A code is bounded at decode to
+/// lowercase ASCII, digits, and `_-.` (`valid_event_code`), while the
+/// message is guest-authored prose that can quote the generation the
+/// hook just read; the message reaches the client's refusal body and
+/// nothing else. Same line `record_guardrail_decision` draws when it
+/// names a guardrail and carries positions rather than matched text.
+///
+/// A host-side fault (`ai_extension_failed` from a session that could
+/// not finish) records as a refusal too: the client gets the same
+/// refused close either way, and the code in the reason is what
+/// separates a hook's verdict from the host's own failure.
 fn record_ai_close_decision(
     ctx: Option<&RequestContext>,
     summary: &crate::ai_extensions::AiCloseSummary,
+    refusal_code: Option<&str>,
 ) {
     use sbproxy_observe::decision::{
         DecisionDetails, DecisionEngine, DecisionEvent, DecisionOutcome,
@@ -13537,6 +14245,11 @@ fn record_ai_close_decision(
 
     let Some(ctx) = ctx else {
         return;
+    };
+    let outcome = if refusal_code.is_some() {
+        DecisionOutcome::Deny
+    } else {
+        DecisionOutcome::Allow
     };
     let origin_id = ctx
         .origin_idx
@@ -13546,7 +14259,7 @@ fn record_ai_close_decision(
     sbproxy_observe::decision::record_decision(
         DecisionEvent::AiClose,
         DecisionEngine::BuiltIn,
-        DecisionOutcome::Allow,
+        outcome,
         origin_for_family,
         &ctx.tenant_id,
     );
@@ -13562,20 +14275,64 @@ fn record_ai_close_decision(
     ) {
         return;
     }
-    let reason = match summary.finish_reason.as_deref() {
-        Some(reason) => format!("stream closed (finish_reason={reason})"),
-        None => "stream closed (no finish_reason reported)".to_owned(),
+    let reason = match (refusal_code, summary.finish_reason.as_deref()) {
+        (Some(code), Some(finish)) => {
+            format!("stream close refused by an AI extension: {code} (finish_reason={finish})")
+        }
+        (Some(code), None) => format!("stream close refused by an AI extension: {code}"),
+        (None, Some(finish)) => format!("stream closed (finish_reason={finish})"),
+        (None, None) => "stream closed (no finish_reason reported)".to_owned(),
     };
     crate::policy_bus::emit_decision_audit_detailed(
         DecisionEvent::AiClose,
         DecisionEngine::BuiltIn,
-        DecisionOutcome::Allow,
+        outcome,
         &ctx.request_id,
         &origin_id,
         &origin_id,
         &ctx.tenant_id,
         &reason,
         DecisionDetails::ai_close(summary.finish_reason.as_deref()),
+    );
+}
+
+/// The one place both `relay_ai_stream` exit paths turn a finished
+/// close into its `ai.close` record (WOR-2689).
+///
+/// `close()` is idempotent across those two paths, but the decision
+/// record is not one of the things it idempotently guards, so the
+/// once-per-generation rule lives here rather than being written twice
+/// and drifting on one path. `already_closed` is the caller's read of
+/// [`crate::ai_extensions::AiRequestExtensions::is_closed`] from
+/// *before* it called `close()`, since `close()` flips that flag as its
+/// own first act.
+///
+/// `refusal` is the close's own `Err` and never a block another hook
+/// raised earlier in the same batch: a stream-event hook's refusal is
+/// `ai.stream.event`'s fact, and filing it here would attribute it to
+/// the wrong event. That is also why the tail-events call site keeps one
+/// condition of its own that this function cannot see: when an earlier
+/// hook in the batch blocked and the close itself was clean, it does not
+/// call here at all, because an `allow` record would claim a normal end
+/// the client never got.
+///
+/// Synchronous on purpose, like [`record_ai_close_decision`]. This sits
+/// on the AI request path, which runs at the Pingora worker's 2 MB
+/// stack limit, so it takes no future and adds no frame the compiler
+/// has to hold live across an await.
+fn record_ai_close_outcome(
+    ctx: Option<&RequestContext>,
+    extensions: &crate::ai_extensions::AiRequestExtensions,
+    already_closed: bool,
+    refusal: Option<&crate::ai_extensions::AiExtensionBlock>,
+) {
+    if already_closed {
+        return;
+    }
+    record_ai_close_decision(
+        ctx,
+        &extensions.close_summary(),
+        refusal.map(|block| block.code.as_str()),
     );
 }
 
@@ -17638,21 +18395,32 @@ pub(super) async fn relay_ai_stream(
                 }
                 if let Some(extensions) = ai_extensions.as_mut() {
                     let already_closed = extensions.is_closed();
-                    let decision = dispatch_ai_hub_events(
+                    let tail = dispatch_ai_hub_events(
                         extensions,
                         &tail_events,
                         &completed_tool_calls,
                         &mut close_released,
                     )
-                    .await
-                    .and(extensions.close().await);
-                    // WOR-2486: `close()` is idempotent across the two
-                    // exit paths this function has, but the decision
-                    // record is not one of the things it idempotently
-                    // guards, so this call site owns not double-firing.
-                    if decision.is_ok() && !already_closed {
-                        record_ai_close_decision(ctx.as_deref(), &extensions.close_summary());
+                    .await;
+                    // WOR-2689: awaited on its own line rather than
+                    // folded into the `and` below, so the record follows
+                    // the close's own verdict. A block from the tail
+                    // dispatch is `ai.stream.event`'s fact, so it never
+                    // becomes this record's refusal, and it does not let
+                    // a clean close claim the stream reached a normal
+                    // end either: that combination publishes nothing,
+                    // exactly as it did before. A close that refuses
+                    // still records, whatever the tail did.
+                    let closed = extensions.close().await;
+                    if closed.is_err() || tail.is_ok() {
+                        record_ai_close_outcome(
+                            ctx.as_deref(),
+                            extensions,
+                            already_closed,
+                            closed.as_ref().err(),
+                        );
                     }
+                    let decision = tail.and(closed);
                     if let Err(block) = decision {
                         warn!(
                             extension_code = %block.code,
@@ -17910,9 +18678,12 @@ pub(super) async fn relay_ai_stream(
     if let Some(extensions) = ai_extensions.as_mut() {
         let already_closed = extensions.is_closed();
         let close_result = extensions.close().await;
-        if close_result.is_ok() && !already_closed {
-            record_ai_close_decision(ctx.as_deref(), &extensions.close_summary());
-        }
+        record_ai_close_outcome(
+            ctx.as_deref(),
+            extensions,
+            already_closed,
+            close_result.as_ref().err(),
+        );
         if let Err(block) = close_result {
             warn!(
                 extension_code = %block.code,
@@ -20143,6 +20914,717 @@ mod external_guardrail_context_tests {
         (format!("http://{address}/v1"), hits)
     }
 
+    // --- WOR-2690: cancel the provider call when the client leaves ---
+    //
+    // Nested rather than loose in the parent module, which is named for
+    // external guardrails and has long since stopped being only about
+    // them. The qualifier is what a CI failure line shows, so these read
+    // as what they are.
+    mod client_disconnect_tests {
+        use super::*;
+
+        /// What a slow provider fixture saw happen to its connection.
+        #[derive(Debug, PartialEq, Eq)]
+        enum SlowUpstreamOutcome {
+            /// The gateway closed the connection before the hold
+            /// elapsed, which is the generation not being paid for.
+            Abandoned,
+            /// The hold elapsed with the gateway still waiting, and the
+            /// fixture answered.
+            Answered,
+        }
+
+        struct SlowUpstream {
+            /// Fires once the fixture has read a whole request off the wire.
+            dispatched: tokio::sync::oneshot::Receiver<()>,
+            outcome: tokio::task::JoinHandle<SlowUpstreamOutcome>,
+        }
+
+        /// A provider that takes `hold` to answer, and reports whether
+        /// the gateway was still there when it did.
+        ///
+        /// The `upstream_fixture` family replies the instant it has read
+        /// the request, which is the wrong shape for a test about what
+        /// happens *during* a generation. This one stands in for a real
+        /// completion call: it holds the connection open with nothing
+        /// written, so the gateway parks on the response header exactly
+        /// as it does against a provider composing a long answer, and
+        /// the fixture can say afterwards whether that wait was
+        /// cancelled or served.
+        async fn slow_upstream_fixture(hold: Duration) -> (String, SlowUpstream) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind slow upstream fixture");
+            let address = listener.local_addr().expect("slow upstream address");
+            let (announce, dispatched) = tokio::sync::oneshot::channel();
+            let outcome = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept upstream request");
+                drain_upstream_request(&mut stream).await;
+                let _ = announce.send(());
+                let mut probe = [0_u8; 1];
+                tokio::select! {
+                    // `Ok(0)` is the gateway's FIN and an error is its
+                    // reset. Either way the call it made was dropped
+                    // before this fixture produced a token.
+                    _ = stream.read(&mut probe) => SlowUpstreamOutcome::Abandoned,
+                    () = tokio::time::sleep(hold) => {
+                        let body = br#"{"choices":[{"message":{"content":"late"}}]}"#;
+                        let header = format!(
+                            "HTTP/1.1 200 Fixture\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(header.as_bytes()).await;
+                        let _ = stream.write_all(body).await;
+                        SlowUpstreamOutcome::Answered
+                    }
+                }
+            });
+            (
+                format!("http://{address}/v1"),
+                SlowUpstream {
+                    dispatched,
+                    outcome,
+                },
+            )
+        }
+
+        /// How a downstream fixture ends its connection.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum DownstreamClose {
+            /// `SO_LINGER` at zero, then close: the peer's connection is
+            /// broken and the gateway's next read fails. This is the
+            /// hard signal, and it cancels whatever the origin config
+            /// says.
+            Reset,
+            /// Shut the write half down and go on reading, which is the
+            /// RFC 9112 section 9.6 shape. Cancels only where the origin
+            /// sets `cancel_on_half_close`.
+            HalfClose,
+        }
+
+        /// A downstream client that keeps both halves of its connection
+        /// open until the test breaks it.
+        ///
+        /// [`downstream_wire_session`] shuts its write side down the
+        /// moment the request is written, which is the polite RFC 9112
+        /// section 9.6 shape and one the watch deliberately never acts
+        /// on. A test about a caller whose connection is gone needs the
+        /// other shape: a connection that is whole when the provider
+        /// call starts and reset while it is running.
+        async fn downstream_session_closing_on_demand(
+            body: serde_json::Value,
+            close_as: DownstreamClose,
+        ) -> (Session, tokio::sync::oneshot::Sender<()>, DownstreamClient) {
+            let body = serde_json::to_vec(&body).expect("request JSON");
+            let mut wire = format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: ai.test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            wire.extend_from_slice(&body);
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind downstream fixture");
+            let address = listener.local_addr().expect("downstream address");
+            let (close, mut closed) = tokio::sync::oneshot::channel::<()>();
+            let mut client = DownstreamClient::new(tokio::spawn(async move {
+                let stream = tokio::net::TcpStream::connect(address)
+                    .await
+                    .expect("connect downstream fixture");
+                let mut stream = stream;
+                stream.write_all(&wire).await.expect("write request");
+                // Deliberately no `shutdown()`: both halves stay open,
+                // so the gateway sees a live client right up to the
+                // moment the test breaks the connection below.
+                let mut response = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = &mut closed => {
+                            match close_as {
+                                DownstreamClose::Reset => {
+                                    // Zero-timeout linger turns the
+                                    // close into an RST rather than a
+                                    // FIN, which is what the gateway
+                                    // sees once a peer's connection is
+                                    // genuinely broken. Deprecated for
+                                    // the blocking-on-drop hazard of a
+                                    // *non-zero* linger; a zero linger
+                                    // resets at once and blocks on
+                                    // nothing.
+                                    #[allow(deprecated)]
+                                    let _ = stream.set_linger(Some(Duration::ZERO));
+                                }
+                                DownstreamClose::HalfClose => {
+                                    // Write side only. The read half
+                                    // stays open, which is precisely
+                                    // what makes this shape ambiguous:
+                                    // a client doing it may still be
+                                    // waiting for the response.
+                                    let _ = stream.shutdown().await;
+                                    // Keep reading, so the socket is not
+                                    // dropped and the FIN is the only
+                                    // thing the gateway ever sees.
+                                    loop {
+                                        match stream.read(&mut chunk).await {
+                                            Ok(0) | Err(_) => return response,
+                                            Ok(read) => {
+                                                response.extend_from_slice(&chunk[..read]);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            return response;
+                        }
+                        read = stream.read(&mut chunk) => match read {
+                            Ok(0) | Err(_) => return response,
+                            Ok(read) => response.extend_from_slice(&chunk[..read]),
+                        },
+                    }
+                }
+            }));
+            let (stream, _) =
+                match tokio::time::timeout(Duration::from_secs(2), listener.accept()).await {
+                    Ok(Ok(accepted)) => accepted,
+                    Ok(Err(error)) => {
+                        client.abort_and_wait().await;
+                        panic!("accept downstream request: {error}");
+                    }
+                    Err(error) => {
+                        client.abort_and_wait().await;
+                        panic!("accept downstream request timed out: {error:?}");
+                    }
+                };
+            let mut session = Session::new_h1(Box::new(Stream::from(stream)));
+            match tokio::time::timeout(
+                Duration::from_secs(2),
+                session.as_downstream_mut().read_request(),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    client.abort_and_wait().await;
+                    panic!("parse downstream request: {error}");
+                }
+                Err(error) => {
+                    client.abort_and_wait().await;
+                    panic!("parse downstream request timed out: {error:?}");
+                }
+            }
+            (session, close, client)
+        }
+
+        fn disconnect_probe_config(upstream_url: &str) -> sbproxy_ai::AiHandlerConfig {
+            disconnect_probe_config_with_opt_in(upstream_url, false)
+        }
+
+        fn disconnect_probe_config_with_opt_in(
+            upstream_url: &str,
+            cancel_on_half_close: bool,
+        ) -> sbproxy_ai::AiHandlerConfig {
+            sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+                "providers": [{
+                    "name": "openai",
+                    "provider_type": "openai",
+                    "base_url": upstream_url,
+                    "allow_private_base_url": true,
+                    "api_key": "fixture-key"
+                }],
+                "cancel_on_half_close": cancel_on_half_close
+            }))
+            .expect("single-provider disconnect fixture config")
+        }
+
+        fn disconnect_probe_request() -> serde_json::Value {
+            serde_json::json!({
+                "model": "requested-model",
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            })
+        }
+
+        /// A provider URL nothing is listening on, so every attempt
+        /// fails at connect and the request ends as an origin failure.
+        async fn dead_upstream_url() -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind dead upstream fixture");
+            let address = listener.local_addr().expect("dead upstream address");
+            drop(listener);
+            format!("http://{address}/v1")
+        }
+
+        /// Seam: the provider await inside the live non-streaming
+        /// dispatcher.
+        ///
+        /// Before WOR-2690 nothing watched the client during that await,
+        /// so a caller whose connection broke left the generation
+        /// running and the invoice arrived seconds after the connection
+        /// did not. Without the race this test waits out the fixture's
+        /// whole hold and then asserts against a served response, which
+        /// is the bug.
+        #[tokio::test]
+        async fn a_client_whose_connection_breaks_cancels_the_provider_call() {
+            let (upstream_url, upstream) = slow_upstream_fixture(Duration::from_secs(8)).await;
+            let config = disconnect_probe_config(&upstream_url);
+            let pipeline = crate::pipeline::CompiledPipeline::default();
+            let (mut session, close, client) = downstream_session_closing_on_demand(
+                disconnect_probe_request(),
+                DownstreamClose::Reset,
+            )
+            .await;
+            let mut context = crate::context::RequestContext::new();
+
+            let SlowUpstream {
+                dispatched,
+                outcome,
+            } = upstream;
+            let dispatch = super::super::handle_ai_proxy(
+                &mut session,
+                &config,
+                &pipeline,
+                "ai.test",
+                &mut context,
+                None,
+            );
+            let walk_away = async {
+                dispatched.await.expect("the provider received the request");
+                let _ = close.send(());
+            };
+            let (result, ()) = tokio::join!(dispatch, walk_away);
+
+            let error = result.expect_err("a client that is gone cannot be served");
+            assert_eq!(
+                *error.esource(),
+                pingora_error::ErrorSource::Downstream,
+                "the failure has to read as the client's, not the provider's: {error}"
+            );
+            assert!(
+                context.ai_upstream_cancelled_on_client_disconnect,
+                "the cancellation must be marked on the request, which is what \
+                 declines the on_error fallback"
+            );
+            // The seam WOR-2335 prices the request through. A
+            // cancellation that did not classify here would abandon the
+            // provider call and still bill it as delivered.
+            assert!(
+                crate::server::proxy_http::client_disconnected(
+                    Some(error.esource().clone()),
+                    crate::server::proxy_http::downstream_half_closed(&session),
+                ),
+                "the cancelled call must settle as client_disconnected"
+            );
+            let observed = tokio::time::timeout(Duration::from_secs(5), outcome)
+                .await
+                .expect("the provider connection settles once the client is gone")
+                .expect("slow upstream fixture");
+            assert_eq!(
+                observed,
+                SlowUpstreamOutcome::Abandoned,
+                "the provider connection must be closed, not left generating"
+            );
+            drop(session);
+            drop(client);
+        }
+
+        /// The earliest departures are the ones an earlier revision
+        /// billed in full: it settled the connection state before the
+        /// attempt loop and treated any answer as "polite half-closer,
+        /// stand down", so a caller already gone at dispatch paid for a
+        /// whole generation. There is no settle now, so a connection
+        /// that is already broken cancels on the first poll.
+        #[tokio::test]
+        async fn a_connection_already_broken_at_dispatch_cancels_immediately() {
+            let (upstream_url, upstream) = slow_upstream_fixture(Duration::from_secs(8)).await;
+            let config = disconnect_probe_config(&upstream_url);
+            let pipeline = crate::pipeline::CompiledPipeline::default();
+            let (mut session, close, client) = downstream_session_closing_on_demand(
+                disconnect_probe_request(),
+                DownstreamClose::Reset,
+            )
+            .await;
+            let mut context = crate::context::RequestContext::new();
+
+            // Break it before dispatch, and give the reset time to land
+            // so the test is about the rule rather than about a packet.
+            let _ = close.send(());
+            tokio::time::sleep(Duration::from_millis(150)).await;
+
+            let started = std::time::Instant::now();
+            let error = super::super::handle_ai_proxy(
+                &mut session,
+                &config,
+                &pipeline,
+                "ai.test",
+                &mut context,
+                None,
+            )
+            .await
+            .expect_err("a client that is already gone cannot be served");
+
+            assert_eq!(*error.esource(), pingora_error::ErrorSource::Downstream);
+            assert!(
+                context.ai_upstream_cancelled_on_client_disconnect,
+                "an early departure is still a cancellation"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(4),
+                "the request must not wait out the generation it cancelled: {:?}",
+                started.elapsed()
+            );
+            drop(session);
+            drop(client);
+            drop(upstream);
+        }
+
+        /// A client that is merely slow is a client. Only a broken
+        /// connection cancels, which is why the signal is the downstream
+        /// connection itself and not a deadline on how long the provider
+        /// is taking.
+        #[tokio::test]
+        async fn a_slow_but_connected_client_is_not_cancelled() {
+            let (upstream_url, upstream) = slow_upstream_fixture(Duration::from_millis(400)).await;
+            let config = disconnect_probe_config(&upstream_url);
+            let pipeline = crate::pipeline::CompiledPipeline::default();
+            let (mut session, _close, client) = downstream_session_closing_on_demand(
+                disconnect_probe_request(),
+                DownstreamClose::Reset,
+            )
+            .await;
+            let mut context = crate::context::RequestContext::new();
+
+            super::super::handle_ai_proxy(
+                &mut session,
+                &config,
+                &pipeline,
+                "ai.test",
+                &mut context,
+                None,
+            )
+            .await
+            .expect("a connected client's request is served");
+            assert!(!context.ai_upstream_cancelled_on_client_disconnect);
+            drop(session);
+            let response = live_downstream_body(client).await;
+
+            assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+            let observed = tokio::time::timeout(Duration::from_secs(5), upstream.outcome)
+                .await
+                .expect("the provider fixture settles")
+                .expect("slow upstream fixture");
+            assert_eq!(observed, SlowUpstreamOutcome::Answered);
+        }
+
+        /// RFC 9112 section 9.6 lets a client shut its write side and go
+        /// on reading, and that FIN is byte-for-byte what a departure
+        /// looks like. By default it never cancels, so a client that
+        /// half-closes on its way in is served exactly as it always was.
+        /// The opt-in that changes this answer is exercised below.
+        #[tokio::test]
+        async fn a_half_close_does_not_cancel_while_the_opt_in_is_off() {
+            let (upstream_url, upstream) = slow_upstream_fixture(Duration::from_millis(400)).await;
+            let config = disconnect_probe_config(&upstream_url);
+            let pipeline = crate::pipeline::CompiledPipeline::default();
+            // This fixture half-closes as soon as the request is written.
+            let (mut session, client) = downstream_session(disconnect_probe_request()).await;
+            let mut context = crate::context::RequestContext::new();
+
+            super::super::handle_ai_proxy(
+                &mut session,
+                &config,
+                &pipeline,
+                "ai.test",
+                &mut context,
+                None,
+            )
+            .await
+            .expect("a half-closed client is still owed its response");
+            assert!(!context.ai_upstream_cancelled_on_client_disconnect);
+            drop(session);
+            let response = live_downstream_body(client).await;
+
+            assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+            let observed = tokio::time::timeout(Duration::from_secs(5), upstream.outcome)
+                .await
+                .expect("the provider fixture settles")
+                .expect("slow upstream fixture");
+            assert_eq!(observed, SlowUpstreamOutcome::Answered);
+        }
+
+        /// The watch must be able to observe a request without changing
+        /// how that request is billed.
+        ///
+        /// Nothing on the AI path had ever read the downstream
+        /// connection, so `downstream_half_closed` was always false
+        /// there. A watch built on Pingora's `read_body_or_idle` sets
+        /// the session's `half_closed` flag on the same read that
+        /// observes a FIN, and `client_disconnected`'s
+        /// `downstream_half_closed && delivery_failed` arm then fires for
+        /// a request that was never cancelled at all: a provider outage
+        /// that priced `origin_5xx` (billable `no`) would price
+        /// `client_disconnected` (billable `partial`) instead, on a
+        /// signed receipt, and the dispute evidence would say the client
+        /// left when the provider failed.
+        #[tokio::test]
+        async fn a_failed_request_from_a_half_closing_client_is_still_an_origin_failure() {
+            let config = disconnect_probe_config(&dead_upstream_url().await);
+            let pipeline = crate::pipeline::CompiledPipeline::default();
+            // Half-closes as soon as the request is written.
+            let (mut session, client) = downstream_session(disconnect_probe_request()).await;
+            let mut context = crate::context::RequestContext::new();
+
+            let error = super::super::handle_ai_proxy(
+                &mut session,
+                &config,
+                &pipeline,
+                "ai.test",
+                &mut context,
+                None,
+            )
+            .await
+            .expect_err("every provider failed to connect");
+
+            assert!(
+                !context.ai_upstream_cancelled_on_client_disconnect,
+                "nothing was cancelled here"
+            );
+            // Exactly the two values `logging()` computes and hands the
+            // classifier.
+            let half_closed = crate::server::proxy_http::downstream_half_closed(&session);
+            assert!(
+                !half_closed,
+                "watching the request must not record a half-close it merely observed"
+            );
+            assert!(
+                !crate::server::proxy_http::client_disconnected(
+                    Some(error.esource().clone()),
+                    half_closed,
+                ),
+                "a provider outage must stay an origin failure, not become a \
+                 partially billable client_disconnected"
+            );
+            drop(session);
+            drop(client);
+        }
+
+        /// The opt-in, at the seam an operator actually configures: one
+        /// boolean on the `ai_proxy` action, and the FIN that was
+        /// tolerated a test above now cancels the provider call and
+        /// bills the request as a client disconnect.
+        ///
+        /// The half-close arrives while the race is armed, which is the
+        /// shape the flag exists for: a caller whose own deadline fired
+        /// mid-generation. A FIN already queued when the race arms takes
+        /// the same path, because the watch is a real await rather than
+        /// a look taken once.
+        #[tokio::test]
+        async fn a_half_close_cancels_when_the_operator_opts_in() {
+            let (upstream_url, upstream) = slow_upstream_fixture(Duration::from_secs(8)).await;
+            let config = disconnect_probe_config_with_opt_in(&upstream_url, true);
+            let pipeline = crate::pipeline::CompiledPipeline::default();
+            let (mut session, close, client) = downstream_session_closing_on_demand(
+                disconnect_probe_request(),
+                DownstreamClose::HalfClose,
+            )
+            .await;
+            let mut context = crate::context::RequestContext::new();
+
+            let SlowUpstream {
+                dispatched,
+                outcome,
+            } = upstream;
+            let dispatch = super::super::handle_ai_proxy(
+                &mut session,
+                &config,
+                &pipeline,
+                "ai.test",
+                &mut context,
+                None,
+            );
+            let walk_away = async {
+                dispatched.await.expect("the provider received the request");
+                let _ = close.send(());
+            };
+            let (result, ()) = tokio::join!(dispatch, walk_away);
+
+            let error = result.expect_err("the opt-in reads a half-close as a departure");
+            assert_eq!(
+                *error.esource(),
+                pingora_error::ErrorSource::Downstream,
+                "the failure has to read as the client's: {error}"
+            );
+            assert!(context.ai_upstream_cancelled_on_client_disconnect);
+            assert!(
+                crate::server::proxy_http::client_disconnected(
+                    Some(error.esource().clone()),
+                    crate::server::proxy_http::downstream_half_closed(&session),
+                ),
+                "an opted-in cancellation must settle as client_disconnected"
+            );
+            let observed = tokio::time::timeout(Duration::from_secs(5), outcome)
+                .await
+                .expect("the provider connection settles once the client is gone")
+                .expect("slow upstream fixture");
+            assert_eq!(
+                observed,
+                SlowUpstreamOutcome::Abandoned,
+                "the provider connection must be closed, not left generating"
+            );
+            drop(session);
+            drop(client);
+        }
+
+        /// The opt-in must buy the FIN and nothing else. A caller that
+        /// keeps its connection whole is still a caller, however long the
+        /// provider takes, because there is still no timer anywhere in
+        /// this.
+        #[tokio::test]
+        async fn a_connected_client_is_not_cancelled_under_the_opt_in() {
+            let (upstream_url, upstream) = slow_upstream_fixture(Duration::from_millis(400)).await;
+            let config = disconnect_probe_config_with_opt_in(&upstream_url, true);
+            let pipeline = crate::pipeline::CompiledPipeline::default();
+            let (mut session, _close, client) = downstream_session_closing_on_demand(
+                disconnect_probe_request(),
+                DownstreamClose::Reset,
+            )
+            .await;
+            let mut context = crate::context::RequestContext::new();
+
+            super::super::handle_ai_proxy(
+                &mut session,
+                &config,
+                &pipeline,
+                "ai.test",
+                &mut context,
+                None,
+            )
+            .await
+            .expect("a connected client's request is served with the opt-in on");
+            assert!(!context.ai_upstream_cancelled_on_client_disconnect);
+            drop(session);
+            let response = live_downstream_body(client).await;
+
+            assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+            let observed = tokio::time::timeout(Duration::from_secs(5), upstream.outcome)
+                .await
+                .expect("the provider fixture settles")
+                .expect("slow upstream fixture");
+            assert_eq!(observed, SlowUpstreamOutcome::Answered);
+        }
+
+        /// The config key itself, because a flag the dispatcher reads
+        /// correctly from a struct nobody can populate is not a feature.
+        #[test]
+        fn the_opt_in_is_off_unless_the_operator_writes_it() {
+            let without = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+                "providers": [{"name": "openai", "api_key": "fixture-key"}]
+            }))
+            .expect("config without the key");
+            assert!(
+                !without.cancel_on_half_close,
+                "the safe reading is the default"
+            );
+
+            let with = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+                "providers": [{"name": "openai", "api_key": "fixture-key"}],
+                "cancel_on_half_close": true
+            }))
+            .expect("config with the key");
+            assert!(
+                with.cancel_on_half_close,
+                "an operator who writes the key gets it"
+            );
+        }
+
+        /// The one risk this change's own commit message calls out, made
+        /// executable.
+        ///
+        /// Pingora workers are std threads with the default 2 MiB stack.
+        /// `#[tokio::test]` is not: it runs on a runtime whose stacks are
+        /// far larger, which is exactly why WOR-2165's overflow on this
+        /// path shipped with roughly 13,000 green tests (see
+        /// `sbproxy-ai/src/client.rs`'s `send_provider_request`, boxed
+        /// for that reason). Running one whole non-streaming dispatch on
+        /// a worker-sized thread turns "the frame still fits" from an
+        /// argument into a check.
+        ///
+        /// A stack overflow aborts the process rather than unwinding, so
+        /// the failure mode here is the test binary dying with a signal.
+        /// That is louder than a failed assertion, not quieter. The dev
+        /// profile this runs under spills more locals than release, so a
+        /// pass here is the stricter of the two answers.
+        ///
+        /// What it still cannot see: the fixture provider is local
+        /// plaintext, so no TLS frames sit on this stack, and the release
+        /// binary's own path is not exercised here.
+        #[test]
+        fn a_non_streaming_dispatch_fits_a_pingora_worker_stack() {
+            const PINGORA_WORKER_STACK: usize = 2 * 1024 * 1024;
+
+            let worker = std::thread::Builder::new()
+                .stack_size(PINGORA_WORKER_STACK)
+                .spawn(|| {
+                    // `new_current_thread` drives the future on *this*
+                    // thread, so the sized stack is the one the dispatch
+                    // state machine is polled on.
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("current-thread runtime");
+                    runtime.block_on(async {
+                        let (upstream_url, upstream) =
+                            slow_upstream_fixture(Duration::from_millis(50)).await;
+                        let config = disconnect_probe_config(&upstream_url);
+                        let pipeline = crate::pipeline::CompiledPipeline::default();
+                        // A connected client, deliberately not
+                        // `downstream_session`, which half-closes the
+                        // instant the request is written. That FIN would
+                        // settle the watch on its first poll and let the
+                        // `select!` resolve immediately, so every later
+                        // poll of the provider future, including the one
+                        // that decodes the response header, would run at
+                        // the bare `.await` outside the `select!`. The
+                        // deeper frame is the one this guard exists to
+                        // measure, so the sender is held and never fired
+                        // and the watch stays pending for the whole
+                        // dispatch.
+                        let (mut session, _close, client) = downstream_session_closing_on_demand(
+                            disconnect_probe_request(),
+                            DownstreamClose::Reset,
+                        )
+                        .await;
+                        let mut context = crate::context::RequestContext::new();
+
+                        super::super::handle_ai_proxy(
+                            &mut session,
+                            &config,
+                            &pipeline,
+                            "ai.test",
+                            &mut context,
+                            None,
+                        )
+                        .await
+                        .expect("the dispatch completes on a worker-sized stack");
+                        assert!(
+                            !context.ai_upstream_cancelled_on_client_disconnect,
+                            "the guard must measure a served dispatch, not a cancelled one"
+                        );
+                        drop(session);
+                        let response = live_downstream_body(client).await;
+                        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+                        let _ = upstream.outcome.await;
+                    });
+                })
+                .expect("spawn a worker-sized thread");
+
+            worker
+                .join()
+                .expect("a non-streaming AI request must fit a 2 MiB Pingora worker stack");
+        }
+    }
     struct QualityVerdictHook {
         scores: Option<Vec<crate::hooks::QualityScore>>,
         minimum_score: f64,
@@ -21756,6 +23238,20 @@ origins:
         manifest: &str,
         javascript: &str,
     ) -> (TempDir, crate::pipeline::CompiledPipeline) {
+        let (directory, chain) = ai_chain_fixture(manifest, javascript);
+        let pipeline = crate::pipeline::CompiledPipeline {
+            ai_extension_chain: Arc::new(chain),
+            ..Default::default()
+        };
+        (directory, pipeline)
+    }
+
+    /// The bundle half of [`pipeline_with_ai_javascript`], for a test
+    /// that needs the chain on a pipeline compiled from real config
+    /// (origins, tenants, and `decision_audit` scoping) instead of on
+    /// `Default::default()`, which carries none of them and so publishes
+    /// no audit record at all.
+    fn ai_chain_fixture(manifest: &str, javascript: &str) -> (TempDir, AiExtensionChain) {
         let directory = TempDir::new().expect("extension fixture directory");
         let bundle = directory.path().join("fixture");
         std::fs::create_dir(&bundle).expect("create extension fixture");
@@ -21771,14 +23267,9 @@ origins:
             &BTreeSet::new(),
         )
         .expect("load extension fixture");
-        let pipeline = crate::pipeline::CompiledPipeline {
-            ai_extension_chain: Arc::new(
-                AiExtensionChain::from_registry(registry.as_ref())
-                    .expect("prepare AI extension chain"),
-            ),
-            ..Default::default()
-        };
-        (directory, pipeline)
+        let chain =
+            AiExtensionChain::from_registry(registry.as_ref()).expect("prepare AI extension chain");
+        (directory, chain)
     }
 
     struct DenyingBufferedPolicy;
@@ -26495,6 +27986,205 @@ origins:
         );
     }
 
+    /// The `ai_close` fixture chain, for the two close-verdict tests
+    /// below. One `ai_close` hook and nothing else, so the only hook
+    /// verdict either test can be reading is the close's own.
+    const AI_CLOSE_MANIFEST: &str = "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: close-verdict\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nhooks:\n  - kind: ai_close\n    type: inspect_close\n    export: inspect\n";
+
+    /// A two-chunk SSE completion that ends `stop`, so the close
+    /// summary the record is built from carries a finish reason.
+    fn ai_close_upstream_stream() -> Vec<u8> {
+        concat!(
+            "data: {\"id\":\"chatcmpl-close\",\"object\":\"chat.completion.chunk\",",
+            "\"created\":1,\"model\":\"requested-model\",\"choices\":[{\"index\":0,",
+            "\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-close\",\"object\":\"chat.completion.chunk\",",
+            "\"created\":1,\"model\":\"requested-model\",\"choices\":[{\"index\":0,",
+            "\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .as_bytes()
+        .to_vec()
+    }
+
+    /// Compile the `ai.close` audit fixture and hang an AI extension
+    /// chain built from `javascript` off it.
+    fn ai_close_pipeline(
+        javascript: &str,
+    ) -> (TempDir, std::sync::Arc<crate::pipeline::CompiledPipeline>) {
+        let compiled = sbproxy_config::compile_config(
+            r#"
+proxy:
+  tenants:
+    - id: acme
+  observability:
+    log:
+      decision_audit:
+        enabled: false
+        events:
+          ai.close: true
+origins:
+  "ai.test":
+    tenant_id: acme
+    action:
+      type: static
+      body: ok
+"#,
+        )
+        .expect("ai.close fixture config");
+        let mut pipeline = crate::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+            .expect("ai.close fixture pipeline");
+        let (directory, chain) = ai_chain_fixture(AI_CLOSE_MANIFEST, javascript);
+        pipeline.ai_extension_chain = Arc::new(chain);
+        (directory, std::sync::Arc::new(pipeline))
+    }
+
+    /// Every `ai.close` record this request published.
+    fn ai_close_records(
+        rx: &mut crate::policy_bus::PolicyVerdictReceiver,
+        request_id: &str,
+    ) -> Vec<sbproxy_observe::decision::DecisionAudit> {
+        let mut ours = Vec::new();
+        while let Ok(record) = rx.try_recv() {
+            if let crate::policy_bus::AuditRecord::Decision(audit) = record {
+                if audit.request_id == request_id
+                    && audit.event == sbproxy_observe::decision::DecisionEvent::AiClose
+                {
+                    ours.push(*audit);
+                }
+            }
+        }
+        ours
+    }
+
+    /// WOR-2689: an `ai_close` hook that refuses the close has to reach
+    /// the decision feed.
+    ///
+    /// Red before the fix: both `relay_ai_stream` close sites published
+    /// only when `close()` returned `Ok`, so a refused close cut the
+    /// stream, wrote a warn line, and left the audit feed with nothing
+    /// at all, while `docs/extension-bundles.md` promises a record
+    /// either way. Driven through `handle_ai_proxy` rather than against
+    /// `record_ai_close_decision` directly, because the defect was in
+    /// the call sites' gating, which a direct call cannot see.
+    #[tokio::test]
+    async fn a_refused_stream_close_publishes_a_denied_ai_close_record() {
+        let (upstream_url, _hits) =
+            upstream_bytes_fixture(ai_close_upstream_stream(), "text/event-stream").await;
+        let (_directory, pipeline) = ai_close_pipeline(
+            r#"export function inspect() { return {version:"sbproxy-envelope/v1",decision:"block",status:409,code:"fixture_close_refused",message:"zebramarker close refusal"}; }"#,
+        );
+        let config = openai_proxy_config(&upstream_url);
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        context.pipeline = std::sync::Arc::clone(&pipeline);
+        context.origin_idx = Some(0);
+        context.tenant_id = "acme".into();
+        context.request_id = "req-ai-close-block".into();
+
+        let (bus, mut rx) = crate::policy_bus::channel(32);
+        crate::policy_bus::init_global_bus(bus);
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            pipeline.as_ref(),
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("the refused close is handled");
+        drop(session);
+        let _ = live_downstream_body(client).await;
+
+        let ours = ai_close_records(&mut rx, "req-ai-close-block");
+        assert_eq!(
+            ours.len(),
+            1,
+            "a refused close publishes exactly one ai.close record"
+        );
+        let audit = &ours[0];
+        assert_eq!(
+            audit.outcome,
+            sbproxy_observe::decision::DecisionOutcome::Deny
+        );
+        assert_eq!(audit.origin, "ai.test");
+        assert_eq!(audit.tenant, "acme");
+        // The stream's own terminal reason still rides in `verdict`; the
+        // refusal is the record's outcome, not a second vocabulary in
+        // that field.
+        assert_eq!(audit.details.verdict.as_deref(), Some("stop"));
+        assert!(
+            audit.reason.as_str().contains("fixture_close_refused"),
+            "the hook's bounded code is what says which hook refused: {}",
+            audit.reason.as_str()
+        );
+        let rendered = audit.to_ocsf().to_string();
+        assert!(
+            !rendered.contains("zebramarker"),
+            "the hook's message is guest-authored prose that can quote the \
+             generation, so it must not reach the record: {rendered}"
+        );
+    }
+
+    /// The other half of the same promise: a clean close still records
+    /// `allow`, and still records exactly once.
+    #[tokio::test]
+    async fn a_clean_stream_close_publishes_an_allowed_ai_close_record() {
+        let (upstream_url, _hits) =
+            upstream_bytes_fixture(ai_close_upstream_stream(), "text/event-stream").await;
+        let (_directory, pipeline) = ai_close_pipeline(
+            r#"export function inspect() { return {version:"sbproxy-envelope/v1",decision:"release"}; }"#,
+        );
+        let config = openai_proxy_config(&upstream_url);
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        context.pipeline = std::sync::Arc::clone(&pipeline);
+        context.origin_idx = Some(0);
+        context.tenant_id = "acme".into();
+        context.request_id = "req-ai-close-allow".into();
+
+        let (bus, mut rx) = crate::policy_bus::channel(32);
+        crate::policy_bus::init_global_bus(bus);
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            pipeline.as_ref(),
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("the clean close is handled");
+        drop(session);
+        let _ = live_downstream_body(client).await;
+
+        let ours = ai_close_records(&mut rx, "req-ai-close-allow");
+        assert_eq!(
+            ours.len(),
+            1,
+            "close() is idempotent across the relay's two exit paths, so one \
+             generation publishes one record"
+        );
+        assert_eq!(
+            ours[0].outcome,
+            sbproxy_observe::decision::DecisionOutcome::Allow
+        );
+        assert_eq!(ours[0].details.verdict.as_deref(), Some("stop"));
+    }
+
     /// The negative case: a request the shim admits with a lossiness
     /// note must publish no `ai.admission` record at all.
     ///
@@ -29423,6 +31113,7 @@ origins:
             &crate::ai_extensions::AiCloseSummary {
                 finish_reason: Some("tool_calls".to_string()),
             },
+            None,
         );
 
         let mut ours = None;
@@ -29481,6 +31172,7 @@ origins:
             &crate::ai_extensions::AiCloseSummary {
                 finish_reason: Some("stop".to_string()),
             },
+            None,
         );
 
         while let Ok(record) = rx.try_recv() {

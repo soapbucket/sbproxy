@@ -543,3 +543,51 @@ describe("api.auditChain (WOR-2579)", () => {
     );
   });
 });
+
+describe("admin client marker (WOR-2688)", () => {
+  it("marks a read as this app's own so the server can drop the Basic challenge", async () => {
+    const fetchMock = stubFetch("[]");
+
+    await api.keys();
+
+    // The header is what tells `basic_challenge_for_request` server-side
+    // that a 401 here must not carry `WWW-Authenticate`, which is what
+    // opens the browser's native credential dialog over the console.
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/admin/keys",
+      expect.objectContaining({
+        headers: expect.objectContaining({ "X-Requested-With": "XMLHttpRequest" }),
+      }),
+    );
+  });
+
+  it("marks a mutation, alongside the CSRF token rather than instead of it", async () => {
+    setCsrfToken("csrf-token");
+    const fetchMock = stubFetch('{"level":"debug"}');
+
+    await api.setLogLevel("debug");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/admin/log-level",
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          "X-Requested-With": "XMLHttpRequest",
+          "X-CSRF-Token": "csrf-token",
+        }),
+      }),
+    );
+  });
+
+  it("marks a raw-body write too: the config editor is a fetch like any other", async () => {
+    const fetchMock = stubFetch("saved");
+
+    await api.putConfig("proxy: {}\n");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/admin/config",
+      expect.objectContaining({
+        headers: expect.objectContaining({ "X-Requested-With": "XMLHttpRequest" }),
+      }),
+    );
+  });
+});

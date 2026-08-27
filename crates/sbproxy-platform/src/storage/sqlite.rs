@@ -16,6 +16,17 @@ use rusqlite::{params, Connection, OpenFlags};
 use super::KVStore;
 
 /// SQLite-backed key-value store.
+///
+/// Every method takes the connection mutex with
+/// `unwrap_or_else(|poisoned| poisoned.into_inner())` rather than
+/// unwrapping it. A poisoned mutex means some earlier caller panicked
+/// while holding it, and `std`'s default answer to that is to panic
+/// every subsequent caller too, which turns one panic into a
+/// store-wide outage for the life of the process. The connection is
+/// not left in a torn state by a panic here: `rusqlite` statements are
+/// individually atomic and this type holds no invariant across calls,
+/// so recovering the guard is the honest thing to do. It is the same
+/// posture `MemoryKVStore` gets for free from `parking_lot`.
 pub struct SqliteKVStore {
     conn: Mutex<Connection>,
 }
@@ -52,7 +63,10 @@ impl SqliteKVStore {
 
 impl KVStore for SqliteKVStore {
     fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        let conn = self.conn.lock().expect("lock poisoned");
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut stmt = conn
             .prepare_cached("SELECT value FROM kv WHERE key = ?1")
             .context("prepare SELECT")?;
@@ -67,7 +81,10 @@ impl KVStore for SqliteKVStore {
     }
 
     fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        let conn = self.conn.lock().expect("lock poisoned");
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.execute(
             "INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)",
             params![key, value],
@@ -86,7 +103,10 @@ impl KVStore for SqliteKVStore {
         // that needs one carries the deadline inside the value and
         // re-checks it on read, which the idempotency backend does.
         // What that costs is space rather than correctness.
-        let conn = self.conn.lock().expect("lock poisoned");
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let created = conn
             .execute(
                 "INSERT OR IGNORE INTO kv (key, value) VALUES (?1, ?2)",
@@ -107,7 +127,10 @@ impl KVStore for SqliteKVStore {
         // interleave. A backend with the create half but not the swap
         // half wedges every key whose holder died, because taking a
         // lapsed row over is a conditional replace.
-        let conn = self.conn.lock().expect("lock poisoned");
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let swapped = conn
             .execute(
                 "UPDATE kv SET value = ?2 WHERE key = ?1 AND value = ?3",
@@ -122,14 +145,20 @@ impl KVStore for SqliteKVStore {
     }
 
     fn delete(&self, key: &[u8]) -> Result<()> {
-        let conn = self.conn.lock().expect("lock poisoned");
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.execute("DELETE FROM kv WHERE key = ?1", params![key])
             .context("execute DELETE")?;
         Ok(())
     }
 
     fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Bytes, Bytes)>> {
-        let conn = self.conn.lock().expect("lock poisoned");
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         // Compute the exclusive upper bound for the prefix range.
         // If every byte is 0xFF there is no upper bound - fall back to a full
