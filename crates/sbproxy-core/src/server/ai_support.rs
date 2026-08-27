@@ -3348,7 +3348,30 @@ pub(super) async fn send_response_with_extras_and_reason(
                 error,
             )
         })?;
+    // WOR-2630: the first entry for a name replaces, and a repeat of
+    // the same name adds a value. A caller that put two entries with
+    // one name in `extras` asked for a two-value header; inserting
+    // every entry kept only the last, which is how a `cel` transform's
+    // two `append` rules reached the wire as one value on a plugin
+    // response while the identical config on a `mock` origin emitted
+    // both. Single-name lists, which is every other caller, behave
+    // exactly as before.
+    let mut written: Vec<String> = Vec::with_capacity(extras.len());
     for (name, value) in extras {
+        let lowered = name.to_ascii_lowercase();
+        if written.contains(&lowered) {
+            header
+                .append_header(name.clone(), value.clone())
+                .map_err(|error| {
+                    Error::because(
+                        ErrorType::InternalError,
+                        "failed to append response header",
+                        error,
+                    )
+                })?;
+            continue;
+        }
+        written.push(lowered);
         header
             .insert_header(name.clone(), value.clone())
             .map_err(|error| {

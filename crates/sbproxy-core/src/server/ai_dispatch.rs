@@ -254,6 +254,256 @@ fn update_router_quota_from_response(
     router.update_quota_from_headers(provider_name, &headers, status);
 }
 
+/// How one provider attempt settled.
+///
+/// One value, so the per-provider attempt metric and the router's health
+/// axes cannot disagree about the same attempt. Before WOR-2532 they
+/// were independent calls and the health half was simply absent from
+/// every dispatch path in this file.
+///
+/// One attempt outcome is deliberately not a variant here.
+/// `cancel_upstream_for_client_disconnect` (WOR-2690) ticks the attempt
+/// counter under `client_disconnected` directly, because the client
+/// went away and nothing about the provider was learned: it is the same
+/// "no sample" answer a raced loser the winner cancelled gets, and it
+/// sits in a function that holds neither the router nor the provider
+/// index. Every settled attempt that could say something about a
+/// provider's health goes through here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderAttemptOutcome {
+    /// The upstream answered with this status.
+    Answered(u16),
+    /// The attempt reached an upstream and got nothing back: a transport
+    /// error, a timeout, a refused connection.
+    NoResponse,
+    /// The attempt never reached an upstream at all: the managed-local
+    /// engine this provider serves from failed to come up. Counted as a
+    /// failed attempt so per-provider load stays honest, never as a
+    /// provider health signal, because nothing about the upstream was
+    /// observed. A quota-pool admission refusal settles earlier still
+    /// and is not an attempt at all, so it does not reach here.
+    NotDialed,
+}
+
+impl ProviderAttemptOutcome {
+    /// The `outcome` label on `sbproxy_ai_provider_attempts_total`.
+    ///
+    /// A 4xx or 5xx is an error for the attempt metric, matching the
+    /// request span's final classification. Every call site in this file
+    /// already computed this same label, except the raced fan-out, which
+    /// spelled it `2xx or nothing`; a 3xx from an AI provider now counts
+    /// as a success there too, which is what every other path already
+    /// said.
+    const fn metric_label(self) -> &'static str {
+        match self {
+            Self::Answered(status) if status < 400 => "success",
+            _ => "error",
+        }
+    }
+
+    /// Whether this settled attempt is evidence about the upstream's
+    /// health, and if so which way.
+    ///
+    /// A 5xx is the upstream's failure. A 4xx is the caller's, and
+    /// counts as a success the same way Envoy's `consecutive_5xx`
+    /// detector ignores client errors; sbproxy has no
+    /// `consecutive_gateway_failure` equivalent, so a provider answering
+    /// 429 to everything does read as healthy here. Nothing at all came
+    /// back from a `NoResponse`, which is the upstream's failure too.
+    /// A `NotDialed` observed no upstream and says nothing either way.
+    const fn upstream_health(self) -> Option<bool> {
+        match self {
+            Self::Answered(status) => Some(status < 500),
+            Self::NoResponse => Some(false),
+            Self::NotDialed => None,
+        }
+    }
+}
+
+/// Record one settled provider attempt: the attempt metric and the
+/// router's health axes, together.
+///
+/// Every settled attempt in this file goes through here. Before
+/// WOR-2532 the raced fan-out and the sequential failover loop each
+/// counted attempts and fed neither the circuit breaker nor the outlier
+/// detector, so `resilience.outlier_detection` and
+/// `resilience.circuit_breaker` sat at zero however badly a provider
+/// behaved: their only production callers were in `sbproxy_ai::client`,
+/// which this handler does not use. A provider that failed every
+/// request was never ejected on any routing strategy.
+///
+/// Two settled attempts deliberately record no health. A `NotDialed`
+/// never reached an upstream. A raced loser the winner cancelled never
+/// settles at all, so this is never reached for it, the same way a
+/// cancelled Envoy hedge contributes no outlier sample.
+///
+/// Synchronous on purpose: `handle_ai_proxy` sits at the 2 MB Pingora
+/// worker stack limit, so no call site here may add an await point.
+fn record_provider_attempt_outcome(
+    router: &sbproxy_ai::Router,
+    provider_idx: usize,
+    provider_name: &str,
+    outcome: ProviderAttemptOutcome,
+) {
+    sbproxy_observe::metrics::record_provider_attempt(provider_name, outcome.metric_label());
+    match outcome.upstream_health() {
+        Some(true) => router.record_provider_success(provider_idx, provider_name),
+        Some(false) => router.record_provider_failure(provider_idx, provider_name),
+        None => {}
+    }
+}
+
+#[cfg(test)]
+mod provider_attempt_outcome_tests {
+    use super::*;
+
+    /// A two-provider `race` pool whose outlier detector ejects on the
+    /// second sample, matching the fixture the sequential path's own
+    /// ejection test uses in `sbproxy-ai::handler`.
+    fn raced_pool() -> sbproxy_ai::AiHandlerConfig {
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "openai", "api_key": "k"},
+                {"name": "anthropic", "api_key": "k"}
+            ],
+            "routing": {"strategy": "race"},
+            "resilience": {
+                "outlier_detection": {
+                    "threshold": 0.5,
+                    "window_secs": 60,
+                    "min_requests": 2,
+                    "ejection_duration_secs": 300
+                }
+            }
+        }))
+        .expect("a race pool with outlier detection compiles")
+    }
+
+    #[test]
+    fn a_racing_leg_that_answers_5xx_reaches_outlier_detection() {
+        // WOR-2532: the race fan-out recorded the attempt metric and the
+        // quota headers and stopped there, so a provider that lost every
+        // race by failing stayed eligible forever.
+        let config = raced_pool();
+        let router = config.router();
+
+        record_provider_attempt_outcome(
+            &router,
+            1,
+            "anthropic",
+            ProviderAttemptOutcome::Answered(503),
+        );
+        assert_eq!(
+            router.eligible_indices(&config.providers),
+            vec![0, 1],
+            "one sample is under min_requests, so nothing is ejected yet"
+        );
+        record_provider_attempt_outcome(
+            &router,
+            1,
+            "anthropic",
+            ProviderAttemptOutcome::Answered(500),
+        );
+        assert_eq!(
+            router.eligible_indices(&config.providers),
+            vec![0],
+            "a racing provider that keeps answering 5xx has to leave the pool"
+        );
+    }
+
+    #[test]
+    fn a_racing_leg_that_never_reached_an_upstream_counts_as_a_failure() {
+        let config = raced_pool();
+        let router = config.router();
+
+        record_provider_attempt_outcome(&router, 0, "openai", ProviderAttemptOutcome::NoResponse);
+        record_provider_attempt_outcome(&router, 0, "openai", ProviderAttemptOutcome::NoResponse);
+        assert_eq!(
+            router.eligible_indices(&config.providers),
+            vec![1],
+            "a transport error is the upstream's failure, not the caller's"
+        );
+    }
+
+    #[test]
+    fn a_racing_leg_that_answers_4xx_is_not_an_upstream_failure() {
+        // Envoy's `consecutive_5xx` detector counts a 4xx as a success:
+        // the caller sent a bad request and the upstream answered it
+        // correctly. Ejecting on it would take a healthy provider out of
+        // the pool for someone else's malformed prompt.
+        let config = raced_pool();
+        let router = config.router();
+
+        for _ in 0..8 {
+            record_provider_attempt_outcome(
+                &router,
+                0,
+                "openai",
+                ProviderAttemptOutcome::Answered(429),
+            );
+            record_provider_attempt_outcome(
+                &router,
+                0,
+                "openai",
+                ProviderAttemptOutcome::Answered(400),
+            );
+        }
+        assert_eq!(
+            router.eligible_indices(&config.providers),
+            vec![0, 1],
+            "client errors must not eject the provider that reported them"
+        );
+    }
+
+    #[test]
+    fn an_attempt_that_never_dialed_an_upstream_is_counted_but_not_judged() {
+        // A managed-local engine that failed to come up is a local
+        // capacity failure. It is a real attempt for per-provider load,
+        // and no evidence at all about a remote provider's health, so
+        // ejecting on it would take a provider out of the pool for a
+        // GPU that was busy.
+        let config = raced_pool();
+        let router = config.router();
+
+        for _ in 0..8 {
+            record_provider_attempt_outcome(
+                &router,
+                0,
+                "openai",
+                ProviderAttemptOutcome::NotDialed,
+            );
+        }
+        assert_eq!(
+            router.eligible_indices(&config.providers),
+            vec![0, 1],
+            "an attempt that reached no upstream must not eject anyone"
+        );
+        assert_eq!(
+            ProviderAttemptOutcome::NotDialed.metric_label(),
+            "error",
+            "the attempt still counts as a failed attempt for per-provider load"
+        );
+    }
+
+    #[test]
+    fn the_attempt_metric_label_agrees_with_the_health_verdict_on_every_outcome() {
+        // One value decides both, so the two can never drift apart the
+        // way they did before WOR-2532, when each call site spelled the
+        // label itself and most spelled no health verdict at all.
+        for (outcome, label, health) in [
+            (ProviderAttemptOutcome::Answered(200), "success", Some(true)),
+            (ProviderAttemptOutcome::Answered(302), "success", Some(true)),
+            (ProviderAttemptOutcome::Answered(429), "error", Some(true)),
+            (ProviderAttemptOutcome::Answered(503), "error", Some(false)),
+            (ProviderAttemptOutcome::NoResponse, "error", Some(false)),
+            (ProviderAttemptOutcome::NotDialed, "error", None),
+        ] {
+            assert_eq!(outcome.metric_label(), label, "{outcome:?}");
+            assert_eq!(outcome.upstream_health(), health, "{outcome:?}");
+        }
+    }
+}
+
 /// Run one selected provider attempt with shared load-balancer observation.
 ///
 /// The in-flight guard is cancellation-safe. Successful response-header
@@ -12395,15 +12645,32 @@ pub(super) async fn handle_ai_proxy(
                     let status = resp.status().as_u16();
                     // WOR-1881: race losers still contribute quota signals.
                     update_router_quota_from_response(&router, &config.providers[idx].name, &resp);
-                    let outcome = if (200..300).contains(&status) {
-                        "success"
-                    } else {
-                        "error"
-                    };
-                    sbproxy_observe::metrics::record_provider_attempt(
+                    // WOR-2532: the attempt metric and the router's
+                    // health axes settle together, so
+                    // `resilience.outlier_detection` and the circuit
+                    // breaker see a race outcome and a provider that
+                    // loses every race by failing is ejected.
+                    record_provider_attempt_outcome(
+                        &router,
+                        idx,
                         &config.providers[idx].name,
-                        outcome,
+                        ProviderAttemptOutcome::Answered(status),
                     );
+                    // WOR-2532: the per-error-class cooldown axis, the
+                    // same one the sequential loop arms below, so one
+                    // `resilience` block does not mean two different
+                    // things depending on the routing strategy. No body
+                    // to refine the cause with here: a race leg's body
+                    // belongs to the winner, and the coarse status
+                    // classification is what the sequential loop also
+                    // uses when the body does not refine it.
+                    if (400..600).contains(&status) {
+                        router.note_classified_failure(
+                            idx,
+                            &config.providers[idx].name,
+                            sbproxy_ai::failure_cause::FailureCause::classify(status, ""),
+                        );
+                    }
                     if (200..300).contains(&status) {
                         winner = Some((idx, resp));
                         break;
@@ -12412,9 +12679,11 @@ pub(super) async fn handle_ai_proxy(
                     }
                 }
                 Err(RacedAttemptError::Upstream(e)) => {
-                    sbproxy_observe::metrics::record_provider_attempt(
+                    record_provider_attempt_outcome(
+                        &router,
+                        idx,
                         &config.providers[idx].name,
-                        "error",
+                        ProviderAttemptOutcome::NoResponse,
                     );
                     last_error_type = ai_transport_error_type(&e);
                     last_error = Some(e);
@@ -12656,9 +12925,14 @@ pub(super) async fn handle_ai_proxy(
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    sbproxy_observe::metrics::record_provider_attempt(
+                    // The engine never came up, so nothing was dialed:
+                    // the attempt counts for per-provider load and
+                    // contributes no upstream health sample.
+                    record_provider_attempt_outcome(
+                        &router,
+                        provider_idx,
                         &resolved_provider.name,
-                        "error",
+                        ProviderAttemptOutcome::NotDialed,
                     );
                     // Give deployment capacity back before failing over.
                     ctx.managed_model_permit = None;
@@ -13184,9 +13458,11 @@ pub(super) async fn handle_ai_proxy(
                             key_fallback_extra_attempts = 1;
                             key_fallback_material = Some((provider_idx, material));
                             provider_order.insert(attempt + 1, provider_idx);
-                            sbproxy_observe::metrics::record_provider_attempt(
+                            record_provider_attempt_outcome(
+                                &router,
+                                provider_idx,
                                 &provider.name,
-                                "error",
+                                ProviderAttemptOutcome::Answered(status),
                             );
                             // Scrapeable from day one, because the typed
                             // event only reaches a deployment that
@@ -13266,7 +13542,12 @@ pub(super) async fn handle_ai_proxy(
                     // WOR-1103: record the failed attempt so per-provider
                     // load distribution and failure rates are visible,
                     // not just the fact that a failover happened.
-                    sbproxy_observe::metrics::record_provider_attempt(&provider.name, "error");
+                    record_provider_attempt_outcome(
+                        &router,
+                        provider_idx,
+                        &provider.name,
+                        ProviderAttemptOutcome::Answered(status),
+                    );
                     // WOR-1535: count the handover so sbproxy_ai_failovers_total
                     // reflects real failovers (it was defined but never recorded).
                     let to_provider = provider_order
@@ -13295,7 +13576,12 @@ pub(super) async fn handle_ai_proxy(
                     continue;
                 }
                 if takes_managed_break {
-                    sbproxy_observe::metrics::record_provider_attempt(&provider.name, "error");
+                    record_provider_attempt_outcome(
+                        &router,
+                        provider_idx,
+                        &provider.name,
+                        ProviderAttemptOutcome::Answered(status),
+                    );
                     let _ = resp.bytes().await;
                     last_error = Some(anyhow::anyhow!(
                         "fallback provider returned retryable HTTP status {status}"
@@ -13380,9 +13666,11 @@ pub(super) async fn handle_ai_proxy(
                         ) {
                             let to_provider = config.providers[next_idx].name.to_string();
                             ctx.admin_failover_trigger = Some("context_window".to_string());
-                            sbproxy_observe::metrics::record_provider_attempt(
+                            record_provider_attempt_outcome(
+                                &router,
+                                provider_idx,
                                 &provider.name,
-                                "error",
+                                ProviderAttemptOutcome::Answered(status),
                             );
                             sbproxy_ai::ai_metrics::record_failover(
                                 &provider.name,
@@ -13411,9 +13699,11 @@ pub(super) async fn handle_ai_proxy(
                             let to_provider = config.providers[next_idx].name.to_string();
                             ctx.ai_outcome = Some("content_filter".to_string());
                             ctx.admin_failover_trigger = Some("content_policy".to_string());
-                            sbproxy_observe::metrics::record_provider_attempt(
+                            record_provider_attempt_outcome(
+                                &router,
+                                provider_idx,
                                 &provider.name,
-                                "error",
+                                ProviderAttemptOutcome::Answered(status),
                             );
                             sbproxy_ai::ai_metrics::record_failover(
                                 &provider.name,
@@ -13444,7 +13734,12 @@ pub(super) async fn handle_ai_proxy(
                             .get(attempt + 1)
                             .map(|&i| config.providers[i].name.clone())
                             .unwrap_or_default();
-                        sbproxy_observe::metrics::record_provider_attempt(&provider.name, "error");
+                        record_provider_attempt_outcome(
+                            &router,
+                            provider_idx,
+                            &provider.name,
+                            ProviderAttemptOutcome::Answered(status),
+                        );
                         sbproxy_ai::ai_metrics::record_failover(
                             &provider.name,
                             &to_provider,
@@ -13465,7 +13760,12 @@ pub(super) async fn handle_ai_proxy(
                         Some(body_bytes.as_ref()),
                         Some(&*ctx),
                     );
-                    sbproxy_observe::metrics::record_provider_attempt(&provider.name, "error");
+                    record_provider_attempt_outcome(
+                        &router,
+                        provider_idx,
+                        &provider.name,
+                        ProviderAttemptOutcome::Answered(status),
+                    );
                     try_spawn_governed_shadow_after_primary(
                         config,
                         &surface,
@@ -13530,10 +13830,11 @@ pub(super) async fn handle_ai_proxy(
                 // HTTP error statuses still count as provider-attempt
                 // errors even when they are not retried, so metrics agree
                 // with the request span's final ERROR classification.
-                let provider_attempt_outcome = if status >= 400 { "error" } else { "success" };
-                sbproxy_observe::metrics::record_provider_attempt(
+                record_provider_attempt_outcome(
+                    &router,
+                    provider_idx,
                     &provider.name,
-                    provider_attempt_outcome,
+                    ProviderAttemptOutcome::Answered(status),
                 );
                 last_format = sbproxy_ai::client::provider_format(provider);
                 last_upstream_host = match url::Url::parse(&provider.effective_base_url()) {
@@ -13596,7 +13897,12 @@ pub(super) async fn handle_ai_proxy(
                 }
                 // WOR-1103: a transport-level failure is an attempt
                 // outcome too; count it per provider.
-                sbproxy_observe::metrics::record_provider_attempt(&provider.name, "error");
+                record_provider_attempt_outcome(
+                    &router,
+                    provider_idx,
+                    &provider.name,
+                    ProviderAttemptOutcome::NoResponse,
+                );
                 warn!(
                     error = %e,
                     provider = %provider.name,
@@ -14020,6 +14326,12 @@ fn cancel_upstream_for_client_disconnect(
     observed: &pingora_error::Error,
 ) -> Box<Error> {
     ctx.ai_upstream_cancelled_on_client_disconnect = true;
+    // The one attempt in this file that ticks the counter without going
+    // through `record_provider_attempt_outcome`, and legitimately: the
+    // client left, so there is no upstream verdict to record on the
+    // breaker, the outlier detector, or the cooldown axis. See
+    // `ProviderAttemptOutcome`'s doc for the invariant this is the
+    // stated exception to (WOR-2532 / WOR-2690).
     sbproxy_observe::metrics::record_provider_attempt(provider, "client_disconnected");
     sbproxy_ai::tracing_spans::record_error(
         span,
@@ -29363,6 +29675,190 @@ origins:
                 .any(|decision| decision == "request_timeout:deny"),
             "the refusal reaches the admin decision row: {:?}",
             context.policy_decisions
+        );
+    }
+
+    /// An upstream that answers `status` to each of `accepts`
+    /// connections and counts them.
+    ///
+    /// `upstream_bytes_fixture_with_status` accepts exactly one
+    /// connection, which is enough for a single-provider test and not
+    /// enough to watch a failover chain visit two of them.
+    async fn failing_upstream_fixture(status: u16, accepts: usize) -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind failing upstream fixture");
+        let address = listener.local_addr().expect("failing upstream address");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&hits);
+        tokio::spawn(async move {
+            for _ in 0..accepts {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                observed.fetch_add(1, Ordering::SeqCst);
+                drain_upstream_request(&mut stream).await;
+                let body = r#"{"error":{"message":"fixture upstream is unavailable"}}"#;
+                let response = format!(
+                    "HTTP/1.1 {status} Fixture\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (format!("http://{address}/v1"), hits)
+    }
+
+    /// Two providers under `strategy`, with an outlier detector that
+    /// ejects on the first failed sample.
+    ///
+    /// `min_requests: 1` is the point: one dispatched request is enough
+    /// to move `eligible_indices`, so the assertion is about whether the
+    /// dispatch path fed the detector at all, not about how many samples
+    /// it takes to eject.
+    fn two_provider_outlier_config(
+        strategy: &str,
+        first_url: &str,
+        second_url: &str,
+    ) -> sbproxy_ai::AiHandlerConfig {
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {
+                    "name": "provider-one",
+                    "provider_type": "openai",
+                    "base_url": first_url,
+                    "allow_private_base_url": true,
+                    "api_key": "fixture-key",
+                    "priority": 1
+                },
+                {
+                    "name": "provider-two",
+                    "provider_type": "openai",
+                    "base_url": second_url,
+                    "allow_private_base_url": true,
+                    "api_key": "fixture-key",
+                    "priority": 2
+                }
+            ],
+            "routing": {"strategy": strategy},
+            "resilience": {
+                "outlier_detection": {
+                    "threshold": 0.5,
+                    "window_secs": 60,
+                    "min_requests": 1,
+                    "ejection_duration_secs": 300
+                }
+            }
+        }))
+        .expect("two-provider outlier config")
+    }
+
+    /// Drive one request through `handle_ai_proxy` and hand back the raw
+    /// downstream bytes, whatever status they carry.
+    ///
+    /// `dispatch_chat_request` asserts a 200; these tests are about what
+    /// the router learned from a failure, so they need the error bytes.
+    async fn dispatch_ai_request_bytes(
+        config: &sbproxy_ai::AiHandlerConfig,
+        body: serde_json::Value,
+    ) -> Vec<u8> {
+        let (mut session, client) = downstream_session(body).await;
+        let mut context = crate::context::RequestContext::new();
+        context.tenant_id = "tenant-a".into();
+        super::handle_ai_proxy(
+            &mut session,
+            config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the dispatcher answers the request");
+        drop(session);
+        live_downstream_body(client).await
+    }
+
+    /// WOR-2532, the seam rather than the classification.
+    ///
+    /// `race_mode` requires `!is_stream`, so a `stream: true` request on
+    /// a `race` pool falls through to the sequential loop. Before this
+    /// change that loop fed neither the circuit breaker nor the outlier
+    /// detector on any path, so the majority shape of chat traffic left
+    /// `resilience.outlier_detection` at zero samples however badly a
+    /// provider behaved. Deleting the call site in the loop turns this
+    /// red; the classification unit tests above stay green, which is why
+    /// they are not the proof.
+    #[tokio::test]
+    async fn a_streaming_race_request_feeds_the_outlier_detector() {
+        let (first_url, first_hits) = failing_upstream_fixture(503, 1).await;
+        let (second_url, second_hits) = failing_upstream_fixture(503, 1).await;
+        let config = two_provider_outlier_config("race", &first_url, &second_url);
+
+        let response = dispatch_ai_request_bytes(
+            &config,
+            serde_json::json!({
+                "model": "fixture-model",
+                "stream": true,
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }),
+        )
+        .await;
+        assert!(response.starts_with(b"HTTP/1.1 503"), "{response:?}");
+
+        let first = first_hits.load(Ordering::SeqCst);
+        let second = second_hits.load(Ordering::SeqCst);
+        assert_eq!(
+            first + second,
+            1,
+            "a streaming request on a race pool takes one sequential leg, \
+             which is the carve-out this test exists for"
+        );
+        let dialed = if first == 1 { 0 } else { 1 };
+        let eligible = config.router().eligible_indices(&config.providers);
+        assert!(
+            !eligible.contains(&dialed),
+            "the provider that answered 503 has to leave the pool, got {eligible:?}"
+        );
+    }
+
+    /// WOR-2532: every leg of a sequential failover is a settled attempt,
+    /// so both providers that answered 503 leave the pool.
+    ///
+    /// This pins the failover call site specifically. The test above only
+    /// ever reaches the terminal one, so without this a deletion in the
+    /// failover arm would go unnoticed.
+    #[tokio::test]
+    async fn every_leg_of_a_sequential_failover_feeds_the_outlier_detector() {
+        let (first_url, first_hits) = failing_upstream_fixture(503, 1).await;
+        let (second_url, second_hits) = failing_upstream_fixture(503, 1).await;
+        let config = two_provider_outlier_config("fallback_chain", &first_url, &second_url);
+
+        let response = dispatch_ai_request_bytes(
+            &config,
+            serde_json::json!({
+                "model": "fixture-model",
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }),
+        )
+        .await;
+        assert!(response.starts_with(b"HTTP/1.1 503"), "{response:?}");
+
+        assert_eq!(
+            (
+                first_hits.load(Ordering::SeqCst),
+                second_hits.load(Ordering::SeqCst)
+            ),
+            (1, 1),
+            "the premise: a fallback chain visits both providers"
+        );
+        assert!(
+            config
+                .router()
+                .eligible_indices(&config.providers)
+                .is_empty(),
+            "both legs answered 503, so both providers leave the pool"
         );
     }
 }
