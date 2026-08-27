@@ -1090,6 +1090,21 @@ pub const METRICS: &[MetricCapability] = &[
         description: "Rich classifier sidecar request attempts observed at a typed transport boundary.",
         dead_reason: None,
     },
+    // Written by `sbproxy-classifier-client`, inside the proxy process, not
+    // by the sidecar. It is the one family that answers "are we running on
+    // the in-process fallback right now", which no sidecar-side metric can:
+    // an unreachable sidecar emits nothing at all.
+    MetricCapability {
+        name: "sbproxy_classifier_client_fallback_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("note_degrade"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["reason"],
+        description: "Classifier calls served by the in-process fallback because the configured sidecar did not answer, by closed reason (connect, timeout, rpc, protocol, invalid_request, empty_response).",
+        dead_reason: None,
+    },
     MetricCapability {
         name: "sbproxy_classifier_completions_total",
         kind: MetricKind::Counter,

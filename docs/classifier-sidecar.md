@@ -1,6 +1,6 @@
 # Classifier Sidecar
 
-*Last modified: 2026-08-25*
+*Last modified: 2026-08-26*
 
 SBproxy heavily invests in out-of-process AI safety via the `sbproxy-classifier-sidecar`, `sbproxy-classifier`, and `sbproxy-classifier-client` crates. These components allow you to run remote or local Machine Learning safety classifiers (e.g., prompt injection detection, PII detection, toxicity) outside of the main proxy process using gRPC, plus (for `sbproxy-classifier`) TCP + MessagePack.
 
@@ -307,7 +307,8 @@ See [guardrails.md](guardrails.md) and [prompt-injection-v2.md](prompt-injection
 | Quality scoring | gRPC `ClassifierService.Quality`, and TCP `quality_score` | Heuristic AI-response quality score: refusal-phrase detection, length, repetition, formatting, casing. Sub-100us, no model. |
 | Text normalization / PII redaction | TCP, applied to `classify` text before scoring | Unicode NFKC plus a regex substitution pipeline per tenant; an operator registers `email` / `phone` / `credit_card` rules (or its own) with a `<REDACTED>`-style replacement in `normalization.rules`. |
 | Intent / content-type detection | TCP `intent_detect` / `content_type_detect` | Coarse heuristic categories (coding / vision / analysis / summarization / general; image / audio / video / text). |
-| Per-token streaming safety | gRPC `ClassifierService.StreamSafety` (bidi), and TCP `streaming_safety` | Checks accumulated streamed tokens against a rule set as they arrive, so a caller can cut a response short instead of waiting for the full body. After the first match, `safe` remains false and carries the matching reason; `blocked` is true only on the message that first caused that transition. |
+| Per-token streaming safety, session-aware | gRPC `ClassifierService.StreamSafety` (bidi) | Checks accumulated streamed tokens against a rule set as they arrive, so a caller can cut a response short instead of waiting for the full body. The stream retains a tail across messages, so a rule spanning two tokens still matches. After the first match, `safe` remains false and carries the matching reason; `blocked` is true only on the message that first caused that transition. |
+| Per-token streaming safety, stateless | TCP `streaming_safety` | Scores one frame's `streaming_tokens` against that frame's `safety_rules` and nothing else. There is no retained tail, so a rule spanning two frames never matches, and there is no sticky state: `blocked` is always `!safe`, and `safe` returns to true on the next frame. A caller that wants the session semantics above accumulates the tokens itself, or uses the gRPC stream. |
 
 `Compress` (token-classification pruning) is not ported and returns `UNIMPLEMENTED` on this binary; run the minimal sidecar for that RPC. See the crate's module docs (`crates/sbproxy-classifier/src/*.rs`) for the full scope note, including what was deliberately not ported from the enterprise source (LLM-judge backends, license-leak detection, the Wave 5 agent-classifier ML path, Ed25519 model-signing, OpenTelemetry).
 
@@ -347,13 +348,40 @@ listener or publishing readiness:
 | `--inference-deadline-ms` | `5000` | `30000` |
 | `--tcp-max-connections` | `128` | `128` |
 | `--tcp-io-timeout-ms` | `5000` | `60000` |
+| `--tcp-frame-timeout-ms` | `15000` | `300000` |
+| `--tcp-connection-timeout-ms` | `300000` | `3600000` |
 
-Running connections and both deadlines must be at least one; the inference
-queue alone may be zero. The TCP connection limit applies independently to
+Running connections and every deadline must be at least one; the inference
+queue alone may be zero. `--tcp-frame-timeout-ms` must be at least
+`--tcp-io-timeout-ms`, and `--tcp-connection-timeout-ms` at least
+`--tcp-frame-timeout-ms`. The TCP connection limit applies independently to
 the public and optional admin listeners, while both listeners share the same
 16 MiB in-flight frame-byte budget. Each frame remains capped at 4 MiB, and
 the process acquires its share of the aggregate budget before allocating the
 caller-declared body. A client that exhausts that budget is disconnected.
+
+The three deadlines nest, and they nest for a reason. `--tcp-io-timeout-ms`
+bounds one `read()`, `--tcp-frame-timeout-ms` bounds the length prefix plus
+the declared body, and `--tcp-connection-timeout-ms` bounds the socket from
+accept to close. Without the middle one a client that sends a byte just
+inside every per-read window holds its share of the shared frame budget for
+as long as it likes, and a handful of such sockets lock every other
+connection, the admin listener included, out of that budget.
+
+The public TCP listener authenticates nothing, encrypts nothing, and takes
+the `tenant` field verbatim from each frame. It therefore binds to loopback
+only unless you pass `--tcp-allow-nonlocal`, which is the operator saying, in
+writing, that a network boundary outside this process is what protects the
+port. A non-loopback bind logs one warning at startup naming what is exposed:
+anything that can route to it can enumerate registered tenants, classify
+against any of them, and read back that tenant's normalized text, which is
+the redaction pipeline section 6 tells you to configure for PII.
+
+Every CPU-bound public command (`classify`, `quality_score`, `intent_detect`,
+`content_type_detect`, `streaming_safety`) runs behind the same bounded
+executor the gRPC RPCs use, under the same `--inference-max-running`,
+`--inference-max-queued`, and `--inference-deadline-ms` bounds, and enforces
+the same per-request budgets listed below.
 
 Other rich-sidecar refusal limits are fixed:
 
@@ -363,7 +391,16 @@ Other rich-sidecar refusal limits are fixed:
 | gRPC `Embed` batch | 64 items and 1 MiB aggregate text |
 | gRPC `StreamSafety` stream | 4096 chunks and 1 MiB aggregate token text |
 | gRPC `StreamSafety` first-message rules | 64 rules and 64 KiB aggregate rule text |
+| TCP text in one `classify`, `quality_score`, `intent_detect`, or `content_type_detect` frame | 1 MiB |
+| TCP `streaming_safety` frame | 1 MiB of token text, 64 rules, 64 KiB aggregate rule text |
 | TCP MessagePack frame | 4 MiB per frame; 16 MiB in flight process-wide |
+| Normalization output | 4 MiB after every rule has run |
+| Tenant id | 128 bytes, `[A-Za-z0-9._-]` only |
+| Tenant registry | 64 tenants |
+| Tenant config | 64 aggregate patterns, 64 normalization rules, 4096 bytes per pattern |
+| Tenant config bytes | 256 KiB of pattern and rule source; 256 KiB encoded |
+| Compiled tenant programs | 48 KiB per pattern, 64 KiB per enabled rule, 32 MiB process-wide |
+| Tenant list page | 32 entries; 256 KiB serialized on either the admin TCP or the HTTP boundary |
 | HTTP health/metrics connections | 128, each with a 5-second whole-connection deadline |
 | HTTP request line plus headers | 8192 bytes, including the required blank header terminator |
 | Admin token file | 256 KiB and 1024 token grants |
@@ -387,10 +424,12 @@ The optional `--listen-admin` address must be loopback and requires
 Per the epic's rule that a sidecar a deployment must run and keep running is the same category of hard dependency as an external database: **nothing in this OSS workspace may require either classifier sidecar to be up.** The shipping `prompt_injection_v2` compiler enforces this directly: selecting `detector: sidecar` requires a pinned real-ONNX fallback and constructs one composite detector. `sbproxy-classifier-client`'s `FallbackClassifier` offers the same primary/fallback control flow to custom callers, but those callers remain responsible for supplying and bounding a real fallback implementation.
 
 - No sidecar configured (the common OSS case: an operator who never deploys one) - every call goes straight to a caller-supplied in-process classifier. No connection is ever attempted.
-- A sidecar is configured but unreachable, times out, or returns a malformed response - the call degrades to the in-process classifier for that request. Closed stage metrics and bounded health state record the outage; warnings are aggregated for 60 seconds by configured origin and reason.
+- A sidecar is configured but unreachable, times out, or returns a malformed response - the call degrades to the in-process classifier for that request. Every degraded call increments `sbproxy_classifier_client_fallback_total{reason}` on the proxy's own `/metrics`, over a closed reason set (`connect`, `timeout`, `rpc`, `protocol`, `invalid_request`, `empty_response`), so an operator can alert on running on the fallback. The warning is held to one line per reason per 60 seconds and carries the count it speaks for, because an outage that writes one WARN per request is its own log flood.
 - A sidecar is configured and healthy - its verdict is used, and the in-process classifier is not invoked at all.
 
 For `prompt_injection_v2`, the fallback is not an arbitrary stub: config construction verifies the model and tokenizer paths, mandatory SHA-256 pins, size limits, and any configured detached signatures, then uses the same bounded admission/deadline mechanism as the explicit in-process detector. A local queue, deadline, worker, runtime, or inference failure remains unavailable and follows the policy's blocked/degraded action; it never becomes a clean verdict.
+
+The rich sidecar holds the same line on its own side. A model id that a validated manifest names but no `--model` or `--embed-model` actually loaded is `FAILED_PRECONDITION` on `Classify` and `Embed`, never a descriptor-shaped answer: no label from the manifest at score 1.0, and no zero vector at the declared width. A missing model reads as a missing model.
 
 ```rust,ignore
 use sbproxy_classifier_client::{ClassifierClient, FallbackClassifier, InProcessClassifier, Verdict};

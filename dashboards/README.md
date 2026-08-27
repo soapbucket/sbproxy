@@ -1,5 +1,5 @@
 # SBproxy Dashboards and Alerts
-*Last modified: 2026-08-25*
+*Last modified: 2026-08-26*
 
 Grafana dashboards and Prometheus alert/recording rules for monitoring SBproxy.
 
@@ -31,7 +31,7 @@ scrape_configs:
 | AI Bot & Agent Traffic | `grafana/sbproxy-ai-bot-traffic.json` | `sbproxy-ai-bot-traffic` | Inbound AI bot / agent volume by class, vendor, and verification status (verified Web Bot Auth vs anonymous vs unknown); paid vs unpaid breakdown; AI crawl policy verdicts (allow / block / tarpit); bot-auth integrity (nonce replays, skill digest mismatches) |
 | Model Host | `grafana/sbproxy-model-host.json` | `sbproxy-model-host` | Local inference-engine lifecycle: resident models, cold-start (time-to-ready) latency, launch/eviction rates, load-queue depth, and per-device VRAM used/free and GPU utilization |
 | Mesh Admission & Storage | `grafana/sbproxy-mesh-storage.json` | `sbproxy-mesh-storage` | Mesh inbound connection admission by refusal reason and regrouped by operator fix, plus storage backend latency percentiles, error rate by error kind, operation throughput, and error ratio. Both halves report only where the mesh runs with its Redis backend, and the header tiles say so rather than leaving an empty chart to read as health. |
-| Classifier Sidecar | `grafana/sbproxy-classifier.json` | `sbproxy-classifier` | The rich classifier sidecar (`sbproxy-classifier`, WOR-2665): admission queue/refusals, registered tenant count, request rate by transport and command, errors by reason, quality-score distribution (p50/p95), and streaming safety verdict rate. This sidecar runs as its own process with its own `/metrics` endpoint (`--metrics-addr`, default `127.0.0.1:9402`), separate from the main proxy scrape target. Its seven families are still classified in the central `docs/metrics-stability.md` capability catalog, and this dashboard graphs all seven. |
+| Classifier Sidecar | `grafana/sbproxy-classifier.json` | `sbproxy-classifier` | The rich classifier sidecar (`sbproxy-classifier`, WOR-2665): admission queue/refusals, registered tenant count, request rate by transport and command, errors by reason, quality-score distribution (p50/p95), streaming safety verdict rate, the typed attempt/completion/terminal-outcome lifecycle, and the release startup owner. This sidecar runs as its own process with its own `/metrics` endpoint (`--metrics-addr`, default `127.0.0.1:9402`), separate from the main proxy scrape target. Its eleven families are classified in the central `docs/metrics-stability.md` capability catalog, and this dashboard graphs all eleven. The last panel is the exception to the scrape target: `sbproxy_classifier_client_fallback_total` is written by the proxy, not the sidecar, because an unreachable sidecar emits nothing at all and only the caller can say the fallback is carrying the traffic. |
 
 The routing and reliability section on `sbproxy-ai-gateway` follows the
 convention `sbproxy-mesh-storage` set: a strip of `absent()` tiles reading

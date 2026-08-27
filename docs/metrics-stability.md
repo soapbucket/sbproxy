@@ -134,6 +134,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_classifier_admission_queue` | Gauge | `stable` | `beta` | `cmd` | Rich-sidecar requests currently waiting for a bounded inference slot, by command. |
 | `sbproxy_classifier_admission_refusals_total` | Counter | `stable` | `beta` | `cmd`, `reason` | Rich-sidecar requests refused by bounded admission, by command and closed reason. |
 | `sbproxy_classifier_attempts_total` | Counter | `stable` | `beta` | `transport`, `cmd` | Rich classifier sidecar request attempts observed at a typed transport boundary. |
+| `sbproxy_classifier_client_fallback_total` | Counter | `stable` | `beta` | `reason` | Classifier calls served by the in-process fallback because the configured sidecar did not answer, by closed reason (connect, timeout, rpc, protocol, invalid_request, empty_response). |
 | `sbproxy_classifier_completions_total` | Counter | `stable` | `beta` | `transport`, `cmd` | Rich classifier sidecar requests whose successful response reached the transport completion boundary. |
 | `sbproxy_classifier_errors_total` | Counter | `stable` | `beta` | `transport`, `cmd`, `reason` | Rich classifier sidecar requests that could not complete, by transport, command, and bounded reason. |
 | `sbproxy_classifier_quality_score` | Histogram | `stable` | `beta` | `transport` | Heuristic quality scores returned by the rich classifier sidecar, by transport. |

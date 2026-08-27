@@ -405,6 +405,45 @@
         }
       ],
       "description": "Must be exactly one for the shipped release entrypoint. Missing or zero means the prepared runtime capability owner is not observable."
+    },
+    {
+      "id": 11,
+      "title": "Proxy-side fallback to the in-process classifier",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 6, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["mean", "max", "lastNotNull"]
+        },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (reason) (rate(sbproxy_classifier_client_fallback_total[5m]))",
+          "legendFormat": "{{reason}}",
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+        }
+      ],
+      "description": "Classifier calls the proxy served from its in-process fallback because the configured sidecar did not answer, by closed reason (connect, timeout, rpc, protocol, invalid_request, empty_response). Scraped from the proxy, not from this sidecar: an unreachable sidecar emits nothing at all, so this is the only line an outage draws. Any sustained rate means a sidecar is configured and is not being used."
     }
   ],
   "refresh": "30s",
