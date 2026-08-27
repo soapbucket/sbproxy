@@ -16,11 +16,12 @@
 //!
 //! ## Regex safety
 //!
-//! All user-supplied patterns are validated with [`RegexBuilder::size_limit`]
-//! (`REGEX_SIZE_LIMIT`). Rust's `regex` crate uses NFA execution with no
-//! backtracking, so ReDoS CPU attacks are not possible; the size limit
-//! prevents memory exhaustion from pathological patterns. Patterns longer
-//! than `MAX_PATTERN_LENGTH` bytes are rejected outright.
+//! All user-supplied patterns are validated with `RegexBuilder::size_limit`,
+//! under the same per-pattern ceiling `crate::registry` charges to the
+//! process-wide compiled-program budget. Rust's `regex` crate uses NFA
+//! execution with no backtracking, so ReDoS CPU attacks are not possible; the
+//! size limit prevents memory exhaustion from pathological patterns. Patterns
+//! longer than `MAX_PATTERN_LENGTH` bytes are rejected outright.
 
 #[cfg(test)]
 use crate::config::LabelConfig;
@@ -30,16 +31,6 @@ use regex::Regex;
 use regex::RegexBuilder;
 #[cfg(test)]
 use tracing::warn;
-
-/// Max compiled regex size in bytes (10MB). Prevents memory exhaustion from
-/// adversarial patterns. Rust's regex crate uses NFA (no backtracking), so
-/// ReDoS CPU attacks are not possible, but memory can still be exhausted.
-///
-/// Production never compiles here: `crate::registry` owns the one compile of
-/// every tenant pattern, under the per-pattern ceiling it also charges to the
-/// process-wide compiled-program budget.
-#[cfg(test)]
-const REGEX_SIZE_LIMIT: usize = 10 * 1024 * 1024;
 
 /// Max pattern string length before it is rejected outright.
 #[cfg(test)]
@@ -94,7 +85,9 @@ impl Classifier {
     ///
     /// Test-only: production compiles once in `crate::registry` and calls
     /// [`Classifier::from_compiled`], so a registered tenant never pays for
-    /// two compiles of the same pattern set.
+    /// two compiles of the same pattern set. It compiles under the registry's
+    /// charged per-pattern ceiling, not a larger test-only one, so a pattern
+    /// a test here proves compiles is one registration would admit too.
     #[cfg(test)]
     fn from_labels(
         label_configs: &[LabelConfig],
@@ -113,7 +106,10 @@ impl Classifier {
                             warn!(label = %lc.name, len = p.len(), "regex pattern too long (max {}), skipping", MAX_PATTERN_LENGTH);
                             return None;
                         }
-                        match RegexBuilder::new(p).size_limit(REGEX_SIZE_LIMIT).build() {
+                        match RegexBuilder::new(p)
+                            .size_limit(crate::registry::CLASSIFIER_PATTERN_SIZE_LIMIT)
+                            .build()
+                        {
                             Ok(r) => Some(r),
                             Err(e) => {
                                 warn!(label = %lc.name, pattern = %p, error = %e, "invalid regex, skipping");

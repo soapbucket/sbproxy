@@ -15,7 +15,7 @@
 //!    markers.
 //!
 //! The same regex-safety rules as [`crate::heuristic`] apply here:
-//! [`RegexBuilder::size_limit`] caps compilation memory, and patterns over
+//! `RegexBuilder::size_limit` caps compilation memory, and patterns over
 //! `MAX_PATTERN_LENGTH` are rejected. Rust's `regex` crate has no
 //! backtracking, so ReDoS is not a concern.
 
@@ -27,14 +27,6 @@ use regex::RegexBuilder;
 #[cfg(test)]
 use tracing::warn;
 use unicode_normalization::UnicodeNormalization;
-
-/// Max compiled regex size in bytes.
-///
-/// Production never compiles here: `crate::registry` owns the one compile of
-/// every enabled rule, under the per-rule ceiling it also charges to the
-/// process-wide compiled-program budget.
-#[cfg(test)]
-const REGEX_SIZE_LIMIT: usize = 10 * 1024 * 1024;
 
 /// Max pattern string length.
 #[cfg(test)]
@@ -87,7 +79,9 @@ impl Normalizer {
     ///
     /// Test-only: production compiles once in `crate::registry` and calls
     /// [`Normalizer::from_compiled`], so a registered tenant never pays for
-    /// two compiles of the same rule set.
+    /// two compiles of the same rule set. It compiles under the registry's
+    /// charged per-rule ceiling, not a larger test-only one, so a rule a test
+    /// here proves compiles is one registration would admit too.
     #[cfg(test)]
     fn from_config(config: &NormalizationConfig) -> Self {
         let rules = config
@@ -99,7 +93,10 @@ impl Normalizer {
                     warn!(rule = %r.name, len = r.pattern.len(), "regex pattern too long (max {}), skipping", MAX_PATTERN_LENGTH);
                     return None;
                 }
-                match RegexBuilder::new(&r.pattern).size_limit(REGEX_SIZE_LIMIT).build() {
+                match RegexBuilder::new(&r.pattern)
+                    .size_limit(crate::registry::NORMALIZATION_RULE_SIZE_LIMIT)
+                    .build()
+                {
                     Ok(regex) => Some(CompiledRule {
                         regex,
                         replace: r.replace.clone(),
@@ -295,6 +292,14 @@ mod tests {
     /// card number with space or dash separators also syntactically
     /// matches the looser phone pattern, so the more specific rule claims
     /// the digits first.
+    ///
+    /// The card and phone rules spell their digits `[0-9]` rather than `\d`
+    /// on purpose.
+    /// `\d` is Unicode-aware, and unrolled a dozen or more times it
+    /// compiles past the per-rule compiled-program budget the registry
+    /// charges, so the Unicode spelling is refused at registration. This fixture compiles
+    /// under the same ceiling registration enforces, so a rule it proves
+    /// works is a rule an operator can register.
     #[test]
     fn operator_configured_pii_rules_redact_email_card_and_phone() {
         let config = NormalizationConfig {
@@ -309,13 +314,13 @@ mod tests {
                 },
                 NormalizationRule {
                     name: "credit_card".into(),
-                    pattern: r"\b(?:\d[ -]?){13,16}\b".into(),
+                    pattern: r"\b(?:[0-9][ -]?){13,16}\b".into(),
                     replace: "<CARD>".into(),
                     enabled: true,
                 },
                 NormalizationRule {
                     name: "phone".into(),
-                    pattern: r"\+?\d[\d\-. ]{7,14}\d".into(),
+                    pattern: r"\+?[0-9][0-9\-. ]{7,14}[0-9]".into(),
                     replace: "<PHONE>".into(),
                     enabled: true,
                 },
