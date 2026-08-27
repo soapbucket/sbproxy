@@ -72,7 +72,9 @@ pub use config_merge::{
     changed_leaf_paths, denied_paths_in, merge_config, BaseOrigin, MergeError, MergeMode,
     MergeOutcome, Provenance, ProvenanceMap, AUTHORITY_DENIED_PATHS,
 };
-pub use confined_template::{resolve_confined_fragment, ConfinedTemplateError};
+pub use confined_template::{
+    check_confined_document, resolve_confined_fragment, ConfinedTemplateError, ConfinementPolicy,
+};
 pub use extensions::*;
 pub use listing::{
     is_well_placed_skill_url, load_listing_file, load_listings_from_repo, validate_listings,

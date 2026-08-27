@@ -3254,6 +3254,110 @@ pub fn is_secret_reference(value: &str) -> bool {
     }
 }
 
+/// What a secret reference reads on the machine that resolves it, when
+/// it reads the host directly rather than an operator-declared backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostSecretSource {
+    /// `env:NAME` - the process environment.
+    Environment,
+    /// `vault://env/NAME` - the legacy alias for the same read.
+    LegacyVaultEnvironment,
+    /// `file:/path` - an arbitrary path on the host filesystem.
+    HostFile,
+}
+
+impl HostSecretSource {
+    /// The reference spelling, for an error message. Never the value.
+    #[must_use]
+    pub fn form(self) -> &'static str {
+        match self {
+            Self::Environment => "env:NAME",
+            Self::LegacyVaultEnvironment => "vault://env/NAME",
+            Self::HostFile => "file:PATH",
+        }
+    }
+
+    /// What the form reads, for an error message.
+    #[must_use]
+    pub fn reads(self) -> &'static str {
+        match self {
+            Self::Environment | Self::LegacyVaultEnvironment => "the process environment",
+            Self::HostFile => "a file on the host filesystem",
+        }
+    }
+}
+
+/// Whether `value` is a secret reference the process resolver reads
+/// straight off the host, rather than through a backend the operator
+/// declared under `proxy.secrets`.
+///
+/// This is the shape half of a guard whose enforcing half lives in
+/// another crate. `sbproxy-vault`'s `SecretResolver::resolve_with_limit`
+/// (`crates/sbproxy-vault/src/resolver.rs:135-165`) tests four prefixes
+/// before it reaches the backend manager, in this order: the legacy
+/// `vault://env/NAME` alias, a whole-value `${VAR}`, `env:NAME`, and
+/// `file:PATH`. The first, third and fourth are what this returns; the
+/// second is a template form the confined pass
+/// ([`crate::confined_template`]) already refuses as `${VAR}`.
+///
+/// # What this cannot see
+///
+/// `sbproxy-config` does not depend on `sbproxy-vault` and cannot, so
+/// this is a mirror rather than a call, and a new host-backed prefix
+/// added to that resolver will not appear here on its own. Two things
+/// hold it: this doc names the exact function and line range, and
+/// `sbproxy-vault`'s
+/// `every_host_backed_prefix_is_mirrored_by_the_confined_pass` pins the
+/// resolver's prefix set with a failure message pointing back here. The
+/// mirror is deliberately the wider of the two everywhere they differ,
+/// and they differ twice. `vault://env/` is matched on the scheme and
+/// authority alone, while the resolver additionally requires a
+/// syntactically valid variable name, so a fragment writing a malformed
+/// one is refused rather than waved through. And the value is trimmed
+/// before the prefixes are tested, while the resolver tests the raw
+/// value, so a leading space cannot smuggle a reference past this and
+/// into a field that trims later.
+///
+/// Provider-URI schemes (`secret://`, `vault://<backend>/`, `awssm://`,
+/// `gcpsm://`, `k8ssecret://`, `secretfile://<backend>/`) are
+/// deliberately absent: each resolves only against a backend named under
+/// `proxy.secrets`, which is in [`crate::AUTHORITY_DENIED_PATHS`] and is
+/// not a field an externally authored document may set, so the operator
+/// still chooses what those reach.
+#[must_use]
+pub fn host_backed_secret_reference(value: &str) -> Option<HostSecretSource> {
+    let trimmed = value.trim();
+    // Mirrors the resolver's own branch order.
+    if let Some(rest) = trimmed.strip_prefix("vault://env/") {
+        if !rest.is_empty() {
+            return Some(HostSecretSource::LegacyVaultEnvironment);
+        }
+    }
+    if let Some(rest) = trimmed.strip_prefix("env:") {
+        if !rest.is_empty() {
+            return Some(HostSecretSource::Environment);
+        }
+    }
+    if let Some(rest) = trimmed.strip_prefix("file:") {
+        // No carve-out for `file://`, because the resolver has none:
+        // its branch is a bare `strip_prefix("file:")`, so
+        // `file:///etc/sbproxy/creds` reaches
+        // `read_to_string("///etc/sbproxy/creds")`, which POSIX
+        // resolves to `/etc/sbproxy/creds`. Sparing the git transport
+        // spelling would have left the mirror narrower than the
+        // enforcer at the one spelling an author would reach for.
+        // Nothing needs the exemption: a `source:` block is read off
+        // the operator's own local document, the loader never hands a
+        // fetched document's `source:` back to git, and `source` is on
+        // [`crate::AUTHORITY_DENIED_PATHS`], so no externally authored
+        // document names a git transport at all.
+        if !rest.is_empty() {
+            return Some(HostSecretSource::HostFile);
+        }
+    }
+    None
+}
+
 /// Validate one bounded, non-empty, control-character-free value.
 fn validate_authority_value(
     field: &'static str,
