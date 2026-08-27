@@ -276,6 +276,137 @@ async fn run_routed_provider_attempt<T, E>(
     result
 }
 
+/// How many times [`downstream_closed_before_dispatch`] polls the idle
+/// probe before it concludes the client is still connected.
+///
+/// Each round is one poll and one cooperative yield, never a sleep, so
+/// the whole settle costs scheduler ticks rather than wall clock. More
+/// than one round exists because the readiness the poll reads is
+/// published by the runtime's I/O driver, and a FIN that landed in the
+/// last microsecond may not have reached it yet on the first look.
+const DOWNSTREAM_SETTLE_POLLS: usize = 3;
+
+/// Whether a downstream idle probe's answer means the client is gone,
+/// and the error that says so.
+///
+/// Pingora's `Session::read_body_or_idle` is its own "is the client
+/// still there" future. With `no_body_expected` set it reads a byte off
+/// the downstream connection and resolves only once that read says
+/// something. It is the same signal `pingora-proxy`'s body pump already
+/// races against the upstream for an ordinary proxied request
+/// (`proxy_h1.rs`, the `read_body_or_idle` arm of its `tokio::select!`),
+/// so this classifier answers a question the proxy path has always asked
+/// and the AI path never did.
+///
+/// Three of its answers mean the client is gone, and the rest do not:
+///
+/// - `ConnectionClosed` is the read returning zero: the client sent FIN.
+/// - `ReadError` is the connection failing outright, which is what a
+///   reset looks like from this side.
+/// - `H2Error` is an HTTP/2 client resetting its stream, which is an
+///   explicit cancellation rather than an inference drawn from a socket.
+///
+/// The answer deliberately excluded is `ConnectError` ("Sent data after
+/// end of body"), which is bytes arriving early on a keep-alive
+/// connection. That is a second request, not a departure, and cancelling
+/// a paid call on it would charge one client for another's impatience.
+fn downstream_disconnect_cause(
+    observed: &pingora_error::Result<Option<Bytes>>,
+) -> Option<&pingora_error::Error> {
+    let Err(error) = observed else {
+        return None;
+    };
+    matches!(
+        error.etype(),
+        ErrorType::ConnectionClosed | ErrorType::ReadError | ErrorType::H2Error
+    )
+    .then(|| error.as_ref())
+}
+
+/// Whether the client had already closed its write half before this
+/// request reached a provider.
+///
+/// RFC 9112 section 9.6 lets a client shut down its write side and go on
+/// reading the response, and at the TCP layer that polite half-close and
+/// a client walking away are the same FIN. WOR-2335 settled the billing
+/// half of the ambiguity: a half-close on its own is not
+/// `client_disconnected`, because counting it turned every fully
+/// delivered response into a discount the client could award itself.
+/// This is the dispatch half of the same problem, and it separates the
+/// two cases by *when* the FIN arrives rather than by what it looks
+/// like. A client that half-closes does it as part of sending its
+/// request, so the FIN is already queued before the gateway has picked a
+/// provider. A client that walks away does it while the model is
+/// generating, seconds later. Only the second is worth cancelling a paid
+/// call for, and only the second reaches the race in
+/// `handle_ai_proxy`.
+///
+/// This never waits. Each round polls the probe once and yields, so a
+/// FIN the kernel has already delivered is observed and a client that is
+/// still there costs a few scheduler ticks and no wall clock. A `true`
+/// answer disarms the cancellation race for the rest of the request,
+/// which is what keeps a half-closing client's response being delivered
+/// exactly as it was before this existed.
+async fn downstream_closed_before_dispatch(session: &mut Session) -> bool {
+    use futures::future::FutureExt as _;
+
+    for _ in 0..DOWNSTREAM_SETTLE_POLLS {
+        // Boxed so the probe is `Unpin` for `now_or_never`, and so the
+        // frame this runs on carries a pointer rather than the read
+        // state machine. `now_or_never` polls once with a no-op waker
+        // and drops the future when it is not ready; dropping a pending
+        // `read` consumes nothing, because the byte is only taken on a
+        // completed read.
+        let probe = Box::pin(session.read_body_or_idle(true));
+        if let Some(observed) = probe.now_or_never() {
+            return downstream_disconnect_cause(&observed).is_some();
+        }
+        tokio::task::yield_now().await;
+    }
+    false
+}
+
+#[cfg(test)]
+mod downstream_liveness_tests {
+    use super::*;
+
+    #[test]
+    fn a_closed_or_broken_connection_is_a_disconnect() {
+        for etype in [
+            ErrorType::ConnectionClosed,
+            ErrorType::ReadError,
+            ErrorType::H2Error,
+        ] {
+            let observed: pingora_error::Result<Option<Bytes>> = Err(Error::new(etype.clone()));
+            assert!(
+                downstream_disconnect_cause(&observed).is_some(),
+                "{etype:?} means the client is gone"
+            );
+        }
+    }
+
+    /// Pingora's HTTP/1 idle probe answers a byte arriving after the
+    /// request body with `ConnectError`, and on a keep-alive connection
+    /// that byte is the next request. Cancelling on it would abandon one
+    /// caller's paid generation because a later caller was early.
+    #[test]
+    fn a_pipelined_request_is_not_a_disconnect() {
+        let observed: pingora_error::Result<Option<Bytes>> = Err(Error::explain(
+            ErrorType::ConnectError,
+            "Sent data after end of body",
+        ));
+        assert!(downstream_disconnect_cause(&observed).is_none());
+    }
+
+    #[test]
+    fn request_body_is_not_a_disconnect() {
+        let chunk: pingora_error::Result<Option<Bytes>> = Ok(Some(Bytes::from_static(b"chunk")));
+        assert!(downstream_disconnect_cause(&chunk).is_none());
+        let finished: pingora_error::Result<Option<Bytes>> = Ok(None);
+        assert!(downstream_disconnect_cause(&finished).is_none());
+    }
+}
+
 #[cfg(test)]
 mod routed_provider_observation_tests {
     use super::*;
@@ -11895,6 +12026,41 @@ pub(super) async fn handle_ai_proxy(
     // spend the operator's `max_retries` budget. One, at most, per
     // request.
     let mut key_fallback_extra_attempts = 0usize;
+    // --- WOR-2690: cancel the provider call when the client leaves ---
+    //
+    // A non-streaming AI request spends nearly all of its wall clock in
+    // one await on the provider's response header, and until now nothing
+    // watched the client during it. A caller that gave up (a `curl
+    // --max-time` that fired, a browser tab closed, an agent that timed
+    // out) left the generation running to completion and the invoice
+    // arrived seconds after the connection did not. Racing that await
+    // against Pingora's downstream idle probe closes the gap: the
+    // provider call is dropped the moment the client's connection goes,
+    // which is what closes the connection to the provider and stops the
+    // meter.
+    //
+    // Three conditions arm it, and each one is a case where the probe
+    // would answer a question it was not asked:
+    //
+    //   * Only when the request body is finished. The probe reads a byte
+    //     off the downstream connection, and a body still arriving is
+    //     that byte. Every AI request buffers its body before dispatch,
+    //     so this holds in practice and fails closed if it ever stops.
+    //   * Only for a non-streaming request. A stream already learns the
+    //     client left, from its own per-chunk write failing, and it owns
+    //     the downstream connection while it does.
+    //   * Only when a client that half-closed on its way in is not
+    //     mistaken for one that walked away, which is
+    //     `downstream_closed_before_dispatch`'s whole job.
+    //
+    // A raced (hedged) dispatch and a cascade both resolve before this
+    // point and set `last_resp`; the sequential loop below is the one
+    // that owns the await this guards.
+    let cancel_on_client_disconnect = !is_stream
+        && !race_mode
+        && last_resp.is_none()
+        && session.as_mut().is_body_done()
+        && !downstream_closed_before_dispatch(session).await;
     for attempt in 0..max_provider_visits {
         let Some(&provider_idx) = provider_order.get(attempt) else {
             break;
@@ -12236,7 +12402,7 @@ pub(super) async fn handle_ai_proxy(
         let pre_header_budget = pre_header_timeout.filter(|_| is_stream);
         let result: anyhow::Result<reqwest::Response> =
             {
-                let attempt_future =
+                let mut attempt_future =
                     Box::pin(run_routed_provider_attempt(&router, provider_idx, async {
                         if distributed_managed {
                             let managed_body = serde_json::to_vec(&attempt_body)
@@ -12350,6 +12516,79 @@ pub(super) async fn handle_ai_proxy(
                             budget_ms: u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
                         })),
                     },
+                    // WOR-2690: the same await, now watched. `select!`
+                    // polls its branches one after another rather than
+                    // nesting them, so the deepest stack this reaches is
+                    // still the provider call's own; the idle probe is a
+                    // one-byte socket read polled through a `Box`, and
+                    // this frame grows by two pointers and a
+                    // discriminant. That matters here and nowhere else:
+                    // `handle_ai_proxy` runs on a Pingora worker with the
+                    // std 2MB stack and has already overflowed it once,
+                    // on a single nested `.await` added to this path,
+                    // while every unit test stayed green.
+                    None if cancel_on_client_disconnect => {
+                        let mut downstream_probe = Box::pin(session.read_body_or_idle(true));
+                        // Biased so a provider response that is already
+                        // in hand wins a tie. Having paid for the answer,
+                        // the cheapest thing left to do with it is try to
+                        // deliver it.
+                        let raced = tokio::select! {
+                            biased;
+                            attempted = &mut attempt_future => Ok(attempted),
+                            observed = &mut downstream_probe => Err(observed),
+                        };
+                        match raced {
+                            Ok(attempted) => attempted,
+                            Err(observed) => match downstream_disconnect_cause(&observed) {
+                                Some(cause) => {
+                                    // Dropping the attempt future is the
+                                    // cancellation: it drops the
+                                    // in-flight `reqwest` call, which
+                                    // closes the connection the provider
+                                    // is generating into. It also
+                                    // releases the shared-quota
+                                    // reservation and the router's
+                                    // in-flight slot, both of which are
+                                    // documented cancellation-safe, and
+                                    // it releases the borrow of `ctx`
+                                    // that the record below needs.
+                                    drop(attempt_future);
+                                    let cancelled = cancel_upstream_for_client_disconnect(
+                                        ctx,
+                                        &ai_span,
+                                        &provider.name,
+                                        attempt,
+                                        attempt_start.elapsed(),
+                                        cause,
+                                    );
+                                    return Err(cancelled);
+                                }
+                                // Not a departure, so the provider call
+                                // this request is waiting on carries
+                                // on, unwatched from here (nothing
+                                // re-arms the probe).
+                                //
+                                // The one answer that lands here is a
+                                // byte arriving after the request body,
+                                // which on a keep-alive connection is
+                                // a pipelined next request. Pingora's
+                                // probe consumes that byte and, with
+                                // pipelining off, does not stash it, so
+                                // the connection is left desynced for
+                                // whatever the client sent next. That
+                                // is the same thing Pingora's own body
+                                // pump does to a pipelined request on
+                                // every proxied (non-AI) origin, where
+                                // it is fatal rather than survivable:
+                                // HTTP/1.1 pipelining is not a
+                                // supported shape here, and swallowing
+                                // the answer at least leaves *this*
+                                // request served.
+                                None => attempt_future.await,
+                            },
+                        }
+                    }
                     None => attempt_future.await,
                 }
             };
@@ -13264,6 +13503,57 @@ fn mcp_inject_denial_first_seen(config_revision: &str, tenant: &str, reference: 
         tenant.to_string(),
         reference.to_string(),
     ))
+}
+
+/// Abandon an in-flight provider call because the client went away, and
+/// report it (WOR-2690).
+///
+/// The cancellation itself is the caller dropping the attempt future
+/// before this runs; what this adds is the record and the error the
+/// request terminates on.
+///
+/// That error's *source* is the load-bearing part. `logging()` decides
+/// the billing outcome by asking `client_disconnected` whether the
+/// failure came from downstream (WOR-2335), so returning a
+/// `Downstream`-sourced error is what makes this request's receipt say
+/// `client_disconnected` rather than `delivered` or an origin failure,
+/// with no second classification to keep in step with the first. The
+/// usage the receipt carries is whatever the provider reported, which
+/// for a call abandoned before its response header is nothing: the
+/// context has no token counts to hand the usage sinks.
+///
+/// The attempt counter is the operator's view. It is the same family the
+/// transport-failure arm ticks a few lines below, under its own
+/// `outcome`, so "how often are we paying for calls nobody waited for"
+/// is a label selector on a series that already exists rather than a
+/// metric that has to be discovered.
+fn cancel_upstream_for_client_disconnect(
+    ctx: &RequestContext,
+    span: &tracing::Span,
+    provider: &str,
+    attempt: usize,
+    waited: std::time::Duration,
+    observed: &pingora_error::Error,
+) -> Box<Error> {
+    sbproxy_observe::metrics::record_provider_attempt(provider, "client_disconnected");
+    sbproxy_ai::tracing_spans::record_error(
+        span,
+        sbproxy_ai::tracing_spans::error_type::CLIENT_DISCONNECTED,
+        "client disconnected before the provider responded",
+    );
+    warn!(
+        request_id = %ctx.request_id,
+        provider = %provider,
+        attempt = %attempt,
+        waited_ms = %waited.as_millis(),
+        downstream = %observed,
+        "AI proxy: client disconnected while the provider was generating; upstream call cancelled"
+    );
+    Error::explain(
+        ErrorType::ConnectionClosed,
+        "AI upstream call cancelled: the client disconnected before the provider responded",
+    )
+    .into_down()
 }
 
 fn record_ai_transport_failure(
@@ -20111,6 +20401,300 @@ mod external_guardrail_context_tests {
                 .expect("write upstream response body");
         });
         (format!("http://{address}/v1"), hits)
+    }
+
+    // --- WOR-2690: cancel the provider call when the client leaves ---
+
+    /// What a slow provider fixture saw happen to its connection.
+    #[derive(Debug, PartialEq, Eq)]
+    enum SlowUpstreamOutcome {
+        /// The gateway closed the connection before the hold elapsed,
+        /// which is the generation not being paid for.
+        Abandoned,
+        /// The hold elapsed with the gateway still waiting, and the
+        /// fixture answered.
+        Answered,
+    }
+
+    struct SlowUpstream {
+        /// Fires once the fixture has read a whole request off the wire.
+        dispatched: tokio::sync::oneshot::Receiver<()>,
+        outcome: tokio::task::JoinHandle<SlowUpstreamOutcome>,
+    }
+
+    /// A provider that takes `hold` to answer, and reports whether the
+    /// gateway was still there when it did.
+    ///
+    /// The `upstream_fixture` family replies the instant it has read the
+    /// request, which is the wrong shape for a test about what happens
+    /// *during* a generation. This one stands in for a real completion
+    /// call: it holds the connection open with nothing written, so the
+    /// gateway parks on the response header exactly as it does against a
+    /// provider composing a long answer, and the fixture can say
+    /// afterwards whether that wait was cancelled or served.
+    async fn slow_upstream_fixture(hold: Duration) -> (String, SlowUpstream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind slow upstream fixture");
+        let address = listener.local_addr().expect("slow upstream address");
+        let (announce, dispatched) = tokio::sync::oneshot::channel();
+        let outcome = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept upstream request");
+            drain_upstream_request(&mut stream).await;
+            let _ = announce.send(());
+            let mut probe = [0_u8; 1];
+            tokio::select! {
+                // `Ok(0)` is the gateway's FIN and an error is its
+                // reset. Either way the call it made was dropped before
+                // this fixture produced a token.
+                _ = stream.read(&mut probe) => SlowUpstreamOutcome::Abandoned,
+                () = tokio::time::sleep(hold) => {
+                    let body = br#"{"choices":[{"message":{"content":"late"}}]}"#;
+                    let header = format!(
+                        "HTTP/1.1 200 Fixture\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(body).await;
+                    SlowUpstreamOutcome::Answered
+                }
+            }
+        });
+        (
+            format!("http://{address}/v1"),
+            SlowUpstream {
+                dispatched,
+                outcome,
+            },
+        )
+    }
+
+    /// A downstream client that keeps both halves of its connection open
+    /// until the test closes it.
+    ///
+    /// [`downstream_wire_session`] shuts its write side down the moment
+    /// the request is written. That is the polite RFC 9112 section 9.6
+    /// shape, and the dispatch race deliberately tolerates it: the FIN
+    /// is already queued when the provider is picked, so the gateway
+    /// treats the client as present and delivers the response. A test
+    /// about a caller walking away needs the other shape, a connection
+    /// that is whole when the provider call starts and gone while it is
+    /// running.
+    async fn downstream_session_closing_on_demand(
+        body: serde_json::Value,
+    ) -> (Session, tokio::sync::oneshot::Sender<()>, DownstreamClient) {
+        let body = serde_json::to_vec(&body).expect("request JSON");
+        let mut wire = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: ai.test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        wire.extend_from_slice(&body);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind downstream fixture");
+        let address = listener.local_addr().expect("downstream address");
+        let (close, mut closed) = tokio::sync::oneshot::channel::<()>();
+        let mut client = DownstreamClient::new(tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect downstream fixture");
+            stream.write_all(&wire).await.expect("write request");
+            // Deliberately no `shutdown()`: both halves stay open, so
+            // the gateway sees a live client right up to the moment the
+            // test drops the socket below.
+            let mut response = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut closed => return response,
+                    read = stream.read(&mut chunk) => match read {
+                        Ok(0) | Err(_) => return response,
+                        Ok(read) => response.extend_from_slice(&chunk[..read]),
+                    },
+                }
+            }
+        }));
+        let (stream, _) =
+            match tokio::time::timeout(Duration::from_secs(2), listener.accept()).await {
+                Ok(Ok(accepted)) => accepted,
+                Ok(Err(error)) => {
+                    client.abort_and_wait().await;
+                    panic!("accept downstream request: {error}");
+                }
+                Err(error) => {
+                    client.abort_and_wait().await;
+                    panic!("accept downstream request timed out: {error:?}");
+                }
+            };
+        let mut session = Session::new_h1(Box::new(Stream::from(stream)));
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            session.as_downstream_mut().read_request(),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                client.abort_and_wait().await;
+                panic!("parse downstream request: {error}");
+            }
+            Err(error) => {
+                client.abort_and_wait().await;
+                panic!("parse downstream request timed out: {error:?}");
+            }
+        }
+        (session, close, client)
+    }
+
+    fn disconnect_probe_config(upstream_url: &str) -> sbproxy_ai::AiHandlerConfig {
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key"
+            }]
+        }))
+        .expect("single-provider disconnect fixture config")
+    }
+
+    fn disconnect_probe_request() -> serde_json::Value {
+        serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        })
+    }
+
+    /// Seam: the provider await inside the live non-streaming dispatcher.
+    ///
+    /// Before WOR-2690 nothing watched the client during that await, so
+    /// a caller that gave up left the generation running and the invoice
+    /// arrived seconds after the connection did not. Without the race in
+    /// `handle_ai_proxy` this test hangs until the fixture's hold
+    /// elapses and then asserts `Answered`, which is the bug.
+    #[tokio::test]
+    async fn a_client_that_walks_away_cancels_the_in_flight_provider_call() {
+        let (upstream_url, upstream) = slow_upstream_fixture(Duration::from_secs(8)).await;
+        let config = disconnect_probe_config(&upstream_url);
+        let pipeline = crate::pipeline::CompiledPipeline::default();
+        let (mut session, close, client) =
+            downstream_session_closing_on_demand(disconnect_probe_request()).await;
+        let mut context = crate::context::RequestContext::new();
+
+        let SlowUpstream {
+            dispatched,
+            outcome,
+        } = upstream;
+        let dispatch = super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            None,
+        );
+        let walk_away = async {
+            dispatched.await.expect("the provider received the request");
+            let _ = close.send(());
+        };
+        let (result, ()) = tokio::join!(dispatch, walk_away);
+
+        let error = result.expect_err("a client that left cannot be served");
+        assert_eq!(
+            *error.esource(),
+            pingora_error::ErrorSource::Downstream,
+            "the failure has to read as the client's, not the provider's: {error}"
+        );
+        // The seam WOR-2335 prices the request through. A cancellation
+        // that did not classify here would abandon the provider call and
+        // still bill it as delivered.
+        assert!(
+            crate::server::proxy_http::client_disconnected(Some(error.esource().clone()), false),
+            "the cancelled call must settle as client_disconnected"
+        );
+        let observed = tokio::time::timeout(Duration::from_secs(5), outcome)
+            .await
+            .expect("the provider connection settles once the client is gone")
+            .expect("slow upstream fixture");
+        assert_eq!(
+            observed,
+            SlowUpstreamOutcome::Abandoned,
+            "the provider connection must be closed, not left generating"
+        );
+        drop(session);
+        drop(client);
+    }
+
+    /// A client that is merely slow is a client. Only an actual close
+    /// cancels, which is why the signal is Pingora's downstream probe
+    /// and not a deadline on how long the provider is taking.
+    #[tokio::test]
+    async fn a_slow_but_connected_client_is_not_cancelled() {
+        let (upstream_url, upstream) = slow_upstream_fixture(Duration::from_millis(400)).await;
+        let config = disconnect_probe_config(&upstream_url);
+        let pipeline = crate::pipeline::CompiledPipeline::default();
+        let (mut session, _close, client) =
+            downstream_session_closing_on_demand(disconnect_probe_request()).await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("a connected client's request is served");
+        drop(session);
+        let response = live_downstream_body(client).await;
+
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+        let observed = tokio::time::timeout(Duration::from_secs(5), upstream.outcome)
+            .await
+            .expect("the provider fixture settles")
+            .expect("slow upstream fixture");
+        assert_eq!(observed, SlowUpstreamOutcome::Answered);
+    }
+
+    /// RFC 9112 section 9.6 lets a client shut its write side and go on
+    /// reading, and WOR-2335 already decided that shape is not a
+    /// disconnect. The dispatch race has to agree, or every client that
+    /// half-closes on its way in would have its generation cancelled the
+    /// instant it started.
+    #[tokio::test]
+    async fn a_client_that_half_closed_on_its_way_in_is_still_served() {
+        let (upstream_url, upstream) = slow_upstream_fixture(Duration::from_millis(400)).await;
+        let config = disconnect_probe_config(&upstream_url);
+        let pipeline = crate::pipeline::CompiledPipeline::default();
+        // This fixture half-closes as soon as the request is written.
+        let (mut session, client) = downstream_session(disconnect_probe_request()).await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("a half-closed client is still owed its response");
+        drop(session);
+        let response = live_downstream_body(client).await;
+
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+        let observed = tokio::time::timeout(Duration::from_secs(5), upstream.outcome)
+            .await
+            .expect("the provider fixture settles")
+            .expect("slow upstream fixture");
+        assert_eq!(observed, SlowUpstreamOutcome::Answered);
     }
 
     struct QualityVerdictHook {

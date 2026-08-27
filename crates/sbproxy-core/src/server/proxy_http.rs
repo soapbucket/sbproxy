@@ -802,7 +802,16 @@ async fn lingering_drain_downstream_body(session: &mut Session, ctx: &RequestCon
     }
 }
 
-fn client_disconnected(
+/// Whether this request's failure was the client going away, which is
+/// the one question the receipt's `client_disconnected` outcome asks.
+///
+/// `pub(super)` rather than private because the AI dispatcher's
+/// cancellation path (WOR-2690) is answerable only against this
+/// function: it abandons a paid provider call by returning a
+/// `Downstream`-sourced error, and "does that error price as a
+/// disconnect" is a claim about this classifier rather than about the
+/// dispatcher.
+pub(super) fn client_disconnected(
     error_source: Option<pingora_error::ErrorSource>,
     downstream_half_closed: bool,
 ) -> bool {
@@ -820,6 +829,21 @@ fn client_disconnected(
     let delivery_failed = error_source.is_some();
     error_source.is_some_and(|source| source == pingora_error::ErrorSource::Downstream)
         || (downstream_half_closed && delivery_failed)
+}
+
+/// Whether a proxy failure leaves a client that can still be answered.
+///
+/// A `Downstream` error source is Pingora's statement that the request
+/// failed because the client's connection did, so every response
+/// [`ProxyHttp::fail_to_proxy`] could render goes to a socket nobody is
+/// reading. Rendering the synthesized error anyway is merely wasted
+/// work, and it is left alone. Running the origin's `fallback.on_error`
+/// action is not: that dispatches a whole second action on behalf of a
+/// caller who has already left, and on an `ai_proxy` fallback that
+/// action is another paid provider call. WOR-2690 cancels the first
+/// call for exactly that reason, so the fallback declines for it too.
+fn failure_leaves_a_client_to_answer(e: &Error) -> bool {
+    *e.esource() != pingora_error::ErrorSource::Downstream
 }
 
 fn should_record_proxy_request_metrics(path: &str) -> bool {
@@ -8066,7 +8090,7 @@ impl ProxyHttp for SbProxy {
         if let Some(origin_idx) = ctx.origin_idx {
             let pipeline = ctx.pipeline.clone();
             if let Some(fallback) = &pipeline.fallbacks[origin_idx] {
-                if fallback.on_error {
+                if fallback.on_error && failure_leaves_a_client_to_answer(e) {
                     debug!(
                         hostname = %ctx.hostname,
                         error = %e,
@@ -9467,6 +9491,30 @@ origins:
             Some(pingora_error::ErrorSource::Upstream),
             false
         ));
+    }
+
+    #[test]
+    fn a_downstream_failure_declines_the_on_error_fallback() {
+        // WOR-2690: the AI dispatcher cancels a provider call when the
+        // client leaves. Letting `fallback.on_error` then run would
+        // dispatch a second action for a caller who is gone, and on an
+        // `ai_proxy` fallback that action is another paid provider call,
+        // which hands straight back the spend the cancellation saved.
+        let client_gone = Error::new_down(ErrorType::ConnectionClosed);
+        assert!(!failure_leaves_a_client_to_answer(&client_gone));
+
+        // Every other failure keeps the fallback it always had.
+        for source in [
+            pingora_error::ErrorSource::Upstream,
+            pingora_error::ErrorSource::Internal,
+            pingora_error::ErrorSource::Unset,
+        ] {
+            let failure = Error::create(ErrorType::ConnectError, source.clone(), None, None);
+            assert!(
+                failure_leaves_a_client_to_answer(&failure),
+                "{source:?} is not the client leaving"
+            );
+        }
     }
 
     #[test]

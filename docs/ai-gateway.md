@@ -1,6 +1,6 @@
 # SBproxy AI gateway guide
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-27*
 
 ![the same OpenAI-shape request answered by OpenAI, Claude, and Gemini, switched only by Host header](assets/ai-gateway.gif)
 
@@ -1184,6 +1184,31 @@ The retry keeps the provider, the model, the base URL, and the price the request
 A request that arrived carrying a caller-owned native provider key never falls back, whatever the entry says: the caller presented their own credential and the provider refused it, so spending yours would bill you for their authorization failure.
 
 `credential_source` on the admin request row (`provider_entry`, `native_caller`, `fallback`) says which secret paid, one `credential_fallback` event lands on the typed feed per swap, and `sbproxy_ai_key_fallbacks_total{provider,outcome}` counts the same decision for anyone alerting off the scrape rather than off the feed. Full decision path, the `fail_closed` argument, and a runnable walkthrough are in [multi-tenant.md](multi-tenant.md#when-a-tenants-provider-key-is-refused) and [examples/tenant-key-fallback](../examples/tenant-key-fallback/).
+
+### A client that hangs up stops the meter
+
+A non-streaming completion spends nearly all of its wall clock waiting on the provider's response header, and the caller is on the other end of that wait. When the caller leaves first (a `curl --max-time` that fired, a closed browser tab, an agent whose own deadline expired), the gateway drops the provider call instead of paying for a response nobody will read.
+
+The signal is the client's connection closing, and nothing else. There is no deadline here, no "the caller has been quiet for N seconds", and no heuristic about how long a model ought to take: a slow client is still a client, and a slow provider is still worth waiting for. The gateway races the provider call against a one-byte read on the downstream connection and cancels only when that read says the connection is gone.
+
+```mermaid
+flowchart TD
+    A[non-streaming request dispatched to a provider] --> B{downstream connection}
+    B -->|still open, provider answers| C[response relayed<br/>receipt outcome: delivered]
+    B -->|closed before the request<br/>RFC 9112 section 9.6 half-close| C
+    B -->|closes while the provider is generating| D[provider call dropped<br/>connection to the provider closed]
+    D --> E[receipt outcome: client_disconnected<br/>usage: whatever the provider reported, which is none]
+    D --> F[counted on sbproxy_ai_provider_attempts_total<br/>under outcome client_disconnected]
+```
+
+Two shapes of close are deliberately treated differently, because at the TCP layer they look identical and only their timing separates them:
+
+- **A client that half-closed on its way in.** RFC 9112 section 9.6 lets a client shut its write side down after sending a request and go on reading the response. That FIN is already queued before the gateway has picked a provider, and it is not a departure. The request is dispatched and served exactly as it always was.
+- **A client whose connection goes while the model is generating.** That is a caller who left, and it is the one that cancels.
+
+What this covers, stated narrowly so the gap is visible: the wait for the provider's response header on the sequential non-streaming dispatch path. A streaming response already learns the caller left, from its own per-chunk write failing. A hedged (`strategy: race`) dispatch and a confidence `cascade` resolve on their own paths and are not raced against the client. And a caller who leaves after the response header has arrived is past the cancellation window; there is nothing left to cancel, because the generation is already paid for.
+
+Operators see the cancellation three ways: on `sbproxy_ai_provider_attempts_total{outcome="client_disconnected"}`, on the request's span as `error.type=client_disconnected`, and on the consumption receipt, whose outcome is `client_disconnected` and whose billable treatment is whatever the origin's `billable:` table says for that outcome. See [metering.md](metering.md#billable-the-outcome-table) for the table.
 
 ## Shadow eval
 

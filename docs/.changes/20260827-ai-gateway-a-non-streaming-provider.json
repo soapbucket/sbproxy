@@ -1,0 +1,4 @@
+{
+  "type": "added",
+  "message": "AI gateway: a non-streaming provider call is now cancelled when the client disconnects while the model is still generating, instead of running the generation to completion and billing for a response nobody received. The signal is the downstream connection closing, never a timer, and a client that half-closed its write side on the way in (RFC 9112 section 9.6) is still served. The cancelled call settles on the `client_disconnected` receipt outcome and is counted on `sbproxy_ai_provider_attempts_total{outcome=\"client_disconnected\"}`."
+}
