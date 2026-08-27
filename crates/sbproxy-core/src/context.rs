@@ -935,12 +935,28 @@ pub struct RequestContext {
 
     // --- Wave 5 day-6 Item 1: CEL header transform mutations ---
     /// Header mutations produced by the `headers:` array on a `type:
-    /// cel` transform. The static action and `response_filter` drain
-    /// this and stamp the operations onto the outgoing response so
-    /// operators can set / append / remove response headers from a
-    /// CEL expression. Empty by default; populated by the transform
-    /// pipeline at `apply_transform_with_ctx` time.
+    /// cel` transform. The `static`, `mock`, and `plugin` actions drain
+    /// this and stamp the operations onto the response they are about
+    /// to write, so operators can set / append / remove response
+    /// headers from a CEL expression. Empty by default; populated by
+    /// the transform pipeline at `apply_transform_with_ctx` time, and
+    /// only for an action that will drain it -- a streaming response
+    /// evaluates the same rules in `response_filter`, where the header
+    /// map still exists, and never stashes here (WOR-2630).
     pub cel_response_header_mutations: Vec<CelHeaderMutation>,
+    /// Whether the action dispatched for this request buffers its
+    /// whole response before writing any of it, so a `cel` transform's
+    /// `headers:` rules still own the header map when the body-buffer
+    /// phase runs and [`Self::cel_response_header_mutations`] will be
+    /// drained.
+    ///
+    /// Stamped by `handle_action` from the action it actually
+    /// dispatches, which a matched forward rule can change out from
+    /// under the origin's own action. `false` until then, which is the
+    /// streaming answer: an action that streams evaluated the same
+    /// rules in `response_filter`, where the header map still existed
+    /// (WOR-2630).
+    pub response_buffered_before_headers: bool,
 
     // --- WOR-168 transform-error attribution ---
     /// Set by the body-buffer transform pipeline when a transform
@@ -1944,6 +1960,7 @@ impl RequestContext {
             openapi_deprecation: None,
             trust_headers: None,
             callback_inject_headers: None,
+            response_buffered_before_headers: false,
             cel_response_header_mutations: Vec::new(),
             transform_error_attribution: None,
             crawl_challenge: None,
