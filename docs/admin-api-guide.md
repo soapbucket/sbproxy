@@ -1,6 +1,6 @@
 # Admin API guide
 
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-27*
 
 This is the task-oriented "how do I call it" guide to the embedded admin
 server: enabling it, authenticating, and a curl cookbook for the routes
@@ -160,6 +160,35 @@ somewhere to call *to get* a session). The signing key for sessions is
 random per process: restarting the proxy invalidates every open
 session, by design, since this is an admin surface, not a customer
 login.
+
+### What a refused request gets back
+
+A request with no credentials, or the wrong ones, answers `401` with
+`{"error":"Unauthorized"}`. For a script that 401 also carries
+`WWW-Authenticate: Basic realm="sbproxy admin"`, the RFC 7235 challenge
+naming the scheme to retry with, so `curl -u` and `sbproxy admin` behave
+the way an HTTP client expects.
+
+A request from a browser's own script client gets the same 401 without
+that header. Two markers identify one, and either is enough:
+`X-Requested-With: XMLHttpRequest`, which the console's fetch layer
+sends on every admin call, and `Sec-Fetch-Dest: empty`, which browsers
+stamp on `fetch`, `XMLHttpRequest`, and `EventSource` requests (a
+browser navigating to an admin URL sends `document` instead, and still
+gets the challenge). The reason is that the challenge header has one
+effect in a browser, which is to open the native credential dialog, and
+that dialog is not this console's sign-in page. Cancelling it leaves the
+console wedged until a hard reload, and typing the top-level password
+into it caches the credential for the whole origin, where the browser
+re-sends it on every later request and quietly re-establishes a session
+nobody signed in for. The console reads the bare 401 and routes to its
+own login form.
+
+Both markers are only a hint about the caller. They choose one response
+header and nothing else: credentials resolve identically with or without
+them, so a marked request carrying no password is refused exactly like
+an unmarked one. Send them from a script if you would rather not read
+challenges, or leave them off and keep the RFC behavior.
 
 ## Roles: `admin` vs. `read_only`
 

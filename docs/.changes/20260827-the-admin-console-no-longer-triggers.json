@@ -1,0 +1,4 @@
+{
+  "type": "fixed",
+  "message": "**The admin console no longer triggers the browser's native credential dialog when a session expires.** A `401` answering a request the console made for itself now comes back without `WWW-Authenticate: Basic`, so a lapsed session drops the operator on the console's own sign-in page instead of behind a popup whose Cancel button left the page unusable until a hard reload. The server tells the console's calls apart by `X-Requested-With: XMLHttpRequest`, which its fetch layer sends on every admin call, or `Sec-Fetch-Dest: empty`, which browsers stamp on `fetch` and `EventSource` requests; both only choose that one response header, and neither changes how credentials are resolved. Scripted and CLI callers send neither and still get the RFC 7235 challenge, so `curl -u` and `sbproxy admin` are unaffected. See [docs/admin-api-guide.md](docs/admin-api-guide.md)."
+}
