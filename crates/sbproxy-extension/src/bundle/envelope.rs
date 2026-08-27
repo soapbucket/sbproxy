@@ -241,7 +241,7 @@ pub(crate) fn resolve_declared_secrets(
         // The provenance test is by value rather than by presence so it
         // stays correct if `apply_schema_defaults` ever learns to
         // rewrite a property the operator did set.
-        if operator_authored.get(name) != Some(&Value::String(text.clone())) {
+        if operator_authored.get(name).and_then(Value::as_str) != Some(text.as_str()) {
             // The confined checker owns the message, so a bundle
             // manifest and a config fragment refuse the same way: the
             // document and the key are named, the value never is.
