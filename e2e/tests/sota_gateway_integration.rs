@@ -819,6 +819,59 @@ impl Gateway {
             self.proxy.stderr_contents()
         )
     }
+
+    /// The retained content sample for the most recent request made
+    /// under `key_id`, or `None` when nothing was retained.
+    fn retained_pair(&self, key_id: &str) -> Option<Value> {
+        let mut request_id = None;
+        for _ in 0..60 {
+            let rows: Vec<Value> = self
+                .admin_json(&format!("/api/requests?api_key_id={key_id}"))
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            if let Some(id) = rows.first().and_then(|row| row["request_id"].as_str()) {
+                request_id = Some(id.to_string());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let request_id = request_id?;
+        // The shadow halves land from their own tasks, so poll until
+        // both are attached or the window closes.
+        let mut last = None;
+        for _ in 0..60 {
+            let response = reqwest::blocking::Client::new()
+                .get(format!(
+                    "http://127.0.0.1:{}/api/requests/{request_id}/content",
+                    self.admin_port
+                ))
+                .basic_auth("admin", Some("secret"))
+                .send()
+                .expect("content fetch");
+            if response.status().as_u16() != 200 {
+                return None;
+            }
+            let body: Value = response.json().unwrap_or(Value::Null);
+            let shadows = body["shadow_responses"].as_array().map_or(0, Vec::len);
+            last = Some(body);
+            if shadows >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        last
+    }
+
+    /// A GET served by the proxy itself rather than the admin server,
+    /// for the LiteLLM-parity read-only endpoints.
+    fn admin_json_via_proxy(&self, path: &str) -> Value {
+        self.proxy
+            .get(path, "sota.local")
+            .expect("proxy-served management endpoint")
+            .json()
+            .expect("management json")
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1746,59 +1799,4 @@ fn sbproxy_connect_configures_a_client_and_disconnect_restores_it_byte_for_byte(
             .exists(),
         "a hand edit made after connecting survives the removal"
     );
-}
-
-impl Gateway {
-    /// The retained content sample for the most recent request made
-    /// under `key_id`, or `None` when nothing was retained.
-    fn retained_pair(&self, key_id: &str) -> Option<Value> {
-        let mut request_id = None;
-        for _ in 0..60 {
-            let rows: Vec<Value> = self
-                .admin_json(&format!("/api/requests?api_key_id={key_id}"))
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            if let Some(id) = rows.first().and_then(|row| row["request_id"].as_str()) {
-                request_id = Some(id.to_string());
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        let request_id = request_id?;
-        // The shadow halves land from their own tasks, so poll until
-        // both are attached or the window closes.
-        let mut last = None;
-        for _ in 0..60 {
-            let response = reqwest::blocking::Client::new()
-                .get(format!(
-                    "http://127.0.0.1:{}/api/requests/{request_id}/content",
-                    self.admin_port
-                ))
-                .basic_auth("admin", Some("secret"))
-                .send()
-                .expect("content fetch");
-            if response.status().as_u16() != 200 {
-                return None;
-            }
-            let body: Value = response.json().unwrap_or(Value::Null);
-            let shadows = body["shadow_responses"].as_array().map_or(0, Vec::len);
-            last = Some(body);
-            if shadows >= 2 {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        last
-    }
-
-    /// A GET served by the proxy itself rather than the admin server,
-    /// for the LiteLLM-parity read-only endpoints.
-    fn admin_json_via_proxy(&self, path: &str) -> Value {
-        self.proxy
-            .get(path, "sota.local")
-            .expect("proxy-served management endpoint")
-            .json()
-            .expect("management json")
-    }
 }

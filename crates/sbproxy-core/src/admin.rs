@@ -416,6 +416,24 @@ pub struct RequestLogEntry {
     /// Completion tokens, when reported.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_out: Option<u64>,
+    /// Provider prompt-cache **read** tokens, when the provider
+    /// reported them (OpenAI's `prompt_tokens_details.cached_tokens`,
+    /// Anthropic's `cache_read_input_tokens`).
+    ///
+    /// WOR-2658: a subset of `tokens_in`, not an addition to it, and on
+    /// this row because this is the row that already names the provider,
+    /// the model, and the credential that paid. Before this the counts
+    /// existed only on the request-event envelope and the attribution
+    /// metric, so the one record an operator reads per request could
+    /// show a bill that dropped without showing the cache hit that
+    /// explains it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_cached: Option<u64>,
+    /// Provider prompt-cache **write** tokens (Anthropic's
+    /// `cache_creation_input_tokens`). Absent for providers that report
+    /// only cache reads. Also a subset of `tokens_in`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_cache_write: Option<u64>,
     /// Derived AI cost in micro-USD (WOR-1874).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_usd_micros: Option<u64>,
@@ -4440,6 +4458,10 @@ const EXPORT_CSV_COLUMNS: [&str; 37] = [
     // importer keyed on column position keeps working and a new one
     // reads which credential paid for the row.
     "credential_source",
+    // WOR-2658, appended after it for the same reason. Both are subsets
+    // of `tokens_in` rather than additions to it.
+    "tokens_cached",
+    "tokens_cache_write",
 ];
 
 /// One row's value in `column`, as text.
@@ -4475,6 +4497,8 @@ fn export_csv_cell(entry: &RequestLogEntry, column: &str) -> String {
         "model" => text(&entry.model),
         "tokens_in" => number(&entry.tokens_in),
         "tokens_out" => number(&entry.tokens_out),
+        "tokens_cached" => number(&entry.tokens_cached),
+        "tokens_cache_write" => number(&entry.tokens_cache_write),
         "cost_usd_micros" => number(&entry.cost_usd_micros),
         "guardrail_category" => text(&entry.guardrail_category),
         "guardrail_action" => text(&entry.guardrail_action),
@@ -8959,16 +8983,24 @@ mod tests {
         // panics if the name is missing, and indexing panics if the row
         // is short, which is the pair this asserts.
         assert_eq!(header.len(), row.len(), "{header:?} vs {row:?}");
+        // The three columns appended since the original contract, in
+        // append order. An importer keyed on position keeps working
+        // because nothing before them moved.
         assert_eq!(
-            col("credential_source"),
-            header.len() - 1,
-            "credential_source is the appended column"
+            [
+                col("credential_source"),
+                col("tokens_cached"),
+                col("tokens_cache_write"),
+            ],
+            [header.len() - 3, header.len() - 2, header.len() - 1],
+            "the appended columns keep their append order: {header:?}"
         );
-        assert_eq!(
-            row[col("credential_source")],
-            "",
-            "a non-AI row leaves it empty rather than dropping the field"
-        );
+        for column in ["credential_source", "tokens_cached", "tokens_cache_write"] {
+            assert_eq!(
+                row[col(column)], "",
+                "a non-AI row leaves {column} empty rather than dropping the field"
+            );
+        }
     }
 
     #[test]

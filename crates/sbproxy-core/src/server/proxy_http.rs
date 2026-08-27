@@ -8432,6 +8432,11 @@ impl ProxyHttp for SbProxy {
                 model: ctx.ai_model.clone(),
                 tokens_in: ctx.ai_tokens_in,
                 tokens_out: ctx.ai_tokens_out,
+                // WOR-2658: both are subsets of `tokens_in` rather than
+                // additions to it, so a reader summing the row does not
+                // double-count a cached prefix.
+                tokens_cached: ctx.ai_tokens_cached,
+                tokens_cache_write: ctx.ai_tokens_cache_write,
                 cost_usd_micros: ctx.ai_cost_usd_micros,
                 guardrail_category: ctx.ai_guardrail_category.clone(),
                 guardrail_action: ctx.ai_guardrail_action.clone(),
