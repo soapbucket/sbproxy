@@ -96,6 +96,18 @@ impl OpenAiFixture {
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // The listener is non-blocking so the accept loop can
+                        // poll `thread_stop`. On BSD and macOS an accepted
+                        // socket inherits that flag, which makes the read
+                        // timeout below a no-op: every `read` returns
+                        // `WouldBlock` at once, the reader gives up on a
+                        // partial request, and the fixture answers a request
+                        // it never finished reading while the proxy is still
+                        // writing one. Clear it, the way every other
+                        // non-blocking-listener fixture in this workspace
+                        // does (`config_authority_cli`, `models_lifecycle_cli`,
+                        // `group_b_startup`).
+                        let _ = stream.set_nonblocking(false);
                         let _ = stream.set_read_timeout(Some(FIXTURE_IO_TIMEOUT));
                         let request = read_bounded_http_request(&mut stream).unwrap_or_default();
                         if contains_bytes(&request, PROMPT_MARKER.as_bytes()) {
