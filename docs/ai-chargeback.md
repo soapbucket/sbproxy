@@ -1,5 +1,5 @@
 # AI chargeback and spend forecasting
-*Last modified: 2026-08-25*
+*Last modified: 2026-08-26*
 
 `sbproxy_ai::billing` (WOR-2672) is per-event usage attribution,
 chargeback rollups, unified bill generation, and spend forecasting for
@@ -14,14 +14,27 @@ the same trait `JsonlFileSink`, `WebhookSink`, `LangfuseSink`, and
 gateway call's `LlmUsageEvent` reaches it automatically, the same way it
 already reaches whichever other sinks are configured.
 
-Turn it on from config alone, the same way as the other sinks:
+Turn it on from config alone, the same way as the other sinks.
+`usage_sinks` is a field of the `ai_proxy` action, so it belongs under
+the origin that serves the AI traffic being attributed, not at the top
+level of `sb.yml`:
 
 ```yaml
-usage_sinks:
-  - type: chargeback
-    max_entries: 10000
-    max_workspaces: 1000
-    max_teams: 1000
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          provider_type: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+          models: [gpt-4o-mini]
+      usage_sinks:
+        - type: chargeback
+          max_entries: 10000
+          max_workspaces: 1000
+          max_teams: 1000
 ```
 
 One chargeback sink is allowed per `ai_proxy` origin; config load rejects a

@@ -1,6 +1,6 @@
 # Live AI evaluation
 
-*Last modified: 2026-08-25*
+*Last modified: 2026-08-26*
 
 Register one immutable dataset version and evaluate already-recorded model
 responses through SBproxy's authenticated, scoped, bounded control plane. The
@@ -37,6 +37,15 @@ sbproxy ai evaluate \
   --min-bytes 1 \
   --max-bytes 512
 ```
+
+The run reports `expected_match_rate: 1.0` and `metric_pass_rate: 0.75`.
+Both recorded responses match their dataset entry's `expected_output`
+exactly, which is the first number. The second is deliberately not 1.0:
+metrics are scored per response, and `--required-keyword Settings` matches
+only the second response ("Open Settings, then Security.") while
+`--min-bytes 1 --max-bytes 512` matches both, so three of the four checks
+pass. Use a keyword every response carries when you want a clean sweep;
+this example keeps the split so the per-response scoring is visible.
 
 The result contains aggregate counts and scores, never dataset entries or
 recorded responses. A duplicate `(name, version)` is refused; evaluation always

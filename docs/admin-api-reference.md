@@ -1,6 +1,6 @@
 # Admin API reference
 
-*Last modified: 2026-08-25*
+*Last modified: 2026-08-26*
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
@@ -1679,13 +1679,13 @@ gateway has reached (or attempted to reach) since process start, with its
 most recent authorization outcome. Both `admin` and `read_only` operators
 may call the route.
 
-Every one of the twelve wired egress purposes below goes through the same
-authorizer and lands in the same inventory and, on denial, the same
+Every one of the thirteen wired egress purposes below goes through the
+same authorizer and lands in the same inventory and, on denial, the same
 event:
 
 ```mermaid
 flowchart TD
-    A["Egress call site: AI provider, judge, classifier hook, MCP upstream,\nOpenAPI tool, token exchange, webhook, usage sink,\nmodel/engine artifact, bundle hook, telemetry"] --> B[EgressAuthorizer authorizes the destination]
+    A["Egress call site: AI provider, judge, agent orchestration,\nclassifier hook, MCP upstream, OpenAPI tool, token exchange,\nwebhook, usage sink, model/engine artifact, bundle hook, telemetry"] --> B[EgressAuthorizer authorizes the destination]
     B -->|no authorizer armed for this purpose| C[ungated]
     B -->|authorizer armed| D{Destination allowed?}
     D -->|yes| E[allowed]
@@ -1737,22 +1737,33 @@ The inventory is process-lifetime and in-memory: it clears on restart and
 is capped at 1,024 tracked destinations, after which a new destination
 stops being tracked while every already-tracked one keeps updating. Every
 wired egress purpose writes here: AI providers, the dual-LLM quarantine
-judge, stock classifier hooks, OpenAPI-backed MCP tools, token exchange,
-webhooks, usage sinks, model and engine artifact downloads, extension
-bundle hooks, and the OTLP telemetry exporters. `mcp_upstream` covers the
-base MCP connect for a plain `type: mcp` federated server, gated and
-DNS-pinned at the dial.
+judge, agent endpoints invoked by AI toolkit workflows, stock classifier
+hooks, OpenAPI-backed MCP tools, token exchange, webhooks, usage sinks,
+model and engine artifact downloads, extension bundle hooks, and the OTLP
+telemetry exporters. `mcp_upstream` covers the base MCP connect for a
+plain `type: mcp` federated server, gated and DNS-pinned at the dial.
+
+The thirteen purpose labels, exactly as they appear in
+`endpoints[].purpose`, in `sbproxy_egress_refused_total{purpose}`, and in
+the `egress_refused` event, are `ai_provider`, `ai_judge`,
+`agent_orchestration`, `classifier_hook`, `mcp_upstream`, `openapi_tool`,
+`token_exchange`, `webhook`, `usage_sink`, `model_artifact`,
+`engine_artifact`, `bundle_hook`, and `telemetry`.
 
 The top-level `egress:` section (see
-[Egress allowlists](configuration.md#egress-allowlists)) arms seven of
-the purposes above through six sub-blocks: `ai_providers` (AI
-providers), `classifier_hooks` (stock intent and provider-quality
-classifier RPCs), `usage_sinks` (usage sinks and webhooks, one allowlist
-for both, including the `events:` webhook sink), `model_artifacts`,
-`token_exchange` (both the non-MCP outbound-credential resolver and the
-MCP run-as-user token exchange), and `telemetry`. Until a sub-block sets
-`mode: deny_by_default`, its purpose stays `ungated`: reached, but
-nothing was ever denied because nothing was armed.
+[Egress allowlists](configuration.md#egress-allowlists)) arms eight of
+the purposes above through seven sub-blocks: `ai_providers` (AI
+providers), `agent_orchestration` (agent endpoints invoked by configured
+AI toolkit workflows), `classifier_hooks` (stock intent and
+provider-quality classifier RPCs), `usage_sinks` (usage sinks and
+webhooks, one allowlist for both, including the `events:` webhook sink),
+`model_artifacts`, `token_exchange` (both the non-MCP
+outbound-credential resolver and the MCP run-as-user token exchange),
+and `telemetry`. Until a sub-block sets `mode: deny_by_default`, its
+purpose stays `ungated`: reached, but nothing was ever denied because
+nothing was armed. `agent_orchestration` is the exception in the other
+direction: a configured agent fails closed unless that sub-block arms it
+with `mode: deny_by_default`.
 
 Three more purposes arm outside that section, per-tool or per-action:
 MCP upstream connects and OpenAPI-backed MCP tools take a per-server
@@ -1761,7 +1772,9 @@ dual-LLM quarantine judge takes a per-action `egress:` block. A
 per-server `egress:` block does not reach the token-exchange purpose;
 that one is armed by `egress.token_exchange` and nothing else.
 Extension bundle hooks are armed automatically from the bundle's own
-outbound grant and never appear as `ungated`.
+outbound grant and never appear as `ungated`. `engine_artifact` is the
+one purpose no config knob arms today: engine downloads are stamped into
+the inventory and always report `ungated`.
 
 No purpose lets its HTTP client follow a redirect on its own. Each `3xx`
 `Location` is re-authorized from scratch, against the same purpose, with
