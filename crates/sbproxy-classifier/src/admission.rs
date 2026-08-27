@@ -358,6 +358,9 @@ impl BlockingWorkExecutor {
         &self.admission
     }
 
+    // `tonic::Status` is 176 bytes, over `result_large_err`'s threshold; see the
+    // note on `check_text_bytes` for why this takes the allow, not the reshape.
+    #[allow(clippy::result_large_err)]
     pub async fn run_blocking<F, T>(&self, command: &'static str, work: F) -> Result<T, Status>
     where
         F: FnOnce() -> anyhow::Result<T> + Send + 'static,
@@ -414,6 +417,9 @@ impl Drop for ActiveWorkerGuard {
     }
 }
 
+// `tonic::Status` is 176 bytes, over `result_large_err`'s threshold; see the
+// note on `check_text_bytes` for why this takes the allow, not the reshape.
+#[allow(clippy::result_large_err)]
 async fn sanitize_blocking_result<T>(
     command: &'static str,
     expires: Instant,
@@ -462,6 +468,9 @@ impl Admission {
         self
     }
 
+    // `tonic::Status` is 176 bytes, over `result_large_err`'s threshold; see the
+    // note on `check_text_bytes` for why this takes the allow, not the reshape.
+    #[allow(clippy::result_large_err)]
     pub async fn acquire(&self, command: &'static str) -> Result<Lease, Status> {
         let expires = Instant::now()
             .checked_add(self.deadline)
@@ -517,6 +526,9 @@ impl Admission {
         })
     }
 
+    // `tonic::Status` is 176 bytes, over `result_large_err`'s threshold; see the
+    // note on `check_text_bytes` for why this takes the allow, not the reshape.
+    #[allow(clippy::result_large_err)]
     pub async fn run_blocking<F, T>(&self, command: &'static str, work: F) -> Result<T, Status>
     where
         F: FnOnce() -> anyhow::Result<T> + Send + 'static,
@@ -531,6 +543,9 @@ impl Admission {
         sanitize_blocking_result(command, expires, worker).await
     }
 
+    // `tonic::Status` is 176 bytes, over `result_large_err`'s threshold; see the
+    // note on `check_text_bytes` for why this takes the allow, not the reshape.
+    #[allow(clippy::result_large_err)]
     pub async fn run_with_lease<F, T>(
         &self,
         command: &'static str,

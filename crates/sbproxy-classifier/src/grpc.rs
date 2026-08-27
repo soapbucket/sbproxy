@@ -330,6 +330,9 @@ impl GrpcState {
         }
     }
 
+    // `tonic::Status` is 176 bytes, over `result_large_err`'s threshold; see the
+    // note on `check_text_bytes` for why this takes the allow, not the reshape.
+    #[allow(clippy::result_large_err)]
     async fn run_blocking<F, T>(&self, command: &'static str, work: F) -> Result<T, Status>
     where
         F: FnOnce() -> anyhow::Result<T> + Send + 'static,
@@ -714,6 +717,9 @@ impl ClassifierService for ClassifierHandler {
 /// to detect a rule split across two chunks. After a match, `safe` remains
 /// false and `blocked` becomes a one-shot transition signal, though `reason`
 /// may remain populated on later unsafe messages.
+// `tonic::Status` is 176 bytes, over `result_large_err`'s threshold; see the
+// note on `check_text_bytes` for why this takes the allow, not the reshape.
+#[allow(clippy::result_large_err)]
 async fn run_stream_safety<S>(
     mut inbound: S,
     tx: tokio::sync::mpsc::Sender<Result<SafetyVerdict, Status>>,
@@ -2373,6 +2379,9 @@ impl GrpcRuntime {
         }
     }
 
+    // `tonic::Status` is 176 bytes, over `result_large_err`'s threshold; see the
+    // note on `check_text_bytes` for why this takes the allow, not the reshape.
+    #[allow(clippy::result_large_err)]
     async fn with_request_budget<F, T>(
         &self,
         command: crate::metrics::Command,
@@ -5886,7 +5895,7 @@ mod tests {
                 let payload = &bytes[parsed + 9..parsed + 9 + length];
                 if frame_type == 0x04 && stream_id == 0 && flags & 0x01 == 0 {
                     assert_eq!(payload.len() % 6, 0, "malformed server SETTINGS frame");
-                    for setting in payload.chunks_exact(6) {
+                    for setting in payload.as_chunks::<6>().0 {
                         let id = u16::from_be_bytes([setting[0], setting[1]]);
                         let value =
                             u32::from_be_bytes([setting[2], setting[3], setting[4], setting[5]]);
