@@ -1,5 +1,5 @@
 # OpenAPI Emission
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-27*
 
 SBproxy documents and governs your API. It does not just proxy it.
 
@@ -330,16 +330,40 @@ Supported `in:` values are `path`, `query`, and `header`. Cookie parameters are 
 
 ## Auth scheme mappings
 
-Auth blocks turn into OpenAPI `securitySchemes` and a `security` requirement attached to each operation. The mapping covers every auth type the gateway implements:
+Auth blocks turn into OpenAPI `securitySchemes` and a `security` requirement attached to each operation. Every auth type the gateway implements has a mapper of its own:
 
-| Auth type           | OpenAPI shape                                                      |
-|---------------------|--------------------------------------------------------------------|
-| `api_keys`          | `apiKey` in header (uses `header:` from config)                    |
-| `basic_auth`        | `http` scheme `basic`                                              |
-| `oauth_client_creds`| `oauth2` with `clientCredentials` flow + `tokenUrl`                |
-| anything else (`bearer`, `jwt`, `digest`, `kya`, `cap`, `forward_auth`, ...) | Generic `apiKey` placeholder + `x-sbproxy-auth-type` extension naming the original type |
+| Auth type | OpenAPI shape |
+|---|---|
+| `api_key` | `apiKey` in header, named by `header_name`. An opt-in `query_param` rides `x-sbproxy-api-key-query-param`, because OpenAPI 3.0 cannot express "either of these" |
+| `basic_auth`, `ldap_auth` | `http` scheme `basic` |
+| `digest` | `http` scheme `digest` |
+| `bearer` | `http` scheme `bearer`, with `x-sbproxy-require-dpop` when the origin demands an RFC 9449 proof |
+| `jwt` | `http` scheme `bearer`, `bearerFormat: JWT`, plus the required audience and any DPoP or mTLS binding as extensions |
+| `hmac_auth`, `bot_auth` | `http` scheme `signature` (RFC 9421) |
+| `cap` | `http` scheme `bearer`, `bearerFormat: cap` |
+| `oidc` | `openIdConnect`, pointing at the pinned issuer's discovery document |
+| `forward_auth` | `apiKey` in the `Authorization` header, with a description saying the gateway does not know what the authorization service requires |
+| `ext_authz` | `apiKey` in the first allowlisted forwarded header; every forwarded header name rides `x-sbproxy-forwarded-headers` |
+| `oauth_introspection` | `http` scheme `bearer`, plus `x-sbproxy-required-scopes` |
+| `kya` | `apiKey` in `X-Skyfire-KYA`, plus the trusted issuers and any spend floor |
+| `noop` | No scheme and no requirement. An origin that challenges nobody must not tell a client to send a credential |
+| anything else | Generic `apiKey` placeholder + `x-sbproxy-auth-type` extension naming the original type |
 
 Custom auth types can register their own mappers via the `AuthSchemeMapper` registry exposed from the OpenAPI emission engine.
+
+### What never reaches this document
+
+`/.well-known/openapi.json` is served unauthenticated, so an auth mapper publishes only what a caller cannot use the API without. A header name, a required scope, and a trusted KYA issuer qualify. A key, a secret, a client id, and the address of an internal service do not, and no mapper reads one. That rule is enforced by a test that renders a document from an auth block carrying all of them and greps the result.
+
+It is worth saying because the shape it rules out is the tempting one: an `oauth_introspection` block knows its introspection endpoint and an `ext_authz` block knows its authorization service, and publishing either would tell an attacker the address of a service that answers questions about tokens. Neither is emitted.
+
+### Two corrections in this table (WOR-2675)
+
+Until WOR-2675 this table listed three mappers, two of which named types the gateway does not implement.
+
+`api_keys` is not the auth type; `api_key` is, and its field is `header_name` rather than `header`. Every origin using the shipped provider therefore fell through to the generic placeholder and published a document telling clients to send `Authorization` when the origin wanted `X-Api-Key`. Both spellings are accepted now, and both fields are read, so a plugin registered under the old name keeps working.
+
+`oauth_client_creds` names no inbound provider anywhere in this workspace. The outbound client-credentials grant is `outbound_credential`, which the gateway uses to get a token for an upstream and which never appears in an origin's `authentication:` block. The mapper arm is kept so a linked plugin implementing an inbound type under that name still emits an `oauth2` flow object rather than the placeholder.
 
 ## Limitations
 

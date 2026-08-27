@@ -1,6 +1,6 @@
 # OpenAPI 3.0 emission
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-27*
 
 The gateway publishes an OpenAPI 3.0 document describing the routes it exposes, derived from the live config. Three things land together: rich path matchers (`template` for `/users/{id}`, `regex` as the escape hatch, plus `prefix` and `exact`, with per-segment regex constraints supported inline as `{id:[0-9]+}`); OpenAPI Parameter Object declarations on each forward rule that mirror the spec verbatim and pass through directly into `parameters[]`; and two emit surfaces, one admin-only at `GET /api/openapi.{json,yaml}` (basic auth, all hosts) and one per-host at `GET /.well-known/openapi.{json,yaml}` opt-in via `expose_openapi: true` on the origin. Prefix matchers carry the `x-sbproxy-prefix-match` extension because OpenAPI has no native concept of "starts-with"; whole-path regex matchers carry `x-sbproxy-regex-path` and named captures become path parameters.
 
@@ -56,6 +56,27 @@ curl -s -H 'Host: api.localhost' \
      http://127.0.0.1:8080/users/42/posts/abc | jq .url
 ```
 
+```bash
+# The second host carries an `authentication:` block, so its document
+# publishes the scheme a caller has to satisfy: the header name, and
+# nothing else from the auth config.
+curl -s -H 'Host: secure.localhost' \
+     http://127.0.0.1:8080/.well-known/openapi.json \
+  | jq '.components.securitySchemes'
+# {
+#   "secure-localhost_auth": {
+#     "type": "apiKey",
+#     "in": "header",
+#     "name": "X-Acme-Key",
+#     "x-sbproxy-auth-type": "api_key"
+#   }
+# }
+```
+
+The keys themselves are not in there, and nothing else in this document
+is either: `/.well-known/openapi.json` is served unauthenticated, so a
+mapper publishes only what a client cannot call the API without.
+
 ## What this exercises
 
 - `expose_openapi: true` per-origin opt-in for `/.well-known/openapi.{json,yaml}`
@@ -64,6 +85,7 @@ curl -s -H 'Host: api.localhost' \
 - Catch-all matchers (`template: /static/{*rest}`) and whole-path regex (`regex: ^/v(?P<version>[0-9]+)/items`)
 - Parameter Object declarations on forward rules passed through verbatim into the emitted spec
 - Vendor extensions `x-sbproxy-prefix-match` and `x-sbproxy-regex-path` for non-standard matcher shapes
+- `securitySchemes` emission from an `authentication:` block, on the `secure.localhost` host
 
 ## See also
 

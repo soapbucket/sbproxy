@@ -131,3 +131,34 @@ origins:
           action:
             type: proxy
             url: https://test.sbproxy.dev/anything
+
+  # A second host, to show what an `authentication:` block publishes.
+  # Every auth type the gateway implements maps to a SecurityScheme of
+  # its own; what a mapper emits is only what a caller cannot call the
+  # API without. The document is served unauthenticated, so no key, no
+  # secret, no client id, and no internal service address reaches it.
+  "secure.localhost":
+    expose_openapi: true
+
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    # Emits `{"type": "apiKey", "in": "header", "name": "X-Acme-Key"}`.
+    # The header name is what the caller has to send; the keys
+    # themselves never appear in the document.
+    authentication:
+      type: api_key
+      header_name: X-Acme-Key
+      api_keys:
+        - demo-key-1
+
+    forward_rules:
+      - rules:
+          - path:
+              exact: /reports
+        origin:
+          id: secure-reports
+          action:
+            type: proxy
+            url: https://test.sbproxy.dev/anything
