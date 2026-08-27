@@ -56,7 +56,9 @@
 //! affinity saved. Pricing the tier that was not chosen, and pricing
 //! the cache miss that did not happen, are both counterfactuals nobody
 //! has defined yet, which makes a fourth lane a design decision rather
-//! than an integration fix. No test here pretends otherwise.
+//! than an integration fix. That decision is WOR-2692, which has to
+//! name the counterfactual for each lane before either is built. No
+//! test here pretends otherwise.
 
 use std::collections::HashMap;
 use std::io::{Read as _, Write as _};

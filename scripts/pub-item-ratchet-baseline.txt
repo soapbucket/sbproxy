@@ -764,10 +764,11 @@ The rest are the batch judge's planning API in
 `JudgeSpendSnapshot`, `JudgeBudget`, `JudgePair`, `PairPlan`,
 `JudgePlan`, and `plan_batch`. These have no production caller yet by
 design: the deterministic divergence pre-filter and the hard spend cap
-ship now, and the judge prompt and scoring loop are a scoped follow-up
-recorded in the shadow-eval section of `docs/ai-gateway.md`, which also
-says in so many words that nothing behind the `judge:` key is running
-yet. Narrowing
+ship now, and the judge prompt and scoring loop are a scoped follow-up,
+WOR-2691, which names these twelve items as the delta it is answerable
+for. The shadow-eval section of `docs/ai-gateway.md` carries the same
+scope for an operator, and says in so many words that nothing behind the
+`judge:` key is running yet. Narrowing
 them to pub(crate) was tried and produced eleven `never used` errors
 under `-D warnings`, which is the #757 shape the 2026-08-25 entry above
 describes: an item whose only callers are cfg(test) code is dead code.
