@@ -2431,6 +2431,15 @@ impl CompiledPipeline {
             proxy_wasm_filters.push(proxy_wasm_filter);
             let origin_action_is_mcp = matches!(&action, Action::Mcp(_));
             let origin_action_is_ai_proxy = matches!(&action, Action::AiProxy(_));
+            // Chargeback signals are per-origin, and `AiHandlerConfig` has
+            // no identity of its own: the compiled origin and its AI action
+            // are one binding only here. Stamped before the first request,
+            // because `usage_sinks()` builds its trackers once on first use
+            // and a tracker built unattributed stays that way. The same
+            // hostname the chargeback admin export keys by.
+            if let Action::AiProxy(ai) = &action {
+                ai.config.attribute_origin(origin.hostname.as_str());
+            }
             actions.push(action);
 
             // Compile auth (optional per origin). Route through the
@@ -6019,6 +6028,95 @@ egress:
     /// pre-check all build in validation mode, so a reference the runtime
     /// will refuse must be refused here rather than persisted to `sb.yml`
     /// and discovered by the next boot.
+    // One cell of a chargeback counter family, by label pairs.
+    fn chargeback_counter(name: &str, labels: &[(&str, &str)]) -> f64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.name() == name)
+            .map(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .filter(|metric| {
+                        labels.iter().all(|(key, value)| {
+                            metric
+                                .get_label()
+                                .iter()
+                                .any(|label| label.name() == *key && label.value() == *value)
+                        })
+                    })
+                    .map(|metric| metric.get_counter().value())
+                    .sum()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `AiHandlerConfig` has no identity of its own, and the compiled
+    /// origin is paired with its AI action only here, so the chargeback
+    /// tracker is attributable only if the pipeline stamps the origin at
+    /// build. Without the call every chargeback series in a running proxy
+    /// reads `origin="unattributed"`, which is the one value that cannot
+    /// tell an operator whose billing went wrong.
+    #[test]
+    fn ai_proxy_chargeback_signals_carry_the_compiled_origin() {
+        const ORIGIN: &str = "chargeback-attribution.example";
+        let compiled = sbproxy_config::compile_config(
+            r#"
+origins:
+  chargeback-attribution.example:
+    action:
+      type: ai_proxy
+      usage_sinks:
+        - type: chargeback
+          max_entries: 8
+          max_workspaces: 8
+          max_teams: 8
+      providers:
+        - name: openai
+          api_key: "k"
+"#,
+        )
+        .expect("chargeback fixture config compiles");
+        let pipeline = CompiledPipeline::from_config(compiled).expect("pipeline compiles");
+
+        let sbproxy_modules::Action::AiProxy(ai) = &pipeline.actions[0] else {
+            panic!("the fixture origin compiles to an ai_proxy action");
+        };
+        let tracker = ai
+            .config
+            .usage_sinks()
+            .iter()
+            .find_map(|sink| sink.chargeback_tracker())
+            .expect("the configured chargeback sink is built");
+        assert_eq!(tracker.origin(), ORIGIN);
+
+        let before = chargeback_counter(
+            "sbproxy_ai_chargeback_refusals_total",
+            &[("reason", "invalid_cost"), ("origin", ORIGIN)],
+        );
+        let refused = tracker.try_record(
+            Some("workspace-a"),
+            sbproxy_ai::billing::ChargebackEntry {
+                team: "team-a".to_string(),
+                project: String::new(),
+                provider: "openai".to_string(),
+                model: "gpt-4o-mini".to_string(),
+                tokens: 10,
+                cost: -1.0,
+                timestamp: "2026-08-26T00:00:00Z".to_string(),
+            },
+        );
+        assert!(refused.is_err(), "a negative cost is refused");
+        assert_eq!(
+            chargeback_counter(
+                "sbproxy_ai_chargeback_refusals_total",
+                &[("reason", "invalid_cost"), ("origin", ORIGIN)]
+            ),
+            before + 1.0,
+            "the refusal has to be attributable to the origin that configured the sink"
+        );
+    }
+
     #[test]
     fn toolkit_validation_refuses_an_agent_secret_it_cannot_resolve() {
         let compiled = sbproxy_config::compile_config(&toolkit_agent_config(
