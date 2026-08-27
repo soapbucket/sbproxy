@@ -181,6 +181,32 @@ Attempting a transition the state machine does not allow answers `422`:
 {"error":"cannot approve a registration in state rejected","code":"invalid_transition"}
 ```
 
+### Checking an agent's credential
+
+```bash
+curl -s -u admin:admin -X POST \
+  http://127.0.0.1:9090/admin/agent-registry/registrations/$AGENT_ID/verify \
+  -H 'Content-Type: application/json' -d "{\"client_secret\":\"$SECRET\"}"
+```
+
+```json
+{"authenticated": true}
+```
+
+This is the DCR client-authentication check: it answers whether the secret
+an agent is presenting is the one this registration holds, taking the
+rotation grace window into account. Only an approved registration
+authenticates, because a pending one has not been allowed yet and a
+terminal one has been withdrawn.
+
+A wrong secret, an unapproved registration, a registration in another
+tenant, and an agent id that does not exist all answer
+`{"authenticated": false}`, so the route cannot be used to tell them apart.
+Every call ticks `sbproxy_agent_registry_operations_total{op="verify"}`.
+
+No module on the request path consumes this yet; see
+[What this does not do](#what-this-does-not-do).
+
 ### Rotating a secret
 
 Rotation is the agent's own call, not the operator's, so it authenticates
@@ -373,9 +399,51 @@ logs at `warn` and increments
 `sbproxy_agent_registry_operations_total{op="feed_refresh"}` under the
 matching outcome.
 
+### When the feed is read
+
+At boot, and then on a timer, and whenever an operator POSTs the route
+above.
+
+The timer's interval is derived from `stale_grace_secs` rather than from a
+key of its own, because that value is already the operator's statement of
+how stale a catalog may be: polling at most that often is what makes the
+tolerance mean something. It is clamped to `[60s, 1h]`, and
+`stale_grace_secs: 0` means the publisher's expiry is honored exactly,
+which is a statement about acceptance rather than about polling, so it
+falls back to 300 seconds.
+
 `stale_grace_secs` extends the feed's own `expires_at`. Zero, the default,
 honors the publisher's expiry exactly. An operator who would rather serve a
 day-old catalog than none sets `86400`.
+
+### The catalog on `/readyz`
+
+The registry registers an `agent_catalog` component:
+`not_configured` before any verified catalog has been applied, `degraded`
+once the catalog in memory is past its expiry, and `healthy` otherwise with
+the entry count.
+
+The component named `agent_registry` on the same endpoint is a different
+subsystem, the agent-class resolver, and predates this block. Read
+`agent_catalog` for this one.
+
+### Reload
+
+Every key in `agent_registry` is applied at boot only. The block opens a
+redb file and starts the refresh loop, and there is no rebuild path, so a
+reload that changed it is **refused** with a message naming the key:
+
+```
+proxy.agent_registry changed; restart sbproxy to apply it. That block opens its own
+store or installs a process-global sink at boot and has no rebuild path, so accepting
+the reload would leave the node running the old one
+```
+
+Refusing is the lesser failure. An accepted reload that silently did
+nothing is how an operator ends up watching `/admin/config` serve a rotated
+`bootstrap_keys` entry while every refresh keeps answering `unknown_key`.
+`proxy.notifications` and `request_events` are boot-only for the same
+mechanical reason and are refused the same way.
 
 The verified catalog is written through to the embedded store, and boot
 restores it, so a restart while the publisher's file is missing or stale
@@ -468,7 +536,8 @@ lossy under load the way every `events:` sink is.
 ## What this does not do
 
 It does not fetch. `feed_path` and `key_directory_path` are files you sync;
-SBproxy verifies them and never dials for them.
+SBproxy reads and verifies them at boot and on the refresh timer, and never
+dials for them.
 
 It does not expose an unauthenticated public registration endpoint. RFC 7591
 describes a `POST /register` on the data plane, and this ships the queue on

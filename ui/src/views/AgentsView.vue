@@ -11,6 +11,7 @@
 import { computed, onMounted, ref } from "vue";
 import {
   api,
+  ApiError,
   type AgentCatalogResponse,
   type AgentRegistration,
   type AgentRegistrationState,
@@ -43,9 +44,14 @@ onMounted(refreshAll);
  * A 404 from every route means `proxy.agent_registry` is absent or
  * disabled. That is a configuration state, not a failure, and rendering it
  * as an error is how an operator ends up debugging a working proxy.
+ *
+ * Read off the status the fetch wrapper carries rather than by looking for
+ * "404" in the rendered message: a 500 whose body happens to contain that
+ * string would otherwise render as a configuration state and hide a real
+ * fault.
  */
 const notConfigured = computed(
-  () => !!summary.error.value && String(summary.error.value).includes("404"),
+  () => summary.error.value instanceof ApiError && summary.error.value.status === 404,
 );
 
 const stats = computed<AgentRegistrySummary | null>(() => summary.data.value ?? null);

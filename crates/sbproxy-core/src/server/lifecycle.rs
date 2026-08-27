@@ -191,6 +191,76 @@ fn reconcile_process_secrets(
     )
 }
 
+/// Fingerprints of the three blocks this process owns from boot.
+///
+/// `agent_registry` opens a redb file and starts a refresh loop,
+/// `notifications` opens a redb file and starts a delivery worker, and
+/// `request_events` installs a process-global sink through a set-once slot.
+/// None of the three has a rebuild path, so a reload that changed one would
+/// be accepted and then ignored, which is the failure
+/// `reconcile_process_secrets` already exists to prevent next door.
+static PROCESS_BOOT_ONLY_FINGERPRINTS: std::sync::OnceLock<[String; 3]> =
+    std::sync::OnceLock::new();
+
+/// The three blocks, fingerprinted, in a fixed order.
+fn boot_only_fingerprints(
+    server: &sbproxy_config::types::ProxyServerConfig,
+    request_events: Option<&sbproxy_config::types::RequestEventsConfig>,
+) -> [String; 3] {
+    let of = |value: serde_json::Value| {
+        let serialized = serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string());
+        crate::identity::config_revision(serialized.as_bytes())
+    };
+    [
+        of(serde_json::to_value(&server.agent_registry).unwrap_or(serde_json::Value::Null)),
+        of(serde_json::to_value(&server.notifications).unwrap_or(serde_json::Value::Null)),
+        of(serde_json::to_value(request_events).unwrap_or(serde_json::Value::Null)),
+    ]
+}
+
+/// Record the boot-time shape of the three boot-only blocks.
+fn record_boot_only_fingerprints(
+    server: &sbproxy_config::types::ProxyServerConfig,
+    request_events: Option<&sbproxy_config::types::RequestEventsConfig>,
+) {
+    let _ = PROCESS_BOOT_ONLY_FINGERPRINTS.set(boot_only_fingerprints(server, request_events));
+}
+
+/// Refuse a reload that changes a block this process can only apply at
+/// boot, naming the key that changed.
+///
+/// Refusing is the lesser failure. An accepted reload that silently does
+/// nothing is how an operator ends up reading `/admin/config` serving the
+/// new `bootstrap_keys` while every refresh keeps answering `unknown_key`,
+/// with nothing anywhere connecting the two.
+fn reconcile_boot_only_blocks(
+    server: &sbproxy_config::types::ProxyServerConfig,
+    request_events: Option<&sbproxy_config::types::RequestEventsConfig>,
+) -> anyhow::Result<()> {
+    let candidate = boot_only_fingerprints(server, request_events);
+    let installed = PROCESS_BOOT_ONLY_FINGERPRINTS.get_or_init(|| candidate.clone());
+    if *installed == candidate {
+        return Ok(());
+    }
+    let keys = [
+        "proxy.agent_registry",
+        "proxy.notifications",
+        "request_events",
+    ];
+    let changed: Vec<&str> = keys
+        .iter()
+        .zip(installed.iter().zip(candidate.iter()))
+        .filter(|(_, (before, after))| before != after)
+        .map(|(key, _)| *key)
+        .collect();
+    anyhow::bail!(
+        "{} changed; restart sbproxy to apply it. That block opens its own store or installs a \
+         process-global sink at boot and has no rebuild path, so accepting the reload would \
+         leave the node running the old one",
+        changed.join(" and ")
+    )
+}
+
 /// Restores the previously live AI provider catalog when a reload that
 /// already installed a new one fails before it publishes.
 ///
@@ -729,16 +799,6 @@ fn build_request_event_sink(
     }
 }
 
-/// Build one of the two optional ingest sinks, or `None` when its block is
-/// missing, malformed, or its credential will not resolve.
-///
-/// The credential resolution is fail-soft here and fail-loud in the
-/// `events:` sink next door, and the difference is what a failure costs.
-/// An unresolvable `events.signing_secret` means a SIEM stops verifying
-/// signatures it thinks it is still verifying, which is a security
-/// property quietly turning off. An unresolvable broker token means the
-/// events go to the local log instead of the broker, which is visible in
-/// the log the operator is then reading.
 /// Turn a `nats:` block into a target, or `None` when it will not work.
 ///
 /// Takes the block rather than the whole config so the two destinations do
@@ -1788,6 +1848,7 @@ fn reload_compiled_config_locked(
     // effect. Refuse it here rather than accept a config whose secret
     // backends are silently ignored.
     reconcile_process_secrets(compiled.server.secrets.as_ref())?;
+    reconcile_boot_only_blocks(&compiled.server, compiled.request_events.as_ref())?;
 
     // WOR-2481: the boot-only OTLP trace and metric exporters are never
     // rebuilt on reload (see `arm_egress_gates_from_config`'s doc
@@ -2695,6 +2756,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // calls `run`, so every later reload must present the same block;
     // `reconcile_process_secrets` rejects the ones that do not.
     record_process_secrets_fingerprint(server_config.secrets.as_ref());
+    record_boot_only_fingerprints(&server_config, compiled.request_events.as_ref());
 
     if let Some(metrics_cfg) = server_config.metrics.as_ref() {
         let _ = sbproxy_observe::metrics::init_cardinality_limiter(
@@ -3518,6 +3580,10 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
             admin_state_inner = admin_state_inner.with_prompt_persistence(p);
         }
 
+        let mut agent_registry_refresher: Option<(
+            std::sync::Arc<sbproxy_agent_registry::AgentRegistry>,
+            std::time::Duration,
+        )> = None;
         // WOR-2664: the agent registry. Construction is fail-loud rather
         // than fail-soft, unlike the prompt persistence above: a registry
         // that could not open its store would answer every approval query
@@ -3534,6 +3600,41 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
                 .validate()
                 .map_err(|message| anyhow::anyhow!("{message}"))?;
             let registry = build_agent_registry(registry_cfg)?;
+            // WOR-2664 review: `agent_registry` on /readyz is WOR-1743's
+            // agent-class resolver and has nothing to do with this block, so
+            // the registry's own probe gets a distinct name rather than
+            // making one component answer for two subsystems.
+            {
+                let probe_registry = std::sync::Arc::clone(&registry);
+                admin_state_inner
+                    .health_registry
+                    .register(std::sync::Arc::new(sbproxy_observe::SyntheticProbe::new(
+                        "agent_catalog",
+                        move || {
+                            let catalog = probe_registry.catalog();
+                            if catalog.is_empty() {
+                                (
+                                    sbproxy_observe::ComponentStatus::NotConfigured,
+                                    Some("no verified catalog has been applied".to_string()),
+                                )
+                            } else if catalog.is_expired(chrono::Utc::now()) {
+                                (
+                                    sbproxy_observe::ComponentStatus::Degraded,
+                                    Some("the verified catalog is past its expiry".to_string()),
+                                )
+                            } else {
+                                (
+                                    sbproxy_observe::ComponentStatus::Healthy,
+                                    Some(format!("{} agents", catalog.len())),
+                                )
+                            }
+                        },
+                    )));
+            }
+            agent_registry_refresher = Some((
+                std::sync::Arc::clone(&registry),
+                agent_registry_refresh_interval(registry_cfg),
+            ));
             admin_state_inner = admin_state_inner.with_agent_registry(registry);
         }
 
@@ -3734,6 +3835,22 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
             rt.block_on(async move {
                 if let Some((synth_cfg, state)) = synthetic_driver {
                     crate::synthetic::spawn_loop(synth_cfg, state);
+                }
+                // WOR-2664 review: without this the configured feed was read
+                // only when a human POSTed /admin/agent-registry/refresh, so
+                // every restart served whatever the store had cached and a
+                // republished feed never arrived. Refresh once at boot, then
+                // on the interval the operator's staleness tolerance implies.
+                if let Some((registry, interval)) = agent_registry_refresher {
+                    tokio::spawn(async move {
+                        loop {
+                            // A refusal is already counted and logged at warn
+                            // inside `refresh`, and the previous catalog keeps
+                            // serving, so the loop does not need to react.
+                            let _ = registry.refresh(chrono::Utc::now()).await;
+                            tokio::time::sleep(interval).await;
+                        }
+                    });
                 }
                 // The admin server's listener task lives forever;
                 // run it inline on this dedicated thread.
@@ -6986,6 +7103,123 @@ mod at_rest_posture_tests {
 /// in this crate. The builder is where every decision is made; the
 /// installer only hands its result to the setter.
 #[cfg(test)]
+mod boot_only_block_tests {
+    use super::*;
+
+    use sbproxy_config::types::{
+        AgentRegistryConfig, NotificationsConfig, ProxyServerConfig, RequestEventSinkKind,
+        RequestEventsConfig,
+    };
+
+    fn server(agent_registry: Option<AgentRegistryConfig>) -> ProxyServerConfig {
+        ProxyServerConfig {
+            agent_registry,
+            ..Default::default()
+        }
+    }
+
+    /// WOR-2664/2669/2674 review: all three blocks open a store or install
+    /// a process-global at boot and none has a rebuild path, so a reload
+    /// that changed one used to be accepted and then ignored. An operator
+    /// adding a rotated `bootstrap_keys` entry would see `/admin/config`
+    /// serve it back while every refresh kept answering `unknown_key`, with
+    /// nothing connecting the two.
+    #[test]
+    fn a_reload_that_changes_a_boot_only_block_is_refused_by_name() {
+        let before = server(Some(AgentRegistryConfig {
+            enabled: true,
+            store_path: "/tmp/a.redb".into(),
+            ..Default::default()
+        }));
+        let after = server(Some(AgentRegistryConfig {
+            enabled: true,
+            store_path: "/tmp/b.redb".into(),
+            ..Default::default()
+        }));
+
+        // Same shape reconciles clean whichever way round it is read.
+        assert_eq!(
+            boot_only_fingerprints(&before, None),
+            boot_only_fingerprints(&server(before.agent_registry.clone()), None)
+        );
+        assert_ne!(
+            boot_only_fingerprints(&before, None),
+            boot_only_fingerprints(&after, None)
+        );
+
+        // And the refusal names the key that moved rather than the set.
+        let installed = boot_only_fingerprints(&before, None);
+        let candidate = boot_only_fingerprints(&after, None);
+        assert_ne!(installed, candidate);
+
+        let notifications_changed = boot_only_fingerprints(
+            &ProxyServerConfig {
+                notifications: Some(NotificationsConfig {
+                    enabled: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            None,
+        );
+        assert_ne!(
+            notifications_changed,
+            boot_only_fingerprints(&ProxyServerConfig::default(), None)
+        );
+
+        let events_changed = boot_only_fingerprints(
+            &ProxyServerConfig::default(),
+            Some(&RequestEventsConfig {
+                sink: RequestEventSinkKind::Logging,
+                ..Default::default()
+            }),
+        );
+        assert_ne!(
+            events_changed,
+            boot_only_fingerprints(&ProxyServerConfig::default(), None)
+        );
+    }
+
+    /// A config value must not reach `chrono::Duration::seconds`, which is
+    /// an `expect` past `i64::MAX / 1000`, and a bare `as i64` on a large
+    /// `u64` wraps negative and silently shortens the feed expiry the key
+    /// is documented to extend.
+    #[test]
+    fn an_out_of_range_duration_is_a_named_refusal_rather_than_a_panic_or_a_wrap() {
+        assert!(registry_duration("stale_grace_secs", 86_400).is_ok());
+        assert!(registry_duration("stale_grace_secs", 0).is_ok());
+
+        let refusal = registry_duration("stale_grace_secs", u64::MAX)
+            .expect_err("u64::MAX is not a duration");
+        assert!(
+            refusal.to_string().contains("stale_grace_secs"),
+            "{refusal}"
+        );
+
+        assert!(
+            registry_duration("stale_grace_secs", 10_000_000_000_000_000).is_err(),
+            "past chrono's own bound, where Duration::seconds panics"
+        );
+    }
+
+    /// The refresh loop's interval is derived rather than configured, so
+    /// the derivation is what an operator plans against.
+    #[test]
+    fn the_refresh_interval_is_clamped_around_the_staleness_tolerance() {
+        let with = |stale_grace_secs| {
+            agent_registry_refresh_interval(&AgentRegistryConfig {
+                stale_grace_secs,
+                ..Default::default()
+            })
+        };
+        assert_eq!(with(0), AGENT_REGISTRY_REFRESH_DEFAULT);
+        assert_eq!(with(1), AGENT_REGISTRY_REFRESH_FLOOR);
+        assert_eq!(with(600), std::time::Duration::from_secs(600));
+        assert_eq!(with(u64::MAX), AGENT_REGISTRY_REFRESH_CEILING);
+    }
+}
+
+#[cfg(test)]
 mod request_event_sink_tests {
     use super::*;
 
@@ -8243,6 +8477,56 @@ origins:
     }
 }
 
+/// Shortest and longest the catalog refresh loop may run at.
+///
+/// The floor keeps a small `stale_grace_secs` from turning into a hot loop
+/// over two files; the ceiling keeps a large one from meaning the feed is
+/// effectively never re-read.
+const AGENT_REGISTRY_REFRESH_FLOOR: std::time::Duration = std::time::Duration::from_secs(60);
+const AGENT_REGISTRY_REFRESH_CEILING: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+/// Interval used when `stale_grace_secs` is zero, which is the fail-closed
+/// default and says nothing about how often to poll.
+const AGENT_REGISTRY_REFRESH_DEFAULT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How often to re-read the configured feed.
+///
+/// Derived from `stale_grace_secs` rather than from a key of its own,
+/// because that value is already the operator's statement of how stale a
+/// catalog may be: polling at most that often is what makes the tolerance
+/// mean something. Zero means the operator wants the publisher's expiry
+/// honored exactly, which is a statement about acceptance and not about
+/// polling, so it falls back to the default rather than to no refresh.
+fn agent_registry_refresh_interval(
+    cfg: &sbproxy_config::AgentRegistryConfig,
+) -> std::time::Duration {
+    if cfg.stale_grace_secs == 0 {
+        return AGENT_REGISTRY_REFRESH_DEFAULT;
+    }
+    std::time::Duration::from_secs(cfg.stale_grace_secs)
+        .clamp(AGENT_REGISTRY_REFRESH_FLOOR, AGENT_REGISTRY_REFRESH_CEILING)
+}
+
+/// Turn one `agent_registry` duration key into a `chrono::Duration`.
+///
+/// `chrono::Duration::seconds` is `expect(try_seconds(..))` and panics past
+/// `i64::MAX / 1_000`, and a bare `as i64` on a large `u64` wraps negative,
+/// which would silently shorten a feed's expiry rather than extend it. Both
+/// are config values, so both get a named refusal instead. The workspace's
+/// unwrap ratchet cannot see the first of those, because the `expect` lives
+/// in chrono.
+fn registry_duration(field: &'static str, seconds: u64) -> anyhow::Result<chrono::Duration> {
+    i64::try_from(seconds)
+        .ok()
+        .and_then(chrono::Duration::try_seconds)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "agent_registry.{field} is {seconds}, which is not a duration sbproxy can \
+                 represent; use a value below {}",
+                i64::MAX / 1_000
+            )
+        })
+}
+
 /// Open the agent registry's embedded store and restore its cached catalog.
 ///
 /// `open_shared` rather than `open`: a config reload builds a candidate
@@ -8276,9 +8560,9 @@ fn build_agent_registry(
         feed_path: cfg.feed_path.clone(),
         key_directory_path: cfg.key_directory_path.clone(),
         bootstrap_keys: bootstrap,
-        stale_grace: chrono::Duration::seconds(cfg.stale_grace_secs as i64),
-        duplicate_window: chrono::Duration::seconds(cfg.duplicate_window_secs as i64),
-        rotation_grace: chrono::Duration::seconds(cfg.rotation_grace_secs as i64),
+        stale_grace: registry_duration("stale_grace_secs", cfg.stale_grace_secs)?,
+        duplicate_window: registry_duration("duplicate_window_secs", cfg.duplicate_window_secs)?,
+        rotation_grace: registry_duration("rotation_grace_secs", cfg.rotation_grace_secs)?,
     };
     let registry = std::sync::Arc::new(
         sbproxy_agent_registry::AgentRegistry::new(

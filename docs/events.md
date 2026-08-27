@@ -2,7 +2,7 @@
 
 *Last modified: 2026-08-27*
 
-SBproxy hands a SIEM three different things, and this page is the map of how they fit together: typed proxy events (the `events:` block, a closed set of twenty-two), decision-audit records (`observability.log.decision_audit`, nineteen pipeline decisions normalized to OCSF), and four audit channels that write to their own tracing targets (`security_audit`, `config_audit`, `key_audit`, and the admin action ring). Two of those four, `security_audit` and `config_audit`, can additionally be hash-chained and Ed25519-signed for tamper evidence.
+SBproxy hands a SIEM three different things, and this page is the map of how they fit together: typed proxy events (the `events:` block, a closed set of twenty-three), decision-audit records (`observability.log.decision_audit`, nineteen pipeline decisions normalized to OCSF), and four audit channels that write to their own tracing targets (`security_audit`, `config_audit`, `key_audit`, and the admin action ring). Two of those four, `security_audit` and `config_audit`, can additionally be hash-chained and Ed25519-signed for tamper evidence.
 
 If you only read one section, read [How the four audit channels relate to the event stream](#how-the-four-audit-channels-relate-to-the-event-stream). It is the piece that is easy to miss: `events:` is a delivery mechanism, not a source of truth, and most of what it delivers is a typed copy of a record another channel already produced.
 
@@ -61,7 +61,7 @@ Twenty-one of the twenty-three publish today. The other two, `cache_hit` and `ca
 
 ### The boot warning, so a quiet sink is a fact, not a guess
 
-An empty `events:` sink and a broken one look identical from the outside: neither delivers anything. So at boot, the proxy checks every name in `events.types:` (or, when `types:` is absent, every name that means "all twenty-two") against the emitters that actually exist, and warns once, by name, for anything that will never fire:
+An empty `events:` sink and a broken one look identical from the outside: neither delivers anything. So at boot, the proxy checks every name in `events.types:` (or, when `types:` is absent, every name that means "all twenty-three") against the emitters that actually exist, and warns once, by name, for anything that will never fire:
 
 ```
 WARN events.types selects event types that nothing publishes yet; the configured sink will not
@@ -85,7 +85,7 @@ Eight of the twenty wired events are worth being explicit about, because "wired"
 
 ## Decision-audit: the other nineteen
 
-Most of the twenty-two typed proxy events map onto request lifecycle and infrastructure facts. The gateway's actual security decisions, "did the WAF block this," "did the AI guardrail block this," "did this MCP tool dispatch succeed," live on a separate, wider channel: `DecisionEvent`, configured under `proxy.observability.log.decision_audit` and documented in full in [observability.md](observability.md#decision-audit-records) and the generated [decision-records.md](decision-records.md).
+Most of the twenty-three typed proxy events map onto request lifecycle and infrastructure facts. The gateway's actual security decisions, "did the WAF block this," "did the AI guardrail block this," "did this MCP tool dispatch succeed," live on a separate, wider channel: `DecisionEvent`, configured under `proxy.observability.log.decision_audit` and documented in full in [observability.md](observability.md#decision-audit-records) and the generated [decision-records.md](decision-records.md).
 
 The short version, because this page is where the two channels need to be told apart:
 
@@ -194,7 +194,7 @@ events:
 | `path` | Output file for `sink: file`. Parent directories are created at boot. Required by `file`, refused otherwise. |
 | `url` | Destination for `sink: webhook`. Must be `http://` or `https://`. Required by `webhook`, refused otherwise. |
 | `signing_secret` | HMAC-SHA256 key for the webhook signature. Takes a secret reference and nothing else; see below. |
-| `types` | Which event types to deliver. Empty or absent means all twenty-two. An unrecognized name is refused at compile time with the accepted list; a recognized but unwired name compiles and warns at boot (see above). |
+| `types` | Which event types to deliver. Empty or absent means all twenty-three. An unrecognized name is refused at compile time with the accepted list; a recognized but unwired name compiles and warns at boot (see above). |
 | `fail_closed` | Event type names that must never be silently dropped. Empty by default. Same accepted set and refusal as `types`. See [Fail-closed delivery](#fail-closed-delivery). |
 | `queue_capacity` | Depth of the hand-off queue. Defaults to 4096. Zero is refused. |
 
@@ -438,7 +438,7 @@ Every one of these is a config that would compile, boot, serve traffic, and deli
 - A `url` that is not `http://` or `https://`.
 - `queue_capacity: 0`.
 - `types:` or `queue_capacity:` under `sink: none`.
-- An event name `types:` or `fail_closed:` does not recognize. The error quotes the name and lists all twenty-two.
+- An event name `types:` or `fail_closed:` does not recognize. The error quotes the name and lists all twenty-three.
 - Any key the block does not define, so a hopeful `retries:`, `batch_size:`, or `retention:` fails rather than being dropped. See [Retention](#retention) for why the last one is absent on purpose.
 
 A recognized but unwired name (`cache_hit`, `cache_miss`) is different from all of the above: it compiles, because the config layer cannot know which names a future release will wire, and it warns once at boot instead. See [The boot warning](#the-boot-warning-so-a-quiet-sink-is-a-fact-not-a-guess).

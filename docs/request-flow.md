@@ -215,7 +215,7 @@ see [cache-reserve.md](cache-reserve.md) and [degradation.md](degradation.md).
 ## 9. Logging and the typed event bus
 
 Metrics emission, the structured access log, and event publication close
-out the pipeline. `EventType` has twenty-two variants; twenty of them
+out the pipeline. `EventType` has twenty-three variants; twenty-one of them
 ship a production emitter in the OSS binary today: `request_started`,
 `request_completed`, `request_error` (the `request_events:` lane),
 `auth_denied`, `policy_denied`, `config_reloaded`, `egress_refused`
@@ -231,8 +231,10 @@ and `provider_selected`,
 fallback, a budget cap denial, or a guardrail block, never a
 per-request or per-chunk line), `ai_workflow_operation` (one terminal
 governed workflow execution), `ai_evaluation_operation` (one terminal
-offline evaluation run), and `ai_prompt_rollout_selected` (an admin dry-run
-or live AI request selected a weighted prompt version). `cache_hit` and
+offline evaluation run), `ai_prompt_rollout_selected` (an admin dry-run
+or live AI request selected a weighted prompt version), and
+`agent_registration_decided` (an agent entered the owner-approval queue, or
+an operator approved, rejected, or revoked one). `cache_hit` and
 `cache_miss` are the two enum variants left unwired on purpose: firing on every cacheable request would put an
 NDJSON line on every configured `events:` sink per cache lookup. Cache
 admission already reports through `DecisionEvent::CacheAdmit`/`CacheKey`
@@ -253,7 +255,7 @@ and the access log's `cache_status` column; naming either in
 | Inspect/mutate an AI guardrail or tool call | AI origin call | `ai_guardrail_*`/`ai_tool_call` hooks | [ai-guardrail-mesh.md](ai-guardrail-mesh.md) |
 | Reshape a response | `response_body_filter` | A transform, or a scripting transform (CEL/Lua/JS/WASM) | [transforms.md](transforms.md) |
 | Detect anomalous behavior after the fact | `response_filter` | `AnomalyDetectorHook` (Rust trait) | [plugins.md](plugins.md) |
-| React to a lifecycle event | `logging` (mostly) | Typed event bus (20 of 22 event types emitted) | [events.md](events.md) |
+| React to a lifecycle event | `logging` (mostly) | Typed event bus (21 of 23 event types emitted) | [events.md](events.md) |
 
 ## Who reads this page for what
 
