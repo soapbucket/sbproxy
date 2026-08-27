@@ -10901,7 +10901,30 @@ pub(super) async fn handle_ai_proxy(
         && router.cost_quality_config().is_none()
     {
         if let Some(hook) = pipeline.hooks.quality_scoring.clone() {
-            if !extracted_prompt.is_empty() && !provider_order.is_empty() {
+            // A hook that declares a prompt bound is not asked at all past
+            // it. The refusal then carries its own decision label instead
+            // of folding into `hook_unavailable`, which is the label an
+            // operator alerts on for a dead scoring sidecar, and the
+            // oversized prompt is never copied into the request.
+            if !extracted_prompt.is_empty()
+                && !provider_order.is_empty()
+                && hook
+                    .max_prompt_bytes()
+                    .is_some_and(|maximum| extracted_prompt.len() > maximum)
+            {
+                sbproxy_ai::ai_metrics::record_quality_routing_decision("prompt_too_large");
+                // Prompt size is client controlled, so debug: the counter
+                // carries the signal without handing a caller one operator
+                // log line per request.
+                tracing::debug!(
+                    event = "ai.quality_routing.prompt_too_large",
+                    "quality routing prompt exceeds the hook's bound; using configured routing"
+                );
+                append_ai_route_reason(
+                    ctx,
+                    "quality_hook: prompt too large, preserved configured routing".to_owned(),
+                );
+            } else if !extracted_prompt.is_empty() && !provider_order.is_empty() {
                 let candidate_providers: Vec<String> = provider_order
                     .iter()
                     .map(|&i| config.providers[i].name.to_string())
@@ -20295,6 +20318,91 @@ mod external_guardrail_context_tests {
         assert_eq!(
             context.ai_route_reason.as_deref(),
             Some("quality_hook: unavailable, preserved configured routing")
+        );
+    }
+
+    /// Seam: the live POST dispatcher's prompt-size refusal. A hook that
+    /// declares a prompt bound is never asked past it, so a client cannot
+    /// drive the hook's oversized-prompt log line once per request, and the
+    /// refusal carries its own decision label rather than folding into
+    /// `hook_unavailable`, which is the label an operator alerts on for a
+    /// dead scoring sidecar.
+    #[tokio::test]
+    async fn quality_hook_prompt_bound_refuses_before_the_hook_is_asked() {
+        struct BoundedQualityHook {
+            asked: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::hooks::QualityScoringHook for BoundedQualityHook {
+            fn max_prompt_bytes(&self) -> Option<usize> {
+                Some(16)
+            }
+
+            async fn score_providers(
+                &self,
+                _req: &crate::hooks::QualityRequest,
+            ) -> Option<Vec<crate::hooks::QualityScore>> {
+                self.asked.fetch_add(1, Ordering::SeqCst);
+                Some(vec![crate::hooks::QualityScore {
+                    provider: "second".into(),
+                    score: 0.9,
+                }])
+            }
+        }
+
+        let (first_url, first_hits) =
+            upstream_fixture(r#"{"choices":[{"message":{"content":"first"}}]}"#).await;
+        let (second_url, second_hits) =
+            upstream_fixture(r#"{"choices":[{"message":{"content":"second"}}]}"#).await;
+        let config = two_provider_quality_config(&first_url, &second_url);
+        let asked = Arc::new(AtomicUsize::new(0));
+        let mut pipeline = crate::pipeline::CompiledPipeline::default();
+        pipeline.hooks.quality_scoring = Some(Arc::new(BoundedQualityHook {
+            asked: Arc::clone(&asked),
+        }));
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "a prompt well past the hook's declared bound"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        let too_large_before = quality_routing_decisions_count("prompt_too_large");
+        let unavailable_before = quality_routing_decisions_count("hook_unavailable");
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("an oversized prompt preserves configured routing");
+        drop(session);
+        let response = live_downstream_body(client).await;
+
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            0,
+            "a prompt past the hook's bound must never reach the hook"
+        );
+        assert_eq!(first_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(second_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            context.ai_route_reason.as_deref(),
+            Some("quality_hook: prompt too large, preserved configured routing")
+        );
+        assert!(
+            quality_routing_decisions_count("prompt_too_large") > too_large_before,
+            "the size refusal carries its own decision label"
+        );
+        assert_eq!(
+            quality_routing_decisions_count("hook_unavailable"),
+            unavailable_before,
+            "a size refusal must not read as a dead scoring sidecar"
         );
     }
 

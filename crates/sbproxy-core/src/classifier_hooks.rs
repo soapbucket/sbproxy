@@ -760,6 +760,10 @@ impl QualityScoringHook for ClassifierQualityHook {
         self.minimum_score
     }
 
+    fn max_prompt_bytes(&self) -> Option<usize> {
+        Some(quality_fanout_limits().max_prompt_bytes())
+    }
+
     async fn score_providers(&self, req: &QualityRequest) -> Option<Vec<QualityScore>> {
         const MAX_CANDIDATES: usize = 64;
         if req.candidate_providers.len() > MAX_CANDIDATES {
@@ -771,7 +775,13 @@ impl QualityScoringHook for ClassifierQualityHook {
             return None;
         }
         if req.prompt.len() > quality_fanout_limits().max_prompt_bytes() {
-            tracing::warn!(
+            // Prompt bytes are client controlled, and `warn` survives
+            // `release_max_level_info`, so warning here would hand any
+            // client one operator log line per oversized request at
+            // whatever rate it can sustain. The live caller refuses these
+            // ahead of the call and counts them under their own routing
+            // decision label; this arm is the defense for any other caller.
+            tracing::debug!(
                 prompt_bytes = req.prompt.len(),
                 maximum = quality_fanout_limits().max_prompt_bytes(),
                 "quality classifier prompt limit exceeded; preserving configured routing"

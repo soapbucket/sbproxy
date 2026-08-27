@@ -135,7 +135,7 @@ before any response exists.
 
 Live outcomes are visible in three places:
 
-- `sbproxy_ai_quality_routing_decisions_total{outcome="selected"|"hook_unavailable"|"target_ineligible"}`.
+- `sbproxy_ai_quality_routing_decisions_total{outcome="selected"|"hook_unavailable"|"target_ineligible"|"prompt_too_large"}`.
 - The "Quality Hook Routing Outcomes" Grafana panel and AI performance admin
   view.
 - Structured `ai.quality_routing.*` events and the `quality_hook:` reason on
@@ -143,7 +143,9 @@ Live outcomes are visible in three places:
 
 `hook_unavailable` includes transport/deadline failures, incomplete provider
 contracts, malformed classifier responses, and the valid case where no score
-meets the configured threshold. All preserve configured routing.
+meets the configured threshold. `prompt_too_large` is the separate case where
+the prompt is bigger than the hook will score (1 MiB for the stock classifier
+hook), so the hook is never called. All preserve configured routing.
 
 ## See also
 

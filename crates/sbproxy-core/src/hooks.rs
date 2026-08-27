@@ -213,6 +213,18 @@ pub trait QualityScoringHook: Send + Sync {
         0.0
     }
 
+    /// Largest prompt, in bytes, this hook will score.
+    ///
+    /// The default is no bound, which is what a hook with no fanout budget
+    /// of its own wants. A hook that declares one is asked nothing at all
+    /// for a prompt over it, so the refusal is attributable (its own
+    /// routing-decision label) instead of arriving at the caller as an
+    /// indistinguishable "no opinion", and the caller can skip copying the
+    /// prompt it already knows will be refused.
+    fn max_prompt_bytes(&self) -> Option<usize> {
+        None
+    }
+
     /// Score each provider in `req.candidate_providers` for `req.prompt`.
     ///
     /// Returning `None` defers to the caller's default ordering. A `Some`
