@@ -394,7 +394,7 @@ describe("extension inventory contract", () => {
           match_key: "fallback_policy",
           position: null,
           state: "available",
-          detail: "loaded but not attached",
+          detail: null,
           runtime: "javascript",
           execution: {
             phase: "request",
