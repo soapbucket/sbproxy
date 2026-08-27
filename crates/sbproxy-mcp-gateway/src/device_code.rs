@@ -611,6 +611,34 @@ pub async fn device_authorization(
         );
     }
 
+    if !cfg.scopes_supported.is_empty()
+        && form
+            .scope
+            .as_deref()
+            .is_none_or(|scope| scope.trim().is_empty())
+    {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_scope",
+            "a supported scope is required",
+        );
+    }
+    if let Some(scope) = form.scope.as_deref() {
+        for requested in scope.split_whitespace() {
+            if !cfg
+                .scopes_supported
+                .iter()
+                .any(|supported| supported == requested)
+            {
+                return oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_scope",
+                    "requested scope is not supported by this server",
+                );
+            }
+        }
+    }
+
     // Mint the codes. 256 bits of entropy for the device_code matches
     // the access-token strength and is comfortably URL-safe.
     let device_code = mint_device_code();
@@ -1036,6 +1064,7 @@ mod tests {
             device_code_polling_interval_secs: 5,
             device_code_verification_uri: "https://broker.example/mcp/oauth/verify".to_string(),
             resource_uri: "https://mcp.example".to_string(),
+            scopes_supported: vec!["read".to_string()],
             broker_signing_key: Some(crate::config::JwkKey::Pem {
                 pem: include_str!("../../sbproxy-modules/src/auth/dpop_test_ec_p256.pem")
                     .to_string(),
@@ -1124,6 +1153,28 @@ mod tests {
         let (status, body) = post_form(app, "/mcp/oauth/device_authorization", "scope=read").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body.contains("invalid_request"));
+    }
+
+    #[tokio::test]
+    async fn device_authorization_rejects_a_missing_scope_when_the_server_requires_one() {
+        let app = build_app(enabled_config());
+        let (status, body) =
+            post_form(app, "/mcp/oauth/device_authorization", "client_id=cli").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("invalid_scope"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn device_authorization_rejects_a_scope_outside_the_server_grant() {
+        let app = build_app(enabled_config());
+        let (status, body) = post_form(
+            app,
+            "/mcp/oauth/device_authorization",
+            "client_id=cli&scope=write",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("invalid_scope"), "{body}");
     }
 
     #[tokio::test]

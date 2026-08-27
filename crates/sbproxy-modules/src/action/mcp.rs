@@ -4519,6 +4519,15 @@ impl McpAction {
                         "mcp action: oauth.resource_server.authorization_servers must match oauth.authorization_servers"
                     );
                 }
+                if let Some(broker) = oauth.broker.as_ref() {
+                    let expected_issuer = format!("{}{}", broker.external_base_url.trim_end_matches('/'), broker.base_path);
+                    if !resource.authorization_servers.contains(&expected_issuer) {
+                        anyhow::bail!(
+                            "mcp action: colocated broker issuer ({}) is not in resource_server.authorization_servers",
+                            expected_issuer
+                        );
+                    }
+                }
                 if resource.scopes_supported != oauth.scopes_supported {
                     anyhow::bail!(
                         "mcp action: oauth.resource_server.scopes_supported must match oauth.scopes_supported"

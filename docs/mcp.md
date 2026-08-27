@@ -1,6 +1,6 @@
 # MCP gateway
 
-*Last modified: 2026-08-22*
+*Last modified: 2026-08-27*
 
 SBproxy ships an MCP (Model Context Protocol) gateway that speaks
 JSON-RPC 2.0 over HTTP POST. Configure the `mcp` action on an origin
@@ -593,6 +593,19 @@ verifier before the catalog, request body, or upstream federation.
 The device verification route receives user identity only from
 sbproxy's completed authentication phase, and mTLS bindings receive a
 certificate thumbprint only from the verified TLS connection.
+
+With a `resource_server`, the verified token's scopes are also checked
+per operation. `tools/call` needs `mcp.call`; every other method needs
+`mcp.read`. A request whose token carries neither gets a JSON-RPC
+`invalid_params` naming the scope it lacks, before the catalog, tool
+policy, or upstream federation is touched.
+
+The mapping is sbproxy's convention rather than something RFC 9728
+fixes, so it applies only to the scope names above and only when
+`scopes_supported` advertises them. Advertise a vocabulary of your own
+and sbproxy does not enforce a per-operation mapping over it; the
+authorization server owns that decision instead. Audience, issuer,
+expiry, DPoP, and mTLS binding are checked either way.
 
 See [`examples/mcp-oauth-discovery`](../examples/mcp-oauth-discovery)
 for the discovery-only shape. The full broker behavior and standalone

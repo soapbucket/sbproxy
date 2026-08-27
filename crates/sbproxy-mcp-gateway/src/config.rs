@@ -14,6 +14,16 @@ use serde::{Deserialize, Serialize};
 /// at startup.
 #[derive(Debug, thiserror::Error)]
 pub enum StartupConfigError {
+    #[error("MCP OAuth base_path must not be root or empty")]
+    InvalidBrokerPath,
+    /// Device approval cannot mint an access token without an
+    /// operator-provided asymmetric broker key.
+    #[error("device authorization requires broker_signing_key")]
+    DeviceAuthorizationRequiresSigningKey,
+    /// Metadata must not advertise a client-authentication method the
+    /// broker cannot parse and forward at every applicable endpoint.
+    #[error("unsupported token endpoint client authentication method: {0}")]
+    UnsupportedClientAuthenticationMethod(String),
     /// DPoP is enabled in config but the broker has no externally
     /// visible base URL, so the proof's `htu` claim cannot be matched
     /// against the canonical /token URL.
@@ -42,13 +52,32 @@ pub enum StartupConfigError {
 /// validator is conservative: it errors only on configurations that
 /// would silently downgrade security at runtime.
 ///
-/// Today the only enforced rule is the DPoP base-URL requirement
-/// (WOR-47): when DPoP is advertised or required, the broker must
-/// know its own canonical /token URL to validate the proof's `htu`
-/// claim. The URL comes from `external_base_url`; the
-/// `MCP_GATEWAY_BASE_URL` environment variable remains a backwards-
-/// compatible override.
+/// The validator rejects route capture, enabled flows with missing
+/// signing collaborators, unsupported advertised client-auth methods,
+/// and unsafe DPoP replay/base-URL settings before a listener binds.
 pub fn validate_startup(cfg: &McpGatewayConfig) -> Result<(), StartupConfigError> {
+    if cfg.base_path.is_empty() || cfg.base_path == "/" {
+        return Err(StartupConfigError::InvalidBrokerPath);
+    }
+    if cfg.device_code_enabled && cfg.broker_signing_key.is_none() {
+        return Err(StartupConfigError::DeviceAuthorizationRequiresSigningKey);
+    }
+    const SUPPORTED_CLIENT_AUTH_METHODS: &[&str] = &[
+        "client_secret_basic",
+        "client_secret_post",
+        "client_secret_jwt",
+        "private_key_jwt",
+        "none",
+    ];
+    if let Some(unsupported) = cfg
+        .accepted_client_auth_methods
+        .iter()
+        .find(|method| !SUPPORTED_CLIENT_AUTH_METHODS.contains(&method.as_str()))
+    {
+        return Err(StartupConfigError::UnsupportedClientAuthenticationMethod(
+            unsupported.clone(),
+        ));
+    }
     if cfg.dpop_supported || cfg.dpop_require_nonce {
         let minimum = cfg.dpop_max_clock_skew_secs.saturating_mul(2);
         if cfg.dpop_jti_ttl_secs < minimum {
@@ -284,6 +313,10 @@ pub struct McpGatewayConfig {
     /// this list. Mismatches return RFC 8707 §2 `invalid_target`.
     #[serde(default)]
     pub resource_uri_allowlist: Vec<String>,
+
+    /// The scopes supported by this broker.
+    #[serde(default)]
+    pub scopes_supported: Vec<String>,
 
     /// Exact-match allowlist of client redirect URIs. RFC 6749
     /// §3.1.2.4 mandates exact matching for security; we never do
@@ -567,6 +600,7 @@ impl Default for McpGatewayConfig {
             upstream_metadata_url: None,
             resource_uri: String::new(),
             resource_uri_allowlist: Vec::new(),
+            scopes_supported: Vec::new(),
             allowed_redirect_uris: Vec::new(),
             session_ttl_secs: 600,
             upstream_token_endpoint_url: String::new(),
@@ -620,6 +654,51 @@ mod tests {
         assert_eq!(cfg.accepted_client_auth_methods.len(), 5);
         assert!(cfg.client_jwt_signing_key.is_none());
         assert!(cfg.dcr_upstream_shape.is_none());
+    }
+
+    #[test]
+    fn validate_startup_rejects_root_and_empty_broker_paths() {
+        for base_path in ["", "/"] {
+            let cfg = McpGatewayConfig {
+                base_path: base_path.to_string(),
+                ..McpGatewayConfig::default()
+            };
+            assert!(matches!(
+                validate_startup(&cfg),
+                Err(StartupConfigError::InvalidBrokerPath)
+            ));
+        }
+    }
+
+    #[test]
+    fn validate_startup_rejects_device_flow_without_a_signing_key() {
+        let cfg = McpGatewayConfig {
+            device_code_enabled: true,
+            broker_signing_key: None,
+            dpop_supported: false,
+            dpop_require_nonce: false,
+            ..McpGatewayConfig::default()
+        };
+
+        assert!(
+            validate_startup(&cfg).is_err(),
+            "a device flow that can never mint its token must fail at startup"
+        );
+    }
+
+    #[test]
+    fn validate_startup_rejects_unimplemented_client_auth_methods() {
+        let cfg = McpGatewayConfig {
+            accepted_client_auth_methods: vec!["not-a-real-oauth-auth-method".to_string()],
+            dpop_supported: false,
+            dpop_require_nonce: false,
+            ..McpGatewayConfig::default()
+        };
+
+        assert!(
+            validate_startup(&cfg).is_err(),
+            "metadata must not advertise an auth method the broker cannot process"
+        );
     }
 
     #[test]

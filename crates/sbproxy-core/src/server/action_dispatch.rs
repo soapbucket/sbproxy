@@ -3958,7 +3958,12 @@ pub(super) async fn handle_mcp_action(
                 )
                 .await
             {
-                Ok(token) => ctx.principal.sub = token.sub,
+                Ok(token) => {
+                    ctx.principal.sub = token.sub;
+                    if let serde_json::Value::Object(map) = token.claims {
+                        ctx.principal.attrs.claims = Some(map);
+                    }
+                }
                 Err(error) => {
                     let challenge = provider.www_authenticate_header(&error);
                     let mut header = pingora_http::ResponseHeader::build(401, Some(3))?;
@@ -4435,6 +4440,35 @@ pub(super) async fn handle_mcp_action(
     let request_id = decoded.request_id;
     let routing_headers = decoded.routing_headers;
     let mut request = decoded.request;
+
+    // Per-operation scope check. It runs after the JSON-RPC body is
+    // decoded, because the method it maps is only known once the body
+    // is, and before any catalog lookup, tool policy, or upstream
+    // federation work. The verifier that produced these claims already
+    // ran in the request phase.
+    if mcp.resource_server.is_some() {
+        let scopes_supported = mcp
+            .oauth
+            .as_ref()
+            .map(|oauth| oauth.scopes_supported.as_slice())
+            .unwrap_or(&[]);
+        if let Some(required_scope) = mcp_scope_refusal(
+            request.method.as_str(),
+            scopes_supported,
+            ctx.principal.attrs.claims.as_ref(),
+        ) {
+            let message = format!("insufficient scope, requires {required_scope}");
+            let error = match request_id.clone() {
+                sbproxy_extension::mcp::DecodedRequestId::Modern(id) => {
+                    sbproxy_extension::mcp::McpWireError::modern_invalid_params(id, &message)
+                }
+                sbproxy_extension::mcp::DecodedRequestId::Legacy(id) => {
+                    sbproxy_extension::mcp::McpWireError::invalid_params(id, &message)
+                }
+            };
+            return write_mcp_wire_response(session, *error.0).await;
+        }
+    }
 
     let is_modern = era == McpProtocolEra::Modern2026_07_28;
     if is_modern {
@@ -9839,6 +9873,142 @@ fn mcp_oauth_resource_metadata_url(
             sbproxy_extension::mcp::discovery::OAUTH_PROTECTED_RESOURCE_PATH
         ),
         None => sbproxy_extension::mcp::discovery::OAUTH_PROTECTED_RESOURCE_PATH.to_string(),
+    }
+}
+
+/// Scope a `tools/call` needs when the action runs a colocated OAuth
+/// resource server.
+pub(super) const MCP_SCOPE_CALL: &str = "mcp.call";
+
+/// Scope every other MCP method needs when the action runs a colocated
+/// OAuth resource server.
+pub(super) const MCP_SCOPE_READ: &str = "mcp.read";
+
+/// Map an MCP JSON-RPC method to the scope a token must carry.
+///
+/// The vocabulary is the one `docs/mcp.md` and
+/// `examples/mcp-oauth-discovery` publish: `mcp.call` invokes a tool,
+/// `mcp.read` covers everything else.
+pub(super) fn required_mcp_scope(method: &str) -> &'static str {
+    if method == "tools/call" {
+        MCP_SCOPE_CALL
+    } else {
+        MCP_SCOPE_READ
+    }
+}
+
+/// Decide whether a verified token may run `method`, returning the scope
+/// it lacks when it may not.
+///
+/// What this cannot see: a deployment whose scope vocabulary is not
+/// sbproxy's. The mapping above is a convention, not something RFC 9728
+/// fixes, so it is enforced only for a resource that advertises the
+/// scope it names in `scopes_supported`. A resource advertising some
+/// other vocabulary (or none) is admitted here and gets whatever
+/// per-operation authorization its authorization server applies; this
+/// function is not the only gate on such a deployment, and it does not
+/// claim to be. Audience, issuer, expiry, DPoP, and mTLS binding are
+/// checked earlier by the resource-server verifier regardless.
+pub(super) fn mcp_scope_refusal(
+    method: &str,
+    scopes_supported: &[String],
+    claims: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<&'static str> {
+    let required = required_mcp_scope(method);
+    if !scopes_supported.iter().any(|s| s == required) {
+        return None;
+    }
+    let granted = claims
+        .and_then(|c| c.get("scope"))
+        .and_then(|s| s.as_str())
+        .is_some_and(|s| s.split_whitespace().any(|scope| scope == required));
+    if granted {
+        None
+    } else {
+        Some(required)
+    }
+}
+
+#[cfg(test)]
+mod mcp_scope_enforcement_tests {
+    use super::{mcp_scope_refusal, required_mcp_scope};
+
+    fn advertised() -> Vec<String> {
+        vec!["mcp.read".to_string(), "mcp.call".to_string()]
+    }
+
+    fn claims(scope: &str) -> serde_json::Map<String, serde_json::Value> {
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "scope".to_string(),
+            serde_json::Value::String(scope.to_string()),
+        );
+        map
+    }
+
+    #[test]
+    fn the_scope_names_are_the_ones_the_docs_and_the_example_publish() {
+        assert_eq!(required_mcp_scope("tools/call"), "mcp.call");
+        assert_eq!(required_mcp_scope("tools/list"), "mcp.read");
+        assert_eq!(required_mcp_scope("initialize"), "mcp.read");
+    }
+
+    #[test]
+    fn a_token_without_the_operation_scope_is_refused() {
+        let read_only = claims("mcp.read");
+        assert_eq!(
+            mcp_scope_refusal("tools/call", &advertised(), Some(&read_only)),
+            Some("mcp.call"),
+            "a read-only token must not be able to invoke a tool"
+        );
+        assert_eq!(
+            mcp_scope_refusal("tools/list", &advertised(), None),
+            Some("mcp.read"),
+            "a token carrying no scope claim must not be able to list tools"
+        );
+        let empty = serde_json::Map::new();
+        assert_eq!(
+            mcp_scope_refusal("tools/list", &advertised(), Some(&empty)),
+            Some("mcp.read"),
+        );
+        let unrelated = claims("openid profile");
+        assert_eq!(
+            mcp_scope_refusal("tools/call", &advertised(), Some(&unrelated)),
+            Some("mcp.call"),
+        );
+    }
+
+    #[test]
+    fn a_token_carrying_the_operation_scope_is_admitted() {
+        let both = claims("mcp.read mcp.call");
+        assert_eq!(mcp_scope_refusal("tools/call", &advertised(), Some(&both)), None);
+        assert_eq!(mcp_scope_refusal("tools/list", &advertised(), Some(&both)), None);
+        let read_only = claims("mcp.read");
+        assert_eq!(
+            mcp_scope_refusal("tools/list", &advertised(), Some(&read_only)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_scope_that_only_looks_like_the_required_one_does_not_admit() {
+        for lookalike in ["mcp.calls", "mcp.call.write", "xmcp.call", "mcp:call"] {
+            let map = claims(lookalike);
+            assert_eq!(
+                mcp_scope_refusal("tools/call", &advertised(), Some(&map)),
+                Some("mcp.call"),
+                "{lookalike} must not satisfy mcp.call"
+            );
+        }
+    }
+
+    #[test]
+    fn a_resource_advertising_another_vocabulary_is_left_to_its_issuer() {
+        let other = vec!["api.full".to_string()];
+        let map = claims("api.full");
+        assert_eq!(mcp_scope_refusal("tools/call", &other, Some(&map)), None);
+        assert_eq!(mcp_scope_refusal("tools/call", &other, None), None);
+        assert_eq!(mcp_scope_refusal("tools/call", &[], None), None);
     }
 }
 
