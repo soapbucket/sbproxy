@@ -77,8 +77,8 @@ Config: `proxy.observability.log.decision_audit.events.route.decide: true`
 [observability.md](observability.md#one-family-for-every-decision-event),
 [decision-records.md](decision-records.md).
 
-Named limit: eleven of the nineteen possible decision events publish under
-their own label today (`auth`, `cache.admit`, `cache.key`, `route.decide`,
+Named limit: twelve of the twenty possible decision events publish under
+their own label today (`auth`, `cache.admit`, `cache.key`, `cache.reserve.health`, `route.decide`,
 `ai.guardrail.input`, `ai.guardrail.output`, `ai.tool_call`, `ai.close`,
 `ai.failure`, `ai.admission`, `mcp.tool`), plus `policy` under the newer
 record format. The other seven are not one undifferentiated leftover; the

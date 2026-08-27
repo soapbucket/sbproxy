@@ -973,6 +973,126 @@
         }
       ],
       "description": "Failed storage operations as a fraction of all of them. The latency histogram is observed on success and on failure alike, so the denominator contains the numerator and this really is bounded to 0 and 1. Anything sustained above one percent is worth a ticket. Anything near 1 means the store is effectively down and the mesh is running without shared state, which is the SBPROXY-STORAGE-BACKEND-ERRORS condition. Returns nothing rather than zero when there is no storage traffic to divide."
+    },
+    {
+      "id": 13,
+      "title": "Cache Reserve Backend State",
+      "type": "stat",
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 0,
+        "y": 37
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "Healthy",
+                  "color": "green",
+                  "index": 0
+                },
+                "1": {
+                  "text": "Degraded",
+                  "color": "red",
+                  "index": 1
+                }
+              }
+            }
+          ],
+          "noValue": "Cache Reserve not configured"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (backend) (sbproxy_cache_reserve_degraded)",
+          "legendFormat": "{{backend}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Current Cache Reserve health by configured backend. A value of one means the cold tier has failed initialization or its latest operation failed; requests continue through the hot cache and origin fallback. Check GET /admin/cache for the bounded reason and recovery timestamp."
+    },
+    {
+      "id": 14,
+      "title": "Cache Reserve Health Transitions",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 12,
+        "y": 37
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "noValue": "No Cache Reserve health transitions"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (backend, state, reason) (rate(sbproxy_cache_reserve_health_transitions_total[5m]))",
+          "legendFormat": "{{backend}} / {{state}} / {{reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Transition-only Cache Reserve health events. Repeated failures while already degraded do not add noise; a healthy transition means a later backend operation succeeded and cleared the degraded state."
     }
   ],
   "templating": {

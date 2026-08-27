@@ -115,6 +115,13 @@ pub const FIELD_CONTRACTS: &[FieldContract] = &[
                configured value applies. A zero would claim the decision chose none.",
     },
     FieldContract {
+        event: DecisionEvent::CacheReserveHealth,
+        fields: &["backend", "state", "reason_code"],
+        note: "One record per health transition, never per reserve operation. `backend`, \
+               `state`, and `reason_code` are closed proxy-authored vocabularies; raw SDK, \
+               filesystem, and configuration errors never enter structured detail.",
+    },
+    FieldContract {
         event: DecisionEvent::AiGuardrailInput,
         fields: &[
             "guardrail",
@@ -382,6 +389,9 @@ mod tests {
             verdict: Some("a".into()),
             decision_latency_ms: Some(1),
             auth_type: Some("a".into()),
+            backend: Some("a".into()),
+            state: Some("a".into()),
+            reason_code: Some("a".into()),
             tool: Some("a".into()),
             tool_server: Some("a".into()),
             guardrail: Some("a".into()),

@@ -3,8 +3,8 @@ use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
 use prometheus::{
-    CounterVec, Encoder, GaugeVec, Histogram, HistogramVec, IntCounterVec, IntGauge, Opts,
-    Registry, TextEncoder,
+    CounterVec, Encoder, GaugeVec, Histogram, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec,
+    Opts, Registry, TextEncoder,
 };
 
 use crate::agent_labels::AgentLabels;
@@ -587,6 +587,12 @@ pub struct ProxyMetrics {
     /// reserve deletions (invalidate-on-mutation, expired sweeps),
     /// labelled by origin.
     pub cache_reserve_evictions: IntCounterVec,
+    /// Gauge `sbproxy_cache_reserve_degraded` set to one while the
+    /// configured reserve backend is degraded, labelled by backend.
+    pub cache_reserve_degraded: IntGaugeVec,
+    /// Counter `sbproxy_cache_reserve_health_transitions_total` of
+    /// bounded reserve health transitions by backend, state, and reason.
+    pub cache_reserve_health_transitions: IntCounterVec,
 
     // --- Synthetic probe metrics ---
     /// Counter `sbproxy_synthetic_probe_failures_total` of synthetic
@@ -1009,6 +1015,24 @@ impl ProxyMetrics {
         )
         .unwrap();
 
+        let cache_reserve_degraded = IntGaugeVec::new(
+            Opts::new(
+                "sbproxy_cache_reserve_degraded",
+                "Whether the configured Cache Reserve backend is degraded",
+            ),
+            &["backend"],
+        )
+        .unwrap();
+
+        let cache_reserve_health_transitions = IntCounterVec::new(
+            Opts::new(
+                "sbproxy_cache_reserve_health_transitions_total",
+                "Cache Reserve backend health transitions by bounded reason",
+            ),
+            &["backend", "state", "reason"],
+        )
+        .unwrap();
+
         // --- Synthetic probe counters ---
 
         let synthetic_probe_failures = IntCounterVec::new(
@@ -1171,6 +1195,12 @@ impl ProxyMetrics {
             .register(Box::new(cache_reserve_evictions.clone()))
             .unwrap();
         registry
+            .register(Box::new(cache_reserve_degraded.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(cache_reserve_health_transitions.clone()))
+            .unwrap();
+        registry
             .register(Box::new(synthetic_probe_failures.clone()))
             .unwrap();
         registry
@@ -1224,6 +1254,8 @@ impl ProxyMetrics {
             cache_reserve_misses,
             cache_reserve_writes,
             cache_reserve_evictions,
+            cache_reserve_degraded,
+            cache_reserve_health_transitions,
             synthetic_probe_failures,
             mirror_state_drift,
             request_body_drain_timeout,
