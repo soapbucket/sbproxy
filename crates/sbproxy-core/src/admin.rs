@@ -7329,12 +7329,20 @@ enum BasicChallenge {
 /// - `X-Requested-With: XMLHttpRequest` is what the console's own fetch
 ///   wrapper sends on every admin call. It is the deliberate marker, the
 ///   one signal this repository sets on both sides of the wire.
-/// - `Sec-Fetch-Dest: empty` is what a browser stamps on a
-///   script-initiated subresource request (`fetch`, `XMLHttpRequest`,
-///   `EventSource`) and no shell client sends. It covers the console's
-///   `EventSource` log and job streams, which the fetch wrapper cannot
-///   decorate because `EventSource` accepts no request headers. A browser
-///   navigation carries `document` instead and still gets the challenge.
+/// - `Sec-Fetch-Dest`, present at any value, is a browser. Browsers send
+///   the fetch-metadata headers on every request they make; curl,
+///   `reqwest`, undici, Deno, and Bun send none of them. It covers the
+///   console's `EventSource` log and job streams, which the fetch wrapper
+///   cannot decorate because `EventSource` accepts no request headers, and
+///   it covers the address-bar navigation (`Sec-Fetch-Dest: document`)
+///   that was the last way a browser could be handed the top-level
+///   credential: challenge, dialog, password, and from then on a cached
+///   credential re-attached to every console call, accepted by
+///   `resolve_principal` and upgraded to a session by
+///   `basic_session_upgrade_headers` with no login form ever shown. The
+///   value is deliberately not inspected, because every value of it is
+///   still a browser and a browser is the only client that can open the
+///   dialog. What a browser gets instead is the JSON refusal.
 ///
 /// This chooses one response header and nothing else. Neither value
 /// reaches [`AdminState::resolve_principal`], so a request carrying both
@@ -7345,8 +7353,8 @@ fn basic_challenge_for_request(
 ) -> BasicChallenge {
     let from_fetch_wrapper =
         requested_with.is_some_and(|v| v.trim().eq_ignore_ascii_case("XMLHttpRequest"));
-    let script_initiated = fetch_dest.is_some_and(|v| v.trim().eq_ignore_ascii_case("empty"));
-    if from_fetch_wrapper || script_initiated {
+    let from_a_browser = fetch_dest.is_some();
+    if from_fetch_wrapper || from_a_browser {
         BasicChallenge::Suppress
     } else {
         BasicChallenge::Send
@@ -7411,10 +7419,37 @@ async fn write_admin_response_headed<S: tokio::io::AsyncWrite + Unpin>(
     // paragraph above describes. The console reads the bare 401 and routes
     // to its own login page instead. `curl` and `sbproxy admin` send no
     // browser marker, so their 401s are unchanged.
+    //
+    // A browser typing an admin URL into the address bar is covered by the
+    // same rule, which is what keeps the credential out of the browser's
+    // password cache in the first place: it reads the JSON refusal instead
+    // of being offered a dialog it should not be answering.
     if status == 401 && challenge == BasicChallenge::Send {
         header.push_str("WWW-Authenticate: Basic realm=\"sbproxy admin\"\r\n");
     }
+    // Whether that header is there depends on two request headers, so
+    // anything caching a 401 has to key on them. Without this a shared
+    // cache can store a browser's challenge-less 401 and replay it to
+    // `curl --anyauth`, which is then left with no scheme to select.
+    // Any `Vary` the extra headers carry (CORS contributes `Origin`) is
+    // folded into this one field line rather than sent as a second, so a
+    // single header names the whole key.
+    if status == 401 {
+        header.push_str("Vary: X-Requested-With, Sec-Fetch-Dest");
+        for (_, value) in extra_headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("vary"))
+        {
+            header.push_str(", ");
+            header.push_str(value);
+        }
+        header.push_str("\r\n");
+    }
     for (k, v) in extra_headers {
+        if status == 401 && k.eq_ignore_ascii_case("vary") {
+            // Already folded into the challenge `Vary` above.
+            continue;
+        }
         header.push_str(k);
         header.push_str(": ");
         header.push_str(v);
@@ -7444,7 +7479,14 @@ fn cors_response_headers(origin: Option<&str>, allowed: &[String]) -> Vec<(Strin
             ),
             (
                 "Access-Control-Allow-Headers".to_string(),
-                "Authorization, Content-Type, X-CSRF-Token".to_string(),
+                // `X-Requested-With` is on the list because the console
+                // sends it on every call (WOR-2688) and it is not a
+                // CORS-safelisted request header. Without it a
+                // cross-origin console preflights every call, including
+                // the plain GETs that used to go straight out, and the
+                // browser blocks each one on a preflight that does not
+                // name the header.
+                "Authorization, Content-Type, X-CSRF-Token, X-Requested-With".to_string(),
             ),
             ("Vary".to_string(), "Origin".to_string()),
         ],
@@ -7769,12 +7811,53 @@ mod tests {
     async fn admin_401_omits_the_basic_challenge_for_a_browser_event_source() {
         // The console's log and job tails are `EventSource`, which takes no
         // request headers, so the fetch wrapper cannot mark them. The
-        // browser marks them instead: `Sec-Fetch-Dest: empty` is on every
-        // script-initiated subresource request and on no shell client.
+        // browser marks them instead: `Sec-Fetch-Dest` is on every request a
+        // browser makes and on no shell client.
+        //
+        // Both routes own their socket and write their own 401 ahead of the
+        // generic writer, so both are named here. A path that is not a route
+        // would fall through to the generic 401 and pin neither.
+        for (peer, path) in [
+            ("10.0.0.42", "/api/requests/stream"),
+            ("10.0.0.46", "/admin/model-host/jobs/job-1/stream"),
+        ] {
+            let response = admin_connection_roundtrip(
+                std::sync::Arc::new(make_state()),
+                peer,
+                &format!(
+                    "GET {path} HTTP/1.1\r\nAccept: text/event-stream\r\nSec-Fetch-Dest: empty\r\n\r\n"
+                ),
+            )
+            .await;
+
+            assert!(
+                response.starts_with("HTTP/1.1 401 Unauthorized"),
+                "{path}: {response}"
+            );
+            assert!(
+                !response.to_ascii_lowercase().contains("www-authenticate"),
+                "{path}: {response}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_401_omits_the_basic_challenge_for_a_browser_navigation() {
+        // WOR-2688 review, second Major: a top-level navigation was the last
+        // way a browser could pick up the top-level credential. An operator
+        // pasting an admin URL into the address bar got the challenge, the
+        // dialog took the password, and the browser then attached it to
+        // every later console call, where `resolve_principal` accepts it
+        // against a config credential no restart invalidates and
+        // `basic_session_upgrade_headers` mints a session nobody signed in
+        // for. A browser sends `Sec-Fetch-Dest` on every request whatever
+        // the destination, so keying on the header's presence closes that
+        // door. The cost is that a browser poking the admin API by hand
+        // reads the JSON refusal instead of being offered a dialog.
         let response = admin_connection_roundtrip(
             std::sync::Arc::new(make_state()),
-            "10.0.0.42",
-            "GET /admin/logs/stream HTTP/1.1\r\nAccept: text/event-stream\r\nSec-Fetch-Dest: empty\r\n\r\n",
+            "10.0.0.45",
+            "GET /admin/keys HTTP/1.1\r\nAccept: text/html\r\nSec-Fetch-Dest: document\r\nSec-Fetch-Mode: navigate\r\n\r\n",
         )
         .await;
 
@@ -7786,6 +7869,37 @@ mod tests {
             !response.to_ascii_lowercase().contains("www-authenticate"),
             "{response}"
         );
+    }
+
+    #[tokio::test]
+    async fn admin_401_names_the_client_markers_in_one_vary_header() {
+        // WOR-2688 review, third finding: the challenge now varies on two
+        // request headers, so a cache in front of the admin port has to key
+        // on them or it will replay a browser's challenge-less 401 to a
+        // shell client, which is then left with no scheme to select. The
+        // CORS `Vary` folds into the same field line rather than arriving as
+        // a second one.
+        let mut state = make_state();
+        state.config.cors_origins = vec!["https://ops.example.com".to_string()];
+        let response = admin_connection_roundtrip(
+            std::sync::Arc::new(state),
+            "10.0.0.47",
+            "GET /admin/keys HTTP/1.1\r\nOrigin: https://ops.example.com\r\n\r\n",
+        )
+        .await;
+
+        assert!(
+            response.starts_with("HTTP/1.1 401 Unauthorized"),
+            "{response}"
+        );
+        let vary: Vec<&str> = response
+            .lines()
+            .filter(|line| line.to_ascii_lowercase().starts_with("vary:"))
+            .collect();
+        assert_eq!(vary.len(), 1, "one Vary field line: {response}");
+        for name in ["X-Requested-With", "Sec-Fetch-Dest", "Origin"] {
+            assert!(vary[0].contains(name), "{name} missing from {vary:?}");
+        }
     }
 
     #[tokio::test]
@@ -7828,7 +7942,7 @@ mod tests {
     }
 
     #[test]
-    fn basic_challenge_for_request_reads_only_the_two_client_markers() {
+    fn basic_challenge_for_request_reads_the_console_marker_or_any_fetch_metadata() {
         // The console's marker, case-insensitively (a header value is not
         // a case-sensitive token here) and whitespace-tolerantly.
         assert_eq!(
@@ -7844,19 +7958,27 @@ mod tests {
             basic_challenge_for_request(None, Some("empty")),
             BasicChallenge::Suppress
         );
-        // A browser navigating to an admin URL is not the console's client;
-        // it gets the RFC-correct challenge, as does every shell caller.
-        assert_eq!(
-            basic_challenge_for_request(None, Some("document")),
-            BasicChallenge::Send
-        );
+        // Any other destination is a browser too, and a browser is the only
+        // client that can open a credential dialog, so it is suppressed the
+        // same way. `document` is the address-bar navigation the review's
+        // second Major describes.
+        for dest in ["document", "iframe", "script", "image", ""] {
+            assert_eq!(
+                basic_challenge_for_request(None, Some(dest)),
+                BasicChallenge::Suppress,
+                "Sec-Fetch-Dest: {dest:?}"
+            );
+        }
+        // Neither marker is a shell client: curl and `sbproxy admin` send no
+        // fetch metadata at all, and they get the RFC-correct challenge.
         assert_eq!(
             basic_challenge_for_request(None, None),
             BasicChallenge::Send
         );
-        // A near miss is not the marker: nothing here is a prefix match.
+        // A near miss on the console's marker is not the console's marker,
+        // and does not suppress on its own.
         assert_eq!(
-            basic_challenge_for_request(Some("XMLHttpRequestish"), Some("emptyish")),
+            basic_challenge_for_request(Some("XMLHttpRequestish"), None),
             BasicChallenge::Send
         );
     }
@@ -12694,6 +12816,34 @@ origins:
         assert!(hs
             .iter()
             .any(|(k, v)| k == "Access-Control-Allow-Origin" && v == "https://any.example.com"));
+    }
+
+    #[test]
+    fn cors_allow_headers_admit_the_console_client_marker() {
+        // WOR-2688 review, first Major: the console sends `X-Requested-With`
+        // on every call now, and that is not a CORS-safelisted request
+        // header. A cross-origin console (`proxy.admin.cors_origins`, the
+        // separately hosted UI shape) therefore preflights every call,
+        // including the plain GETs that used to go straight out. A preflight
+        // that does not list the header makes the browser block the real
+        // request, and the admin server never sees it, so there is nothing
+        // in the log to read either.
+        let allowed = vec!["https://ops.example.com".to_string()];
+        let headers = cors_response_headers(Some("https://ops.example.com"), &allowed);
+        let allow = headers
+            .iter()
+            .find(|(k, _)| k == "Access-Control-Allow-Headers")
+            .map(|(_, v)| v.as_str())
+            .expect("Access-Control-Allow-Headers present");
+
+        for expected in [
+            "Authorization",
+            "Content-Type",
+            "X-CSRF-Token",
+            "X-Requested-With",
+        ] {
+            assert!(allow.contains(expected), "{expected} missing from {allow}");
+        }
     }
 
     #[test]
