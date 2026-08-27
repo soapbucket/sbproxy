@@ -210,7 +210,7 @@ A top-level alias namespace for the `request.agent_*` fields, for cleaner expres
 | `response.headers` | map | Response headers, lowercase keys |
 | `response.body_size` | int | Response body size in bytes, when known |
 
-The `response` namespace is available where CEL runs at response time: assertion policies and the `cel` transform. The `cel` transform additionally binds `response.body` (the body as a UTF-8 string).
+The `response` namespace is available where CEL runs at response time: assertion policies and the `cel` transform. The `cel` transform additionally binds `response.body` (the body as a UTF-8 string), but only on an origin whose action buffers its whole response before writing it; see the phase table in [3.6](#36-the-cel-response-transform).
 
 Within a populated namespace, missing fields render as zero values (`""`, `0`, `false`, empty map), so expressions like `size(request.agent_id) > 0` work without probing for presence first. A namespace whose subsystem never ran for the request (for example `request.tls` on a plain HTTP listener) may be absent entirely; guard those accesses or accept the fail-closed deny.
 
@@ -505,7 +505,16 @@ origins:
           - { op: remove, name: x-internal-trace }
 ```
 
-Each `value_expr` sees `response.body`, `response.status`, `response.headers`, and the `request.*` namespace. A string result is used verbatim; ints, floats, and bools render as strings; maps and lists are JSON-serialized; null skips the rule. `Set-Cookie` is on a deny-list: a CEL header rule cannot set it.
+Each `value_expr` sees `response.status`, `response.headers`, and the `request.*` namespace, plus `response.body` where the phase has one (below). A string result is used verbatim; ints, floats, and bools render as strings; maps and lists are JSON-serialized; null skips the rule. `Set-Cookie` is on a deny-list: a CEL header rule cannot set it.
+
+**Which phase a rule runs in.** A header rule can only change a header while the header map is still yours to change, and that moment is different for a response streamed from an upstream than for one sbproxy writes itself. Envoy and Kong draw the same line: a header filter runs before the body exists, and a body filter runs after the headers are gone.
+
+| Origin's action | Phase the rules run in | `response.status` | `response.headers` | `response.body` |
+| -- | -- | :-: | :-: | :-: |
+| `proxy`, `load_balancer`, and every other action that streams an upstream response | Response header phase, before the first body byte arrives | upstream status | upstream headers | not available |
+| `static`, `mock`, `plugin` | After the whole response is buffered and before any of it is written | the status the action produced | the headers the action produced | the whole body |
+
+Each rule evaluates exactly once, in one phase. A rule that reads `response.body` on a streaming origin is refused when the config compiles, naming the origin and the rule, rather than loading and resolving the body to `""` on every response. If a forward rule on that origin serves a buffered action, the rule is accepted: that route is the one that can run it. The refusal reads the expression as written, so it catches `response.body` and `response["body"]` but not a reference built at runtime through an alias or string concatenation; those still see an empty body in the streaming phase.
 
 Every `value_expr` is compiled when the config compiles. A syntax error refuses the config, naming the origin and the header the expression belongs to. Responses then only evaluate.
 

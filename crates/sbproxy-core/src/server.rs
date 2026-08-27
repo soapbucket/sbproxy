@@ -631,6 +631,24 @@ fn apply_transform_with_ctx(
             t.apply_with_context(body, script_modifier_context(ctx))
         }
         Transform::CelScript(t) => {
+            // WOR-2630: this arm is the buffered own-write phase. An
+            // action that holds its whole response -- `static`, `mock`,
+            // `plugin` -- evaluates its header rules here, against the
+            // real body, and drains the stashed mutations onto the
+            // response it is about to write. That is the one evaluation
+            // those rules get.
+            //
+            // An action that streams its response already evaluated the
+            // same rules in `response_filter`, against the real upstream
+            // status and header map, and applied them there; its headers
+            // are on the wire by the time this runs. Evaluating again
+            // would run every rule twice and strand the second set of
+            // mutations on `ctx` with no drain left to reach, which is
+            // how a proxied rule could resolve against an empty header
+            // map and then vanish.
+            if !ctx.response_buffered_before_headers {
+                return Ok(());
+            }
             // Wave 5 day-6 Item 1: typed dispatch for the CEL response
             // transform. The per-header `headers:` rules evaluate
             // against the live response context here and stash their

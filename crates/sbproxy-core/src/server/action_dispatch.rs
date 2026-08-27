@@ -100,6 +100,14 @@ pub(super) async fn handle_action(
     origin_idx: Option<usize>,
     ctx: &mut RequestContext,
 ) -> Result<bool> {
+    // WOR-2630: which response phase this request's `cel` header rules
+    // can still change a header in follows the action actually
+    // dispatched, and a matched forward rule can serve a buffered
+    // action on an origin whose own action streams. Stamp it here,
+    // where the dispatched action is in hand, so the body-buffer
+    // transform stage knows whether anything will drain what it
+    // stashes.
+    ctx.response_buffered_before_headers = action.buffers_response_before_headers();
     // WOR-2565: route settlement. Both settlement sites (a matched
     // forward rule and the origin's own action) enter through here
     // exactly once per request, so this is where a deprecated route
@@ -1440,6 +1448,11 @@ pub(super) async fn handle_action(
                             !name.eq_ignore_ascii_case("content-encoding")
                                 && !name.eq_ignore_ascii_case("set-cookie")
                         });
+                        // The chain that produced these mutations
+                        // faulted and its body is gone, so the headers
+                        // it asked for go with it rather than riding
+                        // on the 500.
+                        ctx.cel_response_header_mutations.clear();
                         set_plugin_action_response_header(
                             &mut headers,
                             "content-type",
@@ -1449,10 +1462,20 @@ pub(super) async fn handle_action(
                     } else {
                         let transformed_status =
                             ctx.response_status_override.unwrap_or(response.status);
+                        // WOR-2630: a `cel` transform in the chain above
+                        // stashed its header mutations on the context.
+                        // The `static` and `mock` arms drain the same
+                        // slot; this arm did not, so a plugin response
+                        // lost even a constant `set` silently. Drained
+                        // before the response modifiers so an operator's
+                        // explicit header still wins on a collision,
+                        // matching the `static` arm's ordering.
+                        let mut headers = response.headers;
+                        drain_cel_response_header_mutations(ctx, &mut headers);
                         apply_plugin_action_response_modifiers(
                             session,
                             transformed_status,
-                            response.headers,
+                            headers,
                             transform_outcome.body,
                             pipeline,
                             origin_idx,
@@ -1517,6 +1540,37 @@ async fn serve_generated_transform_failure(
         .write_response_body(Some(outcome.body), true)
         .await?;
     Ok(true)
+}
+
+/// Drain [`RequestContext::cel_response_header_mutations`] onto an owned
+/// response header list.
+///
+/// A `cel` transform's header rules produce mutations; draining them is
+/// what puts one on the wire. An action that evaluates the rules and
+/// never drains loses every mutation with no error, log, metric, or
+/// event, which is what a plugin action's response did before WOR-2630.
+///
+/// `set` replaces every existing entry with that name, `append` adds
+/// one, and `remove` drops them all -- the same three semantics the
+/// `mock` arm gets from Pingora's own insert/append/remove.
+fn drain_cel_response_header_mutations(
+    ctx: &mut RequestContext,
+    headers: &mut Vec<(String, String)>,
+) {
+    for mutation in std::mem::take(&mut ctx.cel_response_header_mutations) {
+        match mutation {
+            sbproxy_modules::transform::CelHeaderMutation::Set(name, value) => {
+                headers.retain(|(existing, _)| !existing.eq_ignore_ascii_case(&name));
+                headers.push((name, value));
+            }
+            sbproxy_modules::transform::CelHeaderMutation::Append(name, value) => {
+                headers.push((name, value));
+            }
+            sbproxy_modules::transform::CelHeaderMutation::Remove(name) => {
+                headers.retain(|(existing, _)| !existing.eq_ignore_ascii_case(&name));
+            }
+        }
+    }
 }
 
 struct PluginActionTransformOutcome {
@@ -2258,6 +2312,84 @@ origins:
         assert!(
             response.starts_with("HTTP/1.1 451 Blocked By Policy\r\n"),
             "status.text must reach the HTTP/1.1 status line; response: {response}"
+        );
+    }
+
+    /// WOR-2630: a `cel` transform on a plugin action's response
+    /// evaluated its header rules and stashed the mutations on the
+    /// context, and this arm never drained them. Even a constant `set`
+    /// vanished with no error, log, metric, or event, while the
+    /// `static` and `mock` arms drained the same slot.
+    ///
+    /// The fixture's YAML action is `static` because a linked plugin
+    /// action has no YAML spelling; the dispatched action is the plugin
+    /// one passed in, and both buffer their whole response, so both
+    /// evaluate the rules in this phase.
+    #[tokio::test]
+    async fn plugin_action_http1_applies_cel_header_mutations() {
+        let config = sbproxy_config::compile_config(
+            r#"
+origins:
+  "plugin.test":
+    action:
+      type: static
+      body: placeholder
+    transforms:
+      - type: cel
+        headers:
+          - op: set
+            name: x-cel-set
+            value_expr: '"set-from-cel"'
+          - op: set
+            name: x-cel-status
+            value_expr: 'string(response.status)'
+          - op: remove
+            name: x-drop-me
+"#,
+        )
+        .expect("fixture config");
+        let pipeline =
+            std::sync::Arc::new(CompiledPipeline::from_config(config).expect("fixture pipeline"));
+        let action = response_action(
+            202,
+            vec![
+                ("content-type".into(), "text/plain".into()),
+                ("x-drop-me".into(), "leaked".into()),
+            ],
+            Bytes::from_static(b"queued"),
+        );
+
+        let pipeline_for_ctx = std::sync::Arc::clone(&pipeline);
+        let (result, wire) = exchange_with(
+            &action,
+            &pipeline,
+            Some(0),
+            DEFAULT_TEST_REQUEST,
+            move |ctx| {
+                ctx.pipeline = pipeline_for_ctx;
+                ctx.origin_idx = Some(0);
+            },
+        )
+        .await;
+
+        assert!(result.expect("valid plugin response must dispatch"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        let head = response
+            .split("\r\n\r\n")
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        assert!(
+            head.contains("x-cel-set: set-from-cel"),
+            "a constant CEL set must reach the wire: {response}"
+        );
+        assert!(
+            head.contains("x-cel-status: 202"),
+            "the rule sees the status the action produced: {response}"
+        );
+        assert!(
+            !head.contains("x-drop-me"),
+            "a CEL remove must drop the header the action supplied: {response}"
         );
     }
 

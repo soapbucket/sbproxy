@@ -25,9 +25,15 @@
 //!
 //! Bindings exposed to each `value_expr`:
 //!
-//! - `response.body` - response body as a UTF-8 string. Non-UTF-8
-//!   bodies are passed through as the empty string and the transform
-//!   logs a warning.
+//! - `response.body` - response body as a UTF-8 string, on an origin
+//!   whose action buffers its whole response (`static`, `mock`,
+//!   `plugin`). An action that streams its response evaluates these
+//!   rules in the header phase, before the first body byte arrives, so
+//!   the body is not available there and a rule that reads it is
+//!   refused when the config compiles; see
+//!   [`CelScriptTransform::header_rule_reading_response_body`].
+//!   Non-UTF-8 bodies are passed through as the empty string and the
+//!   transform logs a warning.
 //! - `response.status` - HTTP status code (integer).
 //! - `response.headers` - map of lowercase header name to value.
 //! - All of the existing `request.*` namespace populated by the
@@ -121,6 +127,29 @@ pub struct CelResponseRequestView<'a> {
     pub agent: Option<AgentClassView<'a>>,
     /// JA4-based headless-browser detector output.
     pub headless: Option<HeadlessSignalView<'a>>,
+}
+
+/// Whether an authored CEL expression reads the response body.
+///
+/// Textual, because the compiled program exposes only its top-level
+/// variable names and every rule here references `response`. The three
+/// forms below are the ones CEL itself accepts for a field of a map;
+/// `response.body_size` is excluded because it is a different binding
+/// and belongs to the assertion surface, not this one.
+fn expression_reads_response_body(expression: &str) -> bool {
+    if expression.contains("response[\"body\"]") || expression.contains("response['body']") {
+        return true;
+    }
+    let mut rest = expression;
+    while let Some(at) = rest.find("response.body") {
+        let after = &rest[at + "response.body".len()..];
+        let next = after.chars().next();
+        if !next.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return true;
+        }
+        rest = after;
+    }
+    false
 }
 
 /// Headers a CEL expression is not allowed to mutate. Case-insensitive
@@ -304,6 +333,33 @@ impl CelScriptTransform {
         Ok(Self {
             headers: cfg.headers,
             compiled_headers,
+        })
+    }
+
+    /// The first `headers:` rule whose expression reads
+    /// `response.body`.
+    ///
+    /// A rule can only change a header in the phase that still owns the
+    /// header map, and on an action that streams its response that
+    /// phase runs before the first body byte has arrived. So a rule
+    /// reading `response.body` has no phase to run in there, and the
+    /// pipeline compiler in `sbproxy-core` refuses the pairing and
+    /// names the rule this returns (WOR-2630). Actions that buffer
+    /// their whole response -- `static`, `mock`, `plugin` -- evaluate
+    /// with the real body and are unaffected.
+    ///
+    /// The check is textual over the authored expression. It sees
+    /// `response.body`, `response["body"]`, and the single-quoted form,
+    /// and deliberately does not match `response.body_size`. It cannot
+    /// see a reference reached through a `cel.bind` alias or assembled
+    /// by string concatenation; those reach the runtime, where the
+    /// streaming header phase binds the body as the empty string.
+    #[must_use]
+    pub fn header_rule_reading_response_body(&self) -> Option<&CelHeaderRule> {
+        self.headers.iter().find(|rule| {
+            rule.value_expr
+                .as_deref()
+                .is_some_and(expression_reads_response_body)
         })
     }
 
@@ -681,6 +737,51 @@ mod tests {
             "headers": [{"op": "set", "name": "x-foo"}],
         });
         assert!(CelScriptTransform::from_config(v).is_err());
+    }
+
+    #[test]
+    fn a_header_rule_reading_the_response_body_is_reported_by_name() {
+        // WOR-2630: the pipeline compiler refuses this rule on an origin
+        // whose action streams, and the refusal has to name the rule an
+        // operator can find in their YAML.
+        let transform = CelScriptTransform::from_config(serde_json::json!({
+            "headers": [
+                {"op": "set", "name": "x-status", "value_expr": "string(response.status)"},
+                {"op": "set", "name": "x-body-len", "value_expr": "string(size(response.body))"}
+            ]
+        }))
+        .expect("both expressions compile");
+        assert_eq!(
+            transform
+                .header_rule_reading_response_body()
+                .map(|rule| rule.name.as_str()),
+            Some("x-body-len")
+        );
+    }
+
+    #[test]
+    fn index_syntax_and_only_index_syntax_counts_as_a_body_reference() {
+        for expression in [
+            "response.body",
+            "size(response.body) > 0",
+            "response[\"body\"]",
+            "response['body']",
+        ] {
+            assert!(
+                super::expression_reads_response_body(expression),
+                "must see a body reference in {expression}"
+            );
+        }
+        for expression in [
+            "string(response.status)",
+            "response.headers['x-trace']",
+            "request.body_size",
+        ] {
+            assert!(
+                !super::expression_reads_response_body(expression),
+                "must not see a body reference in {expression}"
+            );
+        }
     }
 
     #[test]

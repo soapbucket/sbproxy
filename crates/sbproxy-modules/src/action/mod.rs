@@ -952,6 +952,26 @@ impl Action {
             Self::Plugin(p) => p.handler().handler_type(),
         }
     }
+
+    /// Whether this action buffers its whole response before it writes
+    /// any of it, so a response-phase rule can still see the body and
+    /// change the headers in the same pass.
+    ///
+    /// `static`, `mock`, and `plugin` build a complete status, header
+    /// list, and body in the request phase and write them together.
+    /// Every other action either streams an upstream response, whose
+    /// headers are committed downstream before the first body byte
+    /// arrives, or never runs the transform chain at all. This is the
+    /// axis a `cel` transform's `headers:` rules divide on: only these
+    /// three can evaluate a rule that reads `response.body`
+    /// (WOR-2630).
+    ///
+    /// A new action defaults to the streaming answer, which refuses a
+    /// body-reading header rule at config compile rather than accepting
+    /// one that would silently read an empty body.
+    pub const fn buffers_response_before_headers(&self) -> bool {
+        matches!(self, Self::Static(_) | Self::Mock(_) | Self::Plugin(_))
+    }
 }
 
 impl std::fmt::Debug for Action {

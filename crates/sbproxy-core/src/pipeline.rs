@@ -2431,6 +2431,12 @@ impl CompiledPipeline {
             proxy_wasm_filters.push(proxy_wasm_filter);
             let origin_action_is_mcp = matches!(&action, Action::Mcp(_));
             let origin_action_is_ai_proxy = matches!(&action, Action::AiProxy(_));
+            // WOR-2630: which response phase this origin's `cel` header
+            // rules run in. Captured here because `action` is moved into
+            // `actions` a few lines down, and the transform compile that
+            // needs the answer runs after that.
+            let origin_action_buffers_response = action.buffers_response_before_headers();
+            let origin_action_type = action.action_type().to_string();
             // Chargeback signals are per-origin, and `AiHandlerConfig` has
             // no identity of its own: the compiled origin and its AI action
             // are one binding only here. Stamped before the first request,
@@ -2595,6 +2601,25 @@ impl CompiledPipeline {
                     );
                 }
             }
+            // WOR-2630: a `cel` transform's `headers:` rules run in
+            // whichever response phase can still change a header. On an
+            // action that streams its response that phase is Pingora's
+            // `response_filter`, which runs before a single body byte
+            // has arrived, so a rule reading `response.body` would
+            // evaluate against an empty string and write the wrong
+            // header with nothing to say so. Note the rule here, where
+            // the compiled transforms are still in hand, and refuse
+            // below once the forward rules have compiled -- a matched
+            // forward rule can serve this origin with a buffered action
+            // the origin's own action is not.
+            let cel_rule_reading_response_body: Option<String> =
+                origin_transforms.iter().find_map(|compiled| {
+                    let sbproxy_modules::Transform::CelScript(cel) = &compiled.transform else {
+                        return None;
+                    };
+                    cel.header_rule_reading_response_body()
+                        .map(|rule| rule.name.clone())
+                });
             transforms.push(origin_transforms);
 
             // Compile forward rules (zero or more per origin).
@@ -2609,6 +2634,23 @@ impl CompiledPipeline {
                 if let Action::Mcp(mcp) = &mut rule.action {
                     mcp.bind_exact_route_authority(origin.hostname.as_str());
                 }
+            }
+            if let Some(rule_name) = cel_rule_reading_response_body {
+                let buffered_somewhere = origin_action_buffers_response
+                    || origin_fwd_rules
+                        .iter()
+                        .any(|rule| rule.action.buffers_response_before_headers());
+                anyhow::ensure!(
+                    buffered_somewhere,
+                    "origin `{}`: `cel` transform header rule `{}` reads `response.body`, but a \
+                     `{}` action commits its response headers before the body arrives, so the \
+                     body is not available in the phase that can still change a header. Drop the \
+                     `response.body` reference, or move the rule to an origin served by an action \
+                     that buffers its whole response (`static`, `mock`, `plugin`)",
+                    origin.origin_id,
+                    rule_name,
+                    origin_action_type
+                );
             }
             // MCP picks its protocol era and trust anchor from the route
             // before the body is buffered or auth has run. Any rule that
@@ -8551,6 +8593,113 @@ origins:
             );
             assert!(msg.contains(key), "diagnostic must name the key: {msg}");
         }
+    }
+
+    /// WOR-2630: a proxied response commits its headers downstream
+    /// before the body arrives, so the only phase that can still change
+    /// a header cannot see `response.body`. The rule used to load as
+    /// configured and evaluate the body as `""`, writing the wrong
+    /// header value on every response.
+    #[test]
+    fn a_streaming_origin_refuses_a_cel_header_rule_that_reads_the_response_body() {
+        let msg = pipeline_rejection(
+            r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  "streamed.local":
+    action:
+      type: proxy
+      url: https://upstream.invalid
+    transforms:
+      - type: cel
+        headers:
+          - op: set
+            name: x-body-len
+            value_expr: 'string(size(response.body))'
+"#,
+        );
+        assert!(
+            msg.contains("streamed.local"),
+            "diagnostic must name the origin: {msg}"
+        );
+        assert!(
+            msg.contains("x-body-len"),
+            "diagnostic must name the header rule: {msg}"
+        );
+        assert!(
+            msg.contains("response.body"),
+            "diagnostic must name the binding that has no phase: {msg}"
+        );
+        assert!(
+            msg.contains("proxy"),
+            "diagnostic must name the action whose phase cannot serve it: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_buffered_origin_accepts_a_cel_header_rule_that_reads_the_response_body() {
+        // `static` holds the whole response, so the body-buffer phase
+        // still owns the header map and the rule has a phase to run in.
+        let cfg = sbproxy_config::compile_config(
+            r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  "buffered.local":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+    transforms:
+      - type: cel
+        headers:
+          - op: set
+            name: x-body-len
+            value_expr: 'string(size(response.body))'
+"#,
+        )
+        .expect("yaml parses");
+        CompiledPipeline::from_config(cfg).expect("a buffered action can serve the rule");
+    }
+
+    #[test]
+    fn a_streaming_origin_with_a_buffered_forward_rule_still_accepts_the_body_rule() {
+        // A matched forward rule settles the request with its own
+        // action, so an origin that streams by default can still serve
+        // the rule from a buffered route. Judging only the origin's own
+        // action would refuse a config that works.
+        let cfg = sbproxy_config::compile_config(
+            r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  "mixed.local":
+    action:
+      type: proxy
+      url: https://upstream.invalid
+    forward_rules:
+      - rules:
+          - path: { prefix: /local/ }
+        origin:
+          id: local-static
+          action:
+            type: static
+            status_code: 200
+            content_type: text/plain
+            body: "ok"
+    transforms:
+      - type: cel
+        headers:
+          - op: set
+            name: x-body-len
+            value_expr: 'string(size(response.body))'
+"#,
+        )
+        .expect("yaml parses");
+        CompiledPipeline::from_config(cfg)
+            .expect("a buffered forward-rule action can serve the rule");
     }
 
     #[test]
