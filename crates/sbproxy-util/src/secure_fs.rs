@@ -160,6 +160,24 @@ pub fn ensure_file_owner_only(path: &Path) -> io::Result<()> {
     open_with_mode(options, path).map(drop)
 }
 
+/// Creates `path` owner-only, truncating whatever was there.
+///
+/// The opener for a sink that writes a whole file in one pass instead
+/// of appending to it: the gzip of a rotated access log. Appending
+/// would be wrong there rather than merely untidy, because a partial
+/// `.gz` left by a rotation that died mid-write is not a prefix of the
+/// member this call is about to write, and the reader would see one
+/// corrupt stream instead of one truncated one.
+///
+/// # Errors
+///
+/// As [`open_append_owner_only`].
+pub fn create_truncate_owner_only(path: &Path) -> io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    open_with_mode(options, path)
+}
+
 /// Creates `path` and every missing parent, each at `0o700`.
 ///
 /// Directories that already exist are left exactly as they are, mode

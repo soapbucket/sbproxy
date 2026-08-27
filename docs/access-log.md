@@ -1,6 +1,6 @@
 # Access log
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-27*
 
 ![a GET and a POST proxied through an origin that emits a structured JSON access-log line for each](assets/access-log.gif)
 
@@ -491,6 +491,18 @@ When the active file reaches `max_size_mb`, SBproxy rotates it before
 writing the next line. Rotated files use suffixes like
 `access.log.1` or `access.log.1.gz`; `max_backups` caps how many
 rotated files are retained. `compress: true` gzips rotated files.
+
+The active file and every rotated copy are created owner-only
+(`0600`), and a directory SBproxy creates for them is `0700`. An
+access-log line carries the path, the identity, and the decision for
+one request, which is a record an operator asked to keep rather than
+to publish. A file that is already on disk at a wider mode is
+tightened when the sink next opens it rather than inherited, so a log
+shipper or backup job running as a different user loses access the
+first time that happens after an upgrade. Run those readers as the
+proxy user, or point `path` at a fifo or `/dev/stdout`, which are left
+exactly as the operator set them. A directory that already exists
+keeps its mode, so a shared `/var/log` is never narrowed.
 
 Omitting `output` keeps the default behavior: emit JSON through the
 `access_log` tracing target.

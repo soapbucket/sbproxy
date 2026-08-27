@@ -77,26 +77,13 @@ HELPER="crates/sbproxy-util/src/secure_fs.rs"
 
 # Files inside the guarded crates that still open their own files.
 #
-# This list is shrink-only. Every entry is a real WOR-2626 site that a
-# concurrent branch held when the helper landed; converting one is a
-# one-line change plus a mode assertion, and the entry comes out with
-# it. Nothing may be added here without a mode of its own.
-EXEMPT=(
-  # Access log write, rotation, and the rotated `.gz`. Operator-facing
-  # and the most likely to be read by an outside shipper, so the
-  # conversion wants its own upgrade note.
-  "crates/sbproxy-observe/src/access_log.rs"
-  # The compiled observability sink fan-out: file target plus its
-  # parent directory.
-  "crates/sbproxy-observe/src/sink_dispatcher.rs"
-  # The decision event file worker.
-  "crates/sbproxy-observe/src/event_sink.rs"
-  # Only the parent directory here. The chain file itself already goes
-  # through sbproxy-meter's `UsageLedger::open`, which is converted.
-  "crates/sbproxy-observe/src/audit_chain.rs"
-  # The value-ledger cache directory under the serve cache dir.
-  "crates/sbproxy-ai/src/handler.rs"
-)
+# This list is shrink-only, and as of WOR-2606 it is empty: the access
+# log and its rotated `.gz`, the sink dispatcher's file target, the
+# decision event worker, the audit chain's parent directory, and the
+# value-ledger cache directory were the last five entries and all now
+# go through the helper. An empty list is the point. Nothing may be
+# added back without a mode of its own.
+EXEMPT=()
 
 # Production code only. A test that pre-creates a fixture at `0o644` to
 # prove the tightening works is exactly what this change added, so the
@@ -211,7 +198,10 @@ scan_helper() {
 
 is_exempt() {
   local candidate="$1" entry
-  for entry in "${EXEMPT[@]}"; do
+  # `"${EXEMPT[@]}"` on an empty array is an unbound reference under
+  # `set -u` in bash 3.2, which is what macOS ships; the `+` expansion
+  # yields nothing at all instead of erroring.
+  for entry in ${EXEMPT[@]+"${EXEMPT[@]}"}; do
     [ "$entry" = "$candidate" ] && return 0
   done
   return 1

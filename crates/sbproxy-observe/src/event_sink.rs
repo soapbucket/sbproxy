@@ -541,7 +541,7 @@ fn start_file_worker(
 ) -> anyhow::Result<std::thread::JoinHandle<()>> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(|error| {
+            sbproxy_util::secure_fs::create_dir_all_owner_only(parent).map_err(|error| {
                 anyhow::anyhow!(
                     "events.path {}: cannot create the directory {}: {error}",
                     path.display(),
@@ -550,10 +550,10 @@ fn start_file_worker(
             })?;
         }
     }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
+    // Owner-only. Decision events name the tenant, the rule, and what
+    // was refused; a world-readable NDJSON feed on a shared host is a
+    // map of the operator's policy surface.
+    let file = sbproxy_util::secure_fs::open_append_owner_only(path)
         .map_err(|error| anyhow::anyhow!("events.path {}: {error}", path.display()))?;
 
     let handle = std::thread::Builder::new()
@@ -1968,5 +1968,67 @@ mod tests {
         // installed (`Ok`, `QueueFull`, and `WorkerStopped` are all
         // legitimate outcomes there), so only the not-wanted case has
         // one correct answer to assert on here.
+    }
+
+    /// WOR-2626: a decision event names the tenant, the rule, and what
+    /// was refused, so the NDJSON feed and the directory the sink
+    /// creates for it are owner-only.
+    ///
+    /// The file is pre-created world-readable between the two starts
+    /// rather than left to the ambient umask, so this is red before the
+    /// fix whatever the runner's umask is.
+    #[cfg(unix)]
+    #[test]
+    fn the_event_file_and_its_directory_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fn mode_of(path: &std::path::Path) -> u32 {
+            std::fs::metadata(path)
+                .expect("stat the path under test")
+                .permissions()
+                .mode()
+                & 0o7777
+        }
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nested = dir.path().join("nested");
+        let path = nested.join("events.ndjson");
+
+        let egress = EventEgress::start(
+            EventSinkTarget::File { path: path.clone() },
+            EventTypeMask::all(),
+            16,
+        )
+        .expect("file egress starts");
+        drop(egress);
+        assert_eq!(
+            mode_of(&nested),
+            0o700,
+            "the sink's own directory is world-traversable"
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("loosen the event file");
+        let egress = EventEgress::start(
+            EventSinkTarget::File { path: path.clone() },
+            EventTypeMask::all(),
+            16,
+        )
+        .expect("file egress restarts");
+        egress.publish(event(EventType::PolicyDenied));
+        drop(egress);
+
+        assert_eq!(
+            mode_of(&path),
+            0o600,
+            "the event file is {:o}, not owner-only",
+            mode_of(&path)
+        );
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("read back")
+                .contains("policy_denied"),
+            "tightening must not cost the records"
+        );
     }
 }

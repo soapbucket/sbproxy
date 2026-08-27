@@ -540,7 +540,7 @@ impl AccessLogEntry {
     ) -> anyhow::Result<()> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            sbproxy_util::secure_fs::create_dir_all_owner_only(parent)?;
         }
         if path
             .metadata()
@@ -550,10 +550,11 @@ impl AccessLogEntry {
             rotate_access_log(path, max_backups, compress)?;
         }
         let line = self.redacted_json_line()?;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        // Owner-only, and tightened if an older build left the file at
+        // 0o644. Every request the proxy served is in here with its
+        // path, its identity, and its decision, which is the traffic
+        // record an operator asked to keep and not to publish.
+        let mut file = sbproxy_util::secure_fs::open_append_owner_only(path)?;
         writeln!(file, "{line}")?;
         Ok(())
     }
@@ -622,7 +623,10 @@ fn rotated_path(path: &Path, idx: usize, compress: bool) -> PathBuf {
 
 fn gzip_file(src: &Path, dest: &Path) -> anyhow::Result<()> {
     let input = std::fs::File::open(src)?;
-    let output = std::fs::File::create(dest)?;
+    // The rotated copy holds the same records as the live file, so it
+    // gets the same mode. A rotation that widened the archive would
+    // hand away exactly what the live file withheld.
+    let output = sbproxy_util::secure_fs::create_truncate_owner_only(dest)?;
     let mut encoder = flate2::write::GzEncoder::new(output, flate2::Compression::default());
     let mut reader = std::io::BufReader::new(input);
     std::io::copy(&mut reader, &mut encoder)?;
@@ -1692,5 +1696,74 @@ mod tests {
         // Verify redaction markers appear.
         assert!(redacted.contains("sk-[REDACTED]"));
         assert!(redacted.contains("Bearer [REDACTED]"));
+    }
+
+    /// WOR-2626: the access log holds the path, the identity, and the
+    /// decision for every request served, and a rotated copy holds the
+    /// same records. Both must be owner-only, and so must a directory
+    /// the sink creates for itself.
+    ///
+    /// The active file is pre-created world-readable rather than left
+    /// to the ambient umask, so this stays red before the fix on a
+    /// runner whose umask is already `0o077` and the assertion is about
+    /// the sink rather than about the environment it ran in.
+    #[cfg(unix)]
+    #[test]
+    fn the_access_log_and_its_rotated_copy_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fn mode_of(path: &Path) -> u32 {
+            std::fs::metadata(path)
+                .expect("stat the path under test")
+                .permissions()
+                .mode()
+                & 0o7777
+        }
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nested = dir.path().join("nested");
+        let path = nested.join("access.log");
+
+        // First write creates the directory and the file.
+        minimal_entry()
+            .emit_to_file(&path, 1024 * 1024, 3, true)
+            .expect("first write");
+        assert_eq!(
+            mode_of(&nested),
+            0o700,
+            "the sink's own directory is world-traversable"
+        );
+
+        // Second write reopens a file somebody left world-readable.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("loosen the active log");
+        minimal_entry()
+            .emit_to_file(&path, 1024 * 1024, 3, true)
+            .expect("second write");
+        assert_eq!(
+            mode_of(&path),
+            0o600,
+            "the active access log is {:o}, not owner-only",
+            mode_of(&path)
+        );
+
+        // A threshold of one byte rotates on the next write, so the
+        // records land in `access.log.1.gz` and must not widen on the
+        // way.
+        minimal_entry()
+            .emit_to_file(&path, 1, 3, true)
+            .expect("rotating write");
+        let rotated = nested.join("access.log.1.gz");
+        assert!(
+            rotated.exists(),
+            "rotation did not produce {}",
+            rotated.display()
+        );
+        assert_eq!(
+            mode_of(&rotated),
+            0o600,
+            "the rotated access log is {:o}, not owner-only",
+            mode_of(&rotated)
+        );
     }
 }

@@ -1,6 +1,6 @@
 # SBproxy events
 
-*Last modified: 2026-08-25*
+*Last modified: 2026-08-27*
 
 SBproxy hands a SIEM three different things, and this page is the map of how they fit together: typed proxy events (the `events:` block, a closed set of twenty-two), decision-audit records (`observability.log.decision_audit`, nineteen pipeline decisions normalized to OCSF), and four audit channels that write to their own tracing targets (`security_audit`, `config_audit`, `key_audit`, and the admin action ring). Two of those four, `security_audit` and `config_audit`, can additionally be hash-chained and Ed25519-signed for tamper evidence.
 
@@ -220,6 +220,13 @@ events:
   types:
     - policy_denied
 ```
+
+The file is created owner-only (`0600`), as is a directory SBproxy
+creates for it (`0700`). A decision event names the tenant, the rule,
+and what was refused, so the feed is a map of the policy surface. A
+file already on disk at a wider mode is tightened when the sink opens
+it, which means a collector running as another user loses access after
+an upgrade unless it runs as the proxy user or reads a fifo instead.
 
 ### The webhook contract
 

@@ -585,7 +585,7 @@ impl AiHandlerConfig {
                         .map(|dir| std::path::Path::new(&dir).join("value-ledger.redb"))
                         .unwrap_or_default();
                     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                        let _ = std::fs::create_dir_all(parent);
+                        let _ = sbproxy_util::secure_fs::create_dir_all_owner_only(parent);
                     }
                     // Every handler obtains the one stable process facade.
                     // A configured cache path promotes that facade in place,
