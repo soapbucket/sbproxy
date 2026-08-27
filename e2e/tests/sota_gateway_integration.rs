@@ -1742,8 +1742,12 @@ fn the_request_row_names_the_serving_credential_and_the_cache_tokens() {
         "the provider's prompt-cache read count reaches the record: {row}"
     );
 
-    // The ledger row for the same request, which is where cost lives.
-    let usage = gateway.usage_rows(1);
+    // The ledger rows for the same request, which is where cost lives:
+    // one primary and one per shadow target. Waiting for all three
+    // rather than for the first, because the three are written by three
+    // different tasks and "the first line that lands" is as likely to
+    // be a shadow row as the primary.
+    let usage = gateway.usage_rows(3);
     let primary = usage
         .iter()
         .find(|entry| entry["tag"] != json!("shadow"))
