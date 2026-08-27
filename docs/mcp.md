@@ -656,7 +656,8 @@ action you meant to keep read-only admits every `tools/call`, because
 See [`examples/mcp-oauth-discovery`](../examples/mcp-oauth-discovery)
 for the discovery-only shape and
 [`examples/mcp-oauth-broker`](../examples/mcp-oauth-broker) for the
-colocated broker plus resource server above, as a runnable `sb.yml`. The full broker behavior and standalone
+colocated broker plus resource server above, as a runnable `sb.yml`.
+The full broker behavior and standalone
 embedding API are documented in
 [mcp-oauth-gateway.md](mcp-oauth-gateway.md).
 

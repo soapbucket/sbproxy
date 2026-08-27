@@ -1,6 +1,6 @@
 # SBproxy documentation
 
-*Last modified: 2026-08-22*
+*Last modified: 2026-08-27*
 
 SBproxy is an open source Enterprise AI Gateway for API, MCP and agent, and AI model traffic. Every feature in this repository ships under Apache-2.0.
 
@@ -175,7 +175,7 @@ Point a framework you already run at the gateway: chat completions through the O
 - [mcp-security.md](mcp-security.md) - see [MCP and agents](#mcp-and-agents).
 - [authentication.md](authentication.md) - the chooser over all twelve inbound auth providers: which fits which caller, accepting several on one origin (credential migrations), and what the gateway does with the resulting identity.
 - [auth-oidc.md](auth-oidc.md) - the `oidc` auth provider: OpenID Connect Relying-Party login flow (authorization-code + PKCE, sealed session cookie, optional userinfo trust-header projection, RP-initiated logout).
-- [federation.md](federation.md) - the `sbproxy-federation` crate: OpenID Federation 1.0 entity statements, JWS sign/verify, RFC 7638 key thumbprints, a well-known issuer, and a trust-chain resolver, for establishing trust between independently-operated gateways.
+- [federation.md](federation.md) - `proxy.federation`: the OpenID Federation 1.0 entity statement this proxy publishes, and `peer_trust`, which walks a caller's claimed entity to a pinned anchor on the request path. Also the `sbproxy-federation` crate behind it (JWS sign/verify, RFC 7638 key thumbprints, metadata policy, trust marks, trust-chain resolution) for establishing trust between independently-operated gateways.
 - [web-bot-auth.md](web-bot-auth.md) - the `bot_auth` provider: verifying RFC 9421-signed AI crawlers against a published key directory.
 - [cap.md](cap.md) - the `cap` provider: verifying Crawler Authorization Protocol capability tokens (path globs, rate grants, agent binding) against an issuer's JWKS.
 - [trust-tiers.md](trust-tiers.md) - the four-value trust tier every request gets (`suspicious`, `strong`, `named`, `anonymous`), what earns each, and how policies and dashboards consume it.
