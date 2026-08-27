@@ -164,6 +164,10 @@ fn export_example_env_dummies_once() {
         // The extension-bundles HMAC auth hook resolves its shared secret
         // at pipeline construction, so building that example needs a value.
         ("SBPROXY_HMAC_SECRET", "worked-example-secret"),
+        // The AI toolkit resolves every agent shared secret through the
+        // same bounded resolver in validation as at runtime, so the
+        // agent-orchestration example needs a value here too.
+        ("SB_AGENT_SECRET", "agent-example-dummy"),
     ];
     for (k, v) in DUMMIES {
         std::env::set_var(k, v);

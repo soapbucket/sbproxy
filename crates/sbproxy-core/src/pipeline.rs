@@ -5983,9 +5983,9 @@ origins:
         assert!(snapshot.workflows.is_empty());
     }
 
-    #[test]
-    fn toolkit_validation_does_not_resolve_agent_secrets() {
-        let compiled = sbproxy_config::compile_config(
+    // One toolkit agent whose shared secret is the caller's reference.
+    fn toolkit_agent_config(shared_secret_reference: &str) -> String {
+        format!(
             r#"
 proxy:
   ai_toolkit:
@@ -5994,11 +5994,11 @@ proxy:
         id: worker
         endpoint: https://agents.example.test/invoke
         auth:
-          shared_secret: file:/definitely/not/read-during-validation
+          shared_secret: {shared_secret_reference}
         capabilities:
           - name: answer
-            input_schema: {type: object}
-            output_schema: {type: object}
+            input_schema: {{type: object}}
+            output_schema: {{type: object}}
 origins:
   ai.example.test:
     action:
@@ -6010,11 +6010,45 @@ egress:
   agent_orchestration:
     mode: deny_by_default
     hosts: ["agents.example.test"]
-"#,
+"#
         )
+    }
+
+    /// The validation gate has to be exactly as wide as the runtime
+    /// constructor. `sbproxy validate`, `PUT /admin/config`, and the reload
+    /// pre-check all build in validation mode, so a reference the runtime
+    /// will refuse must be refused here rather than persisted to `sb.yml`
+    /// and discovered by the next boot.
+    #[test]
+    fn toolkit_validation_refuses_an_agent_secret_it_cannot_resolve() {
+        let compiled = sbproxy_config::compile_config(&toolkit_agent_config(
+            "file:/definitely/not/present-during-validation",
+        ))
         .expect("declaration parses without resolving its secret");
+        // `CompiledPipeline` is deliberately not `Debug`, so `expect_err`
+        // is unavailable here.
+        let Err(error) = CompiledPipeline::from_config_for_validation(compiled) else {
+            panic!("validation must resolve the reference the runtime resolves");
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("proxy.ai_toolkit.agents[0].auth.shared_secret"),
+            "the refusal names the field an operator has to fix: {message}"
+        );
+    }
+
+    #[test]
+    fn toolkit_validation_admits_a_resolvable_agent_secret() {
+        let directory = tempfile::tempdir().expect("create agent secret fixture directory");
+        let path = directory.path().join("agent.key");
+        std::fs::write(&path, "agent-shared-secret").expect("write agent secret fixture");
+        let compiled = sbproxy_config::compile_config(&toolkit_agent_config(&format!(
+            "file:{}",
+            path.display()
+        )))
+        .expect("declaration parses");
         let pipeline = CompiledPipeline::from_config_for_validation(compiled)
-            .expect("validation uses a protected placeholder instead of resolving the file");
+            .expect("a resolvable reference validates");
         let scope = sbproxy_ai::toolkit::ToolkitScope::new("ai.example.test", "__default__")
             .expect("bounded scope");
         let agents = pipeline

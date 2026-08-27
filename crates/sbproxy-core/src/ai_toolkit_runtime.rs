@@ -21,7 +21,7 @@ use sbproxy_security::egress::EgressPurpose;
 /// generation as the pipeline that will own it.
 pub(crate) fn build(
     config: &CompiledConfig,
-    resolve_secrets: bool,
+    retain_secrets: bool,
 ) -> anyhow::Result<std::sync::Arc<AiToolkitRuntime>> {
     let mut input = AiToolkitConfigInput::default();
     let configured = config.server.ai_toolkit.as_ref();
@@ -48,19 +48,25 @@ pub(crate) fn build(
                          {max_secret_bytes}-byte reference limit"
                     );
                 }
-                let shared_secret = if resolve_secrets {
-                    let field = format!("proxy.ai_toolkit.agents[{index}].auth.shared_secret");
-                    let resolved = zeroize::Zeroizing::new(
-                        crate::config_source::resolve_secret_reference_bounded(
-                            &agent.auth.shared_secret,
-                            &field,
-                            max_secret_bytes,
-                        )?,
-                    );
+                // Validation resolves through the same bounded resolver the
+                // runtime uses, then drops the material. `sbproxy validate`,
+                // `PUT /admin/config`, and the reload pre-check all build in
+                // validation mode, and a gate narrower than the constructor
+                // blesses a document the admin route then persists to
+                // `sb.yml` for the next boot to refuse.
+                let field = format!("proxy.ai_toolkit.agents[{index}].auth.shared_secret");
+                let resolved = zeroize::Zeroizing::new(
+                    crate::config_source::resolve_secret_reference_bounded(
+                        &agent.auth.shared_secret,
+                        &field,
+                        max_secret_bytes,
+                    )?,
+                );
+                let shared_secret = if retain_secrets {
                     sbproxy_vault::SecretString::new(resolved.as_str())
                 } else {
-                    // Validation proves the complete runtime shape without
-                    // touching the environment, filesystem, or secret backend.
+                    // A runtime that is never going to serve keeps a
+                    // placeholder rather than live credential material.
                     sbproxy_vault::SecretString::new("x")
                 };
                 Ok(ToolkitAgentInput {
