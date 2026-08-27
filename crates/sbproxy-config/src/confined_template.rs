@@ -202,32 +202,72 @@
 //! behavior described here. A fragment has no such gap, because
 //! [`ConfinementPolicy::sealed`] allows no environment name at all.
 //!
+//! That residual reaches further than the document. `${VAR}` is
+//! substituted over the whole text before the parse
+//! (`crate::compiler::interpolate_env_vars`), so a `remote_document`
+//! confined config can write `token: "${AWS_SECRET_ACCESS_KEY}"` in an
+//! extension bundle's attachment config and the resolved value is handed
+//! to guest code, which can put it in a response. That is the same
+//! outcome [`ConfinementPolicy::bundle_manifest`] exists to prevent,
+//! reached from the operator-config side rather than from the manifest,
+//! and it is the strongest single argument for the operator-declared
+//! name allowlist the follow-up adds.
+//!
 //! **A git-sourced document is not confined unless the operator says
 //! so.** `source.confine` defaults to `false`, so a `source: { kind:
-//! git }` document keeps every power it has today. The reason is that
-//! on that path the refusal's own remedy does not exist: a git-sourced
-//! node's local file is a pointer and the repository *is* the config, so
-//! there is no root config left to declare the value in. `env:NAME` and
-//! `file:PATH` are the documented spellings for the cluster shared key
-//! (docs/secrets.md), the Kubernetes operator generates the first
-//! (`crates/sbproxy-k8s-operator/src/reconcile.rs:708`), and sealing
-//! them by default would leave a clustered GitOps node with no legal
-//! spelling at all. An operator whose config repository is written by
-//! somebody else sets `source.confine: true` and gets
+//! git }` document keeps every power it has today. Two reasons, and the
+//! first is the one that decides it:
+//!
+//! * Flipping it on is a **fail-closed upgrade on a running fleet**. A
+//!   node that boots into a refusal serves nothing, and every GitOps
+//!   deployment that names a host path in its repository would refuse
+//!   its own config on the release that changed the default. That is the
+//!   worst upgrade shape there is, and it is what makes this a decision
+//!   the operator takes rather than one a release takes for them.
+//! * The `HOST_FILE_KEYS` half has **no substitute spelling**. A path
+//!   still has to be a host path, so a repository that names one has
+//!   nowhere else to put it except a layer the node owns, which on a
+//!   git-sourced node means a `git_overlay` over a local base.
+//!
+//! What is *not* a reason, though an earlier draft of this module said
+//! it was: that a clustered node would have no legal spelling for its
+//! secret. `remote_document` keeps `${VAR}`, the pre-parse pass
+//! substitutes it, and `crate::cluster`'s shared-key validation runs on
+//! the substituted value, so `shared_key: "${SB_CLUSTER_SHARED_KEY}"` is
+//! legal under `confine: true` and fails closed when the variable is
+//! unset. `env:NAME` and `file:PATH` are documented and widely used
+//! (docs/secrets.md), which is a migration cost, not an impossibility.
+//! Pinned by `a_confined_document_may_name_its_shared_key_as_a_variable`.
+//!
+//! Silence is not the default, though. An unconfined git source whose
+//! document reaches for this host logs one warning per finding at boot
+//! (`crate::source`'s `warn_unconfined_host_reference`), naming the
+//! source and the key and never the value, so an operator on the default
+//! learns that the setting exists and what turning it on would refuse.
+//! An operator whose config repository is written by somebody else sets
+//! `source.confine: true` and gets
 //! [`ConfinementPolicy::remote_document`].
 //!
-//! **The host-file list is a list.** `HOST_FILE_KEYS` names eleven
-//! config keys and refuses those. It is not a rule about host files in
-//! general and cannot be: the enforcers are module constructors in
-//! `sbproxy-modules`, each of which opens whatever path its own config
-//! key names, and a module added later opens a path this list has never
-//! heard of. The list carries the `path:LINE` of every enforcer it
-//! mirrors so the next reader can check it, which is the same shape as
-//! the `sbproxy-vault` mirror below, and
-//! `every_host_file_key_is_refused_under_the_parent_that_scopes_it`
-//! pins every entry's behavior. What that test cannot do is notice a key
-//! nobody added, which is why the list's own doc carries the grep that
-//! finds them.
+//! **The host-file list is a list.** `HOST_FILE_KEYS` names the config
+//! keys it knows about and refuses those. It is not a rule about host
+//! files in general and cannot be: the enforcers are module
+//! constructors, the extension loader and the boot path, each of which
+//! opens whatever path its own config key names, and a module added
+//! later opens a path this list has never heard of. Two shapes it
+//! cannot express today, both recorded on `HostFileKey`: a key that is a
+//! host path only when a *sibling* key says so (`action.path` is refused
+//! whatever `backend:` says), and a key whose parent scope is a
+//! coincidence rather than a contract.
+//!
+//! The list carries the `path:LINE` of the function that opens each key,
+//! and where two keys reach one read it names the function that chooses
+//! between them, which is what `feed.cache_file` taught: listing
+//! `feed.cache_dir` alone left the guard bypassable by its own sibling
+//! through `cache_path()`. `a_document_naming_a_host_file_key_is_refused`
+//! pins every entry by literal name and shape, so deleting one goes red,
+//! and asserts the count so adding one without a pin goes red too. What
+//! no test can do is notice a key nobody added, which is why the list's
+//! own doc carries the sweep that finds them.
 //!
 //! **Naming an environment variable is not always reading a secret out
 //! of it.** `WafFeedConfig::signature_key_env` and `auth_token_env`
@@ -237,7 +277,10 @@
 //! the document or a response (it is an HMAC key and a bearer token the
 //! subscriber sends to the feed it was configured with), and naming the
 //! variable is the only way the feature can be configured at all, so
-//! refusing it would be the no-legal-spelling trap again.
+//! refusing it would leave the feature with no legal spelling. The same
+//! reasoning covers `api_key_env` on the MCP action and on the semantic
+//! constraint policy, and `token_env` in
+//! [`crate::types`], all of which are consistently left off the list.
 //!
 //! The mirror of `sbproxy-vault`'s host-backed reference set is a mirror
 //! and not a call, because `sbproxy-config` does not depend on that
@@ -269,130 +312,414 @@ const SCRIPT_BODY_KEYS: &[&str] = &["lua_script", "js_script", "rego_module"];
 const RESOLVABLE_BRACE_PREFIXES: &[&str] = &["env.", "vars.", "variables."];
 
 /// One config key whose value the proxy opens on the host filesystem:
-/// the key as authored, the parent key that scopes the match, and the
-/// remedy the refusal offers.
+/// the key as authored, the parent key that scopes the match, the remedy
+/// the refusal offers, and an optional test on the value.
 #[derive(Debug)]
 struct HostFileKey {
     /// The mapping key that must own this one, or `None` when the key
     /// name is unambiguous anywhere in a document. `path` is why this
     /// exists: refusing every `path` in a document would refuse a
-    /// `source:` block's own repository path and half the runtime
-    /// vocabulary with it.
+    /// `source:` block's own repository path, `health_check.path`, and
+    /// half the routing vocabulary with it.
+    ///
+    /// A parent is the only discriminator this shape has, which is a
+    /// real limit worth stating: `action.path` is a host path when the
+    /// storage action's sibling `backend:` is `local` and meaningless
+    /// otherwise, and this entry refuses it either way. That is the safe
+    /// direction today because no other action puts a `path` directly
+    /// under `action:`; an action that needs one would have to teach
+    /// this struct about sibling keys.
     parent: Option<&'static str>,
     /// The key as authored.
     key: &'static str,
     /// What the operator does instead, rendered into the refusal. Named
-    /// after the key that actually exists on that module, because a
-    /// remedy naming a key the module does not have is worse than no
-    /// remedy at all.
+    /// after something that exists, because a remedy naming a key the
+    /// module does not have is worse than no remedy at all. The message
+    /// adds the layer-level remedy that every one of these shares.
     remedy: &'static str,
+    /// When set, the key names a host path only for values this answers
+    /// `true` for. `agent_skills[].url` is why: it is a fetched URL for
+    /// an `https://` value and a host file read for anything else
+    /// (`crates/sbproxy-modules/src/projections/agent_skills.rs:341-347`),
+    /// so a name-only entry would either miss the read or refuse the
+    /// documented remote form.
+    host_path_value: Option<fn(&str) -> bool>,
 }
 
 impl HostFileKey {
-    /// Whether `key`, sitting directly under `parent_key`, is this entry.
-    fn matches(&self, parent_key: Option<&str>, key: &str) -> bool {
-        self.key == key && (self.parent.is_none() || self.parent == parent_key)
+    /// Whether `key`, sitting directly under `parent_key` and carrying
+    /// `value`, is this entry.
+    ///
+    /// A value that is not a string where a path belongs is refused
+    /// rather than waved through: the module that reads it would reject
+    /// it anyway, and fail-closed is the direction this boundary picks
+    /// everywhere else.
+    fn refuses(&self, parent_key: Option<&str>, key: &str, value: &serde_yaml::Value) -> bool {
+        if self.key != key || (self.parent.is_some() && self.parent != parent_key) {
+            return false;
+        }
+        let Some(text) = value.as_str() else {
+            // A value that is not a string where a path belongs is a
+            // config error the module would reject anyway; refusing is
+            // the fail-closed side.
+            return true;
+        };
+        if !document_chose_the_path(text) {
+            return false;
+        }
+        match self.host_path_value {
+            None => true,
+            Some(is_host_path) => is_host_path(text),
+        }
     }
 }
 
+/// Whether the *document* chose this path, as opposed to naming a value
+/// the node supplies.
+///
+/// A whole-value `${VAR}` with no `:-default` is the node's choice:
+/// [`ConfinementPolicy::remote_document`] keeps `${VAR}` on purpose, the
+/// pre-parse pass resolves it from the environment of the machine that
+/// compiles, and an unset variable fails closed through
+/// [`crate::unresolved_env_references`]. Refusing that spelling would be
+/// the no-legal-spelling trap for real: `proxy.cluster.state_dir` is
+/// required for a clustered node, and it is a path, so a document that
+/// could not name it even through the node's own environment could not
+/// configure a cluster at all.
+///
+/// Everything else is the document's choice and is refused: a literal, a
+/// `${VAR:-/etc/cron.d}` whose default the document wrote, and any value
+/// with text around the placeholder, because the bytes around it come
+/// from the document.
+///
+/// Under [`ConfinementPolicy::sealed`] the question does not arise: a
+/// fragment's `${VAR}` is refused by the environment scan a moment
+/// later, with a message about the variable rather than about the key.
+fn document_chose_the_path(value: &str) -> bool {
+    let trimmed = value.trim();
+    let Some(inner) = trimmed
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+    else {
+        return true;
+    };
+    // A second `${` inside means this is not one whole-value
+    // placeholder, and `:-` means the document wrote the fallback.
+    inner.is_empty() || inner.contains("${") || inner.contains(":-")
+}
+
+/// Whether an `agent_skills[]` entry's `url` is read off this host.
+///
+/// `resolve_artifact_bytes`
+/// (`crates/sbproxy-modules/src/projections/agent_skills.rs:341-347`)
+/// fetches an absolute `http(s)` URL and, for anything else, strips the
+/// leading slashes and reads `workspace_root.join(rest)` off the disk,
+/// serving the bytes to clients. So the remote form stays legal and
+/// every other form is a host read.
+fn agent_skill_url_is_a_host_path(value: &str) -> bool {
+    let trimmed = value.trim();
+    !(trimmed.starts_with("https://") || trimmed.starts_with("http://"))
+}
+
 /// Config keys whose value is a path the proxy opens on the host
-/// filesystem while it builds the pipeline.
+/// filesystem or writes to it.
 ///
 /// Two of them are read by the compiler itself: `rego_module_path` in
 /// `resolve_rego_modifier_module`
 /// (`crates/sbproxy-config/src/compiler.rs:590`) at compile and again on
 /// every reload, and `module_path`, its spelling on `policy: rego` and
 /// on `transforms[] type: wasm`. The rest are opened by module
-/// constructors that `CompiledPipeline::from_config` runs, which is why
-/// "the compiler has exactly one host-file read" was true and beside the
-/// point (WOR-2433 re-review). Each entry names its enforcer:
+/// constructors that `CompiledPipeline::from_config` runs, by the
+/// extension loader, or at boot, which is why "the compiler has exactly
+/// one host-file read" was true and beside the point (WOR-2433
+/// re-review). Each entry names the function that opens it, and where
+/// two config keys reach the same read, the entry names the function
+/// that chooses between them rather than the read site:
 ///
 /// * `spec_file` - `crates/sbproxy-modules/src/policy/openapi_validation.rs:140`
 /// * `sha1_file` - `crates/sbproxy-modules/src/policy/exposed_creds.rs:112`
 /// * `transcode.descriptor_set` - `crates/sbproxy-modules/src/action/grpc.rs:135`
-/// * `bulk_list.path` - `crates/sbproxy-modules/src/action/mod.rs:786`, the
-///   worst of them, because the file's contents become the redirect
-///   targets the proxy serves and so come back out over HTTP
-/// * `feed.cache_dir` - `crates/sbproxy-modules/src/policy/waf/feed.rs:838`,
-///   a directory the feed subscriber reads and writes
+/// * `bulk_list.path` - `crates/sbproxy-modules/src/action/mod.rs:786`; the
+///   file's contents become the redirect targets the proxy serves, so
+///   they come back out over HTTP
+/// * `feed.cache_dir` and `feed.cache_file` -
+///   `WafFeedConfig::cache_path` (`crates/sbproxy-modules/src/policy/waf/feed.rs:227`),
+///   which returns `cache_file` **in preference to** `cache_dir`, so
+///   listing only the directory left the guard bypassable by its own
+///   sibling. The path is read (`feed.rs:838`), its parent is created
+///   (`:873`) and the fetched bundle plus a `.sig` sibling are written
+///   to it (`:887,:890`)
 /// * `spec_path` - `crates/sbproxy-modules/src/action/mcp.rs:5903`
 /// * `argument_policies[].path` and `result_policies[].path` -
 ///   `crates/sbproxy-modules/src/action/mcp.rs:2419,2749`
-/// * `agent_skills[].path` -
-///   `crates/sbproxy-modules/src/projections/agent_skills.rs:330`, which
-///   is `bulk_list`'s twin: the bytes are served to clients
+/// * `agent_skills[].path` and `agent_skills[].url` -
+///   `resolve_artifact_bytes`
+///   (`crates/sbproxy-modules/src/projections/agent_skills.rs:323-347`),
+///   which reads either one and serves the bytes to clients
+/// * `action.path` - `resolve_local_root`
+///   (`crates/sbproxy-modules/src/action/storage.rs:193`) roots an
+///   object store at it and the storage action serves everything under
+///   it over HTTP; `reject_traversal` (`:552`) rejects `..` but not an
+///   absolute `/`
+/// * `detector_config.model_path`, `.tokenizer_path`,
+///   `.model_signature_path`, `.tokenizer_signature_path` -
+///   `crates/sbproxy-modules/src/policy/prompt_injection_v2/inprocess.rs:65,68,291,293`
+/// * `bundles.bundles_dir` - `crates/sbproxy-config/src/extensions.rs:42`,
+///   which loads extension *code* from a host directory
+/// * `tool_versioning.lockfile` -
+///   `crates/sbproxy-modules/src/action/mcp.rs:727`
+/// * `proxy.ai_providers_file` - `crates/sbproxy-config/src/types.rs:1905`,
+///   read at boot by `crates/sbproxy-core/src/server/lifecycle.rs:1663`
+/// * `store.path`, `usage_sinks[].path`, `backend.path` - the durable
+///   sinks: the key-management store, the AI usage ledger, and the
+///   filesystem cache reserve, each of which creates and writes the
+///   path it is given
+/// * `tls_cert_file`, `tls_key_file`, `security.cert_file`,
+///   `security.key_file`, `security.ca_file`, `authority_dir`,
+///   `signing_key_file`, `verifying_key_file`, `state_dir`,
+///   `model_host.store_path`, `model_host.catalog_file` - node identity
+///   and node state. An authority bundle cannot reach these anyway,
+///   because [`crate::AUTHORITY_DENIED_PATHS`] denies `proxy.*` at the
+///   path level; they are here for the git path, where a `source:` block
+///   supplies the whole document and no deny list applies
 ///
 /// A document that may name one of these can name any path the proxy
-/// process can open, which is a host-file read handed to whoever writes
-/// the document. The root config keeps the power because the operator
-/// owns the filesystem.
+/// process can open, which is a host-file read, or write, handed to
+/// whoever writes the document. The root config keeps the power because
+/// the operator owns the filesystem.
 ///
 /// This list is a list, not a rule, so it is exactly as wide as its
-/// entries and no wider. It was assembled by reading every host read in
-/// `sbproxy-modules` (`rg 'std::fs::read' crates/sbproxy-modules/src`)
-/// and keeping the ones whose path comes from a config key; run that
-/// again when auditing it. There is deliberately no count ratchet over
-/// that grep: the crate's own tests read files too, so a count would go
-/// red on a new test rather than on a new host-file key, which is a
-/// guard that trains people to bump a number. What the list cannot see
-/// is stated in the module docs under "What this boundary does not
-/// stop".
+/// entries and no wider. It was assembled by sweeping every
+/// `pub <name>(path|file|dir):` config field in `sbproxy-config` and
+/// `sbproxy-modules` and every `std::fs::{read,write,create_dir,File}`
+/// in `sbproxy-modules` back to the key that supplies the path; run that
+/// sweep again when auditing it. There is deliberately no count ratchet
+/// over the greps: the crates' own tests read files too, so a count
+/// would go red on a new test rather than on a new host-file key, which
+/// is a guard that trains people to bump a number. What the list cannot
+/// see is stated in the module docs under "What this boundary does not
+/// stop", and every entry is pinned by name in
+/// `a_document_naming_a_host_file_key_is_refused`.
+///
+/// Keys that take the *name* of an environment variable rather than a
+/// path are deliberately absent; see the module docs for why.
 const HOST_FILE_KEYS: &[HostFileKey] = &[
     HostFileKey {
         parent: None,
         key: "rego_module_path",
         remedy: "carry the module inline under `rego_module`",
+        host_path_value: None,
     },
     HostFileKey {
         parent: None,
         key: "module_path",
         remedy: "carry the module inline under `module` (a Rego policy) or under \
                  `module_bytes` (a wasm transform)",
+        host_path_value: None,
     },
     HostFileKey {
         parent: None,
         key: "spec_file",
         remedy: "carry the OpenAPI document inline under `spec`",
+        host_path_value: None,
     },
     HostFileKey {
         parent: None,
         key: "sha1_file",
         remedy: "carry the hashes inline under `sha1_hashes`",
+        host_path_value: None,
     },
     HostFileKey {
         parent: Some("transcode"),
         key: "descriptor_set",
-        remedy: "set the descriptor path in the root config the operator owns",
+        remedy: "leave the descriptor set to the layer this node owns; it has no inline form",
+        host_path_value: None,
     },
     HostFileKey {
         parent: Some("bulk_list"),
         key: "path",
         remedy: "carry the rows inline under `rows`, or serve the list over https with `url`",
+        host_path_value: None,
     },
     HostFileKey {
         parent: Some("feed"),
         key: "cache_dir",
-        remedy: "set the cache directory in the root config the operator owns",
+        remedy: "leave the cache location unset and take the subscriber's default",
+        host_path_value: None,
+    },
+    HostFileKey {
+        parent: Some("feed"),
+        key: "cache_file",
+        remedy: "leave the cache location unset and take the subscriber's default",
+        host_path_value: None,
     },
     HostFileKey {
         parent: None,
         key: "spec_path",
         remedy: "carry the OpenAPI document inline under `spec`",
+        host_path_value: None,
     },
     HostFileKey {
         parent: Some("argument_policies"),
         key: "path",
         remedy: "carry the policy source inline under `source`",
+        host_path_value: None,
     },
     HostFileKey {
         parent: Some("result_policies"),
         key: "path",
         remedy: "carry the policy source inline under `source`",
+        host_path_value: None,
     },
     HostFileKey {
         parent: Some("agent_skills"),
         key: "path",
         remedy: "carry the artifact inline under `body`",
+        host_path_value: None,
+    },
+    HostFileKey {
+        parent: Some("agent_skills"),
+        key: "url",
+        remedy: "give the entry an absolute `https://` url, or carry the artifact inline \
+                 under `body`",
+        host_path_value: Some(agent_skill_url_is_a_host_path),
+    },
+    HostFileKey {
+        parent: Some("action"),
+        key: "path",
+        remedy: "serve the objects from a cloud backend (`s3`, `gcs`, `azure`)",
+        host_path_value: None,
+    },
+    HostFileKey {
+        parent: Some("detector_config"),
+        key: "model_path",
+        remedy: "leave the detector's files to the layer this node owns",
+        host_path_value: None,
+    },
+    HostFileKey {
+        parent: Some("detector_config"),
+        key: "tokenizer_path",
+        remedy: "leave the detector's files to the layer this node owns",
+        host_path_value: None,
+    },
+    HostFileKey {
+        parent: Some("detector_config"),
+        key: "model_signature_path",
+        remedy: "leave the detector's files to the layer this node owns",
+        host_path_value: None,
+    },
+    HostFileKey {
+        parent: Some("detector_config"),
+        key: "tokenizer_signature_path",
+        remedy: "leave the detector's files to the layer this node owns",
+        host_path_value: None,
+    },
+    HostFileKey {
+        parent: Some("bundles"),
+        key: "bundles_dir",
+        remedy: "declare the bundle as a `sources:` entry with its own digest, or leave \
+                 the directory to the layer this node owns",
+        host_path_value: None,
+    },
+    HostFileKey {
+        parent: Some("tool_versioning"),
+        key: "lockfile",
+        remedy: "leave the lockfile path to the layer this node owns",
+        host_path_value: None,
+    },
+    HostFileKey {
+        parent: Some("proxy"),
+        key: "ai_providers_file",
+        remedy: "leave the provider catalog to the layer this node owns, or take the \
+                 catalog compiled into the binary",
+        host_path_value: None,
+    },
+    HostFileKey {
+        parent: Some("store"),
+        key: "path",
+        remedy: "leave the store path to the layer this node owns",
+        host_path_value: None,
+    },
+    HostFileKey {
+        parent: Some("usage_sinks"),
+        key: "path",
+        remedy: "send the events to a `webhook` sink, or leave the file path to the layer \
+                 this node owns",
+        host_path_value: None,
+    },
+    HostFileKey {
+        parent: Some("backend"),
+        key: "path",
+        remedy: "use the `memory` backend, or leave the reserve path to the layer this \
+                 node owns",
+        host_path_value: None,
+    },
+    HostFileKey {
+        parent: None,
+        key: "tls_cert_file",
+        remedy: "leave this node's certificate to the layer it owns",
+        host_path_value: None,
+    },
+    HostFileKey {
+        parent: None,
+        key: "tls_key_file",
+        remedy: "leave this node's key to the layer it owns",
+        host_path_value: None,
+    },
+    HostFileKey {
+        parent: Some("security"),
+        key: "cert_file",
+        remedy: "leave this node's certificate to the layer it owns",
+        host_path_value: None,
+    },
+    HostFileKey {
+        parent: Some("security"),
+        key: "key_file",
+        remedy: "leave this node's key to the layer it owns",
+        host_path_value: None,
+    },
+    HostFileKey {
+        parent: Some("security"),
+        key: "ca_file",
+        remedy: "leave the cluster CA to the layer this node owns",
+        host_path_value: None,
+    },
+    HostFileKey {
+        parent: None,
+        key: "authority_dir",
+        remedy: "leave the enrollment authority directory to the layer this node owns",
+        host_path_value: None,
+    },
+    HostFileKey {
+        parent: None,
+        key: "signing_key_file",
+        remedy: "leave the signing key to the layer this node owns",
+        host_path_value: None,
+    },
+    HostFileKey {
+        parent: None,
+        key: "verifying_key_file",
+        remedy: "leave the verifying key to the layer this node owns",
+        host_path_value: None,
+    },
+    HostFileKey {
+        parent: None,
+        key: "state_dir",
+        remedy: "leave this node's durable state directory to the layer it owns",
+        host_path_value: None,
+    },
+    HostFileKey {
+        parent: Some("model_host"),
+        key: "store_path",
+        remedy: "leave the revision store to the layer this node owns",
+        host_path_value: None,
+    },
+    HostFileKey {
+        parent: Some("model_host"),
+        key: "catalog_file",
+        remedy: "take the model catalog compiled into the binary, or leave the file to \
+                 the layer this node owns",
+        host_path_value: None,
     },
 ];
 
@@ -666,8 +993,10 @@ pub enum ConfinedTemplateError {
         "externally authored config `{fragment}` sets `{path}`, which the proxy opens on the \
          host filesystem while it builds the pipeline. A document authored somewhere other \
          than the host it runs on may not name a path on that host: the file belongs to \
-         whoever runs the proxy. Instead, {remedy}. See the `Confined fragments` section of \
-         docs/configuration.md."
+         whoever runs the proxy. Instead, {remedy}. The layer this node owns keeps the \
+         power: the local document on a config-authority node, or the pointer file through \
+         `source:` `kind: git_overlay` over a `kind: local` base on a git-sourced one. See \
+         the `Confined fragments` section of docs/configuration.md."
     )]
     HostFileInlining {
         /// Caller-supplied label for the document, for the operator.
@@ -902,7 +1231,7 @@ impl Resolver<'_> {
                     let child = join_path(path, &key_name);
                     if let Some(entry) = HOST_FILE_KEYS
                         .iter()
-                        .find(|entry| entry.matches(parent_key, key_name.as_str()))
+                        .find(|entry| entry.refuses(parent_key, key_name.as_str(), val))
                     {
                         if !self.policy.host_file_inlining {
                             return Err(ConfinedTemplateError::HostFileInlining {
@@ -1613,34 +1942,294 @@ mod tests {
         }
     }
 
+    /// Every entry in [`HOST_FILE_KEYS`], written out by hand, in the
+    /// shape the real config has: the sequence keys as sequences, the
+    /// scoped keys under the parent that scopes them.
+    ///
+    /// Literal rather than derived from the list, which is the point.
+    /// The previous version of this test iterated `HOST_FILE_KEYS`
+    /// itself, so it passed on the two-entry list it was written to
+    /// widen and would keep passing if an entry were deleted
+    /// (WOR-2433 re-review). Deleting an entry now goes red here, and
+    /// adding one without a case goes red on the count assertion below.
+    const REFUSED_HOST_FILE_DOCUMENTS: &[(&str, &str)] = &[
+        (
+            "rego_module_path",
+            "origins:\n  api:\n    request_modifiers:\n      - rego_module_path: /etc/sbproxy/x.rego\n",
+        ),
+        (
+            "module_path",
+            "origins:\n  api:\n    transforms:\n      - type: wasm\n        module_path: /etc/sbproxy/x.wasm\n",
+        ),
+        (
+            "spec_file",
+            "origins:\n  api:\n    policies:\n      - type: openapi_validation\n        spec_file: /etc/sbproxy/openapi.yaml\n",
+        ),
+        (
+            "sha1_file",
+            "origins:\n  api:\n    policies:\n      - type: exposed_credentials\n        sha1_file: /etc/shadow\n",
+        ),
+        (
+            "descriptor_set",
+            "origins:\n  api:\n    action:\n      type: grpc\n      transcode:\n        descriptor_set: /etc/sbproxy/x.pb\n",
+        ),
+        (
+            "bulk_list.path",
+            "origins:\n  api:\n    action:\n      type: redirect\n      bulk_list:\n        type: file\n        path: /etc/passwd\n",
+        ),
+        (
+            "feed.cache_dir",
+            "origins:\n  api:\n    policies:\n      - type: waf\n        feed:\n          cache_dir: /etc/cron.d\n",
+        ),
+        (
+            "feed.cache_file",
+            "origins:\n  api:\n    policies:\n      - type: waf\n        feed:\n          cache_file: /etc/cron.d/sbproxy\n",
+        ),
+        (
+            "spec_path",
+            "origins:\n  api:\n    action:\n      type: mcp\n      federated_servers:\n        - origin: upstream\n          spec_path: /etc/sbproxy/openapi.json\n",
+        ),
+        (
+            "argument_policies.path",
+            "origins:\n  api:\n    action:\n      type: mcp\n      argument_policies:\n        - name: guard\n          path: /etc/sbproxy/guard.rego\n",
+        ),
+        (
+            "result_policies.path",
+            "origins:\n  api:\n    action:\n      type: mcp\n      result_policies:\n        - name: guard\n          path: /etc/sbproxy/guard.rego\n",
+        ),
+        (
+            "agent_skills.path",
+            "agent_skills:\n  - name: skill\n    url: https://example.test/skill.md\n    path: /etc/passwd\n",
+        ),
+        (
+            "agent_skills.url",
+            "agent_skills:\n  - name: skill\n    url: /../../../../etc/passwd\n",
+        ),
+        (
+            "action.path",
+            "origins:\n  api:\n    action:\n      type: storage\n      backend: local\n      path: /\n",
+        ),
+        (
+            "detector_config.model_path",
+            "origins:\n  api:\n    policies:\n      - type: prompt_injection_v2\n        detector_config:\n          model_path: /etc/sbproxy/model.onnx\n",
+        ),
+        (
+            "detector_config.tokenizer_path",
+            "origins:\n  api:\n    policies:\n      - type: prompt_injection_v2\n        detector_config:\n          tokenizer_path: /etc/sbproxy/tokenizer.json\n",
+        ),
+        (
+            "detector_config.model_signature_path",
+            "origins:\n  api:\n    policies:\n      - type: prompt_injection_v2\n        detector_config:\n          model_signature_path: /etc/sbproxy/model.sig\n",
+        ),
+        (
+            "detector_config.tokenizer_signature_path",
+            "origins:\n  api:\n    policies:\n      - type: prompt_injection_v2\n        detector_config:\n          tokenizer_signature_path: /etc/sbproxy/tokenizer.sig\n",
+        ),
+        (
+            "bundles.bundles_dir",
+            "extensions:\n  bundles:\n    bundles_dir: /etc/sbproxy/bundles\n",
+        ),
+        (
+            "tool_versioning.lockfile",
+            "origins:\n  api:\n    action:\n      type: mcp\n      tool_versioning:\n        lockfile: /etc/sbproxy/mcp.lock\n",
+        ),
+        (
+            "proxy.ai_providers_file",
+            "proxy:\n  ai_providers_file: /etc/sbproxy/providers.yaml\n",
+        ),
+        (
+            "store.path",
+            "proxy:\n  key_management:\n    store:\n      backend: embedded\n      path: /etc/sbproxy/keys.redb\n",
+        ),
+        (
+            "usage_sinks.path",
+            "origins:\n  api:\n    ai:\n      usage_sinks:\n        - type: jsonl_file\n          path: /etc/sbproxy/usage.jsonl\n",
+        ),
+        (
+            "backend.path",
+            "proxy:\n  cache_reserve:\n    backend:\n      type: filesystem\n      path: /etc/sbproxy/reserve\n",
+        ),
+        (
+            "tls_cert_file",
+            "proxy:\n  tls_cert_file: /etc/sbproxy/tls.crt\n",
+        ),
+        (
+            "tls_key_file",
+            "proxy:\n  tls_key_file: /etc/sbproxy/tls.key\n",
+        ),
+        (
+            "security.cert_file",
+            "proxy:\n  cluster:\n    security:\n      cert_file: /etc/sbproxy/node.crt\n",
+        ),
+        (
+            "security.key_file",
+            "proxy:\n  cluster:\n    security:\n      key_file: /etc/sbproxy/node.key\n",
+        ),
+        (
+            "security.ca_file",
+            "proxy:\n  cluster:\n    security:\n      ca_file: /etc/sbproxy/ca.crt\n",
+        ),
+        (
+            "authority_dir",
+            "proxy:\n  cluster:\n    enrollment:\n      authority_dir: /etc/sbproxy/authority\n",
+        ),
+        (
+            "signing_key_file",
+            "proxy:\n  cluster:\n    deployment_authority:\n      signing_key_file: /etc/sbproxy/sign.key\n",
+        ),
+        (
+            "verifying_key_file",
+            "proxy:\n  cluster:\n    deployment_authority:\n      verifying_key_file: /etc/sbproxy/verify.pub\n",
+        ),
+        (
+            "state_dir",
+            "proxy:\n  cluster:\n    state_dir: /var/lib/sbproxy\n",
+        ),
+        (
+            "model_host.store_path",
+            "proxy:\n  model_host:\n    store_path: /var/lib/sbproxy/models\n",
+        ),
+        (
+            "model_host.catalog_file",
+            "proxy:\n  model_host:\n    catalog_file: /etc/sbproxy/catalog.yaml\n",
+        ),
+    ];
+
     #[test]
-    fn every_host_file_key_is_refused_under_the_parent_that_scopes_it() {
-        // The guard is exactly as wide as this list, so the list is what
-        // the test walks: an entry added without a refusal, or a
-        // parent-scoped entry that stopped matching, fails here rather
-        // than in production (WOR-2433 re-review, "a guard narrower than
-        // its claim").
-        for entry in HOST_FILE_KEYS {
-            let leaf = serde_json::json!({ entry.key: "/etc/sbproxy/host-owned" });
-            let document = match entry.parent {
-                None => serde_json::json!({ "origins": { "api": leaf } }),
-                Some(parent) => serde_json::json!({ "origins": { "api": { parent: leaf } } }),
-            };
-            let yaml = serde_yaml::to_string(&document).expect("fixture serializes");
-            let error = check_confined_document(
+    fn a_document_naming_a_host_file_key_is_refused() {
+        assert_eq!(
+            REFUSED_HOST_FILE_DOCUMENTS.len(),
+            HOST_FILE_KEYS.len(),
+            "every HOST_FILE_KEYS entry needs a literal case here, and every case an entry",
+        );
+        for (name, document) in REFUSED_HOST_FILE_DOCUMENTS {
+            let error = match check_confined_document(
                 "acme/runtime-config",
-                &yaml,
+                document,
                 &ConfinementPolicy::remote_document(),
-            )
-            .expect_err("a key on the host-file list must be refused");
+            ) {
+                Ok(()) => panic!("`{name}` opens a host path and must be refused"),
+                Err(error) => error,
+            };
             match &error {
                 ConfinedTemplateError::HostFileInlining { path, remedy, .. } => {
-                    assert!(path.ends_with(entry.key), "{path}");
-                    assert_eq!(*remedy, entry.remedy);
+                    let key = name.rsplit('.').next().expect("a key name");
+                    assert!(
+                        path.ends_with(key),
+                        "`{name}` was refused at `{path}`, which is not the key it names",
+                    );
+                    assert!(!remedy.is_empty(), "`{name}` has no remedy");
                 }
-                other => panic!("expected a HostFileInlining refusal, got {other:?}"),
+                other => panic!("expected a HostFileInlining refusal for `{name}`, got {other:?}"),
             }
+            assert!(
+                !error.to_string().contains("/etc/passwd"),
+                "the refusal echoed the path it refused: {error}",
+            );
         }
+    }
+
+    #[test]
+    fn a_host_file_key_the_node_parameterizes_is_not_refused() {
+        // The host-path half of the boundary is about who chose the
+        // path, not about the key existing. A whole-value `${VAR}` is
+        // the node's choice: `remote_document` keeps that spelling, the
+        // pre-parse pass resolves it from the compiling machine's
+        // environment, and an unset variable fails closed. Refusing it
+        // would make `proxy.cluster.state_dir`, which a clustered node
+        // must set and which is a path, impossible to configure from a
+        // confined document at all.
+        let policy = ConfinementPolicy::remote_document();
+        check_confined_document(
+            "acme/runtime-config",
+            "proxy:\n  cluster:\n    state_dir: \"${SB_STATE_DIR}\"\n",
+            &policy,
+        )
+        .expect("a path the node supplies through its own environment is not the document's");
+
+        for chosen in [
+            "proxy:\n  cluster:\n    state_dir: /var/lib/sbproxy\n",
+            "proxy:\n  cluster:\n    state_dir: \"${SB_STATE_DIR:-/etc/cron.d}\"\n",
+            "proxy:\n  cluster:\n    state_dir: \"/srv/${SB_TENANT}\"\n",
+        ] {
+            let error = check_confined_document("acme/runtime-config", chosen, &policy)
+                .expect_err("a path the document chose is refused");
+            assert!(
+                matches!(error, ConfinedTemplateError::HostFileInlining { .. }),
+                "{error:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn an_agent_skill_url_that_is_remote_is_still_allowed() {
+        // The value-aware half of `agent_skills[].url`.
+        // `resolve_artifact_bytes` fetches an absolute http(s) URL and
+        // reads anything else off this host, so a name-only entry would
+        // have had to choose between missing the read and refusing the
+        // documented remote form.
+        check_confined_document(
+            "acme/runtime-config",
+            "agent_skills:\n  - name: skill\n    url: https://example.test/skill.md\n",
+            &ConfinementPolicy::remote_document(),
+        )
+        .expect("an absolute https url is fetched, not read off this host");
+    }
+
+    #[test]
+    fn a_confined_document_may_name_its_shared_key_as_a_variable() {
+        // The justification for `source.confine` defaulting to off used
+        // to say that sealing a git source would leave a clustered node
+        // with no legal spelling for its cluster secret, because
+        // `proxy.cluster.security.shared_key` accepts only `env:` and
+        // `file:`. That is false, and this is the test that says so:
+        // `remote_document` keeps `${VAR}`, the pre-parse pass
+        // substitutes it, and the shared-key validator runs on the
+        // substituted value against the 16-byte inline floor. The
+        // default is still off, for the reasons the module docs now
+        // give (a fail-closed upgrade on running fleets, and host paths
+        // having no substitute spelling), and this pins the correction
+        // so a future reader does not decide the default on a claim
+        // that was never true (WOR-2433 re-review).
+        let _env = EnvVarGuard::set(&[
+            (SECRET_VAR, Some(SECRET_VALUE)),
+            (
+                "SBPROXY_CONFINED_TEST_STATE_DIR",
+                Some("/var/lib/sbproxy/confined-test"),
+            ),
+        ]);
+        assert!(
+            SECRET_VALUE.len() >= 16,
+            "the fixture value has to clear the inline-entropy floor",
+        );
+        let document = format!(
+            "proxy:\n  http_bind_port: 8080\n  cluster:\n    cluster_id: prod-a\n    node_id: worker-a\n    roles: [gateway]\n    state_dir: \"${{SBPROXY_CONFINED_TEST_STATE_DIR}}\"\n    security:\n      mode: shared_key\n      development: true\n      shared_key: \"${{{SECRET_VAR}}}\"\norigins:\n  \"edge.example.com\":\n    action:\n      type: proxy\n      url: https://test.sbproxy.dev\n"
+        );
+
+        check_confined_document(
+            "acme/runtime-config",
+            &document,
+            &ConfinementPolicy::remote_document(),
+        )
+        .expect("a confined document may still name a per-node variable");
+        crate::compile_config(&document)
+            .expect("the substituted shared key clears the inline-entropy floor");
+
+        // The contrast, and the half of the round-1 reasoning that does
+        // hold: the documented `env:` spelling is refused, so this is a
+        // migration cost rather than an impossibility.
+        let with_env_reference =
+            document.replace(&format!("${{{SECRET_VAR}}}"), &format!("env:{SECRET_VAR}"));
+        let error = check_confined_document(
+            "acme/runtime-config",
+            &with_env_reference,
+            &ConfinementPolicy::remote_document(),
+        )
+        .expect_err("`env:` is the spelling confinement does take away");
+        assert!(
+            matches!(error, ConfinedTemplateError::HostSecretReference { .. }),
+            "{error:?}",
+        );
     }
 
     #[test]
