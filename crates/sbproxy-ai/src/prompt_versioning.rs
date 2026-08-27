@@ -319,7 +319,58 @@ impl Drop for PromptDrawProbe {
 
 // --- Store ---
 
-type PromptRolloutSnapshot = std::sync::Arc<[WeightedPromptVersion]>;
+/// One published rollout: its canonical version list plus the exact
+/// selection prefix derived from it once, at publication.
+///
+/// The prefix and the aggregate total are immutable for the life of the
+/// snapshot, and selection runs on the live AI request path. Re-deriving
+/// them per request cost a 64-version rollout on the order of 130 heap
+/// allocations of multi-hundred-bit integers purely to recompute a
+/// constant. Nothing about the exactness changes: these are the same
+/// `2^-1074`-unit integers `exact_weight_units` produced inside the
+/// selection loop before.
+#[derive(Debug)]
+struct PublishedRollout {
+    versions: std::sync::Arc<[WeightedPromptVersion]>,
+    /// `cumulative_units(..=i) << 64` for each version, in canonical
+    /// order, so selection compares `draw * total` against it directly.
+    cumulative_shifted: Vec<BigUint>,
+    /// Exact aggregate weight, or the `f64` an invalid total reports.
+    total: Result<BigUint, f64>,
+}
+
+impl PublishedRollout {
+    fn new(versions: Vec<WeightedPromptVersion>) -> Self {
+        let total = exact_rollout_total(versions.iter().map(|version| &version.weight));
+        let mut cumulative = BigUint::default();
+        let cumulative_shifted = versions
+            .iter()
+            .map(|version| {
+                cumulative += exact_weight_units(version.weight);
+                &cumulative << 64usize
+            })
+            .collect();
+        Self {
+            versions: versions.into(),
+            cumulative_shifted,
+            total,
+        }
+    }
+}
+
+impl std::ops::Deref for PublishedRollout {
+    type Target = [WeightedPromptVersion];
+
+    fn deref(&self) -> &Self::Target {
+        &self.versions
+    }
+}
+
+fn published_rollout(versions: Vec<WeightedPromptVersion>) -> PromptRolloutSnapshot {
+    std::sync::Arc::new(PublishedRollout::new(versions))
+}
+
+type PromptRolloutSnapshot = std::sync::Arc<PublishedRollout>;
 type PromptStoreSnapshot = std::sync::Arc<HashMap<String, PromptRolloutSnapshot>>;
 
 fn exact_weight_units(weight: f64) -> BigUint {
@@ -482,7 +533,7 @@ impl WeightedPromptStore {
         stored.sort_by_key(|version| version.version);
 
         let mut replacement = clone_store_for_publication(&current);
-        let stored: PromptRolloutSnapshot = stored.into();
+        let stored = published_rollout(stored);
         #[cfg(test)]
         run_prompt_publication_hook(PromptPublicationEvent::PublicationNameCloned {
             operation: PromptPublicationOperation::AddVersion,
@@ -516,7 +567,7 @@ impl WeightedPromptStore {
             operation: PromptPublicationOperation::AddVersion,
             name_bytes: name.len(),
         });
-        replacement.insert(name.to_string(), stored.into());
+        replacement.insert(name.to_string(), published_rollout(stored));
         let retired = {
             let mut live = self.versions.lock();
             debug_assert!(std::sync::Arc::ptr_eq(&current, &live));
@@ -575,7 +626,7 @@ impl WeightedPromptStore {
         exact_rollout_total(versions.iter().map(|version| &version.weight))
             .map_err(|total| PromptVersionError::InvalidTotalWeight { total })?;
 
-        let rollout: PromptRolloutSnapshot = versions.into();
+        let rollout = published_rollout(versions);
         let current = self.snapshot();
         let mut replacement = clone_store_for_publication(&current);
         #[cfg(test)]
@@ -664,13 +715,15 @@ impl WeightedPromptStore {
                 name: name.to_string(),
             })?;
 
+        // Derived once at publication: the total is immutable for the life
+        // of this snapshot, and this runs per AI request.
         let total =
-            exact_rollout_total(vs.iter().map(|version| &version.weight)).map_err(|total| {
-                PromptSelectionError::InvalidTotalWeight {
+            vs.total
+                .as_ref()
+                .map_err(|total| PromptSelectionError::InvalidTotalWeight {
                     name: name.to_string(),
-                    total,
-                }
-            })?;
+                    total: *total,
+                })?;
 
         #[cfg(test)]
         run_prompt_callsite_hook(PromptCallsiteEvent::CohortHash {
@@ -691,12 +744,10 @@ impl WeightedPromptStore {
         let unit = ((draw >> 11) as f64) / 9_007_199_254_740_992.0;
         #[cfg(test)]
         PROMPT_UNIT_OBSERVATION.with(|slot| slot.set(Some(unit.to_bits())));
-        let pick = BigUint::from(draw) * &total;
+        let pick = BigUint::from(draw) * total;
 
-        let mut cumulative = BigUint::default();
-        for v in vs.iter() {
-            cumulative += exact_weight_units(v.weight);
-            if pick < (&cumulative << 64usize) {
+        for (v, cumulative_shifted) in vs.versions.iter().zip(vs.cumulative_shifted.iter()) {
+            if pick < *cumulative_shifted {
                 #[cfg(test)]
                 run_prompt_callsite_hook(PromptCallsiteEvent::SelectedContentClone {
                     content_bytes: v.content.len(),

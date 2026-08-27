@@ -51,6 +51,14 @@ impl Experiment {
 // --- Store ---
 
 /// Thread-safe, in-memory experiment store.
+///
+/// # Unbounded: not for live traffic
+///
+/// An offline primitive with no cap and no eviction:
+/// [`ExperimentStore::record`] grows without limit. The bounded,
+/// scope-keyed equivalent an embedder should reach for on a path a
+/// request can drive is [`crate::toolkit::AiToolkitRuntime`], whose
+/// experiment retention is capped per scope and process-wide.
 pub struct ExperimentStore {
     experiments: Mutex<Vec<Experiment>>,
 }

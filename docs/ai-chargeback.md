@@ -182,6 +182,8 @@ let history = vec![
     UsageDataPoint::new(2, 48.0),
     UsageDataPoint::new(3, 51.0),
 ];
+// Each returns None rather than an answer when the series or the budget
+// cannot support one, so a non-finite cost cannot read as "under budget".
 let next_30_days = forecast_spend(&history, 30);
 let over_budget = will_exceed_budget(&history, 1500.0, 30);
 let days_left = days_until_exhaustion(&history, 1500.0); // None if burn rate is zero

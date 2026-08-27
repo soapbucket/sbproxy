@@ -140,10 +140,18 @@ fn main() {
         .map(|day| UsageDataPoint::new(day, bill.total))
         .collect();
     let monthly_budget = 300.0;
-    let projected = forecast_spend(&daily_history, 30);
-    let remaining = remaining_budget(&daily_history, monthly_budget);
-    println!("\nAt today's run rate, projected 30-day spend: ${projected:.2}");
-    println!("Remaining budget under a ${monthly_budget:.2} monthly cap: ${remaining:.2}");
+    // Both refuse rather than answer when the series cannot be summed
+    // exactly, so a poisoned cost cannot read as "you are under budget".
+    match (
+        forecast_spend(&daily_history, 30),
+        remaining_budget(&daily_history, monthly_budget),
+    ) {
+        (Some(projected), Some(remaining)) => {
+            println!("\nAt today's run rate, projected 30-day spend: ${projected:.2}");
+            println!("Remaining budget under a ${monthly_budget:.2} monthly cap: ${remaining:.2}");
+        }
+        _ => println!("\nSpend history could not be summed exactly; no forecast is reported."),
+    }
 }
 
 fn billing_period_from_snapshot(

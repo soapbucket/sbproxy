@@ -54,7 +54,16 @@ fn main() {
     let target_agent = "coding-agent";
     let token = generate_agent_token(target_agent, shared_secret);
     assert!(verify_agent_token(target_agent, &token, shared_secret));
-    println!("\nIssued a token for {target_agent}: {token}");
+    // The token itself is never printed. It is a long-lived, non-expiring
+    // bearer credential, and this file is the template an operator copies:
+    // substituting a real `proxy.ai_toolkit` shared secret and running the
+    // example would otherwise write a working agent credential into shell
+    // history and any CI log that captures stdout. The length and the
+    // round-trip below demonstrate the same thing.
+    println!(
+        "\nIssued a {}-character token for {target_agent}; it verifies against the same secret",
+        token.len()
+    );
 
     // --- 3. Drive a triage -> dispatch workflow with the FSM orchestrator ---
     let states = vec![

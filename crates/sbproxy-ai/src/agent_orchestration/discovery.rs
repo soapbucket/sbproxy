@@ -19,6 +19,14 @@ pub struct AgentCapability {
 }
 
 /// Central registry of agents and their capabilities.
+///
+/// # Unbounded: not for live traffic
+///
+/// An offline primitive with no cap and no eviction:
+/// [`AgentRegistry::register`] grows without limit and accepts any agent
+/// id and capability an embedder hands it. The bounded equivalent, which
+/// compiles one immutable generation from configuration and keys every
+/// entry by tenant and origin, is [`crate::toolkit::AiToolkitRuntime`].
 pub struct AgentRegistry {
     agents: Mutex<HashMap<String, Vec<AgentCapability>>>,
 }

@@ -40,6 +40,16 @@ impl PromptScore {
 // --- Scorer ---
 
 /// Thread-safe store that accumulates prompt scores and computes aggregates.
+///
+/// # Unbounded: not for live traffic
+///
+/// This is an offline primitive. It never evicts, has no cap, and
+/// [`PromptScore::prompt`] holds the prompt text verbatim, so wiring
+/// [`PromptScorer::record`] to live requests grows the process by the full
+/// text of every prompt and makes [`PromptScorer::rank_prompts`] quadratic
+/// under the lock. Use it against a recorded dataset, and reach for the
+/// bounded, scope-keyed [`crate::toolkit::AiToolkitRuntime`] when the
+/// caller is a request rather than an operator.
 pub struct PromptScorer {
     scores: Mutex<Vec<PromptScore>>,
 }

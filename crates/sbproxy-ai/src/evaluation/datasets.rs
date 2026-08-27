@@ -96,6 +96,15 @@ pub enum DatasetError {
 // --- Store ---
 
 /// Thread-safe, in-memory dataset store.
+///
+/// # Unbounded: not for live traffic
+///
+/// An offline primitive with no cap and no eviction:
+/// [`DatasetStore::save`] grows without limit and retains every entry
+/// verbatim. The bounded equivalent is
+/// [`crate::toolkit::AiToolkitRuntime`], which caps dataset names,
+/// versions, entries, and retained bytes per scope and across the
+/// process.
 pub struct DatasetStore {
     datasets: Mutex<HashMap<(String, u32), Dataset>>,
 }
