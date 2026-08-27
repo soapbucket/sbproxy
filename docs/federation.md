@@ -113,6 +113,10 @@ on every restart.
 
 ## Configuring `proxy.federation`
 
+[`examples/openid-federation`](../examples/openid-federation) is a
+complete `sb.yml` carrying both halves of what follows, with a README
+that walks the served statement and the peer-trust refusal end to end.
+
 The identity half. This is all it takes for the proxy to publish its own
 entity configuration at `/.well-known/openid-federation` on the listener
 it already serves:
@@ -303,6 +307,22 @@ with `event` set to one of:
 - `federation_trust_chain_decision`, fields `outcome`,
   `leaf_entity_id`, and either `trust_anchor_id` plus `chain_len` on
   success or `error` on rejection.
+
+Those three are the crate's own verification steps. The proxy's
+admission decision on top of them is a fourth event at the same target:
+
+- `federation_peer_decision`, field `outcome` (`trusted` or `refused`).
+  On `trusted` it also carries `entity_id`, the value the chain proved,
+  and `trust_anchor_id`, the pinned anchor it reached. On `refused` it
+  carries `reason` (`no_peer_named`, `metadata_policy`, `trust_mark`,
+  or the chain-walk failure) and, for the policy and trust-mark
+  reasons, the `entity_type` or `trust_mark` at fault.
+
+  This is the event that corresponds to the 403, and it fires once per
+  request, including on a cache hit where none of the three above run.
+  The refusal deliberately does not echo the entity id the caller
+  supplied: that string is attacker-chosen on an unauthenticated
+  request, and `reason` says what the walk found without it.
 
 None of these ever log a private key or a raw JWS signature; `iss` /
 `sub` / `id` are the entity and trust-mark URLs the spec already

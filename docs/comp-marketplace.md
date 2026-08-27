@@ -1,6 +1,6 @@
 # CoMP marketplace bridge
 
-*Last modified: 2026-08-22*
+*Last modified: 2026-08-27*
 
 [`sbproxy-licensing`](../crates/sbproxy-licensing) is a standalone
 crate implementing the IAB Content Authorization Marketplace Protocol
@@ -175,6 +175,30 @@ this process serves.
   either as its own process in front of (or alongside) their sbproxy
   deployment, or mounts `sbproxy_licensing::router` into their own
   axum app.
+- **A quote_id this process never issued still redeems.** `redeem`
+  compares `buyer_acceptance.accepted_quote_hash` against the quote the
+  ledger holds for that `quote_id`, so a buyer cannot redeem a quote it
+  altered or one that has expired. It cannot make that comparison for a
+  `quote_id` the ledger has never seen, and it admits rather than
+  refuses in that case, because the ledger is same-process and refusing
+  would break every redeem across a restart. Concretely: a key already
+  in your `BuyerKeyRegistry` can mint a license per call with a
+  fabricated `quote_id`, a fabricated `accepted_quote_hash`, and a
+  payment proof that only has to be shape-valid. Onboarding a buyer key
+  is the trust decision; quoting is not a second one. Revoke through
+  [`RedisRevocation`](../crates/sbproxy-licensing/src/revocation.rs) and
+  treat the OLP token's own audit trail as the record of what was
+  minted.
+- **Quote and redeem signatures are not JCS.** The bytes both
+  signatures cover are `serde_json::to_vec` of the Rust struct, so the
+  field order is the struct's declaration order rather than the sorted
+  key order [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785) defines.
+  A non-Rust CoMP client has to reproduce that order byte for byte to
+  sign or verify; the canonical form is whatever
+  `canonical_quote_signing_input` and `canonical_redeem_signing_input`
+  in
+  [`comp/marketplace.rs`](../crates/sbproxy-licensing/src/comp/marketplace.rs)
+  emit. Moving to JCS is a wire break and is separate scope.
 - **Redeem always picks the first OLP-authorized tier.** `quote_id`
   does not yet carry a durable pointer back to the exact tier it was
   quoted against; a manifest with more than one `Olp`-authorized tier
