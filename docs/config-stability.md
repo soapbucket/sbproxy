@@ -1,6 +1,6 @@
 # Config stability tiers
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-27*
 
 This page defines the stability tiers and applies them to representative or
 high-impact configuration leaves. It also lists the current reviewed
@@ -910,14 +910,14 @@ Nothing about the JSON body changed.
 
 One surface deliberately does not move, and it is a change in its own
 right. `fallback_origin.on_status` is no longer consulted at all on an
-origin with `transcode` or `grpc_web: true`. Both translated modes own
-the response body outright, so a fallback that fired there could commit
-the fallback's status and `content-length` while the body downstream
-stayed the translated one, and a body that does not match its declared
-length desynchronizes a keep-alive connection. `on_error` is unaffected:
-it fires before any upstream response exists, so there is no translated
-body to conflict with. If you need a status fallback on a gRPC upstream,
-put it on a plain-passthrough origin in front of it.
+origin with `transcode` or `grpc_web: true`. Both translated modes build
+the client-facing response body themselves, out of the buffered
+translated payload, and a fallback firing there would serve its own
+response and silently skip the translation the route exists to produce.
+`on_error` is unaffected: it fires before any upstream response exists,
+so there is no translated body to conflict with. If you need a status
+fallback on a gRPC upstream, put it on a plain-passthrough origin in
+front of it.
 
 **What to do before upgrading.** Re-baseline error-rate alerts on the affected
 origins, and check any client that treated a transcoded call as always-2xx and
