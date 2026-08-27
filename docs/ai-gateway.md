@@ -1209,6 +1209,23 @@ flowchart TD
 
 The residual is worth stating plainly rather than hiding behind the guarantee: **a client that half-closes its write side and then silently vanishes keeps its generation running until a write to it fails.** For an HTTP/1 client that simply closes its socket while waiting, that is what happens, and the disconnect is caught at the response write instead of during the generation. What the gateway will not do is guess, because the guess it would have to make cannot be made from a FIN.
 
+**The opt-in, where a half-close really does mean gone.** If you know your callers never half-close after sending, set `cancel_on_half_close: true` on the `ai_proxy` action and the FIN is read as the departure it usually is:
+
+```yaml
+origins:
+  ai.example.com:
+    action:
+      type: ai_proxy
+      cancel_on_half_close: true    # default false
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+```
+
+That is what makes the ordinary HTTP/1 abandonment reachable: a caller whose own deadline fired and closed its socket sends a FIN and nothing else, so with the flag off the generation runs to completion and is billed, and with it on the provider call is dropped where it stands.
+
+Enable it only on that knowledge, because the cost of being wrong is paid by a live caller: a client that half-closes and is still reading has its request cancelled and receives an error instead of the completion it was waiting for. Plain HTTP client libraries do not half-close; hand-rolled tools, some load generators, and a fronting proxy configured to shut the request side down do. The scope is the origin, so it applies to every caller and tenant routed to that action, and it changes exactly one answer: a reset, a read error, an `RST_STREAM` and a `GOAWAY` all cancel with the flag off, and a client that keeps its connection whole is never cancelled with it on. There is still no timer.
+
 **Scope.** The wait for the provider's response header on the sequential non-streaming dispatch path. A streaming response already learns the caller left, from its own per-chunk write failing, and the upstream body is dropped there on the way out. A hedged (`strategy: race`) dispatch and a confidence `cascade` resolve on their own paths and are not watched. A caller who leaves after the response header has arrived is past the window; the generation is already paid for.
 
 **Watching a request never changes how it is billed.** The watch reads the downstream connection without recording anything about it, so a request that was not cancelled is priced exactly as it was before this existed. That matters more than it sounds: the receipt classifier treats a recorded half-close plus a failed delivery as a client disconnect, so a watch that recorded what it saw would have turned provider outages into partially billable client departures on signed documents.

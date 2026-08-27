@@ -1,6 +1,6 @@
 # Observability
-*Last modified: 2026-08-21*
 *Last modified: 2026-08-27*
+
 SBproxy ships metrics, logs, and traces from one process. This guide covers the Wave 1 substrate: the SLO catalog, the metric label budget, the log schema and redaction policy, the trace propagation contract, the health endpoints, the dashboards, and the reference Compose stack you can boot in one command.
 
 This is the umbrella page: the cross-cutting mechanics (sinks, redaction, sampling, correlation ids, spans, dashboards, alerts) live here, and three companion pages own the record shapes and compatibility promises this page only points at. [access-log.md](access-log.md) is the per-request access-log schema (opt-in, one JSON line per completed request). [audit-log.md](audit-log.md) is the admin-action and tamper-evident audit trail (four independently opt-in chained channels). [metrics-stability.md](metrics-stability.md) is the generated catalog of every metric SBproxy emits and what is promised about its name. Start here for how the pillars fit together; go to those three for the field-by-field reference.

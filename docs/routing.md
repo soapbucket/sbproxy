@@ -1,6 +1,6 @@
 # Routing and traffic management
-*Last modified: 2026-08-21*
 *Last modified: 2026-08-27*
+
 How SBproxy decides which upstream serves a request: hostname matching, forward rules, load balancing, protocol-specific actions, failover, and the extension point for custom selection logic. This page is the hub; [configuration.md](configuration.md) is the field-by-field source of truth for every block below.
 
 ![The same hostname routed to different backends by request body content](assets/body-routing.gif)

@@ -376,6 +376,38 @@ pub struct AiHandlerConfig {
     /// hold a connection, a `quota_pool` slot, and an upstream generation.
     #[serde(default)]
     pub max_request_timeout_ms: Option<u64>,
+    /// Treat a downstream HTTP/1 half-close before any response byte as
+    /// the client having left, and cancel the in-flight provider call
+    /// (WOR-2690).
+    ///
+    /// Defaults to `false`, which is the safe reading. RFC 9112 section
+    /// 9.6 lets a client shut down its write half and go on reading the
+    /// response, and on the wire that polite half-close is byte-for-byte
+    /// the same event as a client that walked away: one FIN, with
+    /// nothing to tell them apart short of writing to the socket. Off,
+    /// the gateway declines to guess, and such a client keeps its
+    /// generation until a write to it fails.
+    ///
+    /// Turn it on only when you know your callers never half-close after
+    /// sending, because a caller that does will have its request
+    /// cancelled falsely and receive an error instead of the completion
+    /// it was waiting for. Plain HTTP client libraries do not half-close;
+    /// hand-rolled tools, some load generators, and a fronting proxy
+    /// configured to shut the request side down do.
+    ///
+    /// What it buys is the common HTTP/1 abandonment: a caller whose own
+    /// deadline fired and closed its socket sends a FIN and nothing else,
+    /// so with this off the generation runs to completion and is billed.
+    ///
+    /// Scope is the origin, so this applies to every caller and tenant
+    /// routed to this `ai_proxy` action.
+    ///
+    /// Nothing else changes. A TCP reset or read error on HTTP/1 and an
+    /// `RST_STREAM` or `GOAWAY` on HTTP/2 are unambiguous departures and
+    /// always cancel, on or off. Streaming responses are untouched: they
+    /// learn the client left from their own per-chunk write failing.
+    #[serde(default)]
+    pub cancel_on_half_close: bool,
     /// WOR-1880: optional fair-share quota pool across providers.
     /// When set, each provider attempt reserves against the pool before
     /// dispatch; a deny advances to the next candidate when alternatives
@@ -3191,6 +3223,7 @@ mod tests {
             max_price_per_request: None,
             allow_request_timeout_override: false,
             max_request_timeout_ms: None,
+            cancel_on_half_close: false,
             quota_pool: None,
             rag: None,
             guardrails_pipeline: OnceLock::new(),
@@ -3248,6 +3281,7 @@ mod tests {
             max_price_per_request: None,
             allow_request_timeout_override: false,
             max_request_timeout_ms: None,
+            cancel_on_half_close: false,
             quota_pool: None,
             rag: None,
             guardrails_pipeline: OnceLock::new(),
@@ -3305,6 +3339,7 @@ mod tests {
             max_price_per_request: None,
             allow_request_timeout_override: false,
             max_request_timeout_ms: None,
+            cancel_on_half_close: false,
             quota_pool: None,
             rag: None,
             guardrails_pipeline: OnceLock::new(),
@@ -3363,6 +3398,7 @@ mod tests {
             max_price_per_request: None,
             allow_request_timeout_override: false,
             max_request_timeout_ms: None,
+            cancel_on_half_close: false,
             quota_pool: None,
             rag: None,
             guardrails_pipeline: OnceLock::new(),

@@ -311,8 +311,23 @@ enum DownstreamLiveness {
     Inconclusive,
 }
 
-/// Watch the downstream connection for a hard disconnect, and resolve
-/// only when there is one (WOR-2690).
+/// Watch the downstream connection for a disconnect, and resolve only
+/// when there is one (WOR-2690).
+///
+/// `half_close_is_departure` is the origin's `cancel_on_half_close`. Off
+/// (the default) only an unambiguous break counts, and a bare HTTP/1 FIN
+/// does not: RFC 9112 section 9.6 makes it byte-for-byte identical to a
+/// client that has simply finished sending, and cancelling on it would
+/// abort live callers. On, the operator has told us their callers never
+/// half-close after sending, and the FIN is read as the departure it
+/// usually is.
+///
+/// The flag changes which answers count, never how or when the
+/// connection is read. There is no separate pre-dispatch look and no
+/// timing rule: this is a real await, so a FIN already queued when the
+/// race arms resolves on the first poll and one that lands mid-generation
+/// resolves when it lands. Both are the same code path, and neither
+/// depends on winning a scheduler race.
 ///
 /// Deliberately built on Pingora's `idle()` rather than on
 /// `read_body_or_idle()`, and the difference is not stylistic. On
@@ -326,18 +341,32 @@ enum DownstreamLiveness {
 /// would price `client_disconnected` instead, turning a free outcome
 /// into a partially billable one on a signed document. `idle()` reads
 /// the same byte and touches no flag, so watching a request cannot
-/// change how a request that was never cancelled is billed.
+/// change how a request that was never cancelled is billed. That holds
+/// with `cancel_on_half_close` on as well: a request this cancels is
+/// classified by the error it returns, never by session state.
 ///
 /// Never resolves while the client is merely slow: a connected caller
 /// that is sending nothing leaves this pending for as long as the
-/// provider takes.
-async fn downstream_hard_disconnect(session: &mut Session) -> DownstreamLiveness {
+/// provider takes, whatever the flag says.
+async fn downstream_hard_disconnect(
+    session: &mut Session,
+    half_close_is_departure: bool,
+) -> DownstreamLiveness {
     use pingora_core::protocols::http::ServerSession;
 
     match session.as_downstream_mut() {
-        // `Ok(0)` is a FIN and `Ok(n)` is a pipelined byte; both are
-        // `Inconclusive`. Only the read itself failing is a departure.
         ServerSession::H1(h1) => match h1.idle().await {
+            // A FIN. Ambiguous by construction, so it is a departure
+            // only where the operator has said it is one.
+            Ok(0) if half_close_is_departure => DownstreamLiveness::Gone(Error::explain(
+                ErrorType::ConnectionClosed,
+                "downstream half-closed before any response byte, and this origin sets \
+                 cancel_on_half_close",
+            )),
+            // `Ok(0)` without the opt-in is the half-close the gateway
+            // declines to read as a departure; `Ok(n)` is a pipelined
+            // byte, which is the next request rather than a departure
+            // whatever the flag says.
             Ok(_) => DownstreamLiveness::Inconclusive,
             Err(error) => DownstreamLiveness::Gone(error),
         },
@@ -345,7 +374,9 @@ async fn downstream_hard_disconnect(session: &mut Session) -> DownstreamLiveness
         // `GOAWAY` and on a connection-level error. HTTP/2 has no
         // half-close to confuse this with: a client that is done sending
         // ends its stream without ending the response, and that does not
-        // resolve here.
+        // resolve here. `cancel_on_half_close` is therefore irrelevant
+        // to an HTTP/2 caller, which is why the flag's documentation
+        // says so.
         ServerSession::H2(h2) => match h2.idle().await {
             Ok(reason) => DownstreamLiveness::Gone(Error::explain(
                 ErrorType::H2Error,
@@ -413,14 +444,14 @@ mod downstream_liveness_tests {
 
         let observed = tokio::time::timeout(
             Duration::from_secs(2),
-            downstream_hard_disconnect(&mut session),
+            downstream_hard_disconnect(&mut session, false),
         )
         .await
         .expect("a queued FIN resolves the watch");
 
         assert!(
             matches!(observed, DownstreamLiveness::Inconclusive),
-            "a half-close is not a departure"
+            "a half-close is not a departure by default"
         );
         assert!(
             !crate::server::proxy_http::downstream_half_closed(&session),
@@ -447,7 +478,7 @@ mod downstream_liveness_tests {
 
         let observed = tokio::time::timeout(
             Duration::from_secs(2),
-            downstream_hard_disconnect(&mut session),
+            downstream_hard_disconnect(&mut session, false),
         )
         .await
         .expect("a reset resolves the watch");
@@ -467,13 +498,57 @@ mod downstream_liveness_tests {
 
         let observed = tokio::time::timeout(
             Duration::from_millis(250),
-            downstream_hard_disconnect(&mut session),
+            downstream_hard_disconnect(&mut session, false),
         )
         .await;
 
         assert!(
             observed.is_err(),
             "a live client must never resolve the watch"
+        );
+    }
+
+    /// `cancel_on_half_close` changes exactly one answer: the FIN. The
+    /// operator has asserted their callers do not half-close after
+    /// sending, so the ambiguity the default declines to resolve is
+    /// resolved their way.
+    #[tokio::test]
+    async fn a_half_close_is_a_departure_under_the_opt_in() {
+        let (mut session, mut client) = live_h1_session().await;
+        client.shutdown().await.expect("half-close the client");
+
+        let observed = tokio::time::timeout(
+            Duration::from_secs(2),
+            downstream_hard_disconnect(&mut session, true),
+        )
+        .await
+        .expect("a queued FIN resolves the watch");
+
+        assert!(
+            matches!(observed, DownstreamLiveness::Gone(_)),
+            "with the opt-in on, a half-close is the client leaving"
+        );
+        assert!(
+            !crate::server::proxy_http::downstream_half_closed(&session),
+            "the opt-in changes which answers cancel, never what the watch records"
+        );
+    }
+
+    /// The opt-in must not turn a quiet client into a departure. Only the
+    /// FIN moves.
+    #[tokio::test]
+    async fn a_connected_client_stays_pending_under_the_opt_in() {
+        let (mut session, _client) = live_h1_session().await;
+
+        let observed = tokio::time::timeout(
+            Duration::from_millis(250),
+            downstream_hard_disconnect(&mut session, true),
+        )
+        .await;
+
+        assert!(
+            observed.is_err(),
+            "a live client must never resolve the watch, opt-in or not"
         );
     }
 }
@@ -12600,7 +12675,10 @@ pub(super) async fn handle_ai_proxy(
                     // on a single nested `.await` added to this path,
                     // while every unit test stayed green.
                     None if cancel_on_client_disconnect => {
-                        let mut watch = Box::pin(downstream_hard_disconnect(session));
+                        let mut watch = Box::pin(downstream_hard_disconnect(
+                            session,
+                            config.cancel_on_half_close,
+                        ));
                         // Biased so a provider response that is already
                         // in hand wins a tie. Having paid for the answer,
                         // the cheapest thing left to do with it is try to
@@ -20548,8 +20626,13 @@ mod external_guardrail_context_tests {
         enum DownstreamClose {
             /// `SO_LINGER` at zero, then close: the peer's connection is
             /// broken and the gateway's next read fails. This is the
-            /// hard signal, and the only shape that cancels.
+            /// hard signal, and it cancels whatever the origin config
+            /// says.
             Reset,
+            /// Shut the write half down and go on reading, which is the
+            /// RFC 9112 section 9.6 shape. Cancels only where the origin
+            /// sets `cancel_on_half_close`.
+            HalfClose,
         }
 
         /// A downstream client that keeps both halves of its connection
@@ -20607,6 +20690,25 @@ mod external_guardrail_context_tests {
                                     #[allow(deprecated)]
                                     let _ = stream.set_linger(Some(Duration::ZERO));
                                 }
+                                DownstreamClose::HalfClose => {
+                                    // Write side only. The read half
+                                    // stays open, which is precisely
+                                    // what makes this shape ambiguous:
+                                    // a client doing it may still be
+                                    // waiting for the response.
+                                    let _ = stream.shutdown().await;
+                                    // Keep reading, so the socket is not
+                                    // dropped and the FIN is the only
+                                    // thing the gateway ever sees.
+                                    loop {
+                                        match stream.read(&mut chunk).await {
+                                            Ok(0) | Err(_) => return response,
+                                            Ok(read) => {
+                                                response.extend_from_slice(&chunk[..read]);
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             return response;
                         }
@@ -20650,6 +20752,13 @@ mod external_guardrail_context_tests {
         }
 
         fn disconnect_probe_config(upstream_url: &str) -> sbproxy_ai::AiHandlerConfig {
+            disconnect_probe_config_with_opt_in(upstream_url, false)
+        }
+
+        fn disconnect_probe_config_with_opt_in(
+            upstream_url: &str,
+            cancel_on_half_close: bool,
+        ) -> sbproxy_ai::AiHandlerConfig {
             sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
                 "providers": [{
                     "name": "openai",
@@ -20657,7 +20766,8 @@ mod external_guardrail_context_tests {
                     "base_url": upstream_url,
                     "allow_private_base_url": true,
                     "api_key": "fixture-key"
-                }]
+                }],
+                "cancel_on_half_close": cancel_on_half_close
             }))
             .expect("single-provider disconnect fixture config")
         }
@@ -20843,10 +20953,11 @@ mod external_guardrail_context_tests {
 
         /// RFC 9112 section 9.6 lets a client shut its write side and go
         /// on reading, and that FIN is byte-for-byte what a departure
-        /// looks like. It never cancels, so a client that half-closes on
-        /// its way in is served exactly as it always was.
+        /// looks like. By default it never cancels, so a client that
+        /// half-closes on its way in is served exactly as it always was.
+        /// The opt-in that changes this answer is exercised below.
         #[tokio::test]
-        async fn a_client_that_half_closed_on_its_way_in_is_still_served() {
+        async fn a_half_close_does_not_cancel_while_the_opt_in_is_off() {
             let (upstream_url, upstream) = slow_upstream_fixture(Duration::from_millis(400)).await;
             let config = disconnect_probe_config(&upstream_url);
             let pipeline = crate::pipeline::CompiledPipeline::default();
@@ -20930,6 +21041,135 @@ mod external_guardrail_context_tests {
             );
             drop(session);
             drop(client);
+        }
+
+        /// The opt-in, at the seam an operator actually configures: one
+        /// boolean on the `ai_proxy` action, and the FIN that was
+        /// tolerated a test above now cancels the provider call and
+        /// bills the request as a client disconnect.
+        ///
+        /// The half-close arrives while the race is armed, which is the
+        /// shape the flag exists for: a caller whose own deadline fired
+        /// mid-generation. A FIN already queued when the race arms takes
+        /// the same path, because the watch is a real await rather than
+        /// a look taken once.
+        #[tokio::test]
+        async fn a_half_close_cancels_when_the_operator_opts_in() {
+            let (upstream_url, upstream) = slow_upstream_fixture(Duration::from_secs(8)).await;
+            let config = disconnect_probe_config_with_opt_in(&upstream_url, true);
+            let pipeline = crate::pipeline::CompiledPipeline::default();
+            let (mut session, close, client) = downstream_session_closing_on_demand(
+                disconnect_probe_request(),
+                DownstreamClose::HalfClose,
+            )
+            .await;
+            let mut context = crate::context::RequestContext::new();
+
+            let SlowUpstream {
+                dispatched,
+                outcome,
+            } = upstream;
+            let dispatch = super::super::handle_ai_proxy(
+                &mut session,
+                &config,
+                &pipeline,
+                "ai.test",
+                &mut context,
+                None,
+            );
+            let walk_away = async {
+                dispatched.await.expect("the provider received the request");
+                let _ = close.send(());
+            };
+            let (result, ()) = tokio::join!(dispatch, walk_away);
+
+            let error = result.expect_err("the opt-in reads a half-close as a departure");
+            assert_eq!(
+                *error.esource(),
+                pingora_error::ErrorSource::Downstream,
+                "the failure has to read as the client's: {error}"
+            );
+            assert!(context.ai_upstream_cancelled_on_client_disconnect);
+            assert!(
+                crate::server::proxy_http::client_disconnected(
+                    Some(error.esource().clone()),
+                    crate::server::proxy_http::downstream_half_closed(&session),
+                ),
+                "an opted-in cancellation must settle as client_disconnected"
+            );
+            let observed = tokio::time::timeout(Duration::from_secs(5), outcome)
+                .await
+                .expect("the provider connection settles once the client is gone")
+                .expect("slow upstream fixture");
+            assert_eq!(
+                observed,
+                SlowUpstreamOutcome::Abandoned,
+                "the provider connection must be closed, not left generating"
+            );
+            drop(session);
+            drop(client);
+        }
+
+        /// The opt-in must buy the FIN and nothing else. A caller that
+        /// keeps its connection whole is still a caller, however long the
+        /// provider takes, because there is still no timer anywhere in
+        /// this.
+        #[tokio::test]
+        async fn a_connected_client_is_not_cancelled_under_the_opt_in() {
+            let (upstream_url, upstream) = slow_upstream_fixture(Duration::from_millis(400)).await;
+            let config = disconnect_probe_config_with_opt_in(&upstream_url, true);
+            let pipeline = crate::pipeline::CompiledPipeline::default();
+            let (mut session, _close, client) = downstream_session_closing_on_demand(
+                disconnect_probe_request(),
+                DownstreamClose::Reset,
+            )
+            .await;
+            let mut context = crate::context::RequestContext::new();
+
+            super::super::handle_ai_proxy(
+                &mut session,
+                &config,
+                &pipeline,
+                "ai.test",
+                &mut context,
+                None,
+            )
+            .await
+            .expect("a connected client's request is served with the opt-in on");
+            assert!(!context.ai_upstream_cancelled_on_client_disconnect);
+            drop(session);
+            let response = live_downstream_body(client).await;
+
+            assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+            let observed = tokio::time::timeout(Duration::from_secs(5), upstream.outcome)
+                .await
+                .expect("the provider fixture settles")
+                .expect("slow upstream fixture");
+            assert_eq!(observed, SlowUpstreamOutcome::Answered);
+        }
+
+        /// The config key itself, because a flag the dispatcher reads
+        /// correctly from a struct nobody can populate is not a feature.
+        #[test]
+        fn the_opt_in_is_off_unless_the_operator_writes_it() {
+            let without = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+                "providers": [{"name": "openai", "api_key": "fixture-key"}]
+            }))
+            .expect("config without the key");
+            assert!(
+                !without.cancel_on_half_close,
+                "the safe reading is the default"
+            );
+
+            let with = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+                "providers": [{"name": "openai", "api_key": "fixture-key"}],
+                "cancel_on_half_close": true
+            }))
+            .expect("config with the key");
+            assert!(
+                with.cancel_on_half_close,
+                "an operator who writes the key gets it"
+            );
         }
 
         /// The one risk this change's own commit message calls out, made
