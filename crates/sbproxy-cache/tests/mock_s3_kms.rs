@@ -49,6 +49,7 @@ fn sample_config() -> S3ReserveConfig {
         prefix: Some("reserve/".into()),
         replication_target_bucket: None,
         sse_kms_bucket_default: false,
+        max_size_bytes: 1_048_576,
     }
 }
 
@@ -58,6 +59,30 @@ fn sample_config() -> S3ReserveConfig {
 fn encode_meta_blob(metadata: &ReserveMetadata) -> String {
     let json = serde_json::to_vec(metadata).expect("serialize metadata");
     base64::engine::general_purpose::STANDARD.encode(json)
+}
+
+fn envelope_aad_v2(
+    config: &S3ReserveConfig,
+    logical_key: &str,
+    object_key: &str,
+    meta_blob: &str,
+) -> Vec<u8> {
+    fn push_component(aad: &mut Vec<u8>, component: &[u8]) {
+        aad.extend_from_slice(&(component.len() as u64).to_be_bytes());
+        aad.extend_from_slice(component);
+    }
+
+    let mut aad = b"sbproxy-cache-reserve-s3-aad-v2".to_vec();
+    for component in [
+        config.bucket.as_bytes(),
+        config.prefix.as_deref().unwrap_or("").as_bytes(),
+        logical_key.as_bytes(),
+        object_key.as_bytes(),
+        meta_blob.as_bytes(),
+    ] {
+        push_component(&mut aad, component);
+    }
+    aad
 }
 
 /// Fixed 32-byte data key the KMS mock returns.
@@ -134,17 +159,12 @@ async fn put_then_get_round_trip_decrypts_body() {
     // the original plaintext.
     let nonce = [42u8; 12];
     let plaintext = b"hello world";
-    let ciphertext = aes256gcm_encrypt(
-        &FAKE_DATA_KEY,
-        &nonce,
-        plaintext,
-        b"sbproxy-cache-reserve-s3-v1",
-    )
-    .expect("seal");
-
     let b64 = base64::engine::general_purpose::STANDARD;
+    let config = sample_config();
     let metadata = sample_metadata();
     let meta_blob = encode_meta_blob(&metadata);
+    let aad = envelope_aad_v2(&config, "k", "reserve/k", &meta_blob);
+    let ciphertext = aes256gcm_encrypt(&FAKE_DATA_KEY, &nonce, plaintext, &aad).expect("seal");
     let wrapped_b64 = b64.encode(FAKE_WRAPPED_KEY);
     let nonce_b64 = b64.encode(nonce);
 
@@ -154,7 +174,7 @@ async fn put_then_get_round_trip_decrypts_body() {
             GetObjectOutput::builder()
                 .body(ByteStream::from(ciphertext.clone()))
                 .metadata("sbproxy-meta", meta_blob.clone())
-                .metadata("sbproxy-encryption", "envelope-aes256gcm")
+                .metadata("sbproxy-encryption", "envelope-aes256gcm-v2")
                 .metadata("sbproxy-wrapped-key", wrapped_b64.clone())
                 .metadata("sbproxy-nonce", nonce_b64.clone())
                 .build()
@@ -171,7 +191,7 @@ async fn put_then_get_round_trip_decrypts_body() {
         });
     let kms = mock_client!(aws_sdk_kms, RuleMode::Sequential, &[&decrypt_rule]);
 
-    let reserve = S3Reserve::with_clients(sample_config(), s3, kms);
+    let reserve = S3Reserve::with_clients(config, s3, kms);
     let got = reserve.get("k").await.expect("get ok").expect("hit");
     assert_eq!(got.0.as_ref(), plaintext.as_slice());
     assert_eq!(got.1.size, 11);

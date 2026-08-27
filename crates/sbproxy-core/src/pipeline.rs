@@ -858,6 +858,7 @@ fn build_cache_reserve(
             prefix: prefix.clone(),
             replication_target_bucket: replication_target_bucket.clone(),
             sse_kms_bucket_default: *sse_kms_bucket_default,
+            max_size_bytes: cfg.max_size_bytes,
         }) {
             Ok(r) => Some(Arc::new(r)),
             Err(e) => {

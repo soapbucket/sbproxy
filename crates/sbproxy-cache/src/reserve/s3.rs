@@ -28,10 +28,9 @@
 //! `ReserveMetadata` grows a field (it already has once, gaining
 //! `headers`, since that backend was last synced), where a whole-struct
 //! blob round-trips automatically. The AWS SDK client is built lazily
-//! on first use behind a `tokio::sync::Mutex`, mirroring
-//! [`super::redis::RedisReserve`]'s lazy `ConnectionManager`, so
-//! constructing an [`S3Reserve`] from a YAML config block never needs
-//! an async context.
+//! on first use through a `tokio::sync::OnceCell`, so concurrent first
+//! use performs one initialization while constructing an [`S3Reserve`]
+//! from YAML still needs no async context.
 //!
 //! S3 combines the size of every `x-amz-meta-*` key and value into one
 //! 2 KiB budget per object. The `sbproxy-meta` blob competes with the
@@ -44,7 +43,6 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
-use aws_config::BehaviorVersion;
 use aws_sdk_kms::primitives::Blob;
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::primitives::ByteStream;
@@ -54,7 +52,7 @@ use bytes::Bytes;
 use sbproxy_security::crypto::{
     aes256gcm_decrypt, aes256gcm_encrypt, random_aes_gcm_nonce, AES256_KEY_LEN, AES_GCM_NONCE_LEN,
 };
-use tokio::sync::Mutex;
+use tokio::sync::OnceCell;
 use tracing::{debug, instrument, warn};
 use zeroize::Zeroizing;
 
@@ -62,17 +60,25 @@ use super::{CacheReserveBackend, ReserveMetadata};
 
 /// Whole-`ReserveMetadata` blob: base64(json(metadata)).
 const META_META: &str = "sbproxy-meta";
-/// `"envelope-aes256gcm"` or `"sse-kms"`.
+/// Versioned envelope mode or `"sse-kms"`.
 const META_ENCRYPTION: &str = "sbproxy-encryption";
 /// base64(KMS-wrapped data key). Present only in envelope mode.
 const META_WRAPPED_KEY: &str = "sbproxy-wrapped-key";
 /// base64(AES-GCM nonce). Present only in envelope mode.
 const META_NONCE: &str = "sbproxy-nonce";
 
-/// AAD bound into every seal. Distinct from other AES-256-GCM users of
-/// [`sbproxy_security::crypto`] so a ciphertext sealed for one purpose
-/// cannot be replayed as another's.
-const AAD: &[u8] = b"sbproxy-cache-reserve-s3-v1";
+/// AES-GCM appends one 128-bit authentication tag to the stored
+/// ciphertext. The configured object limit applies to plaintext, so
+/// envelope-mode reads allow exactly this much storage overhead.
+const AES_GCM_TAG_LEN: u64 = 16;
+
+/// Legacy envelopes used a process-constant AAD and are not safe to
+/// read as key-bound objects.
+const ENCRYPTION_ENVELOPE_V1: &str = "envelope-aes256gcm";
+/// Current envelope format. Its AAD binds storage and cache identity.
+const ENCRYPTION_ENVELOPE_V2: &str = "envelope-aes256gcm-v2";
+/// Domain separator and wire-version marker for the canonical v2 AAD.
+const AAD_V2_DOMAIN: &[u8] = b"sbproxy-cache-reserve-s3-aad-v2";
 
 /// Soft warning threshold for [`S3Reserve::evict_expired`]. Past this
 /// many listed objects, a HEAD-per-object sweep is expensive enough
@@ -102,6 +108,8 @@ pub struct S3ReserveConfig {
     /// encryption. `put`/`get` never call `KMS:GenerateDataKey` or
     /// `KMS:Decrypt` in this mode.
     pub sse_kms_bucket_default: bool,
+    /// Maximum allowed object size in bytes.
+    pub max_size_bytes: u64,
 }
 
 /// S3-backed reserve with AWS KMS envelope encryption.
@@ -113,7 +121,7 @@ pub struct S3ReserveConfig {
 /// cheaply cloneable (reference-counted internally by the SDK).
 pub struct S3Reserve {
     config: S3ReserveConfig,
-    clients: Mutex<Option<(aws_sdk_s3::Client, aws_sdk_kms::Client)>>,
+    clients: OnceCell<(aws_sdk_s3::Client, aws_sdk_kms::Client)>,
 }
 
 impl std::fmt::Debug for S3Reserve {
@@ -161,7 +169,7 @@ impl S3Reserve {
         }
         Ok(Self {
             config,
-            clients: Mutex::new(None),
+            clients: OnceCell::new(),
         })
     }
 
@@ -172,9 +180,11 @@ impl S3Reserve {
         s3: aws_sdk_s3::Client,
         kms: aws_sdk_kms::Client,
     ) -> Self {
+        let clients = OnceCell::new();
+        let _ = clients.set((s3, kms));
         Self {
             config,
-            clients: Mutex::new(Some((s3, kms))),
+            clients,
         }
     }
 
@@ -192,24 +202,16 @@ impl S3Reserve {
     }
 
     /// Return the cached AWS clients, building them on first call.
-    ///
-    /// Mirrors [`super::redis::RedisReserve::conn`]'s lazy-init
-    /// pattern: the lock is held only long enough to clone the cached
-    /// pair or install a freshly built one.
     async fn clients(&self) -> anyhow::Result<(aws_sdk_s3::Client, aws_sdk_kms::Client)> {
-        let mut guard = self.clients.lock().await;
-        if let Some((s3, kms)) = guard.as_ref() {
-            return Ok((s3.clone(), kms.clone()));
-        }
-        let region = aws_sdk_s3::config::Region::new(self.config.region.clone());
-        let aws_cfg = aws_config::defaults(BehaviorVersion::latest())
-            .region(region)
-            .load()
-            .await;
-        let s3 = aws_sdk_s3::Client::new(&aws_cfg);
-        let kms = aws_sdk_kms::Client::new(&aws_cfg);
-        *guard = Some((s3.clone(), kms.clone()));
-        Ok((s3, kms))
+        let (s3, kms) = self.clients.get_or_init(|| async {
+            let region = aws_sdk_s3::config::Region::new(self.config.region.clone());
+            let aws_cfg = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                .region(region)
+                .load()
+                .await;
+            (aws_sdk_s3::Client::new(&aws_cfg), aws_sdk_kms::Client::new(&aws_cfg))
+        }).await;
+        Ok((s3.clone(), kms.clone()))
     }
 }
 
@@ -300,15 +302,61 @@ fn decode_meta_blob(blob: &str) -> anyhow::Result<ReserveMetadata> {
     serde_json::from_slice(&json).map_err(|e| anyhow::anyhow!("decode reserve metadata json: {e}"))
 }
 
+fn exceeds_size_limit(size: u64, limit: u64) -> bool {
+    limit > 0 && size > limit
+}
+
+/// Build an unambiguous, versioned AAD value for one envelope.
+///
+/// Each component is length-prefixed, so no delimiter or concatenation
+/// ambiguity can map two cache identities to the same authenticated
+/// bytes. `meta_blob` is the exact base64 metadata value stored in S3;
+/// changing status, headers, expiry, or any later `ReserveMetadata`
+/// field therefore invalidates authentication before it is trusted.
+fn envelope_aad_v2(
+    config: &S3ReserveConfig,
+    logical_key: &str,
+    object_key: &str,
+    meta_blob: &str,
+) -> Vec<u8> {
+    fn push_component(aad: &mut Vec<u8>, component: &[u8]) {
+        aad.extend_from_slice(&(component.len() as u64).to_be_bytes());
+        aad.extend_from_slice(component);
+    }
+
+    let prefix = config.prefix.as_deref().unwrap_or("");
+    let mut aad = Vec::with_capacity(
+        AAD_V2_DOMAIN.len()
+            + config.bucket.len()
+            + prefix.len()
+            + logical_key.len()
+            + object_key.len()
+            + meta_blob.len()
+            + 5 * std::mem::size_of::<u64>(),
+    );
+    aad.extend_from_slice(AAD_V2_DOMAIN);
+    push_component(&mut aad, config.bucket.as_bytes());
+    push_component(&mut aad, prefix.as_bytes());
+    push_component(&mut aad, logical_key.as_bytes());
+    push_component(&mut aad, object_key.as_bytes());
+    push_component(&mut aad, meta_blob.as_bytes());
+    aad
+}
+
 // --- Trait impl ---
 
 #[async_trait]
 impl CacheReserveBackend for S3Reserve {
     #[instrument(skip(self, value, metadata), fields(bucket = %self.config.bucket, size = value.len()))]
     async fn put(&self, key: &str, value: Bytes, metadata: ReserveMetadata) -> anyhow::Result<()> {
-        let (s3, kms) = self.clients().await?;
+        if exceeds_size_limit(value.len() as u64, self.config.max_size_bytes) {
+            return Err(anyhow::anyhow!(
+                "S3 cache reserve value exceeds maximum object size"
+            ));
+        }
         let object_key = self.object_key(key);
         let meta_blob = encode_meta_blob(&metadata)?;
+        let (s3, kms) = self.clients().await?;
 
         let mut user_meta: HashMap<String, String> = HashMap::new();
         let body_bytes = if self.config.sse_kms_bucket_default {
@@ -318,14 +366,15 @@ impl CacheReserveBackend for S3Reserve {
         } else {
             let dk = generate_data_key(&kms, &self.config.kms_key_id).await?;
             let nonce = random_aes_gcm_nonce();
-            let ciphertext = aes256gcm_encrypt(&dk.plaintext, &nonce, &value, AAD)?;
+            let aad = envelope_aad_v2(&self.config, key, &object_key, &meta_blob);
+            let ciphertext = aes256gcm_encrypt(&dk.plaintext, &nonce, &value, &aad)?;
             // The plaintext key's binding is dropped as soon as
             // encryption finishes; `Zeroizing` scrubs the bytes here
             // rather than leaving them for the allocator to reuse.
             drop(dk.plaintext);
             user_meta.insert(
                 META_ENCRYPTION.to_string(),
-                "envelope-aes256gcm".to_string(),
+                ENCRYPTION_ENVELOPE_V2.to_string(),
             );
             user_meta.insert(
                 META_WRAPPED_KEY.to_string(),
@@ -392,21 +441,54 @@ impl CacheReserveBackend for S3Reserve {
             .and_then(|m| m.get(META_META))
             .ok_or_else(|| anyhow::anyhow!("S3 object missing {META_META} metadata"))?;
         let metadata = decode_meta_blob(meta_blob)?;
-
-        let body_bytes = resp
-            .body
-            .collect()
-            .await
-            .map_err(|e| anyhow::anyhow!("S3 GetObject body collect failed: {e}"))?
-            .into_bytes();
-
         let mode = user_meta
             .as_ref()
             .and_then(|m| m.get(META_ENCRYPTION))
-            .map(String::as_str)
-            .unwrap_or("envelope-aes256gcm");
-        let plaintext = if mode == "sse-kms" {
-            body_bytes.to_vec()
+            .map(String::as_str);
+        if mode.is_none() || mode == Some(ENCRYPTION_ENVELOPE_V1) {
+            return Err(anyhow::anyhow!(
+                "legacy S3 cache reserve envelope v1 is not key-bound; object must be rewritten"
+            ));
+        }
+        if mode != Some("sse-kms") && mode != Some(ENCRYPTION_ENVELOPE_V2) {
+            return Err(anyhow::anyhow!(
+                "unsupported S3 cache reserve encryption version"
+            ));
+        }
+        let stored_size_limit = if self.config.max_size_bytes == 0 {
+            0
+        } else if mode == Some("sse-kms") {
+            self.config.max_size_bytes
+        } else {
+            self.config
+                .max_size_bytes
+                .saturating_add(AES_GCM_TAG_LEN)
+        };
+        if let Some(declared) = resp.content_length() {
+            if declared < 0 || exceeds_size_limit(declared as u64, stored_size_limit) {
+                return Err(anyhow::anyhow!(
+                    "S3 cache reserve object exceeds maximum object size"
+                ));
+            }
+        }
+        let mut body = resp.body;
+        let mut body_bytes = Vec::new();
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk
+                .map_err(|e| anyhow::anyhow!("S3 GetObject body stream failed: {e}"))?;
+            if exceeds_size_limit(
+                (body_bytes.len() as u64).saturating_add(chunk.len() as u64),
+                stored_size_limit,
+            ) {
+                return Err(anyhow::anyhow!(
+                    "S3 cache reserve object exceeds maximum object size"
+                ));
+            }
+            body_bytes.extend_from_slice(&chunk);
+        }
+
+        let plaintext = if mode == Some("sse-kms") {
+            body_bytes
         } else {
             let wrapped_b64 = user_meta
                 .as_ref()
@@ -426,8 +508,15 @@ impl CacheReserveBackend for S3Reserve {
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("nonce has wrong length"))?;
             let dk = unwrap_data_key(&kms, &self.config.kms_key_id, &wrapped).await?;
-            aes256gcm_decrypt(&dk, &nonce, &body_bytes, AAD)?
+            let aad = envelope_aad_v2(&self.config, key, &object_key, meta_blob);
+            aes256gcm_decrypt(&dk, &nonce, &body_bytes, &aad)?
         };
+
+        if exceeds_size_limit(plaintext.len() as u64, self.config.max_size_bytes) {
+            return Err(anyhow::anyhow!(
+                "S3 cache reserve plaintext exceeds maximum object size"
+            ));
+        }
 
         debug!(key = %key, object_key = %object_key, size = plaintext.len(), "cache reserve s3 get ok");
         Ok(Some((Bytes::from(plaintext), metadata)))
@@ -567,6 +656,7 @@ mod tests {
             prefix: prefix.map(|s| s.to_string()),
             replication_target_bucket: None,
             sse_kms_bucket_default: false,
+            max_size_bytes: 1_048_576,
         }
     }
 
@@ -577,11 +667,11 @@ mod tests {
         use aws_sdk_s3::config::Region;
         let region = Region::new("us-west-2");
         let cfg_s3 = aws_sdk_s3::Config::builder()
-            .behavior_version(BehaviorVersion::latest())
+            .behavior_version(aws_config::BehaviorVersion::latest())
             .region(region.clone())
             .build();
         let cfg_kms = aws_sdk_kms::Config::builder()
-            .behavior_version(BehaviorVersion::latest())
+            .behavior_version(aws_config::BehaviorVersion::latest())
             .region(region)
             .build();
         S3Reserve::with_clients(
@@ -739,6 +829,7 @@ mod mock_trait_tests {
             prefix: Some("reserve/".into()),
             replication_target_bucket: None,
             sse_kms_bucket_default: false,
+            max_size_bytes: 1_048_576,
         }
     }
 
@@ -764,7 +855,7 @@ mod mock_trait_tests {
         m.insert(META_META.to_string(), encode_meta_blob(md).expect("encode"));
         m.insert(
             META_ENCRYPTION.to_string(),
-            "envelope-aes256gcm".to_string(),
+            ENCRYPTION_ENVELOPE_V2.to_string(),
         );
         m.insert(META_WRAPPED_KEY.to_string(), wrapped_b64.to_string());
         m.insert(META_NONCE.to_string(), nonce_b64.to_string());
@@ -777,6 +868,96 @@ mod mock_trait_tests {
             builder = builder.metadata(k, v);
         }
         builder.build()
+    }
+
+    fn sse_metadata() -> HashMap<String, String> {
+        HashMap::from([
+            (
+                META_META.to_string(),
+                encode_meta_blob(&sample_metadata()).expect("encode metadata"),
+            ),
+            (META_ENCRYPTION.to_string(), "sse-kms".to_string()),
+        ])
+    }
+
+    #[tokio::test]
+    async fn put_rejects_an_oversized_direct_backend_write_before_aws_calls() {
+        let put_rule = mock!(aws_sdk_s3::Client::put_object)
+            .then_output(|| PutObjectOutput::builder().build());
+        let s3 = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&put_rule]);
+        let generate_rule = mock!(aws_sdk_kms::Client::generate_data_key).then_output(|| {
+            GenerateDataKeyOutput::builder()
+                .plaintext(KmsBlob::new(FAKE_DATA_KEY.to_vec()))
+                .ciphertext_blob(KmsBlob::new(FAKE_WRAPPED_KEY.to_vec()))
+                .build()
+        });
+        let kms = mock_client!(aws_sdk_kms, RuleMode::Sequential, &[&generate_rule]);
+        let mut config = sample_config();
+        config.max_size_bytes = 4;
+        let reserve = S3Reserve::with_clients(config, s3, kms);
+
+        let error = reserve
+            .put("too-large", Bytes::from_static(b"12345"), sample_metadata())
+            .await
+            .expect_err("direct backend writes must enforce the object limit");
+
+        assert!(format!("{error:#}").contains("maximum object size"));
+        assert_eq!(generate_rule.num_calls(), 0, "KMS must not be called");
+        assert_eq!(put_rule.num_calls(), 0, "S3 must not be called");
+    }
+
+    #[tokio::test]
+    async fn get_rejects_an_oversized_declared_length_before_reading_the_body() {
+        let get_rule = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
+            let mut builder = GetObjectOutput::builder()
+                .body(ByteStream::from(vec![0_u8; 5]))
+                .content_length(5);
+            for (key, value) in sse_metadata() {
+                builder = builder.metadata(key, value);
+            }
+            builder.build()
+        });
+        let s3 = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&get_rule]);
+        let kms_rule = mock!(aws_sdk_kms::Client::decrypt)
+            .then_output(|| DecryptOutput::builder().build());
+        let kms = mock_client!(aws_sdk_kms, RuleMode::Sequential, &[&kms_rule]);
+        let mut config = sample_config();
+        config.max_size_bytes = 4;
+        let reserve = S3Reserve::with_clients(config, s3, kms);
+
+        let error = reserve
+            .get("too-large")
+            .await
+            .expect_err("declared oversize must fail before body collection");
+
+        assert!(format!("{error:#}").contains("maximum object size"));
+        assert_eq!(kms_rule.num_calls(), 0, "KMS must not be called");
+    }
+
+    #[tokio::test]
+    async fn get_caps_an_oversized_body_when_length_is_absent() {
+        let get_rule = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
+            let mut builder = GetObjectOutput::builder().body(ByteStream::from(vec![0_u8; 5]));
+            for (key, value) in sse_metadata() {
+                builder = builder.metadata(key, value);
+            }
+            builder.build()
+        });
+        let s3 = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&get_rule]);
+        let kms_rule = mock!(aws_sdk_kms::Client::decrypt)
+            .then_output(|| DecryptOutput::builder().build());
+        let kms = mock_client!(aws_sdk_kms, RuleMode::Sequential, &[&kms_rule]);
+        let mut config = sample_config();
+        config.max_size_bytes = 4;
+        let reserve = S3Reserve::with_clients(config, s3, kms);
+
+        let error = reserve
+            .get("too-large")
+            .await
+            .expect_err("streaming oversize must fail at the hard cap");
+
+        assert!(format!("{error:#}").contains("maximum object size"));
+        assert_eq!(kms_rule.num_calls(), 0, "KMS must not be called");
     }
 
     #[tokio::test]
@@ -826,7 +1007,7 @@ mod mock_trait_tests {
         assert!(md.contains_key(META_NONCE), "nonce present");
         assert_eq!(
             md.get(META_ENCRYPTION).map(String::as_str),
-            Some("envelope-aes256gcm"),
+            Some(ENCRYPTION_ENVELOPE_V2),
         );
         let decoded = decode_meta_blob(md.get(META_META).unwrap()).expect("decode");
         assert_eq!(decoded.status, 200);
@@ -834,10 +1015,69 @@ mod mock_trait_tests {
     }
 
     #[tokio::test]
+    async fn an_envelope_copied_to_another_logical_key_fails_closed() {
+        #[derive(Default, Clone)]
+        struct CapturedObject {
+            body: Vec<u8>,
+            metadata: HashMap<String, String>,
+        }
+
+        let captured = Arc::new(StdMutex::new(CapturedObject::default()));
+        let capture_for_put = Arc::clone(&captured);
+        let put_rule = mock!(aws_sdk_s3::Client::put_object).then_compute_output(move |request| {
+            let mut capture = capture_for_put.lock().expect("capture lock");
+            capture.body = request
+                .body()
+                .bytes()
+                .expect("in-memory put body")
+                .to_vec();
+            capture.metadata = request.metadata().cloned().unwrap_or_default();
+            PutObjectOutput::builder().build()
+        });
+        let put_s3 = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&put_rule]);
+        let generate_rule = mock!(aws_sdk_kms::Client::generate_data_key).then_output(|| {
+            GenerateDataKeyOutput::builder()
+                .plaintext(KmsBlob::new(FAKE_DATA_KEY.to_vec()))
+                .ciphertext_blob(KmsBlob::new(FAKE_WRAPPED_KEY.to_vec()))
+                .key_id("alias/test")
+                .build()
+        });
+        let put_kms = mock_client!(aws_sdk_kms, RuleMode::Sequential, &[&generate_rule]);
+        let writer = S3Reserve::with_clients(sample_config(), put_s3, put_kms);
+        writer
+            .put("original", Bytes::from_static(b"hello world"), sample_metadata())
+            .await
+            .expect("write fixture");
+
+        let copied = captured.lock().expect("capture lock").clone();
+        let get_rule = mock!(aws_sdk_s3::Client::get_object)
+            .match_requests(|request| request.key() == Some("reserve/copied"))
+            .then_output(move || build_get_output(copied.body.clone(), copied.metadata.clone()));
+        let get_s3 = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&get_rule]);
+        let decrypt_rule = mock!(aws_sdk_kms::Client::decrypt).then_output(|| {
+            DecryptOutput::builder()
+                .plaintext(KmsBlob::new(FAKE_DATA_KEY.to_vec()))
+                .key_id("alias/test")
+                .build()
+        });
+        let get_kms = mock_client!(aws_sdk_kms, RuleMode::Sequential, &[&decrypt_rule]);
+        let reader = S3Reserve::with_clients(sample_config(), get_s3, get_kms);
+
+        reader
+            .get("copied")
+            .await
+            .expect_err("AAD must bind ciphertext to the exact logical and object key");
+    }
+
+    #[tokio::test]
     async fn get_decrypts_body_through_kms() {
         let nonce = random_aes_gcm_nonce();
         let plaintext = b"hello world";
-        let ciphertext = aes256gcm_encrypt(&FAKE_DATA_KEY, &nonce, plaintext, AAD).expect("seal");
+        let config = sample_config();
+        let meta_blob = encode_meta_blob(&sample_metadata()).expect("encode metadata");
+        let aad = envelope_aad_v2(&config, "k", "reserve/k", &meta_blob);
+        let ciphertext =
+            aes256gcm_encrypt(&FAKE_DATA_KEY, &nonce, plaintext, &aad).expect("seal");
 
         let b64 = base64::engine::general_purpose::STANDARD;
         let metadata = meta_pairs(
@@ -863,7 +1103,7 @@ mod mock_trait_tests {
             });
         let kms = mock_client!(aws_sdk_kms, RuleMode::Sequential, &[&decrypt_rule]);
 
-        let reserve = S3Reserve::with_clients(sample_config(), s3, kms);
+        let reserve = S3Reserve::with_clients(config, s3, kms);
         let (body, md) = reserve.get("k").await.expect("get").expect("hit");
         assert_eq!(body.as_ref(), plaintext);
         assert_eq!(md.size, 11);
