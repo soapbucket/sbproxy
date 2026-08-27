@@ -3008,6 +3008,32 @@ fn carry_inbound_identity_into_stamped_principal(
 /// WOR-2096: both the origin flag and the governed key's policy must
 /// consent before any redacted content sample is retained. Fail closed:
 /// no effective policy (unkeyed or native traffic) means no capture.
+/// WOR-2651: whether a prompt-cache lease may re-order this request's
+/// candidates, and whether one may be recorded for it.
+///
+/// A free function rather than an expression inline in
+/// `handle_ai_proxy`, because the rule it encodes is four clauses long,
+/// is stated in prose in `docs/ai-gateway.md`, and was wrong: the
+/// dispatch site named `fallback_chain` among the excluded strategies
+/// in a comment and never tested for it. A rule with four arms wants a
+/// name and a test, not a chain of `is_none()` a reader has to hold
+/// against a paragraph.
+///
+/// - `configured`: the origin declared a `cache_affinity:` block.
+/// - `is_failover`: this is a retry after a candidate failed, where
+///   the point is to try somewhere *else*.
+/// - `has_routing_policy_plan`: an authored `routing_policy` named this
+///   request's providers in order.
+/// - `strategy_owns_order`: [`sbproxy_ai::routing::Router::owns_candidate_order`].
+fn cache_affinity_may_reorder(
+    configured: bool,
+    is_failover: bool,
+    has_routing_policy_plan: bool,
+    strategy_owns_order: bool,
+) -> bool {
+    configured && !is_failover && !has_routing_policy_plan && !strategy_owns_order
+}
+
 fn content_capture_allowed(config: &AiHandlerConfig, ctx: &RequestContext) -> bool {
     config.capture_content
         && ctx
@@ -11063,18 +11089,19 @@ pub(super) async fn handle_ai_proxy(
     // composition this feature is for.
     //
     // "Whatever the strategy picked" excludes the four that own their
-    // ordering outright, which is the same set the block above skips plus
-    // `fallback_chain`. A cascade's tiers, cost_quality's cheap/frontier
-    // split, an authored routing-policy plan, and a priority-sorted failover
-    // chain are all orderings the operator wrote down on purpose; a lease
-    // jumping that queue would quietly defeat the strategy rather than
-    // compose with it. Nothing is recorded on those origins either, so the
-    // table never fills with leases no lookup will read.
-    let cache_affinity_applies = config.cache_affinity.is_some()
-        && !is_failover
-        && routing_policy_cascade.is_none()
-        && router.cascade_config().is_none()
-        && router.cost_quality_config().is_none();
+    // ordering outright. The rule and the check used to live apart: this
+    // comment named all four while the condition below tested three, so
+    // `fallback_chain` was documented as excluded and was not. The
+    // predicate is a named free function now, and the strategy half of
+    // it is `Router::owns_candidate_order`, so the next reader compares
+    // one sentence against one expression instead of a paragraph against
+    // a chain of `is_none()`.
+    let cache_affinity_applies = cache_affinity_may_reorder(
+        config.cache_affinity.is_some(),
+        is_failover,
+        routing_policy_cascade.is_some(),
+        router.owns_candidate_order(),
+    );
     // The key is derived once and reused at the record site below, so the
     // lease is written under the same identity it was read under.
     let cache_affinity_key = cache_affinity_applies
@@ -21384,6 +21411,64 @@ origins:
         assert_eq!(
             body["user"], "caller-42",
             "the caller's own field must reach the upstream unchanged"
+        );
+    }
+
+    /// WOR-2651, re-checked by WOR-2658: the four exclusions the docs
+    /// promise, as one table.
+    ///
+    /// Red before the fix on the `fallback_chain` row. The dispatch
+    /// site's own comment named that strategy among the excluded ones
+    /// and the condition never tested for it, so a priority-sorted
+    /// chain had its first candidate replaced by whichever provider
+    /// held the caller's lease, and recorded a fresh lease on every
+    /// success. `docs/ai-gateway.md` says of all four that "on those
+    /// origins no lease is read and none is recorded".
+    #[test]
+    fn cache_affinity_stands_aside_for_every_authored_ordering() {
+        // (configured, is_failover, routing_policy_plan, strategy_owns_order)
+        assert!(
+            cache_affinity_may_reorder(true, false, false, false),
+            "an ordinary strategy with a configured block is the whole point"
+        );
+        assert!(
+            !cache_affinity_may_reorder(false, false, false, false),
+            "no block, no affinity"
+        );
+        assert!(
+            !cache_affinity_may_reorder(true, true, false, false),
+            "a failover is trying somewhere else on purpose"
+        );
+        assert!(
+            !cache_affinity_may_reorder(true, false, true, false),
+            "an authored routing_policy plan names its providers in order"
+        );
+        assert!(
+            !cache_affinity_may_reorder(true, false, false, true),
+            "fallback_chain, cascade, and cost_quality each own their order"
+        );
+    }
+
+    /// The strategy half of the rule above, at the seam that decides it
+    /// rather than at the predicate that consumes it. A predicate that
+    /// takes the right boolean proves nothing if the router hands it
+    /// the wrong one.
+    #[test]
+    fn the_router_reports_a_fallback_chain_as_owning_its_order() {
+        assert!(
+            sbproxy_ai::routing::Router::new(
+                sbproxy_ai::routing::RoutingStrategy::FallbackChain,
+                2
+            )
+            .owns_candidate_order(),
+            "the arm that was missing"
+        );
+        assert!(
+            !sbproxy_ai::routing::Router::new(
+                sbproxy_ai::routing::RoutingStrategy::RoundRobin,
+                2
+            )
+            .owns_candidate_order()
         );
     }
 

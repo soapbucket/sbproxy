@@ -4577,6 +4577,7 @@ mod tests {
                 false,
                 None,
                 Some(eligibility),
+                &crate::shadow_eval::ShadowEvalContext::default(),
             )
             .expect("the request-level gates admit this request")
             .pop()

@@ -832,19 +832,23 @@ mod tests {
         );
     }
 
-    /// p95, not the mean: a candidate whose tail is twice as slow while
-    /// its median is identical is exactly the migration that should not
-    /// happen, and a mean hides it.
+    /// p95, not the mean: a candidate whose tail is forty times slower
+    /// while its median is identical is exactly the migration that
+    /// should not happen, and a mean hides it.
+    ///
+    /// Two of twenty are slow rather than one, because nearest rank
+    /// puts p95 of twenty samples at the nineteenth: a single outlier
+    /// sits above that rank and is not what p95 reports. That is the
+    /// definition working, not a rounding accident, and a test built on
+    /// the other reading would have pinned the wrong percentile.
     #[test]
     fn the_tail_is_reported_separately_from_the_median() {
         let ledger = ShadowPairLedger::default();
-        // Twenty pairs: identical medians, a shadow tail four times
-        // the primary's.
         for index in 0..20u64 {
             let id = format!("req-tail-{index}");
             ledger.open(&id, &legs(&["t"], 1.0));
             ledger.record_primary(&id, primary(0.01, 100));
-            let shadow_latency = if index == 19 { 4_000 } else { 100 };
+            let shadow_latency = if index >= 18 { 4_000 } else { 100 };
             ledger.record_shadow(&id, "t", ran(0.01, shadow_latency, Some("stop")));
         }
         let report = ledger.report(Duration::from_secs(60), &no_judge);

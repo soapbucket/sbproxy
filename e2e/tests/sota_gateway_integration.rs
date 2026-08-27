@@ -92,6 +92,15 @@ const MODEL_FLEX: &str = "gpt-e2e-flex";
 const MODEL_STANDARD: &str = "gpt-e2e-standard";
 /// The one public name the group publishes.
 const GROUP: &str = "sota-chat";
+/// Served by `openai-flex` **and** `openai-flex-backup`, so a stalled
+/// candidate has somewhere to go. Kept off `MODEL_FLEX` on purpose: the
+/// single-candidate ids above are what make every non-failover test
+/// deterministic.
+const MODEL_STALL: &str = "gpt-e2e-stall";
+/// Served by `openai-standard` **and** `openai-standard-backup`, so
+/// "nothing moved after the commit point" is a claim with something to
+/// move to.
+const MODEL_STREAM: &str = "gpt-e2e-stream";
 
 // ---------------------------------------------------------------------
 // Stubs
@@ -144,6 +153,8 @@ enum Reply {
     /// connection mid-stream. Past the headers the request is committed
     /// to this provider.
     DieMidStream(String),
+    /// A complete SSE stream, terminated properly.
+    Sse(Vec<String>),
 }
 
 impl ScriptedUpstream {
@@ -162,7 +173,6 @@ impl ScriptedUpstream {
 
         let seen_thread = Arc::clone(&seen);
         let stop_thread = Arc::clone(&stop);
-        let reply = Arc::new(reply);
         let join = std::thread::spawn(move || {
             // Held open until shutdown so a `StallForever` connection is
             // not closed by dropping its stream.
@@ -191,6 +201,16 @@ impl ScriptedUpstream {
                             }
                             Reply::StallForever => {
                                 stalled.push(stream);
+                            }
+                            Reply::Sse(frames) => {
+                                let head =
+                                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                                     Cache-Control: no-cache\r\nConnection: close\r\n\r\n";
+                                let _ = stream.write_all(head.as_bytes());
+                                for frame in frames {
+                                    let _ = stream.write_all(frame.as_bytes());
+                                }
+                                let _ = stream.flush();
                             }
                             Reply::DieMidStream(frame) => {
                                 let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
@@ -323,6 +343,38 @@ fn converse_reply(text: &str, stop_reason: &str) -> Vec<u8> {
     .expect("converse reply")
 }
 
+/// A complete OpenAI-shaped SSE stream: one content delta, one finish
+/// frame, `[DONE]`.
+fn sse_frames(content: &str) -> Vec<String> {
+    vec![
+        format!(
+            "data: {}\n\n",
+            json!({
+                "id": "chatcmpl-sota",
+                "object": "chat.completion.chunk",
+                "created": 1_700_000_000,
+                "model": MODEL_STALL,
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": content}}]
+            })
+        ),
+        format!(
+            "data: {}\n\n",
+            json!({
+                "id": "chatcmpl-sota",
+                "object": "chat.completion.chunk",
+                "created": 1_700_000_000,
+                "model": MODEL_STALL,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+            })
+        ),
+        "data: [DONE]\n\n".to_string(),
+    ]
+}
+
+fn wants_stream(request: &SeenRequest) -> bool {
+    request.json().get("stream").and_then(Value::as_bool) == Some(true)
+}
+
 fn refused_credential() -> Vec<u8> {
     serde_json::to_vec(&json!({
         "error": {
@@ -357,6 +409,8 @@ struct Wiring<'a> {
     standard_url: &'a str,
     shadow_a_url: &'a str,
     shadow_b_url: &'a str,
+    flex_backup_url: &'a str,
+    standard_backup_url: &'a str,
 }
 
 /// The whole epic in one `ai_proxy` action.
@@ -375,6 +429,8 @@ fn composite_config(wiring: &Wiring<'_>) -> String {
         standard_url,
         shadow_a_url,
         shadow_b_url,
+        flex_backup_url,
+        standard_backup_url,
     } = wiring;
     let key_store = key_store.display();
     let usage_path = usage_path.display();
@@ -451,7 +507,7 @@ origins:
           api_key: {TENANT_KEY}
           base_url: "{flex_url}"
           allow_private_base_url: true
-          models: [{MODEL_FLEX}]
+          models: [{MODEL_FLEX}, {MODEL_STALL}]
           service_tier: flex
           fallback_credential_id: house-openai
         - name: openai-standard
@@ -459,9 +515,25 @@ origins:
           api_key: {TENANT_KEY}
           base_url: "{standard_url}"
           allow_private_base_url: true
-          models: [{MODEL_STANDARD}]
+          models: [{MODEL_STANDARD}, {MODEL_STREAM}]
           service_tier: standard
           on_key_failure: fail_closed
+        # Two providers exist only to give a failover somewhere to go.
+        # They serve the pooled ids and nothing else, so the
+        # single-candidate ids above stay deterministic for every test
+        # that is not about failover.
+        - name: openai-flex-backup
+          provider_type: openai
+          api_key: {TENANT_KEY}
+          base_url: "{flex_backup_url}"
+          allow_private_base_url: true
+          models: [{MODEL_STALL}]
+        - name: openai-standard-backup
+          provider_type: openai
+          api_key: {TENANT_KEY}
+          base_url: "{standard_backup_url}"
+          allow_private_base_url: true
+          models: [{MODEL_STREAM}]
         - name: shadow-a
           provider_type: openai
           api_key: shadow-a-key
@@ -515,6 +587,8 @@ struct Gateway {
     standard: ScriptedUpstream,
     shadow_a: ScriptedUpstream,
     shadow_b: ScriptedUpstream,
+    flex_backup: ScriptedUpstream,
+    standard_backup: ScriptedUpstream,
     usage_path: std::path::PathBuf,
     events_path: std::path::PathBuf,
     _workdir: tempfile::TempDir,
@@ -531,10 +605,30 @@ struct Behavior {
     flex_refuses_first_key: bool,
     /// The standard stub refuses the first credential it sees with 401.
     standard_refuses_first_key: bool,
-    /// The flex stub accepts the connection and never answers.
+    /// The flex stub accepts the connection and never answers, so a
+    /// streaming request on the pooled `MODEL_STALL` id has to be moved
+    /// to `openai-flex-backup` on the pre-header budget.
     flex_stalls: bool,
-    /// The standard stub answers headers plus one frame, then dies.
+    /// **Both** members of the `MODEL_STREAM` pool answer headers plus
+    /// one frame and then die. Both, so "nothing moved after the commit
+    /// point" is falsifiable from a single dial count rather than
+    /// depending on which member the rotation happened to pick.
     standard_dies_mid_stream: bool,
+}
+
+/// One SSE frame, truncated: response headers and a partial body, then
+/// the connection drops.
+fn truncated_stream_frame() -> String {
+    format!(
+        "data: {}\n\n",
+        json!({
+            "id": "chatcmpl-sota",
+            "object": "chat.completion.chunk",
+            "created": 1_700_000_000,
+            "model": MODEL_STREAM,
+            "choices": [{"index": 0, "delta": {"content": "partial"}}]
+        })
+    )
 }
 
 fn start_gateway(behavior: Behavior) -> Gateway {
@@ -570,12 +664,32 @@ fn start_gateway(behavior: Behavior) -> Gateway {
             .to_string();
         Reply::Body(200, "application/json", openai_reply(&model, "flex"))
     });
+    let flex_backup = ScriptedUpstream::start(|request, _index| {
+        if wants_stream(request) {
+            return Reply::Sse(sse_frames("flex backup"));
+        }
+        Reply::Body(
+            200,
+            "application/json",
+            openai_reply(MODEL_STALL, "flex backup"),
+        )
+    });
+    let standard_backup = ScriptedUpstream::start(move |request, _index| {
+        if behavior.standard_dies_mid_stream {
+            return Reply::DieMidStream(truncated_stream_frame());
+        }
+        if wants_stream(request) {
+            return Reply::Sse(sse_frames("standard backup"));
+        }
+        Reply::Body(
+            200,
+            "application/json",
+            openai_reply(MODEL_STREAM, "standard backup"),
+        )
+    });
     let standard = ScriptedUpstream::start(move |request, index| {
         if behavior.standard_dies_mid_stream {
-            return Reply::DieMidStream(
-                "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n"
-                    .to_string(),
-            );
+            return Reply::DieMidStream(truncated_stream_frame());
         }
         if behavior.standard_refuses_first_key && index == 0 {
             return Reply::Body(401, "application/json", refused_credential());
@@ -613,6 +727,8 @@ fn start_gateway(behavior: Behavior) -> Gateway {
         standard_url: &standard.base_url(),
         shadow_a_url: &shadow_a.base_url(),
         shadow_b_url: &shadow_b.base_url(),
+        flex_backup_url: &flex_backup.base_url(),
+        standard_backup_url: &standard_backup.base_url(),
     });
     let proxy = ProxyHarness::start_with_workspace(&yaml, &[]).expect("composite gateway boots");
 
@@ -624,6 +740,8 @@ fn start_gateway(behavior: Behavior) -> Gateway {
         standard,
         shadow_a,
         shadow_b,
+        flex_backup,
+        standard_backup,
         usage_path,
         events_path,
         _workdir: workdir,
@@ -1167,14 +1285,19 @@ fn the_second_credential_opts_out_and_gets_the_providers_own_refusal() {
     );
 }
 
-/// WOR-2651 against WOR-2657: affinity layers over the group's weighted
-/// pick rather than replacing it, so a caller who sent a
-/// `prompt_cache_key` goes back to the provider that already holds
-/// their warm prefix on every later turn.
+/// WOR-2651, running under everything else the epic added: affinity
+/// layers over the strategy that is already configured rather than
+/// replacing it, so a caller who sent a `prompt_cache_key` goes back to
+/// the provider that already holds their warm prefix on every later
+/// turn.
 ///
-/// The group is weighted 1:8:1, so an unbiased draw would land a
-/// twelve-turn conversation on more than one member with overwhelming
-/// probability; every turn landing on the first one is the signal.
+/// `MODEL_STALL` is a two-member pool under `round_robin`, which alone
+/// alternates every turn. Twelve turns all landing on one member is the
+/// signal, and it is deterministic in both directions: without the
+/// lease this test reads six of each. Both members serve the same model
+/// id on purpose, because a lease recorded against a different resolved
+/// model is dropped by design and a pool is where the feature is meant
+/// to bite.
 #[test]
 fn cache_affinity_returns_a_caller_to_the_provider_that_holds_its_warm_prefix() {
     let gateway = start_gateway(Behavior::default());
@@ -1188,7 +1311,7 @@ fn cache_affinity_returns_a_caller_to_the_provider_that_holds_its_warm_prefix() 
                 "/v1/chat/completions",
                 "sota.local",
                 &json!({
-                    "model": GROUP,
+                    "model": MODEL_STALL,
                     "prompt_cache_key": cache_key,
                     "messages": [{"role": "user", "content": format!("turn {turn}")}]
                 }),
@@ -1212,7 +1335,17 @@ fn cache_affinity_returns_a_caller_to_the_provider_that_holds_its_warm_prefix() 
     let first = served.first().cloned().unwrap_or_default();
     assert!(
         served.iter().all(|answer| *answer == first),
-        "a warm-cache caller was scattered across members: {served:?}"
+        "a warm-cache caller was scattered across the pool, which is what round robin \
+         alone does: {served:?}"
+    );
+
+    // And the affinity is the caller's, not the route's: a second
+    // caller with its own key is free to land anywhere, so the lease is
+    // keyed rather than a global pin.
+    let unkeyed = gateway.chat(MODEL_STALL, "no cache key at all", &[]);
+    assert_eq!(
+        unkeyed.status, 200,
+        "a caller that sends no cache key is routed by the strategy alone"
     );
 }
 
@@ -1222,44 +1355,57 @@ fn cache_affinity_returns_a_caller_to_the_provider_that_holds_its_warm_prefix() 
 /// only bound was the attempt's own `timeout_ms`, which has to be long
 /// enough for a real completion, so nothing failed over for as long as
 /// it ran.
+///
+/// Two requests, not one. `MODEL_STALL` is served by a two-member pool
+/// under `round_robin`, so across two requests the stalling member is
+/// picked first at least once whichever end of the rotation the fresh
+/// harness starts at. That makes "the stalled member was dialed and the
+/// caller still got an answer" a claim about this feature rather than
+/// about a coin toss.
 #[test]
 fn a_stream_that_never_produces_a_first_byte_fails_over_before_the_commit_point() {
     let gateway = start_gateway(Behavior {
         flex_stalls: true,
         ..Behavior::default()
     });
-    let started = std::time::Instant::now();
-    let response = gateway
-        .proxy
-        .post_json(
-            "/v1/chat/completions",
-            "sota.local",
-            &json!({
-                "model": GROUP,
-                "stream": true,
-                "prompt_cache_key": "sota-e2e-stall",
-                "messages": [{"role": "user", "content": "stream please"}]
-            }),
-            &[],
-        )
-        .expect("streaming request");
-    let elapsed = started.elapsed();
 
-    assert_eq!(
-        response.status,
-        200,
-        "a stalled candidate should have been replaced, not relayed: {}",
-        String::from_utf8_lossy(&response.body)
-    );
-    assert!(
-        elapsed < Duration::from_secs(20),
-        "the pre-header budget is 400ms and the failover has to happen on it, \
-         not on the 30s HTTP client default; took {elapsed:?}"
-    );
+    for attempt in 0..2 {
+        let started = std::time::Instant::now();
+        let response = gateway
+            .proxy
+            .post_json(
+                "/v1/chat/completions",
+                "sota.local",
+                &json!({
+                    "model": MODEL_STALL,
+                    "stream": true,
+                    "messages": [{"role": "user", "content": "stream please"}]
+                }),
+                &[],
+            )
+            .expect("streaming request");
+        let elapsed = started.elapsed();
+        assert_eq!(
+            response.status,
+            200,
+            "attempt {attempt}: a stalled candidate should have been replaced, not \
+             relayed: {}",
+            String::from_utf8_lossy(&response.body)
+        );
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "attempt {attempt}: the pre-header budget is 400ms and the failover has to \
+             happen on it, not on the 30s HTTP client default; took {elapsed:?}"
+        );
+    }
+
     assert!(
         !gateway.flex.seen().is_empty(),
-        "the stalled member was dialed, which is what makes this a failover \
-         rather than a member that was never picked"
+        "the stalled member was never dialed, so nothing here was a failover"
+    );
+    assert!(
+        !gateway.flex_backup.seen().is_empty(),
+        "the sibling never answered, so the request was not moved"
     );
 }
 
@@ -1269,36 +1415,39 @@ fn a_stream_that_never_produces_a_first_byte_fails_over_before_the_commit_point(
 /// candidate cannot replace it. A stream that dies mid-body ends,
 /// truncated, rather than being silently restarted somewhere else with
 /// a second copy of the answer.
+///
+/// `MODEL_STREAM` is a two-member pool and **both** members die the
+/// same way, so the assertion is a dial count rather than a guess about
+/// which member the rotation picked: exactly one provider was ever
+/// asked. A post-commit failover, or a retry of the same provider,
+/// would make it two.
 #[test]
 fn a_stream_that_dies_after_the_first_byte_is_not_failed_over() {
     let gateway = start_gateway(Behavior {
         standard_dies_mid_stream: true,
         ..Behavior::default()
     });
-    let response = gateway.proxy.post_json(
+    // Either a truncated body or a transport error is a correct outcome
+    // for a stream that died after commit. What is not correct is a
+    // second attempt.
+    let _ = gateway.proxy.post_json(
         "/v1/chat/completions",
         "sota.local",
         &json!({
-            "model": MODEL_STANDARD,
+            "model": MODEL_STREAM,
             "stream": true,
             "messages": [{"role": "user", "content": "stream please"}]
         }),
         &[],
     );
-    // Either a truncated body or a transport error is a correct
-    // outcome for a stream that died after commit. What is not correct
-    // is a second, complete answer from another provider.
-    let body = response
-        .map(|response| String::from_utf8_lossy(&response.body).to_string())
-        .unwrap_or_default();
-    assert!(
-        !body.contains("flex"),
-        "a committed stream was replaced by another provider's answer: {body}"
-    );
-    assert!(
-        gateway.flex.seen().is_empty(),
-        "no sibling may be dialed after the commit point; the flex member saw {} requests",
-        gateway.flex.seen().len()
+
+    let dials = gateway.standard.seen().len() + gateway.standard_backup.seen().len();
+    assert_eq!(
+        dials, 1,
+        "a committed stream was retried or moved: {} dial(s) on openai-standard and {} \
+         on openai-standard-backup",
+        gateway.standard.seen().len(),
+        gateway.standard_backup.seen().len()
     );
 }
 

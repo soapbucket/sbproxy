@@ -1,6 +1,6 @@
 # SBproxy AI gateway guide
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-27*
 
 ![the same OpenAI-shape request answered by OpenAI, Claude, and Gemini, switched only by Host header](assets/ai-gateway.gif)
 
@@ -1194,7 +1194,7 @@ own request unit after the local shadow gates and commits it only at the
 background send boundary. A quota denial suppresses only the optional copy;
 it never replaces or delays the primary response.
 
-The shadow body is drained while at most 1 MiB is retained for comparison metadata, which is logged at `target=sbproxy_ai_shadow` (status, latency, prompt/completion tokens, finish reason). Configured usage sinks also receive a separate row with `tag: shadow` and a fresh server-generated request ID ending in `:shadow`. That row estimates shadow cost for comparison, but it never debits the primary budget tracker.
+The shadow body is drained while at most 1 MiB is retained for comparison metadata, which is logged at `target=sbproxy_ai_shadow` (status, latency, prompt/completion tokens, finish reason). The answer *text* is kept only when the content-recording consent below is on, and is dropped with the frame otherwise. Configured usage sinks also receive a separate row with `tag: shadow` and a fresh server-generated request ID ending in `:shadow`. That row estimates shadow cost for comparison, but it never debits the primary budget tracker.
 
 ### Two or more targets
 
@@ -1248,7 +1248,142 @@ Per target, from Prometheus:
 
 Cost per target is answerable from the ledger rather than from a metric, deliberately: the ledger is non-lossy and the metrics feed is not, and a cost figure that silently drops samples under load is worse than no cost figure.
 
-Comparing the two answers' *text* is not part of this. Shadow response bodies are drained, not retained, so what you can compare today is cost, latency, tokens, and finish reason. Retaining the text (behind the same `capture_content` plus key-policy consent gate the primary content store uses) and scoring agreement between the answers are tracked separately.
+### Retaining the pair
+
+Numbers say a candidate cost less and answered faster. They never say it answered *worse*. Reading that needs the two answers side by side, which means keeping text, which means consent.
+
+Retention rides the same two-sided gate the primary content store uses, and nothing widens it: the origin sets `capture_content: true` **and** the calling key's policy sets `allow_content_capture`. With either side off, the target's response body is drained exactly as before, and no sink is installed in the first place, so the text is never held rather than held and then discarded.
+
+```yaml
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      capture_content: true      # half the gate; the key policy is the other half
+      shadow:
+        targets:
+          - provider: anthropic
+            model: claude-haiku-4-5
+```
+
+The pair is whole or absent. A target's answer whose primary was not captured is refused by the store rather than kept on its own, because half a pair is not a comparison and keeping it would retain content whose counterpart the gate declined. Both halves go through the same redaction stack as the primary sample: the always-on secret redactor, then the origin's PII rules, then the payload cap. At most eight targets are retained per request.
+
+Read the pair on the existing per-request content endpoint, where it arrives beside the primary's own answer:
+
+```bash
+curl -su admin:secret \
+  http://127.0.0.1:9090/api/requests/$REQUEST_ID/content | jq
+```
+
+```json
+{
+  "request_id": "01J...",
+  "input_messages": [{"role": "user", "content": "What is 2+2?"}],
+  "output_text": "4",
+  "shadow_responses": [
+    {"target": "anthropic", "model": "claude-haiku-4-5", "status": 200, "output_text": "Four."}
+  ]
+}
+```
+
+Reading a sample is audited with the operator's name, the same as any other content read.
+
+### The comparison view
+
+One row per target, over a window:
+
+```bash
+curl -su admin:secret \
+  'http://127.0.0.1:9090/api/ai/shadow/report?window=1h' | jq
+```
+
+`window` takes `15m`, `1h` (the default), `24h`, `7d`, or `30d`.
+
+```json
+{
+  "window_secs": 3600,
+  "targets": [
+    {
+      "target": "anthropic",
+      "provenance": {
+        "requests_seen": 412,
+        "sample_rate": 0.1,
+        "pairs_retained": 38,
+        "pairs_dropped": {"sampled_out": 371, "shadow_timeout": 2, "shadow_error": 1},
+        "responses_retained": 38
+      },
+      "cost": {
+        "shadow_usd": 0.147,
+        "primary_usd": 0.226,
+        "delta_usd": -0.079,
+        "delta_usd_per_request": -0.00208,
+        "delta_usd_extrapolated": -0.857
+      },
+      "latency": {
+        "shadow_p50_ms": 610, "shadow_p95_ms": 1840,
+        "primary_p50_ms": 720, "primary_p95_ms": 1490,
+        "delta_p50_ms": -110, "delta_p95_ms": 350
+      },
+      "finish_reasons": {"stop": 35, "length": 3},
+      "errors": {
+        "shadow_rate": 0.073,
+        "primary_rate": 0.0,
+        "shadow_status_classes": {"2xx": 38, "5xx": 1, "none": 2}
+      },
+      "agreement": {
+        "status": "not_configured",
+        "pairs_judged": 0,
+        "judge_spend_usd": 0.0,
+        "paused": false,
+        "wins": 0, "ties": 0, "losses": 0
+      },
+      "cost_to_decide_usd": 0.147
+    }
+  ]
+}
+```
+
+Read it in the order it renders, because that order is the argument:
+
+- **Provenance first.** A delta over four pairs and a delta over four thousand look identical once each is a single number. `requests_seen` counts every request that reached per-target admission, `pairs_retained` counts the ones where both halves landed, and `pairs_dropped` accounts for the rest by reason. The three sum. `responses_retained` says how many pairs also kept their text, which is zero unless the consent gate above is on.
+- **Every delta is over the retained pairs and nothing else.** A failed or timed-out call is on the error axis and off the cost and latency ones, because a call that produced nothing has no comparable price. Negative means the candidate was cheaper or faster. `delta_usd_extrapolated` projects the per-request delta across `requests_seen`, which is what promoting the candidate would have cost or saved on the whole eligible population rather than the sampled slice.
+- **Latency is p50 and p95, never a mean.** A candidate whose median matches and whose tail doubles is exactly the migration that should not happen, and a mean hides it.
+- **The finish-reason distribution is the cheapest disagreement signal there is.** A candidate stopping on `length` where the primary stopped on `stop` truncated its answer, and no amount of cost comparison says that. A call that produced no reason at all is counted under `none` rather than folded into `stop`.
+- **`cost_to_decide_usd`** is what running the evaluation cost: the target's own spend over the window plus whatever a judge spent on it. The shadow leg is a real second bill, and it belongs beside the saving it is measuring.
+
+The source is a bounded in-process ring of the most recent evaluated requests. It clears on restart and it is not a metric: the per-target counters above already carry the scrapeable series, and this answers what a PromQL query cannot, which is what one target cost *relative to the primary that ran beside it*. A window wider than the ring's turnover reports the ring, and `requests_seen` is what tells you which happened.
+
+### Scoring agreement
+
+Whether the candidate answered *better* is a judge's question, and this gateway answers it as a batch job over retained pairs rather than inline on the request path. Inline is structurally wrong here: the shadow leg exists precisely because it is fire-and-forget, so by the time the candidate answers, the caller has already been served the primary and there is nothing to block on. A survey of shipped gateways on 2026-08-27 found one product running a judge inline, at roughly 1.5 seconds of user-visible latency, to score a single response rather than compare two; every other shipped judge runs asynchronously.
+
+Configure the judge under `shadow:`:
+
+```yaml
+shadow:
+  targets:
+    - provider: anthropic
+      sample_rate: 0.1
+  judge:
+    provider: judge-openai      # a providers[] entry, never the model under evaluation
+    model: gpt-4o-mini          # optional; defaults to that entry's own default model
+    max_spend_usd: 5.0          # required, and refused at zero
+    spend_window: daily         # daily (default) or weekly
+    divergence_prefilter: true  # default; there is no good reason to turn it off
+```
+
+`max_spend_usd` has no default on purpose. An unbounded judge is the failure the key exists to prevent, so a `judge:` block without it is refused at config load, on the same reasoning as the request-timeout ceiling. The cap is per target name across the process, which is the key the shadow metrics and the ledger rows already use: two routes naming one candidate share its bill. When the cap is reached, judging auto-pauses until the window rolls, and `agreement.paused` says so.
+
+Two things run today behind that key:
+
+- **The deterministic divergence pre-filter.** Two answers that are byte-identical, or identical once whitespace and JSON key order are normalized, need no judge and are never billed for one. A finish-reason mismatch counts as divergence even when the texts match, because two answers can read the same and still have stopped differently.
+- **The spend cap and its auto-pause**, enforced per pair before any call is planned. Each admitted pair reserves two calls, because the reverse-order run is part of the method rather than an option.
+
+What does not run yet is the judge prompt and the scoring loop, and `agreement.status` says `scoring_pending` rather than reporting a zero that would read as a tie. The design they will implement is fixed and is why the budget already reserves two calls per pair: blind pairwise comparison with randomized A/B labels, plus a second pass of the same pair in the opposite order, with the flip rate between the two published per candidate. That is not fastidiousness. Across 36 models the first-shown candidate is picked 64.3% of the time, and a content-free null model scores 86.5% on AlpacaEval 2.0 by exploiting exactly that bias, so a single-order verdict is closer to a coin flip than to a score. Both responses will be carried as untrusted data in structured fields the prompt never interpolates as instructions, and every verdict row will be stamped with judge model and prompt version so a suspect batch can be re-judged.
+
+### Streaming stays out of scope
+
+A streamed answer is committed to the caller frame by frame. There is no complete candidate text to compare until the stream ends, and buffering one to get it would put the primary's memory ceiling under the candidate's control, which is the opposite of what the 16-task and 64 MiB admission bounds exist to guarantee. So streaming requests are skipped for shadow dispatch, and there is nothing to retain or score for them. Evaluate a candidate on the non-streaming population and promote it for both.
 
 Every shadow target must appear in `providers`. Set `enabled: false` on a shadow-only provider to exclude it from primary routing; explicit shadow selection still uses it. Credential `allowed_providers` and `blocked_providers` rules apply to it independently; a disallowed shadow is suppressed while the primary continues. The `x-sbproxy-disallow-prompt-training` opt-out also suppresses a shadow provider unless it declares `no_prompt_training: true`. If the hosting process attaches a purpose-scoped egress authorizer to `AiClient`, v1 shadow dispatch fails closed because the shadow transport cannot yet consume authorized DNS pins and redirect checks. `sbproxy_ai_shadow_dropped_total{reason=...}` reports the closed skip/drop reasons `streaming`, `provider_not_found`, `provider_not_allowed`, `prompt_training_disallowed`, `egress_denied`, and `saturated`. Deliberate sample misses are not failures and do not increment that counter.
 
