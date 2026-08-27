@@ -1077,19 +1077,47 @@ fn engage_validated_graphql_idempotency(
     ctx.idempotency_permit = Some(permit);
 
     let body_hash = sbproxy_middleware::idempotency::hash_body(authoritative_body);
-    if let Some(cached) = idem.cache.get(&workspace, &key) {
-        ctx.idempotency_permit = None;
-        if cached.request_body_hash == body_hash {
-            ctx.idempotency_deferred_hit = Some(cached);
-        } else {
-            let (status, content_type, body) = sbproxy_middleware::idempotency::conflict_response();
+    // WOR-2609: this path runs in `upstream_request_filter`, which has
+    // no await point of its own and has already committed the body, so
+    // it cannot wait for a key another request holds the way the
+    // ordinary path does. It answers the 409 that
+    // draft-ietf-httpapi-idempotency-key-header names as the floor, and
+    // the client's retry resolves normally once the holder publishes.
+    match sbproxy_middleware::idempotency::claim(
+        &idem.cache,
+        &workspace,
+        &key,
+        idem.claim_lease_secs,
+    ) {
+        sbproxy_middleware::idempotency::ClaimState::Completed(cached) => {
+            ctx.idempotency_permit = None;
+            if cached.request_body_hash == body_hash {
+                ctx.idempotency_deferred_hit = Some(*cached);
+            } else {
+                let (status, content_type, body) =
+                    sbproxy_middleware::idempotency::conflict_response();
+                ctx.validator_failed = Some((
+                    status.as_u16(),
+                    String::from_utf8_lossy(&body).into_owned(),
+                    content_type.to_string(),
+                ));
+            }
+            return true;
+        }
+        sbproxy_middleware::idempotency::ClaimState::InFlight { .. } => {
+            ctx.idempotency_permit = None;
+            let (status, content_type, body) =
+                sbproxy_middleware::idempotency::in_flight_response();
             ctx.validator_failed = Some((
                 status.as_u16(),
                 String::from_utf8_lossy(&body).into_owned(),
                 content_type.to_string(),
             ));
+            return true;
         }
-        return true;
+        sbproxy_middleware::idempotency::ClaimState::Claimed(held) => {
+            ctx.idempotency_claim = Some(held);
+        }
     }
 
     ctx.idempotency_miss = Some((key, body_hash));
@@ -7318,28 +7346,35 @@ impl ProxyHttp for SbProxy {
                 }
             }
             if end_of_stream {
-                if let Some((key, body_hash)) = ctx.idempotency_miss.take() {
+                if let Some((_key, body_hash)) = ctx.idempotency_miss.take() {
                     let buf = ctx.idempotency_response_body_buf.take();
                     let status = ctx.idempotency_response_status.take();
                     let headers = ctx.idempotency_response_headers.take();
-                    let workspace = ctx.idempotency_workspace.clone().unwrap_or_default();
-                    if let (Some(buf), Some(status), Some(headers)) = (buf, status, headers) {
+                    // Taken unconditionally, and deliberately so: every
+                    // one of these four is either all present or the
+                    // response was never captured, and a claim that
+                    // cannot be published has to be released rather than
+                    // left to time out. Taking it here drops it on the
+                    // spot when the tuple does not match (WOR-2609).
+                    let claim = ctx.idempotency_claim.take();
+                    if let (Some(buf), Some(status), Some(headers), Some(claim)) =
+                        (buf, status, headers, claim)
+                    {
                         let pipeline = ctx.pipeline.clone();
-                        if let Some(idem) = ctx
+                        let ttl = ctx
                             .origin_idx
                             .and_then(|i| pipeline.idempotencies.get(i))
                             .and_then(|opt| opt.as_ref())
-                        {
+                            .map(|idem| idem.ttl_secs);
+                        if let Some(ttl_secs) = ttl {
                             sbproxy_middleware::idempotency::record_response(
-                                idem.cache.as_ref(),
-                                &workspace,
-                                &key,
+                                claim,
                                 sbproxy_middleware::idempotency::RecordedResponse {
                                     status,
                                     headers,
                                     body: buf.to_vec(),
                                     body_hash,
-                                    ttl_secs: idem.ttl_secs,
+                                    ttl_secs,
                                 },
                             );
                         }

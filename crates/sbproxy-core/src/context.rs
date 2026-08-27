@@ -572,6 +572,16 @@ pub struct RequestContext {
     /// into `response_body_filter` so the captured upstream response
     /// can be stored under the same `(workspace, key)` pair.
     pub idempotency_miss: Option<(String, [u8; 32])>,
+    /// The claim this request holds on its idempotency key, when it is
+    /// the request that will produce the response (WOR-2609).
+    ///
+    /// It lives on the context rather than in a local because it is
+    /// taken in `request_filter` and published in
+    /// `response_body_filter`. Dropping the context releases the key, so
+    /// a request that dies, is cancelled, or returns early anywhere
+    /// between those two points does not leave every retry of the same
+    /// key answering 409 until the lease runs out.
+    pub idempotency_claim: Option<sbproxy_middleware::idempotency::IdempotencyClaim>,
     /// Buffer the upstream response body accumulates into while the
     /// proxy captures a cache-miss response for later replay.
     pub idempotency_response_body_buf: Option<BytesMut>,
@@ -1835,6 +1845,7 @@ impl RequestContext {
             idempotency_buffering: false,
             idempotency_workspace: None,
             idempotency_miss: None,
+            idempotency_claim: None,
             idempotency_response_body_buf: None,
             idempotency_response_status: None,
             idempotency_response_headers: None,

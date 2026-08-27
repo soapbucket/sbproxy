@@ -1581,6 +1581,13 @@ pub struct CompiledIdempotency {
     /// Acquire a permit on engagement; pool exhaustion forces the
     /// request through the no-cache path.
     pub permits: Arc<tokio::sync::Semaphore>,
+    /// How long the request that took an idempotency key holds it
+    /// before another request may take it over (WOR-2609). The bound on
+    /// how long a crashed request can wedge one key.
+    pub claim_lease_secs: u64,
+    /// How long an overlapping request waits for the key holder's
+    /// response before answering 409 `ledger.idempotency_in_flight`.
+    pub claim_wait: std::time::Duration,
 }
 
 /// Immutable MCP catalog sources owned by one compiled pipeline generation.
@@ -3287,6 +3294,14 @@ fn compile_origin_idempotency(
         .unwrap_or(sbproxy_config::DEFAULT_IDEMPOTENCY_MAX_CONCURRENT_BUFFERS);
     let permits = Arc::new(tokio::sync::Semaphore::new(max_concurrent_buffers));
     Ok(CompiledIdempotency {
+        // Constants rather than config keys for now: both are carried on
+        // the compiled origin so an `idempotency.claim_lease_secs` /
+        // `claim_wait_ms` pair is a config-plumbing change here and
+        // nowhere else.
+        claim_lease_secs: sbproxy_middleware::idempotency::DEFAULT_CLAIM_LEASE_SECS,
+        claim_wait: std::time::Duration::from_millis(
+            sbproxy_middleware::idempotency::DEFAULT_CLAIM_WAIT_MS,
+        ),
         cache,
         header_name,
         ttl_secs,
@@ -5098,6 +5113,77 @@ hooks:
             usage_reporters: sbproxy_config::UsageReportersConfig::default(),
         });
         config
+    }
+
+    /// WOR-2609: the compiled origin hands the request path a cache
+    /// that actually serializes two callers on one key.
+    ///
+    /// The middleware's own suite proves the claim protocol. This proves
+    /// the pipeline is what wires it: `idempotency.backend` selects the
+    /// implementation at compile time, and a backend that answered
+    /// "claimed" to everybody would pass every single-request test in
+    /// this file while putting the stampede straight back.
+    #[test]
+    fn a_compiled_idempotency_origin_single_flights_one_key() {
+        let yaml = r#"
+origins:
+  "api.localhost":
+    action:
+      type: static
+      status_code: 200
+      body: "ok"
+    idempotency:
+      enabled: true
+"#;
+        let config = sbproxy_config::compile_config(yaml).expect("idempotency config compiles");
+        let pipeline = CompiledPipeline::from_config_for_validation(config)
+            .expect("idempotency pipeline compiles");
+        let idem = pipeline.idempotencies[0]
+            .as_ref()
+            .expect("the origin compiles an idempotency block");
+
+        assert!(
+            idem.claim_lease_secs > 0,
+            "a zero lease releases the key before the holder can use it"
+        );
+        assert!(
+            !idem.claim_wait.is_zero(),
+            "a zero wait budget makes every overlapping retry a 409"
+        );
+
+        let held = match sbproxy_middleware::idempotency::claim(
+            &idem.cache,
+            "ws",
+            "order-1",
+            idem.claim_lease_secs,
+        ) {
+            sbproxy_middleware::idempotency::ClaimState::Claimed(held) => held,
+            other => panic!("the first request must take the key, got {other:?}"),
+        };
+        match sbproxy_middleware::idempotency::claim(
+            &idem.cache,
+            "ws",
+            "order-1",
+            idem.claim_lease_secs,
+        ) {
+            sbproxy_middleware::idempotency::ClaimState::InFlight { .. } => {}
+            other => {
+                panic!("a second overlapping request must not take the same key, got {other:?}")
+            }
+        }
+
+        // And the key comes back the instant the holder is gone, rather
+        // than waiting out the lease.
+        drop(held);
+        assert!(matches!(
+            sbproxy_middleware::idempotency::claim(
+                &idem.cache,
+                "ws",
+                "order-1",
+                idem.claim_lease_secs,
+            ),
+            sbproxy_middleware::idempotency::ClaimState::Claimed(_)
+        ));
     }
 
     #[test]

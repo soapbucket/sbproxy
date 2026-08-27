@@ -57,6 +57,19 @@ impl KVStore for MemoryKVStore {
         self.put(key, value)
     }
 
+    fn put_if_absent_with_ttl(&self, key: &[u8], value: &[u8], _ttl_secs: u64) -> Result<bool> {
+        // The whole check-and-insert happens under one lock, so two
+        // threads racing the same absent key produce exactly one
+        // creator. TTLs are not modeled here; callers that need expiry
+        // carry it in the value, as the idempotency backend does.
+        let mut data = self.data.lock();
+        if data.contains_key(key) {
+            return Ok(false);
+        }
+        data.insert(key.to_vec(), Bytes::copy_from_slice(value));
+        Ok(true)
+    }
+
     fn compare_and_swap_with_ttl(
         &self,
         key: &[u8],

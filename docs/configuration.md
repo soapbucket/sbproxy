@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-08-25*
+*Last modified: 2026-08-27*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -5577,18 +5577,69 @@ The `idempotency:` block opts the origin into RFC 8594-style cached
 retries. The middleware reads the `Idempotency-Key` request header,
 hashes the request body, and:
 
-- **First call** under a given key: forwards the request upstream and
-  caches the response under `(tenant, origin, key)` keyed by the body
-  hash. Two origins never see each other's entries, including on the
-  `redis` backend where they share one store.
+- **First call** under a given key: claims the key, forwards the
+  request upstream, and caches the response under
+  `(tenant, origin, key)` keyed by the body hash. Two origins never see
+  each other's entries, including on the `redis` backend where they
+  share one store.
 - **Replay** with the same key + same body: returns the cached
   response with `x-sbproxy-idempotency: HIT`. The upstream is not
   contacted.
 - **Conflict** (same key, different body): returns 409 with the
   `ledger.idempotency_conflict` JSON body per the RFC.
+- **Overlap** (a second request arrives while the first is still
+  running): waits for the first request's response and replays it. If
+  the first request has not finished within three seconds, the second
+  gets 409 with `ledger.idempotency_in_flight`,
+  `x-sbproxy-idempotency: IN-FLIGHT`, and `Retry-After: 1`. It never
+  reaches the upstream.
 
 The middleware runs ahead of policy enforcement so a cached replay
 does not consume a rate-limit slot.
+
+### Overlapping requests reach the upstream once
+
+A client that times out locally and fires fifty retries of one POST
+produces one upstream call and fifty identical responses. The key is
+claimed, not merely looked up, so only the request holding it goes
+upstream; the rest wait on that claim and replay its answer.
+
+The claim is a lease, held for sixty seconds. A request that finishes,
+fails, or is cancelled releases the key immediately, so the next retry
+proceeds without waiting. A process that dies mid-request cannot
+release anything, and its key is takeable again once the lease runs
+out: sixty seconds is the bound on how long one crashed request can
+make one key answer 409. An upstream that routinely takes longer than
+that can have a retry take the key over while the original is still
+running, which is one duplicate call; the lease is sized for the slow
+tail of a normal API call, not for a long-poll.
+
+A request that arrives during an overlap and carries a *different*
+body still gets `ledger.idempotency_conflict` rather than a replay: the
+body hash is compared against the response that eventually lands, so a
+key reused with different content is never answered with somebody
+else's result.
+
+Two exceptions worth knowing. Requests on a GraphQL origin with
+validation enabled engage idempotency after validation, at a point in
+the pipeline that cannot wait, so an overlap there answers
+`ledger.idempotency_in_flight` immediately instead of waiting three
+seconds. And single-flight across replicas needs a store that can
+create a key atomically: `backend: redis` can, and so can the in-memory
+backend within one process. If `proxy.l2_store` points at a backend
+that cannot, the proxy warns once at the first request naming the
+store, counts every affected request under
+`sbproxy_idempotency_cache_results_total{result="single_flight_unsupported"}`,
+and falls back to replay-only behavior rather than pretending.
+
+The outcome of every request through the middleware lands on
+`sbproxy_idempotency_cache_results_total{backend,result}`. `result` is
+a closed set: `not_applicable`, `miss`, `hit`, `conflict`, `claimed`,
+`takeover`, `in_flight`, `coalesced`, `wait_timeout`, `fenced`,
+`single_flight_unsupported`, and `error`. A nonzero `takeover` rate
+means requests are dying between claiming a key and answering it; a
+nonzero `wait_timeout` means overlapping retries are outliving the
+three-second budget.
 
 ```yaml
 origins:

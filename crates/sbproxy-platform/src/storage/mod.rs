@@ -69,6 +69,21 @@ pub trait KVStore: Send + Sync + 'static {
         anyhow::bail!("compare_and_swap_with_ttl: not supported by this backend")
     }
 
+    /// Atomically create `key` with `value` and a TTL, only if `key` is
+    /// absent. Returns `true` when this caller created it (WOR-2609).
+    ///
+    /// Redis's `SET NX EX`. The default is an error rather than an
+    /// unconditional success, which is the opposite of [`Self::try_lock`]
+    /// and deliberately so: a caller reaching for an atomic create is
+    /// building single-flight on it, in one process as much as across a
+    /// fleet, and a backend that quietly says yes to every caller turns
+    /// that into no single-flight at all while every single-request test
+    /// still passes. An error lets the caller degrade on purpose and say
+    /// so.
+    fn put_if_absent_with_ttl(&self, _key: &[u8], _value: &[u8], _ttl_secs: u64) -> Result<bool> {
+        anyhow::bail!("put_if_absent_with_ttl: not supported by this backend")
+    }
+
     /// Atomically increment the integer counter stored at `key` and ensure
     /// the key's TTL is at least `ttl_secs` seconds. Returns the post-increment
     /// value.

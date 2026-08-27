@@ -6657,23 +6657,21 @@ pub(super) async fn handle_ai_proxy(
                     .await?;
                     return Ok(());
                 }
-                AiIdempotencyEngagement::Conflict => {
+                AiIdempotencyEngagement::Conflict | AiIdempotencyEngagement::InFlight => {
                     return Ok(());
                 }
                 AiIdempotencyEngagement::NotApplicable => (None, None),
                 AiIdempotencyEngagement::Skipped { reason } => (Some(reason), None),
                 AiIdempotencyEngagement::Miss {
                     idem,
-                    workspace_id,
-                    key,
+                    claim,
                     body_hash,
                     permit,
                 } => (
                     None,
                     Some(AiIdempotencyCapture {
                         idem,
-                        workspace_id,
-                        key,
+                        claim,
                         body_hash,
                         _permit: permit,
                     }),
@@ -7540,7 +7538,9 @@ pub(super) async fn handle_ai_proxy(
                     }
                     return Ok(());
                 }
-                AiIdempotencyEngagement::Conflict => return Ok(()),
+                AiIdempotencyEngagement::Conflict | AiIdempotencyEngagement::InFlight => {
+                    return Ok(())
+                }
                 AiIdempotencyEngagement::NotApplicable => None,
                 AiIdempotencyEngagement::Skipped { reason } => Some(reason),
                 AiIdempotencyEngagement::Miss { .. } => None,
@@ -9893,21 +9893,19 @@ pub(super) async fn handle_ai_proxy(
             }
             return Ok(());
         }
-        AiIdempotencyEngagement::Conflict => return Ok(()),
+        AiIdempotencyEngagement::Conflict | AiIdempotencyEngagement::InFlight => return Ok(()),
         AiIdempotencyEngagement::NotApplicable => (None, None),
         AiIdempotencyEngagement::Skipped { reason } => (Some(reason), None),
         AiIdempotencyEngagement::Miss {
             idem,
-            workspace_id,
-            key,
+            claim,
             body_hash,
             permit,
         } => (
             None,
             Some(AiIdempotencyCapture {
                 idem,
-                workspace_id,
-                key,
+                claim,
                 body_hash,
                 _permit: permit,
             }),
@@ -19564,24 +19562,51 @@ mod external_guardrail_context_tests {
     }
 
     impl sbproxy_middleware::idempotency::IdempotencyCache for RecordingIdempotencyCache {
-        fn get(
+        fn peek(
             &self,
             _workspace_id: &str,
             _key: &str,
-        ) -> Option<sbproxy_middleware::idempotency::CachedResponse> {
-            self.gets.fetch_add(1, Ordering::SeqCst);
-            self.hit.lock().expect("idempotency hit lock").clone()
+        ) -> sbproxy_middleware::idempotency::EntryState {
+            match self.hit.lock().expect("idempotency hit lock").clone() {
+                Some(response) => {
+                    sbproxy_middleware::idempotency::EntryState::Completed(Box::new(response))
+                }
+                None => sbproxy_middleware::idempotency::EntryState::Absent,
+            }
         }
 
-        fn put(
+        fn try_claim(
             &self,
             _workspace_id: &str,
             _key: &str,
+            _lease_secs: u64,
+        ) -> sbproxy_middleware::idempotency::TryClaim {
+            // The double answers from a fixed slot rather than storing
+            // claims: these tests assert the ordering of the AI
+            // dispatcher's stages, not the backend's atomicity, which
+            // the middleware's own suite covers.
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            match self.hit.lock().expect("idempotency hit lock").clone() {
+                Some(response) => {
+                    sbproxy_middleware::idempotency::TryClaim::Completed(Box::new(response))
+                }
+                None => sbproxy_middleware::idempotency::TryClaim::Claimed {
+                    owner: 1,
+                    took_over: false,
+                },
+            }
+        }
+
+        fn complete(
+            &self,
+            _claim: &sbproxy_middleware::idempotency::IdempotencyClaim,
             response: sbproxy_middleware::idempotency::CachedResponse,
         ) {
             self.puts.fetch_add(1, Ordering::SeqCst);
             *self.stored.lock().expect("idempotency stored lock") = Some(response);
         }
+
+        fn release(&self, _claim: &sbproxy_middleware::idempotency::IdempotencyClaim) {}
 
         fn backend_label(&self) -> &'static str {
             "memory"
@@ -19667,6 +19692,8 @@ mod external_guardrail_context_tests {
             max_request_body_bytes: configured.max_request_body_bytes,
             max_response_body_bytes: configured.max_response_body_bytes,
             permits: configured.permits.clone(),
+            claim_lease_secs: configured.claim_lease_secs,
+            claim_wait: configured.claim_wait,
         };
         pipeline.idempotencies[0] = Some(Arc::new(replacement));
 

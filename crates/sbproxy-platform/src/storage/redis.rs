@@ -367,6 +367,31 @@ impl KVStore for RedisKVStore {
         })
     }
 
+    fn put_if_absent_with_ttl(&self, key: &[u8], value: &[u8], ttl_secs: u64) -> Result<bool> {
+        self.execute(RedisOperation::CompareSwap, || {
+            // `SET <key> <value> NX EX <ttl>`: the reply is "OK" when
+            // this caller created the key and nil when it was already
+            // there. The same primitive `try_lock` uses, exposed
+            // separately because the value here is a payload rather than
+            // a lock token and the caller compares against the payload.
+            let encoded = Self::encode_key(key);
+            self.with_conn(RedisOperation::CompareSwap, |connection| {
+                let response: Option<String> = redis::cmd("SET")
+                    .arg(&encoded)
+                    .arg(value)
+                    .arg("NX")
+                    .arg("EX")
+                    .arg(ttl_secs)
+                    .query(connection)?;
+                match response.as_deref() {
+                    Some("OK") => Ok(true),
+                    None => Ok(false),
+                    Some(_) => Err((ErrorKind::TypeError, "unexpected SET NX response").into()),
+                }
+            })
+        })
+    }
+
     fn compare_and_swap_with_ttl(
         &self,
         key: &[u8],

@@ -716,3 +716,23 @@ pub(crate) would leave items whose only callers are cfg(test) code, which
 `-D warnings` reports as dead code (the #757 shape). The avoidable
 same-file constant `AI_TOOLKIT_EVENT_ID_MAX_BYTES` was narrowed to
 pub(crate) before recording this result.
+
+314 -> 316 on the WOR-2606 storage tree. Both additions are
+`sbproxy-middleware/src/idempotency.rs`'s `EntryState` and `TryClaim`,
+the return types of the `IdempotencyCache` trait's `peek` and
+`try_claim`. The trait is pub and is meant to be implemented outside
+this file (`sbproxy-core` carries one such impl today), so an
+implementor has to be able to name what it returns; the only
+cross-file caller in tree is that impl, which lives in a test module.
+Narrowing either to pub(crate) would make the trait unimplementable
+from outside the crate, which is the opposite of what the item is for.
+They come out of this bucket the first time an out-of-crate backend
+lands.
+
+The unreferenced bucket moved 1462 -> 1464 in the same change and for
+the same two items: `EntryState` and `TryClaim` are named 27 and 19
+times inside `idempotency.rs` and nowhere else in production, because
+the only thing that reads them is the module that defines the trait.
+They stay pub for the reason above. The third candidate that change
+produced, `IdempotencyOutcome::is_in_flight`, had no caller but a test
+and was deleted rather than baselined.

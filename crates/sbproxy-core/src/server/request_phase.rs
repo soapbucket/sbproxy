@@ -3867,8 +3867,47 @@ pub(super) async fn request_filter(
                             .map(|s| s.trim().to_string())
                             .unwrap_or_default();
                         let workspace = ctx.idempotency_workspace.clone().unwrap_or_default();
-                        let cached = idem.cache.get(&workspace, &key);
-                        if let Some(cached_resp) = cached {
+                        // WOR-2609: take the key, do not merely look at
+                        // it. A read-only probe is what let fifty
+                        // overlapping retries of one POST all see
+                        // "nothing here" and all reach the upstream.
+                        // The claim is atomic against every other
+                        // request that can reach this key, including
+                        // requests on other nodes when the backend is
+                        // the shared store, so exactly one of them goes
+                        // upstream and the rest resolve below.
+                        let claimed = sbproxy_middleware::idempotency::claim(
+                            &idem.cache,
+                            &workspace,
+                            &key,
+                            idem.claim_lease_secs,
+                        );
+                        // `Some(_)` means this request is not the one
+                        // producing the response, so it needs its body
+                        // to compare hashes and is never going upstream.
+                        // The inner `Option` is the response, when one
+                        // already exists.
+                        let resolving = match claimed {
+                            sbproxy_middleware::idempotency::ClaimState::Claimed(held) => {
+                                // This request owns the key. Set the
+                                // buffering flag so `request_body_filter`
+                                // accumulates the body, hashes it, and
+                                // records the response; Pingora's normal
+                                // upstream forwarding handles the body
+                                // delivery. Dropping the claim with the
+                                // context releases the key.
+                                ctx.idempotency_claim = Some(held);
+                                ctx.idempotency_buffering = true;
+                                None
+                            }
+                            sbproxy_middleware::idempotency::ClaimState::Completed(stored) => {
+                                Some(Some(*stored))
+                            }
+                            sbproxy_middleware::idempotency::ClaimState::InFlight { .. } => {
+                                Some(None)
+                            }
+                        };
+                        if let Some(already_stored) = resolving {
                             // Drain the body to compare hashes.
                             let max = idem.max_request_body_bytes;
                             let mut buf = bytes::BytesMut::new();
@@ -3957,44 +3996,78 @@ pub(super) async fn request_filter(
                             }
 
                             let body_hash = sbproxy_middleware::idempotency::hash_body(&buf);
-                            if body_hash == cached_resp.request_body_hash {
-                                // Cache hit: replay the cached response. The
-                                // shared helper also serves GraphQL hits that
-                                // must wait until final-request validation.
-                                let status =
-                                    send_idempotency_cache_hit(session, cached_resp).await?;
-                                ctx.response_status = Some(status);
-                                return Ok(true);
-                            } else {
-                                // Body conflict: same key,
-                                // different body. Return 409
-                                // per RFC 8594.
-                                let (status, content_type, body) =
-                                    sbproxy_middleware::idempotency::conflict_response();
-                                let status_u16 = status.as_u16();
-                                let mut header =
-                                    pingora_http::ResponseHeader::build(status_u16, Some(2))?;
-                                let _ = header.insert_header("content-type", content_type);
-                                let _ =
-                                    header.insert_header("content-length", body.len().to_string());
-                                session
-                                    .write_response_header(Box::new(header), false)
-                                    .await?;
-                                session
-                                    .write_response_body(Some(bytes::Bytes::from(body)), true)
-                                    .await?;
-                                ctx.response_status = Some(status_u16);
-                                return Ok(true);
+                            // A request that found a live claim waits
+                            // for the holder's response instead of
+                            // opening a second upstream connection.
+                            // When the wait runs out it answers 409 and
+                            // the client's retry, which still has an
+                            // undrained body, is what takes the lapsed
+                            // key over: this request cannot, because it
+                            // just consumed its own body to hash it.
+                            //
+                            // Boxed because this is `request_filter`,
+                            // which is already at the worker's stack
+                            // budget on the AI path; an inline future
+                            // here grows every caller's state machine.
+                            let resolved = match already_stored {
+                                Some(stored) => Some(stored),
+                                None => {
+                                    Box::pin(sbproxy_middleware::idempotency::await_completion(
+                                        &idem.cache,
+                                        &workspace,
+                                        &key,
+                                        idem.claim_wait,
+                                    ))
+                                    .await
+                                }
+                            };
+                            let (body, marker) = match resolved {
+                                Some(cached_resp) if cached_resp.request_body_hash == body_hash => {
+                                    // Replay. The shared helper also
+                                    // serves GraphQL hits that must wait
+                                    // until final-request validation.
+                                    let status =
+                                        send_idempotency_cache_hit(session, cached_resp).await?;
+                                    ctx.response_status = Some(status);
+                                    return Ok(true);
+                                }
+                                // Body conflict: same key, different
+                                // body. 409 per RFC 8594.
+                                Some(_) => (
+                                    sbproxy_middleware::idempotency::conflict_response(),
+                                    "CONFLICT",
+                                ),
+                                // The holder is still working, or died
+                                // without publishing. 409 per
+                                // draft-ietf-httpapi-idempotency-key-header:
+                                // the client retries with the same key.
+                                None => (
+                                    sbproxy_middleware::idempotency::in_flight_response(),
+                                    "IN-FLIGHT",
+                                ),
+                            };
+                            let (status, content_type, body) = body;
+                            let status_u16 = status.as_u16();
+                            let mut header =
+                                pingora_http::ResponseHeader::build(status_u16, Some(4))?;
+                            let _ = header.insert_header("content-type", content_type);
+                            let _ = header.insert_header("content-length", body.len().to_string());
+                            let _ = header.insert_header("x-sbproxy-idempotency", marker);
+                            if marker == "IN-FLIGHT" {
+                                // A hint, not a contract: the holder's
+                                // lease is the real bound and the client
+                                // may retry sooner.
+                                let _ = header.insert_header("retry-after", "1");
                             }
+                            session
+                                .write_response_header(Box::new(header), false)
+                                .await?;
+                            session
+                                .write_response_body(Some(bytes::Bytes::from(body)), true)
+                                .await?;
+                            ctx.response_status = Some(status_u16);
+                            return Ok(true);
                         }
-
-                        // No cached entry. Set the buffering flag
-                        // so `request_body_filter` accumulates the
-                        // body, hashes it, and records the
-                        // response. This is the first-call (cache
-                        // miss) path; Pingora's normal upstream
-                        // forwarding handles the body delivery.
-                        ctx.idempotency_buffering = true;
                     }
                     Err(_) => {
                         ctx.idempotency_skip_reason = Some("SKIPPED-POOL-FULL");
