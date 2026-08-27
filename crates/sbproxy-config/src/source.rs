@@ -1678,9 +1678,10 @@ fn load_with_depth(
             // its own config on the release that changed the default,
             // and a node that boots into a refusal serves nothing. The
             // unconfined path is not silent, though - a document that
-            // reaches for this host logs one warning per finding, so an
-            // operator on the default learns the setting exists. See
-            // `ConfigSource::Git`'s `confine` field for the rest.
+            // reaches for this host logs one warning naming the first
+            // finding, so an operator on the default learns the setting
+            // exists. See `ConfigSource::Git`'s `confine` field for the
+            // rest.
             //
             // `remote_document()` keeps `${VAR}`, which is the
             // documented and only supported way to run one shared
@@ -1690,7 +1691,7 @@ fn load_with_depth(
             if *confine {
                 confine_fetched_document(&spec, &text)?;
             } else {
-                warn_unconfined_host_reference(&spec, &text);
+                warn_unconfined_host_reference(&spec, &text, &resolved);
             }
             revisions.push(resolved);
             Ok(text)
@@ -1753,16 +1754,47 @@ fn confine_fetched_document(spec: &GitSpec<'_>, text: &str) -> Result<(), Config
 /// path and a static form and never a value, which is what makes this
 /// safe to log.
 ///
-/// Deduplicated per source and finding, because the refresh poller
-/// resolves the document on every cycle and an operator does not need
-/// the same line every sixty seconds. A document that changes to reach
-/// for something else warns again, which is the behavior that matters.
+/// The **first** finding, not one per finding: the checker returns on
+/// the first thing it refuses, so a document naming both a host path and
+/// an `env:` reference reports one of them now and the other once that
+/// one is fixed. Four places used to say "one warning per finding" and
+/// the code never did (WOR-2433 re-review round 3); they say this now.
+///
+/// Skipped entirely for a `(source, commit)` this process has already
+/// walked. `confine` defaults to off, so this walk is on the ordinary
+/// path: it parses the whole document into a `serde_yaml::Value` and
+/// allocates a `String` per scalar, and the refresh poller resolves the
+/// same commit every cycle. A commit and a path pin the bytes, so
+/// re-walking them can only produce the answer already given, and the
+/// finding dedup below suppressed the line but not the work
+/// (WOR-2433 re-review round 3).
+///
+/// Deduplicated per source and finding on top of that, because a
+/// refresh that does bring a new commit usually brings the same finding
+/// with it. A document that changes to reach for something else warns
+/// again, which is the behavior that matters.
+///
+/// The key path in the summary is assembled from the fetched document's
+/// own mapping key names, and YAML permits a newline or an ANSI escape
+/// inside a quoted key, so it goes through
+/// [`crate::extensions::sanitize_detail`] before it is formatted: an
+/// unsanitized document-controlled string at a log site is newline log
+/// forging. The label goes through it too, after [`redact_repo`].
 ///
 /// Returns the redacted source label and the summary it logged, for the
 /// test that pins this, and `None` when the document reaches for nothing
-/// (or when this exact finding has already been reported).
-fn warn_unconfined_host_reference(spec: &GitSpec<'_>, text: &str) -> Option<(String, String)> {
-    let label = format!("{}:{}", redact_repo(spec.repo), spec.path);
+/// (or when this revision, or this exact finding, has already been
+/// reported).
+fn warn_unconfined_host_reference(
+    spec: &GitSpec<'_>,
+    text: &str,
+    resolved: &ResolvedRevision,
+) -> Option<(String, String)> {
+    let label =
+        crate::extensions::sanitize_detail(&format!("{}:{}", redact_repo(spec.repo), spec.path));
+    if !first_check_of_revision(&label, &resolved.commit) {
+        return None;
+    }
     let refusal = crate::confined_template::check_confined_document(
         &label,
         text,
@@ -1776,9 +1808,15 @@ fn warn_unconfined_host_reference(spec: &GitSpec<'_>, text: &str) -> Option<(Str
     let summary = match &refusal {
         crate::confined_template::ConfinedTemplateError::HostSecretReference {
             path, form, ..
-        } => format!("`{path}` is a `{form}` secret reference read off this host"),
+        } => format!(
+            "`{}` is a `{form}` secret reference read off this host",
+            crate::extensions::sanitize_detail(path)
+        ),
         crate::confined_template::ConfinedTemplateError::HostFileInlining { path, .. } => {
-            format!("`{path}` names a path the proxy opens on this host")
+            format!(
+                "`{}` names a path the proxy opens on this host",
+                crate::extensions::sanitize_detail(path)
+            )
         }
         _ => return None,
     };
@@ -1794,6 +1832,26 @@ fn warn_unconfined_host_reference(spec: &GitSpec<'_>, text: &str) -> Option<(Str
          layer this node owns"
     );
     Some((label, summary))
+}
+
+/// Whether this process has yet walked `commit` for `label`.
+///
+/// Same bounded shape as [`first_report_of`], and bounded for the same
+/// reason: a process that has resolved this many distinct commits is
+/// long-lived enough that walking one document again costs less than the
+/// set does. A poisoned lock falls through to walking, because the walk
+/// is what produces the warning and silence is the wrong failure here.
+fn first_check_of_revision(label: &str, commit: &str) -> bool {
+    static CHECKED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let checked = CHECKED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let Ok(mut seen) = checked.lock() else {
+        return true;
+    };
+    if seen.len() >= MAX_REMEMBERED_UNCONFINED_FINDINGS {
+        return true;
+    }
+    seen.insert(format!("{label} @ {commit}"))
 }
 
 /// Whether this is the first time `summary` has been reported for
@@ -1818,8 +1876,8 @@ fn first_report_of(label: &str, summary: &str) -> bool {
     seen.insert(format!("{label} :: {summary}"))
 }
 
-/// How many distinct unconfined-source findings this process remembers
-/// for deduplication.
+/// How many distinct unconfined-source entries this process remembers,
+/// for the finding dedup and for the revision cache alike.
 const MAX_REMEMBERED_UNCONFINED_FINDINGS: usize = 256;
 
 /// One `Git` source, flattened so the loader is not passing seven
@@ -2066,6 +2124,16 @@ mod tests {
         }
     }
 
+    /// A resolved revision for the warning tests, which care about the
+    /// commit only as a cache key.
+    fn revision_at(commit: &str) -> ResolvedRevision {
+        ResolvedRevision {
+            repo: "https://example.test/warn.git".into(),
+            reference: "HEAD".into(),
+            commit: commit.into(),
+        }
+    }
+
     /// WOR-2433 re-review, the ruling on the default. `source.confine`
     /// stays off, so the unconfined path has to say something: an
     /// operator who never heard of the setting otherwise gets no signal
@@ -2083,8 +2151,9 @@ mod tests {
         let document =
             "origins:\n  api:\n    authentication:\n      api_key: \"env:AWS_SECRET_ACCESS_KEY\"\n";
 
-        let (label, summary) = warn_unconfined_host_reference(&spec, document)
-            .expect("an unconfined source reaching for this host must be reported");
+        let (label, summary) =
+            warn_unconfined_host_reference(&spec, document, &revision_at("warn-once-1"))
+                .expect("an unconfined source reaching for this host must be reported");
 
         assert!(
             !label.contains("ghp_examplesecrettoken"),
@@ -2102,9 +2171,111 @@ mod tests {
             !summary.contains("AWS_SECRET_ACCESS_KEY"),
             "the warning named the variable rather than the form: {summary}"
         );
+        // A new commit, so the revision cache does not answer this one:
+        // the walk runs again and the finding dedup is what stays quiet.
         assert!(
-            warn_unconfined_host_reference(&spec, document).is_none(),
+            warn_unconfined_host_reference(&spec, document, &revision_at("warn-once-2")).is_none(),
             "the same finding must not be reported on every refresh cycle"
+        );
+    }
+
+    /// WOR-2433 re-review round 3, New 9. The docs say the warning fires
+    /// "at boot and again whenever a refresh brings a revision this
+    /// process has not already checked", and the dedup set above
+    /// suppressed the log line without suppressing the walk: a full
+    /// `serde_yaml` parse plus a `String` per scalar, every refresh
+    /// cycle, on the default path where nothing asked for a check.
+    ///
+    /// The observable is a *different* finding at the same commit. The
+    /// finding dedup cannot explain silence here, so the only thing that
+    /// can is the walk not having run.
+    #[test]
+    fn an_unconfined_source_is_not_rewalked_at_a_revision_already_checked() {
+        let spec = GitSpec {
+            repo: "https://github.com/acme/warn-revision.git",
+            revision: None,
+            path: "sb.yml",
+            credential: None,
+            verify_signature: false,
+            timeout: Duration::from_secs(60),
+        };
+        let commit = revision_at("f00dcafe");
+
+        let (_, first) = warn_unconfined_host_reference(
+            &spec,
+            "origins:\n  api:\n    authentication:\n      api_key: \"env:AWS_SECRET_ACCESS_KEY\"\n",
+            &commit,
+        )
+        .expect("the first sight of a revision is walked");
+        assert!(first.contains("api_key"), "{first}");
+
+        assert!(
+            warn_unconfined_host_reference(
+                &spec,
+                "origins:\n  api:\n    request_modifiers:\n      - rego_module_path: /etc/x.rego\n",
+                &commit,
+            )
+            .is_none(),
+            "a revision this process already walked must not be walked again"
+        );
+
+        // And a genuinely new revision is walked, so the skip is a cache
+        // rather than a mute button.
+        assert!(
+            warn_unconfined_host_reference(
+                &spec,
+                "origins:\n  api:\n    request_modifiers:\n      - rego_module_path: /etc/x.rego\n",
+                &revision_at("deadbeef"),
+            )
+            .is_some(),
+            "a revision this process has not checked must be walked"
+        );
+    }
+
+    /// WOR-2433 re-review round 3, New 5. The key path in the summary is
+    /// assembled from the document's own mapping key names, and YAML
+    /// permits a newline or an ANSI escape inside a quoted key, so an
+    /// externally authored repository could forge a complete log line
+    /// under the default fmt layer.
+    #[test]
+    fn a_document_controlled_key_cannot_forge_a_log_line() {
+        let spec = GitSpec {
+            repo: "https://github.com/acme/warn-forge.git",
+            revision: None,
+            path: "sb.yml",
+            credential: None,
+            verify_signature: false,
+            timeout: Duration::from_secs(60),
+        };
+        // A quoted key carrying a newline, a carriage return and an ANSI
+        // SGR sequence, wrapped around a key the guard refuses so the
+        // path reaches the log line at all.
+        let document = concat!(
+            "\"forged\\n2026-08-27T00:00:00Z WARN sbproxy: all clear\\r\\u001b[31m\":\n",
+            "  rego_module_path: /etc/sbproxy/x.rego\n",
+        );
+
+        let (label, summary) =
+            warn_unconfined_host_reference(&spec, document, &revision_at("forge"))
+                .expect("the host path is still refused; only its rendering changes");
+
+        for (name, rendered) in [("label", &label), ("finding", &summary)] {
+            assert!(
+                !rendered.contains('\n') && !rendered.contains('\r'),
+                "a newline survived into the {name} field: {rendered:?}"
+            );
+            assert!(
+                !rendered.contains('\u{1b}'),
+                "an ANSI escape survived into the {name} field: {rendered:?}"
+            );
+            assert!(
+                !rendered.chars().any(char::is_control),
+                "a control character survived into the {name} field: {rendered:?}"
+            );
+        }
+        assert!(
+            summary.contains("rego_module_path"),
+            "the warning must still name the key it refused: {summary}"
         );
     }
 
@@ -2121,8 +2292,9 @@ mod tests {
         let document =
             "origins:\n  api:\n    request_modifiers:\n      - rego_module_path: /etc/sbproxy/x.rego\n";
 
-        let (_, summary) = warn_unconfined_host_reference(&spec, document)
-            .expect("a host path in an unconfined document must be reported");
+        let (_, summary) =
+            warn_unconfined_host_reference(&spec, document, &revision_at("warn-path"))
+                .expect("a host path in an unconfined document must be reported");
 
         assert!(summary.contains("rego_module_path"), "{summary}");
         assert!(
@@ -2162,8 +2334,12 @@ mod tests {
             verify_signature: false,
             timeout: Duration::from_secs(60),
         };
+        // A commit the fixture never resolved to, so the revision cache
+        // cannot answer this call and the finding dedup is still the
+        // only thing that can make it quiet.
         assert!(
-            warn_unconfined_host_reference(&spec, DOCUMENT).is_none(),
+            warn_unconfined_host_reference(&spec, DOCUMENT, &revision_at("not-the-fixtures"))
+                .is_none(),
             "the loader did not report the finding, so nothing warned the operator"
         );
     }
@@ -2184,7 +2360,8 @@ mod tests {
 
         assert!(warn_unconfined_host_reference(
             &spec,
-            "proxy:\n  cluster:\n    node_id: \"${SB_NODE_ID}\"\n"
+            "proxy:\n  cluster:\n    node_id: \"${SB_NODE_ID}\"\n",
+            &revision_at("warn-clean"),
         )
         .is_none());
     }
