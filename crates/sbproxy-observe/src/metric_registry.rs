@@ -1146,7 +1146,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["transport", "cmd"],
-        description: "Requests handled by the rich classifier sidecar, by transport and command.",
+        description: "Successful rich classifier sidecar requests, by transport and command; an error rate needs `sbproxy_classifier_attempts_total` as its denominator, not this.",
         dead_reason: None,
     },
     MetricCapability {

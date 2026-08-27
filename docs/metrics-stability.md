@@ -138,7 +138,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_classifier_completions_total` | Counter | `stable` | `beta` | `transport`, `cmd` | Rich classifier sidecar requests whose successful response reached the transport completion boundary. |
 | `sbproxy_classifier_errors_total` | Counter | `stable` | `beta` | `transport`, `cmd`, `reason` | Rich classifier sidecar requests that could not complete, by transport, command, and bounded reason. |
 | `sbproxy_classifier_quality_score` | Histogram | `stable` | `beta` | `transport` | Heuristic quality scores returned by the rich classifier sidecar, by transport. |
-| `sbproxy_classifier_requests_total` | Counter | `stable` | `beta` | `transport`, `cmd` | Requests handled by the rich classifier sidecar, by transport and command. |
+| `sbproxy_classifier_requests_total` | Counter | `stable` | `beta` | `transport`, `cmd` | Successful rich classifier sidecar requests, by transport and command; an error rate needs `sbproxy_classifier_attempts_total` as its denominator, not this. |
 | `sbproxy_classifier_safety_verdicts_total` | Counter | `stable` | `beta` | `verdict` | Per-token streaming safety verdicts emitted by the rich classifier sidecar (`safe`, `blocked`, or `unsafe_continued`). |
 | `sbproxy_classifier_startup_owner_info` | Gauge | `stable` | `beta` | `entrypoint`, `owner` | Release entrypoint ownership of the prepared rich-classifier runtime capability. |
 | `sbproxy_classifier_terminal_outcomes_total` | Counter | `stable` | `beta` | `transport`, `cmd`, `stage`, `reason` | Rich classifier sidecar requests finalized unsuccessfully, by typed transport, command, stage, and bounded reason. |
