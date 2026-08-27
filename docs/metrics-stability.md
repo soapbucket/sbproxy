@@ -97,7 +97,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_ai_audio_seconds_attributed_total` | Counter | `stable` | `beta` | `provider`, `model`, `surface`, `project`, `feature`, `team`, `agent_type`, `environment`, `tenant_id`, `api_key_id` | AI audio seconds consumed (realtime + audio surfaces), partitioned by attribution tag. |
 | `sbproxy_ai_budget_utilization_ratio` | Gauge | `stable` | `stable` | `scope` | Budget utilization as a fraction of the limit; above 1 is over budget. |
 | `sbproxy_ai_cache_results_total` | Counter | `stable` | `stable` | `provider`, `cache_type`, `result` | AI response cache results. |
-| `sbproxy_ai_cascade_tier_outcomes_total` | Counter | `stable` | `beta` | `tier`, `outcome` | Cascade routing tier outcomes (accepted | retry | cost_cap). |
+| `sbproxy_ai_cascade_tier_outcomes_total` | Counter | `stable` | `beta` | `tier`, `outcome` | Cascade routing tier outcomes (accepted, retry, cost_cap, credential_lock, data_posture, disabled, not_found, unhealthy). |
 | `sbproxy_ai_compression_duration_seconds` | Histogram | `stable` | `beta` | `tenant_id`, `api_key_id`, `lever`, `outcome`, `backend` | AI context compression lever duration in seconds. |
 | `sbproxy_ai_compression_lever_total` | Counter | `stable` | `beta` | `tenant_id`, `api_key_id`, `lever`, `outcome`, `reason`, `backend` | AI context compression lever invocations by closed outcome. |
 | `sbproxy_ai_compression_ratio` | Histogram | `stable` | `beta` | `tenant_id`, `api_key_id`, `lever` | Final-to-initial SBproxy token-estimate ratio for applied AI context compression levers. |

@@ -91,7 +91,7 @@ pub use budget::{
     cheapest_model, estimate_cost, BudgetConfig, BudgetLimit, BudgetScope, BudgetTracker,
     OnExceedAction, UsageRecord,
 };
-pub use client::{AiClient, OutboundSigner};
+pub use client::{AiClient, CascadeBlockLists, CascadeExhausted, OutboundSigner};
 pub use concurrency::ConcurrencyLimiter;
 pub use context_window::model_context_window;
 pub use degradation::{should_degrade, DegradationConfig};

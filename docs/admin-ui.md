@@ -1,6 +1,6 @@
 # Admin UI
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-27*
 
 The built-in admin UI is a Vue 3 + Vite single-page app that drives the
 same [admin API](admin-api-reference.md) any curl script can call. It
@@ -107,6 +107,12 @@ A session that expires while you are working is caught wherever it
 surfaces: any request answered `401` clears the stored session and
 redirects to the login form with a note that the session expired,
 instead of leaving a page half-loaded with an error nobody can act on.
+No browser credential dialog opens over the top of that. The console
+marks its own calls with `X-Requested-With: XMLHttpRequest`, and the
+admin server answers a marked 401 without the `WWW-Authenticate` header
+that makes a browser prompt (see
+[admin-api-guide.md](admin-api-guide.md#what-a-refused-request-gets-back)),
+so signing back in always happens on the app's own form.
 
 The UI does not hide pages or controls based on role: a `read_only`
 operator sees every page and every button. Attempting a mutation as

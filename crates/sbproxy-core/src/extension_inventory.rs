@@ -1130,17 +1130,43 @@ fn ensure_unattributed_failure_bundle(
     });
 }
 
+/// Move every hook named by a collision to its resolved state, and
+/// give it the reason.
+///
+/// The reason is the only thing that reaches an operator. A hook record
+/// carries no load record, so `detail` is its single free-text field,
+/// and every running-mode construction site leaves it `None`
+/// (`compiled_observations` sets `detail: None`, and the loader's
+/// `hook_inventory` does too). Without this a failed or shadowed hook
+/// reported a state with nothing to act on, and `docs/admin-ui.md`
+/// promised a reason the payload could not carry (WOR-2684).
+///
+/// This runs after `apply_observation`, so a concrete observation
+/// cannot overwrite it, and before `sanitize_records`, which bounds and
+/// sanitizes the text like any other detail.
 fn apply_collision_states(collisions: &[ExtensionCollision], hooks: &mut [ExtensionHookRecord]) {
     for collision in collisions {
         for registration in &collision.registrations {
             let Some(hook) = hooks.iter_mut().find(|hook| hook.id == *registration) else {
                 continue;
             };
-            hook.state = match collision.winner.as_deref() {
-                Some(winner) if winner != registration => ExtensionState::Shadowed,
-                Some(_) => hook.state,
-                None => ExtensionState::Failed,
-            };
+            match collision.winner.as_deref() {
+                Some(winner) if winner != registration => {
+                    hook.state = ExtensionState::Shadowed;
+                    hook.detail = Some(format!(
+                        "{}; {winner} serves `{}`",
+                        collision.resolution, collision.match_key
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    hook.state = ExtensionState::Failed;
+                    hook.detail = Some(format!(
+                        "{} on `{}`",
+                        collision.resolution, collision.match_key
+                    ));
+                }
+            }
         }
     }
 }
@@ -1785,6 +1811,48 @@ failure_posture: closed
         assert_eq!(snapshot.collisions[0].registrations, ["a-hook", "b-hook"]);
         assert_eq!(snapshot.hooks[0].state, ExtensionState::Available);
         assert_eq!(snapshot.hooks[1].state, ExtensionState::Shadowed);
+        assert_eq!(snapshot.hooks[0].detail, None);
+        let shadowed = snapshot.hooks[1]
+            .detail
+            .as_deref()
+            .expect("a shadowed hook names the registration that beat it");
+        assert!(
+            shadowed.contains("linked registration takes precedence"),
+            "{shadowed}"
+        );
+        assert!(shadowed.contains("a-hook"), "{shadowed}");
+    }
+
+    #[test]
+    fn extension_inventory_unresolved_collision_gives_each_hook_its_reason() {
+        // The running inventory detects this itself: two exclusive
+        // registrations claiming one match key, no winner. Before
+        // WOR-2684 both hooks reported `failed` with `detail: null`,
+        // so the Extensions page showed a red badge over a row with
+        // nothing to act on.
+        let mut preliminary = empty_preliminary();
+        preliminary.bundles = vec![bundle("a", &["a-hook"]), bundle("b", &["b-hook"])];
+        preliminary.hooks = vec![hook("a-hook", "a", "shared"), hook("b-hook", "b", "shared")];
+
+        let snapshot =
+            ExtensionInventorySnapshot::running("proxy-version", None, &[], preliminary, &[])
+                .expect("unresolved collision should remain reportable");
+
+        assert_eq!(snapshot.summary.collisions, 1);
+        assert!(snapshot.collisions[0].winner.is_none());
+        for hook in &snapshot.hooks {
+            assert_eq!(hook.state, ExtensionState::Failed);
+            let detail = hook
+                .detail
+                .as_deref()
+                .expect("a failed hook names why it failed");
+            assert!(
+                detail.contains("rejected duplicate exclusive registrations"),
+                "{detail}"
+            );
+            assert!(detail.contains("shared"), "{detail}");
+        }
+        assert_eq!(snapshot.bundles[0].state, ExtensionState::Failed);
     }
 
     #[test]
