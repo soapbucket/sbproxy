@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -51,6 +52,15 @@ pub trait Revocation: Send + Sync {
 /// and unit tests. Sweeps expired entries on every `is_revoked` call;
 /// the sweep is O(n) but n is bounded by the operator's revocation
 /// rate over the quote-validity window.
+///
+/// A poisoned denylist is recovered with
+/// [`PoisonError::into_inner`] rather than unwrapped. The guarded
+/// state is a plain `id -> expiry` map whose every write is a single
+/// `insert` or `retain`, so a panic in another thread cannot leave a
+/// half-written row: the map either holds the id or it does not.
+/// Refusing every later redeem because one earlier request panicked
+/// would be a worse failure than continuing to answer from the map
+/// that survived.
 #[derive(Default)]
 pub struct InMemoryRevocation {
     entries: Mutex<HashMap<String, u64>>,
@@ -65,12 +75,18 @@ impl InMemoryRevocation {
     /// Number of entries currently held (including expired entries
     /// that have not been swept yet).
     pub fn len(&self) -> usize {
-        self.entries.lock().unwrap().len()
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
     }
 
     /// Whether the store is empty.
     pub fn is_empty(&self) -> bool {
-        self.entries.lock().unwrap().is_empty()
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty()
     }
 
     fn now_unix() -> u64 {
@@ -86,14 +102,14 @@ impl Revocation for InMemoryRevocation {
     async fn revoke(&self, id: &str, expires_at_unix: u64) -> Result<(), LicensingError> {
         self.entries
             .lock()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .insert(id.to_string(), expires_at_unix);
         Ok(())
     }
 
     async fn is_revoked(&self, id: &str) -> Result<bool, LicensingError> {
         let now = Self::now_unix();
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         // Sweep expired entries lazily.
         entries.retain(|_, exp| *exp > now);
         Ok(entries.contains_key(id))

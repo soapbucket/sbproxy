@@ -22,7 +22,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use hkdf::Hkdf;
 use sha2::Sha256;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 
 use crate::error::LicensingError;
 
@@ -104,6 +104,15 @@ struct KeyEntry {
 /// verification during a rotation window. Adding a new active key
 /// rolls the previous active key into the verifier-only set; removing
 /// an entry retires it from verification.
+///
+/// Both locks are recovered with
+/// [`PoisonError::into_inner`](std::sync::PoisonError::into_inner)
+/// rather than unwrapped. The guarded state is a plain map and a plain
+/// `Option`, and every writer replaces a whole entry rather than
+/// mutating one in place, so a panic in another thread cannot leave a
+/// half-written key behind for a later reader to trust. Ending the
+/// process instead would take a running proxy down for a fault in one
+/// request, which is the trade the unwrap ratchet exists to refuse.
 pub struct KeyManager {
     master: MasterKey,
     active: RwLock<Option<KeyEntry>>,
@@ -112,7 +121,13 @@ pub struct KeyManager {
 
 impl std::fmt::Debug for KeyManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let kids: Vec<String> = self.verifiers.read().unwrap().keys().cloned().collect();
+        let kids: Vec<String> = self
+            .verifiers
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect();
         f.debug_struct("KeyManager")
             .field("verifier_kids", &kids)
             .finish()
@@ -142,9 +157,9 @@ impl KeyManager {
         // concurrently with the rotation always sees a resolvable kid.
         self.verifiers
             .write()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .insert(kid.clone(), verifying_key);
-        *self.active.write().unwrap() = Some(KeyEntry {
+        *self.active.write().unwrap_or_else(PoisonError::into_inner) = Some(KeyEntry {
             kid: kid.clone(),
             signing_key,
         });
@@ -154,14 +169,22 @@ impl KeyManager {
     /// Retire a kid from the verifier map. The active key cannot be
     /// retired; rotate it via [`Self::set_active`] first.
     pub fn retire_kid(&self, kid: &str) -> Result<(), LicensingError> {
-        if let Some(active) = self.active.read().unwrap().as_ref() {
+        if let Some(active) = self
+            .active
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
             if active.kid == kid {
                 return Err(LicensingError::Encode(format!(
                     "cannot retire active kid {kid}; rotate first"
                 )));
             }
         }
-        self.verifiers.write().unwrap().remove(kid);
+        self.verifiers
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(kid);
         Ok(())
     }
 
@@ -169,7 +192,7 @@ impl KeyManager {
     /// signature_bytes)`. Caller is responsible for encoding the
     /// signature into the wire form (base64url for a CoMP quote).
     pub fn sign(&self, signing_input: &[u8]) -> Result<(String, [u8; 64]), LicensingError> {
-        let active = self.active.read().unwrap();
+        let active = self.active.read().unwrap_or_else(PoisonError::into_inner);
         let entry = active.as_ref().ok_or_else(|| {
             LicensingError::Encode("no active signing key; call set_active first".into())
         })?;
@@ -183,7 +206,7 @@ impl KeyManager {
     pub fn lookup(&self, kid: &str) -> Result<VerifyingKey, LicensingError> {
         self.verifiers
             .read()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .get(kid)
             .copied()
             .ok_or_else(|| LicensingError::UnknownKey(kid.to_string()))
@@ -192,7 +215,11 @@ impl KeyManager {
     /// Active kid, for stamping into a newly-signed quote. Returns
     /// `None` if [`Self::set_active`] has not been called yet.
     pub fn active_kid(&self) -> Option<String> {
-        self.active.read().unwrap().as_ref().map(|e| e.kid.clone())
+        self.active
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|e| e.kid.clone())
     }
 
     /// All currently-trusted `(kid, verifying_key)` pairs, suitable
@@ -200,7 +227,7 @@ impl KeyManager {
     pub fn jwks(&self) -> Vec<(String, VerifyingKey)> {
         self.verifiers
             .read()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .iter()
             .map(|(kid, key)| (kid.clone(), *key))
             .collect()

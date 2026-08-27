@@ -18,7 +18,7 @@ use base64::Engine as _;
 use ed25519_dalek::{Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::LicensingError;
@@ -48,6 +48,13 @@ pub trait BuyerKeyRegistry: Send + Sync {
 
 /// In-memory buyer-key registry. Suitable for unit tests and
 /// single-tenant deployments where buyer keys are managed out of band.
+///
+/// A poisoned registry is recovered with
+/// [`PoisonError::into_inner`] rather than unwrapped: the guarded
+/// state is a plain `kid -> key` map written one whole entry at a
+/// time, so a panic elsewhere cannot leave a partial key behind, and
+/// an unknown kid is already answered with
+/// [`LicensingError::UnknownKey`] rather than a panic.
 #[derive(Default)]
 pub struct InMemoryBuyerKeyRegistry {
     keys: RwLock<HashMap<String, VerifyingKey>>,
@@ -61,7 +68,10 @@ impl InMemoryBuyerKeyRegistry {
 
     /// Register a buyer key under `kid`.
     pub fn insert(&self, kid: impl Into<String>, key: VerifyingKey) {
-        self.keys.write().unwrap().insert(kid.into(), key);
+        self.keys
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(kid.into(), key);
     }
 }
 
@@ -70,7 +80,7 @@ impl BuyerKeyRegistry for InMemoryBuyerKeyRegistry {
     async fn resolve(&self, kid: &str) -> Result<VerifyingKey, LicensingError> {
         self.keys
             .read()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .get(kid)
             .copied()
             .ok_or_else(|| LicensingError::UnknownKey(kid.to_string()))
@@ -96,6 +106,12 @@ pub struct CompMarketplace {
     /// not rejected on that basis alone; the revocation check below
     /// is the durable-enough backstop an operator who needs
     /// restart-survival should reach for via [`crate::revocation::RedisRevocation`].
+    ///
+    /// Poisoning is recovered with [`PoisonError::into_inner`]: the
+    /// ledger is advisory (a quote_id it does not hold is not rejected
+    /// on that basis alone) and every write is one `insert` or
+    /// `retain`, so reading a map that survived another thread's panic
+    /// is strictly better than refusing every redeem from here on.
     issued_quotes: std::sync::Mutex<HashMap<String, u64>>,
 }
 
@@ -173,7 +189,10 @@ impl CompMarketplace {
         response.signature.value = B64URL.encode(sig);
 
         {
-            let mut ledger = self.issued_quotes.lock().unwrap();
+            let mut ledger = self
+                .issued_quotes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             ledger.retain(|_, exp| *exp > now);
             ledger.insert(quote_id, valid_until_unix);
         }
@@ -221,7 +240,7 @@ impl CompMarketplace {
         if let Some(valid_until) = self
             .issued_quotes
             .lock()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .get(&request.quote_id)
             .copied()
         {

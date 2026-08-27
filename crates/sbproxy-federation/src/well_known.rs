@@ -33,7 +33,7 @@
 //! lock contention is acceptable for a request rate any operator
 //! would put behind a single proxy instance.
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
@@ -179,6 +179,15 @@ impl EntityConfigurationDocument {
 /// document is still cryptographically valid until `exp`, and a
 /// short window of "old but valid" reduces lock contention under
 /// load.
+///
+/// A poisoned cache is recovered with [`PoisonError::into_inner`]
+/// rather than unwrapped. The guarded value is one whole
+/// [`EntityConfigurationDocument`] replaced by a single assignment
+/// under the write lock, so a panic in another thread cannot leave a
+/// half-signed document behind, and the freshness check on the way
+/// out rejects anything past its refresh margin regardless. Ending
+/// the process instead would take the whole proxy down because one
+/// request panicked while re-signing.
 pub struct WellKnownIssuer {
     config: FederationServerConfig,
     cached: RwLock<Option<EntityConfigurationDocument>>,
@@ -235,7 +244,7 @@ impl WellKnownIssuer {
     /// `Some` only when the cached doc is still outside the refresh
     /// margin; `None` triggers a re-sign in `current_at`.
     fn peek_fresh(&self, now: DateTime<Utc>) -> Option<Arc<EntityConfigurationDocument>> {
-        let guard = self.cached.read().expect("federation cache poisoned");
+        let guard = self.cached.read().unwrap_or_else(PoisonError::into_inner);
         let doc = guard.as_ref()?;
         let remaining = doc.remaining_lifetime(now);
         if remaining > self.config.refresh_margin {
@@ -249,7 +258,7 @@ impl WellKnownIssuer {
     /// write lock; double-check the cache after acquiring the lock
     /// so two concurrent refresh requests only sign once.
     fn refresh(&self, now: DateTime<Utc>) -> FederationResult<Arc<EntityConfigurationDocument>> {
-        let mut guard = self.cached.write().expect("federation cache poisoned");
+        let mut guard = self.cached.write().unwrap_or_else(PoisonError::into_inner);
         if let Some(doc) = guard.as_ref() {
             if doc.remaining_lifetime(now) > self.config.refresh_margin {
                 return Ok(Arc::new(doc.clone()));
