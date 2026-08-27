@@ -6420,7 +6420,7 @@ all three read a machine the fragment's author does not own:
 |---|---|---|
 | Name a process variable: `${VAR}`, `${VAR:-default}`, `{{env.X}}` | yes | refused, naming the variable |
 | Reference a secret the resolver reads off the host: `env:NAME`, `vault://env/NAME`, `file:PATH` | yes | refused, naming the form |
-| Name a host path the proxy opens: `rego_module_path`, `module_path`, `spec_file`, `spec_path`, `sha1_file`, `transcode.descriptor_set`, `bulk_list.path`, `feed.cache_dir`, `argument_policies[].path`, `result_policies[].path`, `agent_skills[].path` | yes | refused, naming the key and the inline alternative |
+| Name a host path the proxy opens, through any of the config keys listed below | yes | refused, naming the key and what to do instead |
 
 The second row matters as much as the first and is easier to miss.
 `api_key: "env:AWS_SECRET_ACCESS_KEY"` contains no `${` and no `{{`, so
@@ -6430,13 +6430,32 @@ it out of the process environment at config load exactly the way
 syntax would refuse one spelling of an attack and wave through the
 other.
 
-The third row is a list of config keys, not a rule about files. Each key
-on it is one a module opens on the proxy host, and a module added later
-opens a path the list has never heard of until somebody adds it. Keys
-that take the *name* of an environment variable rather than its value
-(the WAF feed's `signature_key_env`, for instance) are deliberately not
-on it: the value never reaches the document or a response, and naming
-the variable is the only way to configure the feature at all.
+The third row is a list of config keys, not a rule about files:
+
+| Where | Keys |
+|---|---|
+| Policy and transform modules | `rego_module_path`, `module_path`, `spec_file`, `sha1_file`, `detector_config.model_path`, `detector_config.tokenizer_path`, `detector_config.model_signature_path`, `detector_config.tokenizer_signature_path` |
+| Actions | `action.path` (the `local` storage backend), `bulk_list.path`, `transcode.descriptor_set`, `spec_path`, `argument_policies[].path`, `result_policies[].path`, `tool_versioning.lockfile` |
+| Served content | `agent_skills[].path`, `agent_skills[].url` (any value that is not an absolute `http(s)` URL) |
+| Durable sinks | `feed.cache_dir`, `feed.cache_file`, `store.path`, `usage_sinks[].path`, `backend.path` |
+| Node identity and node state | `tls_cert_file`, `tls_key_file`, `security.cert_file`, `security.key_file`, `security.ca_file`, `authority_dir`, `signing_key_file`, `verifying_key_file`, `state_dir`, `model_host.store_path`, `model_host.catalog_file`, `bundles.bundles_dir`, `proxy.ai_providers_file` |
+
+Two things about that table. It is a list, so it is exactly as wide as
+its entries: a module added later opens a path the list has never heard
+of until somebody adds it, and the list's own source (`HOST_FILE_KEYS`)
+carries the sweep that finds them. And it refuses the *document's*
+choice of path, not the key: `state_dir: "${SB_STATE_DIR}"` is fine,
+because the node resolves that from its own environment and an unset
+variable fails the compile closed, while `state_dir: /var/lib/x` and
+`state_dir: "${SB_STATE_DIR:-/var/lib/x}"` are both refused, because the
+document picked the bytes.
+
+Keys that take the *name* of an environment variable rather than its
+value (the WAF feed's `signature_key_env` and `auth_token_env`, the MCP
+action's and the semantic-constraint policy's `api_key_env`) are
+deliberately not on it: the value never reaches the document or a
+response, and naming the variable is the only way to configure the
+feature at all.
 
 A reference to a backend the operator declared under `proxy.secrets`
 (`secret://acme/openai`, `vault://acme-vault/openai`, `awssm://...`)
@@ -6608,18 +6627,20 @@ A remote document may still write
 substitute its own value. The existing gate only refuses a `${VAR}` that
 fails to resolve. Closing that needs the node operator to declare which
 variable names a remote document may name, which is a config key this
-change does not add.
+change does not add. That residual reaches further than the document
+itself: `${VAR}` is substituted over the whole text before the parse, so
+a remote document can put one in an extension bundle's attachment config
+and the resolved value is handed to guest code, which is the outcome the
+bundle-manifest rule above exists to prevent, reached from the other
+side.
 
-And the host-path half is a list of config keys, not a rule about files:
-`rego_module_path`, `module_path`, `spec_file`, `spec_path`, `sha1_file`,
-`transcode.descriptor_set`, `bulk_list.path`, `feed.cache_dir`,
-`argument_policies[].path`, `result_policies[].path` and
-`agent_skills[].path`. A module added later opens whatever path its own
-config key names, and this list has never heard of it until somebody adds
-it. Keys that take the *name* of an environment variable rather than its
-value, such as the WAF feed's `signature_key_env`, are deliberately not
-on the list: the value never reaches the document or a response, and
-naming the variable is the only way to configure the feature.
+And the host-path half is the list of config keys in the table above,
+not a rule about files. A module added later opens whatever path its own
+config key names, and the list has never heard of it until somebody adds
+it. Two shapes it cannot express today: a key that is a host path only
+when a sibling key says so (`action.path` is refused whatever `backend:`
+says), and a key whose parent scope is a coincidence rather than a
+contract.
 
 Composition itself is still being built, so nothing in a stock `sb.yml`
 supplies a fragment yet. The boundary is documented here because it is
@@ -6823,7 +6844,7 @@ source:
 | `path` | string | required for `git` | Path to the config file inside the repository. Relative, and `..` components are refused: this names a file in the repository, not a file on the proxy host. |
 | `credential` | secret ref | | `env:NAME`, `${NAME}`, `file:/path`, or `secret://backend/name`. An inline literal is refused. |
 | `verify_signature` | bool | `false` | Require a verifiable signature on the resolved tag or commit. |
-| `confine` | bool | `false` | Treat the fetched document as externally authored: no `env:NAME`, `file:PATH` or `vault://env/NAME` secret reference, and no config key that names a path on the proxy host. See [Confined fragments](#confined-fragments). |
+| `confine` | bool | `false` | Treat the fetched document as externally authored: no `env:NAME`, `file:PATH` or `vault://env/NAME` secret reference, and no config key naming a path this document chose on the proxy host. Per source leaf, so each `git` node in a `git_overlay` carries its own. See [Confined fragments](#confined-fragments). |
 | `timeout_secs` | int | `60` | Hard timeout for one fetch, 1 to 3600. A `git` child, or the in-process clone, is stopped when it expires. |
 | `refresh_interval_secs` | int | `60` | How often to re-resolve while running. `0` resolves at boot and on ordinary reloads only. |
 
@@ -6837,7 +6858,13 @@ Two settings close most of that gap, and both are yours to choose:
 - **Set `verify_signature: true`.** The resolved tag is checked first, then the commit, and a missing or unverifiable signature refuses the document. The signing key has to be in the git trust store on the proxy host.
 - **Set `confine: true`** when the repository is written by somebody other than whoever runs the proxy. The fetched document then loses the two powers a document authored elsewhere was never granted: a secret reference that reads this host directly (`env:NAME`, `file:PATH`, `vault://env/NAME`) and a config key that names a path on this host for the proxy to open. `${VAR}` still resolves, because that is how one shared document names per-node values.
 
-  It is off by default on purpose. In the ordinary GitOps shape the repository *is* your config: the local file is a pointer, so "declare the value in the config you own" has nowhere to go, and `env:NAME` or `file:PATH` is the only spelling `proxy.cluster.security.shared_key` accepts (see [secrets](secrets.md)). Sealing that by default would leave a clustered node with no legal way to name its own secret. Turn it on when the trust boundary is real, and keep the secrets your nodes need in the pointer file or in a declared backend under `proxy.secrets`.
+  It is off by default on purpose: turning it on for everybody would be a fail-closed upgrade. Every GitOps repository that names a host path anywhere in its document would refuse its own config on the release that changed the default, and a node that boots into a refusal serves nothing. That is a decision you take, on a repository you know is written by somebody else, not one a release takes for you.
+
+  It is not silent while it is off. A git source whose document reaches for this host logs one warning per finding at boot, naming the source and the key and never the value, with a pointer to this setting. That is the answer to "what would `confine: true` refuse if I turned it on".
+
+  A secret still has a spelling under it. `${VAR}` survives confinement, so `shared_key: "${SB_CLUSTER_SHARED_KEY}"` and any other secret-bearing field can name a variable your node exports; an unset variable fails the compile closed. What confinement takes away is `env:NAME`, `file:PATH`, `vault://env/NAME` and the host-path keys, so a document that uses those has to move them into a layer this node owns: the pointer file, through a `kind: git_overlay` source whose `base` is `kind: local`, which is the one arm that merges the local file's own content rather than discarding it.
+
+  `confine` is per source leaf, not per tree. A `git_overlay` resolves each `kind: git` node with its own setting, so an overlay you left unconfined keeps its own powers and warns on its own.
 
 ### How a git source is fetched
 
@@ -6865,6 +6892,7 @@ The interval carries jitter, so a fleet that restarts together does not hit your
 | `revision` pins a sha and `HEAD` is a different commit | Refuse the document. `revision_mismatch`. |
 | `verify_signature` set and no verifiable signature | Refuse the document. `verify_failed`. |
 | `confine` set and the document reaches for this host | Refuse the document. `confinement_refused`. |
+| `confine` unset and the document reaches for this host | Serve it, and warn once per finding, naming the source and the key. |
 | Resolved document does not compile or cannot be constructed | Refuse the document. `compile_failed`. |
 | Another reload in flight | Skip the cycle. `reload_busy`. |
 | Resolved commit unchanged | Nothing at all. `not_modified`. |
