@@ -524,7 +524,7 @@ impl CelScriptTransform {
     /// and names the rule this returns (WOR-2630).
     ///
     /// Same textual limits as its sibling: see
-    /// [`expression_reads_response_field`].
+    /// `expression_reads_response_field`.
     #[must_use]
     pub fn header_rule_reading_response_headers(&self) -> Option<&CelHeaderRule> {
         self.headers
