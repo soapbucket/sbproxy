@@ -100,6 +100,10 @@ sbproxy-platform.workspace = true
 sbproxy-classifiers.workspace = true
 sbproxy-classifier-client.workspace = true
 sbproxy-observe.workspace = true
+# WOR-2667: shared outbound-error summarizer. `reqwest::Error`'s
+# Display ends with the full URL, so an auth callout that fails must
+# log the summary rather than the error (WOR-2629).
+sbproxy-httpkit.workspace = true
 prometheus.workspace = true
 
 arc-swap.workspace = true

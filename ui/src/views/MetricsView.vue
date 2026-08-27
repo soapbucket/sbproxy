@@ -134,6 +134,19 @@ const cacheFamily = computed(() =>
 const authFamily = computed(() =>
   findFamily(families.value, "sbproxy_auth_results_total"),
 );
+/* The three providers that reach a service to decide (WOR-2667). None
+ * of the three families carries an origin label, on purpose: they answer
+ * "what did the callout conclude" rather than "for whom", and the
+ * per-origin split already lives on sbproxy_auth_results_total. */
+const extAuthzFamily = computed(() =>
+  findFamily(families.value, "sbproxy_ext_authz_decisions_total"),
+);
+const introspectionFamily = computed(() =>
+  findFamily(families.value, "sbproxy_oauth_introspection_results_total"),
+);
+const kyaFamily = computed(() =>
+  findFamily(families.value, "sbproxy_kya_verdicts_total"),
+);
 
 const tokenFamily = computed(() =>
   findFamily(
@@ -260,6 +273,34 @@ const authResults = computed(() => {
           : undefined,
     }));
 });
+/* One card for the three callout providers. Renders nothing until an
+ * origin configures one, and colours the outcomes that mean a request
+ * was refused, or admitted without a decision, as failures. `fail_open`
+ * is red rather than green for that reason: the request went through,
+ * but nothing authorized it. */
+const authCallouts = computed(() => {
+  const rows: { key: string; value: number; color?: string }[] = [];
+  const push = (
+    prefix: string,
+    family: MetricFamily | undefined,
+    label: string,
+  ) => {
+    for (const row of groupByLabel(family, label)) {
+      rows.push({
+        key: `${prefix} ${row.key}`,
+        value: row.value,
+        color: /allow|active|verified|cached/i.test(row.key)
+          ? "var(--sb-ok)"
+          : "var(--sb-err)",
+      });
+    }
+  };
+  push("ext_authz", extAuthzFamily.value, "outcome");
+  push("introspection", introspectionFamily.value, "result");
+  push("kya", kyaFamily.value, "verdict");
+  return rows;
+});
+
 const bytesByDirection = computed(() => {
   const f = scopeByOrigin(bytesFamily.value);
   return f ? groupByLabel(f, "direction").slice(0, 4) : [];
@@ -573,6 +614,7 @@ const hasAnyPanel = computed(
     errorsByType.value.length ||
     cacheResults.value.length ||
     authResults.value.length ||
+    authCallouts.value.length ||
     bytesByDirection.value.length ||
     tokensByDirection.value.length ||
     tokensByProvider.value.length ||
@@ -789,6 +831,13 @@ function formatPct(v: number): string {
         <div class="sb-card" v-if="authResults.length">
           <h3>Auth results</h3>
           <MiniBars :items="authResults" />
+        </div>
+        <div class="sb-card" v-if="authCallouts.length">
+          <h3>
+            Auth callouts
+            <span v-if="selectedOrigin" class="sb-eyebrow">all origins</span>
+          </h3>
+          <MiniBars :items="authCallouts" />
         </div>
         <div class="sb-card" v-if="bytesByDirection.length">
           <h3>Bytes by direction</h3>

@@ -3515,6 +3515,14 @@ pub(super) async fn request_filter(
             if let Some(principal) = principal_opt {
                 ctx.principal = principal;
             }
+            // WOR-2667: the `kya` provider resolves an agent identity,
+            // not just an admission. Copy what it learned off the
+            // principal and onto the request context so `request.kya.*`
+            // is addressable from CEL, Lua, JavaScript, and WASM the
+            // same way it is when an out-of-tree `IdentityResolverHook`
+            // populates it.
+            #[cfg(feature = "agent-class")]
+            stamp_kya_context(ctx, &decided_auth_type);
             // Phase-timing capture: snapshot the moment the auth
             // provider returned (success, deny, or challenge). The
             // access-log + `sbproxy_phase_duration_seconds{phase="auth"}`
@@ -7733,6 +7741,162 @@ origins:
         assert!(
             response.contains("buffered policy denied"),
             "response: {response}"
+        );
+    }
+}
+
+/// WOR-2667: mirror a verified `kya` principal's metadata onto the
+/// request context's `request.kya.*` fields.
+///
+/// The provider stamps what it learned onto
+/// `Principal::attrs::metadata` because that is the carrier every
+/// provider already writes and the access log already reads. The
+/// scripting layers read the typed context fields instead, and
+/// `trust_tier` reads `kya_verdict`, so the two have to agree. This is
+/// the one place that copy happens.
+///
+/// Keyed on the *deciding* provider rather than on the configured
+/// `Auth` variant, so a `kya` slot that wins inside an `any_of`
+/// composition is stamped too. Matching the variant would skip it
+/// there and leave `request.kya.verdict` unset for a request a KYA
+/// token actually authenticated.
+#[cfg(feature = "agent-class")]
+pub(crate) fn stamp_kya_context(ctx: &mut RequestContext, decided_auth_type: &str) {
+    if decided_auth_type != "kya" {
+        return;
+    }
+    let metadata = &ctx.principal.attrs.metadata;
+    // The label set is the closed one `KyaVerdict::metric_label`
+    // produces; anything else means the provider and this mapping
+    // disagree, and an unknown label is dropped rather than widened
+    // into the `&'static str` the context field holds.
+    let verdict = metadata
+        .get("kya_verdict")
+        .and_then(|value| match value.as_str() {
+            "verified" => Some("verified"),
+            "missing" => Some("missing"),
+            "expired" => Some("expired"),
+            "revoked" => Some("revoked"),
+            "invalid" => Some("invalid"),
+            "insufficient_balance" => Some("insufficient_balance"),
+            "directory_unavailable" => Some("directory_unavailable"),
+            _ => None,
+        });
+    if verdict.is_none() {
+        return;
+    }
+    ctx.kya_verdict = verdict;
+    ctx.kya_vendor = metadata.get("kya_vendor").cloned();
+    ctx.kya_version = metadata.get("kya_version").cloned();
+    ctx.kya_kyab_balance = metadata
+        .get("kya_kyab_balance")
+        .and_then(|amount| amount.parse::<u64>().ok());
+}
+
+/// WOR-2667: the `kya` provider's context stamping, tested at the seam
+/// rather than through the provider.
+#[cfg(all(test, feature = "agent-class"))]
+mod kya_context_tests {
+    use super::*;
+
+    fn ctx_with_kya_metadata(pairs: &[(&str, &str)]) -> crate::context::RequestContext {
+        let mut ctx = crate::context::RequestContext::new();
+        for (key, value) in pairs {
+            ctx.principal
+                .attrs
+                .metadata
+                .insert((*key).to_string(), (*value).to_string());
+        }
+        ctx
+    }
+
+    #[test]
+    fn a_verified_kya_principal_populates_the_scripting_fields() {
+        let mut ctx = ctx_with_kya_metadata(&[
+            ("kya_verdict", "verified"),
+            ("kya_vendor", "skyfire"),
+            ("kya_version", "1.0"),
+            ("kya_kyab_balance", "2500"),
+        ]);
+        stamp_kya_context(&mut ctx, "kya");
+        assert_eq!(ctx.kya_verdict, Some("verified"));
+        assert_eq!(ctx.kya_vendor.as_deref(), Some("skyfire"));
+        assert_eq!(ctx.kya_version.as_deref(), Some("1.0"));
+        assert_eq!(ctx.kya_kyab_balance, Some(2500));
+    }
+
+    /// A `kya` slot that wins inside an `any_of` composition is still
+    /// the deciding provider, and stamping keyed on the configured
+    /// `Auth` variant rather than on the decision would skip it.
+    #[test]
+    fn a_provider_that_did_not_decide_stamps_nothing() {
+        let mut ctx = ctx_with_kya_metadata(&[("kya_verdict", "verified")]);
+        stamp_kya_context(&mut ctx, "bearer");
+        assert_eq!(ctx.kya_verdict, None);
+    }
+
+    /// The context field holds a `&'static str` from a closed set. A
+    /// label the provider never produces is dropped rather than
+    /// widening that set.
+    #[test]
+    fn an_unrecognized_verdict_label_is_dropped() {
+        let mut ctx = ctx_with_kya_metadata(&[
+            ("kya_verdict", "definitely-fine"),
+            ("kya_vendor", "skyfire"),
+        ]);
+        stamp_kya_context(&mut ctx, "kya");
+        assert_eq!(ctx.kya_verdict, None);
+        assert_eq!(
+            ctx.kya_vendor, None,
+            "an unrecognized verdict must not stamp the fields around it"
+        );
+    }
+
+    /// Every label `KyaVerdict::metric_label` can return has to survive
+    /// the mapping, or a policy branching on one of them reads `None`
+    /// for a verdict that really happened.
+    #[test]
+    fn every_verdict_label_the_provider_produces_round_trips() {
+        use sbproxy_modules::auth::kya::VerifiedAgent;
+        use sbproxy_modules::auth::KyaVerdict;
+
+        // Built from the enum rather than from a hand-copied list, so a
+        // provider that gains or renames a verdict fails here instead
+        // of silently leaving `request.kya.verdict` unset for it.
+        let every_verdict = [
+            KyaVerdict::Verified(Box::new(VerifiedAgent {
+                agent_id: "agent".to_string(),
+                vendor: "skyfire".to_string(),
+                agent_class: "assistant".to_string(),
+                kya_version: "1.0".to_string(),
+                sub: "sub".to_string(),
+                kyab_balance: None,
+            })),
+            KyaVerdict::Missing,
+            KyaVerdict::Invalid {
+                reason: "signature_invalid",
+            },
+            KyaVerdict::Expired,
+            KyaVerdict::Revoked,
+            KyaVerdict::InsufficientBalance { required: 1 },
+            KyaVerdict::DirectoryUnavailable,
+        ];
+        for label in every_verdict.iter().map(KyaVerdict::metric_label) {
+            let mut ctx = ctx_with_kya_metadata(&[("kya_verdict", label)]);
+            stamp_kya_context(&mut ctx, "kya");
+            assert_eq!(ctx.kya_verdict, Some(label), "label {label} was dropped");
+        }
+    }
+
+    #[test]
+    fn a_balance_that_is_not_a_number_is_dropped_rather_than_defaulted() {
+        let mut ctx =
+            ctx_with_kya_metadata(&[("kya_verdict", "verified"), ("kya_kyab_balance", "lots")]);
+        stamp_kya_context(&mut ctx, "kya");
+        assert_eq!(
+            ctx.kya_kyab_balance, None,
+            "an unparseable balance must not read as zero, which a \
+             `min_balance` script would treat as a real answer"
         );
     }
 }

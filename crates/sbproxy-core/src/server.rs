@@ -3583,6 +3583,247 @@ async fn check_auth_with_tls_outcome(
                 }
             }
         }
+        // WOR-2667: Envoy-style external authorization. Like
+        // `ldap_auth`, this is an outbound call on the inbound path
+        // that needs nothing the H1/H2 pipeline has and the H3
+        // dispatch lacks, so it dispatches here rather than in a
+        // dedicated branch the way `forward_auth` has to.
+        Auth::ExtAuthz(provider) => {
+            use sbproxy_modules::auth::ExtAuthzOutcome;
+            // The service authorizes the request line it would see, so
+            // the query rides along with the path; a service gating on
+            // `?admin=1` cannot do that from the path alone.
+            let target = match query {
+                Some(query) if !query.is_empty() => format!("{path}?{query}"),
+                _ => path.to_string(),
+            };
+            match provider.authorize(method, &target, headers).await {
+                ExtAuthzOutcome::Allowed { subject } => {
+                    let principal = match subject.as_deref() {
+                        Some(subject) => sbproxy_plugin::Principal {
+                            tenant_id: tenant_id.clone(),
+                            sub: subject.to_string(),
+                            source: sbproxy_plugin::PrincipalSource::ExtAuthz,
+                            virtual_key: None,
+                            attrs: sbproxy_plugin::PrincipalAttrs::default(),
+                        },
+                        None => sbproxy_plugin::Principal::anonymous_for(tenant_id.clone()),
+                    };
+                    (
+                        AuthResult::Allow {
+                            sub: subject,
+                            source: Some(sbproxy_plugin::AuthSubjectSource::ForwardAuth),
+                        },
+                        Some(principal),
+                        AuthTrustOutcome::Allowed,
+                    )
+                }
+                ExtAuthzOutcome::Denied {
+                    status,
+                    message,
+                    headers: response_headers,
+                } => (
+                    AuthResult::DenyWithHeaders(status, message, response_headers),
+                    None,
+                    // The service refused a request it was able to
+                    // judge. That is a decision about authorization,
+                    // not evidence that the caller forged a
+                    // credential, so it stays off the suspicious tier.
+                    AuthTrustOutcome::Challenge,
+                ),
+                ExtAuthzOutcome::Unavailable => (
+                    AuthResult::Deny(503, "authorization service unavailable".to_string()),
+                    None,
+                    AuthTrustOutcome::BackendFailure,
+                ),
+                ExtAuthzOutcome::FailedOpen => (
+                    AuthResult::allow_anonymous(),
+                    Some(sbproxy_plugin::Principal::anonymous_for(tenant_id.clone())),
+                    // Allowed, because the request proceeds. The
+                    // fail-open itself is counted separately on
+                    // `sbproxy_ext_authz_decisions_total{outcome="fail_open"}`,
+                    // which is the series an operator alerts on.
+                    AuthTrustOutcome::Allowed,
+                ),
+            }
+        }
+        // WOR-2667: RFC 7662 token introspection.
+        Auth::OauthIntrospection(provider) => {
+            use sbproxy_modules::auth::IntrospectionOutcome;
+            use sbproxy_modules::auth::OauthIntrospectionProvider;
+            let token_offered = OauthIntrospectionProvider::extract_token(headers).is_some();
+            match provider.authenticate(headers).await {
+                IntrospectionOutcome::Active { subject } => {
+                    let principal = match subject.as_deref() {
+                        Some(subject) => sbproxy_plugin::Principal {
+                            tenant_id: tenant_id.clone(),
+                            sub: subject.to_string(),
+                            source: sbproxy_plugin::PrincipalSource::OauthIntrospection,
+                            virtual_key: None,
+                            attrs: sbproxy_plugin::PrincipalAttrs::default(),
+                        },
+                        // A client-credentials token often carries no
+                        // `sub`. It is still an authenticated caller.
+                        None => sbproxy_plugin::Principal::anonymous_for(tenant_id.clone()),
+                    };
+                    (
+                        AuthResult::Allow {
+                            sub: subject,
+                            source: Some(sbproxy_plugin::AuthSubjectSource::Jwt),
+                        },
+                        Some(principal),
+                        AuthTrustOutcome::Allowed,
+                    )
+                }
+                IntrospectionOutcome::Inactive => {
+                    // RFC 6750 section 3: a bare `Bearer` challenge
+                    // when nothing was offered, and `invalid_token`
+                    // when something was and the server rejected it.
+                    // The split is what tells a client whether to go
+                    // get a credential or to refresh the one it holds.
+                    let (challenge, trust_outcome) = if token_offered {
+                        (
+                            "Bearer error=\"invalid_token\"".to_string(),
+                            AuthTrustOutcome::InvalidProof,
+                        )
+                    } else {
+                        ("Bearer".to_string(), AuthTrustOutcome::Missing)
+                    };
+                    (
+                        AuthResult::DenyWithHeaders(
+                            401,
+                            "unauthorized".to_string(),
+                            vec![("WWW-Authenticate".to_string(), challenge)],
+                        ),
+                        None,
+                        trust_outcome,
+                    )
+                }
+                IntrospectionOutcome::InsufficientScope { missing } => (
+                    AuthResult::DenyWithHeaders(
+                        403,
+                        "insufficient scope".to_string(),
+                        vec![(
+                            "WWW-Authenticate".to_string(),
+                            format!("Bearer error=\"insufficient_scope\", scope=\"{missing}\""),
+                        )],
+                    ),
+                    None,
+                    // The token verified; it just does not carry the
+                    // grant this origin needs.
+                    AuthTrustOutcome::Challenge,
+                ),
+                IntrospectionOutcome::Unavailable => (
+                    AuthResult::Deny(503, "token introspection unavailable".to_string()),
+                    None,
+                    AuthTrustOutcome::BackendFailure,
+                ),
+            }
+        }
+        // WOR-2667: Know Your Agent token verification.
+        Auth::Kya(verifier) => {
+            use sbproxy_modules::auth::KyaVerdict;
+            let hostname = headers
+                .get(http::header::HOST)
+                .and_then(|value| value.to_str().ok())
+                .map(crate::dispatch::strip_port)
+                .unwrap_or("");
+            match verifier.verify(headers, hostname).await {
+                KyaVerdict::Verified(agent) => {
+                    let mut attrs = sbproxy_plugin::PrincipalAttrs::default();
+                    // The agent metadata rides on the principal so the
+                    // access log, policy scripts, and the request
+                    // context all read one carrier rather than
+                    // re-deriving it from the token.
+                    attrs
+                        .metadata
+                        .insert("kya_verdict".to_string(), "verified".to_string());
+                    if !agent.vendor.is_empty() {
+                        attrs
+                            .metadata
+                            .insert("kya_vendor".to_string(), agent.vendor.clone());
+                    }
+                    if !agent.kya_version.is_empty() {
+                        attrs
+                            .metadata
+                            .insert("kya_version".to_string(), agent.kya_version.clone());
+                    }
+                    if !agent.agent_class.is_empty() {
+                        attrs
+                            .metadata
+                            .insert("kya_agent_class".to_string(), agent.agent_class.clone());
+                    }
+                    if !agent.agent_id.is_empty() {
+                        attrs
+                            .metadata
+                            .insert("kya_agent_id".to_string(), agent.agent_id.clone());
+                    }
+                    if let Some(balance) = agent.kyab_balance.as_ref() {
+                        attrs
+                            .metadata
+                            .insert("kya_kyab_balance".to_string(), balance.amount.to_string());
+                    }
+                    let sub = agent.sub.clone();
+                    let principal = sbproxy_plugin::Principal {
+                        tenant_id: tenant_id.clone(),
+                        sub: sub.clone(),
+                        source: sbproxy_plugin::PrincipalSource::Kya,
+                        virtual_key: None,
+                        attrs,
+                    };
+                    (
+                        AuthResult::Allow {
+                            sub: (!sub.is_empty()).then_some(sub),
+                            source: Some(sbproxy_plugin::AuthSubjectSource::Jwt),
+                        },
+                        Some(principal),
+                        AuthTrustOutcome::Allowed,
+                    )
+                }
+                KyaVerdict::Missing => (
+                    AuthResult::Deny(401, "kya: agent token required".to_string()),
+                    None,
+                    AuthTrustOutcome::Missing,
+                ),
+                verdict @ (KyaVerdict::Invalid { .. }
+                | KyaVerdict::Expired
+                | KyaVerdict::Revoked) => {
+                    // The reason is log-safe by construction: it is a
+                    // closed label, never any part of the token.
+                    tracing::warn!(reason = verdict.reason(), "kya: agent token rejected");
+                    (
+                        AuthResult::Deny(401, "kya: agent token rejected".to_string()),
+                        None,
+                        AuthTrustOutcome::InvalidProof,
+                    )
+                }
+                KyaVerdict::InsufficientBalance { required } => (
+                    AuthResult::Deny(
+                        402,
+                        format!("kya: agent balance below the required {required}"),
+                    ),
+                    None,
+                    // The token verified. The agent cannot pay, which
+                    // is a state it can fix, not a forged credential.
+                    AuthTrustOutcome::Challenge,
+                ),
+                KyaVerdict::DirectoryUnavailable => {
+                    if verifier.fail_open {
+                        (
+                            AuthResult::allow_anonymous(),
+                            Some(sbproxy_plugin::Principal::anonymous_for(tenant_id.clone())),
+                            AuthTrustOutcome::Allowed,
+                        )
+                    } else {
+                        (
+                            AuthResult::Deny(503, "kya: issuer directory unavailable".to_string()),
+                            None,
+                            AuthTrustOutcome::BackendFailure,
+                        )
+                    }
+                }
+            }
+        }
         Auth::Noop => (
             AuthResult::allow_anonymous(),
             Some(sbproxy_plugin::Principal::anonymous_for(tenant_id.clone())),

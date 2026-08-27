@@ -535,6 +535,32 @@ pub struct ProxyMetrics {
     pub bytes_total: CounterVec,
     /// Auth check results with origin, auth_type, and result labels.
     pub auth_results: CounterVec,
+    /// WOR-2667: `ext_authz` callout outcomes, by outcome
+    /// (`allow`, `deny`, `unavailable`, `fail_open`).
+    ///
+    /// Separate from `auth_results` because that family answers "was
+    /// the request admitted"; this one answers "did the authorization
+    /// service decide". A `fail_open` is an admitted request whose
+    /// decision was never made, and folding the two together hides
+    /// exactly the event an operator alerts on. Break down per origin
+    /// by joining against `sbproxy_auth_results_total{auth_type="ext_authz"}`.
+    pub ext_authz_decisions: Option<IntCounterVec>,
+    /// WOR-2667: RFC 7662 token-introspection results, by result
+    /// (`active`, `inactive`, `insufficient_scope`, `cached`,
+    /// `unavailable`).
+    ///
+    /// `cached` counts the requests a verdict cache answered without
+    /// reaching the authorization server, which is what tells an
+    /// operator whether `cache_ttl` is doing anything.
+    pub oauth_introspection_results: Option<IntCounterVec>,
+    /// WOR-2667: Know Your Agent token verdicts, by verdict
+    /// (`verified`, `missing`, `expired`, `revoked`, `invalid`,
+    /// `insufficient_balance`, `directory_unavailable`).
+    ///
+    /// The issuer URL is deliberately not a label: an operator's
+    /// issuer allowlist is small but the value is operator-supplied
+    /// config, and the verdict is what an alert fires on.
+    pub kya_verdicts: Option<IntCounterVec>,
     /// Policy enforcement results with origin, policy_type, and action labels.
     pub policy_triggers: CounterVec,
     /// Cache hit/miss with origin and result labels.
@@ -642,6 +668,38 @@ pub struct ProxyMetrics {
     /// field; dashboards use it to size how much chrome the strip pass
     /// removes per origin.
     pub boilerplate_stripped_bytes: IntCounterVec,
+}
+
+/// Build a labeled counter and register it, without a panic on either
+/// step.
+///
+/// `IntCounterVec::new` rejects an invalid metric name or label set, and
+/// `Registry::register` rejects a duplicate. Both inputs here are
+/// compile-time constants, so neither can happen in a build that ran its
+/// tests once. The helper exists because the alternative is an
+/// `.unwrap()` on a startup path, and a proxy that refuses to boot over
+/// a metric it could have skipped is a worse failure than a metric that
+/// is missing. A refusal logs the family name and yields `None`; the
+/// recorders below are no-ops against `None`, so the only consequence is
+/// a series that does not appear.
+fn registered_counter_vec(
+    registry: &Registry,
+    name: &'static str,
+    help: &'static str,
+    labels: &[&str],
+) -> Option<IntCounterVec> {
+    let counter = match IntCounterVec::new(Opts::new(name, help), labels) {
+        Ok(counter) => counter,
+        Err(error) => {
+            tracing::error!(metric = name, %error, "metric family could not be built");
+            return None;
+        }
+    };
+    if let Err(error) = registry.register(Box::new(counter.clone())) {
+        tracing::error!(metric = name, %error, "metric family could not be registered");
+        return None;
+    }
+    Some(counter)
 }
 
 impl ProxyMetrics {
@@ -886,6 +944,33 @@ impl ProxyMetrics {
             &["origin", "auth_type", "result"],
         )
         .unwrap();
+
+        // WOR-2667: built and registered through the panic-free helper
+        // rather than the `.unwrap()` every family above uses. The
+        // construction cannot fail for a name and label set that are
+        // compile-time constants, but "cannot fail" is exactly the
+        // claim a `.unwrap()` in a proxy makes right up until it is
+        // wrong, and this workspace's unwrap ratchet is the record of
+        // that judgment. A refusal here loses one metric family and
+        // says so; it does not take the process with it.
+        let ext_authz_decisions = registered_counter_vec(
+            &registry,
+            "sbproxy_ext_authz_decisions_total",
+            "External-authorization callout outcomes, by outcome",
+            &["outcome"],
+        );
+        let oauth_introspection_results = registered_counter_vec(
+            &registry,
+            "sbproxy_oauth_introspection_results_total",
+            "RFC 7662 token-introspection results, by result",
+            &["result"],
+        );
+        let kya_verdicts = registered_counter_vec(
+            &registry,
+            "sbproxy_kya_verdicts_total",
+            "Know Your Agent token verification verdicts, by verdict",
+            &["verdict"],
+        );
 
         let policy_triggers = CounterVec::new(
             Opts::new(
@@ -1212,6 +1297,9 @@ impl ProxyMetrics {
             per_origin_active_connections,
             bytes_total,
             auth_results,
+            ext_authz_decisions,
+            oauth_introspection_results,
+            kya_verdicts,
             policy_triggers,
             cache_results,
             decision_event_total,
@@ -1549,6 +1637,39 @@ pub fn record_auth(origin: &str, auth_type: &str, allowed: bool) {
         .auth_results
         .with_label_values(&[origin.as_str(), auth_type, result])
         .inc();
+}
+
+/// Record one `ext_authz` callout outcome (WOR-2667).
+///
+/// `outcome` is the closed set `allow` / `deny` / `unavailable` /
+/// `fail_open`, produced by
+/// `sbproxy_modules::auth::ext_authz::ExtAuthzOutcome::metric_label`, so
+/// the label vocabulary cannot drift from the outcomes the provider can
+/// actually reach.
+pub fn record_ext_authz_decision(outcome: &'static str) {
+    if let Some(counter) = metrics().ext_authz_decisions.as_ref() {
+        counter.with_label_values(&[outcome]).inc();
+    }
+}
+
+/// Record one RFC 7662 introspection result (WOR-2667).
+///
+/// `result` is the closed set `active` / `inactive` /
+/// `insufficient_scope` / `cached` / `unavailable`.
+pub fn record_oauth_introspection_result(result: &'static str) {
+    if let Some(counter) = metrics().oauth_introspection_results.as_ref() {
+        counter.with_label_values(&[result]).inc();
+    }
+}
+
+/// Record one Know Your Agent verification verdict (WOR-2667).
+///
+/// `verdict` is the closed set produced by
+/// `sbproxy_modules::auth::kya::KyaVerdict::metric_label`.
+pub fn record_kya_verdict(verdict: &'static str) {
+    if let Some(counter) = metrics().kya_verdicts.as_ref() {
+        counter.with_label_values(&[verdict]).inc();
+    }
 }
 
 /// Observe one phase-duration sample on `sbproxy_phase_duration_seconds`.

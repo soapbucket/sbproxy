@@ -15,16 +15,24 @@ pub mod cap;
 pub mod dpop;
 /// WOR-1071: RFC 9449 outbound DPoP proof minting (companion to `dpop`).
 pub mod dpop_outbound;
+/// WOR-2667: Envoy-style external-authorization callout
+/// (`ext_authz`).
+pub mod ext_authz;
 /// WOR-2518: HMAC signed-request authentication (`hmac_auth`).
 pub mod hmac_auth;
 /// WOR-2520: JWE (RFC 7516) decryption for encrypted tokens presented
 /// to the `jwt` provider (decrypt-then-verify nested JWTs).
 mod jwe;
 pub mod jwks;
+/// WOR-2667: Know Your Agent token verification (`kya`).
+pub mod kya;
 /// WOR-2519: LDAP directory-bind authentication (`ldap_auth`).
 pub mod ldap;
 /// WOR-1072: RFC 8705 mTLS-bound access token validation.
 pub mod mtls_bound;
+/// WOR-2667: RFC 7662 OAuth 2.0 token introspection
+/// (`oauth_introspection`).
+pub mod oauth_introspection;
 pub mod oidc;
 /// Outbound credential resolver (WOR-802): per-upstream RFC 8693 token
 /// exchange, OAuth client-credentials, and vault-resolved secrets.
@@ -40,8 +48,11 @@ pub use bot_auth_directory::{
     MIN_DIRECTORY_TTL_SECS,
 };
 pub use cap::{CapConfig, CapError, CapRateLimitInfo, CapTokenView, CapVerdict, CapVerifier};
+pub use ext_authz::{ExtAuthzOutcome, ExtAuthzProvider};
 pub use hmac_auth::{HmacAuth, HmacVerdict};
 pub use jwe::JweConfig;
+pub use kya::{KyaVerdict, KyaVerifier, KyabBalance, VerifiedAgent};
+pub use oauth_introspection::{IntrospectionOutcome, OauthIntrospectionProvider};
 pub use trust_tier::{compute_trust_tier, TrustSignals, TrustTier, NAMED_AGENT_SCORE_THRESHOLD};
 
 use base64::Engine;
@@ -228,6 +239,23 @@ pub enum Auth {
     /// inline storage would force every other Auth variant to carry
     /// the same footprint.
     Oidc(Box<crate::auth::oidc::OidcAuth>),
+    /// WOR-2667: Envoy-style external authorization. The origin asks
+    /// a service the operator runs whether to admit each request, over
+    /// a typed JSON check document. Unlike `forward_auth` it composes
+    /// inside an `authentication:` list and evaluates on the HTTP/3
+    /// dispatch path, and the service picks the refusal status and
+    /// body. See [`ext_authz::ExtAuthzProvider`].
+    ExtAuthz(Box<ext_authz::ExtAuthzProvider>),
+    /// WOR-2667: RFC 7662 token introspection. An opaque bearer token
+    /// is validated by asking the authorization server that issued it,
+    /// with a bounded verdict cache keyed on the token's hash. See
+    /// [`oauth_introspection::OauthIntrospectionProvider`].
+    OauthIntrospection(Box<oauth_introspection::OauthIntrospectionProvider>),
+    /// WOR-2667: Know Your Agent token verification. An AI agent
+    /// presents an issuer-signed identity token carrying its agent id,
+    /// vendor, class, and an optional spend balance the origin can set
+    /// a floor on. See [`kya::KyaVerifier`].
+    Kya(Box<kya::KyaVerifier>),
     /// No authentication required.
     Noop,
     /// Third-party plugin (only case using dynamic dispatch).
@@ -264,6 +292,9 @@ impl Auth {
             Self::BotAuth(_) => "bot_auth",
             Self::Cap(_) => "cap",
             Self::Oidc(_) => "oidc",
+            Self::ExtAuthz(_) => "ext_authz",
+            Self::OauthIntrospection(_) => "oauth_introspection",
+            Self::Kya(_) => "kya",
             Self::Noop => "noop",
             Self::Plugin(p) => p.auth_type(),
             Self::AnyOf(_) => "any_of",
@@ -285,6 +316,9 @@ impl std::fmt::Debug for Auth {
             Self::BotAuth(a) => f.debug_tuple("BotAuth").field(a).finish(),
             Self::Cap(a) => f.debug_tuple("Cap").field(a).finish(),
             Self::Oidc(a) => f.debug_tuple("Oidc").field(a).finish(),
+            Self::ExtAuthz(a) => f.debug_tuple("ExtAuthz").field(a).finish(),
+            Self::OauthIntrospection(a) => f.debug_tuple("OauthIntrospection").field(a).finish(),
+            Self::Kya(a) => f.debug_tuple("Kya").field(a).finish(),
             Self::Noop => write!(f, "Noop"),
             Self::Plugin(_) => write!(f, "Plugin(...)"),
             Self::AnyOf(providers) => f.debug_tuple("AnyOf").field(providers).finish(),

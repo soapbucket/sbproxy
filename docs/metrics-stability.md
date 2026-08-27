@@ -242,6 +242,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_errors_total` | Counter | `stable` | `beta` | `hostname`, `error_type` | Total errors. |
 | `sbproxy_events_dropped_total` | Counter | `stable` | `beta` | `sink`, `reason` | Proxy events the events: egress did not deliver, by sink (file or webhook) and closed reason. |
 | `sbproxy_evidence_seq_tenant_cap_total` | Counter | `stable` | `beta` | none | Evidence sequence lookups for a tenant past the tracked-tenant cap, sharing the overflow counter. |
+| `sbproxy_ext_authz_decisions_total` | Counter | `stable` | `beta` | `outcome` | External-authorization callout outcomes; `fail_open` counts requests admitted without a decision. |
 | `sbproxy_gateway_reconcile_duration_seconds` | Histogram | `stable` | `beta` | `kind` | Gateway API reconcile latency in seconds, by the Kubernetes resource kind that triggered the pass. Answers whether a reconcile is outrunning the resync interval. |
 | `sbproxy_gateway_reconcile_total` | Counter | `stable` | `beta` | `kind`, `result` | Gateway API reconcile attempts, by triggering resource kind and outcome. `kind` is one of GatewayClass, Gateway, HTTPRoute, GRPCRoute, or periodic, so cardinality is bounded by a closed set. |
 | `sbproxy_gateway_status_writes_total` | Counter | `stable` | `beta` | `kind`, `result` | Patches to the `/status` subresource, by resource kind and outcome. A rising error count here is usually RBAC missing the status subresource rather than anything wrong with the reconcile. |
@@ -266,6 +267,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_key_policy_stored_rejections_total` | Counter | `stable` | `alpha` | `reason` | Stored key records rejected while lowering to an effective policy, by reason. |
 | `sbproxy_key_store_outage_total` | Counter | `stable` | `beta` | `entrypoint`, `posture`, `outcome` | Inbound-key resolutions that could not reach the virtual key store, by entrypoint, configured failure posture, and what the posture decided. |
 | `sbproxy_key_store_unavailable` | Gauge | `stable` | `beta` | `posture` | 1 while the last inbound-key resolution could not reach the virtual key store; the posture label is what that costs. |
+| `sbproxy_kya_verdicts_total` | Counter | `stable` | `beta` | `verdict` | Know Your Agent token verification verdicts; the issuer is deliberately not a label. |
 | `sbproxy_label_cardinality_budget` | Gauge | `stable` | `beta` | `label` | Cap the accepted unique values for a label name are counted against. Denominator for sbproxy_label_cardinality_unique_values. |
 | `sbproxy_label_cardinality_overflow_per_tenant_total` | Counter | `stable` | `beta` | `metric`, `label`, `tenant_id` | Per-tenant overflow demotions (`sbproxy_label_cardinality_overflow_total` with the tenant_id label). |
 | `sbproxy_label_cardinality_overflow_total` | Counter | `stable` | `beta` | `metric`, `label` | Number of label values demoted to __other__ because the per-label budget was exhausted. |
@@ -328,6 +330,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_model_plane_stream_cancellations_total` | Counter | `stable` | `beta` | `route_class` | Managed response streams dropped before completion by route class. |
 | `sbproxy_mtls_cert_cache_evictions_total` | Counter | `stable` | `beta` | none | Number of mTLS client cert metadata entries evicted by the LRU bound. |
 | `sbproxy_mtls_handshake_total` | Counter | `stable` | `beta` | `result` | mTLS client-certificate verification outcomes. |
+| `sbproxy_oauth_introspection_results_total` | Counter | `stable` | `beta` | `result` | RFC 7662 token-introspection results; `cached` is a verdict answered without reaching the authorization server. |
 | `sbproxy_object_authz_enumeration_tracker_saturated_total` | Counter | `stable` | `beta` | none | Enumeration observations the object_authz policy could not track because the per-principal tracker was at capacity with live windows. |
 | `sbproxy_object_authz_violations_total` | Counter | `stable` | `beta` | `origin`, `kind`, `enforced` | Object/function-level authorization violations, by kind (bola, bfla, enumeration) and enforcement disposition (enforced=true refused the request; enforced=false was audited only). |
 | `sbproxy_ocsp_fetch_total` | Counter | `stable` | `beta` | `result` | OCSP fetch attempts, by outcome. |

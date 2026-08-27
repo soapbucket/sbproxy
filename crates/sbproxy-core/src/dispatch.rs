@@ -281,6 +281,45 @@ async fn check_auth(
             warn!("H3: cap not yet supported in H3 dispatch; denying request");
             false
         }
+        // WOR-2667: the three providers ported from the enterprise
+        // tree all verify from the request headers plus, for
+        // `ext_authz`, the method and target, every one of which the
+        // H3 dispatch holds. They run for real here rather than
+        // failing closed like the providers that need wiring this path
+        // lacks. The boolean return cannot carry the 503-vs-401 split
+        // the H1/H2 path reports, so every non-allow answers a denial,
+        // which still fails closed.
+        Auth::ExtAuthz(provider) => {
+            use sbproxy_modules::auth::ExtAuthzOutcome;
+            let target = match uri.query() {
+                Some(query) if !query.is_empty() => format!("{}?{}", uri.path(), query),
+                _ => uri.path().to_string(),
+            };
+            matches!(
+                provider.authorize(method.as_str(), &target, headers).await,
+                ExtAuthzOutcome::Allowed { .. } | ExtAuthzOutcome::FailedOpen
+            )
+        }
+        Auth::OauthIntrospection(provider) => {
+            use sbproxy_modules::auth::IntrospectionOutcome;
+            matches!(
+                provider.authenticate(headers).await,
+                IntrospectionOutcome::Active { .. }
+            )
+        }
+        Auth::Kya(verifier) => {
+            use sbproxy_modules::auth::KyaVerdict;
+            let hostname = headers
+                .get(http::header::HOST)
+                .and_then(|value| value.to_str().ok())
+                .map(strip_port)
+                .unwrap_or("");
+            match verifier.verify(headers, hostname).await {
+                KyaVerdict::Verified(_) => true,
+                KyaVerdict::DirectoryUnavailable => verifier.fail_open,
+                _ => false,
+            }
+        }
         Auth::Noop => true,
         Auth::Oidc(_) => {
             // WOR-892 PR1 step 2/3: OIDC requires the H1 / H2 request
@@ -748,7 +787,11 @@ fn extract_hostname(headers: &http::HeaderMap, uri: &http::Uri) -> String {
 }
 
 /// Remove `:port` suffix from a host string.
-fn strip_port(host: &str) -> &str {
+///
+/// `pub(crate)` since WOR-2667: the `kya` audience check compares the
+/// token's `aud` claim against the request's host, and a second copy of
+/// the IPv6 bracket handling here is a second place for it to be wrong.
+pub(crate) fn strip_port(host: &str) -> &str {
     // IPv6 addresses look like [::1]:443 - strip after the closing bracket.
     if host.starts_with('[') {
         if let Some(bracket_end) = host.rfind(']') {
