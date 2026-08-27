@@ -849,8 +849,14 @@ pub enum ConfigSource {
         /// only place to move one is a layer this node owns.
         ///
         /// It is not silent while it is off: a document that reaches
-        /// for this host logs one warning per finding, naming the
-        /// source and the key and never the value.
+        /// for this host logs one warning naming the **first** finding
+        /// the check reaches, at boot and again whenever a refresh
+        /// brings a revision this process has not already checked,
+        /// naming the source and the key and never the value. First
+        /// rather than every, because the check stops at the first
+        /// thing it refuses: a document naming both a host path and an
+        /// `env:` reference reports one of them now and the other once
+        /// you fix it.
         ///
         /// Per source leaf, not per tree. A `git_overlay` resolves each
         /// `kind: git` node with its own `confine`, so an overlay left
