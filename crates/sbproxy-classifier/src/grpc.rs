@@ -63,13 +63,16 @@ use tower::{Layer, Service};
 /// Matches the minimal sidecar's own default (`DEFAULT_INFERENCE_MAX_REQUEST_BYTES`
 /// in `sbproxy-classifier-sidecar`), so the two report the same ceiling to an
 /// operator sizing traffic against either one.
-const MAX_TEXT_BYTES: usize = 1024 * 1024;
+// The four `pub(crate)` constants below are the transport-independent
+// per-request budgets. `crate::tcp` enforces the same numbers on the public
+// MessagePack listener rather than declaring a second set that can drift.
+pub(crate) const MAX_TEXT_BYTES: usize = 1024 * 1024;
 const MAX_EMBED_ITEMS: usize = 64;
 const MAX_EMBED_TOTAL_BYTES: usize = MAX_TEXT_BYTES;
-const MAX_STREAM_BYTES: usize = MAX_TEXT_BYTES;
+pub(crate) const MAX_STREAM_BYTES: usize = MAX_TEXT_BYTES;
 const MAX_STREAM_CHUNKS: usize = 4096;
-const MAX_STREAM_RULES: usize = 64;
-const MAX_STREAM_RULE_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_STREAM_RULES: usize = 64;
+pub(crate) const MAX_STREAM_RULE_BYTES: usize = 64 * 1024;
 
 pub const DEFAULT_MAX_RUNNING: usize = 4;
 pub const DEFAULT_MAX_QUEUED: usize = 32;
@@ -263,11 +266,40 @@ fn validate_default_kind(
     Ok(())
 }
 
+/// One loaded classification engine.
+///
+/// A trait rather than the concrete `OnnxClassifier` so a test can install a
+/// stub and reach the handler's real success path. Production installs
+/// exactly one implementor, the tract-backed classifier `--model` loads: the
+/// handler no longer has a modelless branch to answer from, so a `Classify`
+/// for an id with no loaded bytes is a typed refusal rather than a verdict.
+pub(crate) trait LoadedClassifier: Send + Sync {
+    fn classify(&self, text: &str) -> anyhow::Result<(String, f32)>;
+}
+
+impl LoadedClassifier for OnnxClassifier {
+    fn classify(&self, text: &str) -> anyhow::Result<(String, f32)> {
+        let output = OnnxClassifier::classify(self, text)?;
+        Ok((output.label, output.score))
+    }
+}
+
+/// One loaded embedding engine. Same reason as [`LoadedClassifier`].
+pub(crate) trait LoadedEmbedder: Send + Sync {
+    fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>>;
+}
+
+impl LoadedEmbedder for OnnxEmbedder {
+    fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+        Ok(OnnxEmbedder::embed(self, text)?.values)
+    }
+}
+
 /// Shared state for both gRPC services. Constructed once in `main.rs` and
 /// wrapped in the tonic server handles for each service.
 pub struct GrpcState {
-    pub models: HashMap<String, Arc<OnnxClassifier>>,
-    pub embedders: HashMap<String, Arc<OnnxEmbedder>>,
+    pub(crate) models: HashMap<String, Arc<dyn LoadedClassifier>>,
+    pub(crate) embedders: HashMap<String, Arc<dyn LoadedEmbedder>>,
     pub default_model: Option<String>,
     pub default_embed_model: Option<String>,
     pub version: String,
@@ -309,7 +341,7 @@ impl GrpcState {
         }
     }
 
-    fn resolve_classifier(&self, model: &str) -> Option<Arc<OnnxClassifier>> {
+    fn resolve_classifier(&self, model: &str) -> Option<Arc<dyn LoadedClassifier>> {
         let id = if model.is_empty() {
             self.default_model.clone()?
         } else {
@@ -318,7 +350,7 @@ impl GrpcState {
         self.models.get(&id).cloned()
     }
 
-    fn resolve_embedder(&self, model: &str) -> Option<Arc<OnnxEmbedder>> {
+    fn resolve_embedder(&self, model: &str) -> Option<Arc<dyn LoadedEmbedder>> {
         let id = if model.is_empty() {
             self.default_embed_model.clone()?
         } else {
@@ -343,22 +375,22 @@ impl GrpcState {
         }
     }
 
-    fn fallback_classifier_descriptor(&self, model: &str) -> Option<ModelDescriptor> {
-        let id = self.resolved_classifier_id(model)?;
+    /// True when the id resolves to a catalog entry of `kind` that has no
+    /// loaded bytes behind it. The handlers turn this into a typed refusal:
+    /// a validated manifest entry is a promise about identity, never a
+    /// substitute for inference.
+    fn catalog_only(&self, model: &str, kind: ModelKind) -> bool {
+        let id = match kind {
+            ModelKind::Classifier => self.resolved_classifier_id(model),
+            ModelKind::Embedder => self.resolved_embedder_id(model),
+        };
+        let Some(id) = id else {
+            return false;
+        };
         self.catalog
             .as_ref()
             .and_then(|catalog| catalog.descriptor(&id))
-            .filter(|descriptor| descriptor.kind == ModelKind::Classifier)
-            .cloned()
-    }
-
-    fn fallback_embedder_descriptor(&self, model: &str) -> Option<ModelDescriptor> {
-        let id = self.resolved_embedder_id(model)?;
-        self.catalog
-            .as_ref()
-            .and_then(|catalog| catalog.descriptor(&id))
-            .filter(|descriptor| descriptor.kind == ModelKind::Embedder)
-            .cloned()
+            .is_some_and(|descriptor| descriptor.kind == kind)
     }
 }
 
@@ -409,23 +441,17 @@ impl InferenceService for InferenceHandler {
         let text = req.text;
         let started = std::time::Instant::now();
         let output = if let Some(classifier) = self.resolve_classifier(&req.model) {
-            self.run_blocking("classify", move || {
-                classifier
-                    .classify(&text)
-                    .map(|output| (output.label, output.score))
-            })
-            .await?
-        } else if let Some(descriptor) = self.fallback_classifier_descriptor(&req.model) {
-            self.run_blocking("classify", move || {
-                let label = descriptor
-                    .labels
-                    .as_ref()
-                    .and_then(|labels| labels.first())
-                    .cloned()
-                    .unwrap_or_else(|| "safe".to_string());
-                Ok((label, 1.0_f32))
-            })
-            .await?
+            self.run_blocking("classify", move || classifier.classify(&text))
+                .await?
+        } else if self.catalog_only(&req.model, ModelKind::Classifier) {
+            // The id is in the validated catalog but nothing is loaded behind
+            // it. Answering from the descriptor produced a confident verdict
+            // out of a missing model: `labels.first()`, or the literal
+            // "safe", at score 1.0, indistinguishable on the wire and in
+            // every metric from a real inference.
+            return Err(Status::failed_precondition(
+                "classifier model is in the validated catalog but no model bytes are loaded; start the sidecar with --model <id>=<model.onnx>:<tokenizer.json>",
+            ));
         } else {
             return Err(Status::not_found(
                 "unknown or unconfigured classifier model",
@@ -469,19 +495,17 @@ impl InferenceService for InferenceHandler {
             self.run_blocking("embed", move || {
                 texts
                     .iter()
-                    .map(|text| embedder.embed(text).map(|output| output.values))
+                    .map(|text| embedder.embed(text))
                     .collect::<anyhow::Result<Vec<_>>>()
             })
             .await?
-        } else if let Some(descriptor) = self.fallback_embedder_descriptor(&req.model) {
-            self.run_blocking("embed", move || {
-                let dimensions = descriptor.dimensions.unwrap_or(384) as usize;
-                Ok(texts
-                    .iter()
-                    .map(|_| vec![0.0_f32; dimensions])
-                    .collect::<Vec<_>>())
-            })
-            .await?
+        } else if self.catalog_only(&req.model, ModelKind::Embedder) {
+            // Same reason as `Classify` above: a zero vector is a valid-looking
+            // embedding, and a caller that cosine-compares it cannot tell it
+            // apart from a real one.
+            return Err(Status::failed_precondition(
+                "embedding model is in the validated catalog but no model bytes are loaded; start the sidecar with --embed-model <id>=<model.onnx>:<tokenizer.json>",
+            ));
         } else {
             return Err(Status::failed_precondition(
                 "no matching embedding model is loaded; start with --embed-model",
@@ -541,7 +565,7 @@ impl InferenceService for InferenceHandler {
                 .run_blocking("model_info", move || {
                     embedder
                         .embed("dimension probe")
-                        .map(|output| output.values.len() as u32)
+                        .map(|values| values.len() as u32)
                 })
                 .await?;
             ModelInfoResponse {
@@ -4086,24 +4110,88 @@ mod tests {
         })
     }
 
+    /// A classifier engine that answers without a model file.
+    ///
+    /// This exists so a test can reach the handler's loaded-model success
+    /// path. It is installed into `GrpcState::models` exactly the way
+    /// `--model` installs the tract-backed one, which is the point: the
+    /// handler has no branch that answers from a descriptor, so the only way
+    /// to get a verdict out of it is to load something that computes one.
+    struct StubClassifier;
+
+    impl LoadedClassifier for StubClassifier {
+        fn classify(&self, _text: &str) -> anyhow::Result<(String, f32)> {
+            Ok(("safe".to_string(), 1.0))
+        }
+    }
+
+    struct StubEmbedder;
+
+    impl LoadedEmbedder for StubEmbedder {
+        fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            Ok(vec![0.0; 384])
+        }
+    }
+
     fn validated_mixed_state(
         admission: Admission,
         worker_faults: Arc<crate::admission::BlockingExecutorFaultControl>,
     ) -> Arc<GrpcState> {
-        // Deliberate compile-RED against the production catalog/loader and
-        // worker-executor owners.  `ValidatedModelFixture::Mixed` must contain
-        // a classifier ONNX and a genuinely embedding-shaped ONNX model; a
-        // classifier fixture loaded as an embedder is not an acceptable
-        // implementation of this seam.
         let catalog = ModelCatalog::load_validated_fixture(ValidatedModelFixture::Mixed)
             .expect("the checked mixed classifier/embedder fixture loads");
         let executor = crate::admission::BlockingWorkExecutor::new(admission)
             .with_test_fault_control(worker_faults);
-        Arc::new(GrpcState::from_catalog(
+        let mut state =
+            GrpcState::from_catalog(catalog, "sbproxy-classifier test".to_string(), executor);
+        state
+            .models
+            .insert("classifier-a".to_string(), Arc::new(StubClassifier));
+        state
+            .embedders
+            .insert("embedder-b".to_string(), Arc::new(StubEmbedder));
+        Arc::new(state)
+    }
+
+    /// The catalog is an identity promise, not an answer.
+    ///
+    /// A `Classify` for an id the manifest validated but no `--model` loaded
+    /// used to return `descriptor.labels.first()` (or the literal "safe") at
+    /// score 1.0, and `Embed` returned a zero vector of the descriptor's
+    /// declared width. Both read on the wire exactly like a real inference,
+    /// so a model that failed to load, or a manifest pushed from anywhere
+    /// other than the loaded set, turned every request into a clean verdict.
+    #[tokio::test]
+    async fn a_catalog_entry_with_no_loaded_model_refuses_rather_than_answering() {
+        let catalog = ModelCatalog::load_validated_fixture(ValidatedModelFixture::Mixed)
+            .expect("the checked mixed classifier/embedder fixture loads");
+        let executor = crate::admission::BlockingWorkExecutor::new(
+            Admission::new(2, 4, std::time::Duration::from_secs(2)).unwrap(),
+        );
+        // No `--model` / `--embed-model` equivalent installed: catalog only.
+        let state = Arc::new(GrpcState::from_catalog(
             catalog,
             "sbproxy-classifier test".to_string(),
             executor,
-        ))
+        ));
+
+        let classify = InferenceHandler(Arc::clone(&state))
+            .classify(Request::new(ClassifyRequest {
+                model: "classifier-a".to_string(),
+                text: "hello".to_string(),
+                top_k: 1,
+            }))
+            .await
+            .expect_err("a catalog-only classifier must refuse, not answer");
+        assert_eq!(classify.code(), tonic::Code::FailedPrecondition);
+
+        let embed = InferenceHandler(state)
+            .embed(Request::new(EmbedRequest {
+                model: "embedder-b".to_string(),
+                texts: vec!["hello".to_string()],
+            }))
+            .await
+            .expect_err("a catalog-only embedder must refuse, not answer");
+        assert_eq!(embed.code(), tonic::Code::FailedPrecondition);
     }
 
     fn inference_state() -> InferenceHandler {

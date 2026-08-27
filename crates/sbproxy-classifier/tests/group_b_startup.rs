@@ -533,6 +533,56 @@ struct WireRequest<'a> {
     cmd: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     admin_token: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tenant: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config: Option<TenantConfig<'a>>,
+}
+
+impl<'a> WireRequest<'a> {
+    fn new(cmd: &'a str) -> Self {
+        Self {
+            cmd,
+            admin_token: None,
+            tenant: None,
+            text: None,
+            config: None,
+        }
+    }
+
+    fn with_admin_token(mut self, token: &'a str) -> Self {
+        self.admin_token = Some(token);
+        self
+    }
+
+    fn with_tenant(mut self, tenant: &'a str) -> Self {
+        self.tenant = Some(tenant);
+        self
+    }
+
+    fn with_text(mut self, text: &'a str) -> Self {
+        self.text = Some(text);
+        self
+    }
+
+    fn with_config(mut self, config: TenantConfig<'a>) -> Self {
+        self.config = Some(config);
+        self
+    }
+}
+
+#[derive(Serialize)]
+struct TenantConfig<'a> {
+    labels: Vec<TenantLabel<'a>>,
+}
+
+#[derive(Serialize)]
+struct TenantLabel<'a> {
+    name: &'a str,
+    patterns: Vec<String>,
+    weight: f64,
 }
 
 #[derive(Deserialize)]
@@ -699,25 +749,12 @@ async fn shipped_binary_uses_production_http_tcp_and_grpc_startup_owners() {
         "the shipped child must expose exactly one release startup-owner sample"
     );
 
-    let public_version: VersionResponse = wire_exchange(
-        public,
-        &WireRequest {
-            cmd: "version",
-            admin_token: None,
-        },
-    )
-    .await;
+    let public_version: VersionResponse = wire_exchange(public, &WireRequest::new("version")).await;
     assert_eq!(public_version.name, "sbproxy-classifier");
     assert!(!public_version.version.is_empty());
 
-    let admin_list: AdminResponse = wire_exchange(
-        admin,
-        &WireRequest {
-            cmd: "list",
-            admin_token: Some("secret"),
-        },
-    )
-    .await;
+    let admin_list: AdminResponse =
+        wire_exchange(admin, &WireRequest::new("list").with_admin_token("secret")).await;
     assert!(admin_list.ok);
 
     let mut grpc_client = tokio::time::timeout(
@@ -749,6 +786,111 @@ async fn shipped_binary_uses_production_http_tcp_and_grpc_startup_owners() {
     assert_eq!(cleanup.stderr.retained.len(), cleanup.stderr.total);
     assert!(cleanup.stdout.total <= PIPE_CAPTURE_BYTES);
     assert!(cleanup.stderr.total <= PIPE_CAPTURE_BYTES);
+}
+
+/// The shipped binary's public classify path runs on the bounded executor
+/// its `--inference-*` flags configure.
+///
+/// This is the one lane a `#[cfg(test)]`-only wiring cannot pass. The
+/// in-crate regressions drive the same listener pair but compile with
+/// `cfg(test)` set, so they went green against a release build that threw
+/// the executor away and ran `handle_classify` inline on a tokio worker with
+/// no cap, no queue, and no deadline. Here the child is the real release
+/// entrypoint: the only way its answer can carry the deadline refusal, and
+/// the only way `sbproxy_classifier_terminal_outcomes_total` can carry
+/// `stage="worker",reason="deadline"` for `transport="tcp"`, is if the
+/// shipped code path is the executor's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shipped_binary_bounds_public_classify_with_its_configured_inference_deadline() {
+    let addresses = reserve_addresses(4);
+    let (grpc, public, admin, http) = (addresses[0], addresses[1], addresses[2], addresses[3]);
+    let token_dir = tempfile::tempdir().expect("admin token tempdir creates");
+    let token_path = token_dir.path().join("admin-tokens.json");
+    std::fs::write(
+        &token_path,
+        br#"{"tokens":[{"token":"secret","tenants":["*"]}]}"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sbproxy-classifier"));
+    command.args([
+        "--listen".to_string(),
+        grpc.to_string(),
+        "--listen-tcp".to_string(),
+        public.to_string(),
+        "--listen-admin".to_string(),
+        admin.to_string(),
+        "--admin-token-file".to_string(),
+        token_path.to_string_lossy().into_owned(),
+        "--metrics-addr".to_string(),
+        http.to_string(),
+        // One millisecond is the smallest deadline `Admission::new` accepts.
+        // The classify below is 64 patterns over 256 KiB of text, which is
+        // orders of magnitude more work than that, so the refusal is the
+        // deadline rather than a race with it.
+        "--inference-deadline-ms".to_string(),
+        "1".to_string(),
+    ]);
+    let mut child = ChildGuard::spawn(command);
+    wait_for_http_ready(&mut child, http).await;
+
+    let register: AdminResponse = wire_exchange(
+        admin,
+        &WireRequest::new("register")
+            .with_admin_token("secret")
+            .with_tenant("tenant.example")
+            .with_config(TenantConfig {
+                labels: (0..64)
+                    .map(|index| TenantLabel {
+                        name: "greeting",
+                        patterns: vec![format!("(?i)needle-{index}-[a-z0-9]+")],
+                        weight: 1.0,
+                    })
+                    .collect(),
+            }),
+    )
+    .await;
+    assert!(register.ok, "the shipped child must accept the tenant");
+
+    let text = "lorem ipsum dolor sit amet ".repeat(10_000);
+    let refusal: AdminResponse = wire_exchange(
+        public,
+        &WireRequest::new("classify")
+            .with_tenant("tenant.example")
+            .with_text(&text),
+    )
+    .await;
+    assert!(
+        !refusal.ok,
+        "the shipped release build must refuse a classify past --inference-deadline-ms rather than running it inline to completion"
+    );
+
+    let metrics = http_get(http, "/metrics").await.unwrap();
+    assert_eq!(
+        public_classify_worker_deadline_samples(&metrics),
+        1,
+        "the shipped child must record the bounded executor's deadline outcome for the public TCP transport"
+    );
+
+    child
+        .cleanup_before(Instant::now() + Duration::from_secs(3))
+        .expect("shipped child cleanup remains bounded and fully owned");
+}
+
+fn public_classify_worker_deadline_samples(metrics: &[u8]) -> usize {
+    let metrics = std::str::from_utf8(metrics).expect("metrics response is utf-8");
+    metrics
+        .lines()
+        .filter(|line| {
+            line.starts_with("sbproxy_classifier_terminal_outcomes_total{")
+                && line.contains("cmd=\"classify\"")
+                && line.contains("reason=\"deadline\"")
+                && line.contains("stage=\"worker\"")
+                && line.contains("transport=\"tcp\"")
+                && line.ends_with(" 1")
+        })
+        .count()
 }
 
 #[test]

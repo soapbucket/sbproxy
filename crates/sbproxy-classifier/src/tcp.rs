@@ -90,6 +90,30 @@ impl FrameAllocationProbe {
         self.peak.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Bytes currently held by live frame allocations. Returns to zero only
+    /// when every `BudgetedFrame` has been dropped, which is what releases
+    /// the matching share of the process-wide budget.
+    fn live_bytes(&self) -> usize {
+        self.current.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    async fn wait_for_live_bytes<F>(&self, within: Duration, mut accept: F) -> anyhow::Result<usize>
+    where
+        F: FnMut(usize) -> bool,
+    {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let live = self.live_bytes();
+            if accept(live) {
+                return Ok(live);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!("live frame bytes stayed at {live} past the wait deadline");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     fn allocations(&self) -> usize {
         self.allocations.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -168,12 +192,21 @@ const TRANSPORT: &str = "tcp";
 const ADMIN_TRANSPORT: &str = "admin_tcp";
 pub(crate) const DEFAULT_MAX_CONNECTIONS: usize = 128;
 const DEFAULT_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Whole-frame deadline: the header plus the declared body must arrive
+/// inside it. `io_timeout` alone bounds one `read()`, which a client that
+/// trickles a byte just under it can restart forever while holding its share
+/// of the process-wide frame budget.
+pub(crate) const DEFAULT_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Whole-connection deadline, from accept to close.
+pub(crate) const DEFAULT_CONNECTION_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(300);
 const DEFAULT_LISTENER_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+#[cfg(test)]
 use tracing::debug;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -186,6 +219,12 @@ pub(crate) enum TransportMode {
 pub(crate) struct TcpLimits {
     pub max_connections: usize,
     pub io_timeout: Duration,
+    /// Whole-frame deadline covering the length prefix and the declared
+    /// body. Must be at least `io_timeout`.
+    pub frame_timeout: Duration,
+    /// Whole-connection deadline, from accept to close. Must be at least
+    /// `frame_timeout`.
+    pub connection_timeout: Duration,
 }
 
 impl TcpLimits {
@@ -195,6 +234,19 @@ impl TcpLimits {
         }
         if self.io_timeout.is_zero() || self.io_timeout > Duration::from_secs(60) {
             anyhow::bail!("TCP io_timeout must be in 1..=60000ms");
+        }
+        if self.frame_timeout.is_zero() || self.frame_timeout > Duration::from_secs(300) {
+            anyhow::bail!("TCP frame_timeout must be in 1..=300000ms");
+        }
+        if self.frame_timeout < self.io_timeout {
+            anyhow::bail!("TCP frame_timeout must be at least io_timeout");
+        }
+        if self.connection_timeout.is_zero() || self.connection_timeout > Duration::from_secs(3600)
+        {
+            anyhow::bail!("TCP connection_timeout must be in 1..=3600000ms");
+        }
+        if self.connection_timeout < self.frame_timeout {
+            anyhow::bail!("TCP connection_timeout must be at least frame_timeout");
         }
         Ok(())
     }
@@ -209,6 +261,8 @@ impl Default for TcpLimits {
         Self {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             io_timeout: DEFAULT_IO_TIMEOUT,
+            frame_timeout: DEFAULT_FRAME_TIMEOUT,
+            connection_timeout: DEFAULT_CONNECTION_TIMEOUT,
         }
     }
 }
@@ -436,7 +490,9 @@ async fn handle_connection(
         };
         crate::metrics::record_request(transport, command.label());
 
-        let resp_len = (resp_bytes.len() as u32).to_be_bytes();
+        let resp_len = u32::try_from(resp_bytes.len())
+            .map_err(|_| std::io::Error::other("TCP response exceeds the frame length prefix"))?
+            .to_be_bytes();
         tokio::time::timeout(limits.io_timeout, async {
             stream.write_all(&resp_len).await?;
             stream.write_all(&resp_bytes).await?;
@@ -447,7 +503,11 @@ async fn handle_connection(
     }
 }
 
-fn sanitize(s: &str, max: usize) -> String {
+/// Bound and de-control a caller-supplied string before it reaches a log
+/// line or a response field. Shared with `crate::registry` so the tenant id
+/// an operator reads in the registration log went through the same walk as
+/// the one echoed on the wire.
+pub(crate) fn sanitize(s: &str, max: usize) -> String {
     let (prefix, truncated) = if s.len() > max {
         let mut end = max;
         while !s.is_char_boundary(end) {
@@ -513,12 +573,77 @@ async fn handle_admin(
     }
 }
 
+/// Normalize, classify, and encode one classify response.
+///
+/// Owned arguments so the production path can move it into the bounded
+/// blocking worker; the test-only `handle_classify` calls the same function,
+/// so there is one implementation of the wire response rather than a
+/// production one and a test one that can drift.
+fn encode_classify_response(
+    tenant: &crate::registry::Tenant,
+    request_id: &str,
+    tenant_label: &str,
+    text: &str,
+    top_k: usize,
+) -> anyhow::Result<Vec<u8>> {
+    let started = Instant::now();
+    let normalized = tenant
+        .normalizer
+        .normalize(text)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let labels: Vec<Label> = tenant.classifier.classify(&normalized, top_k);
+    Ok(rmp_serde::to_vec_named(&ClassifyResponse {
+        id: sanitize(request_id, 128),
+        labels,
+        normalized,
+        latency_us: started.elapsed().as_micros() as i64,
+        tenant: sanitize(tenant_label, 128),
+    })?)
+}
+
+fn encode_quality_score_response(request_id: &str, text: &str) -> anyhow::Result<Vec<u8>> {
+    let started = Instant::now();
+    let result = quality::quality_score(text);
+    crate::metrics::record_quality_score(TRANSPORT, result.score);
+    Ok(rmp_serde::to_vec_named(&QualityScoreResponse {
+        id: sanitize(request_id, 128),
+        score: result.score,
+        signals: result.signals,
+        latency_us: started.elapsed().as_micros() as i64,
+    })?)
+}
+
+fn encode_intent_detect_response(text: &str) -> anyhow::Result<Vec<u8>> {
+    let (intent, confidence) = heuristic::detect_intent(text);
+    Ok(rmp_serde::to_vec_named(&IntentDetectResponse {
+        intent: intent.to_string(),
+        confidence,
+    })?)
+}
+
+fn encode_streaming_safety_response(tokens: &str, rules: &[String]) -> anyhow::Result<Vec<u8>> {
+    let (safe, blocked, reason) = heuristic::check_streaming_safety(tokens, rules);
+    crate::metrics::record_safety_verdict(if safe { "safe" } else { "blocked" });
+    Ok(rmp_serde::to_vec_named(&StreamingSafetyResponse {
+        safe,
+        blocked,
+        reason,
+    })?)
+}
+
+fn encode_content_type_response(content: &str) -> anyhow::Result<Vec<u8>> {
+    let (content_type, confidence) = heuristic::detect_content_type(content);
+    Ok(rmp_serde::to_vec_named(&ContentTypeDetectResponse {
+        content_type: content_type.to_string(),
+        confidence,
+    })?)
+}
+
+#[cfg(test)]
 fn handle_classify(
     registry: &Registry,
     msg: &Message,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    let t0 = Instant::now();
-
     let tenant_id = msg.tenant.as_deref();
     let tenant = match registry.get(tenant_id) {
         Some(t) => t,
@@ -538,37 +663,20 @@ fn handle_classify(
         }
     };
 
-    let normalized = tenant.normalizer.normalize(&msg.text);
-    let labels: Vec<Label> = tenant.classifier.classify(&normalized, msg.top_k);
-    let latency_us = t0.elapsed().as_micros() as i64;
-
-    let resp = ClassifyResponse {
-        id: sanitize(&msg.id, 128),
-        labels,
-        normalized,
-        latency_us,
-        tenant: sanitize(tenant_id.unwrap_or(""), 128),
-    };
-
-    Ok(rmp_serde::to_vec_named(&resp)?)
+    Ok(encode_classify_response(
+        &tenant,
+        &msg.id,
+        tenant_id.unwrap_or(""),
+        &msg.text,
+        msg.top_k,
+    )?)
 }
 
+#[cfg(test)]
 fn handle_quality_score(
     msg: &Message,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    let t0 = Instant::now();
-    let result = quality::quality_score(&msg.text);
-    crate::metrics::record_quality_score(TRANSPORT, result.score);
-    let latency_us = t0.elapsed().as_micros() as i64;
-
-    let resp = QualityScoreResponse {
-        id: sanitize(&msg.id, 128),
-        score: result.score,
-        signals: result.signals,
-        latency_us,
-    };
-
-    Ok(rmp_serde::to_vec_named(&resp)?)
+    Ok(encode_quality_score_response(&msg.id, &msg.text)?)
 }
 
 async fn handle_register(
@@ -616,7 +724,11 @@ async fn handle_register(
             })?)
         }
         Err(e) => {
-            crate::metrics::record_error(TRANSPORT, "register", "invalid_config");
+            // The surrounding `OutcomeGuard` already owns
+            // `sbproxy_classifier_errors_total` for this request, and it
+            // carries the real transport. A second increment here added the
+            // failure to the public listener's series as well, so an admin
+            // config typo paged whoever alerts on public inference errors.
             Ok(rmp_serde::to_vec_named(&AdminResponse {
                 ok: false,
                 cmd: "register".to_string(),
@@ -690,45 +802,32 @@ fn handle_version() -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>
     Ok(rmp_serde::to_vec_named(&resp)?)
 }
 
+#[cfg(test)]
 fn handle_intent_detect(
     msg: &Message,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    let text = msg.intent_text.as_deref().unwrap_or("");
-    let (intent, confidence) = heuristic::detect_intent(text);
-    let resp = IntentDetectResponse {
-        intent: intent.to_string(),
-        confidence,
-    };
-    Ok(rmp_serde::to_vec_named(&resp)?)
+    Ok(encode_intent_detect_response(
+        msg.intent_text.as_deref().unwrap_or(""),
+    )?)
 }
 
+#[cfg(test)]
 fn handle_streaming_safety(
     msg: &Message,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    let tokens = msg.streaming_tokens.as_deref().unwrap_or("");
-    let rules = msg.safety_rules.as_deref().unwrap_or(&[]);
-
-    let (safe, blocked, reason) = heuristic::check_streaming_safety(tokens, rules);
-    crate::metrics::record_safety_verdict(if safe { "safe" } else { "blocked" });
-
-    let resp = StreamingSafetyResponse {
-        safe,
-        blocked,
-        reason,
-    };
-    Ok(rmp_serde::to_vec_named(&resp)?)
+    Ok(encode_streaming_safety_response(
+        msg.streaming_tokens.as_deref().unwrap_or(""),
+        msg.safety_rules.as_deref().unwrap_or(&[]),
+    )?)
 }
 
+#[cfg(test)]
 fn handle_content_type_detect(
     msg: &Message,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    let content = msg.detect_content.as_deref().unwrap_or("");
-    let (content_type, confidence) = heuristic::detect_content_type(content);
-    let resp = ContentTypeDetectResponse {
-        content_type: content_type.to_string(),
-        confidence,
-    };
-    Ok(rmp_serde::to_vec_named(&resp)?)
+    Ok(encode_content_type_response(
+        msg.detect_content.as_deref().unwrap_or(""),
+    )?)
 }
 
 #[repr(transparent)]
@@ -818,15 +917,23 @@ impl Default for PublicWorkLimits {
 }
 
 #[cfg(test)]
-fn tcp_limits_key(limits: &TcpLimits) -> (usize, u128) {
-    (limits.max_connections, limits.io_timeout.as_nanos())
+type TcpLimitsKey = (usize, u128, u128, u128);
+
+#[cfg(test)]
+fn tcp_limits_key(limits: &TcpLimits) -> TcpLimitsKey {
+    (
+        limits.max_connections,
+        limits.io_timeout.as_nanos(),
+        limits.frame_timeout.as_nanos(),
+        limits.connection_timeout.as_nanos(),
+    )
 }
 
 #[cfg(test)]
 fn public_work_limit_overrides(
-) -> &'static std::sync::Mutex<std::collections::HashMap<(usize, u128), PublicWorkLimits>> {
+) -> &'static std::sync::Mutex<std::collections::HashMap<TcpLimitsKey, PublicWorkLimits>> {
     static OVERRIDES: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<(usize, u128), PublicWorkLimits>>,
+        std::sync::Mutex<std::collections::HashMap<TcpLimitsKey, PublicWorkLimits>>,
     > = std::sync::OnceLock::new();
     OVERRIDES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
@@ -1559,17 +1666,25 @@ impl TcpListenerAssembly {
         };
         let public_slots = Arc::new(tokio::sync::Semaphore::new(self.limits.max_connections));
         let admin_slots = Arc::new(tokio::sync::Semaphore::new(self.limits.max_connections));
-        let public_executor = self.public_work_limits.and_then(|limits| {
-            let admission = crate::admission::Admission::new(
-                limits.max_running,
-                limits.max_queued,
-                limits.deadline,
-            )
-            .ok()?;
-            Some(Arc::new(crate::admission::BlockingWorkExecutor::new(
-                admission,
-            )))
-        });
+        // A public listener configured with work limits must get its bounded
+        // executor or refuse to serve. Swallowing the construction error left
+        // the release build running every classify inline on an async worker
+        // with no cap, no queue, and no deadline, while the admission gauges
+        // read flat zero.
+        let public_executor = match self.public_work_limits {
+            Some(limits) => {
+                let admission = crate::admission::Admission::new(
+                    limits.max_running,
+                    limits.max_queued,
+                    limits.deadline,
+                )
+                .map_err(TcpListenerAssemblyError::InvalidConfig)?;
+                Some(Arc::new(crate::admission::BlockingWorkExecutor::new(
+                    admission,
+                )))
+            }
+            None => None,
+        };
         let mut children =
             tokio::task::JoinSet::<(TransportMode, Result<(), std::io::Error>)>::new();
         let mut child_modes = HashMap::<tokio::task::Id, TransportMode>::new();
@@ -1711,7 +1826,7 @@ impl TcpListenerAssembly {
                         let shutdown = Arc::clone(&cleanup);
                         let child = children.spawn(async move {
                             let _permit = permit;
-                            let result = handle_production_connection(
+                            let result = serve_bounded_connection(
                                 stream,
                                 TransportMode::Public,
                                 ListenerResources {
@@ -1788,7 +1903,7 @@ impl TcpListenerAssembly {
                         let shutdown = Arc::clone(&cleanup);
                         let child = children.spawn(async move {
                             let _permit = permit;
-                            let result = handle_production_connection(
+                            let result = serve_bounded_connection(
                                 stream,
                                 TransportMode::Admin,
                                 ListenerResources {
@@ -1889,6 +2004,17 @@ fn metrics_command(command: Command) -> crate::metrics::Command {
     }
 }
 
+/// The earlier of one read's own window and the whole-frame deadline.
+///
+/// Split out because the shutdown-aware and plain arms of the header read
+/// both need it, and a second copy is a second chance to drift.
+fn header_read_deadline(
+    io_timeout: Duration,
+    frame_deadline: tokio::time::Instant,
+) -> tokio::time::Instant {
+    frame_deadline.min(tokio::time::Instant::now() + io_timeout)
+}
+
 enum HeaderRead {
     CleanEof,
     PartialEof,
@@ -1900,11 +2026,15 @@ enum HeaderRead {
 async fn read_frame_length(
     stream: &mut TcpStream,
     io_timeout: Duration,
+    frame_deadline: tokio::time::Instant,
     shutdown: Option<&Arc<TcpListenerCleanupProbe>>,
 ) -> Result<HeaderRead, std::io::Error> {
     let mut len_buf = [0u8; 4];
     let mut filled = 0usize;
     loop {
+        if tokio::time::Instant::now() >= frame_deadline {
+            return Ok(HeaderRead::Timeout);
+        }
         if shutdown.is_some_and(|cleanup| cleanup.shutdown_requested()) {
             return Ok(if filled == 0 {
                 HeaderRead::CleanEof
@@ -1919,10 +2049,17 @@ async fn read_frame_length(
                 _ = notified.as_mut() => {
                     continue;
                 }
-                read = tokio::time::timeout(io_timeout, stream.read(&mut len_buf[filled..])) => read,
+                read = tokio::time::timeout_at(
+                    header_read_deadline(io_timeout, frame_deadline),
+                    stream.read(&mut len_buf[filled..]),
+                ) => read,
             }
         } else {
-            tokio::time::timeout(io_timeout, stream.read(&mut len_buf[filled..])).await
+            tokio::time::timeout_at(
+                header_read_deadline(io_timeout, frame_deadline),
+                stream.read(&mut len_buf[filled..]),
+            )
+            .await
         };
         match read {
             Err(_) => return Ok(HeaderRead::Timeout),
@@ -1950,14 +2087,30 @@ async fn read_frame_length(
     }
 }
 
+/// Read one declared body under two deadlines at once.
+///
+/// `io_timeout` bounds a single `read()`; `frame_deadline` bounds the whole
+/// body. Only the second one stops a client that sends a byte just inside
+/// every per-read window: without it a 4 MiB declared frame can hold its
+/// share of the process-wide frame budget for months, and four such sockets
+/// lock every other connection, including the admin listener, out of the
+/// shared budget.
 async fn read_frame_payload(
     stream: &mut TcpStream,
     io_timeout: Duration,
+    frame_deadline: tokio::time::Instant,
     payload: &mut [u8],
 ) -> Result<Result<(), crate::metrics::Reason>, std::io::Error> {
     let mut filled = 0usize;
     while filled < payload.len() {
-        let read = tokio::time::timeout(io_timeout, stream.read(&mut payload[filled..])).await;
+        if tokio::time::Instant::now() >= frame_deadline {
+            return Ok(Err(crate::metrics::Reason::Deadline));
+        }
+        let read = tokio::time::timeout_at(
+            frame_deadline.min(tokio::time::Instant::now() + io_timeout),
+            stream.read(&mut payload[filled..]),
+        )
+        .await;
         match read {
             Err(_) => return Ok(Err(crate::metrics::Reason::Deadline)),
             Ok(Ok(0)) => return Ok(Err(crate::metrics::Reason::MalformedFrame)),
@@ -1966,6 +2119,137 @@ async fn read_frame_payload(
         }
     }
     Ok(Ok(()))
+}
+
+/// Per-request byte budget for text arriving on the public TCP transport.
+///
+/// The same `MAX_TEXT_BYTES` the gRPC twins enforce, reused rather than
+/// re-declared: the TCP frame ceiling is 4 MiB, so without this a single
+/// unauthenticated frame reached `quality_score`'s trigram map and
+/// `check_streaming_safety`'s per-rule `to_lowercase` with four times the
+/// text the gRPC path refuses.
+#[allow(clippy::result_large_err)]
+fn check_public_text_bytes(text: &str) -> Result<(), String> {
+    if text.len() > crate::grpc::MAX_TEXT_BYTES {
+        return Err(format!(
+            "text exceeds the {}-byte request budget: {} bytes",
+            crate::grpc::MAX_TEXT_BYTES,
+            text.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Per-request shape budget for `streaming_safety`, matching the gRPC
+/// `StreamSafety` limits. `check_streaming_safety` is `O(rules x text)` with
+/// an allocation per rule, so both halves need a ceiling.
+fn check_public_streaming_shape(tokens: &str, rules: &[String]) -> Result<(), String> {
+    if tokens.len() > crate::grpc::MAX_STREAM_BYTES {
+        return Err(format!(
+            "streaming tokens exceed the {}-byte request budget: {} bytes",
+            crate::grpc::MAX_STREAM_BYTES,
+            tokens.len()
+        ));
+    }
+    if rules.len() > crate::grpc::MAX_STREAM_RULES {
+        return Err(format!(
+            "streaming safety accepts at most {} rules",
+            crate::grpc::MAX_STREAM_RULES
+        ));
+    }
+    let rule_bytes = rules
+        .iter()
+        .try_fold(0usize, |total, rule| total.checked_add(rule.len()))
+        .ok_or_else(|| "streaming safety rule byte count overflow".to_string())?;
+    if rule_bytes > crate::grpc::MAX_STREAM_RULE_BYTES {
+        return Err(format!(
+            "streaming safety rules exceed the {}-byte aggregate budget",
+            crate::grpc::MAX_STREAM_RULE_BYTES
+        ));
+    }
+    Ok(())
+}
+
+/// Test-only scope that reports a public worker's start and finish, and
+/// parks it on a barrier when one is armed for that checkpoint.
+#[cfg(test)]
+struct PublicWorkerScope {
+    controls: Arc<TcpTestControl>,
+}
+
+#[cfg(test)]
+impl PublicWorkerScope {
+    fn enter(controls: Option<&Arc<TcpTestControl>>, checkpoint: &'static str) -> Option<Self> {
+        let controls = Arc::clone(controls?);
+        controls.public_worker_probe().worker_started();
+        if let Some(barrier) = controls.take_public_worker_hold(checkpoint) {
+            barrier.enter_and_wait();
+        }
+        Some(Self { controls })
+    }
+}
+
+#[cfg(test)]
+impl Drop for PublicWorkerScope {
+    fn drop(&mut self) {
+        self.controls.public_worker_probe().worker_finished();
+    }
+}
+
+/// Run one public inference command on the bounded blocking executor.
+///
+/// Every CPU-bound public command goes through here, so the admission cap,
+/// the queue, and the deadline the operator configured are the same three
+/// bounds on every one of them, and the refusal a caller sees is the same
+/// shape their gRPC twin returns.
+async fn run_public_work<F>(
+    executor: Option<&Arc<crate::admission::BlockingWorkExecutor>>,
+    command: Command,
+    tenant: Option<String>,
+    #[cfg(test)] controls: Option<Arc<TcpTestControl>>,
+    work: F,
+) -> Result<(Vec<u8>, PlannedOutcome), std::io::Error>
+where
+    F: FnOnce() -> anyhow::Result<Vec<u8>> + Send + 'static,
+{
+    #[cfg(test)]
+    let work = {
+        let checkpoint = command.label();
+        move || {
+            let _worker = PublicWorkerScope::enter(controls.as_ref(), checkpoint);
+            work()
+        }
+    };
+    let Some(executor) = executor else {
+        // Only reachable from an in-crate listener assembled without work
+        // limits; `run_release_main` always supplies them.
+        return Ok((
+            work().map_err(std::io::Error::other)?,
+            PlannedOutcome::Success,
+        ));
+    };
+    let (message, stage, reason) = match executor.run_blocking(command.label(), work).await {
+        Ok(response) => return Ok((response, PlannedOutcome::Success)),
+        Err(status) if status.code() == tonic::Code::ResourceExhausted => (
+            "classifier inference queue is full",
+            crate::metrics::Stage::Admission,
+            crate::metrics::Reason::QueueFull,
+        ),
+        Err(status) if status.code() == tonic::Code::DeadlineExceeded => (
+            "classifier inference deadline exceeded",
+            crate::metrics::Stage::Worker,
+            crate::metrics::Reason::Deadline,
+        ),
+        Err(_status) => (
+            "classifier inference failed",
+            crate::metrics::Stage::Worker,
+            crate::metrics::Reason::InferenceFailed,
+        ),
+    };
+    Ok((
+        admin_error(command, tenant, message).map_err(std::io::Error::other)?,
+        PlannedOutcome::Failure(stage, reason),
+    ))
 }
 
 /// Everything a connection borrows from the listener that owns it.
@@ -1980,6 +2264,49 @@ struct ListenerResources<'a> {
     frame_budget: Arc<tokio::sync::Semaphore>,
     public_executor: Option<Arc<crate::admission::BlockingWorkExecutor>>,
     shutdown: Option<Arc<TcpListenerCleanupProbe>>,
+}
+
+/// Serve one accepted connection under its whole-connection deadline.
+///
+/// The deadline is enforced by dropping the connection future, which drops
+/// whatever `BudgetedFrame` it was holding and returns that frame's share of
+/// the process-wide budget. Both listener arms go through here so neither can
+/// keep a socket, or a lease, past the configured bound.
+async fn serve_bounded_connection(
+    stream: TcpStream,
+    mode: TransportMode,
+    resources: ListenerResources<'_>,
+    #[cfg(test)] controls: Option<Arc<TcpTestControl>>,
+    #[cfg(test)] allocation_probe: Option<Arc<FrameAllocationProbe>>,
+) -> Result<(), std::io::Error> {
+    let connection_timeout = resources.limits.connection_timeout;
+    let served = tokio::time::timeout(
+        connection_timeout,
+        handle_production_connection(
+            stream,
+            mode,
+            resources,
+            #[cfg(test)]
+            controls,
+            #[cfg(test)]
+            allocation_probe,
+        ),
+    )
+    .await;
+    match served {
+        Ok(result) => result,
+        Err(_) => {
+            crate::metrics::begin_outcome(
+                metrics_transport(mode),
+                crate::metrics::Command::Unknown,
+            )
+            .failure(
+                crate::metrics::Stage::Read,
+                crate::metrics::Reason::Deadline,
+            );
+            Ok(())
+        }
+    }
 }
 
 async fn handle_production_connection(
@@ -2010,41 +2337,48 @@ async fn handle_production_connection(
             return Ok(());
         }
 
-        let msg_len =
-            match read_frame_length(&mut stream, limits.io_timeout, shutdown.as_ref()).await? {
-                HeaderRead::CleanEof => return Ok(()),
-                HeaderRead::PartialEof => {
-                    crate::metrics::begin_outcome(
-                        metrics_transport(mode),
-                        crate::metrics::Command::Decode,
-                    )
-                    .failure(
-                        crate::metrics::Stage::Read,
-                        crate::metrics::Reason::MalformedFrame,
-                    );
-                    return Ok(());
-                }
-                HeaderRead::Timeout => {
-                    crate::metrics::begin_outcome(
-                        metrics_transport(mode),
-                        crate::metrics::Command::Decode,
-                    )
-                    .failure(
-                        crate::metrics::Stage::Read,
-                        crate::metrics::Reason::Deadline,
-                    );
-                    return Ok(());
-                }
-                HeaderRead::Io => {
-                    crate::metrics::begin_outcome(
-                        metrics_transport(mode),
-                        crate::metrics::Command::Decode,
-                    )
-                    .failure(crate::metrics::Stage::Read, crate::metrics::Reason::Io);
-                    return Ok(());
-                }
-                HeaderRead::Length(length) => length,
-            };
+        let frame_deadline = tokio::time::Instant::now() + limits.frame_timeout;
+        let msg_len = match read_frame_length(
+            &mut stream,
+            limits.io_timeout,
+            frame_deadline,
+            shutdown.as_ref(),
+        )
+        .await?
+        {
+            HeaderRead::CleanEof => return Ok(()),
+            HeaderRead::PartialEof => {
+                crate::metrics::begin_outcome(
+                    metrics_transport(mode),
+                    crate::metrics::Command::Decode,
+                )
+                .failure(
+                    crate::metrics::Stage::Read,
+                    crate::metrics::Reason::MalformedFrame,
+                );
+                return Ok(());
+            }
+            HeaderRead::Timeout => {
+                crate::metrics::begin_outcome(
+                    metrics_transport(mode),
+                    crate::metrics::Command::Decode,
+                )
+                .failure(
+                    crate::metrics::Stage::Read,
+                    crate::metrics::Reason::Deadline,
+                );
+                return Ok(());
+            }
+            HeaderRead::Io => {
+                crate::metrics::begin_outcome(
+                    metrics_transport(mode),
+                    crate::metrics::Command::Decode,
+                )
+                .failure(crate::metrics::Stage::Read, crate::metrics::Reason::Io);
+                return Ok(());
+            }
+            HeaderRead::Length(length) => length,
+        };
 
         if msg_len > MAX_FRAME_BYTES {
             crate::metrics::begin_outcome(metrics_transport(mode), crate::metrics::Command::Decode)
@@ -2086,7 +2420,9 @@ async fn handle_production_connection(
             return Ok(());
         }
 
-        match read_frame_payload(&mut stream, limits.io_timeout, &mut payload).await? {
+        match read_frame_payload(&mut stream, limits.io_timeout, frame_deadline, &mut payload)
+            .await?
+        {
             Ok(()) => {}
             Err(reason) => {
                 crate::metrics::begin_outcome(
@@ -2117,7 +2453,39 @@ async fn handle_production_connection(
             crate::metrics::begin_outcome(metrics_transport(mode), metrics_command(command));
         let (response, planned_outcome) = match (mode, command) {
             (TransportMode::Public, Command::Classify) => {
-                if registry.get(msg.tenant.as_deref()).is_none() {
+                if let Err(refusal) = check_public_text_bytes(&msg.text) {
+                    (
+                        admin_error(Command::Classify, msg.tenant.clone(), &refusal)
+                            .map_err(std::io::Error::other)?,
+                        PlannedOutcome::Failure(
+                            crate::metrics::Stage::Limit,
+                            crate::metrics::Reason::ResourceLimit,
+                        ),
+                    )
+                } else if let Some(tenant) = registry.get(msg.tenant.as_deref()) {
+                    let tenant_id = msg.tenant.clone();
+                    let echoed_tenant = msg.tenant.clone().unwrap_or_default();
+                    let text = msg.text.clone();
+                    let top_k = msg.top_k;
+                    let request_id = msg.id.clone();
+                    run_public_work(
+                        public_executor.as_ref(),
+                        Command::Classify,
+                        tenant_id,
+                        #[cfg(test)]
+                        controls.clone(),
+                        move || {
+                            encode_classify_response(
+                                &tenant,
+                                &request_id,
+                                &echoed_tenant,
+                                &text,
+                                top_k,
+                            )
+                        },
+                    )
+                    .await?
+                } else {
                     (
                         admin_error(
                             Command::Classify,
@@ -2133,125 +2501,106 @@ async fn handle_production_connection(
                             crate::metrics::Reason::TenantNotFound,
                         ),
                     )
-                } else {
-                    #[cfg(test)]
-                    if let Some(executor) = public_executor.as_ref() {
-                        let tenant_id = msg.tenant.clone();
-                        let text = msg.text.clone();
-                        let top_k = msg.top_k;
-                        let registered_tenant = registry.get(tenant_id.as_deref());
-                        let request_id = msg.id.clone();
-                        let controls = controls.clone();
-                        match executor
-                            .run_blocking("classify", move || {
-                                if let Some(controls) = &controls {
-                                    controls.public_worker_probe().worker_started();
-                                }
-                                let worker_result = (|| {
-                                    if let Some(controls) = &controls {
-                                        if let Some(barrier) =
-                                            controls.take_public_worker_hold("classify")
-                                        {
-                                            barrier.enter_and_wait();
-                                        }
-                                    }
-                                    let tenant = registered_tenant
-                                        .ok_or_else(|| anyhow::anyhow!("missing tenant"))?;
-                                    let normalized = tenant.normalizer.normalize(&text);
-                                    let labels = tenant.classifier.classify(&normalized, top_k);
-                                    Ok(ClassifyResponse {
-                                        id: sanitize(&request_id, 128),
-                                        labels,
-                                        normalized,
-                                        latency_us: 0,
-                                        tenant: tenant_id.unwrap_or_default(),
-                                    })
-                                })();
-                                if let Some(controls) = &controls {
-                                    controls.public_worker_probe().worker_finished();
-                                }
-                                worker_result
-                            })
-                            .await
-                        {
-                            Ok(response) => (
-                                rmp_serde::to_vec_named(&response)
-                                    .map_err(std::io::Error::other)?,
-                                PlannedOutcome::Success,
-                            ),
-                            Err(status) if status.code() == tonic::Code::ResourceExhausted => (
-                                admin_error(
-                                    Command::Classify,
-                                    msg.tenant.clone(),
-                                    "classifier inference queue is full",
-                                )
-                                .map_err(std::io::Error::other)?,
-                                PlannedOutcome::Failure(
-                                    crate::metrics::Stage::Admission,
-                                    crate::metrics::Reason::QueueFull,
-                                ),
-                            ),
-                            Err(status) if status.code() == tonic::Code::DeadlineExceeded => (
-                                admin_error(
-                                    Command::Classify,
-                                    msg.tenant.clone(),
-                                    "classifier inference deadline exceeded",
-                                )
-                                .map_err(std::io::Error::other)?,
-                                PlannedOutcome::Failure(
-                                    crate::metrics::Stage::Worker,
-                                    crate::metrics::Reason::Deadline,
-                                ),
-                            ),
-                            Err(_status) => (
-                                admin_error(
-                                    Command::Classify,
-                                    msg.tenant.clone(),
-                                    "classifier inference failed",
-                                )
-                                .map_err(std::io::Error::other)?,
-                                PlannedOutcome::Failure(
-                                    crate::metrics::Stage::Worker,
-                                    crate::metrics::Reason::InferenceFailed,
-                                ),
-                            ),
-                        }
-                    } else {
-                        (
-                            handle_classify(registry, &msg).map_err(std::io::Error::other)?,
-                            PlannedOutcome::Success,
-                        )
-                    }
-                    #[cfg(not(test))]
-                    {
-                        let _ = &public_executor;
-                        (
-                            handle_classify(registry, &msg).map_err(std::io::Error::other)?,
-                            PlannedOutcome::Success,
-                        )
-                    }
                 }
             }
-            (TransportMode::Public, Command::QualityScore) => (
-                handle_quality_score(&msg).map_err(std::io::Error::other)?,
-                PlannedOutcome::Success,
-            ),
+            (TransportMode::Public, Command::QualityScore) => {
+                if let Err(refusal) = check_public_text_bytes(&msg.text) {
+                    (
+                        admin_error(Command::QualityScore, msg.tenant.clone(), &refusal)
+                            .map_err(std::io::Error::other)?,
+                        PlannedOutcome::Failure(
+                            crate::metrics::Stage::Limit,
+                            crate::metrics::Reason::ResourceLimit,
+                        ),
+                    )
+                } else {
+                    let text = msg.text.clone();
+                    let request_id = msg.id.clone();
+                    run_public_work(
+                        public_executor.as_ref(),
+                        Command::QualityScore,
+                        msg.tenant.clone(),
+                        #[cfg(test)]
+                        controls.clone(),
+                        move || encode_quality_score_response(&request_id, &text),
+                    )
+                    .await?
+                }
+            }
             (TransportMode::Public, Command::Version) => (
                 handle_version().map_err(std::io::Error::other)?,
                 PlannedOutcome::Success,
             ),
-            (TransportMode::Public, Command::IntentDetect) => (
-                handle_intent_detect(&msg).map_err(std::io::Error::other)?,
-                PlannedOutcome::Success,
-            ),
-            (TransportMode::Public, Command::StreamingSafety) => (
-                handle_streaming_safety(&msg).map_err(std::io::Error::other)?,
-                PlannedOutcome::Success,
-            ),
-            (TransportMode::Public, Command::ContentTypeDetect) => (
-                handle_content_type_detect(&msg).map_err(std::io::Error::other)?,
-                PlannedOutcome::Success,
-            ),
+            (TransportMode::Public, Command::IntentDetect) => {
+                let text = msg.intent_text.clone().unwrap_or_default();
+                if let Err(refusal) = check_public_text_bytes(&text) {
+                    (
+                        admin_error(Command::IntentDetect, msg.tenant.clone(), &refusal)
+                            .map_err(std::io::Error::other)?,
+                        PlannedOutcome::Failure(
+                            crate::metrics::Stage::Limit,
+                            crate::metrics::Reason::ResourceLimit,
+                        ),
+                    )
+                } else {
+                    run_public_work(
+                        public_executor.as_ref(),
+                        Command::IntentDetect,
+                        msg.tenant.clone(),
+                        #[cfg(test)]
+                        controls.clone(),
+                        move || encode_intent_detect_response(&text),
+                    )
+                    .await?
+                }
+            }
+            (TransportMode::Public, Command::StreamingSafety) => {
+                let tokens = msg.streaming_tokens.clone().unwrap_or_default();
+                let rules = msg.safety_rules.clone().unwrap_or_default();
+                if let Err(refusal) = check_public_streaming_shape(&tokens, &rules) {
+                    (
+                        admin_error(Command::StreamingSafety, msg.tenant.clone(), &refusal)
+                            .map_err(std::io::Error::other)?,
+                        PlannedOutcome::Failure(
+                            crate::metrics::Stage::Limit,
+                            crate::metrics::Reason::ResourceLimit,
+                        ),
+                    )
+                } else {
+                    run_public_work(
+                        public_executor.as_ref(),
+                        Command::StreamingSafety,
+                        msg.tenant.clone(),
+                        #[cfg(test)]
+                        controls.clone(),
+                        move || encode_streaming_safety_response(&tokens, &rules),
+                    )
+                    .await?
+                }
+            }
+            (TransportMode::Public, Command::ContentTypeDetect) => {
+                let content = msg.detect_content.clone().unwrap_or_default();
+                if let Err(refusal) = check_public_text_bytes(&content) {
+                    (
+                        admin_error(Command::ContentTypeDetect, msg.tenant.clone(), &refusal)
+                            .map_err(std::io::Error::other)?,
+                        PlannedOutcome::Failure(
+                            crate::metrics::Stage::Limit,
+                            crate::metrics::Reason::ResourceLimit,
+                        ),
+                    )
+                } else {
+                    run_public_work(
+                        public_executor.as_ref(),
+                        Command::ContentTypeDetect,
+                        msg.tenant.clone(),
+                        #[cfg(test)]
+                        controls.clone(),
+                        move || encode_content_type_response(&content),
+                    )
+                    .await?
+                }
+            }
             (TransportMode::Admin, Command::Register | Command::Delete | Command::List) => {
                 let auth = auth.ok_or_else(|| {
                     std::io::Error::new(std::io::ErrorKind::PermissionDenied, "missing admin auth")
@@ -2422,7 +2771,19 @@ async fn handle_production_connection(
             return Ok(());
         }
 
-        let resp_len = (response.len() as u32).to_be_bytes();
+        let resp_len = match u32::try_from(response.len()) {
+            Ok(length) => length.to_be_bytes(),
+            Err(_) => {
+                // A response the 4-byte prefix cannot describe would wrap and
+                // desynchronize the connection: the client would read a short
+                // frame and parse the rest of the body as further frames.
+                outcome.failure(
+                    crate::metrics::Stage::Encode,
+                    crate::metrics::Reason::ResourceLimit,
+                );
+                return Ok(());
+            }
+        };
         let write_result = tokio::time::timeout(limits.io_timeout, async {
             stream.write_all(&resp_len).await?;
             stream.write_all(&response).await?;
@@ -3424,6 +3785,8 @@ mod tests {
             TcpLimits {
                 max_connections: DEFAULT_MAX_CONNECTIONS,
                 io_timeout: Duration::from_secs(60),
+                frame_timeout: DEFAULT_FRAME_TIMEOUT,
+                connection_timeout: DEFAULT_CONNECTION_TIMEOUT,
             },
             Arc::new(TcpTestControl::default()),
             Some(Arc::clone(&probe)),
@@ -4972,6 +5335,342 @@ mod tests {
         pair.stop().await;
     }
 
+    /// A client that trickles a byte just inside every per-read window used
+    /// to hold its share of the process-wide frame budget forever: the frame
+    /// had no deadline of its own, so `io_timeout` restarted on each byte.
+    /// Four such sockets exhausted the shared 16 MiB budget and locked the
+    /// admin listener out of `register` / `delete` / `list` for the life of
+    /// the process.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn trickled_frame_releases_its_budget_lease_at_the_frame_deadline() {
+        use crate::metrics::{
+            Command as MetricCommand, OutcomeExpectation, OutcomeProbe, Reason, Stage, Transport,
+        };
+
+        const DECLARED_BYTES: usize = 512 * 1024;
+
+        let outcomes = OutcomeProbe::acquire_unique().await;
+        let registry = Arc::new(Registry::new_empty());
+        let auth = Arc::new(
+            AdminAuth::from_json(br#"{"tokens":[{"token":"secret","tenants":["*"]}]}"#).unwrap(),
+        );
+        let probe = Arc::new(FrameAllocationProbe::default());
+        let pair = spawn_production_listener_pair(
+            registry,
+            auth,
+            TcpLimits {
+                max_connections: 8,
+                io_timeout: Duration::from_millis(400),
+                frame_timeout: Duration::from_millis(700),
+                connection_timeout: Duration::from_secs(30),
+            },
+            Arc::new(TcpTestControl::default()),
+            Some(Arc::clone(&probe)),
+        )
+        .await;
+
+        let before = outcomes.snapshot();
+        let mut stream = bounded_tcp_connect(pair.public_address, "trickling public client").await;
+        stream
+            .write_all(&(DECLARED_BYTES as u32).to_be_bytes())
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+
+        let held = probe
+            .wait_for_live_bytes(Duration::from_secs(3), |live| live > 0)
+            .await
+            .expect("the declared frame takes its budget lease");
+        assert_eq!(held, DECLARED_BYTES);
+
+        let trickle = tokio::spawn(async move {
+            // One byte every 200ms: inside the 400ms per-read window, so the
+            // per-read timeout alone never fires. The loop outlasts the wait
+            // below, so a client hangup cannot be what releases the lease.
+            for _ in 0..200 {
+                if stream.write_all(b"x").await.is_err() {
+                    break;
+                }
+                if stream.flush().await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        });
+
+        let live_after = probe
+            .wait_for_live_bytes(Duration::from_secs(5), |live| live == 0)
+            .await
+            .expect("the frame deadline must release the budget lease");
+        assert_eq!(live_after, 0);
+        before.assert_exact_terminal_delta(
+            OutcomeExpectation::failure(
+                Transport::Tcp,
+                MetricCommand::Decode,
+                Stage::Read,
+                Reason::Deadline,
+            ),
+            "trickled frame deadline",
+        );
+        trickle.abort();
+        let _ = trickle.await;
+        pair.stop().await;
+    }
+
+    /// The public MessagePack commands used to apply none of the per-request
+    /// budgets their gRPC twins enforce, so one 4 MiB frame reached
+    /// `quality_score` with four times the text `Quality` refuses and
+    /// `streaming_safety` with a rule set `StreamSafety` refuses outright.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn public_commands_refuse_request_shapes_beyond_the_shared_grpc_budgets() {
+        use crate::metrics::{
+            Command as MetricCommand, OutcomeExpectation, OutcomeProbe, Reason, Stage, Transport,
+        };
+
+        let outcomes = OutcomeProbe::acquire_unique().await;
+        let registry = Arc::new(Registry::new_empty());
+        registry
+            .register("tenant.example", &sample_tenant_config())
+            .expect("control tenant registers");
+        let auth = Arc::new(
+            AdminAuth::from_json(br#"{"tokens":[{"token":"secret","tenants":["*"]}]}"#).unwrap(),
+        );
+        let pair = spawn_production_listener_pair(
+            registry,
+            auth,
+            TcpLimits::default(),
+            Arc::new(TcpTestControl::default()),
+            None,
+        )
+        .await;
+
+        let oversized = "x".repeat(crate::grpc::MAX_TEXT_BYTES + 1);
+        let mut over_budget_classify = msg("classify");
+        over_budget_classify.tenant = Some("tenant.example".to_string());
+        over_budget_classify.text = oversized.clone();
+
+        let mut over_budget_quality = msg("quality_score");
+        over_budget_quality.text = oversized.clone();
+
+        let mut over_budget_intent = msg("intent_detect");
+        over_budget_intent.intent_text = Some(oversized.clone());
+
+        let mut over_budget_content = msg("content_type_detect");
+        over_budget_content.detect_content = Some(oversized);
+
+        let mut over_budget_rules = msg("streaming_safety");
+        over_budget_rules.streaming_tokens = Some("hello".to_string());
+        over_budget_rules.safety_rules =
+            Some(vec!["x".to_string(); crate::grpc::MAX_STREAM_RULES + 1]);
+
+        let mut over_budget_rule_bytes = msg("streaming_safety");
+        over_budget_rule_bytes.streaming_tokens = Some("hello".to_string());
+        over_budget_rule_bytes.safety_rules =
+            Some(vec!["x".repeat(crate::grpc::MAX_STREAM_RULE_BYTES + 1)]);
+
+        for (case, command, request) in [
+            (
+                "classify text",
+                MetricCommand::Classify,
+                over_budget_classify,
+            ),
+            (
+                "quality_score text",
+                MetricCommand::QualityScore,
+                over_budget_quality,
+            ),
+            (
+                "intent_detect text",
+                MetricCommand::IntentDetect,
+                over_budget_intent,
+            ),
+            (
+                "content_type_detect text",
+                MetricCommand::ContentTypeDetect,
+                over_budget_content,
+            ),
+            (
+                "streaming_safety rule count",
+                MetricCommand::StreamingSafety,
+                over_budget_rules,
+            ),
+            (
+                "streaming_safety rule bytes",
+                MetricCommand::StreamingSafety,
+                over_budget_rule_bytes,
+            ),
+        ] {
+            let before = outcomes.snapshot();
+            let mut stream = bounded_tcp_connect(pair.public_address, case).await;
+            let response: AdminResponse =
+                rmp_serde::from_slice(&wire_exchange(&mut stream, &request).await)
+                    .unwrap_or_else(|error| panic!("{case} must answer with a refusal: {error}"));
+            assert!(!response.ok, "{case} must be refused");
+            before.assert_exact_terminal_delta(
+                OutcomeExpectation::failure(
+                    Transport::Tcp,
+                    command,
+                    Stage::Limit,
+                    Reason::ResourceLimit,
+                ),
+                case,
+            );
+        }
+        pair.stop().await;
+    }
+
+    /// Every CPU-bound public command runs behind the bounded executor, not
+    /// inline on the async worker. Proven at the admission seam: with one
+    /// running slot held and no queue, the next call of the same command is
+    /// refused rather than served.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn every_public_inference_command_runs_behind_bounded_admission() {
+        use crate::metrics::{
+            Command as MetricCommand, OutcomeExpectation, OutcomeProbe, Reason, Stage, Transport,
+        };
+
+        let outcomes = OutcomeProbe::acquire_unique().await;
+        let registry = Arc::new(Registry::new_empty());
+        registry
+            .register("tenant.example", &sample_tenant_config())
+            .expect("control tenant registers");
+        let auth = Arc::new(
+            AdminAuth::from_json(br#"{"tokens":[{"token":"secret","tenants":["*"]}]}"#).unwrap(),
+        );
+        let controls = Arc::new(TcpTestControl::default());
+        let pair = spawn_production_listener_pair(
+            registry,
+            auth,
+            TcpLimits::default().with_public_work_limits(PublicWorkLimits {
+                max_running: 1,
+                max_queued: 0,
+                deadline: Duration::from_secs(5),
+            }),
+            Arc::clone(&controls),
+            None,
+        )
+        .await;
+
+        let mut quality = msg("quality_score");
+        quality.text = "hello".to_string();
+        let mut intent = msg("intent_detect");
+        intent.intent_text = Some("write me a function".to_string());
+        let mut content = msg("content_type_detect");
+        content.detect_content = Some("hello".to_string());
+        let mut safety = msg("streaming_safety");
+        safety.streaming_tokens = Some("hello".to_string());
+        safety.safety_rules = Some(vec!["forbidden".to_string()]);
+
+        for (case, command, request) in [
+            ("quality_score", MetricCommand::QualityScore, quality),
+            ("intent_detect", MetricCommand::IntentDetect, intent),
+            (
+                "content_type_detect",
+                MetricCommand::ContentTypeDetect,
+                content,
+            ),
+            ("streaming_safety", MetricCommand::StreamingSafety, safety),
+        ] {
+            let barrier = Arc::new(PublicWorkerBarrier::default());
+            let hold = controls.hold_next_public_worker(command, Arc::clone(&barrier));
+            let held_request = clone_message(&request);
+            let public_address = pair.public_address;
+            let held = tokio::spawn(async move {
+                let mut stream = bounded_tcp_connect(public_address, "held public worker").await;
+                wire_exchange(&mut stream, &held_request).await
+            });
+            barrier
+                .wait_until_entered(Duration::from_secs(3))
+                .await
+                .unwrap_or_else(|error| panic!("{case} must reach a bounded worker: {error}"));
+            hold.assert_consumed_exactly_once();
+
+            let before = outcomes.snapshot();
+            let mut second = bounded_tcp_connect(pair.public_address, "queue-full probe").await;
+            let refusal: AdminResponse =
+                rmp_serde::from_slice(&wire_exchange(&mut second, &request).await)
+                    .unwrap_or_else(|error| panic!("{case} must answer a refusal: {error}"));
+            assert!(!refusal.ok, "{case} must be refused while the slot is held");
+            before.assert_exact_terminal_delta(
+                OutcomeExpectation::failure(
+                    Transport::Tcp,
+                    command,
+                    Stage::Admission,
+                    Reason::QueueFull,
+                ),
+                case,
+            );
+
+            barrier.release();
+            tokio::time::timeout(Duration::from_secs(3), held)
+                .await
+                .unwrap_or_else(|_| panic!("{case} held worker completes after release"))
+                .unwrap();
+        }
+        pair.stop().await;
+    }
+
+    /// A rejected tenant config used to be counted twice: once by the
+    /// `OutcomeGuard` under `admin_tcp`, and once again inside the handler
+    /// under the constant `tcp`, so an admin config typo showed up on the
+    /// public inference listener's error rate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_register_counts_one_error_on_the_admin_transport_only() {
+        use crate::metrics::{
+            Command as MetricCommand, OutcomeExpectation, OutcomeProbe, Reason, Stage, Transport,
+        };
+
+        let outcomes = OutcomeProbe::acquire_unique().await;
+        let registry = Arc::new(Registry::new_empty());
+        let auth = Arc::new(
+            AdminAuth::from_json(br#"{"tokens":[{"token":"secret","tenants":["*"]}]}"#).unwrap(),
+        );
+        let pair = spawn_production_listener_pair(
+            registry,
+            auth,
+            TcpLimits::default(),
+            Arc::new(TcpTestControl::default()),
+            None,
+        )
+        .await;
+
+        let mut request = msg("register");
+        request.tenant = Some("tenant.example".to_string());
+        request.admin_token = Some("secret".to_string());
+        request.config = Some(TenantConfig {
+            labels: vec![TenantLabel {
+                name: "broken".to_string(),
+                patterns: vec!["(".to_string()],
+                weight: 1.0,
+            }],
+            classification: None,
+            normalization: None,
+        });
+
+        let public_errors_before =
+            crate::metrics::error_count(TRANSPORT, "register", "invalid_config");
+        let before = outcomes.snapshot();
+        let mut stream = bounded_tcp_connect(pair.admin_address, "invalid register").await;
+        let response: AdminResponse =
+            rmp_serde::from_slice(&wire_exchange(&mut stream, &request).await).unwrap();
+        assert!(!response.ok);
+        before.assert_exact_terminal_delta(
+            OutcomeExpectation::failure(
+                Transport::AdminTcp,
+                MetricCommand::Register,
+                Stage::Handler,
+                Reason::InvalidConfig,
+            ),
+            "invalid register",
+        );
+        assert_eq!(
+            crate::metrics::error_count(TRANSPORT, "register", "invalid_config"),
+            public_errors_before,
+            "an admin register failure must not touch the public listener's error series"
+        );
+        pair.stop().await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn public_classification_timeout_retains_bounded_worker_lease_and_recovers() {
         use crate::metrics::{
@@ -5118,6 +5817,8 @@ mod tests {
             TcpLimits {
                 max_connections: 1,
                 io_timeout: Duration::from_millis(250),
+                frame_timeout: DEFAULT_FRAME_TIMEOUT,
+                connection_timeout: DEFAULT_CONNECTION_TIMEOUT,
             },
             Arc::clone(&controls),
             None,
@@ -5783,6 +6484,8 @@ mod tests {
         let limits = TcpLimits {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             io_timeout: Duration::from_secs(5),
+            frame_timeout: DEFAULT_FRAME_TIMEOUT,
+            connection_timeout: DEFAULT_CONNECTION_TIMEOUT,
         };
         limits
             .validate()
@@ -5863,6 +6566,8 @@ mod tests {
             TcpLimits {
                 max_connections: 1,
                 io_timeout: Duration::from_secs(1),
+                frame_timeout: DEFAULT_FRAME_TIMEOUT,
+                connection_timeout: DEFAULT_CONNECTION_TIMEOUT,
             },
             frame_budget(),
             None,
@@ -5917,6 +6622,8 @@ mod tests {
                 TcpLimits {
                     max_connections: DEFAULT_MAX_CONNECTIONS + 1,
                     io_timeout: Duration::from_millis(100),
+                    frame_timeout: DEFAULT_FRAME_TIMEOUT,
+                    connection_timeout: DEFAULT_CONNECTION_TIMEOUT,
                 },
                 frame_budget(),
                 None,
@@ -5954,6 +6661,8 @@ mod tests {
                 TcpLimits {
                     max_connections: 1,
                     io_timeout: Duration::from_millis(20),
+                    frame_timeout: DEFAULT_FRAME_TIMEOUT,
+                    connection_timeout: DEFAULT_CONNECTION_TIMEOUT,
                 },
                 frame_budget(),
                 None,
@@ -5991,6 +6700,8 @@ mod tests {
             let limits = TcpLimits {
                 max_connections: max,
                 io_timeout: timeout,
+                frame_timeout: DEFAULT_FRAME_TIMEOUT,
+                connection_timeout: DEFAULT_CONNECTION_TIMEOUT,
             };
             assert!(limits.validate().is_err());
         }

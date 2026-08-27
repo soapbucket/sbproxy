@@ -102,8 +102,14 @@ impl ClassifierRuntime {
         let state = Arc::get_mut(&mut self.grpc_state).context(
             "prepared classifier runtime was shared before model installation completed",
         )?;
-        state.models = models;
-        state.embedders = embedders;
+        state.models = models
+            .into_iter()
+            .map(|(id, model)| (id, model as Arc<dyn grpc::LoadedClassifier>))
+            .collect();
+        state.embedders = embedders
+            .into_iter()
+            .map(|(id, model)| (id, model as Arc<dyn grpc::LoadedEmbedder>))
+            .collect();
         Ok(self)
     }
 
@@ -311,6 +317,8 @@ pub(crate) async fn run_release_main(cli: Cli) -> Result<StartupExitReport> {
     let tcp_limits = tcp::TcpLimits {
         max_connections: cli.tcp_max_connections,
         io_timeout: Duration::from_millis(cli.tcp_io_timeout_ms),
+        frame_timeout: Duration::from_millis(cli.tcp_frame_timeout_ms),
+        connection_timeout: Duration::from_millis(cli.tcp_connection_timeout_ms),
     };
     let tcp_public_work_limits = tcp::PublicWorkLimits {
         max_running: cli.inference_max_running,
@@ -326,7 +334,8 @@ pub(crate) async fn run_release_main(cli: Cli) -> Result<StartupExitReport> {
     http_limits.validate()?;
 
     let grpc_addr = parse_address("--listen", &cli.listen)?;
-    let tcp_addr = parse_address("--listen-tcp", &cli.listen_tcp)?;
+    let tcp_addr = public_tcp_address(&cli.listen_tcp, cli.tcp_allow_nonlocal)?;
+    warn_on_public_tcp_exposure(tcp_addr);
     let metrics_addr = parse_address("--metrics-addr", &cli.metrics_addr)?;
     let id = NEXT_RUNTIME_ID.fetch_add(1, Ordering::SeqCst);
     let prepared = PreparedRuntimeCapability {

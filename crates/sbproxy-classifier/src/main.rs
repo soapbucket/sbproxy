@@ -133,9 +133,22 @@ struct Cli {
     /// Maximum simultaneous connections on each TCP listener.
     #[arg(long, default_value_t = tcp::DEFAULT_MAX_CONNECTIONS)]
     tcp_max_connections: usize,
-    /// Per-frame TCP read/write deadline in milliseconds.
+    /// Per-read TCP read/write deadline in milliseconds.
     #[arg(long, default_value_t = 5_000)]
     tcp_io_timeout_ms: u64,
+    /// Whole-frame TCP deadline in milliseconds, covering the length prefix
+    /// and the declared body. Must be at least `--tcp-io-timeout-ms`.
+    #[arg(long, default_value_t = tcp::DEFAULT_FRAME_TIMEOUT.as_millis() as u64)]
+    tcp_frame_timeout_ms: u64,
+    /// Whole-connection TCP deadline in milliseconds, from accept to close.
+    /// Must be at least `--tcp-frame-timeout-ms`.
+    #[arg(long, default_value_t = tcp::DEFAULT_CONNECTION_TIMEOUT.as_millis() as u64)]
+    tcp_connection_timeout_ms: u64,
+    /// Bind `--listen-tcp` to a non-loopback address. The public TCP
+    /// listener has no authentication, no TLS, and takes the tenant id from
+    /// the frame, so binding it off loopback is refused unless this is set.
+    #[arg(long = "tcp-allow-nonlocal")]
+    tcp_allow_nonlocal: bool,
     /// PEM certificate chain for TLS on the gRPC listener.
     #[arg(long = "listen-tls-cert-file")]
     listen_tls_cert_file: Option<PathBuf>,
@@ -204,6 +217,39 @@ async fn bind_required_listeners(
         metrics,
         admin,
     })
+}
+
+/// Resolve `--listen-tcp`, refusing a non-loopback bind unless the operator
+/// asked for one by name.
+///
+/// The public TCP listener authenticates nothing, encrypts nothing, and
+/// takes the `tenant` field verbatim from the frame. Anything that can route
+/// to the port can therefore enumerate registered tenants, classify against
+/// another tenant's label set, and read back that tenant's normalization
+/// output, which is the redaction pipeline operators are told to configure
+/// for PII. `--listen-admin` already fails closed the same way; this closes
+/// the larger of the two holes.
+fn public_tcp_address(value: &str, allow_nonlocal: bool) -> Result<SocketAddr> {
+    let address: SocketAddr = value
+        .parse()
+        .with_context(|| format!("invalid --listen-tcp address {value:?}"))?;
+    if !address.ip().is_loopback() && !allow_nonlocal {
+        anyhow::bail!(
+            "--listen-tcp {address} is not a loopback address; the public TCP listener has no authentication, no TLS, and trusts the tenant id in each frame. Pass --tcp-allow-nonlocal to bind it anyway, behind a network boundary you control."
+        );
+    }
+    Ok(address)
+}
+
+/// Say once, loudly, what a non-loopback public bind exposes.
+fn warn_on_public_tcp_exposure(address: SocketAddr) {
+    if address.ip().is_loopback() {
+        return;
+    }
+    tracing::warn!(
+        listen_tcp = %address,
+        "public TCP listener is bound off loopback with no authentication, no TLS, and a caller-asserted tenant id: anything that can route to this port can enumerate tenants, classify against any registered tenant, and read back its normalized text"
+    );
 }
 
 fn loopback_admin_address(value: Option<&str>) -> Result<Option<SocketAddr>> {
@@ -373,6 +419,38 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    /// `--listen-admin` fails closed off loopback; `--listen-tcp` did not,
+    /// while exposing more: classify, quality scoring, intent and
+    /// content-type detection, streaming safety, and a tenant id taken
+    /// verbatim from the frame, with no authentication and no TLS. A
+    /// non-loopback bind now needs an explicit opt-in.
+    #[test]
+    fn public_tcp_address_refuses_a_non_loopback_bind_without_the_opt_in() {
+        let refusal = public_tcp_address("0.0.0.0:9400", false)
+            .expect_err("an unauthenticated public bind must fail closed");
+        let message = refusal.to_string();
+        assert!(
+            message.contains("--tcp-allow-nonlocal"),
+            "the refusal must name the opt-in flag: {message}"
+        );
+        assert!(
+            message.contains("no authentication"),
+            "the refusal must say what is unprotected: {message}"
+        );
+
+        assert_eq!(
+            public_tcp_address("0.0.0.0:9400", true)
+                .expect("the named opt-in permits a non-loopback bind")
+                .port(),
+            9400
+        );
+        for loopback in ["127.0.0.1:9400", "[::1]:9400"] {
+            public_tcp_address(loopback, false)
+                .unwrap_or_else(|error| panic!("{loopback} must keep working: {error}"));
+        }
+        assert!(public_tcp_address("not-an-address", false).is_err());
+    }
+
     trait AmbiguousIfClone<Marker> {
         fn assert_not_clone() {}
     }
@@ -456,6 +534,9 @@ mod tests {
             inference_deadline_ms: grpc::DEFAULT_DEADLINE_MS,
             tcp_max_connections: tcp::DEFAULT_MAX_CONNECTIONS,
             tcp_io_timeout_ms: 5_000,
+            tcp_frame_timeout_ms: tcp::DEFAULT_FRAME_TIMEOUT.as_millis() as u64,
+            tcp_connection_timeout_ms: tcp::DEFAULT_CONNECTION_TIMEOUT.as_millis() as u64,
+            tcp_allow_nonlocal: false,
             listen_tls_cert_file: None,
             listen_tls_key_file: None,
             listen_tls_client_ca_file: None,
@@ -648,6 +729,8 @@ mod tests {
                 tcp::TcpLimits {
                     max_connections,
                     io_timeout: Duration::from_millis(100),
+                    frame_timeout: tcp::DEFAULT_FRAME_TIMEOUT,
+                    connection_timeout: tcp::DEFAULT_CONNECTION_TIMEOUT,
                 },
                 health::HttpLimits {
                     max_connections: health::DEFAULT_MAX_CONNECTIONS,
@@ -691,6 +774,9 @@ mod tests {
             inference_deadline_ms: grpc::DEFAULT_DEADLINE_MS,
             tcp_max_connections: tcp::DEFAULT_MAX_CONNECTIONS,
             tcp_io_timeout_ms: 5_000,
+            tcp_frame_timeout_ms: tcp::DEFAULT_FRAME_TIMEOUT.as_millis() as u64,
+            tcp_connection_timeout_ms: tcp::DEFAULT_CONNECTION_TIMEOUT.as_millis() as u64,
+            tcp_allow_nonlocal: false,
             listen_tls_cert_file: Some(PathBuf::from("server.pem")),
             listen_tls_key_file: None,
             listen_tls_client_ca_file: None,
@@ -718,6 +804,9 @@ mod tests {
             inference_deadline_ms: grpc::DEFAULT_DEADLINE_MS,
             tcp_max_connections: tcp::DEFAULT_MAX_CONNECTIONS,
             tcp_io_timeout_ms: 5_000,
+            tcp_frame_timeout_ms: tcp::DEFAULT_FRAME_TIMEOUT.as_millis() as u64,
+            tcp_connection_timeout_ms: tcp::DEFAULT_CONNECTION_TIMEOUT.as_millis() as u64,
+            tcp_allow_nonlocal: false,
             listen_tls_cert_file: None,
             listen_tls_key_file: None,
             listen_tls_client_ca_file: None,
@@ -758,6 +847,9 @@ mod tests {
             inference_deadline_ms: grpc::DEFAULT_DEADLINE_MS,
             tcp_max_connections: tcp::DEFAULT_MAX_CONNECTIONS,
             tcp_io_timeout_ms: 5_000,
+            tcp_frame_timeout_ms: tcp::DEFAULT_FRAME_TIMEOUT.as_millis() as u64,
+            tcp_connection_timeout_ms: tcp::DEFAULT_CONNECTION_TIMEOUT.as_millis() as u64,
+            tcp_allow_nonlocal: false,
             listen_tls_cert_file: None,
             listen_tls_key_file: None,
             listen_tls_client_ca_file: None,
@@ -800,6 +892,9 @@ mod tests {
             inference_deadline_ms: grpc::DEFAULT_DEADLINE_MS,
             tcp_max_connections: tcp::DEFAULT_MAX_CONNECTIONS,
             tcp_io_timeout_ms: 5_000,
+            tcp_frame_timeout_ms: tcp::DEFAULT_FRAME_TIMEOUT.as_millis() as u64,
+            tcp_connection_timeout_ms: tcp::DEFAULT_CONNECTION_TIMEOUT.as_millis() as u64,
+            tcp_allow_nonlocal: false,
             listen_tls_cert_file: Some(cert_path),
             listen_tls_key_file: Some(key_path),
             listen_tls_client_ca_file: None,
