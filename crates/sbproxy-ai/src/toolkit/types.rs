@@ -182,6 +182,11 @@ pub struct ToolkitWorkflowInput {
     /// Initial state name.
     pub initial_state: String,
     /// FSM graph.
+    ///
+    /// Deserialized through the FSM's own budgeted path so the state-count,
+    /// edge, and graph-byte ceilings hold for the whole graph. `Vec`'s
+    /// derived impl would apply them per state instead.
+    #[serde(deserialize_with = "crate::agent_orchestration::fsm::deserialize_bounded_states")]
     pub states: Vec<FsmState>,
     /// Maximum transitions.
     pub max_steps: usize,

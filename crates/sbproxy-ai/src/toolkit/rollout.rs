@@ -32,12 +32,19 @@ impl AiToolkitRuntime {
     ) -> Result<PromptSelectionResult, ToolkitError> {
         let scope = request.scope.clone();
         let result = self.select_prompt_inner(request);
-        self.record_operation(
-            scope,
-            "prompt_selection",
-            metric_outcome(&result).as_label(),
-        );
-        record_ai_toolkit_operation(AiToolkitCapability::PromptRollout, metric_outcome(&result));
+        let outcome = metric_outcome(&result);
+        // Selection runs on the live AI request path, once per request, so a
+        // successful row stays out of the bounded operations ring for the
+        // same reason a successful snapshot read does (`snapshot.rs`), plus
+        // one the read paths do not have: taking the process-wide
+        // `operations` mutex per request would serialize the data plane of
+        // every origin that owns a rollout behind one lock and a full scan
+        // of the ring. The counter below still records every selection, so
+        // the rate is not lost; only a refusal is worth a row.
+        if result.is_err() {
+            self.record_operation(scope, "prompt_selection", outcome.as_label());
+        }
+        record_ai_toolkit_operation(AiToolkitCapability::PromptRollout, outcome);
         result
     }
 

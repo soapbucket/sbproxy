@@ -368,6 +368,12 @@ pub enum AiToolkitOutcome {
     /// later. Kept distinct from `Internal` so capacity exhaustion can be
     /// alerted on without paging for internal faults.
     Busy,
+    /// The configured downstream agent failed: it returned a non-success
+    /// status, or the governed hop to it could not complete. Kept distinct
+    /// from `Internal` for the same reason `Busy` is: the HTTP surface
+    /// already answers 502 `agent_operation_failed` here, so a customer's
+    /// broken agent must not page the proxy team.
+    AgentFailed,
     /// An internal failure prevented a closed public outcome.
     Internal,
 }
@@ -385,6 +391,7 @@ impl AiToolkitOutcome {
             Self::BodyTooLarge => "body_too_large",
             Self::ResponseTooLarge => "response_too_large",
             Self::Busy => "busy",
+            Self::AgentFailed => "agent_failed",
             Self::Internal => "internal",
         }
     }
@@ -396,7 +403,7 @@ static AI_TOOLKIT_OPERATIONS: LazyLock<CounterVec> = LazyLock::new(|| {
     register_counter_vec!(
         Opts::new(
             "sbproxy_ai_toolkit_operations_total",
-            "AI toolkit operations by capability (workflow, evaluation, prompt_rollout) and terminal outcome (success, invalid, unauthorized, not_found, egress_refused, timeout, body_too_large, response_too_large, busy, internal)"
+            "AI toolkit operations by capability (workflow, evaluation, prompt_rollout) and terminal outcome (success, invalid, unauthorized, not_found, egress_refused, timeout, body_too_large, response_too_large, busy, agent_failed, internal)"
         ),
         &["capability", "outcome"]
     )

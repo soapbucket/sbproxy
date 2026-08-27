@@ -394,6 +394,59 @@ fn registration_and_retention_are_fallible_and_bounded() {
     ));
 }
 
+/// WOR-2661: the per-scope dataset caps multiply out to exactly the
+/// shipped process totals, so without a share one tenant-scoped operator
+/// consumes 100% of the process budget inside its own limits and every
+/// other tenant's registration is refused until the next config reload.
+/// The operations ring already holds this property
+/// (`retention_is_per_scope_and_a_noisy_tenant_cannot_evict_another`);
+/// the dataset budget is the hole in it.
+#[test]
+fn one_scope_cannot_saturate_the_process_dataset_byte_budget() {
+    let entries = vec![DatasetEntry::with_expected("one", "1")];
+    let dataset_bytes = serde_json::to_vec(&entries).expect("serialize").len();
+    let second_scope = ToolkitScope::new("origin-b", "tenant-b").expect("valid scope");
+
+    let mut input = AiToolkitConfigInput::default();
+    input.allowed_scopes.push(scope());
+    input.allowed_scopes.push(second_scope.clone());
+    input.limits.max_request_bytes = dataset_bytes;
+    // Four datasets fit the process budget; two scopes share it, so
+    // neither is entitled to more than two.
+    input.limits.max_dataset_bytes_total = dataset_bytes * 4;
+    let runtime = AiToolkitRuntime::try_new(input).expect("runtime");
+
+    let register = |scope: ToolkitScope, version: u32| {
+        runtime.register_dataset(DatasetRegistrationRequest {
+            scope,
+            name: format!("answers-{version}"),
+            version,
+            entries: entries.clone(),
+        })
+    };
+
+    for version in 1..=2 {
+        register(scope(), version).expect("a scope may fill its own share");
+    }
+    let error = register(scope(), 3).expect_err("a scope may not exceed its own share");
+    assert!(
+        matches!(
+            error,
+            ToolkitError::LimitExceeded {
+                resource: "dataset_bytes_scope",
+                ..
+            }
+        ),
+        "expected the per-scope share to refuse, got {error:?}"
+    );
+
+    // The point of the share: the other tenant's budget is untouched.
+    for version in 1..=2 {
+        register(second_scope.clone(), version)
+            .expect("one scope's traffic must not consume another scope's budget");
+    }
+}
+
 #[test]
 fn dataset_scope_inventory_rejects_unknown_seed_and_registration_without_mutation() {
     let unknown_scope = ToolkitScope::new("origin-b", "tenant-b").expect("valid unknown scope");
@@ -1001,6 +1054,63 @@ fn failed_toolkit_reads_are_still_retained() {
     );
 }
 
+/// WOR-2661: `select_prompt` is the one toolkit entry point driven by
+/// request volume rather than by operator polling, so a successful
+/// selection stays out of the ring. Without this the scope's
+/// `agent_workflow`, `dataset_registration`, and `offline_evaluation`
+/// history is evicted by data-plane traffic, and every AI request on
+/// every origin that owns a rollout serializes on one mutex.
+#[test]
+fn successful_prompt_selection_stays_out_of_the_bounded_operations_ring() {
+    let mut input = AiToolkitConfigInput::default();
+    input.allowed_scopes.push(scope());
+    input.prompt_rollouts.push(PromptRolloutInput {
+        scope: scope(),
+        name: "system".into(),
+        salt: "stable-salt".into(),
+        versions: vec![
+            WeightedPromptVersion::new("system", 1, "first", 1.0).expect("valid version"),
+            WeightedPromptVersion::new("system", 2, "second", 1.0).expect("valid version"),
+        ],
+    });
+    let runtime = AiToolkitRuntime::try_new(input).expect("runtime");
+
+    for index in 0..8 {
+        runtime
+            .select_prompt(PromptSelectionRequest {
+                scope: scope(),
+                name: "system".into(),
+                cohort: format!("cohort-{index}"),
+            })
+            .expect("selection succeeds for the configured rollout");
+    }
+    assert!(
+        runtime.operations.lock().is_empty(),
+        "a successful live selection must not retain a row"
+    );
+
+    // The other half of the bargain: a refusal is still worth a row, so
+    // the assertion above cannot pass merely because the recorder became
+    // unreachable from this path.
+    runtime
+        .select_prompt(PromptSelectionRequest {
+            scope: scope(),
+            name: "absent".into(),
+            cohort: "cohort".into(),
+        })
+        .expect_err("no rollout is configured under that name");
+    let operations = runtime.operations.lock();
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|(candidate, row)| candidate == &scope()
+                && row.operation == "prompt_selection")
+            .count(),
+        1,
+        "a refused selection is still worth a row"
+    );
+}
+
 #[test]
 fn invalid_deserialized_scope_is_never_retained() {
     let runtime = AiToolkitRuntime::try_new(AiToolkitConfigInput::default()).expect("runtime");
@@ -1302,6 +1412,65 @@ async fn absolute_deadline_releases_the_only_workflow_permit_for_recovery() {
     server.await.expect("server task");
 }
 
+/// WOR-2661: `ToolkitWorkflowInput` is the body of
+/// `POST /admin/ai-toolkit/workflows/validate`. `Vec<FsmState>`'s derived
+/// impl never reaches `StatesVisitor`, the only place `MAX_FSM_STATES` is
+/// enforced, and it restarts the graph-byte and edge budget per element,
+/// so the ceilings the ~400 lines of `DeserializeSeed` machinery exist to
+/// hold were absent on the one production surface that parses a bare
+/// state list.
+#[test]
+fn workflow_input_states_are_refused_by_the_budgeted_deserializer() {
+    let workflow = |states: serde_json::Value| {
+        json!({
+            "scope": {"origin_id": "origin-a", "tenant_id": "tenant-a"},
+            "name": "flow",
+            "initial_state": "state-0",
+            "states": states,
+            "max_steps": 1,
+            "timeout_ms": 1_000,
+        })
+    };
+
+    // The state count: 300 states is past MAX_FSM_STATES = 256.
+    let many_states: Vec<serde_json::Value> = (0..300)
+        .map(|index| {
+            json!({
+                "name": format!("state-{index}"),
+                "action": "answer",
+                "transitions": {},
+            })
+        })
+        .collect();
+    let error = serde_json::from_value::<ToolkitWorkflowInput>(workflow(json!(many_states)))
+        .expect_err("300 states is past the FSM state ceiling");
+    assert!(
+        error.to_string().contains("states limit exceeded"),
+        "expected the state ceiling to refuse at parse time, got: {error}"
+    );
+
+    // The edge budget: 8 states x 300 edges is 2,400 edges, past
+    // MAX_FSM_EDGES = 2,048 for the graph but well inside it per state.
+    let wide_states: Vec<serde_json::Value> = (0..8)
+        .map(|state| {
+            let transitions: serde_json::Map<String, serde_json::Value> = (0..300)
+                .map(|edge| (format!("outcome-{edge}"), json!("state-0")))
+                .collect();
+            json!({
+                "name": format!("state-{state}"),
+                "action": "answer",
+                "transitions": transitions,
+            })
+        })
+        .collect();
+    let error = serde_json::from_value::<ToolkitWorkflowInput>(workflow(json!(wide_states)))
+        .expect_err("2,400 edges is past the FSM edge ceiling for the graph");
+    assert!(
+        error.to_string().contains("edges limit exceeded"),
+        "expected one budget for the whole graph, not one per state, got: {error}"
+    );
+}
+
 #[test]
 fn busy_maps_to_its_own_closed_outcome_not_internal() {
     // A concurrency-admission refusal is capacity signal, not an internal
@@ -1315,5 +1484,49 @@ fn busy_maps_to_its_own_closed_outcome_not_internal() {
     assert_eq!(
         error_metric_outcome(&ToolkitError::InvalidAgentResponse).as_label(),
         "invalid"
+    );
+}
+
+/// WOR-2661: the agent-fault family is the same defect `Busy` had. The
+/// admin surface answers 502 `agent_operation_failed` for every error
+/// below, so a more specific outcome is provably safe to expose; labelling
+/// them `internal` pages the proxy team for a customer's broken agent and
+/// hides the 502 rate from both the metric and the SIEM feed.
+#[test]
+fn agent_faults_map_to_their_own_closed_outcome_not_internal() {
+    for error in [
+        ToolkitError::AgentRejected { status: 503 },
+        ToolkitError::GovernedEgress {
+            reason: "transport_error",
+        },
+        ToolkitError::GovernedEgress {
+            reason: "client_build_failed",
+        },
+        ToolkitError::GovernedEgress {
+            reason: "not_replayable",
+        },
+    ] {
+        assert_eq!(
+            error_metric_outcome(&error).as_label(),
+            "agent_failed",
+            "{error:?} is a downstream agent fault, not a proxy fault"
+        );
+    }
+
+    // The two governed-egress reasons that already had closed outcomes
+    // keep them, so the new arm cannot have swallowed the family.
+    assert_eq!(
+        error_metric_outcome(&ToolkitError::GovernedEgress {
+            reason: "egress_denied",
+        })
+        .as_label(),
+        "egress_refused"
+    );
+    assert_eq!(
+        error_metric_outcome(&ToolkitError::GovernedEgress {
+            reason: "response_too_large",
+        })
+        .as_label(),
+        "response_too_large"
     );
 }

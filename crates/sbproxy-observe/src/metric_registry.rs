@@ -1049,7 +1049,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["capability", "outcome"],
-        description: "AI toolkit operations by capability (workflow, evaluation, prompt_rollout) and terminal outcome (success, invalid, unauthorized, not_found, egress_refused, timeout, body_too_large, response_too_large, busy, internal).",
+        description: "AI toolkit operations by capability (workflow, evaluation, prompt_rollout) and terminal outcome (success, invalid, unauthorized, not_found, egress_refused, timeout, body_too_large, response_too_large, busy, agent_failed, internal).",
         dead_reason: None,
     },
     // Rich classifier sidecar metrics. These use the Prometheus default

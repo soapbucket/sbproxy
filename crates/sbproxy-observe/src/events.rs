@@ -222,6 +222,12 @@ pub enum AiToolkitEventOutcome {
     ResponseTooLarge,
     /// Concurrency admission refused the operation; retry later.
     Busy,
+    /// The configured downstream agent failed: a non-success status, or a
+    /// governed hop to it that could not complete. Distinct from
+    /// `Internal` because the HTTP surface already exposes it as 502
+    /// `agent_operation_failed`, so a tenant's broken agent is not a
+    /// proxy fault on the SIEM feed.
+    AgentFailed,
     /// Any failure that is not safe to expose as a more specific outcome.
     Internal,
 }
@@ -239,6 +245,7 @@ impl AiToolkitEventOutcome {
             Self::BodyTooLarge => "body_too_large",
             Self::ResponseTooLarge => "response_too_large",
             Self::Busy => "busy",
+            Self::AgentFailed => "agent_failed",
             Self::Internal => "internal",
         }
     }
@@ -1165,6 +1172,8 @@ mod tests {
                 AiToolkitEventOutcome::ResponseTooLarge,
                 "response_too_large",
             ),
+            (AiToolkitEventOutcome::Busy, "busy"),
+            (AiToolkitEventOutcome::AgentFailed, "agent_failed"),
             (AiToolkitEventOutcome::Internal, "internal"),
         ];
         for (outcome, expected) in outcomes {

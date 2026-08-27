@@ -395,6 +395,27 @@ where
     })
 }
 
+/// Deserialize a state list through the budgeted seed.
+///
+/// `Vec<FsmState>`'s derived impl never reaches [`StatesVisitor`], which is
+/// the only place `MAX_FSM_STATES` is enforced, and it calls
+/// `FsmState::deserialize` per element, which starts a fresh budget each
+/// time and so turns the graph-byte and edge ceilings into per-state ones.
+/// Any request type carrying a bare state list wants
+/// `#[serde(deserialize_with = "...deserialize_bounded_states")]` so the
+/// refusal happens at parse time instead of after the whole body has been
+/// materialized.
+pub fn deserialize_bounded_states<'de, D>(deserializer: D) -> Result<Vec<FsmState>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let mut budget = DeserializationBudget::default();
+    StatesSeed {
+        budget: &mut budget,
+    }
+    .deserialize(deserializer)
+}
+
 struct StatesSeed<'a> {
     budget: &'a mut DeserializationBudget,
 }

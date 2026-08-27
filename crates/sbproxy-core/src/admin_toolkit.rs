@@ -373,6 +373,7 @@ fn event_outcome(
         AiToolkitOutcome::BodyTooLarge => EventOutcome::BodyTooLarge,
         AiToolkitOutcome::ResponseTooLarge => EventOutcome::ResponseTooLarge,
         AiToolkitOutcome::Busy => EventOutcome::Busy,
+        AiToolkitOutcome::AgentFailed => EventOutcome::AgentFailed,
         AiToolkitOutcome::Internal => EventOutcome::Internal,
     }
 }

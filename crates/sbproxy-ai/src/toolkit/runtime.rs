@@ -43,6 +43,15 @@ pub fn error_metric_outcome(error: &ToolkitError) -> AiToolkitOutcome {
         ToolkitError::GovernedEgress {
             reason: "response_too_large",
         } => AiToolkitOutcome::ResponseTooLarge,
+        // The agent-fault family. The admin surface already answers 502
+        // `agent_operation_failed` for every one of these, so a more
+        // specific outcome is provably safe to expose; folding them into
+        // `Internal` pages the proxy team for a customer's broken agent
+        // and hides the 502 rate from the metric and the SIEM feed alike.
+        ToolkitError::GovernedEgress {
+            reason: "transport_error" | "client_build_failed" | "not_replayable",
+        }
+        | ToolkitError::AgentRejected { .. } => AiToolkitOutcome::AgentFailed,
         ToolkitError::LimitExceeded { resource, .. }
             if resource.contains("response") || resource.contains("output") =>
         {
@@ -95,6 +104,10 @@ pub(crate) struct ScopeRollouts {
 pub(crate) struct DatasetRegistry {
     pub(crate) versions: HashMap<(ToolkitScope, String, u32), Dataset>,
     pub(crate) retained_bytes: usize,
+    /// Serialized entry bytes retained per scope. The process total above
+    /// is a ceiling for the deployment; this is what keeps one scope from
+    /// being the whole of it.
+    pub(crate) scope_bytes: HashMap<ToolkitScope, usize>,
 }
 
 /// Live bounded facade for governed orchestration, offline evaluation, and rollout selection.
@@ -195,6 +208,7 @@ impl AiToolkitRuntime {
         let mut datasets = DatasetRegistry {
             versions: HashMap::with_capacity(input.datasets.len()),
             retained_bytes: 0,
+            scope_bytes: HashMap::new(),
         };
         for configured in input.datasets {
             let dataset_bytes = ensure_serialized(
@@ -214,6 +228,12 @@ impl AiToolkitRuntime {
                 dataset_bytes,
                 limits.max_dataset_bytes_total,
             )?;
+            // Config-seeded rows are operator-authored and already refused
+            // at `validate_config`; they are accounted per scope here so a
+            // later admin registration measures the share it is really
+            // left with rather than an empty one.
+            let scope_bytes = datasets.scope_bytes.entry(configured.scope.clone()).or_insert(0);
+            *scope_bytes = scope_bytes.saturating_add(dataset_bytes);
             let key = (
                 configured.scope,
                 configured.dataset.name.clone(),
@@ -422,6 +442,34 @@ impl AiToolkitRuntime {
             1,
             self.limits.max_dataset_versions,
         )?;
+        // The per-scope caps above multiply out to exactly the shipped
+        // process totals, so on their own they let one tenant hold 100% of
+        // both and refuse every other tenant's registration until the next
+        // config reload. This is that tenant's share of the process budget,
+        // and its own ceiling well before the process one.
+        let (scope_bytes_ceiling, scope_versions_ceiling) = self.scope_dataset_share();
+        let scope_versions = datasets
+            .versions
+            .keys()
+            .filter(|(scope, _, _)| scope == &request.scope)
+            .count();
+        checked_bounded_add(
+            "dataset_versions_scope",
+            scope_versions,
+            1,
+            scope_versions_ceiling,
+        )?;
+        let scope_bytes = datasets
+            .scope_bytes
+            .get(&request.scope)
+            .copied()
+            .unwrap_or(0);
+        let next_scope_bytes = checked_bounded_add(
+            "dataset_bytes_scope",
+            scope_bytes,
+            dataset_bytes,
+            scope_bytes_ceiling,
+        )?;
         let next_version_count = checked_bounded_add(
             "dataset_versions_total",
             datasets.versions.len(),
@@ -438,11 +486,35 @@ impl AiToolkitRuntime {
         debug_assert!(previous.is_none());
         debug_assert_eq!(datasets.versions.len(), next_version_count);
         datasets.retained_bytes = next_retained_bytes;
+        datasets
+            .scope_bytes
+            .insert(request.scope.clone(), next_scope_bytes);
         Ok(DatasetRegistrationResult {
             name: request.name,
             version: request.version,
             entries,
         })
+    }
+
+    /// One scope's share of the process-wide dataset budgets, in bytes and
+    /// in versions.
+    ///
+    /// No configuration key is introduced. The share is the existing total
+    /// divided by the number of scopes this generation admits, so a
+    /// single-origin deployment still gets the whole budget and a
+    /// multi-tenant one gets the isolation the operations ring already has
+    /// (`retain_scoped_row`). The byte share is floored at one maximum
+    /// request so a scope can always register at least one dataset, and
+    /// neither share can exceed its process total.
+    pub(crate) fn scope_dataset_share(&self) -> (usize, usize) {
+        let scopes = self.allowed_scopes.len().max(1);
+        let bytes = (self.limits.max_dataset_bytes_total / scopes)
+            .max(self.limits.max_request_bytes)
+            .min(self.limits.max_dataset_bytes_total);
+        let versions = (self.limits.max_dataset_versions_total / scopes)
+            .max(1)
+            .min(self.limits.max_dataset_versions_total);
+        (bytes, versions)
     }
 
     pub(crate) fn record_operation(
