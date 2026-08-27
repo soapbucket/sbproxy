@@ -97,6 +97,24 @@ const NO_FINISH_REASON: &str = "none";
 /// The shadow-eval section of `docs/ai-gateway.md` enumerates the same
 /// set, because a dashboard has to be written against the whole
 /// vocabulary rather than against whichever keys one sample produced.
+///
+/// This is the fourth place the shadow drop vocabulary is written down,
+/// and none of the four is maintained by hand any more. The other three
+/// are bound to this one:
+///
+/// - The dispatch outcome's `pair_drop_reason` mapping in `client.rs`
+///   is an exhaustive match onto these variants, so a new outcome has
+///   to be classified here to compile.
+/// - `ALL_PAIR_DROP_REASONS` is walked against the variant chain at
+///   compile time, so a new variant that is not enumerated fails const
+///   evaluation rather than shipping unlisted.
+/// - `the_page_enumerates_the_whole_drop_vocabulary` reads the
+///   enumeration out of `docs/ai-gateway.md` and requires it to be this
+///   list, in this order, so the prose copy cannot drift either.
+/// - `the_two_shadow_vocabularies_agree_where_they_overlap` requires
+///   every `ShadowDropReason` that also names a pair drop to spell it
+///   identically, so the metric label and the JSON key stay one word
+///   for one thing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PairDropReason {
     /// The request's single sampling draw did not select this target.
@@ -154,7 +172,78 @@ impl PairDropReason {
             Self::NotReported => "not_reported",
         }
     }
+
+    /// The variant that follows this one in `ALL_PAIR_DROP_REASONS`, or
+    /// `None` for the last.
+    ///
+    /// This exists only so the array's contents are enforced rather
+    /// than asserted in prose. The match is exhaustive, so a new
+    /// variant cannot compile without joining the chain, and joining
+    /// the chain is what makes the const walk below index one slot past
+    /// the array unless the author enumerates it too.
+    const fn next_in_report_order(self) -> Option<Self> {
+        match self {
+            Self::SampledOut => Some(Self::ProviderNotFound),
+            Self::ProviderNotFound => Some(Self::ProviderNotAllowed),
+            Self::ProviderNotAllowed => Some(Self::PromptTrainingDisallowed),
+            Self::PromptTrainingDisallowed => Some(Self::EgressDenied),
+            Self::EgressDenied => Some(Self::Saturated),
+            Self::Saturated => Some(Self::QuotaDenied),
+            Self::QuotaDenied => Some(Self::ShadowTimeout),
+            Self::ShadowTimeout => Some(Self::ShadowError),
+            Self::ShadowError => Some(Self::PrimaryMissing),
+            Self::PrimaryMissing => Some(Self::NotReported),
+            Self::NotReported => None,
+        }
+    }
 }
+
+/// Every [`PairDropReason`], in the order `docs/ai-gateway.md`
+/// enumerates them.
+///
+/// Deliberately not `pub`: nothing outside this crate needs the list,
+/// and the report's consumer reads the JSON rather than the Rust. It is
+/// the fixture the two vocabulary tests below walk, which is what turns
+/// the page's enumeration and the metric family's label set from
+/// hand-maintained copies into checked ones.
+const ALL_PAIR_DROP_REASONS: [PairDropReason; 11] = [
+    PairDropReason::SampledOut,
+    PairDropReason::ProviderNotFound,
+    PairDropReason::ProviderNotAllowed,
+    PairDropReason::PromptTrainingDisallowed,
+    PairDropReason::EgressDenied,
+    PairDropReason::Saturated,
+    PairDropReason::QuotaDenied,
+    PairDropReason::ShadowTimeout,
+    PairDropReason::ShadowError,
+    PairDropReason::PrimaryMissing,
+    PairDropReason::NotReported,
+];
+
+// Walks the variant chain against the array at compile time, the same
+// arrangement `ai_metrics` uses for its own drop-reason label array
+// beside `next_in_label_order`. A twelfth
+// variant makes `next_in_report_order` non-exhaustive, and the arm its
+// author has to add puts a twelfth link in the chain, which indexes one
+// slot past an eleven-element array and fails const evaluation. Written
+// as a walk rather than as a length assertion because a length written
+// out beside the array is a copy of the array, not a check on it.
+const _: () = {
+    let mut index = 0usize;
+    let mut current = Some(PairDropReason::SampledOut);
+    while let Some(reason) = current {
+        assert!(
+            ALL_PAIR_DROP_REASONS[index] as u8 == reason as u8,
+            "ALL_PAIR_DROP_REASONS is out of order with the variant chain"
+        );
+        index += 1;
+        current = reason.next_in_report_order();
+    }
+    assert!(
+        index == ALL_PAIR_DROP_REASONS.len(),
+        "ALL_PAIR_DROP_REASONS has an entry no variant claims"
+    );
+};
 
 /// Where a retained shadow response goes.
 ///
@@ -1453,5 +1542,89 @@ mod tests {
             "no sink means the target's body is never kept"
         );
         assert!(context.pair_key().is_none());
+    }
+
+    /// The page's copy of the drop vocabulary is checked, not trusted.
+    ///
+    /// `pairs_dropped` is a closed key set an operator writes a
+    /// dashboard against, so the enumeration in `docs/ai-gateway.md` is
+    /// part of the contract rather than a description of it. Adding a
+    /// variant and forgetting the page would publish a key no dashboard
+    /// was told about; deleting one from the page would tell an
+    /// operator a key that still ships does not exist. This is the same
+    /// gap `ALL_SHADOW_DROP_REASONS`'s rustdoc names as the thing its
+    /// const walk cannot see, closed here for this vocabulary.
+    #[test]
+    fn the_page_enumerates_the_whole_drop_vocabulary() {
+        const PAGE: &str = include_str!("../../../docs/ai-gateway.md");
+        const OPENER: &str = "The `pairs_dropped` key set is closed, and it is this:";
+
+        let sentence = PAGE
+            .lines()
+            .find_map(|line| line.trim_start().strip_prefix(OPENER))
+            .expect("docs/ai-gateway.md still enumerates the pairs_dropped key set");
+        let listed: Vec<&str> = sentence
+            .split_once(". A key is absent")
+            .expect("the enumeration still ends where the reading note begins")
+            .0
+            .split(", ")
+            .map(|key| key.trim().trim_matches('`'))
+            .collect();
+        let shipped: Vec<&str> = ALL_PAIR_DROP_REASONS
+            .iter()
+            .map(|reason| reason.as_str())
+            .collect();
+
+        assert_eq!(
+            listed, shipped,
+            "docs/ai-gateway.md enumerates a different pairs_dropped key set, in a \
+             different order, than PairDropReason ships"
+        );
+    }
+
+    /// The metric label and the JSON key are one word for one thing.
+    ///
+    /// `sbproxy_ai_shadow_dropped_total`'s `reason` label and
+    /// `pairs_dropped`'s keys are separate vocabularies on purpose, and
+    /// the page says so, but five of the metric's six names are also
+    /// pair drops. An operator who pivots from the counter to the
+    /// report joins on those spellings,
+    /// so they cannot be allowed to drift apart. The match is
+    /// exhaustive over the metric enum, so a seventh drop reason has to
+    /// be classified here as either shared or route-level.
+    #[test]
+    fn the_two_shadow_vocabularies_agree_where_they_overlap() {
+        use crate::ai_metrics::{ShadowDropReason, ALL_SHADOW_DROP_REASONS};
+
+        for metric in ALL_SHADOW_DROP_REASONS {
+            let paired = match metric {
+                // Route-level: `prepare_shadows` refuses before any leg
+                // exists, so no pair is ever opened to drop.
+                ShadowDropReason::Streaming => None,
+                ShadowDropReason::ProviderNotFound => Some(PairDropReason::ProviderNotFound),
+                ShadowDropReason::ProviderNotAllowed => Some(PairDropReason::ProviderNotAllowed),
+                ShadowDropReason::PromptTrainingDisallowed => {
+                    Some(PairDropReason::PromptTrainingDisallowed)
+                }
+                ShadowDropReason::EgressDenied => Some(PairDropReason::EgressDenied),
+                ShadowDropReason::Saturated => Some(PairDropReason::Saturated),
+            };
+            let Some(paired) = paired else {
+                assert!(
+                    !ALL_PAIR_DROP_REASONS
+                        .iter()
+                        .any(|reason| reason.as_str() == metric.as_str()),
+                    "{} is documented as route-level and must not also be a pairs_dropped key",
+                    metric.as_str()
+                );
+                continue;
+            };
+            assert_eq!(
+                metric.as_str(),
+                paired.as_str(),
+                "the metric label and the pairs_dropped key for the same refusal have \
+                 drifted apart"
+            );
+        }
     }
 }
