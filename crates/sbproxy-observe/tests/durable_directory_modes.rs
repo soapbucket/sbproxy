@@ -42,8 +42,15 @@ struct PinnedUmask(libc::mode_t);
 impl PinnedUmask {
     fn at_022() -> Self {
         // SAFETY: `umask` cannot fail and returns the previous value.
-        // Each integration test file is its own binary and this is the
-        // only test in it, so there is no other thread to race.
+        // It is process-wide state, so what makes this sound is not an
+        // absence of other tests but that the previous value is restored
+        // on drop, panic included, and that no other test in this binary
+        // reads or depends on the umask: the two rotation tests seed
+        // every fixture with an explicit `set_permissions`, which
+        // `fchmod` applies unmasked. nextest runs a process per test as
+        // well, so in the default configuration there is no concurrent
+        // reader at all; that is a second line of defense rather than
+        // the argument.
         Self(unsafe { libc::umask(0o022) })
     }
 }
@@ -151,4 +158,65 @@ fn rotated_backups_left_by_an_older_build_are_tightened() {
             mode_of(&backup)
         );
     }
+}
+
+/// An operator who turns compression on after upgrading leaves plain
+/// `.N` backups behind that the rotation loop never touches again
+/// (WOR-2606).
+///
+/// Nothing renames them, because the loop only shifts names in the
+/// configured mode, and nothing deletes them for the same reason. Under
+/// a sweep that followed the setting they stayed at whatever mode the
+/// old build left them at, holding the same request records as the
+/// `.gz` files beside them. Red without the two-suffix sweep: the two
+/// seeded plain backups stay `0o644`.
+#[test]
+fn plain_backups_are_tightened_after_compression_is_turned_on() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let log = dir.path().join("access.log");
+
+    // What the pre-upgrade build left behind, uncompressed.
+    for idx in [1usize, 2] {
+        let backup = dir.path().join(format!("access.log.{idx}"));
+        std::fs::write(&backup, b"{\"path\":\"/v1/orders\"}\n").expect("seed a plain backup");
+        std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o644))
+            .expect("loosen the backup");
+    }
+
+    // The operator flips `compress: true`. Rotation now writes `.1.gz`
+    // and shifts only the `.gz` names.
+    entry().emit_to_file(&log, 1, 5, true).expect("first write");
+    entry()
+        .emit_to_file(&log, 1, 5, true)
+        .expect("rotating write");
+
+    for idx in [1usize, 2] {
+        let backup = dir.path().join(format!("access.log.{idx}"));
+        assert!(
+            backup.exists(),
+            "the plain backup {} must still be there: nothing in the compressed \
+             rotation path removes it, which is the whole point",
+            backup.display()
+        );
+        assert_eq!(
+            mode_of(&backup),
+            0o600,
+            "the plain backup {} is {:o}: the sweep followed the configured \
+             compression mode and never looked at it",
+            backup.display(),
+            mode_of(&backup)
+        );
+    }
+
+    let compressed = dir.path().join("access.log.1.gz");
+    assert!(
+        compressed.exists(),
+        "the compressed rotation must have produced {}",
+        compressed.display()
+    );
+    assert_eq!(
+        mode_of(&compressed),
+        0o600,
+        "the compressed backup must stay owner-only"
+    );
 }

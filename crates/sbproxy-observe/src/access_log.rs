@@ -601,7 +601,7 @@ fn rotate_access_log(path: &Path, max_backups: usize, compress: bool) -> anyhow:
         }
     }
     if !path.exists() {
-        tighten_rotated_backups(path, max_backups, compress);
+        tighten_rotated_backups(path, max_backups);
         return Ok(());
     }
     if compress {
@@ -610,7 +610,7 @@ fn rotate_access_log(path: &Path, max_backups: usize, compress: bool) -> anyhow:
     } else {
         std::fs::rename(path, rotated_path(path, 1, false))?;
     }
-    tighten_rotated_backups(path, max_backups, compress);
+    tighten_rotated_backups(path, max_backups);
     Ok(())
 }
 
@@ -631,16 +631,29 @@ fn rotate_access_log(path: &Path, max_backups: usize, compress: bool) -> anyhow:
 /// permission bits, or one another account owns, must not stop the
 /// rotation that is keeping the live log bounded. Each failure is
 /// warned about by name so the gap is visible rather than silent.
-fn tighten_rotated_backups(path: &Path, max_backups: usize, compress: bool) {
+///
+/// Both suffixes are visited, not just the configured one. An operator
+/// who flips `compress: false` to `true` after upgrading leaves
+/// `access.log.1..N` behind as plain files: the rotation loop only ever
+/// shifts names in the current mode, so nothing renames them, nothing
+/// deletes them, and a sweep that followed the setting would never look
+/// at them either. They hold the same request records as the `.gz`
+/// files beside them. Same in reverse. `tighten_existing_owner_only`
+/// treats a missing file as success, so the extra call per index costs
+/// one `open(2)` that fails with `ENOENT` in the ordinary case.
+fn tighten_rotated_backups(path: &Path, max_backups: usize) {
     for idx in 1..=max_backups {
-        let backup = rotated_path(path, idx, compress);
-        if let Err(error) = sbproxy_util::secure_fs::tighten_existing_owner_only(&backup) {
-            tracing::warn!(
-                path = %backup.display(),
-                error = %error,
-                "access log: a rotated backup could not be made owner-only; it holds the same \
-                 request records as the live log. See https://sbproxy.dev/docs/access-log"
-            );
+        for compressed in [false, true] {
+            let backup = rotated_path(path, idx, compressed);
+            if let Err(error) = sbproxy_util::secure_fs::tighten_existing_owner_only(&backup) {
+                tracing::warn!(
+                    path = %backup.display(),
+                    error = %error,
+                    "access log: a rotated backup could not be made owner-only; it holds the \
+                     same request records as the live log. See \
+                     https://sbproxy.dev/docs/access-log"
+                );
+            }
         }
     }
 }
