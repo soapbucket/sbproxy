@@ -1211,7 +1211,7 @@ flowchart TD
 
 **What does not, and the gap that leaves.** A bare HTTP/1 half-close does not cancel. RFC 9112 section 9.6 lets a client shut down its write side and go on reading the response, and on the wire that polite half-close is byte-for-byte identical to a client that walked away: both are one FIN, and nothing distinguishes them without writing to the socket. Cancelling on it would abort live callers, so the gateway treats it as "this client has finished sending" and carries on.
 
-The residual is worth stating plainly rather than hiding behind the guarantee: **a client that half-closes its write side and then silently vanishes keeps its generation running until a write to it fails.** For an HTTP/1 client that simply closes its socket while waiting, that is what happens, and the disconnect is caught at the response write instead of during the generation. That request's receipt is not `client_disconnected`. The relay's write failure is not attributed to the caller today, so the call prices as `delivered` when a 200 header was already committed and `origin_5xx` when it was not. Attributing those write errors downstream is a planned follow-up, and it has to reach the streaming relay too. What the gateway will not do is guess, because the guess it would have to make cannot be made from a FIN.
+The residual is worth stating plainly rather than hiding behind the guarantee: **a client that half-closes its write side and then silently vanishes keeps its generation running until a write to it fails.** For an HTTP/1 client that simply closes its socket while waiting, that is what happens, and the disconnect is caught at the response write instead of during the generation. What that write failure prices as depends on which relay caught it. A streamed response attributes it to the caller: the receipt reads `client_disconnected` and carries the usage the stream had received before the write failed. A non-streaming response does not yet, so it prices as `delivered` when a 200 header was already committed and `origin_5xx` when it was not. Attributing the buffered relay's write errors downstream the same way is the remaining half of that work. What the gateway will not do is guess, because the guess it would have to make cannot be made from a FIN.
 
 **The opt-in, where a half-close really does mean gone.** If you know your callers never half-close after sending, set `cancel_on_half_close: true` on the `ai_proxy` action and the FIN is read as the departure it usually is:
 
@@ -1230,7 +1230,7 @@ That is what makes the ordinary HTTP/1 abandonment reachable: a caller whose own
 
 Enable it only on that knowledge, because the cost of being wrong is paid by a live caller: a client that half-closes and is still reading has its request cancelled and receives an error instead of the completion it was waiting for. Plain HTTP client libraries do not half-close; hand-rolled tools, some load generators, and a fronting proxy configured to shut the request side down do. The scope is the origin, so it applies to every caller and tenant routed to that action, and it changes exactly one answer: a reset, a read error, an `RST_STREAM` and a `GOAWAY` all cancel with the flag off, and a client that keeps its connection whole is never cancelled with it on. There is still no timer.
 
-**Scope.** The wait for the provider's response header on the sequential non-streaming dispatch path. A streaming response already learns the caller left, from its own per-chunk write failing, and the upstream body is dropped there on the way out. A hedged (`strategy: race`) dispatch and a confidence `cascade` resolve on their own paths and are not watched. A caller who leaves after the response header has arrived is past the window; the generation is already paid for.
+**Scope.** The wait for the provider's response header on the sequential non-streaming dispatch path. A streaming response learns the caller left from its own per-chunk write failing: it drops the upstream body there, prices the receipt as `client_disconnected`, and settles the usage it received before the write failed. See [what a stream is billed](#what-a-stream-is-billed). A hedged (`strategy: race`) dispatch and a confidence `cascade` resolve on their own paths and are not watched. A caller who leaves after the response header has arrived is past the window; the generation is already paid for.
 
 **Watching a request never changes how it is billed.** The watch reads the downstream connection without recording anything about it, so a request that was not cancelled is priced exactly as it was before this existed. That matters more than it sounds: the receipt classifier treats a recorded half-close plus a failed delivery as a client disconnect, so a watch that recorded what it saw would have turned provider outages into partially billable client departures on signed documents.
 
@@ -3846,7 +3846,7 @@ The proxy supports streaming responses. When your client sends a streaming reque
 2. Picks a provider using the configured routing strategy.
 3. Opens a streaming connection to the provider.
 4. Forwards SSE chunks to the client as they arrive.
-5. Reads token usage from the final chunk and records it to the metrics counters.
+5. Settles the stream once it ends, however it ends. Token usage, budgets, reservations, the receipt, the access log and the usage sinks all come from one finalizer; see [what a stream is billed](#what-a-stream-is-billed).
 
 No special configuration is needed. Streaming works with all routing strategies and all providers.
 
@@ -3864,7 +3864,7 @@ Different providers report streaming token counts in different SSE shapes. The s
 | `ollama` | NDJSON: `{..., "done": true, "prompt_eval_count": N, "eval_count": M}\n` | Line-delimited JSON instead of SSE |
 | `generic` | Best-effort across all of the above | Default fallback when `auto` cannot match a known upstream |
 | `auto` | Resolved at request time | See order below |
-| `none` | Skip parsing | Disables streaming budget recording for this origin |
+| `none` | Skip parsing | Ignores the provider's own usage frame for this origin. The tokenizer fallback still runs, so the origin is billed from an estimate rather than from nothing |
 
 `auto` resolves in this order:
 
@@ -3874,6 +3874,25 @@ Different providers report streaming token counts in different SSE shapes. The s
 4. Fall back to `generic`.
 
 Unknown values warn once and fall back to `generic` so a typo never silently disables budget recording.
+
+### What a stream is billed
+
+Every way a stream can end goes through one settlement: a clean close, an upstream truncation or error, an output guardrail or stream-safety cut, and a client that hangs up mid-response. That settlement decides one set of numbers, and the budget caps, the receipt, the access log, the usage sinks, the verifiable ledger and the payment bridge all read that same set.
+
+**Where the numbers come from,** in order:
+
+1. The provider's own `usage` frame, when the stream carried one. That is the measured answer, and it is the one the billing event records.
+2. Otherwise the tokens this gateway counted for itself: the assistant text the stream actually delivered, run through the model's tokenizer, plus the prompt estimate computed on the request path. `sbproxy_ai_usage_parse_miss_total{provider, surface}` ticks every time a stream takes this branch.
+3. Otherwise nothing. A stream that carried no usage frame and delivered no assistant text has nothing to price, and its reservations are refunded in full.
+
+The fallback exists because most providers leave usage out of a stream. OpenAI and Azure OpenAI omit it unless the caller asks for `stream_options.include_usage`, and this gateway does not add that option to your request. Without a fallback, a caller could stream indefinitely against a token cap that never moved.
+
+**Estimated and measured are not the same thing, and are not reported as the same thing.** An estimated stream debits your budget caps, settles its rate-limit and governance reservations, and reports its token counts, but it prices no cost: a figure the provider never reported is not one this gateway invents. The billing event on the observability bus and in spend reports therefore carries measured usage only. Watch `sbproxy_ai_usage_parse_miss_total` to see how much of an origin's traffic is arriving this way, and pin `usage_parser` to the provider's own shape if the number is higher than you expect.
+
+**A partial stream is billed for what arrived.** A stream cut short by an upstream error, by a guardrail, or by the caller hanging up is settled from the frames received up to the cut: the provider's usage frame if one had already arrived, the tokenizer count of the delivered text if not. Nothing after the cut is billed, because nothing after the cut is read: the upstream body is dropped at the failure rather than left draining. The cut itself is visible on `sbproxy_ai_stream_post_commit_failures_total{provider, cause}` (see [LLM-aware resilience](ai-llm-aware-resilience.md#after-the-commit-point)) and, when the spend produced a rejected or abandoned outcome, on `sbproxy_ai_waste_total`.
+
+**A caller that hangs up mid-stream gets a `client_disconnected` receipt.** The relay learns it from its own write failing, drops the provider stream at that point, settles what it had received, and prices the request as a disconnect rather than as a delivered sale. What that costs is whatever the origin's `billable:` table says for `client_disconnected`; see [metering.md](metering.md#billable-the-outcome-table).
+
 
 ```yaml
 origins:
