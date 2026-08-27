@@ -17,7 +17,7 @@
 //! test-only fixtures, gated behind a feature named for that purpose.
 //! A broker that runs with no configured Redis URL should default to a
 //! real, permanently-supported in-process backend, not a type whose
-//! name and feature flag both say "for tests" — so this crate carries
+//! name and feature flag both say "for tests", so this crate carries
 //! its own, and every constructor in this crate that takes an
 //! `Arc<dyn EphemeralKv>` / `Arc<dyn PersistentKv>` accepts a
 //! `LocalStore::arc()` exactly as it would a `RedisStore`.
