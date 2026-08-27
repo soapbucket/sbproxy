@@ -384,6 +384,26 @@ const EXEMPT: &[Exemption] = &[
                  the index is rendered from config, not per request. WOR-2318.",
     },
     Exemption {
+        file: "crates/sbproxy-observe/src/event_ingest/mod.rs",
+        reason: "The span is lost at a spawn boundary, and a batch has no single trace \
+                 to join. The ingest worker owns its own runtime and drains a queue, so \
+                 nothing is current when it publishes, and one NATS flush or one \
+                 ClickHouse insert carries events from many unrelated requests. A \
+                 traceparent there would name whichever request happened to be first in \
+                 the batch, which is worse than none: it renders as a real edge. The \
+                 per-event trace id is already a field of the payload, which is where a \
+                 warehouse join belongs. WOR-2318.",
+    },
+    Exemption {
+        file: "crates/sbproxy-observe/src/notify/mod.rs",
+        reason: "The span is lost at a spawn boundary. The notifier's delivery worker \
+                 owns its own runtime and drains a queue, so nothing is current when it \
+                 sends, and a retry lands minutes after the request that produced the \
+                 event has finished. The delivery carries the event's own id in a \
+                 header instead, which is the correlation a receiver can actually act \
+                 on. WOR-2318.",
+    },
+    Exemption {
         file: "crates/sbproxy-observe/src/event_sink.rs",
         reason: "The span is lost at a spawn boundary, and a batch has no single \
                  trace to join. The webhook worker owns its own runtime and drains a \

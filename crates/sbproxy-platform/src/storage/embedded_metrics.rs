@@ -31,7 +31,7 @@ use std::sync::LazyLock;
 use prometheus::{register_int_counter_vec, IntCounterVec, Opts};
 
 /// Operations against an embedded store, by store, operation, and outcome.
-static EMBEDDED_STORE_OPERATIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+static EMBEDDED_STORE_OPERATIONS: LazyLock<Option<IntCounterVec>> = LazyLock::new(|| {
     register_int_counter_vec!(
         Opts::new(
             "sbproxy_embedded_store_operations_total",
@@ -39,14 +39,21 @@ static EMBEDDED_STORE_OPERATIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
         ),
         &["store", "op", "outcome"]
     )
-    .expect("register sbproxy_embedded_store_operations_total")
+    .map_err(|error| {
+        // Only a duplicate or malformed name reaches here, and both are
+        // bugs in this file. An `expect` would turn one into a panic
+        // inside whichever request first touched the new code path,
+        // which is a larger failure than a family that does not record.
+        tracing::error!(family = "sbproxy_embedded_store_operations_total", error = %error, "metric family would not register");
+    })
+    .ok()
 });
 
 /// Count one operation.
 pub(crate) fn record_kv_op(store: &'static str, op: &'static str, outcome: &'static str) {
-    EMBEDDED_STORE_OPERATIONS
-        .with_label_values(&[store, op, outcome])
-        .inc();
+    if let Some(family) = EMBEDDED_STORE_OPERATIONS.as_ref() {
+        family.with_label_values(&[store, op, outcome]).inc();
+    }
 }
 
 /// Count `count` operations at once. Used by the ephemeral sweep, which
@@ -58,9 +65,11 @@ pub(crate) fn record_kv_op_count(
     outcome: &'static str,
     count: u64,
 ) {
-    EMBEDDED_STORE_OPERATIONS
-        .with_label_values(&[store, op, outcome])
-        .inc_by(count);
+    if let Some(family) = EMBEDDED_STORE_OPERATIONS.as_ref() {
+        family
+            .with_label_values(&[store, op, outcome])
+            .inc_by(count);
+    }
 }
 
 /// Map a fallible outcome onto the `outcome` label.
@@ -87,6 +96,8 @@ mod tests {
         record_kv_op_count("test_metrics", "evict", "ok", 3);
         assert_eq!(
             EMBEDDED_STORE_OPERATIONS
+                .as_ref()
+                .expect("the family registers in a fresh process")
                 .with_label_values(&["test_metrics", "evict", "ok"])
                 .get(),
             3

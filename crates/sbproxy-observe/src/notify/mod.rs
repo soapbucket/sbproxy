@@ -831,7 +831,7 @@ pub(crate) mod metrics {
         register_int_counter_vec, register_int_gauge_vec, IntCounterVec, IntGaugeVec, Opts,
     };
 
-    static NOTIFY_DELIVERIES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    static NOTIFY_DELIVERIES: LazyLock<Option<IntCounterVec>> = LazyLock::new(|| {
         register_int_counter_vec!(
             Opts::new(
                 "sbproxy_notify_deliveries_total",
@@ -839,10 +839,18 @@ pub(crate) mod metrics {
             ),
             &["outcome"]
         )
-        .expect("register sbproxy_notify_deliveries_total")
+        .map_err(|error| {
+            // Only a duplicate or malformed name reaches here, and both
+            // are bugs in this file. An `expect` would turn one into a
+            // panic inside whichever request first touched the new code
+            // path, which is a larger failure than a family that does
+            // not record.
+            tracing::error!(family = "sbproxy_notify_deliveries_total", error = %error, "metric family would not register");
+        })
+        .ok()
     });
 
-    static NOTIFY_QUEUE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    static NOTIFY_QUEUE: LazyLock<Option<IntGaugeVec>> = LazyLock::new(|| {
         register_int_gauge_vec!(
             Opts::new(
                 "sbproxy_notify_queue",
@@ -850,37 +858,51 @@ pub(crate) mod metrics {
             ),
             &["collection"]
         )
-        .expect("register sbproxy_notify_queue")
+        .map_err(|error| {
+            // Only a duplicate or malformed name reaches here, and both
+            // are bugs in this file. An `expect` would turn one into a
+            // panic inside whichever request first touched the new code
+            // path, which is a larger failure than a family that does
+            // not record.
+            tracing::error!(family = "sbproxy_notify_queue", error = %error, "metric family would not register");
+        })
+        .ok()
     });
 
     /// Count one delivery outcome.
     pub(crate) fn record_delivery(outcome: &'static str) {
-        NOTIFY_DELIVERIES.with_label_values(&[outcome]).inc();
+        if let Some(family) = NOTIFY_DELIVERIES.as_ref() {
+            family.with_label_values(&[outcome]).inc();
+        }
     }
 
     /// Count several at once, for the eviction sweep.
     pub(crate) fn record_delivery_by(outcome: &'static str, count: u64) {
-        NOTIFY_DELIVERIES
-            .with_label_values(&[outcome])
-            .inc_by(count);
+        if let Some(family) = NOTIFY_DELIVERIES.as_ref() {
+            family.with_label_values(&[outcome]).inc_by(count);
+        }
     }
 
     /// Count one admin mutation, on the same family so one panel covers
     /// "what is this subsystem doing".
     pub(crate) fn record_admin(operation: &'static str) {
-        NOTIFY_DELIVERIES.with_label_values(&[operation]).inc();
+        if let Some(family) = NOTIFY_DELIVERIES.as_ref() {
+            family.with_label_values(&[operation]).inc();
+        }
     }
 
     /// Publish the subscription count.
     pub(crate) fn set_subscriptions(count: i64) {
-        NOTIFY_QUEUE
-            .with_label_values(&["subscriptions"])
-            .set(count);
+        if let Some(family) = NOTIFY_QUEUE.as_ref() {
+            family.with_label_values(&["subscriptions"]).set(count);
+        }
     }
 
     /// Publish the deadletter depth.
     pub(crate) fn set_deadletters(count: i64) {
-        NOTIFY_QUEUE.with_label_values(&["deadletters"]).set(count);
+        if let Some(family) = NOTIFY_QUEUE.as_ref() {
+            family.with_label_values(&["deadletters"]).set(count);
+        }
     }
 
     #[cfg(test)]
@@ -896,7 +918,14 @@ pub(crate) mod metrics {
             record_admin("create");
             set_subscriptions(3);
             set_deadletters(4);
-            assert_eq!(NOTIFY_QUEUE.with_label_values(&["subscriptions"]).get(), 3);
+            assert_eq!(
+                NOTIFY_QUEUE
+                    .as_ref()
+                    .expect("the family registers in a fresh process")
+                    .with_label_values(&["subscriptions"])
+                    .get(),
+                3
+            );
         }
     }
 }

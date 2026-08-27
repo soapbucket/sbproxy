@@ -26,7 +26,7 @@ use prometheus::{
 };
 
 /// Agent registry operations, by operation and outcome.
-static AGENT_REGISTRY_OPERATIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+static AGENT_REGISTRY_OPERATIONS: LazyLock<Option<IntCounterVec>> = LazyLock::new(|| {
     register_int_counter_vec!(
         Opts::new(
             "sbproxy_agent_registry_operations_total",
@@ -34,11 +34,18 @@ static AGENT_REGISTRY_OPERATIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
         ),
         &["op", "outcome"]
     )
-    .expect("register sbproxy_agent_registry_operations_total")
+    .map_err(|error| {
+        // Only a duplicate or malformed name reaches here, and both are
+        // bugs in this file. An `expect` would turn one into a panic
+        // inside whichever request first touched the new code path,
+        // which is a larger failure than a family that does not record.
+        tracing::error!(family = "sbproxy_agent_registry_operations_total", error = %error, "metric family would not register");
+    })
+    .ok()
 });
 
 /// Size of the live catalog and of each registration-queue state.
-static AGENT_REGISTRY_ENTRIES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+static AGENT_REGISTRY_ENTRIES: LazyLock<Option<IntGaugeVec>> = LazyLock::new(|| {
     register_int_gauge_vec!(
         Opts::new(
             "sbproxy_agent_registry_entries",
@@ -46,21 +53,28 @@ static AGENT_REGISTRY_ENTRIES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
         ),
         &["collection"]
     )
-    .expect("register sbproxy_agent_registry_entries")
+    .map_err(|error| {
+        // Only a duplicate or malformed name reaches here, and both are
+        // bugs in this file. An `expect` would turn one into a panic
+        // inside whichever request first touched the new code path,
+        // which is a larger failure than a family that does not record.
+        tracing::error!(family = "sbproxy_agent_registry_entries", error = %error, "metric family would not register");
+    })
+    .ok()
 });
 
 /// Count one operation.
 pub(crate) fn record_registry_op(op: &'static str, outcome: &'static str) {
-    AGENT_REGISTRY_OPERATIONS
-        .with_label_values(&[op, outcome])
-        .inc();
+    if let Some(family) = AGENT_REGISTRY_OPERATIONS.as_ref() {
+        family.with_label_values(&[op, outcome]).inc();
+    }
 }
 
 /// Publish the size of one collection.
 pub(crate) fn set_registry_entries(collection: &'static str, count: i64) {
-    AGENT_REGISTRY_ENTRIES
-        .with_label_values(&[collection])
-        .set(count);
+    if let Some(family) = AGENT_REGISTRY_ENTRIES.as_ref() {
+        family.with_label_values(&[collection]).set(count);
+    }
 }
 
 #[cfg(test)]
@@ -75,7 +89,11 @@ mod tests {
         record_registry_op("register", "applied");
         set_registry_entries("catalog", 7);
         assert_eq!(
-            AGENT_REGISTRY_ENTRIES.with_label_values(&["catalog"]).get(),
+            AGENT_REGISTRY_ENTRIES
+                .as_ref()
+                .expect("the family registers in a fresh process")
+                .with_label_values(&["catalog"])
+                .get(),
             7
         );
     }

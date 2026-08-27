@@ -833,7 +833,7 @@ pub(crate) mod metrics {
 
     use prometheus::{register_int_counter_vec, IntCounterVec, Opts};
 
-    static EVENT_INGEST_EVENTS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    static EVENT_INGEST_EVENTS: LazyLock<Option<IntCounterVec>> = LazyLock::new(|| {
         register_int_counter_vec!(
             Opts::new(
                 "sbproxy_event_ingest_events_total",
@@ -841,21 +841,29 @@ pub(crate) mod metrics {
             ),
             &["target", "outcome"]
         )
-        .expect("register sbproxy_event_ingest_events_total")
+        .map_err(|error| {
+            // Only a duplicate or malformed name reaches here, and both
+            // are bugs in this file. An `expect` would turn one into a
+            // panic inside whichever request first touched the new code
+            // path, which is a larger failure than a family that does
+            // not record.
+            tracing::error!(family = "sbproxy_event_ingest_events_total", error = %error, "metric family would not register");
+        })
+        .ok()
     });
 
     /// Count one event.
     pub(crate) fn record_ingest(target: &'static str, outcome: &'static str) {
-        EVENT_INGEST_EVENTS
-            .with_label_values(&[target, outcome])
-            .inc();
+        if let Some(family) = EVENT_INGEST_EVENTS.as_ref() {
+            family.with_label_values(&[target, outcome]).inc();
+        }
     }
 
     /// Count a whole batch at once.
     pub(crate) fn record_ingest_by(target: &'static str, outcome: &'static str, count: u64) {
-        EVENT_INGEST_EVENTS
-            .with_label_values(&[target, outcome])
-            .inc_by(count);
+        if let Some(family) = EVENT_INGEST_EVENTS.as_ref() {
+            family.with_label_values(&[target, outcome]).inc_by(count);
+        }
     }
 
     #[cfg(test)]
@@ -868,6 +876,8 @@ pub(crate) mod metrics {
             record_ingest_by("clickhouse", "published", 5);
             assert_eq!(
                 EVENT_INGEST_EVENTS
+                    .as_ref()
+                    .expect("the family registers in a fresh process")
                     .with_label_values(&["clickhouse", "published"])
                     .get(),
                 5

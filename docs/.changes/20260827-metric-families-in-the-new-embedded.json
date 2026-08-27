@@ -1,0 +1,4 @@
+{
+  "type": "fixed",
+  "message": "Metric families in the new embedded-store, agent-registry, notifier, and event-ingest modules register without `expect`, so a duplicate or malformed family name logs an error instead of panicking inside whichever request first reached the new code path."
+}

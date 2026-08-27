@@ -201,10 +201,10 @@ impl BootstrapKeys {
     /// Build a bootstrap set from `(kid, base64 public key)` pairs.
     ///
     /// An empty set is allowed to exist so a config with no
-    /// `bootstrap_keys:` still builds a value; it is
-    /// [`verify_key_directory`] that refuses to verify against one, so the
-    /// refusal names the operation an operator was trying to do rather than
-    /// failing at config load in a subsystem they may not have configured.
+    /// `bootstrap_keys:` still builds a value; it is `verify_key_directory`
+    /// that refuses to verify against one, so the refusal names the operation
+    /// an operator was trying to do rather than failing at config load in a
+    /// subsystem they may not have configured.
     pub fn from_pairs<I, K, V>(pairs: I) -> Result<Self>
     where
         I: IntoIterator<Item = (K, V)>,
