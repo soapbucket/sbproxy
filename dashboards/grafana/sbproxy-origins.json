@@ -331,6 +331,66 @@
         }
       ],
       "description": "Per-target tri-state health on LiteLLM's 0/1/2 scale: 0 healthy, 1 degraded (circuit breaker half-open), 2 excluded from selection (probe-unhealthy, outlier-ejected, or breaker open). Sampled at scrape time from the same pipeline walk that renders GET /api/health/targets. Runbook: docs/operator-runbook.md#origins. When a target sits at 2, check /api/health/targets for which of the three mechanisms excluded it; when every target of an origin reads 2, the origin has no eligible upstream left."
+    },
+    {
+      "id": 5,
+      "title": "Fallback Origin Responses Served",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 40
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "noValue": "No fallback has fired in this window. An origin with no fallback_origin configured never reports here."
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (origin, trigger) (rate(sbproxy_fallback_total[5m]))",
+          "legendFormat": "{{origin}} - {{trigger}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Rate of fallback_origin responses served, by origin and by which trigger fired: `status` when the primary answered with a status listed under on_status, `error` when it failed outright. Every series here is a degraded response the client received instead of the primary's. Runbook: docs/operator-runbook.md#origins. When this rises, the primary behind that origin is failing; check the Per-Origin Error Rate panel above for the status it is answering with."
     }
   ],
   "templating": {
