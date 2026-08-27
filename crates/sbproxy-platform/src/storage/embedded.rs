@@ -291,6 +291,15 @@ pub trait EphemeralKv: Send + Sync {
     /// refused rather than evicting something already there. A refusal is
     /// counted under `op="put",outcome="rejected"`, so a store running at
     /// its cap is visible rather than silently lossy.
+    ///
+    /// A caller using this as a dedup window has to read the answer:
+    /// `false` means the fingerprint was not recorded, so the next
+    /// duplicate will not be suppressed, and treating that as a successful
+    /// write is how a window silently stops working at exactly the moment
+    /// it is under load. `#[must_use]` here catches the call that never
+    /// awaits at all; the `bool` itself is a caller obligation this
+    /// signature can only state.
+    #[must_use = "the returned future does nothing unless awaited, and its bool says whether the entry was recorded"]
     async fn put_with_ttl(
         &self,
         namespace: &KvNamespace,
@@ -357,7 +366,12 @@ fn registry_key(path: &Path) -> PathBuf {
 /// path.
 #[cfg(feature = "redb-store")]
 pub struct EmbeddedKvStore {
-    db: Database,
+    /// Behind an `Arc` so every operation can hand the handle to
+    /// [`Self::blocking`]. `Database` is `Send + Sync` and each mutation is
+    /// its own ACID transaction, so sharing one handle across the blocking
+    /// pool is the same sharing `open_shared` already does across reload
+    /// generations.
+    db: Arc<Database>,
     store_name: &'static str,
 }
 
@@ -392,7 +406,10 @@ impl EmbeddedKvStore {
             write_txn.open_table(META).context("open meta table")?;
         }
         write_txn.commit().context("commit init transaction")?;
-        Ok(Self { db, store_name })
+        Ok(Self {
+            db: Arc::new(db),
+            store_name,
+        })
     }
 
     /// Open the store at `path`, reusing the handle this process already
@@ -474,6 +491,30 @@ impl EmbeddedKvStore {
             value: value.to_vec(),
         })
     }
+
+    /// Run one redb transaction on tokio's blocking pool.
+    ///
+    /// Every operation below is a synchronous redb transaction and every
+    /// write ends in an fsync. Called inline from an `async fn` that holds
+    /// an executor thread through a disk flush, so an admin request writing
+    /// a registration stalls whatever else the executor had scheduled on
+    /// that thread; ten concurrent submissions stall ten. `spawn_blocking`
+    /// is the pool tokio keeps for exactly this shape of work.
+    ///
+    /// A join failure is a panic inside the transaction or a runtime
+    /// shutting down. Both are reported as a store error rather than
+    /// re-panicked here, so one poisoned record cannot take down the
+    /// connection task that read it.
+    async fn blocking<T, F>(work: F) -> Result<T>
+    where
+        F: FnOnce() -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        match tokio::task::spawn_blocking(work).await {
+            Ok(result) => result,
+            Err(error) => bail!("embedded store operation did not complete: {error}"),
+        }
+    }
 }
 
 #[cfg(feature = "redb-store")]
@@ -484,22 +525,31 @@ impl PersistentKv for EmbeddedKvStore {
     }
 
     async fn get(&self, namespace: &KvNamespace, key: &str) -> Result<Option<KvEntry>> {
-        let outcome = (|| {
-            let composed = namespace.compose(key)?;
-            let read = self.db.begin_read().context("begin read")?;
-            let table = read.open_table(RECORDS).context("open records table")?;
-            match table.get(composed.as_str()).context("get record")? {
-                Some(guard) => Ok(Some(Self::unframe(guard.value())?)),
-                None => Ok(None),
+        let db = Arc::clone(&self.db);
+        let composed = namespace.compose(key);
+        let outcome = match composed {
+            Ok(composed) => {
+                Self::blocking(move || {
+                    let read = db.begin_read().context("begin read")?;
+                    let table = read.open_table(RECORDS).context("open records table")?;
+                    match table.get(composed.as_str()).context("get record")? {
+                        Some(guard) => Ok(Some(Self::unframe(guard.value())?)),
+                        None => Ok(None),
+                    }
+                })
+                .await
             }
-        })();
+            Err(error) => Err(error),
+        };
         record_kv_op(self.store_name, "get", outcome_label(&outcome));
         outcome
     }
 
     async fn list(&self, namespace: &KvNamespace) -> Result<Vec<(String, KvEntry)>> {
-        let outcome = (|| {
-            let read = self.db.begin_read().context("begin read")?;
+        let db = Arc::clone(&self.db);
+        let namespace = namespace.clone();
+        let outcome = Self::blocking(move || {
+            let read = db.begin_read().context("begin read")?;
             let table = read.open_table(RECORDS).context("open records table")?;
             let start = namespace.range_start();
             let end = namespace.range_end();
@@ -518,25 +568,33 @@ impl PersistentKv for EmbeddedKvStore {
                 out.push((key.to_string(), Self::unframe(stored_value.value())?));
             }
             Ok(out)
-        })();
+        })
+        .await;
         record_kv_op(self.store_name, "list", outcome_label(&outcome));
         outcome
     }
 
     async fn put(&self, namespace: &KvNamespace, key: &str, value: &[u8]) -> Result<u64> {
-        let outcome = (|| {
-            let composed = namespace.compose(key)?;
-            let txn = self.db.begin_write().context("begin write")?;
-            let revision = Self::bump_revision(&txn)?;
-            {
-                let mut table = txn.open_table(RECORDS).context("open records table")?;
-                table
-                    .insert(composed.as_str(), Self::frame(revision, value).as_slice())
-                    .context("insert record")?;
+        let db = Arc::clone(&self.db);
+        let value = value.to_vec();
+        let outcome = match namespace.compose(key) {
+            Ok(composed) => {
+                Self::blocking(move || {
+                    let txn = db.begin_write().context("begin write")?;
+                    let revision = Self::bump_revision(&txn)?;
+                    {
+                        let mut table = txn.open_table(RECORDS).context("open records table")?;
+                        table
+                            .insert(composed.as_str(), Self::frame(revision, &value).as_slice())
+                            .context("insert record")?;
+                    }
+                    txn.commit().context("commit put")?;
+                    Ok(revision)
+                })
+                .await
             }
-            txn.commit().context("commit put")?;
-            Ok(revision)
-        })();
+            Err(error) => Err(error),
+        };
         record_kv_op(self.store_name, "put", outcome_label(&outcome));
         outcome
     }
@@ -547,28 +605,35 @@ impl PersistentKv for EmbeddedKvStore {
         key: &str,
         value: &[u8],
     ) -> Result<Option<u64>> {
-        let outcome = (|| {
-            let composed = namespace.compose(key)?;
-            let txn = self.db.begin_write().context("begin insert-if-absent")?;
-            let revision = Self::bump_revision(&txn)?;
-            let landed = {
-                let mut table = txn.open_table(RECORDS).context("open records table")?;
-                if table
-                    .get(composed.as_str())
-                    .context("get record for insert")?
-                    .is_some()
-                {
-                    None
-                } else {
-                    table
-                        .insert(composed.as_str(), Self::frame(revision, value).as_slice())
-                        .context("insert record")?;
-                    Some(revision)
-                }
-            };
-            txn.commit().context("commit insert-if-absent")?;
-            Ok(landed)
-        })();
+        let db = Arc::clone(&self.db);
+        let value = value.to_vec();
+        let outcome = match namespace.compose(key) {
+            Ok(composed) => {
+                Self::blocking(move || {
+                    let txn = db.begin_write().context("begin insert-if-absent")?;
+                    let revision = Self::bump_revision(&txn)?;
+                    let landed = {
+                        let mut table = txn.open_table(RECORDS).context("open records table")?;
+                        if table
+                            .get(composed.as_str())
+                            .context("get record for insert")?
+                            .is_some()
+                        {
+                            None
+                        } else {
+                            table
+                                .insert(composed.as_str(), Self::frame(revision, &value).as_slice())
+                                .context("insert record")?;
+                            Some(revision)
+                        }
+                    };
+                    txn.commit().context("commit insert-if-absent")?;
+                    Ok(landed)
+                })
+                .await
+            }
+            Err(error) => Err(error),
+        };
         record_kv_op(self.store_name, "insert", outcome_label(&outcome));
         outcome
     }
@@ -580,68 +645,89 @@ impl PersistentKv for EmbeddedKvStore {
         value: &[u8],
         expected_revision: u64,
     ) -> Result<CasOutcome> {
-        let outcome = (|| {
-            let composed = namespace.compose(key)?;
-            let txn = self.db.begin_write().context("begin CAS")?;
-            let revision = Self::bump_revision(&txn)?;
-            let result = {
-                let mut table = txn.open_table(RECORDS).context("open records table")?;
-                // The read guard borrows `table` immutably, so it has to be
-                // owned and dropped in its own scope before the insert below
-                // can take a mutable borrow.
-                let current: Option<KvEntry> = {
-                    let guard = table.get(composed.as_str()).context("get record for CAS")?;
-                    match guard {
-                        Some(found) => Some(Self::unframe(found.value())?),
-                        None => None,
-                    }
-                };
-                match current {
-                    None => CasOutcome::NotFound,
-                    Some(current) if current.revision != expected_revision => {
-                        CasOutcome::Conflict {
-                            actual: current.revision,
+        let db = Arc::clone(&self.db);
+        let value = value.to_vec();
+        let outcome = match namespace.compose(key) {
+            Ok(composed) => {
+                Self::blocking(move || {
+                    let txn = db.begin_write().context("begin CAS")?;
+                    let revision = Self::bump_revision(&txn)?;
+                    let result = {
+                        let mut table = txn.open_table(RECORDS).context("open records table")?;
+                        // The read guard borrows `table` immutably, so it
+                        // has to be owned and dropped in its own scope
+                        // before the insert below can take a mutable borrow.
+                        let current: Option<KvEntry> = {
+                            let guard =
+                                table.get(composed.as_str()).context("get record for CAS")?;
+                            match guard {
+                                Some(found) => Some(Self::unframe(found.value())?),
+                                None => None,
+                            }
+                        };
+                        match current {
+                            None => CasOutcome::NotFound,
+                            Some(current) if current.revision != expected_revision => {
+                                CasOutcome::Conflict {
+                                    actual: current.revision,
+                                }
+                            }
+                            Some(_) => {
+                                table
+                                    .insert(
+                                        composed.as_str(),
+                                        Self::frame(revision, &value).as_slice(),
+                                    )
+                                    .context("replace record")?;
+                                CasOutcome::Applied { revision }
+                            }
                         }
-                    }
-                    Some(_) => {
-                        table
-                            .insert(composed.as_str(), Self::frame(revision, value).as_slice())
-                            .context("replace record")?;
-                        CasOutcome::Applied { revision }
-                    }
-                }
-            };
-            txn.commit().context("commit CAS")?;
-            Ok(result)
-        })();
+                    };
+                    txn.commit().context("commit CAS")?;
+                    Ok(result)
+                })
+                .await
+            }
+            Err(error) => Err(error),
+        };
         record_kv_op(self.store_name, "cas", outcome_label(&outcome));
         outcome
     }
 
     async fn delete(&self, namespace: &KvNamespace, key: &str) -> Result<u64> {
-        let outcome = (|| {
-            let composed = namespace.compose(key)?;
-            let txn = self.db.begin_write().context("begin delete")?;
-            let revision = Self::bump_revision(&txn)?;
-            {
-                let mut table = txn.open_table(RECORDS).context("open records table")?;
-                table.remove(composed.as_str()).context("remove record")?;
+        let db = Arc::clone(&self.db);
+        let outcome = match namespace.compose(key) {
+            Ok(composed) => {
+                Self::blocking(move || {
+                    let txn = db.begin_write().context("begin delete")?;
+                    let revision = Self::bump_revision(&txn)?;
+                    {
+                        let mut table = txn.open_table(RECORDS).context("open records table")?;
+                        table.remove(composed.as_str()).context("remove record")?;
+                    }
+                    txn.commit().context("commit delete")?;
+                    Ok(revision)
+                })
+                .await
             }
-            txn.commit().context("commit delete")?;
-            Ok(revision)
-        })();
+            Err(error) => Err(error),
+        };
         record_kv_op(self.store_name, "delete", outcome_label(&outcome));
         outcome
     }
 
     async fn revision(&self) -> Result<u64> {
-        let read = self.db.begin_read().context("begin read")?;
-        let table = read.open_table(META).context("open meta table")?;
-        Ok(table
-            .get(REVISION_KEY)
-            .context("read revision")?
-            .map(|g| g.value())
-            .unwrap_or(0))
+        let db = Arc::clone(&self.db);
+        Self::blocking(move || {
+            let read = db.begin_read().context("begin read")?;
+            let table = read.open_table(META).context("open meta table")?;
+            Ok(table
+                .get(REVISION_KEY)
+                .context("read revision")?
+                .map(|g| g.value())
+                .unwrap_or(0))
+        })
+        .await
     }
 }
 
@@ -704,7 +790,16 @@ impl EphemeralKv for MemoryKv {
     }
 
     async fn get(&self, namespace: &KvNamespace, key: &str) -> Result<Option<Vec<u8>>> {
-        let composed = namespace.compose(key)?;
+        // Composed inside the counted region, so a refused key is counted as
+        // an error here exactly as it is on the durable store rather than
+        // vanishing from the family.
+        let composed = match namespace.compose(key) {
+            Ok(composed) => composed,
+            Err(error) => {
+                record_kv_op(self.store_name, "get", "error");
+                return Err(error);
+            }
+        };
         let now = Instant::now();
         let entries = self.entries.lock();
         let hit = entries
@@ -723,9 +818,20 @@ impl EphemeralKv for MemoryKv {
         value: &[u8],
         ttl: Duration,
     ) -> Result<bool> {
-        let composed = namespace.compose(key)?;
+        let composed = match namespace.compose(key) {
+            Ok(composed) => composed,
+            Err(error) => {
+                record_kv_op(self.store_name, "put", "error");
+                return Err(error);
+            }
+        };
         let now = Instant::now();
-        let expires_at = now.checked_add(ttl).unwrap_or(now);
+        // Saturating rather than falling back to `now`: an over-large TTL is
+        // a caller asking for "as long as possible", and turning it into an
+        // already-expired entry would silently mean "not at all".
+        let expires_at = now
+            .checked_add(ttl)
+            .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 3600));
         let mut entries = self.entries.lock();
         let mut evicted = 0;
         if entries.len() >= self.max_entries && !entries.contains_key(&composed) {
@@ -756,7 +862,13 @@ impl EphemeralKv for MemoryKv {
     }
 
     async fn remove(&self, namespace: &KvNamespace, key: &str) -> Result<()> {
-        let composed = namespace.compose(key)?;
+        let composed = match namespace.compose(key) {
+            Ok(composed) => composed,
+            Err(error) => {
+                record_kv_op(self.store_name, "delete", "error");
+                return Err(error);
+            }
+        };
         self.entries.lock().remove(&composed);
         record_kv_op(self.store_name, "delete", "ok");
         Ok(())
@@ -1078,6 +1190,75 @@ mod tests {
             store.put_with_ttl(&window, "b", b"2", long).await.unwrap(),
             "an expired entry must not hold a slot forever"
         );
+    }
+
+    /// Every redb operation is a synchronous transaction and every write
+    /// ends in an fsync, so running one inline on an `async fn` holds the
+    /// executor thread for the whole flush: ten concurrent registrations
+    /// stall ten unrelated admin requests scheduled behind them. The
+    /// property that fixes it is that the future is not complete on its
+    /// first poll, because the work has gone to the blocking pool.
+    #[tokio::test]
+    async fn a_store_write_leaves_the_executor_rather_than_holding_it() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let path = temp_path();
+        let store = EmbeddedKvStore::open(&path, "test").expect("open");
+        let namespace = ns("alpha");
+
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        let mut write = Box::pin(store.put(&namespace, "key", b"value"));
+        assert!(
+            matches!(write.as_mut().poll(&mut context), Poll::Pending),
+            "the transaction ran inline on the executor thread"
+        );
+        write.await.expect("write");
+
+        assert_eq!(
+            store
+                .get(&namespace, "key")
+                .await
+                .expect("read")
+                .map(|entry| entry.value),
+            Some(b"value".to_vec())
+        );
+        drop(store);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// An over-large TTL means "as long as possible", not "not at all". The
+    /// saturating add is what keeps `checked_add` overflowing from turning
+    /// a long-lived entry into an already-expired one that still reports a
+    /// successful write.
+    #[tokio::test]
+    async fn an_over_large_ttl_saturates_rather_than_expiring_immediately() {
+        let store = MemoryKv::new("test");
+        let window = ns("dedup");
+        assert!(store
+            .put_with_ttl(&window, "k", b"v", Duration::from_secs(u64::MAX))
+            .await
+            .expect("write"));
+        assert_eq!(
+            store.get(&window, "k").await.expect("read"),
+            Some(b"v".to_vec())
+        );
+    }
+
+    /// A key the namespace refuses is counted the same way on both halves
+    /// of the pair, so the family does not answer differently depending on
+    /// which store the caller happened to hold.
+    #[tokio::test]
+    async fn a_refused_key_is_counted_on_the_ephemeral_half_too() {
+        let store = MemoryKv::new("test");
+        let window = ns("dedup");
+        assert!(store.get(&window, "").await.is_err());
+        assert!(store
+            .put_with_ttl(&window, "", b"v", Duration::from_secs(30))
+            .await
+            .is_err());
+        assert!(store.remove(&window, "").await.is_err());
     }
 
     #[tokio::test]
