@@ -3014,10 +3014,15 @@ impl AiIdempotencyCapture {
     /// Persist the recorded response under `(workspace_id, key)`.
     /// `body` contains the final client-wire bytes after format adaptation
     /// and reversible restoration, so retries replay byte-identically.
+    /// The publish goes through `record_response_detached` because the
+    /// shared backend's write is a network round trip and this runs on
+    /// a proxy worker (WOR-2609). An in-process backend still writes
+    /// inline, so a caller that publishes and then looks is not racing
+    /// itself.
     pub(super) fn record(self, status: u16, headers: Vec<(String, String)>, body: Vec<u8>) {
         let ttl_secs = self.idem.ttl_secs;
         let body_hash = self.body_hash;
-        sbproxy_middleware::idempotency::record_response(
+        sbproxy_middleware::idempotency::record_response_detached(
             self.claim,
             sbproxy_middleware::idempotency::RecordedResponse {
                 status,

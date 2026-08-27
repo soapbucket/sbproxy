@@ -644,6 +644,33 @@ async fn resolve_impersonation_ticket(
 /// request with no `Content-Length`, or an unparseable one, is not
 /// "exceeding" anything knowable here; a chunked body that overruns is
 /// caught by the read loop instead, and both end the same way.
+/// Hand back the buffering slot and take a waiter slot, for a request
+/// that has finished buffering and is about to park on somebody else's
+/// response (WOR-2609).
+///
+/// The two bounds cover different things and used to be one. The
+/// buffering pool bounds requests that are accumulating a body on their
+/// way upstream, which is microseconds of work; the wait is up to three
+/// seconds of doing nothing. Sharing one pool meant a client that timed
+/// out and fired three hundred retries of a single key parked every
+/// slot the origin had, and every subsequent request on *any* key took
+/// the pool-full path, claimed nothing, and went upstream unprotected.
+/// The requests that bypassed the claim were the ones arriving during
+/// the storm, which is exactly when duplicates are most likely.
+///
+/// Returns `None` when the waiter pool is full too, which the caller
+/// answers with the 409 it would have answered after the wait anyway.
+/// The buffering permit is handed back either way: this request is not
+/// going upstream.
+fn enter_idempotency_wait_slot(
+    buffering: &mut Option<tokio::sync::OwnedSemaphorePermit>,
+    waiters: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let waiter = waiters.clone().try_acquire_owned().ok();
+    *buffering = None;
+    waiter
+}
+
 fn declared_body_exceeds_cap(session: &Session, cap: usize) -> bool {
     session
         .req_header()
@@ -3876,12 +3903,19 @@ pub(super) async fn request_filter(
                         // requests on other nodes when the backend is
                         // the shared store, so exactly one of them goes
                         // upstream and the rest resolve below.
-                        let claimed = sbproxy_middleware::idempotency::claim(
+                        // Boxed and awaited rather than called inline:
+                        // a shared backend's claim is up to six network
+                        // round trips, and a Pingora worker that blocks
+                        // on one stops serving every other connection
+                        // assigned to it. The box is for the stack, the
+                        // await is for the worker (WOR-2609).
+                        let claimed = Box::pin(sbproxy_middleware::idempotency::claim_async(
                             &idem.cache,
                             &workspace,
                             &key,
                             idem.claim_lease_secs,
-                        );
+                        ))
+                        .await;
                         // `Some(_)` means this request is not the one
                         // producing the response, so it needs its body
                         // to compare hashes and is never going upstream.
@@ -4012,13 +4046,42 @@ pub(super) async fn request_filter(
                             let resolved = match already_stored {
                                 Some(stored) => Some(stored),
                                 None => {
-                                    Box::pin(sbproxy_middleware::idempotency::await_completion(
-                                        &idem.cache,
-                                        &workspace,
-                                        &key,
-                                        idem.claim_wait,
-                                    ))
-                                    .await
+                                    // Waiting is not buffering. This
+                                    // request has drained and hashed its
+                                    // body and is never going upstream,
+                                    // so it hands its buffering slot
+                                    // back and takes a waiter slot
+                                    // instead. Holding the buffering
+                                    // permit across a three-second wait
+                                    // is what let one client's retry
+                                    // storm park every slot at the
+                                    // origin and push every request on
+                                    // every other key onto the
+                                    // no-cache path, during the exact
+                                    // window duplicates are most
+                                    // likely (WOR-2609).
+                                    match enter_idempotency_wait_slot(
+                                        &mut ctx.idempotency_permit,
+                                        &idem.wait_permits,
+                                    ) {
+                                        Some(wait_permit) => {
+                                            let resolved = Box::pin(
+                                                sbproxy_middleware::idempotency::await_completion(
+                                                    &idem.cache,
+                                                    &workspace,
+                                                    &key,
+                                                    idem.claim_wait,
+                                                ),
+                                            )
+                                            .await;
+                                            drop(wait_permit);
+                                            resolved
+                                        }
+                                        // Every waiter slot is taken.
+                                        // Answer 409 now rather than
+                                        // queueing behind the queue.
+                                        None => None,
+                                    }
                                 }
                             };
                             let (body, marker) = match resolved {
@@ -4032,7 +4095,8 @@ pub(super) async fn request_filter(
                                     return Ok(true);
                                 }
                                 // Body conflict: same key, different
-                                // body. 409 per RFC 8594.
+                                // body. 409 per
+                                // draft-ietf-httpapi-idempotency-key-header.
                                 Some(_) => (
                                     sbproxy_middleware::idempotency::conflict_response(),
                                     "CONFLICT",
@@ -7807,5 +7871,66 @@ origins:
             response.contains("buffered policy denied"),
             "response: {response}"
         );
+    }
+}
+
+#[cfg(test)]
+mod idempotency_wait_slot_tests {
+    use super::*;
+
+    /// WOR-2609: a follower parked on somebody else's response must not
+    /// be holding a buffering slot while it waits.
+    ///
+    /// The failure this forecloses: `max_concurrent_buffers` defaults
+    /// to 256, a client that times out fires 300 retries of one key,
+    /// 256 of them park in `await_completion` for three seconds each,
+    /// and every subsequent request on *any* key at that origin takes
+    /// the pool-full path, claims nothing, and goes upstream. The
+    /// requests that bypass the claim are the ones arriving during the
+    /// storm, which is when duplicates are most likely.
+    #[tokio::test]
+    async fn a_waiter_hands_its_buffering_slot_back() {
+        let buffers = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let waiters = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+
+        let mut held = Some(
+            buffers
+                .clone()
+                .try_acquire_owned()
+                .expect("the only buffering slot"),
+        );
+        assert_eq!(buffers.available_permits(), 0);
+
+        let waiter = enter_idempotency_wait_slot(&mut held, &waiters);
+        assert!(waiter.is_some(), "a free waiter slot must be handed out");
+        assert!(held.is_none(), "the buffering permit must be given up");
+        assert_eq!(
+            buffers.available_permits(),
+            1,
+            "a request on another key still cannot buffer"
+        );
+        assert_eq!(waiters.available_permits(), 0);
+
+        drop(waiter);
+        assert_eq!(waiters.available_permits(), 1);
+    }
+
+    /// When the waiter pool is full too, the caller gets nothing and
+    /// answers 409 now rather than queueing behind the queue. The
+    /// buffering slot is still handed back: this request has drained
+    /// its body and is not going upstream either way.
+    #[tokio::test]
+    async fn a_full_waiter_pool_refuses_rather_than_queueing() {
+        let buffers = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let waiters = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let _parked = waiters
+            .clone()
+            .try_acquire_owned()
+            .expect("the only waiter slot");
+
+        let mut held = Some(buffers.clone().try_acquire_owned().expect("buffering slot"));
+        assert!(enter_idempotency_wait_slot(&mut held, &waiters).is_none());
+        assert!(held.is_none());
+        assert_eq!(buffers.available_permits(), 1);
     }
 }

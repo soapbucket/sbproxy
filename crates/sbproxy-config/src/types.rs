@@ -8346,7 +8346,8 @@ pub struct RawOriginConfig {
     /// `MessageSignatureSigner` runs upstream of the proxy.
     #[serde(default)]
     pub web_bot_auth_publish: Option<WebBotAuthPublishConfig>,
-    /// RFC 8594-style idempotency-key middleware. Opt in per origin to
+    /// `Idempotency-Key` middleware, per
+    /// `draft-ietf-httpapi-idempotency-key-header`. Opt in per origin to
     /// have the proxy short-circuit retries of POST/PUT/PATCH (or any
     /// configured method) carrying a repeated `Idempotency-Key`
     /// header. See [`IdempotencyConfig`].
@@ -10082,7 +10083,8 @@ fn default_include_detail() -> bool {
     true
 }
 
-/// RFC 8594-style idempotency middleware configuration.
+/// `Idempotency-Key` middleware configuration, per
+/// `draft-ietf-httpapi-idempotency-key-header`.
 ///
 /// When `enabled`, the proxy reads an idempotency key from the
 /// configured request header (default: `Idempotency-Key`), hashes the
@@ -10145,6 +10147,47 @@ pub struct IdempotencyConfig {
     /// memory budget per origin.
     #[serde(default)]
     pub max_concurrent_buffers: Option<usize>,
+    /// How long the request that took an idempotency key holds it
+    /// before another request may take it over, in seconds. Defaults
+    /// to 60.
+    ///
+    /// This is the bound on how long a request that died mid-flight can
+    /// wedge one key, and nothing else. Raise it above the slowest
+    /// response this origin produces: a lease that runs out while its
+    /// owner is still working lets a retry through to the upstream,
+    /// which is the duplicate call the middleware exists to prevent.
+    /// An origin fronting an AI completion or a payment with a 3DS
+    /// step-up wants a larger value. Lowering it makes a crashed
+    /// request's key free sooner and makes duplicates more likely; a
+    /// request that ends cleanly releases its key immediately either
+    /// way, so the lease only governs the requests that did not.
+    ///
+    /// A response is stored under `ttl_secs`, which is hours, not under
+    /// this. The two lifetimes are unrelated: an upstream slower than
+    /// the lease still caches its response.
+    ///
+    /// Zero is refused at config-validate time rather than silently
+    /// normalised, because a zero lease expires the instant it is taken
+    /// and would turn single-flight off without saying so.
+    #[serde(default)]
+    pub claim_lease_secs: Option<u64>,
+    /// How long an overlapping request waits for the key holder's
+    /// response before answering 409 `ledger.idempotency_in_flight`, in
+    /// milliseconds. Defaults to 3000.
+    ///
+    /// A retry that arrives while the original request is still running
+    /// waits this long and then replays the original's response, so the
+    /// client sees its answer rather than an error. Set it to 0 to
+    /// answer 409 immediately, which is the floor
+    /// `draft-ietf-httpapi-idempotency-key-header` describes. Raising
+    /// it past the client's own timeout buys nothing: the client gives
+    /// up first and the wait is abandoned.
+    ///
+    /// A waiting request holds a slot in a pool sized by
+    /// `max_concurrent_buffers`, separate from the buffering pool, so a
+    /// long wait cannot spend the slots other keys need.
+    #[serde(default)]
+    pub claim_wait_ms: Option<u64>,
 }
 
 /// Default cap on request body bytes the middleware will buffer

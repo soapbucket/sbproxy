@@ -19599,14 +19599,16 @@ mod external_guardrail_context_tests {
 
         fn complete(
             &self,
-            _claim: &sbproxy_middleware::idempotency::IdempotencyClaim,
+            _workspace_id: &str,
+            _key: &str,
+            _owner: u128,
             response: sbproxy_middleware::idempotency::CachedResponse,
         ) {
             self.puts.fetch_add(1, Ordering::SeqCst);
             *self.stored.lock().expect("idempotency stored lock") = Some(response);
         }
 
-        fn release(&self, _claim: &sbproxy_middleware::idempotency::IdempotencyClaim) {}
+        fn release(&self, _workspace_id: &str, _key: &str, _owner: u128) {}
 
         fn backend_label(&self) -> &'static str {
             "memory"
@@ -19685,6 +19687,7 @@ mod external_guardrail_context_tests {
             .expect("compiled idempotency");
         let recording_idempotency = Arc::new(RecordingIdempotencyCache::default());
         let replacement = crate::pipeline::CompiledIdempotency {
+            wait_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(16)),
             cache: recording_idempotency.clone(),
             header_name: configured.header_name.clone(),
             ttl_secs: configured.ttl_secs,

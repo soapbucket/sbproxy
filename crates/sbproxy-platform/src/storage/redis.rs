@@ -392,6 +392,11 @@ impl KVStore for RedisKVStore {
         })
     }
 
+    fn supports_atomic_create(&self) -> bool {
+        // `SET NX EX` is a single command on a single node.
+        true
+    }
+
     fn compare_and_swap_with_ttl(
         &self,
         key: &[u8],

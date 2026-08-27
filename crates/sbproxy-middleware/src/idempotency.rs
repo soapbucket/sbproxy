@@ -269,10 +269,40 @@ impl std::fmt::Debug for IdempotencyClaim {
 }
 
 impl Drop for IdempotencyClaim {
+    /// Release the key, without blocking a proxy worker on a network
+    /// round trip to do it.
+    ///
+    /// A destructor cannot await, so the usual answer here (wrap it in
+    /// `spawn_blocking` and await the handle) is not available. What is
+    /// available is to *detach* the release: hand it to the blocking
+    /// pool and return immediately. The release is a
+    /// compare-and-swap-to-lapsed that nothing in this request is
+    /// waiting on, so nothing is lost by it landing a scheduler hop
+    /// later, and the alternative is a worker parked for up to the
+    /// store's acquire plus command timeout inside a destructor while
+    /// every other connection assigned to it stops being served.
+    ///
+    /// A backend that answers `false` to
+    /// [`IdempotencyCache::blocks_on_io`] releases inline. Detaching an
+    /// in-process mutex acquisition would buy nothing and would make a
+    /// dropped claim readable as still held for a scheduler hop
+    /// afterwards, which is a race in every caller that drops and then
+    /// looks.
     fn drop(&mut self) {
-        if !self.published {
-            self.cache.release(self);
+        if self.published {
+            return;
         }
+        let owner = self.owner;
+        if self.cache.blocks_on_io() {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let cache = Arc::clone(&self.cache);
+                let workspace_id = std::mem::take(&mut self.workspace_id);
+                let key = std::mem::take(&mut self.key);
+                handle.spawn_blocking(move || cache.release(&workspace_id, &key, owner));
+                return;
+            }
+        }
+        self.cache.release(&self.workspace_id, &self.key, owner);
     }
 }
 
@@ -353,19 +383,58 @@ pub trait IdempotencyCache: Send + Sync {
     /// reports that as `took_over` so the takeover rate is visible.
     fn try_claim(&self, workspace_id: &str, key: &str, lease_secs: u64) -> TryClaim;
 
-    /// Publish `response` under a claim this caller still holds.
+    /// Publish `response` under a claim this caller took, and stop
+    /// holding the key.
     ///
-    /// Refused, silently but counted, when the stored claim no longer
-    /// carries `claim.owner()`: that owner was superseded after its
-    /// lease lapsed, and the response it is holding answers a request
-    /// nobody is waiting for any more.
-    fn complete(&self, claim: &IdempotencyClaim, response: CachedResponse);
+    /// Takes the claim's three identifying fields rather than the RAII
+    /// handle so the call can be moved onto a blocking thread; see
+    /// [`record_response_async`].
+    ///
+    /// The claim's lease and the response's retention are two different
+    /// lifetimes. A response is written under the cache TTL, which
+    /// outlives the lease by hours, and it is written *whether or not
+    /// the claim row is still there*: an upstream slower than the lease
+    /// is the ordinary case this cache exists for, and refusing to
+    /// publish would make every one of that client's retries a fresh
+    /// upstream call forever.
+    ///
+    /// An implementation must therefore refuse in exactly two
+    /// situations, both of which mean somebody else's answer is the one
+    /// waiters are owed:
+    ///
+    /// 1. A **live** claim under a different fencing token is stored.
+    ///    That request took the key over and is producing the answer.
+    /// 2. An unexpired completed response is already stored.
+    ///
+    /// Everything else publishes, including an absent row, an expired
+    /// response, and a lapsed claim under any token. Refusals are
+    /// counted under `result="fenced"` rather than logged.
+    fn complete(&self, workspace_id: &str, key: &str, owner: u128, response: CachedResponse);
 
     /// Release a claim this caller holds without publishing anything,
     /// so the next request can take the key immediately.
     ///
-    /// A no-op when the claim was already superseded.
-    fn release(&self, claim: &IdempotencyClaim);
+    /// A no-op when the claim was already superseded: the row belongs
+    /// to the successor, and a release that did not check the fencing
+    /// token would hand a live claim away.
+    fn release(&self, workspace_id: &str, key: &str, owner: u128);
+
+    /// Whether this backend's calls can block on network I/O.
+    ///
+    /// A proxy worker that blocks on a Redis round trip stops serving
+    /// every other connection assigned to it, so the request path moves
+    /// a backend that answers `true` onto the blocking pool: the wait
+    /// loop and [`claim_async`] and [`record_response_async`] already
+    /// do, and [`IdempotencyClaim`]'s destructor, which cannot await,
+    /// detaches the release onto it instead.
+    ///
+    /// The default is `false`, which is right for any backend answering
+    /// out of process memory: detaching a mutex acquisition onto
+    /// another thread costs more than it saves and makes the release
+    /// observable only after a scheduler hop.
+    fn blocks_on_io(&self) -> bool {
+        false
+    }
 
     /// Short, closed-set name of this backend, used as the `backend`
     /// label on the idempotency metrics.
@@ -420,17 +489,81 @@ pub fn claim(
     key: &str,
     lease_secs: u64,
 ) -> ClaimState {
-    let backend = cache.backend_label();
-    let lease = if lease_secs == 0 {
+    let lease = effective_lease(lease_secs);
+    let taken = cache.try_claim(workspace_id, key, lease);
+    finish_claim(cache, workspace_id, key, taken)
+}
+
+/// [`claim`], with the backend's read and write moved off the caller's
+/// thread.
+///
+/// The request path uses this one. A shared backend's claim is up to
+/// six network round trips (three read-decide-write turns), and a
+/// Pingora worker that blocks on one stops serving every other
+/// connection assigned to it. A backend that answers `false` to
+/// [`IdempotencyCache::blocks_on_io`] runs inline, because a scheduler
+/// hop costs more than the mutex it would be hopping around.
+pub async fn claim_async(
+    cache: &Arc<dyn IdempotencyCache>,
+    workspace_id: &str,
+    key: &str,
+    lease_secs: u64,
+) -> ClaimState {
+    let lease = effective_lease(lease_secs);
+    if !cache.blocks_on_io() {
+        return finish_claim(
+            cache,
+            workspace_id,
+            key,
+            cache.try_claim(workspace_id, key, lease),
+        );
+    }
+    let taken = {
+        let cache = Arc::clone(cache);
+        let workspace_id = workspace_id.to_string();
+        let key = key.to_string();
+        match tokio::task::spawn_blocking(move || cache.try_claim(&workspace_id, &key, lease)).await
+        {
+            Ok(taken) => taken,
+            // The blocking pool is gone or the task panicked. Report
+            // the key as held rather than handing out a claim nothing
+            // wrote: an unowned claim would publish over whatever the
+            // real owner produces.
+            Err(_) => TryClaim::InFlight {
+                lease_expires_at_unix: now_unix().saturating_add(lease),
+            },
+        }
+    };
+    finish_claim(cache, workspace_id, key, taken)
+}
+
+/// Zero means "the caller did not choose", not "expire immediately".
+fn effective_lease(lease_secs: u64) -> u64 {
+    if lease_secs == 0 {
         DEFAULT_CLAIM_LEASE_SECS
     } else {
         lease_secs
-    };
-    match cache.try_claim(workspace_id, key, lease) {
+    }
+}
+
+/// Attach the RAII handle and record the outcome.
+///
+/// Only the arm that ends the request here records a `result`. The
+/// other two are answered further down (a replay, a wait, a 409) and
+/// recording at both places is what made the counter sum to two or
+/// three per request instead of one.
+fn finish_claim(
+    cache: &Arc<dyn IdempotencyCache>,
+    workspace_id: &str,
+    key: &str,
+    taken: TryClaim,
+) -> ClaimState {
+    let backend = cache.backend_label();
+    match taken {
         TryClaim::Claimed { owner, took_over } => {
             sbproxy_observe::metrics::record_idempotency_cache_result(
                 backend,
-                if took_over { "takeover" } else { "claimed" },
+                if took_over { "takeover" } else { "miss" },
             );
             ClaimState::Claimed(IdempotencyClaim {
                 cache: Arc::clone(cache),
@@ -442,12 +575,9 @@ pub fn claim(
         }
         TryClaim::InFlight {
             lease_expires_at_unix,
-        } => {
-            sbproxy_observe::metrics::record_idempotency_cache_result(backend, "in_flight");
-            ClaimState::InFlight {
-                lease_expires_at_unix,
-            }
-        }
+        } => ClaimState::InFlight {
+            lease_expires_at_unix,
+        },
         TryClaim::Completed(response) => ClaimState::Completed(response),
     }
 }
@@ -487,15 +617,19 @@ pub async fn await_completion(
             }
         };
         match state {
-            EntryState::Completed(response) => {
-                sbproxy_observe::metrics::record_idempotency_cache_result(backend, "coalesced");
-                return Some(*response);
-            }
+            // The caller records the outcome: a coalesced replay and a
+            // coalesced conflict are different answers and only the
+            // caller has the body hash that tells them apart.
+            EntryState::Completed(response) => return Some(*response),
             // The holder released without publishing, or its lease
             // lapsed. Either way there is no response coming and this
-            // request cannot produce one.
+            // request cannot produce one. Counted apart from
+            // `wait_timeout`: a budget that ran out means overlapping
+            // retries are outliving the wait, and a holder that vanished
+            // means requests are dying mid-flight. Same 409, opposite
+            // things to go look at.
             EntryState::Absent => {
-                sbproxy_observe::metrics::record_idempotency_cache_result(backend, "wait_timeout");
+                sbproxy_observe::metrics::record_idempotency_cache_result(backend, "abandoned");
                 return None;
             }
             EntryState::InFlight { .. } => {}
@@ -540,26 +674,31 @@ pub async fn check_request(
 
     let body_hash = hash_body(body);
     let start = std::time::Instant::now();
-    let claimed = claim(cache, workspace_id, &key, lease_secs);
+    let claimed = claim_async(cache, workspace_id, &key, lease_secs).await;
     let elapsed = start.elapsed().as_secs_f64();
     sbproxy_observe::metrics::record_idempotency_cache_duration(backend, elapsed);
 
-    let stored = match claimed {
+    // `miss` and `takeover` are recorded by the claim itself. Every
+    // other arm records exactly one value here, so the `result` label
+    // sums to one per request rather than to two or three.
+    let (stored, coalesced) = match claimed {
         ClaimState::Claimed(claim) => {
-            sbproxy_observe::metrics::record_idempotency_cache_result(backend, "miss");
             return IdempotencyOutcome::Miss { body_hash, claim };
         }
-        ClaimState::Completed(stored) => *stored,
+        ClaimState::Completed(stored) => (*stored, false),
         ClaimState::InFlight { .. } => {
             match await_completion(cache, workspace_id, &key, wait).await {
-                Some(stored) => stored,
+                Some(stored) => (stored, true),
                 None => return IdempotencyOutcome::InFlight,
             }
         }
     };
 
     if stored.request_body_hash == body_hash {
-        sbproxy_observe::metrics::record_idempotency_cache_result(backend, "hit");
+        sbproxy_observe::metrics::record_idempotency_cache_result(
+            backend,
+            if coalesced { "coalesced" } else { "hit" },
+        );
         IdempotencyOutcome::CacheHit(Box::new(stored))
     } else {
         sbproxy_observe::metrics::record_idempotency_cache_result(backend, "conflict");
@@ -588,6 +727,26 @@ pub struct RecordedResponse {
     pub ttl_secs: u64,
 }
 
+impl RecordedResponse {
+    /// Stamp the absolute expiry and hand back the row a backend
+    /// stores. The TTL here is the response's retention, hours long and
+    /// unrelated to the claim's lease.
+    fn into_cached(self) -> CachedResponse {
+        let ttl = if self.ttl_secs == 0 {
+            DEFAULT_TTL_SECS
+        } else {
+            self.ttl_secs
+        };
+        CachedResponse {
+            status: self.status,
+            headers: self.headers,
+            body: self.body,
+            request_body_hash: self.body_hash,
+            expires_at_unix: now_unix().saturating_add(ttl),
+        }
+    }
+}
+
 /// Publish the response captured after the handler chain finishes
 /// processing a claimed request, and release the claim.
 ///
@@ -595,23 +754,56 @@ pub struct RecordedResponse {
 /// does not release the key, and taking it by value is what makes that
 /// a compile-time fact rather than a convention.
 pub fn record_response(mut claim: IdempotencyClaim, recorded: RecordedResponse) {
-    let ttl = if recorded.ttl_secs == 0 {
-        DEFAULT_TTL_SECS
-    } else {
-        recorded.ttl_secs
-    };
-    let expires_at_unix = now_unix().saturating_add(ttl);
-    let resp = CachedResponse {
-        status: recorded.status,
-        headers: recorded.headers,
-        body: recorded.body,
-        request_body_hash: recorded.body_hash,
-        expires_at_unix,
-    };
-    claim.cache.complete(&claim, resp);
+    let resp = recorded.into_cached();
+    claim
+        .cache
+        .complete(&claim.workspace_id, &claim.key, claim.owner, resp);
     // Set after the publish, not before: `complete` may refuse a
     // superseded claim, and a claim that was refused is not this
     // caller's to release either. The successor owns the key now.
+    claim.published = true;
+}
+
+/// [`record_response`], with the backend's write kept off the caller's
+/// thread.
+///
+/// The request path uses this one, for the same reason [`claim_async`]
+/// exists: publishing to a shared backend is a read plus a conditional
+/// write, and the two places that publish are `response_body_filter`
+/// and the AI relay, both on a proxy worker that is serving other
+/// connections.
+///
+/// It detaches rather than awaiting because `response_body_filter` is
+/// one of Pingora's synchronous trait methods and has no await point to
+/// offer. What that costs is that a follower polling the key can see it
+/// as still held for a scheduler hop after the owner's response has
+/// gone out; the follower is already in a poll loop with seconds of
+/// budget, so it picks the answer up on its next turn.
+///
+/// A backend that answers `false` to [`IdempotencyCache::blocks_on_io`]
+/// publishes inline. There is nothing to detach from an in-process
+/// mutex, and running it inline is what keeps a caller that publishes
+/// and then looks from racing itself.
+pub fn record_response_detached(mut claim: IdempotencyClaim, recorded: RecordedResponse) {
+    let resp = recorded.into_cached();
+    if claim.cache.blocks_on_io() {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let cache = Arc::clone(&claim.cache);
+            let workspace_id = claim.workspace_id.clone();
+            let key = claim.key.clone();
+            let owner = claim.owner;
+            handle.spawn_blocking(move || cache.complete(&workspace_id, &key, owner, resp));
+            // Set here rather than after the write lands: the publish
+            // is this claim's one way out, and re-releasing it from the
+            // destructor would hand the key away underneath the write
+            // that is about to happen.
+            claim.published = true;
+            return;
+        }
+    }
+    claim
+        .cache
+        .complete(&claim.workspace_id, &claim.key, claim.owner, resp);
     claim.published = true;
 }
 
@@ -636,16 +828,22 @@ pub fn conflict_response() -> (StatusCode, &'static str, Vec<u8>) {
 /// Build the 409 in-flight body:
 /// `{"error":"ledger.idempotency_in_flight", ...}`.
 ///
-/// The answer to a retry that arrived while the original request is
-/// still being processed and did not finish inside the wait budget.
+/// The answer to a retry that arrived while the original request held
+/// the key and no response was stored inside the wait budget.
 /// `draft-ietf-httpapi-idempotency-key-header` names 409 for this case;
 /// the distinct error code is so a client can tell "retry this in a
 /// moment" from "you reused a key with a different body", which are the
 /// same status and opposite instructions.
+///
+/// The message covers both populations that land here, because the
+/// instruction is the same for both and a message that named only the
+/// first would be false for the second: the holder may still be
+/// working, or it may have ended without storing anything, in which
+/// case the retry is what takes the key over.
 pub fn in_flight_response() -> (StatusCode, &'static str, Vec<u8>) {
     let body = serde_json::json!({
         "error": "ledger.idempotency_in_flight",
-        "message": "A request with this Idempotency-Key is still being processed. Retry with the same key.",
+        "message": "A request with this Idempotency-Key is still in progress, or ended without storing a response. Retry with the same key.",
     });
     (
         StatusCode::CONFLICT,
@@ -851,31 +1049,43 @@ impl IdempotencyCache for InMemoryIdempotencyCache {
         TryClaim::Claimed { owner, took_over }
     }
 
-    fn complete(&self, claim: &IdempotencyClaim, response: CachedResponse) {
-        let key_pair = (claim.workspace_id.clone(), claim.key.clone());
+    fn complete(&self, workspace_id: &str, key: &str, owner: u128, response: CachedResponse) {
+        let now = now_unix();
+        let key_pair = (workspace_id.to_string(), key.to_string());
         let mut guard = self.inner.lock();
-        match guard.peek(&key_pair) {
-            Some(StoredEntry::InFlight { owner, .. }) if *owner == claim.owner => {
-                guard.put(key_pair, StoredEntry::Completed(response));
-            }
-            // Superseded: this owner's lease lapsed and another request
-            // took the key. Its answer, not ours, is the one waiters are
-            // owed.
-            _ => {
-                sbproxy_observe::metrics::record_idempotency_cache_result(
-                    self.backend_label(),
-                    "fenced",
-                );
-            }
+        let superseded = match guard.peek(&key_pair) {
+            // Somebody else holds a *live* claim: they took the key
+            // over and their answer is the one waiters are owed.
+            Some(StoredEntry::InFlight {
+                owner: stored,
+                lease_expires_at_unix,
+            }) => *stored != owner && *lease_expires_at_unix > now,
+            // A completed response is already stored. Never overwrite
+            // one, whoever wrote it.
+            Some(StoredEntry::Completed(stored)) => stored.expires_at_unix > now,
+            // Absent, an evicted row, a lapsed claim under any token:
+            // none of those is a successor, and the response in hand is
+            // the only answer this key has. An upstream slower than the
+            // lease lands here and must still cache, or every retry
+            // from this client is a fresh upstream call forever.
+            None => false,
+        };
+        if superseded {
+            sbproxy_observe::metrics::record_idempotency_cache_result(
+                self.backend_label(),
+                "fenced",
+            );
+            return;
         }
+        guard.put(key_pair, StoredEntry::Completed(response));
     }
 
-    fn release(&self, claim: &IdempotencyClaim) {
-        let key_pair = (claim.workspace_id.clone(), claim.key.clone());
+    fn release(&self, workspace_id: &str, key: &str, owner: u128) {
+        let key_pair = (workspace_id.to_string(), key.to_string());
         let mut guard = self.inner.lock();
         if matches!(
             guard.peek(&key_pair),
-            Some(StoredEntry::InFlight { owner, .. }) if *owner == claim.owner
+            Some(StoredEntry::InFlight { owner: stored, .. }) if *stored == owner
         ) {
             guard.pop(&key_pair);
         }
@@ -925,10 +1135,18 @@ pub struct KvIdempotencyCache {
     /// Precomputed `sbproxy:idem:<len>:<tenant>:<len>:<origin>` prefix.
     /// Built once so the request path only appends.
     key_prefix: String,
-    /// Cleared the first time the store refuses an atomic create.
-    single_flight: std::sync::atomic::AtomicBool,
-    /// Guards the one-time warning about that refusal.
-    warned: std::sync::Once,
+    /// Whether the wrapped store implements an atomic create.
+    ///
+    /// Asked once, at construction, and never again. It used to be an
+    /// `AtomicBool` cleared by the error arm of the claim write, which
+    /// made a single command timeout indistinguishable from a store
+    /// that does not have the primitive: one dropped connection
+    /// disarmed the fence for the lifetime of the process, after which
+    /// a stalled owner could overwrite its successor's response and
+    /// every retry for the next day replayed the wrong one. Whether a
+    /// backend can create a key atomically is a property of the
+    /// backend, not of one request's luck.
+    single_flight: bool,
 }
 
 /// Append one length-delimited segment to a storage key.
@@ -975,12 +1193,20 @@ impl KvIdempotencyCache {
         let mut key_prefix = String::from("sbproxy:idem");
         push_key_segment(&mut key_prefix, tenant_id);
         push_key_segment(&mut key_prefix, origin_id);
+        let single_flight = store.supports_atomic_create();
+        if !single_flight {
+            tracing::warn!(
+                prefix = %key_prefix,
+                "idempotency: this l2_store has no atomic create, so two simultaneous first \
+                 requests with one key will both reach the upstream; replay and conflict \
+                 detection still work. Use redis for cluster-wide single-flight."
+            );
+        }
         Self {
             store,
             ttl_secs: ttl,
             key_prefix,
-            single_flight: std::sync::atomic::AtomicBool::new(true),
-            warned: std::sync::Once::new(),
+            single_flight,
         }
     }
 
@@ -995,26 +1221,6 @@ impl KvIdempotencyCache {
 
     fn single_flight_available(&self) -> bool {
         self.single_flight
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Record, once, that this store cannot serialize concurrent first
-    /// requests, and keep counting every request it affects.
-    fn note_no_atomic_create(&self) {
-        self.single_flight
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        self.warned.call_once(|| {
-            tracing::warn!(
-                prefix = %self.key_prefix,
-                "idempotency: this l2_store has no atomic create, so two simultaneous first \
-                 requests with one key will both reach the upstream; replay and conflict \
-                 detection still work. Use redis for cluster-wide single-flight."
-            );
-        });
-        sbproxy_observe::metrics::record_idempotency_cache_result(
-            self.backend_label(),
-            "single_flight_unsupported",
-        );
     }
 
     /// The claim a degraded store can still hand out: unfenced, and
@@ -1050,17 +1256,34 @@ impl IdempotencyCache for KvIdempotencyCache {
         let Some(entry) = parse_entry(&raw) else {
             return EntryState::Absent;
         };
-        let now = now_unix();
-        if !entry.is_live(now) {
-            // Best-effort eviction: ignore errors because the
-            // sweeper / TTL expiry will catch it eventually.
-            let _ = self.store.delete(storage_key.as_bytes());
-            return EntryState::Absent;
-        }
-        entry.state(now)
+        // Deliberately no eviction here. `peek` is the waiter's poll
+        // path, so it runs every five to fifty milliseconds per
+        // follower, and a bare `delete` is unconditional: between
+        // reading a lapsed row and deleting it, a retry can win the
+        // takeover and become the live owner, and the delete then
+        // throws that live claim away. The key reads as absent, the
+        // next request claims it and reaches the upstream a second
+        // time, and the successor's publish is fenced out by a row that
+        // is no longer its own. `release` documents exactly this hazard
+        // and answers it with a compare-and-swap; a read-only method
+        // has no business deleting anything at all. Dead rows are
+        // cleaned up by the release path and by the store's own TTL.
+        entry.state(now_unix())
     }
 
     fn try_claim(&self, workspace_id: &str, key: &str, lease_secs: u64) -> TryClaim {
+        if !self.single_flight_available() {
+            // A store with no atomic create cannot serialize two
+            // simultaneous first requests, and no amount of retrying
+            // builds that guarantee on top of one. Counted per affected
+            // request; the warning naming the store was emitted once at
+            // construction.
+            sbproxy_observe::metrics::record_idempotency_cache_result(
+                self.backend_label(),
+                "single_flight_unsupported",
+            );
+            return self.unfenced_claim();
+        }
         let storage_key = self.build_key(workspace_id, key);
         // Bounded retries. Each turn either answers or loses one race,
         // and losing three in a row means another request is making
@@ -1122,11 +1345,22 @@ impl IdempotencyCache for KvIdempotencyCache {
                 // published, in which case this caller replays instead
                 // of waiting.
                 Ok(false) => continue,
+                // A transient store failure: a command timeout, a
+                // dropped connection, a failover blip. It is NOT
+                // evidence that the store cannot create atomically,
+                // and treating it as such used to latch single-flight
+                // off for the lifetime of the process on one bad
+                // packet, which disarmed the fence for every later
+                // request. Whether the store has the primitive at all
+                // is a static property of the backend, asked once at
+                // construction. Count the failure and take another
+                // turn.
                 Err(_) => {
-                    // Either the store has no atomic create, or it
-                    // failed. Both mean this claim is unfenced.
-                    self.note_no_atomic_create();
-                    return self.unfenced_claim();
+                    sbproxy_observe::metrics::record_idempotency_cache_result(
+                        self.backend_label(),
+                        "error",
+                    );
+                    continue;
                 }
             }
         }
@@ -1135,8 +1369,8 @@ impl IdempotencyCache for KvIdempotencyCache {
         }
     }
 
-    fn complete(&self, claim: &IdempotencyClaim, response: CachedResponse) {
-        let storage_key = self.build_key(&claim.workspace_id, &claim.key);
+    fn complete(&self, workspace_id: &str, key: &str, owner: u128, response: CachedResponse) {
+        let storage_key = self.build_key(workspace_id, key);
         let Ok(payload) = serde_json::to_vec(&StoredEntry::Completed(response)) else {
             return;
         };
@@ -1167,23 +1401,62 @@ impl IdempotencyCache for KvIdempotencyCache {
                 return;
             }
         };
-        let still_ours = matches!(
-            current.as_deref().and_then(parse_entry),
-            Some(StoredEntry::InFlight { owner, .. }) if owner == claim.owner
-        );
-        if !still_ours {
-            // This owner stalled past its lease and somebody else took
-            // the key. Publishing now would overwrite the successor's
-            // answer with one nobody is waiting for.
+        let now = now_unix();
+        let Some(raw) = current else {
+            // The claim row is gone. On Redis it is gone at
+            // `lease_secs`, because the lease is the `SET NX EX` TTL,
+            // and an upstream slower than the lease is the ordinary
+            // case this cache exists for: an AI completion, a payment
+            // with a 3DS step-up. Absent is not superseded, so publish.
+            //
+            // Conditionally, though. A successor may claim the key
+            // between this read and this write, and `put_if_absent`
+            // is what makes that a lost race rather than a clobbered
+            // claim. Losing it means somebody else owns the key and
+            // this response is no longer the one waiters are owed.
+            match self
+                .store
+                .put_if_absent_with_ttl(storage_key.as_bytes(), &payload, self.ttl_secs)
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    sbproxy_observe::metrics::record_idempotency_cache_result(
+                        self.backend_label(),
+                        "fenced",
+                    );
+                }
+                Err(_) => {
+                    sbproxy_observe::metrics::record_idempotency_cache_result(
+                        self.backend_label(),
+                        "error",
+                    );
+                }
+            }
+            return;
+        };
+        let superseded = match parse_entry(&raw) {
+            // A different request holds a *live* claim: it took the key
+            // over and its answer is the one waiters are owed. A lapsed
+            // claim under any token is not a successor, and neither is
+            // this owner's own row.
+            Some(StoredEntry::InFlight {
+                owner: stored,
+                lease_expires_at_unix,
+            }) => stored != owner && lease_expires_at_unix > now,
+            // A completed response is already stored. Never overwrite
+            // one, whoever wrote it: the client has already been told
+            // that answer.
+            Some(StoredEntry::Completed(stored)) => stored.expires_at_unix > now,
+            // An unparseable row is not a successor either.
+            None => false,
+        };
+        if superseded {
             sbproxy_observe::metrics::record_idempotency_cache_result(
                 self.backend_label(),
                 "fenced",
             );
             return;
         }
-        let Some(raw) = current else {
-            return;
-        };
         match self.store.compare_and_swap_with_ttl(
             storage_key.as_bytes(),
             &raw,
@@ -1191,8 +1464,8 @@ impl IdempotencyCache for KvIdempotencyCache {
             self.ttl_secs,
         ) {
             Ok(true) => {}
-            // Lost between the read and the swap: the same fence, one
-            // instant later.
+            // Lost between the read and the swap: somebody wrote the
+            // key one instant later, so the same fence applies.
             Ok(false) => {
                 sbproxy_observe::metrics::record_idempotency_cache_result(
                     self.backend_label(),
@@ -1208,14 +1481,14 @@ impl IdempotencyCache for KvIdempotencyCache {
         }
     }
 
-    fn release(&self, claim: &IdempotencyClaim) {
-        let storage_key = self.build_key(&claim.workspace_id, &claim.key);
+    fn release(&self, workspace_id: &str, key: &str, owner: u128) {
+        let storage_key = self.build_key(workspace_id, key);
         let Ok(Some(raw)) = self.store.get(storage_key.as_bytes()) else {
             return;
         };
         let still_ours = matches!(
             parse_entry(&raw),
-            Some(StoredEntry::InFlight { owner, .. }) if owner == claim.owner
+            Some(StoredEntry::InFlight { owner: stored, .. }) if stored == owner
         );
         if !still_ours {
             return;
@@ -1227,7 +1500,7 @@ impl IdempotencyCache for KvIdempotencyCache {
         // swap can only replace the exact bytes that were read, and the
         // row it leaves is immediately takeable by anyone.
         let lapsed = StoredEntry::InFlight {
-            owner: claim.owner,
+            owner,
             lease_expires_at_unix: 0,
         };
         let Ok(payload) = serde_json::to_vec(&lapsed) else {
@@ -1243,6 +1516,11 @@ impl IdempotencyCache for KvIdempotencyCache {
 
     fn backend_label(&self) -> &'static str {
         "kv"
+    }
+
+    fn blocks_on_io(&self) -> bool {
+        // Every call here is a round trip to the shared store.
+        true
     }
 }
 
@@ -1388,7 +1666,7 @@ mod tests {
         let ClaimState::Claimed(held) = claim(&cache, "ws_a", "expiring-key", LEASE) else {
             panic!("expected to take the key");
         };
-        cache.complete(&held, stale);
+        cache.complete("ws_a", "expiring-key", held.owner(), stale);
         std::mem::forget(held);
 
         match check_request(&cache, "ws_a", &headers, b"x", LEASE, wait()).await {
@@ -1840,6 +2118,11 @@ mod tests {
             IdempotencyOutcome::Miss { claim, .. } => drop(claim),
             other => panic!("tenant B must not read tenant A's entry, got {other:?}"),
         }
+        // The shared backend detaches its release onto the blocking
+        // pool rather than parking a proxy worker inside a destructor,
+        // so the key comes free a scheduler hop later. The next
+        // assertion is about namespacing, not about that hop.
+        settle_release(&tenant_b, "", "order-1234").await;
 
         // And a differing body is tenant B's own miss, not a 409 for a
         // key it never used.
@@ -2019,15 +2302,10 @@ mod tests {
             let TryClaim::Claimed { owner, .. } = cache.try_claim("ws", &key, 60) else {
                 panic!("expected to take {key}");
             };
-            let held = IdempotencyClaim {
-                cache: Arc::clone(&cache),
-                workspace_id: "ws".to_string(),
-                key: key.clone(),
-                owner,
-                published: false,
-            };
             cache.complete(
-                &held,
+                "ws",
+                &key,
+                owner,
                 CachedResponse {
                     status: 200,
                     headers: Vec::new(),
@@ -2036,7 +2314,6 @@ mod tests {
                     expires_at_unix: future,
                 },
             );
-            std::mem::forget(held);
         }
         assert_eq!(concrete.inner.lock().len(), cap);
         // The most-recent key survived; an early evicted key is gone.
@@ -2045,5 +2322,361 @@ mod tests {
             EntryState::Completed(_)
         ));
         assert_eq!(cache.peek("ws", "key-0"), EntryState::Absent);
+    }
+
+    // --- WOR-2606 fix round: the claim / response lifetimes ---
+
+    /// A store that fails the first `n` atomic creates and is healthy
+    /// afterwards. A command timeout, a dropped connection, and a
+    /// Redis failover blip all arrive at the caller exactly like this.
+    struct FlakyCreateStore {
+        inner: sbproxy_platform::storage::MemoryKVStore,
+        failures_left: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FlakyCreateStore {
+        fn new(failures: usize) -> Self {
+            Self {
+                inner: sbproxy_platform::storage::MemoryKVStore::new(0),
+                failures_left: std::sync::atomic::AtomicUsize::new(failures),
+            }
+        }
+    }
+
+    impl KVStore for FlakyCreateStore {
+        fn get(&self, key: &[u8]) -> anyhow::Result<Option<bytes::Bytes>> {
+            self.inner.get(key)
+        }
+        fn put(&self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
+            self.inner.put(key, value)
+        }
+        fn delete(&self, key: &[u8]) -> anyhow::Result<()> {
+            self.inner.delete(key)
+        }
+        fn scan_prefix(&self, prefix: &[u8]) -> anyhow::Result<Vec<(bytes::Bytes, bytes::Bytes)>> {
+            self.inner.scan_prefix(prefix)
+        }
+        fn put_with_ttl(&self, key: &[u8], value: &[u8], ttl: u64) -> anyhow::Result<()> {
+            self.inner.put_with_ttl(key, value, ttl)
+        }
+        fn compare_and_swap_with_ttl(
+            &self,
+            key: &[u8],
+            expected: &[u8],
+            value: &[u8],
+            ttl: u64,
+        ) -> anyhow::Result<bool> {
+            self.inner
+                .compare_and_swap_with_ttl(key, expected, value, ttl)
+        }
+        fn put_if_absent_with_ttl(
+            &self,
+            key: &[u8],
+            value: &[u8],
+            ttl: u64,
+        ) -> anyhow::Result<bool> {
+            if self
+                .failures_left
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                anyhow::bail!("transient: command timed out");
+            }
+            self.inner.put_if_absent_with_ttl(key, value, ttl)
+        }
+        fn supports_atomic_create(&self) -> bool {
+            true
+        }
+    }
+
+    fn response(body: &[u8], status: u16) -> CachedResponse {
+        CachedResponse {
+            status,
+            headers: vec![],
+            body: body.to_vec(),
+            request_body_hash: hash_body(b"req"),
+            expires_at_unix: now_unix() + 600,
+        }
+    }
+
+    /// Poll until a detached release has landed. The KV backend's
+    /// destructor hands the release to the blocking pool rather than
+    /// parking a proxy worker on a network round trip, so a test that
+    /// drops a claim and immediately looks is racing it.
+    async fn settle_release(cache: &Arc<dyn IdempotencyCache>, workspace: &str, key: &str) {
+        for _ in 0..200 {
+            if cache.peek(workspace, key) == EntryState::Absent {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the release never landed for {key}");
+    }
+
+    /// The claim's lease and the response's retention are two different
+    /// lifetimes, and on Redis the lease *is* the row's TTL.
+    ///
+    /// An upstream slower than the lease is the ordinary case this
+    /// cache exists for: an AI completion, a payment with a 3DS
+    /// step-up. The owner claims at t=0 with `EX 60`, the store evicts
+    /// the claim at t=60, and the publish at t=90 used to read an
+    /// absent row, call it superseded, and discard the response. The
+    /// client's retry then missed and re-executed, and so did the one
+    /// after that, forever: strictly worse than the unconditional
+    /// write this replaced.
+    ///
+    /// The lease here is one real second because `MemoryKVStore` has no
+    /// clock to inject and one second is the smallest a seconds-valued
+    /// TTL can express.
+    #[tokio::test]
+    async fn a_publish_lands_after_the_claim_row_expired() {
+        let store = shared_store();
+        let cache: Arc<dyn IdempotencyCache> = Arc::new(kv_cache(&store, "t", "o"));
+
+        let ClaimState::Claimed(held) = claim(&cache, "ws", "slow", 1) else {
+            panic!("expected to take the key");
+        };
+        // The upstream outlives the lease. The claim row goes with it.
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        assert_eq!(
+            cache.peek("ws", "slow"),
+            EntryState::Absent,
+            "the claim row must have expired for this test to mean anything"
+        );
+
+        record_response(
+            held,
+            RecordedResponse {
+                status: 201,
+                headers: vec![],
+                body: b"charged".to_vec(),
+                body_hash: hash_body(b"req"),
+                ttl_secs: 600,
+            },
+        );
+
+        match cache.peek("ws", "slow") {
+            EntryState::Completed(stored) => assert_eq!(stored.body, b"charged"),
+            other => panic!("a slow upstream's response must still cache, got {other:?}"),
+        }
+    }
+
+    /// The other half of the same rule: publishing into an absent row
+    /// is unconditional only until somebody else owns the key. A
+    /// successor that already answered must not be clobbered by the
+    /// owner it replaced.
+    #[tokio::test]
+    async fn a_stalled_owner_cannot_clobber_a_successors_published_response() {
+        let store = shared_store();
+        let cache: Arc<dyn IdempotencyCache> = Arc::new(kv_cache(&store, "t", "o"));
+
+        // The stalled owner: its lease is already spent.
+        let TryClaim::Claimed { owner: stale, .. } = cache.try_claim("ws", "k", 0) else {
+            panic!("expected to take the key");
+        };
+        // The successor takes it over and answers.
+        let TryClaim::Claimed {
+            owner: fresh,
+            took_over,
+        } = cache.try_claim("ws", "k", 60)
+        else {
+            panic!("the successor must be able to take a lapsed key");
+        };
+        assert!(took_over, "taking a lapsed row over must be counted as one");
+        cache.complete("ws", "k", fresh, response(b"fresh", 201));
+
+        // The stalled owner wakes up and publishes.
+        cache.complete("ws", "k", stale, response(b"stale", 500));
+
+        match cache.peek("ws", "k") {
+            EntryState::Completed(stored) => assert_eq!(
+                stored.body, b"fresh",
+                "the stalled owner overwrote the successor's answer"
+            ),
+            other => panic!("expected the successor's response, got {other:?}"),
+        }
+    }
+
+    /// `peek` is the waiter's poll path: every follower runs it every
+    /// five to fifty milliseconds. It used to delete a dead row
+    /// unconditionally, which is the exact hazard `release` documents
+    /// and refuses to take.
+    ///
+    /// The race it opened: follower F reads owner A's lapsed row;
+    /// retry R wins the takeover a millisecond later and is now the
+    /// live owner; F's delete lands a millisecond after that and
+    /// removes R's live claim. The key reads as absent, the next
+    /// request claims it and charges the card a second time, and R's
+    /// own publish is fenced out by a row that is no longer its own.
+    ///
+    /// Deterministic form of the same property: a read-only method
+    /// leaves the row it read alone, so the successor's
+    /// compare-and-swap still has the exact bytes it needs.
+    #[tokio::test]
+    async fn a_peek_never_deletes_the_row_it_read() {
+        let store = shared_store();
+        let cache = kv_cache(&store, "t", "o");
+        let storage_key = cache.build_key("ws", "k");
+
+        // A claim whose holder never came back.
+        let TryClaim::Claimed { .. } = cache.try_claim("ws", "k", 0) else {
+            panic!("expected to take the key");
+        };
+
+        assert_eq!(
+            cache.peek("ws", "k"),
+            EntryState::Absent,
+            "a lapsed claim must not keep answering in-flight"
+        );
+        assert!(
+            store.get(storage_key.as_bytes()).unwrap().is_some(),
+            "a read-only poll deleted the row it read"
+        );
+
+        // And the consequence: the successor still takes it over,
+        // through the compare-and-swap, rather than racing a delete.
+        match cache.try_claim("ws", "k", 60) {
+            TryClaim::Claimed { took_over, .. } => assert!(
+                took_over,
+                "the successor claimed an empty key, so the row was gone"
+            ),
+            other => panic!("the lapsed key must be takeable, got {other:?}"),
+        }
+    }
+
+    /// One transient store failure used to latch single-flight off for
+    /// the lifetime of the process, and the fence with it.
+    ///
+    /// After the latch, `complete` reverted to an unconditional write:
+    /// an owner that stalled past its lease overwrote the answer its
+    /// successor had already sent the client, and every retry for the
+    /// next day replayed the wrong one. One dropped packet bought that.
+    /// Whether a store can create atomically is a property of the
+    /// store, asked once at construction, not something inferred from
+    /// a request's luck.
+    #[tokio::test]
+    async fn a_transient_store_failure_does_not_disarm_the_fence() {
+        let store: Arc<dyn KVStore> = Arc::new(FlakyCreateStore::new(1));
+        let cache = KvIdempotencyCache::new(Arc::clone(&store), DEFAULT_TTL_SECS, "t", "o");
+
+        // The first atomic create fails. The retry inside `try_claim`
+        // is what turns that into a claim rather than a disarmed fence.
+        match cache.try_claim("ws", "first", 60) {
+            TryClaim::Claimed { .. } => {}
+            other => panic!("a transient failure must not lose the claim, got {other:?}"),
+        }
+        assert!(
+            cache.single_flight_available(),
+            "one transient failure disarmed single-flight for the process"
+        );
+
+        // The fence is still doing its job: a stalled owner cannot
+        // overwrite its successor's published answer.
+        let TryClaim::Claimed { owner: stale, .. } = cache.try_claim("ws", "k", 0) else {
+            panic!("expected to take the key");
+        };
+        let TryClaim::Claimed { owner: fresh, .. } = cache.try_claim("ws", "k", 60) else {
+            panic!("the successor must take the lapsed key");
+        };
+        cache.complete("ws", "k", fresh, response(b"fresh", 201));
+        cache.complete("ws", "k", stale, response(b"stale", 500));
+
+        match cache.peek("ws", "k") {
+            EntryState::Completed(stored) => assert_eq!(
+                stored.body, b"fresh",
+                "the fence was disarmed by a transient failure"
+            ),
+            other => panic!("expected the successor's response, got {other:?}"),
+        }
+    }
+
+    /// A store that genuinely has no atomic create is detected once, at
+    /// construction, and every affected request is counted rather than
+    /// the detection being re-derived from each failed write.
+    #[tokio::test]
+    async fn a_store_without_atomic_create_degrades_once_and_says_so() {
+        struct NoAtomicCreate(sbproxy_platform::storage::MemoryKVStore);
+        impl KVStore for NoAtomicCreate {
+            fn get(&self, key: &[u8]) -> anyhow::Result<Option<bytes::Bytes>> {
+                self.0.get(key)
+            }
+            fn put(&self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
+                self.0.put(key, value)
+            }
+            fn delete(&self, key: &[u8]) -> anyhow::Result<()> {
+                self.0.delete(key)
+            }
+            fn scan_prefix(
+                &self,
+                prefix: &[u8],
+            ) -> anyhow::Result<Vec<(bytes::Bytes, bytes::Bytes)>> {
+                self.0.scan_prefix(prefix)
+            }
+            fn put_with_ttl(&self, key: &[u8], value: &[u8], ttl: u64) -> anyhow::Result<()> {
+                self.0.put_with_ttl(key, value, ttl)
+            }
+        }
+
+        let store: Arc<dyn KVStore> = Arc::new(NoAtomicCreate(
+            sbproxy_platform::storage::MemoryKVStore::new(0),
+        ));
+        let cache: Arc<dyn IdempotencyCache> =
+            Arc::new(KvIdempotencyCache::new(store, DEFAULT_TTL_SECS, "t", "o"));
+
+        // Degraded, and honest about it: replay still works, but two
+        // simultaneous first requests both get a claim.
+        assert!(matches!(
+            cache.try_claim("ws", "k", 60),
+            TryClaim::Claimed { .. }
+        ));
+        assert!(matches!(
+            cache.try_claim("ws", "k", 60),
+            TryClaim::Claimed { .. }
+        ));
+
+        let ClaimState::Claimed(held) = claim(&cache, "ws", "k", 60) else {
+            panic!("a degraded store still hands out claims");
+        };
+        record_response(
+            held,
+            RecordedResponse {
+                status: 200,
+                headers: vec![],
+                body: b"replayable".to_vec(),
+                body_hash: hash_body(b"req"),
+                ttl_secs: 600,
+            },
+        );
+        match cache.peek("ws", "k") {
+            EntryState::Completed(stored) => assert_eq!(stored.body, b"replayable"),
+            other => panic!("replay must survive the degradation, got {other:?}"),
+        }
+    }
+
+    /// The destructor detaches the shared backend's release rather than
+    /// parking a proxy worker inside a `Drop` on a network round trip.
+    /// The key still comes free; it comes free a scheduler hop later.
+    #[tokio::test]
+    async fn a_dropped_kv_claim_still_releases_the_key() {
+        let store = shared_store();
+        let cache: Arc<dyn IdempotencyCache> = Arc::new(kv_cache(&store, "t", "o"));
+        assert!(
+            cache.blocks_on_io(),
+            "the shared backend must declare that it blocks"
+        );
+
+        let ClaimState::Claimed(held) = claim(&cache, "ws", "abandoned", 60) else {
+            panic!("expected to take the key");
+        };
+        assert!(matches!(
+            cache.peek("ws", "abandoned"),
+            EntryState::InFlight { .. }
+        ));
+        drop(held);
+        settle_release(&cache, "ws", "abandoned").await;
+        assert!(matches!(
+            claim(&cache, "ws", "abandoned", 60),
+            ClaimState::Claimed(_)
+        ));
     }
 }

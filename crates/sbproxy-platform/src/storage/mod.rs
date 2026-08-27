@@ -84,6 +84,24 @@ pub trait KVStore: Send + Sync + 'static {
         anyhow::bail!("put_if_absent_with_ttl: not supported by this backend")
     }
 
+    /// Whether [`Self::put_if_absent_with_ttl`] is implemented on this
+    /// backend, asked without writing anything.
+    ///
+    /// A caller building single-flight has to know which mode it is in
+    /// *before* the first request, and it cannot learn that from a
+    /// failed write: a command timeout and an unimplemented primitive
+    /// both arrive as `Err`, and a caller that reads the first as the
+    /// second disarms itself permanently on one dropped packet. Support
+    /// is a property of the backend, so it is answered by the backend
+    /// rather than inferred from one request's luck.
+    ///
+    /// Overriding [`Self::put_if_absent_with_ttl`] without overriding
+    /// this leaves the caller in the degraded mode it would have used
+    /// anyway, which is the safe direction for a mistake to point.
+    fn supports_atomic_create(&self) -> bool {
+        false
+    }
+
     /// Atomically increment the integer counter stored at `key` and ensure
     /// the key's TTL is at least `ttl_secs` seconds. Returns the post-increment
     /// value.

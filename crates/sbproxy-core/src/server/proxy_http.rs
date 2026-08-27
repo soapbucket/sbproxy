@@ -1034,6 +1034,92 @@ fn verify_graphql_inbound_body_binding(
 /// `upstream_request_filter`. This late path preserves the cached response
 /// payload and conflict semantics while ensuring an older entry never bypasses
 /// the current validation rules.
+/// Everything `response_body_filter` has in hand when a claimed
+/// request's response ends, each part `None` when that part was never
+/// captured (WOR-2609).
+///
+/// Grouped so the publish decision is one named function with one
+/// argument rather than a six-tuple inline in a two-thousand-line
+/// filter, which is what made the seam untestable in process.
+pub(crate) struct IdempotencyPublishParts {
+    /// The captured response body, absent when the response outgrew
+    /// `max_response_body_bytes` and streamed uncached.
+    pub(crate) body: Option<bytes::BytesMut>,
+    /// The captured status.
+    pub(crate) status: Option<u16>,
+    /// The captured response headers.
+    pub(crate) headers: Option<Vec<(String, String)>>,
+    /// The claim this request took, absent once a disengage path has
+    /// dropped it.
+    pub(crate) claim: Option<sbproxy_middleware::idempotency::IdempotencyClaim>,
+    /// The origin's response TTL, absent when the origin is gone from
+    /// under a reload.
+    pub(crate) ttl_secs: Option<u64>,
+    /// SHA-256 of the request body this response answers.
+    pub(crate) body_hash: [u8; 32],
+}
+
+/// What the publish decision did, so a test can name it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum IdempotencyPublish {
+    /// The response was stored under the claim.
+    Published,
+    /// Something was missing, so the claim was released instead of
+    /// published and the key is free for the client's retry.
+    ReleasedIncomplete,
+    /// No claim was held; nothing to do.
+    NoClaim,
+}
+
+/// Publish a claimed request's captured response, or release the claim.
+///
+/// This is the proxy path's publish seam, and it is a named function
+/// rather than an inline block because nothing in process reached it
+/// before: the only coverage of a claimed request's round trip through
+/// a live proxy is `e2e/tests/idempotency.rs`, and a future edit that
+/// let `claim` be `None` while the other three were `Some` would
+/// silently stop caching every proxied response with thirteen thousand
+/// unit tests still green.
+///
+/// All five parts have to be present. When any is missing the claim is
+/// dropped on the spot rather than left to time out, so a partial
+/// capture costs the client one retry instead of a lease of 409s.
+pub(crate) fn publish_captured_idempotent_response(
+    parts: IdempotencyPublishParts,
+) -> IdempotencyPublish {
+    let IdempotencyPublishParts {
+        body,
+        status,
+        headers,
+        claim,
+        ttl_secs,
+        body_hash,
+    } = parts;
+    let Some(claim) = claim else {
+        return IdempotencyPublish::NoClaim;
+    };
+    let (Some(body), Some(status), Some(headers), Some(ttl_secs)) =
+        (body, status, headers, ttl_secs)
+    else {
+        // Dropping the handle releases the key. Explicit rather than
+        // implicit so the reason is in the code and not only in a
+        // comment about what falls out of scope.
+        drop(claim);
+        return IdempotencyPublish::ReleasedIncomplete;
+    };
+    sbproxy_middleware::idempotency::record_response_detached(
+        claim,
+        sbproxy_middleware::idempotency::RecordedResponse {
+            status,
+            headers,
+            body: body.to_vec(),
+            body_hash,
+            ttl_secs,
+        },
+    );
+    IdempotencyPublish::Published
+}
+
 fn engage_validated_graphql_idempotency(
     request_headers: &http::HeaderMap,
     method: &http::Method,
@@ -7357,28 +7443,20 @@ impl ProxyHttp for SbProxy {
                     // left to time out. Taking it here drops it on the
                     // spot when the tuple does not match (WOR-2609).
                     let claim = ctx.idempotency_claim.take();
-                    if let (Some(buf), Some(status), Some(headers), Some(claim)) =
-                        (buf, status, headers, claim)
-                    {
-                        let pipeline = ctx.pipeline.clone();
-                        let ttl = ctx
-                            .origin_idx
-                            .and_then(|i| pipeline.idempotencies.get(i))
-                            .and_then(|opt| opt.as_ref())
-                            .map(|idem| idem.ttl_secs);
-                        if let Some(ttl_secs) = ttl {
-                            sbproxy_middleware::idempotency::record_response(
-                                claim,
-                                sbproxy_middleware::idempotency::RecordedResponse {
-                                    status,
-                                    headers,
-                                    body: buf.to_vec(),
-                                    body_hash,
-                                    ttl_secs,
-                                },
-                            );
-                        }
-                    }
+                    let pipeline = ctx.pipeline.clone();
+                    let ttl = ctx
+                        .origin_idx
+                        .and_then(|i| pipeline.idempotencies.get(i))
+                        .and_then(|opt| opt.as_ref())
+                        .map(|idem| idem.ttl_secs);
+                    publish_captured_idempotent_response(IdempotencyPublishParts {
+                        body: buf,
+                        status,
+                        headers,
+                        claim,
+                        ttl_secs: ttl,
+                        body_hash,
+                    });
                 }
             }
         }
@@ -8971,6 +9049,122 @@ fn apply_response_status_override(
         if reason.is_some() {
             response.set_reason_phrase(reason).ok();
         }
+    }
+}
+
+#[cfg(test)]
+mod idempotency_publish_seam_tests {
+    use super::*;
+    use sbproxy_middleware::idempotency::{
+        claim, ClaimState, EntryState, IdempotencyCache, InMemoryIdempotencyCache,
+    };
+    use std::sync::Arc;
+
+    fn cache() -> Arc<dyn IdempotencyCache> {
+        Arc::new(InMemoryIdempotencyCache::new())
+    }
+
+    fn parts(held: sbproxy_middleware::idempotency::IdempotencyClaim) -> IdempotencyPublishParts {
+        IdempotencyPublishParts {
+            body: Some(bytes::BytesMut::from(&b"{\"ok\":true}"[..])),
+            status: Some(201),
+            headers: Some(vec![(
+                "content-type".to_string(),
+                "application/json".to_string(),
+            )]),
+            claim: Some(held),
+            ttl_secs: Some(600),
+            body_hash: sbproxy_middleware::idempotency::hash_body(b"req"),
+        }
+    }
+
+    /// WOR-2609: the proxy path's publish seam, in process.
+    ///
+    /// The only thing that asserted a claimed request's round trip
+    /// through a live proxy was `e2e/tests/idempotency.rs`, which no
+    /// per-PR lane runs. A future edit that let one of the five parts
+    /// be `None` while the others were present would silently stop
+    /// caching every proxied response with thirteen thousand unit tests
+    /// still green, so the decision is a named function and this names
+    /// it back.
+    #[tokio::test]
+    async fn a_complete_capture_publishes_under_the_claim() {
+        let cache = cache();
+        let ClaimState::Claimed(held) = claim(&cache, "ws", "k", 60) else {
+            panic!("expected to take the key");
+        };
+        assert_eq!(
+            publish_captured_idempotent_response(parts(held)),
+            IdempotencyPublish::Published
+        );
+        match cache.peek("ws", "k") {
+            EntryState::Completed(stored) => {
+                assert_eq!(stored.status, 201);
+                assert_eq!(stored.body, b"{\"ok\":true}");
+            }
+            other => panic!("the captured response was not published, got {other:?}"),
+        }
+    }
+
+    /// A partial capture releases the key on the spot instead of
+    /// leaving the client's retries to answer 409 for the rest of the
+    /// lease. One missing part per case, because the guard is an
+    /// all-or-nothing tuple and a test that only drops one part cannot
+    /// see the arity change that broke it.
+    #[tokio::test]
+    async fn a_partial_capture_releases_rather_than_publishing() {
+        for (label, mutate) in [
+            (
+                "no body",
+                Box::new(|p: &mut IdempotencyPublishParts| p.body = None)
+                    as Box<dyn Fn(&mut IdempotencyPublishParts)>,
+            ),
+            (
+                "no status",
+                Box::new(|p: &mut IdempotencyPublishParts| p.status = None),
+            ),
+            (
+                "no headers",
+                Box::new(|p: &mut IdempotencyPublishParts| p.headers = None),
+            ),
+            (
+                "no ttl",
+                Box::new(|p: &mut IdempotencyPublishParts| p.ttl_secs = None),
+            ),
+        ] {
+            let cache = cache();
+            let ClaimState::Claimed(held) = claim(&cache, "ws", "k", 60) else {
+                panic!("expected to take the key");
+            };
+            let mut p = parts(held);
+            mutate(&mut p);
+            assert_eq!(
+                publish_captured_idempotent_response(p),
+                IdempotencyPublish::ReleasedIncomplete,
+                "{label}: a partial capture must not publish"
+            );
+            assert_eq!(
+                cache.peek("ws", "k"),
+                EntryState::Absent,
+                "{label}: the key must be free for the client's retry"
+            );
+        }
+    }
+
+    /// A disengage path that already dropped the claim leaves nothing
+    /// to publish and nothing to release.
+    #[tokio::test]
+    async fn no_claim_is_not_a_publish() {
+        let cache = cache();
+        let ClaimState::Claimed(held) = claim(&cache, "ws", "k", 60) else {
+            panic!("expected to take the key");
+        };
+        let mut p = parts(held);
+        p.claim = None;
+        assert_eq!(
+            publish_captured_idempotent_response(p),
+            IdempotencyPublish::NoClaim
+        );
     }
 }
 
