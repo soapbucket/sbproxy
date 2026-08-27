@@ -113,7 +113,7 @@ not claim persistence across a restart.
 
 ### Employee-scoped chargeback: not ported
 
-The enterprise source's per-employee rollup (behind
+The per-employee rollup (behind
 `#[cfg(feature = "employee-binding")]`, keyed by SSO subject with a
 four-level hierarchical budget walk) is not ported. `employee_binding`
 is being rescoped on a separate branch; this port does not
