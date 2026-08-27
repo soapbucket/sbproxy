@@ -204,8 +204,14 @@ impl Drop for OpenAiFixture {
 /// after the accept, before the proxy's request has landed, and the read
 /// budget is never the thing that bounds the read.
 fn read_complete_request(stream: &mut TcpStream) -> Option<Vec<u8>> {
-    stream.set_nonblocking(false).ok()?;
-    stream.set_read_timeout(Some(FIXTURE_IO_TIMEOUT)).ok()?;
+    if let Err(error) = stream.set_nonblocking(false) {
+        eprintln!("upstream fixture could not clear an accepted socket's O_NONBLOCK: {error}");
+        return None;
+    }
+    if let Err(error) = stream.set_read_timeout(Some(FIXTURE_IO_TIMEOUT)) {
+        eprintln!("upstream fixture could not set an accepted socket's read budget: {error}");
+        return None;
+    }
     match read_bounded_http_request(stream) {
         Ok((request, RequestReadOutcome::Complete)) => Some(request),
         Ok((request, outcome)) => {
@@ -262,7 +268,9 @@ fn http_request_is_complete(request: &[u8]) -> bool {
     // The proxy forwards a rewritten AI body chunked, with no
     // Content-Length, so the terminating zero-length chunk is the only
     // end marker there is. Without this arm the reader waits out the whole
-    // read budget on every request that arrives.
+    // read budget on every request that arrives. What this does not
+    // recognize is a trailer section after the terminator; the proxy sends
+    // none, and a request carrying one would read as unfinished.
     let chunked = headers.lines().any(|line| {
         line.split_once(':').is_some_and(|(name, value)| {
             name.trim().eq_ignore_ascii_case("transfer-encoding")
@@ -1289,6 +1297,79 @@ fn group_f_bounded_child_output_scans_beyond_retention_and_across_chunks() {
         .expect_err("the full-stream private marker must reject captured output");
     assert_private_markers_absent(failure.as_bytes(), "bounded scanner failure")
         .expect("scanner failures must remain sanitized");
+}
+
+/// The fixture answers a connection only when this says the request
+/// ended, and answering early is what turned a slow delivery into a 502
+/// under load. Framing is pure byte-slice logic, so pin it here where a
+/// regression fails deterministically instead of once in 800 requests.
+#[test]
+fn group_f_fixture_request_framing_follows_http_body_rules() {
+    let cases: &[(&str, &[u8], bool)] = &[
+        (
+            "headers still arriving",
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: wire\r\n",
+            false,
+        ),
+        (
+            "no framing header means the body ended at the header terminator",
+            b"GET /v1/models HTTP/1.1\r\nHost: wire\r\n\r\n",
+            true,
+        ),
+        (
+            "content-length satisfied exactly",
+            b"POST /v1 HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello",
+            true,
+        ),
+        (
+            "content-length one byte short",
+            b"POST /v1 HTTP/1.1\r\nContent-Length: 5\r\n\r\nhell",
+            false,
+        ),
+        (
+            "content-length zero needs no body",
+            b"POST /v1 HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
+            true,
+        ),
+        (
+            "content-length header name is case insensitive",
+            b"POST /v1 HTTP/1.1\r\ncontent-length: 2\r\n\r\nhi",
+            true,
+        ),
+        (
+            "chunked with the terminating zero-length chunk",
+            b"POST /v1 HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+            true,
+        ),
+        (
+            "chunked still mid-body",
+            b"POST /v1 HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n",
+            false,
+        ),
+        (
+            "chunked with no body bytes yet",
+            b"POST /v1 HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+            false,
+        ),
+        (
+            "chunked header name and value are case insensitive",
+            b"POST /v1 HTTP/1.1\r\ntransfer-encoding: Chunked\r\n\r\n0\r\n\r\n",
+            true,
+        ),
+        (
+            "chunked outranks a satisfied content-length",
+            b"POST /v1 HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\nhello",
+            false,
+        ),
+    ];
+
+    for (name, request, expected) in cases {
+        assert_eq!(
+            http_request_is_complete(request),
+            *expected,
+            "request framing case: {name}"
+        );
+    }
 }
 
 #[test]
