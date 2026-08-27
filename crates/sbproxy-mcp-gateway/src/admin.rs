@@ -116,6 +116,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_in_process_mount_does_not_serve_status_on_the_public_origin() {
+        // Inside sbproxy the whole broker route tree is dispatched
+        // before the resource-server check, and the OAuth routes have
+        // to stay unauthenticated for the flow to work, so mounting
+        // this route there tells anyone who asks which security
+        // controls are off.
+        let store = InMemorySessionStore::arc(Duration::from_secs(60));
+        let app = crate::router_with_security_context(
+            Arc::new(McpGatewayConfig::default()),
+            store,
+            crate::McpSecurityContext::in_process(),
+        );
+        let req = Request::builder()
+            .uri("/mcp/oauth/admin/status")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn status_reports_par_when_configured() {
         let store = InMemorySessionStore::arc(Duration::from_secs(60));
         let par_store: Arc<dyn sbproxy_storage::EphemeralKv> = crate::LocalStore::arc();

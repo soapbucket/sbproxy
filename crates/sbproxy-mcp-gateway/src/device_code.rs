@@ -65,6 +65,96 @@ const USER_CODE_LEN: usize = 8;
 /// intervals frustrate humans waiting at the CLI prompt.
 const SLOW_DOWN_INTERVAL_CAP_SECS: u64 = 60;
 
+// --- Consent-form CSRF defense ---
+
+/// How long a `/verify` form token stays usable.
+///
+/// Long enough for a human to read a code off a device screen and type
+/// it, short enough that a token captured from a stale tab is useless.
+const VERIFY_FORM_TOKEN_TTL: Duration = Duration::from_secs(600);
+
+/// Hidden form field carrying the per-form token.
+const VERIFY_FORM_TOKEN_FIELD: &str = "form_token";
+
+/// Mint a single-use form token for `subject` and store it.
+///
+/// The token is random, and the row records the subject that was
+/// signed in when the form was rendered, so a token minted for one user
+/// cannot approve as another.
+async fn mint_verify_form_token(app: &AppState, subject: &str) -> Option<String> {
+    let mut raw = [0_u8; 32];
+    rand::thread_rng().fill_bytes(&mut raw);
+    let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
+    let key = verify_form_token_key(app, &token);
+    app.security_store
+        .put(
+            &key,
+            Bytes::from(subject.as_bytes().to_vec()),
+            VERIFY_FORM_TOKEN_TTL,
+        )
+        .await
+        .ok()?;
+    Some(token)
+}
+
+/// Redeem a form token. Returns true only when the token existed and
+/// was minted for `subject`. Single use: the row is taken, not read.
+async fn redeem_verify_form_token(app: &AppState, token: &str, subject: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    let key = verify_form_token_key(app, token);
+    match app.security_store.take(&key).await {
+        Ok(Some(bytes)) => bytes.as_ref() == subject.as_bytes(),
+        _ => false,
+    }
+}
+
+fn verify_form_token_key(app: &AppState, token: &str) -> String {
+    format!("verify:csrf:{}:{token}", app.security_namespace)
+}
+
+/// Whether the request's `Origin` (or, failing that, `Referer`) is this
+/// broker's own origin.
+///
+/// Fails closed when both are absent. Every browser that can submit
+/// this form sends `Origin` on a cross-site POST and on a same-origin
+/// one; a request carrying neither header is not the consent page.
+fn verify_same_origin(app: &AppState, headers: &HeaderMap) -> bool {
+    // The consent page's own URL, which is what a browser reports as
+    // the origin when it submits the form. That is
+    // `device_code_verification_uri` when the operator set one, and the
+    // broker's own base URL otherwise.
+    let Ok(expected) = url::Url::parse(&resolve_verification_uri(&app.config)) else {
+        return false;
+    };
+    let expected = expected.origin();
+    let stated = headers
+        .get(header::ORIGIN)
+        .or_else(|| headers.get(header::REFERER))
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| url::Url::parse(value).ok());
+    match stated {
+        Some(url) => url.origin() == expected,
+        None => false,
+    }
+}
+
+/// Headers every `/verify` response carries.
+///
+/// `no-store` keeps the form token out of the browser cache, and the
+/// two framing headers keep the Approve button out of an attacker's
+/// iframe: a clickjacked approval needs no forged request at all.
+fn harden_verify_response(response: &mut Response) {
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+}
+
 // --- Request / response models ---
 
 /// `POST /device_authorization` request body. Per RFC 8628 §3.1 the
@@ -709,21 +799,45 @@ pub(crate) struct VerifyQuery {
 }
 
 /// `GET {base_path}/verify` handler. Returns a tiny self-contained
-/// HTML form so the user can paste their user_code and (for now)
-/// approve or deny. Production deployments will swap this for a
-/// branded page; the contract is that submitting the form arrives
-/// at `POST /verify` with a `user_code` and either `action=approve`
-/// or `action=deny`.
+/// HTML form so the user can paste their user_code and approve or
+/// deny.
+///
+/// The page is a consent surface, so it is rendered only for a caller
+/// the host process already authenticated, and it carries a single-use
+/// form token bound to that subject. An operator replacing this page
+/// with a branded one keeps the same contract: `POST /verify` needs a
+/// `user_code`, an `action` of exactly `approve` or `deny`, and the
+/// `form_token` this handler minted, and the session cookie the host
+/// authenticates with must be `SameSite=Lax` or stricter. See
+/// `docs/mcp-oauth-gateway.md`.
 pub(crate) async fn verify_get(
     State(app): State<AppState>,
+    authenticated_user: Option<axum::extract::Extension<AuthenticatedDeviceUser>>,
     Query(q): Query<VerifyQuery>,
 ) -> Response {
     if !app.config.device_code_enabled {
         return (StatusCode::NOT_FOUND, "device authorization disabled").into_response();
     }
 
+    let Some(axum::extract::Extension(authenticated_user)) = authenticated_user else {
+        return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
+    };
+    if authenticated_user.subject.trim().is_empty() {
+        return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
+    }
+
+    let Some(form_token) = mint_verify_form_token(&app, &authenticated_user.subject).await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "consent form token could not be issued",
+        )
+            .into_response();
+    };
+
     let prefilled = q.user_code.unwrap_or_default();
-    Html(verify_html(&prefilled)).into_response()
+    let mut response = Html(verify_html(&prefilled, &form_token)).into_response();
+    harden_verify_response(&mut response);
+    response
 }
 
 /// `POST {base_path}/verify` body. The HTML form posts the typed
@@ -733,6 +847,10 @@ pub(crate) struct VerifySubmission {
     pub user_code: Option<String>,
     /// Either `approve` or `deny`.
     pub action: Option<String>,
+    /// Single-use token minted by `verify_get` for this signed-in
+    /// subject. Absent or unknown means the submission did not come
+    /// from a form this broker rendered.
+    pub form_token: Option<String>,
 }
 
 /// `POST {base_path}/verify` handler. Requires host-established user
@@ -742,6 +860,7 @@ pub(crate) struct VerifySubmission {
 pub(crate) async fn verify_post(
     State(app): State<AppState>,
     authenticated_user: Option<axum::extract::Extension<AuthenticatedDeviceUser>>,
+    headers: HeaderMap,
     Form(form): Form<VerifySubmission>,
 ) -> Response {
     if !app.config.device_code_enabled {
@@ -753,6 +872,54 @@ pub(crate) async fn verify_post(
     };
     if authenticated_user.subject.trim().is_empty() {
         return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
+    }
+
+    // CSRF. This handler mints an access token carrying the signed-in
+    // browser user's `sub`, from ambient credentials, on a form POST:
+    // without these two checks any page a signed-in user loads can
+    // approve an attacker's device code and hand the attacker a token
+    // as that user. Both checks must pass. The origin check is what
+    // stops a cross-site POST, and the single-use token bound to the
+    // subject is what stops a same-origin injection or a replay of a
+    // captured body.
+    if !verify_same_origin(&app, &headers) {
+        crate::metrics::record_broker_decision("verify", "csrf_refused");
+        tracing::warn!(
+            target: "mcp_gateway::decision",
+            event = "mcp_oauth_verify_decision",
+            outcome = "rejected",
+            reason = "cross_origin",
+            "device consent refused: Origin and Referer are absent or not this broker"
+        );
+        let mut response = (
+            StatusCode::FORBIDDEN,
+            Html(verify_error_html(
+                "this request did not come from the authorization page",
+            )),
+        )
+            .into_response();
+        harden_verify_response(&mut response);
+        return response;
+    }
+    let form_token = form.form_token.clone().unwrap_or_default();
+    if !redeem_verify_form_token(&app, &form_token, &authenticated_user.subject).await {
+        crate::metrics::record_broker_decision("verify", "csrf_refused");
+        tracing::warn!(
+            target: "mcp_gateway::decision",
+            event = "mcp_oauth_verify_decision",
+            outcome = "rejected",
+            reason = "form_token",
+            "device consent refused: form token missing, expired, already used, or minted for another subject"
+        );
+        let mut response = (
+            StatusCode::FORBIDDEN,
+            Html(verify_error_html(
+                "this authorization form has expired; reload the page and try again",
+            )),
+        )
+            .into_response();
+        harden_verify_response(&mut response);
+        return response;
     }
 
     let store = match app.device_code_store.as_ref() {
@@ -976,8 +1143,9 @@ pub fn apply_poll_rate_limit(state: &mut DeviceCodeState, now: i64) -> bool {
 /// Render the /verify form. Inline CSS keeps this self-contained;
 /// operators wanting a branded experience can override this handler
 /// downstream.
-fn verify_html(prefilled: &str) -> String {
+fn verify_html(prefilled: &str, form_token: &str) -> String {
     let safe = html_escape(prefilled);
+    let token = html_escape(form_token);
     format!(
         r#"<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>Authorize device</title>
@@ -990,12 +1158,15 @@ button{{font-size:1rem;padding:.5rem 1rem;margin-right:.5rem}}</style>
 <form method="POST" action="">
 <label for="user_code">User code</label>
 <input id="user_code" name="user_code" value="{safe}" autocomplete="off" autofocus>
+<input type="hidden" name="{field}" value="{token}">
 <p>
 <button type="submit" name="action" value="approve">Approve</button>
 <button type="submit" name="action" value="deny">Deny</button>
 </p>
 </form></body></html>"#,
-        safe = safe
+        safe = safe,
+        field = VERIFY_FORM_TOKEN_FIELD,
+        token = token
     )
 }
 
@@ -1106,19 +1277,50 @@ mod tests {
     }
 
     async fn post_form(app: Router, uri: &str, body: &str) -> (StatusCode, String) {
-        let req = Request::builder()
-            .method("POST")
-            .uri(uri)
-            .header(
-                axum::http::header::CONTENT_TYPE,
-                "application/x-www-form-urlencoded",
-            )
-            .body(Body::from(body.to_string()))
-            .unwrap();
+        post_form_from(app, uri, body, Some(CONSENT_ORIGIN)).await
+    }
+
+    /// The origin `enabled_config`'s `device_code_verification_uri`
+    /// lives on. Every legitimate consent POST carries it.
+    const CONSENT_ORIGIN: &str = "https://broker.example";
+
+    async fn post_form_from(
+        app: Router,
+        uri: &str,
+        body: &str,
+        origin: Option<&str>,
+    ) -> (StatusCode, String) {
+        let mut req = Request::builder().method("POST").uri(uri).header(
+            axum::http::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        );
+        if let Some(origin) = origin {
+            req = req.header(axum::http::header::ORIGIN, origin);
+        }
+        let req = req.body(Body::from(body.to_string())).unwrap();
         let resp = app.oneshot(req).await.unwrap();
         let status = resp.status();
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         (status, String::from_utf8_lossy(&body).to_string())
+    }
+
+    /// Render the consent page and pull the single-use form token out
+    /// of it, the way a browser would.
+    async fn consent_form_token(app: Router) -> String {
+        let req = Request::builder()
+            .method("GET")
+            .uri("/mcp/oauth/verify")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "consent page must render");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body).to_string();
+        let marker = "name=\"form_token\" value=\"";
+        let start = body.find(marker).expect("form carries a token") + marker.len();
+        let rest = &body[start..];
+        let end = rest.find('"').expect("token is quoted");
+        rest[..end].to_string()
     }
 
     #[tokio::test]
@@ -1225,7 +1427,7 @@ mod tests {
 
     #[tokio::test]
     async fn verify_get_renders_form_with_prefilled_user_code() {
-        let app = build_app(enabled_config());
+        let app = authenticated(build_app(enabled_config()));
         let req = Request::builder()
             .method("GET")
             .uri("/mcp/oauth/verify?user_code=ABCD-EFGH")
@@ -1233,11 +1435,94 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::X_FRAME_OPTIONS)
+                .and_then(|value| value.to_str().ok()),
+            Some("DENY"),
+            "the Approve button must not be framable"
+        );
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let body_str = String::from_utf8_lossy(&body);
         assert!(body_str.contains("ABCD-EFGH"));
         assert!(body_str.contains("Approve"));
         assert!(body_str.contains("Deny"));
+        assert!(
+            body_str.contains("name=\"form_token\""),
+            "the form must carry a CSRF token"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_get_requires_an_authenticated_user() {
+        // The page is a consent surface. Rendering it anonymously would
+        // mint a form token bound to nobody.
+        let app = build_app(enabled_config());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/mcp/oauth/verify")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn verify_post_without_a_form_token_is_refused() {
+        // The CSRF scenario: an attacker gets a signed-in victim's
+        // browser to POST their own user_code with action=approve. The
+        // browser attaches the session cookie and the host resolves the
+        // victim; only the absent form token stops the approval.
+        let app = authenticated(build_app(enabled_config()));
+        let (status, body) = post_form(
+            app,
+            "/mcp/oauth/verify",
+            "user_code=ABCD-EFGH&action=approve",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("expired"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn verify_post_from_another_origin_is_refused() {
+        let app = authenticated(build_app(enabled_config()));
+        let token = consent_form_token(app.clone()).await;
+        let (status, _) = post_form_from(
+            app,
+            "/mcp/oauth/verify",
+            &format!("user_code=ABCD-EFGH&action=approve&form_token={token}"),
+            Some("https://attacker.example"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn verify_post_with_neither_origin_nor_referer_is_refused() {
+        // Fail closed. A submission with no origin evidence at all is
+        // not the consent page.
+        let app = authenticated(build_app(enabled_config()));
+        let token = consent_form_token(app.clone()).await;
+        let (status, _) = post_form_from(
+            app,
+            "/mcp/oauth/verify",
+            &format!("user_code=ABCD-EFGH&action=approve&form_token={token}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_consent_form_token_is_single_use() {
+        let app = authenticated(build_app(enabled_config()));
+        let token = consent_form_token(app.clone()).await;
+        let form = format!("user_code=ZZZZ-ZZZZ&action=approve&form_token={token}");
+        let (first, _) = post_form(app.clone(), "/mcp/oauth/verify", &form).await;
+        assert_eq!(first, StatusCode::OK, "the token is good once");
+        let (second, _) = post_form(app, "/mcp/oauth/verify", &form).await;
+        assert_eq!(second, StatusCode::FORBIDDEN, "and not twice");
     }
 
     #[tokio::test]
@@ -1277,9 +1562,15 @@ mod tests {
         let user_code = v["user_code"].as_str().unwrap().to_string();
         let device_code = v["device_code"].as_str().unwrap().to_string();
 
-        // 2. POST /verify
-        let body_form = format!("user_code={}&action=approve", urlencode(&user_code));
-        let (status, _) = post_form(authenticated(app), "/mcp/oauth/verify", &body_form).await;
+        // 2. Render the consent page for the signed-in user, then POST
+        // the form it produced, the way a browser would.
+        let app = authenticated(app);
+        let token = consent_form_token(app.clone()).await;
+        let body_form = format!(
+            "user_code={}&action=approve&form_token={token}",
+            urlencode(&user_code)
+        );
+        let (status, _) = post_form(app, "/mcp/oauth/verify", &body_form).await;
         assert_eq!(status, StatusCode::OK);
 
         // 3. State should be Authorized.
@@ -1319,8 +1610,14 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
             let issued: serde_json::Value = serde_json::from_str(&body).unwrap();
             let user_code = issued["user_code"].as_str().unwrap();
-            let form = format!("user_code={}{}", urlencode(user_code), action);
-            let (status, body) = post_form(authenticated(app), "/mcp/oauth/verify", &form).await;
+            let app = authenticated(app);
+            let token = consent_form_token(app.clone()).await;
+            let form = format!(
+                "user_code={}{}&form_token={token}",
+                urlencode(user_code),
+                action
+            );
+            let (status, body) = post_form(app, "/mcp/oauth/verify", &form).await;
             assert_eq!(status, StatusCode::OK);
             assert!(body.contains("action must be approve or deny"));
         }
@@ -1329,8 +1626,9 @@ mod tests {
     #[tokio::test]
     async fn verify_post_with_unknown_user_code_returns_error_page() {
         let app = authenticated(build_app(enabled_config()));
-        let body_form = "user_code=ZZZZ-ZZZZ&action=approve";
-        let (status, body) = post_form(app, "/mcp/oauth/verify", body_form).await;
+        let token = consent_form_token(app.clone()).await;
+        let body_form = format!("user_code=ZZZZ-ZZZZ&action=approve&form_token={token}");
+        let (status, body) = post_form(app, "/mcp/oauth/verify", &body_form).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("user_code unknown"));
     }

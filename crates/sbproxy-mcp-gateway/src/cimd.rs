@@ -36,6 +36,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use reqwest::Client;
+use sbproxy_security::ssrf::validate_dialable_addrs;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -189,59 +190,20 @@ fn is_disallowed_host(host: &str) -> bool {
     false
 }
 
-/// Returns true when `ip` falls inside one of the address ranges the
-/// CIMD fetcher refuses to talk to. Broader than `is_loopback` because
-/// the SSRF threat covers private RFC 1918, link-local (incl. the
-/// AWS / GCP metadata endpoint at 169.254.169.254), CGNAT, broadcast,
-/// multicast, the 0/8 reserved block, and the IPv6 equivalents.
+/// Returns true when `ip` must not be dialed by the CIMD fetcher.
 ///
-/// IPv4 ranges blocked:
-///   * 10.0.0.0/8        (RFC 1918 private)
-///   * 172.16.0.0/12     (RFC 1918 private)
-///   * 192.168.0.0/16    (RFC 1918 private)
-///   * 127.0.0.0/8       (loopback)
-///   * 169.254.0.0/16    (link-local, includes 169.254.169.254 metadata)
-///   * 100.64.0.0/10     (RFC 6598 CGNAT)
-///   * 0.0.0.0/8         ("this network" reserved)
-///   * 224.0.0.0/4       (multicast)
-///   * 255.255.255.255   (broadcast)
+/// This is one line on purpose. The shared
+/// [`sbproxy_security::ssrf::validate_dialable_addrs`] is the workspace's
+/// dial-time range check: it canonicalizes IPv4-mapped IPv6
+/// (`::ffff:a.b.c.d`) before testing, so the v6-shaped spelling of an
+/// RFC 1918 or link-local address cannot walk past the block, and it
+/// covers the private ranges plus multicast, `0.0.0.0/8`, `240.0.0.0/4`,
+/// and the deprecated `::a.b.c.d` form. A hand-rolled copy here is how
+/// the mapped-address hole got in.
 ///
-/// IPv6 ranges blocked:
-///   * ::1               (loopback)
-///   * ::                (unspecified)
-///   * fc00::/7          (unique local addresses)
-///   * fe80::/10         (link-local)
-///   * ff00::/8          (multicast)
-///   * fd00:ec2::254     (cloud metadata, covered by fc00::/7)
+/// The port is irrelevant to a range test, so a placeholder is used.
 fn is_disallowed_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_broadcast()
-                || v4.is_unspecified()
-                || v4.is_multicast()
-                // 0.0.0.0/8 ("this network", RFC 1122). Includes
-                // 0.0.0.0 (covered by is_unspecified) and the rest
-                // of the /8 which kernels happily route to localhost.
-                || v4.octets()[0] == 0
-                // 169.254/16 link-local is handled by is_link_local.
-                // 169.254.169.254 (cloud metadata) falls under it.
-                // Carrier-grade NAT 100.64.0.0/10 (RFC 6598).
-                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0b1100_0000) == 0b0100_0000)
-        }
-        IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                // Unique-local fc00::/7. Covers the cloud metadata
-                // address fd00:ec2::254.
-                || (v6.segments()[0] & 0xfe00) == 0xfc00
-                // Link-local fe80::/10.
-                || (v6.segments()[0] & 0xffc0) == 0xfe80
-        }
-    }
+    validate_dialable_addrs(&[SocketAddr::new(ip, 0)]).is_err()
 }
 
 // --- DNS resolution + dialer pinning ---
@@ -265,12 +227,22 @@ const CIMD_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// `host` must already be lowercased and stripped of any IPv6
 /// brackets. If `host` is itself an IP literal it is validated and
 /// returned as a single-element vector (no DNS lookup is performed).
-async fn resolve_and_validate(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+///
+/// `allow_loopback` is the crate's own test exemption, described on
+/// [`enforce_fetch_envelope`]. It permits a loopback destination and
+/// nothing else; every other range is refused with it set.
+async fn resolve_and_validate(
+    host: &str,
+    port: u16,
+    allow_loopback: bool,
+) -> Result<Vec<SocketAddr>> {
     // IP literal fast path. Mirrors the inline check in
     // `is_disallowed_host` but is centralised here so the dialer
     // code does not have to special-case literals.
     if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_disallowed_ip(ip) {
+        if !(allow_loopback && sbproxy_security::ssrf::canonical_ip(ip).is_loopback())
+            && is_disallowed_ip(ip)
+        {
             bail!(
                 "CIMD host {host:?} resolves to address {ip} which is in a blocked range (SSRF guard)"
             );
@@ -299,6 +271,9 @@ async fn resolve_and_validate(host: &str, port: u16) -> Result<Vec<SocketAddr>> 
     // canonical fix for the DNS-rebind / metadata SSRF described
     // in WOR-44.
     for sa in &addrs {
+        if allow_loopback && sbproxy_security::ssrf::canonical_ip(sa.ip()).is_loopback() {
+            continue;
+        }
         if is_disallowed_ip(sa.ip()) {
             bail!(
                 "CIMD host {host:?} resolves to address {} which is in a blocked range (SSRF guard)",
@@ -363,11 +338,13 @@ impl reqwest::dns::Resolve for PinnedResolver {
 ///     whether to re-fetch the new URL through this same code path.
 ///   * A hard request timeout caps the broker worker hold time.
 ///
-/// The returned client is intentionally a fresh instance per call:
-/// CIMD URLs are operator-controlled and low-frequency, and a
-/// shared client would have to share the resolver across hostnames
-/// which defeats the pinning.
-async fn build_hardened_client(parsed: &url::Url) -> Result<Client> {
+/// The returned client is intentionally a fresh instance per call. A
+/// CIMD URL is the `client_id` on an unauthenticated `/authorize`, so
+/// it is client-controlled, not operator-controlled: a shared client
+/// would have to share one pinned resolver across every hostname a
+/// caller can name, which is the same as not pinning at all. The cache
+/// in front of the fetch (`CimdCache`) is what keeps the rate down.
+async fn build_hardened_client(parsed: &url::Url, allow_loopback: bool) -> Result<Client> {
     let host = parsed
         .host_str()
         .ok_or_else(|| anyhow!("CIMD URL has no host"))?
@@ -379,23 +356,121 @@ async fn build_hardened_client(parsed: &url::Url) -> Result<Client> {
         .trim_end_matches(']')
         .to_string();
     let port = parsed.port_or_known_default().unwrap_or(443);
-    let addrs = resolve_and_validate(&host, port).await?;
+    let addrs = resolve_and_validate(&host, port, allow_loopback).await?;
     let resolver = Arc::new(PinnedResolver {
         host: host.clone(),
         addrs,
     });
-    Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
+    // Built from the workspace's outbound builder so the connect
+    // timeout, the pool bounds, and the sbproxy user agent are the same
+    // as every other outbound client in this crate; only the resolver
+    // and the request timeout are CIMD-specific.
+    sbproxy_httpkit::OutboundClientBuilder::new()
+        .no_redirects()
+        .request_timeout(CIMD_REQUEST_TIMEOUT)
+        .into_inner()
         .dns_resolver(resolver)
-        .timeout(CIMD_REQUEST_TIMEOUT)
         .build()
         .map_err(|e| anyhow!("CIMD hardened client build failed: {e}"))
+}
+
+/// True when `host` names a loopback destination, in any of the
+/// spellings a URL can carry it: the `localhost` name, an IPv4 literal
+/// in `127.0.0.0/8`, `[::1]`, or the IPv4-mapped form of either.
+fn host_is_loopback(host: &str) -> bool {
+    let lower = host.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "localhost" | "ip6-localhost" | "ip6-loopback"
+    ) {
+        return true;
+    }
+    let trimmed = lower.trim_start_matches('[').trim_end_matches(']');
+    trimmed
+        .parse::<IpAddr>()
+        .is_ok_and(|ip| sbproxy_security::ssrf::canonical_ip(ip).is_loopback())
+}
+
+/// Enforce the transport half of the CIMD fetch envelope and return the
+/// pinned client for `parsed`.
+///
+/// The envelope is: https only, and a destination that is not private,
+/// loopback, link-local, or otherwise reserved. Both halves are
+/// unconditional. They used to sit behind `#[cfg(not(test))]`, which
+/// meant the guard that shipped was the one no test in this crate could
+/// run: `/authorize` reaches CIMD only through a `CimdCache`, and both
+/// cache implementations skipped the guard under `cfg(test)`. Mutating
+/// or deleting it changed nothing any test observed.
+///
+/// `allow_insecure_loopback` replaces that `cfg`. It is false in
+/// production (no config key sets it, and no constructor outside this
+/// crate's own tests can turn it on) and permits exactly one thing: a
+/// loopback destination, over http or https, so the cache paths can be
+/// driven against a local listener with the real guard compiled in and
+/// running. A test that leaves it false sees the production refusal.
+async fn enforce_fetch_envelope(
+    parsed: &url::Url,
+    allow_insecure_loopback: bool,
+) -> Result<Client> {
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow!("CIMD client_id URL has no host"))?;
+    let loopback_exempt = allow_insecure_loopback && host_is_loopback(host);
+    if parsed.scheme() != "https" && !loopback_exempt {
+        bail!(
+            "CIMD client_id MUST use https scheme; got {:?}",
+            parsed.scheme()
+        );
+    }
+    if !loopback_exempt && is_disallowed_host(host) {
+        bail!("CIMD client_id host {host:?} is not externally routable (SSRF guard)");
+    }
+    build_hardened_client(parsed, loopback_exempt).await
+}
+
+/// The three checks every fetched CIMD document must pass, whichever
+/// path fetched it.
+///
+/// This is one function because it used to be three copies and one of
+/// them was missing: `EphemeralKvCimdCache::get_or_fetch` parsed the
+/// document and returned it without any of them, so a deployment on the
+/// storage-backed cache would accept a document declaring
+/// `redirect_uris: ["http://attacker.example/cb"]` and relay the
+/// authorization result to it.
+///
+/// # Errors
+///
+/// Returns an error when the document does not self-identify with the
+/// URL it was fetched from, declares no `redirect_uris`, or declares
+/// one that OAuth 2.1 s1.5 does not permit.
+fn validate_document(doc: &ClientIdMetadataDocument, client_id_url: &str) -> Result<()> {
+    // The document MUST self-identify with the URL we fetched it from.
+    // Compare strings exactly: clients can normalise their own URLs
+    // however they like, but the AS decides which form is canonical.
+    if doc.client_id != client_id_url {
+        bail!(
+            "CIMD document client_id {:?} does not match fetch URL {:?}",
+            doc.client_id,
+            client_id_url
+        );
+    }
+    if doc.redirect_uris.is_empty() {
+        bail!("CIMD document MUST declare at least one redirect_uri");
+    }
+    for uri in &doc.redirect_uris {
+        validate_redirect_uri(uri)?;
+    }
+    Ok(())
 }
 
 // --- Fetch ---
 
 /// Fetches a CIMD document at `client_id_url`, enforcing the security
-/// envelope the broker requires:
+/// envelope the broker requires. `allow_insecure_loopback` is the
+/// crate-internal test exemption described on [`enforce_fetch_envelope`];
+/// production callers pass `false`.
+///
+/// The envelope:
 ///
 ///   * URL scheme MUST be `https`.
 ///   * URL host MUST NOT resolve to a loopback / private / link-local
@@ -409,31 +484,18 @@ async fn build_hardened_client(parsed: &url::Url) -> Result<Client> {
 ///     binding to localhost during development).
 pub async fn fetch(
     client_id_url: &str,
-    _http: &Client,
     max_doc_bytes: usize,
+    allow_insecure_loopback: bool,
 ) -> Result<FetchedCimd> {
     let parsed = url::Url::parse(client_id_url)
         .map_err(|e| anyhow!("client_id_url is not a valid URL: {e}"))?;
-    if parsed.scheme() != "https" {
-        bail!(
-            "CIMD client_id MUST use https scheme; got {:?}",
-            parsed.scheme()
-        );
-    }
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| anyhow!("CIMD client_id URL has no host"))?;
-    if is_disallowed_host(host) {
-        bail!("CIMD client_id host {host:?} is not externally routable (SSRF guard)");
-    }
 
-    // Build a per-fetch client whose DNS resolver returns ONLY the
-    // pre-validated addresses for `host`, and which refuses to
-    // follow redirects. The `_http` parameter the caller passed is
-    // intentionally ignored on the production path: a shared client
-    // cannot pin its DNS resolver to a single hostname and so cannot
-    // defend against the rebind vector described in WOR-44.
-    let http = build_hardened_client(&parsed).await?;
+    // The envelope check builds a per-fetch client whose DNS resolver
+    // returns ONLY the pre-validated addresses for the host, and which
+    // refuses to follow redirects. A shared client cannot pin its DNS
+    // resolver to a single hostname and so cannot defend against the
+    // rebind vector described in WOR-44.
+    let http = enforce_fetch_envelope(&parsed, allow_insecure_loopback).await?;
 
     let resp = http
         .get(parsed.as_str())
@@ -464,24 +526,7 @@ pub async fn fetch(
 
     let doc: ClientIdMetadataDocument = serde_json::from_slice(&body_bytes)
         .map_err(|e| anyhow!("CIMD document parse failed: {e}"))?;
-
-    // The document MUST self-identify with the URL we fetched it from.
-    // Compare strings exactly: clients can normalise their own URLs
-    // however they like, but the AS decides which form is canonical.
-    if doc.client_id != client_id_url {
-        bail!(
-            "CIMD document client_id {:?} does not match fetch URL {:?}",
-            doc.client_id,
-            client_id_url
-        );
-    }
-
-    if doc.redirect_uris.is_empty() {
-        bail!("CIMD document MUST declare at least one redirect_uri");
-    }
-    for uri in &doc.redirect_uris {
-        validate_redirect_uri(uri)?;
-    }
+    validate_document(&doc, client_id_url)?;
 
     Ok(FetchedCimd { doc, etag, max_age })
 }
@@ -562,7 +607,6 @@ pub trait CimdCache: Send + Sync {
     async fn get_or_fetch(
         &self,
         client_id_url: &str,
-        http: &Client,
         max_doc_bytes: usize,
     ) -> Result<Arc<ClientIdMetadataDocument>>;
 }
@@ -573,6 +617,9 @@ pub struct InMemoryCimdCache {
     entries: Mutex<HashMap<String, CachedDoc>>,
     default_ttl: Duration,
     capacity: usize,
+    /// See [`enforce_fetch_envelope`]. False on every path an operator
+    /// can reach; only this crate's own tests set it.
+    allow_insecure_loopback: bool,
 }
 
 const DEFAULT_CIMD_CACHE_CAPACITY: usize = 1_024;
@@ -611,6 +658,21 @@ impl InMemoryCimdCache {
                 default_ttl
             },
             capacity: DEFAULT_CIMD_CACHE_CAPACITY,
+            allow_insecure_loopback: false,
+        }
+    }
+
+    /// Build a cache that permits a loopback CIMD host over plain http.
+    ///
+    /// Test-only, and the reason the fetch envelope no longer hides
+    /// behind `#[cfg(not(test))]`: a test that wants a local listener
+    /// asks for the exemption here, and every other test in this module
+    /// runs the production guard.
+    #[cfg(test)]
+    fn with_loopback_exemption(default_ttl: Duration) -> Self {
+        Self {
+            allow_insecure_loopback: true,
+            ..Self::new(default_ttl)
         }
     }
 
@@ -625,6 +687,7 @@ impl InMemoryCimdCache {
             entries: Mutex::new(HashMap::new()),
             default_ttl,
             capacity,
+            allow_insecure_loopback: false,
         })
     }
 
@@ -638,42 +701,17 @@ impl InMemoryCimdCache {
     async fn refresh(
         &self,
         client_id_url: &str,
-        http: &Client,
         max_doc_bytes: usize,
         cached_etag: Option<String>,
     ) -> Result<FetchedCimd> {
         // The plain `fetch` helper does not know about ETags. For
         // conditional refresh we issue the GET ourselves so we can
-        // attach `If-None-Match` and treat 304 as "reuse cache".
-        // Mark the caller-supplied client used: production builds
-        // shadow it with a hardened per-fetch client below; test
-        // builds use it directly. The explicit ack silences the
-        // unused-variable warning the cfg-gated shadow generates
-        // for non-test builds.
-        let _ = http;
+        // attach `If-None-Match` and treat 304 as "reuse cache". The
+        // envelope, the SSRF guard, and the DNS pin are the same ones
+        // `fetch` uses, and they run here unconditionally.
         let parsed = url::Url::parse(client_id_url)
             .map_err(|e| anyhow!("client_id_url is not a valid URL: {e}"))?;
-        // In tests we let `cfg(test)` skip the https + SSRF guards so
-        // the cache logic can be exercised against a local HTTP
-        // listener. Production builds always enforce both, AND build
-        // a fresh hardened client whose DNS resolver is pinned to
-        // the CIMD hostname's pre-validated addresses (WOR-44).
-        #[cfg(not(test))]
-        let owned_http;
-        #[cfg(not(test))]
-        let http: &Client = {
-            if parsed.scheme() != "https" {
-                bail!("CIMD refresh URL must be https");
-            }
-            let host = parsed
-                .host_str()
-                .ok_or_else(|| anyhow!("CIMD URL has no host"))?;
-            if is_disallowed_host(host) {
-                bail!("CIMD refresh host {host:?} blocked by SSRF guard");
-            }
-            owned_http = build_hardened_client(&parsed).await?;
-            &owned_http
-        };
+        let http = enforce_fetch_envelope(&parsed, self.allow_insecure_loopback).await?;
 
         let mut req = http
             .get(parsed.as_str())
@@ -708,19 +746,7 @@ impl InMemoryCimdCache {
             crate::remote_body::bounded_response_body(resp, max_doc_bytes, "CIMD").await?;
         let doc: ClientIdMetadataDocument = serde_json::from_slice(&body_bytes)
             .map_err(|e| anyhow!("CIMD document parse failed: {e}"))?;
-        if doc.client_id != client_id_url {
-            bail!(
-                "CIMD document client_id {:?} does not match fetch URL {:?}",
-                doc.client_id,
-                client_id_url
-            );
-        }
-        if doc.redirect_uris.is_empty() {
-            bail!("CIMD document MUST declare at least one redirect_uri");
-        }
-        for uri in &doc.redirect_uris {
-            validate_redirect_uri(uri)?;
-        }
+        validate_document(&doc, client_id_url)?;
         Ok(FetchedCimd { doc, etag, max_age })
     }
 
@@ -772,7 +798,6 @@ impl CimdCache for InMemoryCimdCache {
     async fn get_or_fetch(
         &self,
         client_id_url: &str,
-        http: &Client,
         max_doc_bytes: usize,
     ) -> Result<Arc<ClientIdMetadataDocument>> {
         let now = Instant::now();
@@ -794,7 +819,7 @@ impl CimdCache for InMemoryCimdCache {
 
         // Slow path: refresh. We hold no lock during the network call.
         match self
-            .refresh(client_id_url, http, max_doc_bytes, cached_etag.clone())
+            .refresh(client_id_url, max_doc_bytes, cached_etag.clone())
             .await
         {
             Ok(FetchedCimd { doc, etag, max_age }) => {
@@ -857,12 +882,18 @@ impl CimdCache for InMemoryCimdCache {
 ///
 /// ## Key layout
 ///
-/// `cimd:doc:{client_id_url}`. The URL is used verbatim because
-/// CIMD URLs are operator-controlled and bounded in length by the
-/// existing SSRF guard.
+/// `cimd:doc:{client_id_url}`. The URL is used verbatim. It is
+/// client-controlled (the `client_id` on an unauthenticated
+/// `/authorize`), and no guard bounds its length, so the caller is
+/// responsible for the bound: `/authorize` refuses a `client_id`
+/// longer than [`crate::config::MAX_CIMD_CLIENT_ID_LEN`] before it
+/// reaches the cache.
 pub struct EphemeralKvCimdCache {
     store: std::sync::Arc<dyn sbproxy_storage::EphemeralKv>,
     default_ttl: Duration,
+    /// See [`enforce_fetch_envelope`]. False on every path an operator
+    /// can reach; only this crate's own tests set it.
+    allow_insecure_loopback: bool,
 }
 
 impl EphemeralKvCimdCache {
@@ -872,7 +903,24 @@ impl EphemeralKvCimdCache {
         store: std::sync::Arc<dyn sbproxy_storage::EphemeralKv>,
         default_ttl: Duration,
     ) -> Self {
-        Self { store, default_ttl }
+        Self {
+            store,
+            default_ttl,
+            allow_insecure_loopback: false,
+        }
+    }
+
+    /// Build a cache that permits a loopback CIMD host over plain http.
+    /// Test-only; see [`InMemoryCimdCache::with_loopback_exemption`].
+    #[cfg(test)]
+    fn with_loopback_exemption(
+        store: std::sync::Arc<dyn sbproxy_storage::EphemeralKv>,
+        default_ttl: Duration,
+    ) -> Self {
+        Self {
+            allow_insecure_loopback: true,
+            ..Self::new(store, default_ttl)
+        }
     }
 
     /// Construct and return as `Arc<dyn CimdCache>` for handler
@@ -894,15 +942,8 @@ impl CimdCache for EphemeralKvCimdCache {
     async fn get_or_fetch(
         &self,
         client_id_url: &str,
-        http: &Client,
         max_doc_bytes: usize,
     ) -> Result<Arc<ClientIdMetadataDocument>> {
-        // See `InMemoryCimdCache::refresh`: the caller-supplied
-        // client is used directly in test builds and shadowed in
-        // production by a per-fetch hardened client below. This
-        // explicit ack silences the unused-variable warning the
-        // cfg-gated shadow generates for non-test builds.
-        let _ = http;
         let key = Self::cache_key(client_id_url);
 
         // Fast path: cached and inside its TTL (TTL is enforced by
@@ -928,22 +969,7 @@ impl CimdCache for EphemeralKvCimdCache {
         // the price of multi-replica sharing.
         let parsed = url::Url::parse(client_id_url)
             .map_err(|e| anyhow!("client_id_url is not a valid URL: {e}"))?;
-        #[cfg(not(test))]
-        let owned_http;
-        #[cfg(not(test))]
-        let http: &Client = {
-            if parsed.scheme() != "https" {
-                bail!("CIMD refresh URL must be https");
-            }
-            let host = parsed
-                .host_str()
-                .ok_or_else(|| anyhow!("CIMD URL has no host"))?;
-            if is_disallowed_host(host) {
-                bail!("CIMD refresh host {host:?} blocked by SSRF guard");
-            }
-            owned_http = build_hardened_client(&parsed).await?;
-            &owned_http
-        };
+        let http = enforce_fetch_envelope(&parsed, self.allow_insecure_loopback).await?;
         let resp = http
             .get(parsed.as_str())
             .header(reqwest::header::ACCEPT, "application/json")
@@ -961,6 +987,9 @@ impl CimdCache for EphemeralKvCimdCache {
         let body = crate::remote_body::bounded_response_body(resp, max_doc_bytes, "CIMD").await?;
         let doc: ClientIdMetadataDocument =
             serde_json::from_slice(&body).map_err(|e| anyhow!("CIMD JSON parse failed: {e}"))?;
+        // The same three checks the other two fetch paths make. This
+        // implementation used to skip all of them.
+        validate_document(&doc, client_id_url)?;
 
         // Effective TTL: the smaller of the configured default and
         // the response's max-age, when present. Mirrors the
@@ -1107,6 +1136,37 @@ mod tests {
     }
 
     #[test]
+    fn ssrf_guard_blocks_the_ipv4_mapped_ipv6_spelling() {
+        // A dual-stack socket dials `::ffff:10.0.4.7` as the IPv4
+        // address 10.0.4.7, so the v6-shaped spelling has to be
+        // canonicalized before any range test. The literal fast path in
+        // `resolve_and_validate` sees the same string through
+        // `is_disallowed_host`, which is what /authorize reaches.
+        for mapped in [
+            "[::ffff:10.0.4.7]",
+            "[::ffff:127.0.0.1]",
+            "[::ffff:169.254.169.254]",
+            "[::ffff:192.168.1.1]",
+            "[::ffff:100.64.0.1]",
+        ] {
+            assert!(is_disallowed_host(mapped), "{mapped} must not be fetchable");
+        }
+        // The deprecated IPv4-compatible form is reserved space too.
+        assert!(is_disallowed_host("[::10.0.4.7]"));
+        // A public address in the same spelling still resolves.
+        assert!(!is_disallowed_host("[::ffff:8.8.8.8]"));
+    }
+
+    #[tokio::test]
+    async fn resolve_and_validate_refuses_a_mapped_private_literal() {
+        let refused = resolve_and_validate("::ffff:10.0.4.7", 443, false).await;
+        assert!(
+            refused.is_err(),
+            "the pinned dialer must not be handed a mapped private address"
+        );
+    }
+
+    #[test]
     fn ssrf_guard_blocks_extended_ranges() {
         // 0.0.0.0/8 (this network).
         assert!(is_disallowed_ip("0.0.0.0".parse().unwrap()));
@@ -1140,7 +1200,7 @@ mod tests {
         // The cloud metadata literal is the canonical target of the
         // DNS-rebind SSRF this fix defends against. Even if a
         // hostname resolves here, we must refuse before dialing.
-        let err = resolve_and_validate("169.254.169.254", 443)
+        let err = resolve_and_validate("169.254.169.254", 443, false)
             .await
             .expect_err("metadata literal must be rejected");
         let msg = err.to_string();
@@ -1157,7 +1217,7 @@ mod tests {
         // whose DNS A record points at 127/8 or 169.254/16 the
         // resolver will hand us those addresses; we must reject
         // every one before the dialer ever sees them.
-        let err = resolve_and_validate("localhost", 443)
+        let err = resolve_and_validate("localhost", 443, false)
             .await
             .expect_err("localhost DNS result must be rejected");
         let msg = err.to_string();
@@ -1171,7 +1231,7 @@ mod tests {
     async fn resolve_and_validate_accepts_public_literal() {
         // IP-literal fast path: a public address skips DNS and is
         // returned verbatim with the requested port pinned.
-        let addrs = resolve_and_validate("1.1.1.1", 443)
+        let addrs = resolve_and_validate("1.1.1.1", 443, false)
             .await
             .expect("public literal must succeed");
         assert_eq!(addrs.len(), 1);
@@ -1245,8 +1305,7 @@ mod tests {
         // must refuse before dialing. We exercise the same code
         // path by passing the metadata literal as the URL host:
         // resolve_and_validate's IP-literal fast path catches it.
-        let http = Client::new();
-        let err = fetch("https://169.254.169.254/cimd.json", &http, 16 * 1024)
+        let err = fetch("https://169.254.169.254/cimd.json", 16 * 1024, false)
             .await
             .expect_err("metadata target must be rejected");
         let msg = err.to_string();
@@ -1338,8 +1397,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_rejects_http_scheme() {
-        let http = Client::new();
-        let err = fetch("http://client.example/cimd.json", &http, 16 * 1024)
+        let err = fetch("http://client.example/cimd.json", 16 * 1024, false)
             .await
             .expect_err("must reject http");
         let msg = err.to_string();
@@ -1348,8 +1406,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_rejects_loopback_url() {
-        let http = Client::new();
-        let err = fetch("https://127.0.0.1/cimd.json", &http, 16 * 1024)
+        let err = fetch("https://127.0.0.1/cimd.json", 16 * 1024, false)
             .await
             .expect_err("must reject loopback");
         let msg = err.to_string();
@@ -1358,65 +1415,11 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_rejects_private_ip_url() {
-        let http = Client::new();
-        let err = fetch("https://10.0.0.1/cimd.json", &http, 16 * 1024)
+        let err = fetch("https://10.0.0.1/cimd.json", 16 * 1024, false)
             .await
             .expect_err("must reject private ip");
         let msg = err.to_string();
         assert!(msg.contains("SSRF"), "got error: {msg}");
-    }
-
-    /// Helper that bypasses the public `fetch` SSRF / https checks so
-    /// we can drive the parsing + cache logic against a local HTTP
-    /// listener. The production `fetch` always enforces https + SSRF.
-    async fn fetch_for_test(
-        url: &str,
-        http: &Client,
-        max_doc_bytes: usize,
-        cached_etag: Option<String>,
-    ) -> Result<FetchedCimd> {
-        let mut req = http
-            .get(url)
-            .header(reqwest::header::ACCEPT, "application/json");
-        if let Some(etag) = cached_etag.as_deref() {
-            req = req.header(reqwest::header::IF_NONE_MATCH, etag);
-        }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| anyhow!("CIMD fetch failed: {e}"))?;
-        if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
-            bail!("__cimd_not_modified__");
-        }
-        if !resp.status().is_success() {
-            bail!("CIMD fetch returned status {}", resp.status());
-        }
-        let etag = resp
-            .headers()
-            .get(reqwest::header::ETAG)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let max_age = parse_max_age(
-            resp.headers()
-                .get(reqwest::header::CACHE_CONTROL)
-                .and_then(|v| v.to_str().ok()),
-        );
-        let body_bytes = resp.bytes().await.map_err(|e| anyhow!("body: {e}"))?;
-        if body_bytes.len() > max_doc_bytes {
-            bail!("CIMD too large: {} > {}", body_bytes.len(), max_doc_bytes);
-        }
-        let doc: ClientIdMetadataDocument =
-            serde_json::from_slice(&body_bytes).map_err(|e| anyhow!("parse: {e}"))?;
-        if doc.client_id != url {
-            bail!("self-id mismatch: {:?} != {:?}", doc.client_id, url);
-        }
-        if doc.redirect_uris.is_empty() {
-            bail!("redirect_uris empty");
-        }
-        for uri in &doc.redirect_uris {
-            validate_redirect_uri(uri)?;
-        }
-        Ok(FetchedCimd { doc, etag, max_age })
     }
 
     #[tokio::test]
@@ -1428,12 +1431,11 @@ mod tests {
         )])
         .await;
         let url = server.url("/cimd.json");
-        let http = Client::new();
-        let err = fetch_for_test(&url, &http, 16 * 1024, None)
+        let err = fetch(&url, 16 * 1024, true)
             .await
             .expect_err("self-id mismatch must fail");
         let msg = err.to_string();
-        assert!(msg.contains("self-id"), "got error: {msg}");
+        assert!(msg.contains("does not match fetch URL"), "got error: {msg}");
     }
 
     #[tokio::test]
@@ -1445,12 +1447,11 @@ mod tests {
         );
         let server = TestServer::spawn(vec![canned_200(&big_body, &[])]).await;
         let url = server.url("/cimd.json");
-        let http = Client::new();
-        let err = fetch_for_test(&url, &http, 256, None)
+        let err = fetch(&url, 256, true)
             .await
             .expect_err("size cap must fail");
         let msg = err.to_string();
-        assert!(msg.contains("too large"), "got error: {msg}");
+        assert!(msg.contains("byte limit"), "got error: {msg}");
     }
 
     /// Reserve an ephemeral port, build a server listening on it,
@@ -1501,11 +1502,10 @@ mod tests {
             )]
         })
         .await;
-        let http = Client::new();
-        let err = fetch_for_test(&url, &http, 16 * 1024, None)
+        let err = fetch(&url, 16 * 1024, true)
             .await
             .expect_err("empty redirect_uris must fail");
-        assert!(err.to_string().contains("redirect_uris"), "got: {err}");
+        assert!(err.to_string().contains("redirect_uri"), "got: {err}");
         let _ = server.hits.load(Ordering::SeqCst);
     }
 
@@ -1518,8 +1518,7 @@ mod tests {
             )]
         })
         .await;
-        let http = Client::new();
-        let err = fetch_for_test(&url, &http, 16 * 1024, None)
+        let err = fetch(&url, 16 * 1024, true)
             .await
             .expect_err("non-https redirect_uri must fail");
         assert!(
@@ -1531,7 +1530,7 @@ mod tests {
 
     #[tokio::test]
     async fn cache_hit_within_ttl_skips_network() {
-        let cache = InMemoryCimdCache::new(Duration::from_secs(60));
+        let cache = InMemoryCimdCache::with_loopback_exemption(Duration::from_secs(60));
         let url = "https://client.example/.well-known/cimd";
         let doc = fixture_doc(url);
         cache
@@ -1544,11 +1543,7 @@ mod tests {
             )
             .await;
         // Use an unroutable URL to prove we never hit the network.
-        let http = Client::new();
-        let got = cache
-            .get_or_fetch(url, &http, 16 * 1024)
-            .await
-            .expect("cache hit");
+        let got = cache.get_or_fetch(url, 16 * 1024).await.expect("cache hit");
         assert_eq!(got.client_id, url);
         assert_eq!(got.client_name.as_deref(), Some("Test Client"));
     }
@@ -1559,7 +1554,7 @@ mod tests {
         let server = TestServer::spawn(vec![canned_304(&[("ETag", "\"v1\"")])]).await;
         let url = server.url("/cimd.json");
         let doc = fixture_doc(&url);
-        let cache = InMemoryCimdCache::new(Duration::from_secs(60));
+        let cache = InMemoryCimdCache::with_loopback_exemption(Duration::from_secs(60));
         // Seed with fetched_at well in the past so the entry is stale.
         let stale_at = Instant::now() - Duration::from_secs(120);
         cache
@@ -1571,9 +1566,8 @@ mod tests {
                 Duration::from_secs(30),
             )
             .await;
-        let http = Client::new();
         let got = cache
-            .get_or_fetch(&url, &http, 16 * 1024)
+            .get_or_fetch(&url, 16 * 1024)
             .await
             .expect("304 keeps entry");
         assert_eq!(got.client_id, url);
@@ -1625,16 +1619,15 @@ mod tests {
                 idx += 1;
             }
         });
-        let cache = InMemoryCimdCache::new(Duration::from_secs(3600));
-        let http = Client::new();
+        let cache = InMemoryCimdCache::with_loopback_exemption(Duration::from_secs(3600));
         let first = cache
-            .get_or_fetch(&url, &http, 16 * 1024)
+            .get_or_fetch(&url, 16 * 1024)
             .await
             .expect("first fetch");
         assert_eq!(first.client_name.as_deref(), Some("v1"));
         tokio::time::sleep(Duration::from_millis(1100)).await;
         let second = cache
-            .get_or_fetch(&url, &http, 16 * 1024)
+            .get_or_fetch(&url, 16 * 1024)
             .await
             .expect("second fetch");
         assert_eq!(second.client_name.as_deref(), Some("v2"));
@@ -1646,6 +1639,112 @@ mod tests {
         std::sync::Arc::new(crate::local_store::LocalStore::new())
     }
 
+    // --- The guard on the path /authorize actually runs ---
+
+    #[tokio::test]
+    async fn the_in_memory_cache_refuses_a_loopback_document_without_the_exemption() {
+        // /authorize never calls `fetch`; it goes through a
+        // `CimdCache`. This is the same local listener the tests above
+        // use, against a cache built the production way, so the
+        // refusal being asserted is the one that ships.
+        let (url, server) = spawn_with_known_url("/cimd.json", |u| {
+            vec![canned_200(
+                &format!(r#"{{"client_id":"{u}","redirect_uris":["https://client.example/cb"]}}"#),
+                &[],
+            )]
+        })
+        .await;
+        let cache = InMemoryCimdCache::new(Duration::from_secs(60));
+        let refused = cache.get_or_fetch(&url, 16 * 1024).await;
+        assert!(
+            refused.is_err(),
+            "the cache refresh path must run the SSRF guard"
+        );
+        assert_eq!(
+            server.hits.load(Ordering::SeqCst),
+            0,
+            "the refusal must happen before the dial"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_storage_backed_cache_refuses_a_loopback_document_without_the_exemption() {
+        let (url, server) = spawn_with_known_url("/cimd.json", |u| {
+            vec![canned_200(
+                &format!(r#"{{"client_id":"{u}","redirect_uris":["https://client.example/cb"]}}"#),
+                &[],
+            )]
+        })
+        .await;
+        let cache = EphemeralKvCimdCache::new(ephemeral_kv(), Duration::from_secs(60));
+        let refused = cache.get_or_fetch(&url, 16 * 1024).await;
+        assert!(
+            refused.is_err(),
+            "the cache fetch path must run the SSRF guard"
+        );
+        assert_eq!(server.hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn the_storage_backed_cache_validates_the_document_it_returns() {
+        // A plaintext redirect_uri is exactly what `validate_redirect_uri`
+        // exists to refuse, and /authorize's only check for a CIMD
+        // client is `doc.allows_redirect_uri`. This implementation used
+        // to return the document unvalidated.
+        let (url, _server) = spawn_with_known_url("/cimd.json", |u| {
+            vec![canned_200(
+                &format!(r#"{{"client_id":"{u}","redirect_uris":["http://attacker.example/cb"]}}"#),
+                &[],
+            )]
+        })
+        .await;
+        let cache =
+            EphemeralKvCimdCache::with_loopback_exemption(ephemeral_kv(), Duration::from_secs(60));
+        let refused = cache.get_or_fetch(&url, 16 * 1024).await;
+        let message = refused
+            .expect_err("plaintext redirect_uri must be refused")
+            .to_string();
+        assert!(
+            message.contains("redirect_uri"),
+            "the refusal must name the field: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_storage_backed_cache_refuses_a_document_naming_another_client_id() {
+        let (url, _server) = spawn_with_known_url("/cimd.json", |_u| {
+            vec![canned_200(
+                r#"{"client_id":"https://other.example/cimd","redirect_uris":["https://client.example/cb"]}"#,
+                &[],
+            )]
+        })
+        .await;
+        let cache =
+            EphemeralKvCimdCache::with_loopback_exemption(ephemeral_kv(), Duration::from_secs(60));
+        let refused = cache.get_or_fetch(&url, 16 * 1024).await;
+        let message = refused
+            .expect_err("a document that names a different client_id must be refused")
+            .to_string();
+        assert!(
+            message.contains("does not match fetch URL"),
+            "got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_storage_backed_cache_refuses_a_document_with_no_redirect_uris() {
+        let (url, _server) = spawn_with_known_url("/cimd.json", |u| {
+            vec![canned_200(
+                &format!(r#"{{"client_id":"{u}","redirect_uris":[]}}"#),
+                &[],
+            )]
+        })
+        .await;
+        let cache =
+            EphemeralKvCimdCache::with_loopback_exemption(ephemeral_kv(), Duration::from_secs(60));
+        assert!(cache.get_or_fetch(&url, 16 * 1024).await.is_err());
+    }
+
     #[tokio::test]
     async fn ephemeral_kv_cache_first_fetch_populates_store() {
         let body_doc = |url: &str| {
@@ -1655,11 +1754,11 @@ mod tests {
         };
         let (url, server) =
             spawn_with_known_url("/cimd.json", |u| vec![canned_200(&body_doc(u), &[])]).await;
-        let cache = EphemeralKvCimdCache::new(ephemeral_kv(), Duration::from_secs(60));
-        let http = Client::new();
+        let cache =
+            EphemeralKvCimdCache::with_loopback_exemption(ephemeral_kv(), Duration::from_secs(60));
 
         let doc = cache
-            .get_or_fetch(&url, &http, 16 * 1024)
+            .get_or_fetch(&url, 16 * 1024)
             .await
             .expect("first fetch");
         assert_eq!(doc.client_name.as_deref(), Some("populate"));
@@ -1680,11 +1779,11 @@ mod tests {
             )]
         })
         .await;
-        let cache = EphemeralKvCimdCache::new(ephemeral_kv(), Duration::from_secs(60));
-        let http = Client::new();
+        let cache =
+            EphemeralKvCimdCache::with_loopback_exemption(ephemeral_kv(), Duration::from_secs(60));
 
-        let _first = cache.get_or_fetch(&url, &http, 16 * 1024).await.unwrap();
-        let second = cache.get_or_fetch(&url, &http, 16 * 1024).await.unwrap();
+        let _first = cache.get_or_fetch(&url, 16 * 1024).await.unwrap();
+        let second = cache.get_or_fetch(&url, 16 * 1024).await.unwrap();
 
         assert_eq!(second.client_name.as_deref(), Some("cached"));
         assert_eq!(
@@ -1710,14 +1809,14 @@ mod tests {
             ]
         })
         .await;
-        let cache = EphemeralKvCimdCache::new(ephemeral_kv(), Duration::from_secs(60));
-        let http = Client::new();
+        let cache =
+            EphemeralKvCimdCache::with_loopback_exemption(ephemeral_kv(), Duration::from_secs(60));
 
-        let _ = cache.get_or_fetch(&url, &http, 16 * 1024).await.unwrap();
+        let _ = cache.get_or_fetch(&url, 16 * 1024).await.unwrap();
         // After 1.2s the entry should be evicted; the next call
         // re-fetches.
         tokio::time::sleep(Duration::from_millis(1200)).await;
-        let _ = cache.get_or_fetch(&url, &http, 16 * 1024).await.unwrap();
+        let _ = cache.get_or_fetch(&url, 16 * 1024).await.unwrap();
 
         assert_eq!(
             server.hits.load(Ordering::SeqCst),
@@ -1749,10 +1848,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let cache = EphemeralKvCimdCache::new(kv, Duration::from_secs(60));
-        let http = Client::new();
+        let cache = EphemeralKvCimdCache::with_loopback_exemption(kv, Duration::from_secs(60));
 
-        let doc = cache.get_or_fetch(&url, &http, 16 * 1024).await.unwrap();
+        let doc = cache.get_or_fetch(&url, 16 * 1024).await.unwrap();
         assert_eq!(doc.client_name.as_deref(), Some("recovered"));
         assert_eq!(server.hits.load(Ordering::SeqCst), 1);
     }

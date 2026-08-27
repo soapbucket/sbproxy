@@ -416,6 +416,26 @@ pub struct JwksDocument {
     pub keys: Vec<serde_json::Value>,
 }
 
+impl JwksDocument {
+    /// Parse this document into the `jsonwebtoken` key set a verifier
+    /// consumes.
+    ///
+    /// The colocated configuration needs this: the resource server
+    /// verifies tokens the broker in the same process minted, and
+    /// fetching the broker's own JWKS URL over the network to learn a
+    /// key already in memory is what made that configuration fail
+    /// inside a pod.
+    ///
+    /// # Errors
+    ///
+    /// Returns the deserialization error when a configured
+    /// `public_jwk` is not a shape `jsonwebtoken` recognizes, which is
+    /// an operator mistake in `broker_signing_key.public_jwk`.
+    pub fn to_key_set(&self) -> Result<jsonwebtoken::jwk::JwkSet, serde_json::Error> {
+        serde_json::from_value(serde_json::json!({ "keys": self.keys }))
+    }
+}
+
 /// Build the public JWKS for the broker. When the configured key is
 /// PEM-shaped we cannot trivially convert it back to a JWK without
 /// extra dependencies, so we emit an empty array and rely on the

@@ -55,6 +55,20 @@ pub enum StartupConfigError {
         /// Name of the configuration key that was set to zero.
         field: &'static str,
     },
+    /// The broker mints tokens with a PEM signing key and publishes no
+    /// public half, so `/.well-known/jwks.json` serves an empty key set
+    /// while the AS metadata advertises that URL as the place to find
+    /// the key. Every verifier that follows the discovery document,
+    /// including this crate's own resource server, rejects every token
+    /// the broker issues.
+    #[error(
+        "broker_signing_key is a PEM with no public_jwk, so          {base_path}/.well-known/jwks.json would serve an empty key set while AS metadata          advertises it; set broker_signing_key.public_jwk to the public half of the same key          (same kid, same alg), or supply the key as a JWK instead of a PEM"
+    )]
+    SigningKeyHasNoPublicHalf {
+        /// The broker's configured base path, so the message names the
+        /// endpoint that would be empty.
+        base_path: String,
+    },
 }
 
 /// Run startup-time validation against the broker config and process
@@ -72,6 +86,18 @@ pub fn validate_startup(cfg: &McpGatewayConfig) -> Result<(), StartupConfigError
     }
     if cfg.device_code_enabled && cfg.broker_signing_key.is_none() {
         return Err(StartupConfigError::DeviceAuthorizationRequiresSigningKey);
+    }
+    // A signing key with no publishable public half is a broker whose
+    // own JWKS endpoint is empty. The metadata document advertises that
+    // endpoint as soon as a signing key exists, so this is not a
+    // colocated-only problem: any verifier that discovers the broker
+    // finds no key at all.
+    if let Some(JwkKey::Pem { public_jwk, .. }) = cfg.broker_signing_key.as_ref() {
+        if public_jwk.is_none() {
+            return Err(StartupConfigError::SigningKeyHasNoPublicHalf {
+                base_path: cfg.base_path.clone(),
+            });
+        }
     }
     // A zero lifetime is refused here rather than clamped at the store,
     // because the store's floor keeps the process alive without telling
@@ -149,6 +175,17 @@ pub const DEFAULT_METADATA_MAX_STALENESS_SECS: u64 = 3600;
 /// wedging the broker with a multi-megabyte JSON blob.
 pub const DEFAULT_CIMD_MAX_DOC_BYTES: usize = 16 * 1024;
 
+/// Maximum length of a URL-shaped `client_id` the broker will treat as
+/// a CIMD identifier.
+///
+/// The `client_id` on `/authorize` is unauthenticated caller input, and
+/// it becomes the cache key verbatim in
+/// [`crate::cimd::EphemeralKvCimdCache`], so an unbounded value is an
+/// unbounded key on the shared store. 2048 bytes is the de facto URL
+/// ceiling browsers and reverse proxies already enforce, so no real
+/// client is near it.
+pub const MAX_CIMD_CLIENT_ID_LEN: usize = 2048;
+
 /// Default TTL applied to a cached CIMD entry when the response has no
 /// `Cache-Control: max-age` header. 1 hour matches the AS metadata
 /// cache default; CIMD docs are expected to change rarely.
@@ -185,6 +222,17 @@ pub const DEFAULT_REVOCATION_MAX_TTL_SECS: u64 = 24 * 60 * 60;
 pub const DEFAULT_REVOCATION_MAX_ENTRIES: usize = 4_096;
 /// Per-runtime revocation request budget in one minute.
 pub const DEFAULT_REVOCATION_REQUESTS_PER_MINUTE: u64 = 120;
+
+/// Default `/authorize` and `/par` admission rate, per minute, per
+/// runtime.
+///
+/// Chosen against the session store rather than against traffic: 300
+/// per minute times the 600-second default session TTL is 3000 live
+/// rows, below the store's 4096 capacity, so a stream of anonymous
+/// requests inside the limit cannot reach the capacity refusal. Five
+/// authorization starts a second is far above what a real MCP
+/// deployment does.
+pub const DEFAULT_AUTHORIZE_REQUESTS_PER_MINUTE: u64 = 300;
 
 /// Default chain depth limit for nested `act` claims emitted by token
 /// exchange. Five hops covers every realistic delegation chain
@@ -287,7 +335,13 @@ impl std::fmt::Debug for JwkKey {
 /// tests. Fields are grouped by lifecycle: the first block is consulted
 /// at /authorize time, the next block at /token and /register time,
 /// and the last block by the AS metadata cache.
+/// Unknown keys are refused. This struct is unusually security-flag
+/// dense: a misspelled `dpop_require_nonce` would otherwise boot the
+/// broker with the nonce challenge off and `validate_startup`'s DPoP
+/// checks skipped, silently, and the operator would have no signal at
+/// all that the flag they wrote is not the flag the broker read.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct McpGatewayConfig {
     /// URL prefix the broker mounts under, for example `/mcp/oauth`.
     /// Used for log context and (in 4B.3) the metadata document; the
@@ -397,6 +451,19 @@ pub struct McpGatewayConfig {
     /// Maximum revocation calls accepted by one runtime per minute.
     #[serde(default = "McpGatewayConfig::default_revocation_requests_per_minute")]
     pub revocation_requests_per_minute: u64,
+
+    /// Maximum `/authorize` and `/par` requests one runtime admits per
+    /// minute.
+    ///
+    /// This exists to keep the session store out of its capacity
+    /// refusal. The store holds at most `session_ttl_secs` worth of
+    /// admitted requests, so the steady-state ceiling is
+    /// `authorize_requests_per_minute / 60 * session_ttl_secs`. At the
+    /// defaults that is 3000 against a 4096-row store, which means no
+    /// stream of anonymous requests inside the limit can wedge new
+    /// authorizations. Raise both together or the guarantee goes.
+    #[serde(default = "McpGatewayConfig::default_authorize_requests_per_minute")]
+    pub authorize_requests_per_minute: u64,
 
     /// RFC 9068 broker-signed access token signing key. When set,
     /// the broker mints access tokens it issues itself (e.g. on
@@ -610,6 +677,10 @@ impl McpGatewayConfig {
         DEFAULT_REVOCATION_REQUESTS_PER_MINUTE
     }
 
+    fn default_authorize_requests_per_minute() -> u64 {
+        DEFAULT_AUTHORIZE_REQUESTS_PER_MINUTE
+    }
+
     fn default_token_exchange_max_chain_depth() -> usize {
         DEFAULT_TOKEN_EXCHANGE_MAX_CHAIN_DEPTH
     }
@@ -636,6 +707,7 @@ impl Default for McpGatewayConfig {
             revocation_max_entries: DEFAULT_REVOCATION_MAX_ENTRIES,
             revocation_max_ttl_secs: DEFAULT_REVOCATION_MAX_TTL_SECS,
             revocation_requests_per_minute: DEFAULT_REVOCATION_REQUESTS_PER_MINUTE,
+            authorize_requests_per_minute: DEFAULT_AUTHORIZE_REQUESTS_PER_MINUTE,
             metadata_refresh_secs: DEFAULT_METADATA_REFRESH_SECS,
             max_metadata_staleness_secs: DEFAULT_METADATA_MAX_STALENESS_SECS,
             accepted_client_auth_methods: default_accepted_client_auth_methods(),
@@ -856,6 +928,72 @@ mod tests {
             };
             assert!(validate_startup(&cfg).is_err(), "{external_base_url}");
         }
+    }
+
+    #[test]
+    fn validate_startup_rejects_a_pem_signing_key_with_no_public_half() {
+        // The documented colocated configuration walked into this: the
+        // broker minted ES256 tokens, `/.well-known/jwks.json` served
+        // `{"keys":[]}`, AS metadata advertised that URL anyway, and
+        // every verifier that followed discovery rejected every token.
+        let cfg = McpGatewayConfig {
+            external_base_url: "https://broker.example".to_string(),
+            broker_signing_key: Some(JwkKey::Pem {
+                pem: "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----".to_string(),
+                alg: "ES256".to_string(),
+                kid: Some("broker-2026-08".to_string()),
+                public_jwk: None,
+            }),
+            ..Default::default()
+        };
+        let error = validate_startup(&cfg).unwrap_err();
+        assert!(
+            matches!(error, StartupConfigError::SigningKeyHasNoPublicHalf { .. }),
+            "got {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("public_jwk"),
+            "the refusal must name the key to set: {message}"
+        );
+    }
+
+    #[test]
+    fn validate_startup_accepts_a_pem_signing_key_carrying_its_public_half() {
+        let cfg = McpGatewayConfig {
+            external_base_url: "https://broker.example".to_string(),
+            broker_signing_key: Some(JwkKey::Pem {
+                pem: "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----".to_string(),
+                alg: "ES256".to_string(),
+                kid: Some("broker-2026-08".to_string()),
+                public_jwk: Some(serde_json::json!({
+                    "kty": "EC",
+                    "crv": "P-256",
+                    "kid": "broker-2026-08",
+                    "alg": "ES256",
+                    "x": "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU",
+                    "y": "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"
+                })),
+            }),
+            ..Default::default()
+        };
+        validate_startup(&cfg).expect("a published public half is what the verifier needs");
+    }
+
+    #[test]
+    fn a_misspelled_security_flag_is_refused_rather_than_silently_ignored() {
+        // `deny_unknown_fields`: without it, `dpop_require_nonces` (note
+        // the s) booted the broker with the nonce challenge off.
+        let json = serde_json::json!({
+            "resource_uri": "https://mcp.example",
+            "dpop_require_nonces": true
+        });
+        let error = serde_json::from_value::<McpGatewayConfig>(json)
+            .expect_err("an unknown key must be refused");
+        assert!(
+            error.to_string().contains("dpop_require_nonces"),
+            "the error must name the key: {error}"
+        );
     }
 
     #[test]

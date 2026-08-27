@@ -161,7 +161,19 @@ impl AsMetadataCache {
                 let guard = self.current.lock().await;
                 if let Some((doc, at)) = guard.as_ref() {
                     if now.duration_since(*at) <= max_stale {
+                        // A fail-open, and counted as one. The stale
+                        // document supplies the issuer the RFC 9207
+                        // `iss` check at /callback compares against and
+                        // the endpoint URLs the broker publishes, so an
+                        // operator needs to know the broker has been
+                        // running on a copy that is fifty minutes old.
+                        crate::metrics::record_broker_decision("as_metadata", "stale_fallback");
                         tracing::warn!(
+                            target: "mcp_gateway::decision",
+                            event = "mcp_oauth_as_metadata_decision",
+                            outcome = "stale_fallback",
+                            stale_secs = now.duration_since(*at).as_secs(),
+                            max_staleness_secs = max_stale.as_secs(),
                             error = %refresh_err,
                             "as metadata refresh failed; serving stale doc"
                         );

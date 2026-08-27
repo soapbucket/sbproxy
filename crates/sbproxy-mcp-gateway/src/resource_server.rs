@@ -94,7 +94,12 @@ impl AudienceConfig {
 // --- Config ---
 
 /// Configuration for [`McpResourceServerProvider`].
+///
+/// Unknown keys are refused, for the same reason
+/// [`crate::config::McpGatewayConfig`] refuses them: a misspelled
+/// binding flag here turns a verification check off without saying so.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct McpResourceServerConfig {
     /// Public URI of this MCP resource server (e.g.
     /// `https://mcp.example.com`). Checked against the token's RFC
@@ -310,7 +315,6 @@ impl JwksCache {
 
     async fn fetch_or_cached(
         &self,
-        _http: &reqwest::Client,
         url: &str,
         ttl: Duration,
         allow_insecure_loopback: bool,
@@ -359,8 +363,18 @@ impl JwksCache {
 /// MCP resource-server token verifier.
 pub struct McpResourceServerProvider {
     config: McpResourceServerConfig,
-    http: reqwest::Client,
     jwks: JwksCache,
+    /// Key set supplied in process rather than fetched.
+    ///
+    /// Set when the verifier's `jwks_url` is the colocated broker's own
+    /// `/.well-known/jwks.json` route. That URL is the proxy's own
+    /// external base URL, which inside a pod or behind a load balancer
+    /// resolves to a private address or to a VIP the pod cannot
+    /// hairpin, and the JWKS fetch goes through the egress policy,
+    /// which refuses both. The result was that the documented
+    /// single-process configuration 401'd every MCP request. There is
+    /// no reason to dial ourselves for a key we are holding.
+    local_jwks: Option<Arc<JwkSet>>,
     dpop_replay: Arc<DpopReplayCache>,
     revocations: Arc<crate::revoke::RevocationList>,
 }
@@ -369,6 +383,31 @@ impl McpResourceServerProvider {
     /// Build a provider from validated config.
     pub fn new(config: McpResourceServerConfig) -> Result<Self> {
         Self::new_with_security_context(config, crate::McpSecurityContext::new())
+    }
+
+    /// Verify against `jwks` held in this process instead of fetching
+    /// `jwks_url`.
+    ///
+    /// The one caller is the colocated configuration: an `mcp` action
+    /// that compiles both an `oauth.broker` and an `oauth.resource_server`
+    /// whose `jwks_url` is the broker's own route. Nothing else should
+    /// use it: a real remote authorization server rotates its keys, and
+    /// the fetch path is what picks that up.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `jwks` carries no keys, which is the
+    /// failure this exists to prevent: a broker signing key configured
+    /// as a PEM with no `public_jwk` publishes an empty key set, and
+    /// binding the verifier to it would 401 every request forever.
+    pub fn with_local_jwks(mut self, jwks: JwkSet) -> Result<Self> {
+        if jwks.keys.is_empty() {
+            return Err(anyhow!(
+                "colocated resource server was given an empty key set: set oauth.broker.broker_signing_key.public_jwk"
+            ));
+        }
+        self.local_jwks = Some(Arc::new(jwks));
+        Ok(self)
     }
 
     /// Build a provider sharing runtime-local replay and revocation state
@@ -387,8 +426,8 @@ impl McpResourceServerProvider {
         ));
         Ok(Self {
             config,
-            http: sbproxy_httpkit::default_outbound(),
             jwks: JwksCache::new(),
+            local_jwks: None,
             dpop_replay: Arc::new(DpopReplayCache::with_prefix(
                 security.store,
                 Duration::from_secs(replay_ttl_secs),
@@ -568,16 +607,18 @@ impl McpResourceServerProvider {
                 "JWT algorithm {algorithm_name} is not allowed"
             )));
         }
-        let jwk_set = self
-            .jwks
-            .fetch_or_cached(
-                &self.http,
-                &self.config.jwks_url,
-                Duration::from_secs(self.config.jwks_cache_ttl_secs.max(1)),
-                self.config.allow_insecure_loopback,
-            )
-            .await
-            .map_err(|e| ResourceServerAuthError::JwksUnavailable(e.to_string()))?;
+        let jwk_set = match self.local_jwks.as_ref() {
+            Some(local) => local.clone(),
+            None => self
+                .jwks
+                .fetch_or_cached(
+                    &self.config.jwks_url,
+                    Duration::from_secs(self.config.jwks_cache_ttl_secs.max(1)),
+                    self.config.allow_insecure_loopback,
+                )
+                .await
+                .map_err(|e| ResourceServerAuthError::JwksUnavailable(e.to_string()))?,
+        };
 
         let issuer = self
             .config
@@ -833,11 +874,14 @@ fn validate_rfc9068_claim_types(claims: &serde_json::Value) -> Result<(), String
     Ok(())
 }
 
-/// Candidate JWKs to try, in preference order: an exact `kid` match
-/// first (when the token carries one and a key advertises it), then
-/// every remaining key. Trying every key rather than failing outright
-/// on a `kid` miss tolerates an AS that publishes keys without `kid`
-/// (uncommon but not spec-violating).
+/// The JWKs a token's header selects.
+///
+/// When the token carries a `kid`, only keys advertising exactly that
+/// `kid` are candidates, and there is no fallback to the rest of the
+/// set: a token naming a key the AS has retired must not verify against
+/// its replacement. When the token carries no `kid`, every key in the
+/// set is a candidate, which tolerates an AS that publishes keys
+/// without one (uncommon but not spec-violating).
 fn candidate_keys<'a>(
     set: &'a JwkSet,
     kid: Option<&str>,

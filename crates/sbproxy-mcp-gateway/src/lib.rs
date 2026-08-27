@@ -49,6 +49,17 @@ use tower::ServiceExt;
 pub struct McpSecurityContext {
     pub(crate) store: Arc<dyn sbproxy_storage::EphemeralKv>,
     pub(crate) namespace: String,
+    /// Whether this router mounts `GET {base_path}/admin/status`.
+    ///
+    /// True for a standalone embedding, where the host process decides
+    /// what to put in front of the router. False when the broker runs
+    /// inside sbproxy, because there the OAuth routes have to stay
+    /// unauthenticated for the flow to work at all and the whole route
+    /// tree is dispatched before the resource-server check: the status
+    /// route would be world-readable on the public MCP origin,
+    /// answering "which security controls are off" to anyone who asks.
+    /// The proxy's own authenticated admin API is where that belongs.
+    pub(crate) mount_admin_status: bool,
 }
 
 impl McpSecurityContext {
@@ -64,6 +75,18 @@ impl McpSecurityContext {
         Self {
             store: LocalStore::arc(),
             namespace,
+            mount_admin_status: true,
+        }
+    }
+
+    /// Build a context for a broker mounted inside the sbproxy request
+    /// path, where `/admin/status` must not be served on the public
+    /// origin. See [`Self::mount_admin_status`].
+    #[must_use]
+    pub fn in_process() -> Self {
+        Self {
+            mount_admin_status: false,
+            ..Self::new()
         }
     }
 
@@ -72,6 +95,7 @@ impl McpSecurityContext {
         Self {
             store: LocalStore::arc(),
             namespace: namespace.to_string(),
+            mount_admin_status: true,
         }
     }
 }
@@ -394,7 +418,11 @@ pub struct AppState {
     /// Runtime-scoped, bounded local access-token denylist.
     pub(crate) revocations: Arc<revoke::RevocationList>,
     /// Runtime-scoped fixed-window limiter for the revocation endpoint.
-    pub(crate) revocation_rate_limiter: Arc<revoke::RevocationRateLimiter>,
+    pub(crate) revocation_rate_limiter: Arc<revoke::FixedWindowRateLimiter>,
+    /// Runtime-scoped fixed-window limiter shared by `/authorize` and
+    /// `/par`, the two unauthenticated endpoints that consume session
+    /// capacity.
+    pub(crate) authorize_rate_limiter: Arc<revoke::FixedWindowRateLimiter>,
     /// Shared runtime store for refresh-token sender bindings and other
     /// namespaced credential state.
     pub(crate) security_store: Arc<dyn sbproxy_storage::EphemeralKv>,
@@ -528,14 +556,18 @@ fn router_full_with_par_and_security(
 ) -> Router {
     let base = config.base_path.trim_end_matches('/').to_string();
     let par_enabled = par_store.is_some();
+    let mount_admin_status = security.mount_admin_status;
     let revocations = Arc::new(revoke::RevocationList::new(
         security.store.clone(),
         security.namespace.clone(),
         config.revocation_max_entries,
         std::time::Duration::from_secs(config.revocation_max_ttl_secs.max(1)),
     ));
-    let revocation_rate_limiter = Arc::new(revoke::RevocationRateLimiter::new(
+    let revocation_rate_limiter = Arc::new(revoke::FixedWindowRateLimiter::new(
         config.revocation_requests_per_minute.max(1),
+    ));
+    let authorize_rate_limiter = Arc::new(revoke::FixedWindowRateLimiter::new(
+        config.authorize_requests_per_minute.max(1),
     ));
     let state = AppState {
         config,
@@ -549,6 +581,7 @@ fn router_full_with_par_and_security(
         par_store,
         revocations,
         revocation_rate_limiter,
+        authorize_rate_limiter,
         security_store: security.store,
         security_namespace: security.namespace,
     };
@@ -587,10 +620,11 @@ fn router_full_with_par_and_security(
         &format!("{base}/.well-known/jwks.json"),
         get(well_known::jwks),
     );
-    // Always mounted: a small, unauthenticated JSON surface listing
-    // which optional collaborators are wired in. See `admin` module
-    // docs for why this exists instead of a `ui/` admin console page.
-    router = router.route(&format!("{base}/admin/status"), get(admin::status));
+    // Mounted only for a standalone embedding. See
+    // `McpSecurityContext::mount_admin_status`.
+    if mount_admin_status {
+        router = router.route(&format!("{base}/admin/status"), get(admin::status));
+    }
     router
         .layer(middleware::from_fn(record_route_metrics))
         .with_state(state)

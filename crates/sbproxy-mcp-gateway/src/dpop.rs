@@ -423,9 +423,6 @@ pub fn jwk_thumbprint(jwk: &Jwk) -> Result<String, DpopError> {
 pub struct DpopReplayCache {
     kv: Arc<dyn EphemeralKv>,
     ttl: Duration,
-    /// Serializes the backend's separate read-delete and write calls so
-    /// concurrent proofs cannot both observe the same jti as absent.
-    gate: tokio::sync::Mutex<()>,
     /// Optional key prefix so DPoP replay state can coexist with the
     /// gateway's other ephemeral state (sessions, nonces) in the same
     /// backend without colliding.
@@ -440,7 +437,6 @@ impl DpopReplayCache {
         Self {
             kv,
             ttl,
-            gate: tokio::sync::Mutex::new(()),
             prefix: "dpop:jti".to_string(),
         }
     }
@@ -452,30 +448,43 @@ impl DpopReplayCache {
         Self {
             kv,
             ttl,
-            gate: tokio::sync::Mutex::new(()),
             prefix: prefix.into(),
         }
     }
 
     /// Record this proof's jti. Returns Err if the jti was already
     /// observed within the cache TTL.
+    ///
+    /// One atomic set-if-absent, not a take-then-put. The old shape
+    /// serialized on a process-local mutex, which made the pair atomic
+    /// only for callers sharing one cache instance: two replicas on the
+    /// same Redis both saw `take` return `None` and both admitted the
+    /// proof, which is the configuration this crate's module docs
+    /// present as the multi-replica one. It also deleted the row before
+    /// re-inserting it, so a failed re-insert on the replay branch left
+    /// the jti absent and admitted the next replay.
+    ///
+    /// [`sbproxy_storage::EphemeralKv::compare_exchange`] with
+    /// `expected: None` is the set-if-absent the trait does expose, and
+    /// a backend without native CAS fails the call closed rather than
+    /// emulating it racily.
+    ///
+    /// # Errors
+    ///
+    /// [`DpopError::Replay`] when the jti is already held, and
+    /// [`DpopError::Storage`] when the backend could not answer: both
+    /// refuse the proof.
     pub async fn record_jti(&self, proof: &DpopProof) -> Result<(), DpopError> {
-        let _guard = self.gate.lock().await;
         let key = format!("{}:{}", self.prefix, proof.jti);
-        // The trait does not expose an atomic set-if-absent operation,
-        // so the process-local gate makes this read-delete/write pair
-        // atomic for all callers sharing this cache instance.
-        match self.kv.take(&key).await {
-            Ok(Some(_)) => {
-                // Re-insert so subsequent racing replays still trip.
-                let _ = self.kv.put(&key, Bytes::from_static(b"1"), self.ttl).await;
-                Err(DpopError::Replay)
-            }
-            Ok(None) => self
-                .kv
-                .put(&key, Bytes::from_static(b"1"), self.ttl)
-                .await
-                .map_err(|e| DpopError::Storage(format!("{e}"))),
+        match self
+            .kv
+            .compare_exchange(&key, None, Some((Bytes::from_static(b"1"), self.ttl)))
+            .await
+        {
+            // We claimed the jti: this is its first use.
+            Ok(true) => Ok(()),
+            // Somebody already holds it, on this replica or another.
+            Ok(false) => Err(DpopError::Replay),
             Err(e) => Err(DpopError::Storage(format!("{e}"))),
         }
     }
@@ -1098,13 +1107,15 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
 
     // --- Replay cache ---
 
+    /// A backend whose set-if-absent yields to the scheduler on the way
+    /// in, so two concurrent claims for the same jti interleave.
     #[derive(Clone, Default)]
-    struct YieldAfterTakeKv {
+    struct YieldingKv {
         inner: MockEphemeralKv,
     }
 
     #[async_trait]
-    impl EphemeralKv for YieldAfterTakeKv {
+    impl EphemeralKv for YieldingKv {
         async fn get(&self, key: &str) -> Result<Option<Bytes>, StorageError> {
             self.inner.get(key).await
         }
@@ -1114,9 +1125,45 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
         }
 
         async fn take(&self, key: &str) -> Result<Option<Bytes>, StorageError> {
-            let value = self.inner.take(key).await?;
+            self.inner.take(key).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StorageError> {
+            self.inner.delete(key).await
+        }
+
+        async fn compare_exchange(
+            &self,
+            key: &str,
+            expected: Option<Bytes>,
+            replacement: Option<(Bytes, Duration)>,
+        ) -> Result<bool, StorageError> {
             tokio::task::yield_now().await;
-            Ok(value)
+            self.inner
+                .compare_exchange(key, expected, replacement)
+                .await
+        }
+    }
+
+    /// A backend with no CAS support, which is what the trait default
+    /// gives a backend that has not implemented it.
+    #[derive(Clone, Default)]
+    struct NoCasKv {
+        inner: MockEphemeralKv,
+    }
+
+    #[async_trait]
+    impl EphemeralKv for NoCasKv {
+        async fn get(&self, key: &str) -> Result<Option<Bytes>, StorageError> {
+            self.inner.get(key).await
+        }
+
+        async fn put(&self, key: &str, value: Bytes, ttl: Duration) -> Result<(), StorageError> {
+            self.inner.put(key, value, ttl).await
+        }
+
+        async fn take(&self, key: &str) -> Result<Option<Bytes>, StorageError> {
+            self.inner.take(key).await
         }
 
         async fn delete(&self, key: &str) -> Result<(), StorageError> {
@@ -1125,8 +1172,41 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
     }
 
     #[tokio::test]
+    async fn replay_cache_fails_closed_on_a_backend_without_set_if_absent() {
+        // A backend that cannot make the claim atomic must refuse the
+        // proof, not admit it. Emulating the claim with get-then-put
+        // is what let two replicas both accept the same jti.
+        let kv: Arc<dyn EphemeralKv> = Arc::new(NoCasKv::default());
+        let cache = DpopReplayCache::new(kv, Duration::from_secs(60));
+        let (jwk_val, key) = es256_keypair();
+        let token = build_proof_with(
+            &jwk_val,
+            &key,
+            Algorithm::ES256,
+            Some("dpop+jwt"),
+            "POST",
+            "https://broker.example.com/token",
+            0,
+            Some("jti-no-cas"),
+            None,
+            None,
+        );
+        let proof = parse_and_verify(
+            &token,
+            "POST",
+            &url("https://broker.example.com/token"),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        assert!(matches!(
+            cache.record_jti(&proof).await,
+            Err(DpopError::Storage(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn replay_cache_allows_only_one_concurrent_first_use() {
-        let kv: Arc<dyn EphemeralKv> = Arc::new(YieldAfterTakeKv::default());
+        let kv: Arc<dyn EphemeralKv> = Arc::new(YieldingKv::default());
         let cache = Arc::new(DpopReplayCache::new(kv, Duration::from_secs(60)));
         let (jwk_val, key) = es256_keypair();
         let token = build_proof_with(

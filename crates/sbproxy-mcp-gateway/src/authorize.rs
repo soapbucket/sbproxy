@@ -39,6 +39,16 @@ use crate::pkce::CodeChallengeMethod;
 use crate::session::Session;
 use crate::AppState;
 
+/// The `error_description` an unresolvable CIMD `client_id` gets.
+///
+/// Fixed on purpose. The internal error names the address the host
+/// resolved to and whether the connect was refused or timed out, and
+/// the caller supplied the URL, so answering with it makes an
+/// unauthenticated `/authorize` a DNS-to-private-address oracle and a
+/// port scanner against the proxy's own network position. The detail
+/// goes to the log line beside this constant's call site.
+const CIMD_UNRESOLVED_DESCRIPTION: &str = "client_id metadata document could not be resolved";
+
 // --- Query model ---
 
 /// Inbound /authorize query string.
@@ -99,6 +109,29 @@ fn oauth_error(status: StatusCode, error: &str, description: &str) -> Response {
 /// `GET {base_path}/authorize` handler.
 pub async fn authorize(State(app): State<AppState>, Query(q): Query<AuthorizeQuery>) -> Response {
     let cfg = &app.config;
+
+    // Fixed-window admission before any work. The session store fails
+    // closed at its capacity and never evicts a live row, which is the
+    // right choice, and it means a burst of well-formed anonymous
+    // requests can fill it and refuse every subsequent authorization
+    // for a full session TTL. `redirect_uri` values that pass the
+    // allowlist are public (they are in the client's own config), so
+    // the burst costs an attacker nothing to construct.
+    if !app.authorize_rate_limiter.allow().await {
+        crate::metrics::record_broker_decision("authorize", "rate_limited");
+        tracing::warn!(
+            target: "mcp_gateway::decision",
+            event = "mcp_oauth_authorize_decision",
+            outcome = "rejected",
+            reason = "rate_limited",
+            "authorize refused by the fixed-window limiter"
+        );
+        return oauth_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "temporarily_unavailable",
+            "too many authorization requests; retry shortly",
+        );
+    }
 
     // --- Wave 4D.3a PAR request_uri consumption ---
     //
@@ -176,21 +209,26 @@ pub async fn authorize(State(app): State<AppState>, Query(q): Query<AuthorizeQue
     // existing allowlist check.
     let cimd_doc = match detect_cimd_client_id(client_id) {
         Some(_url) if cfg.cimd_enabled => match &app.cimd_cache {
-            Some(cache) => match cache
-                .get_or_fetch(
-                    client_id,
-                    &sbproxy_httpkit::token_bearing_outbound(),
-                    cfg.cimd_max_doc_bytes,
-                )
-                .await
-            {
+            Some(cache) => match cache.get_or_fetch(client_id, cfg.cimd_max_doc_bytes).await {
                 Ok(doc) => Some(doc),
                 Err(e) => {
-                    tracing::warn!(error = %e, client_id = %client_id, "CIMD resolve failed");
+                    // The detail names the resolved address and the
+                    // connect outcome, and the caller chose the URL, so
+                    // returning it turns an unauthenticated /authorize
+                    // into a DNS-to-private-address oracle and a port
+                    // scanner. It goes to the log; the wire gets a
+                    // fixed string.
+                    tracing::warn!(
+                        target: "mcp_gateway::cimd",
+                        error = %e,
+                        client_id = %sbproxy_security::url_redact::redacted_url(client_id),
+                        "CIMD resolve failed"
+                    );
+                    crate::metrics::record_broker_decision("authorize", "cimd_unresolved");
                     return oauth_error(
                         StatusCode::BAD_REQUEST,
                         "invalid_client",
-                        &format!("CIMD resolution failed: {e}"),
+                        CIMD_UNRESOLVED_DESCRIPTION,
                     );
                 }
             },
@@ -357,7 +395,15 @@ pub async fn authorize(State(app): State<AppState>, Query(q): Query<AuthorizeQue
         code_challenge_method: method.to_string(),
     };
     if let Err(error) = app.session_store.put(&upstream_state, session).await {
-        tracing::warn!(%error, "authorization session store refused request");
+        crate::metrics::record_broker_decision("authorize", "session_capacity");
+        tracing::warn!(
+            target: "mcp_gateway::decision",
+            event = "mcp_oauth_authorize_decision",
+            outcome = "error",
+            reason = "session_capacity",
+            %error,
+            "authorization session store refused request"
+        );
         return oauth_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "temporarily_unavailable",
@@ -439,6 +485,13 @@ pub(crate) fn is_resource_bound(requested: &str, cfg: &crate::config::McpGateway
 /// reference (an https URL); returns `None` otherwise. Pre-registered
 /// opaque-string client_ids continue down the existing path.
 fn detect_cimd_client_id(client_id: &str) -> Option<url::Url> {
+    // Bound the value before it becomes a cache key. An over-length
+    // client_id is not a CIMD identifier as far as the broker is
+    // concerned; it falls through to the pre-registered allowlist,
+    // which cannot contain it, so the request is refused either way.
+    if client_id.len() > crate::config::MAX_CIMD_CLIENT_ID_LEN {
+        return None;
+    }
     let parsed = url::Url::parse(client_id).ok()?;
     if parsed.scheme() == "https" {
         Some(parsed)

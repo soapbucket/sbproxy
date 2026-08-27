@@ -124,11 +124,50 @@ impl RevocationList {
         .await
     }
 
+    /// Membership test on the denylist, read only.
+    ///
+    /// This runs on every MCP request, so it must not go through
+    /// [`Self::mutate`]: that reads the whole index, reserializes it,
+    /// and compare-exchanges it back, which turned a read into a write
+    /// on one shared key. Near the 4096-entry default cap the index is
+    /// on the order of 300 KB, so every request was parsing and
+    /// reserializing 300 KB and contending on the CAS, and the
+    /// contention failure then refused a valid token.
+    ///
+    /// Expired rows are filtered in memory rather than swept: the sweep
+    /// is [`Self::record_validated`]'s job, and it is the only caller
+    /// that has a reason to write.
+    ///
+    /// Fails closed. A backend error or an index this process cannot
+    /// parse returns `true`, because the alternative is admitting a
+    /// token the operator revoked.
     pub(crate) async fn contains(&self, token: &str) -> bool {
         let digest = Self::digest(token);
-        self.mutate(move |index| index.entries.contains_key(&digest))
-            .await
-            .unwrap_or(true)
+        let bytes = match self.store.get(&self.index_key).await {
+            Ok(Some(bytes)) => bytes,
+            // Nothing revoked yet: nothing to refuse.
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::warn!(
+                    target: "mcp_gateway::revoke",
+                    %error,
+                    "revocation denylist unreadable; failing closed"
+                );
+                return true;
+            }
+        };
+        let Ok(index) = serde_json::from_slice::<RevocationIndex>(&bytes) else {
+            tracing::warn!(
+                target: "mcp_gateway::revoke",
+                "revocation denylist did not parse; failing closed"
+            );
+            return true;
+        };
+        let now = unix_now();
+        index
+            .entries
+            .get(&digest)
+            .is_some_and(|expires_at| *expires_at > now)
     }
 
     async fn mutate<T>(
@@ -167,12 +206,20 @@ impl RevocationList {
     }
 }
 
-pub(crate) struct RevocationRateLimiter {
+/// Fixed-window admission counter, shared by every broker endpoint that
+/// needs one.
+///
+/// One window per process, not per client: the endpoints it guards are
+/// unauthenticated, so there is no identity to key on that an attacker
+/// cannot mint. It is a ceiling on the endpoint, and the capacity it
+/// protects (the revocation denylist, the session store) is per process
+/// too, so the two are measured in the same units.
+pub(crate) struct FixedWindowRateLimiter {
     limit: u64,
     state: Mutex<(Instant, u64)>,
 }
 
-impl RevocationRateLimiter {
+impl FixedWindowRateLimiter {
     pub(crate) fn new(limit: u64) -> Self {
         Self {
             limit: limit.max(1),
@@ -540,6 +587,125 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
         assert!(!list.contains(&token).await);
     }
 
+    /// A store that answers reads and refuses every write, so a read
+    /// path that writes is observable.
+    #[derive(Default)]
+    struct ReadOnlyStore {
+        inner: crate::local_store::LocalStore,
+        writes: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl sbproxy_storage::EphemeralKv for ReadOnlyStore {
+        async fn get(&self, key: &str) -> Result<Option<Bytes>, sbproxy_storage::StorageError> {
+            self.inner.get(key).await
+        }
+
+        async fn put(
+            &self,
+            _key: &str,
+            _value: Bytes,
+            _ttl: Duration,
+        ) -> Result<(), sbproxy_storage::StorageError> {
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(sbproxy_storage::StorageError::Backend(
+                "read-only replica".to_string(),
+            ))
+        }
+
+        async fn take(&self, key: &str) -> Result<Option<Bytes>, sbproxy_storage::StorageError> {
+            self.inner.take(key).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), sbproxy_storage::StorageError> {
+            self.inner.delete(key).await
+        }
+
+        async fn compare_exchange(
+            &self,
+            _key: &str,
+            _expected: Option<Bytes>,
+            _replacement: Option<(Bytes, Duration)>,
+        ) -> Result<bool, sbproxy_storage::StorageError> {
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(sbproxy_storage::StorageError::Backend(
+                "read-only replica".to_string(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_denylist_membership_test_never_writes() {
+        // `contains` runs on every MCP request. Going through `mutate`
+        // turned that into a read, a full-index parse, a full-index
+        // reserialize, and a CAS write on one shared key, and the CAS
+        // contention that followed then refused valid tokens.
+        let store = std::sync::Arc::new(ReadOnlyStore::default());
+        let list = RevocationList::new(
+            store.clone(),
+            "ns".to_string(),
+            4,
+            Duration::from_secs(3600),
+        );
+        assert!(
+            !list.contains("some-token").await,
+            "nothing is revoked, so nothing is refused"
+        );
+        assert_eq!(
+            store.writes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a membership test must not write"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_denylist_that_cannot_be_read_fails_closed() {
+        struct Unreadable;
+
+        #[async_trait::async_trait]
+        impl sbproxy_storage::EphemeralKv for Unreadable {
+            async fn get(
+                &self,
+                _key: &str,
+            ) -> Result<Option<Bytes>, sbproxy_storage::StorageError> {
+                Err(sbproxy_storage::StorageError::Backend("down".to_string()))
+            }
+
+            async fn put(
+                &self,
+                _key: &str,
+                _value: Bytes,
+                _ttl: Duration,
+            ) -> Result<(), sbproxy_storage::StorageError> {
+                Ok(())
+            }
+
+            async fn take(
+                &self,
+                _key: &str,
+            ) -> Result<Option<Bytes>, sbproxy_storage::StorageError> {
+                Ok(None)
+            }
+
+            async fn delete(&self, _key: &str) -> Result<(), sbproxy_storage::StorageError> {
+                Ok(())
+            }
+        }
+
+        let list = RevocationList::new(
+            std::sync::Arc::new(Unreadable),
+            "ns".to_string(),
+            4,
+            Duration::from_secs(3600),
+        );
+        assert!(
+            list.contains("some-token").await,
+            "an unreadable denylist must refuse, not admit"
+        );
+    }
+
     #[test]
     fn validated_revocation_retention_is_capped() {
         let exp = unix_now() as i64 + (30 * 24 * 60 * 60);
@@ -575,10 +741,24 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
 
     #[tokio::test]
     async fn revocation_rate_limit_fails_closed_at_the_configured_budget() {
-        let limiter = RevocationRateLimiter::new(2);
+        let limiter = FixedWindowRateLimiter::new(2);
         assert!(limiter.allow().await);
         assert!(limiter.allow().await);
         assert!(!limiter.allow().await);
+    }
+
+    #[tokio::test]
+    async fn the_default_authorize_rate_cannot_fill_the_session_store() {
+        // The property the default exists for: a stream of anonymous
+        // /authorize requests inside the limit cannot reach the session
+        // store's capacity refusal, because rows expire faster than the
+        // limiter admits them.
+        let admitted_per_ttl = crate::config::DEFAULT_AUTHORIZE_REQUESTS_PER_MINUTE / 60
+            * crate::config::McpGatewayConfig::default().session_ttl_secs;
+        assert!(
+            admitted_per_ttl < crate::session::DEFAULT_SESSION_CAPACITY as u64,
+            "{admitted_per_ttl} admitted per TTL must stay under the session cap"
+        );
     }
 
     /// Pure construction-side test: confirms the form-body builder

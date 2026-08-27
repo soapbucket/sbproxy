@@ -232,20 +232,23 @@ pub async fn token(
         .filter(|s| is_https_url(s));
     let cimd_doc = if let Some(cid_url) = cimd_url {
         match &app.cimd_cache {
-            Some(cache) => match cache
-                .get_or_fetch(
-                    cid_url,
-                    &sbproxy_httpkit::token_bearing_outbound(),
-                    cfg.cimd_max_doc_bytes,
-                )
-                .await
-            {
+            Some(cache) => match cache.get_or_fetch(cid_url, cfg.cimd_max_doc_bytes).await {
                 Ok(doc) => Some(doc),
                 Err(e) => {
+                    // Same reasoning as `/authorize`: the detail names
+                    // the resolved address, and the caller chose the
+                    // URL. Log it, do not answer with it.
+                    tracing::warn!(
+                        target: "mcp_gateway::cimd",
+                        error = %e,
+                        client_id = %sbproxy_security::url_redact::redacted_url(cid_url),
+                        "CIMD resolve failed"
+                    );
+                    crate::metrics::record_broker_decision("token", "cimd_unresolved");
                     return oauth_error(
                         StatusCode::UNAUTHORIZED,
                         "invalid_client",
-                        &format!("CIMD resolve failed: {e}"),
+                        "client_id metadata document could not be resolved",
                     );
                 }
             },

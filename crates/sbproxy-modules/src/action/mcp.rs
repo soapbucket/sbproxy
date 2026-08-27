@@ -4508,7 +4508,10 @@ impl McpAction {
                 }
             }
         }
-        let oauth_security = sbproxy_mcp_gateway::McpSecurityContext::new();
+        // In-process: the broker's route tree is dispatched on the
+        // public MCP origin ahead of the resource-server check, so its
+        // `/admin/status` route must not be mounted here.
+        let oauth_security = sbproxy_mcp_gateway::McpSecurityContext::in_process();
         let resource_server = cfg
             .oauth
             .as_ref()
@@ -4533,12 +4536,41 @@ impl McpAction {
                         "mcp action: oauth.resource_server.scopes_supported must match oauth.scopes_supported"
                     );
                 }
-                Ok(Arc::new(
+                // A colocated verifier must not dial the broker's JWKS
+                // URL. That URL is this proxy's own external base URL,
+                // which inside a pod or behind a load balancer resolves
+                // to a private address or a VIP the pod cannot hairpin,
+                // and the OAuth egress policy refuses both: every MCP
+                // request 401'd with `JwksUnavailable`. The key is in
+                // this process; hand it over directly.
+                let colocated_jwks = oauth.broker.as_ref().and_then(|broker| {
+                    let own_jwks_url = format!(
+                        "{}{}/.well-known/jwks.json",
+                        broker.external_base_url.trim_end_matches('/'),
+                        broker.base_path.trim_end_matches('/')
+                    );
+                    (resource.jwks_url == own_jwks_url)
+                        .then(|| sbproxy_mcp_gateway::broker_jwks(broker.broker_signing_key.as_ref()))
+                });
+                let provider =
                     sbproxy_mcp_gateway::McpResourceServerProvider::new_with_security_context(
                         resource,
                         oauth_security.clone(),
-                    )?,
-                ))
+                    )?;
+                let provider = match colocated_jwks {
+                    Some(document) => {
+                        let key_set = document.to_key_set().map_err(|error| {
+                            anyhow::anyhow!(
+                                "mcp action: oauth.broker.broker_signing_key.public_jwk is not a JWK jsonwebtoken can read: {error}"
+                            )
+                        })?;
+                        provider.with_local_jwks(key_set).map_err(|error| {
+                            anyhow::anyhow!("mcp action: {error}")
+                        })?
+                    }
+                    None => provider,
+                };
+                Ok(Arc::new(provider))
             })
             .transpose()?;
         let oauth_broker = cfg

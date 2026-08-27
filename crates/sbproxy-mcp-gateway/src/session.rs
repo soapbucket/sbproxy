@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
-const DEFAULT_SESSION_CAPACITY: usize = 4_096;
+pub(crate) const DEFAULT_SESSION_CAPACITY: usize = 4_096;
 
 /// Floor [`InMemorySessionStore::new`] applies to a zero TTL.
 ///
@@ -287,6 +287,24 @@ impl RedisSessionStore {
     }
 }
 
+/// A short SHA-256 prefix of a session key, for log lines.
+///
+/// The key embeds the broker's outbound `state` value verbatim, and
+/// that value is the credential that binds an authorization callback
+/// to its session. Logging it whole put it in every aggregator with
+/// access to error-level lines, where it is replayable for the whole
+/// session TTL. Twelve hex characters is plenty to correlate two lines
+/// about one session without being the session.
+fn key_digest(key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(key.as_bytes());
+    digest
+        .iter()
+        .take(6)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 #[async_trait]
 impl SessionStore for RedisSessionStore {
     async fn put(&self, state: &str, session: Session) -> Result<()> {
@@ -314,14 +332,14 @@ impl SessionStore for RedisSessionStore {
             Ok(Some(b)) => b,
             Ok(None) => return None,
             Err(e) => {
-                tracing::error!(error = %e, key = %key, "session take failed");
+                tracing::error!(error = %e, key = %key_digest(&key), "session take failed");
                 return None;
             }
         };
         match serde_json::from_slice::<Session>(&raw) {
             Ok(s) => Some(s),
             Err(e) => {
-                tracing::error!(error = %e, key = %key, "session JSON parse failed");
+                tracing::error!(error = %e, key = %key_digest(&key), "session JSON parse failed");
                 None
             }
         }

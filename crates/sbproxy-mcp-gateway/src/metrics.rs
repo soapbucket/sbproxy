@@ -93,8 +93,11 @@ pub static TOKEN_REQUESTS_TOTAL: LazyLock<Option<IntCounterVec>> = LazyLock::new
     )
 });
 
-/// DPoP proof verification outcomes, labeled by `outcome` (`verified`,
-/// `rejected`, `replay`).
+/// DPoP proof verification outcomes, labeled by `outcome`. The emitted
+/// vocabulary is `verified`, `nonce_required`, and `rejected`; a replay
+/// is one of the things `rejected` covers, because the middleware that
+/// writes this family sees the HTTP outcome rather than the
+/// `DpopError` variant behind it.
 pub static DPOP_PROOFS_TOTAL: LazyLock<Option<IntCounterVec>> = LazyLock::new(|| {
     registered(
         register_int_counter_vec!(
@@ -107,8 +110,7 @@ pub static DPOP_PROOFS_TOTAL: LazyLock<Option<IntCounterVec>> = LazyLock::new(||
 });
 
 /// `/revoke` and `/introspect` calls, labeled by `endpoint`
-/// (`revoke`, `introspect`) and `outcome` (`ok`, `unsupported`,
-/// `upstream_error`).
+/// (`revoke`, `introspect`) and `outcome` (`ok`, `error`).
 pub static RFC7009_RFC7662_REQUESTS_TOTAL: LazyLock<Option<IntCounterVec>> = LazyLock::new(|| {
     registered(
         register_int_counter_vec!(
@@ -139,6 +141,35 @@ pub static SESSIONS_ACTIVE: LazyLock<Option<IntGauge>> = LazyLock::new(|| {
     )
 });
 
+/// Broker enforcement decisions that are not one of the coarse
+/// per-endpoint outcomes above, labeled by `surface` and `decision`.
+///
+/// This is the family an operator alerts on when the broker starts
+/// refusing, because each of these decisions is one the proxy made and
+/// none of them is visible in an HTTP status code alone:
+///
+/// | `surface` | `decision` | meaning |
+/// | --- | --- | --- |
+/// | `authorize` | `cimd_unresolved` | a URL-shaped `client_id` did not resolve to a usable metadata document |
+/// | `authorize` | `rate_limited` | the per-window `/authorize` limiter refused |
+/// | `authorize` | `session_capacity` | the session store is full, so no new authorization can start |
+/// | `par` | `rate_limited` | the same limiter on `/par` |
+/// | `resource_server` | `unauthenticated` | a token failed verification and the request got a 401 challenge |
+/// | `scope` | `refused` | a verified token lacked the scope the operation maps to |
+/// | `scope` | `admitted_unadvertised` | the resource does not advertise that scope, so the check did not apply: a fail-open, counted as one |
+/// | `as_metadata` | `stale_fallback` | an upstream metadata refresh failed and the cached document was served past its refresh interval |
+/// | `verify` | `csrf_refused` | the device-code consent form failed its origin or nonce check |
+pub static DECISIONS_TOTAL: LazyLock<Option<IntCounterVec>> = LazyLock::new(|| {
+    registered(
+        register_int_counter_vec!(
+            "sbproxy_mcp_gateway_decisions_total",
+            "MCP OAuth broker enforcement decisions by surface and decision.",
+            &["surface", "decision"]
+        ),
+        "sbproxy_mcp_gateway_decisions_total",
+    )
+});
+
 /// Record an `/authorize` decision outcome. A no-op when the family
 /// did not register; see `registered`.
 pub fn record_authorize(outcome: &str) {
@@ -164,7 +195,10 @@ pub fn record_dpop(outcome: &str) {
 /// Record the live in-memory authorization-session count.
 pub fn record_sessions_active(live: usize) {
     if let Some(family) = SESSIONS_ACTIVE.as_ref() {
-        family.set(live as i64);
+        // `usize` is 64-bit on every target the proxy builds for, so
+        // this cannot lose a real count; a truncating `as` cast would
+        // have turned an implausible one into a negative gauge.
+        family.set(i64::try_from(live).unwrap_or(i64::MAX));
     }
 }
 
@@ -172,6 +206,14 @@ pub fn record_sessions_active(live: usize) {
 pub fn record_revocation_or_introspection(endpoint: &str, outcome: &str) {
     if let Some(family) = RFC7009_RFC7662_REQUESTS_TOTAL.as_ref() {
         family.with_label_values(&[endpoint, outcome]).inc();
+    }
+}
+
+/// Record one broker enforcement decision. See [`DECISIONS_TOTAL`] for
+/// the label vocabulary.
+pub fn record_broker_decision(surface: &str, decision: &str) {
+    if let Some(family) = DECISIONS_TOTAL.as_ref() {
+        family.with_label_values(&[surface, decision]).inc();
     }
 }
 
@@ -191,6 +233,8 @@ mod tests {
         record_token("issued");
         record_dpop("verified");
         record_revocation_or_introspection("revoke", "ok");
+        record_broker_decision("resource_server", "unauthenticated");
+        record_broker_decision("scope", "refused");
         record_sessions_active(3);
         assert_eq!(
             SESSIONS_ACTIVE

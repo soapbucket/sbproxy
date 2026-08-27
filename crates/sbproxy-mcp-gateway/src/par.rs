@@ -191,6 +191,25 @@ pub async fn par(
     State(app): State<AppState>,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
+    // Same limiter as `/authorize`: a PAR entry is an authorization
+    // request that has not been redeemed yet, so it consumes the same
+    // capacity from the same unauthenticated surface.
+    if !app.authorize_rate_limiter.allow().await {
+        crate::metrics::record_broker_decision("par", "rate_limited");
+        tracing::warn!(
+            target: "mcp_gateway::decision",
+            event = "mcp_oauth_par_decision",
+            outcome = "rejected",
+            reason = "rate_limited",
+            "pushed authorization request refused by the fixed-window limiter"
+        );
+        return oauth_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "temporarily_unavailable",
+            "too many pushed authorization requests; retry shortly",
+        );
+    }
+
     let Some(store) = app.par_store.as_ref() else {
         return oauth_error(
             StatusCode::SERVICE_UNAVAILABLE,
