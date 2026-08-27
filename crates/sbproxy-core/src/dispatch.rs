@@ -22,6 +22,31 @@ pub(crate) fn unsupported_plugin_action_proxy_message() -> String {
     )
 }
 
+/// Status every transport answers a legacy
+/// [`ActionOutcome::Responded`] with.
+///
+/// The variant says "I wrote a response through host state", and no
+/// host state a linked `ActionHandler` can reach writes one: `handle`
+/// receives the request and an opaque `&mut dyn Any`, never a session
+/// or a response writer. The outcome therefore names a capability this
+/// host does not implement, which is what 501 is for (RFC 9110
+/// section 15.6.2). H3 already answered 501 here; H1/H2 treated the
+/// outcome as handled and wrote nothing at all, so a client saw an
+/// empty exchange and the access log had no status (WOR-2632).
+pub(crate) const LEGACY_RESPONDED_STATUS: u16 = 501;
+
+/// The single refusal body every transport sends for a legacy
+/// [`ActionOutcome::Responded`], carrying the stable
+/// [`sbproxy_plugin::UNSUPPORTED_ACTION_OUTCOME_CODE`] reason so an
+/// operator can match on the code rather than the prose.
+pub(crate) fn unsupported_plugin_action_responded_message() -> String {
+    format!(
+        "{}: plugin action returned the legacy `Responded` outcome, which carries no response \
+         bytes; return `ActionOutcome::Response {{ status, headers, body }}` instead",
+        sbproxy_plugin::UNSUPPORTED_ACTION_OUTCOME_CODE
+    )
+}
+
 // --- Public dispatch API ---
 
 /// Dispatch an HTTP/3 request through the proxy pipeline.
@@ -478,23 +503,41 @@ async fn dispatch_action(
                         handler.handler().handler_type()
                     )
                 })?;
-            match outcome {
-                ActionOutcome::Response {
-                    status,
-                    headers,
-                    body,
-                } => validate_plugin_action_response(status, headers, body),
-                ActionOutcome::Proxy => {
-                    Err(anyhow::anyhow!(unsupported_plugin_action_proxy_message()))
-                }
-                ActionOutcome::Responded => {
-                    warn!("H3: legacy plugin responded outcome cannot write through H3 dispatch");
-                    Ok(text_response(
-                        501,
-                        &h3_unsupported_message("legacy plugin response"),
-                    ))
-                }
-            }
+            plugin_action_outcome_response(outcome)
+        }
+    }
+}
+
+/// Map an [`ActionOutcome`] onto the response a transport sends.
+///
+/// Shared so every variant has one answer rather than one per
+/// transport: `Response` is validated and sent, `Proxy` is a
+/// configuration error the host cannot satisfy, and the legacy
+/// `Responded` is the refusal described on
+/// [`LEGACY_RESPONDED_STATUS`] (WOR-2632). The H1/H2 path in
+/// `server::action_dispatch` writes through the session rather than
+/// returning an [`HttpResponse`], so it consumes the same status and
+/// message constants instead of calling this directly.
+pub(crate) fn plugin_action_outcome_response(outcome: ActionOutcome) -> Result<HttpResponse> {
+    match outcome {
+        ActionOutcome::Response {
+            status,
+            headers,
+            body,
+        } => validate_plugin_action_response(status, headers, body),
+        ActionOutcome::Proxy => Err(anyhow::anyhow!(unsupported_plugin_action_proxy_message())),
+        ActionOutcome::Responded => {
+            warn!(
+                outcome = "responded",
+                reason = sbproxy_plugin::UNSUPPORTED_ACTION_OUTCOME_CODE,
+                status = LEGACY_RESPONDED_STATUS,
+                "plugin action returned the legacy Responded outcome, which carries no response \
+                 bytes"
+            );
+            Ok(text_response(
+                LEGACY_RESPONDED_STATUS,
+                &unsupported_plugin_action_responded_message(),
+            ))
         }
     }
 }
@@ -1368,6 +1411,43 @@ mod tests {
         assert!(
             !check_auth(&auth, &empty, &uri, &http::Method::GET, b"").await,
             "a request neither provider accepts must be denied"
+        );
+    }
+
+    /// WOR-2632: every public `ActionOutcome` has to end in a complete
+    /// response. `Responded` carries no bytes and no writer, so the
+    /// deterministic answer is the shared 501 refusal rather than a
+    /// half-written exchange.
+    #[test]
+    fn every_action_outcome_yields_a_defined_transport_response() {
+        let structured = plugin_action_outcome_response(ActionOutcome::Response {
+            status: 202,
+            headers: vec![("content-type".to_owned(), "text/plain".to_owned())],
+            body: Bytes::from_static(b"queued"),
+        })
+        .expect("a structured response is sent as authored");
+        assert_eq!(structured.status, 202);
+        assert_eq!(structured.body.as_deref(), Some(&b"queued"[..]));
+
+        let responded = plugin_action_outcome_response(ActionOutcome::Responded)
+            .expect("the legacy outcome is a defined refusal, not an error");
+        assert_eq!(responded.status, LEGACY_RESPONDED_STATUS);
+        let body = String::from_utf8(responded.body.expect("the refusal carries a body").to_vec())
+            .expect("refusal body is UTF-8");
+        assert_eq!(body, unsupported_plugin_action_responded_message());
+        assert!(
+            body.contains(sbproxy_plugin::UNSUPPORTED_ACTION_OUTCOME_CODE),
+            "the refusal names the stable plugin-outcome reason: {body}"
+        );
+
+        let Err(proxied) = plugin_action_outcome_response(ActionOutcome::Proxy) else {
+            panic!("the plugin action has no upstream to proxy to");
+        };
+        assert!(
+            proxied
+                .to_string()
+                .contains(sbproxy_plugin::UNSUPPORTED_ACTION_OUTCOME_CODE),
+            "the proxy refusal keeps its own stable reason: {proxied}"
         );
     }
 }

@@ -1380,7 +1380,32 @@ pub(super) async fn handle_action(
                     ErrorType::InternalError,
                     crate::dispatch::unsupported_plugin_action_proxy_message(),
                 )),
-                sbproxy_plugin::ActionOutcome::Responded => Ok(true),
+                sbproxy_plugin::ActionOutcome::Responded => {
+                    // WOR-2632: the legacy outcome claims the handler
+                    // already wrote a response through host state, but
+                    // `ActionHandler::handle` never receives a session or
+                    // a response writer, so there is nothing on the wire.
+                    // Answering `Ok(true)` here marked the request handled
+                    // and left an H1/H2 client with an empty exchange and
+                    // the access log with no status, while an H3 client
+                    // got a defined 501 for the same outcome. Send the one
+                    // refusal both transports share.
+                    warn!(
+                        outcome = "responded",
+                        reason = sbproxy_plugin::UNSUPPORTED_ACTION_OUTCOME_CODE,
+                        status = crate::dispatch::LEGACY_RESPONDED_STATUS,
+                        "plugin action returned the legacy Responded outcome, which carries no \
+                         response bytes"
+                    );
+                    ctx.response_status = Some(crate::dispatch::LEGACY_RESPONDED_STATUS);
+                    send_error(
+                        session,
+                        crate::dispatch::LEGACY_RESPONDED_STATUS,
+                        &crate::dispatch::unsupported_plugin_action_responded_message(),
+                    )
+                    .await?;
+                    Ok(true)
+                }
                 sbproxy_plugin::ActionOutcome::Response {
                     status,
                     headers,
@@ -1852,6 +1877,12 @@ mod plugin_action_tests {
         }
     }
 
+    fn outcome_action(outcome: ActionOutcome) -> Action {
+        Action::Plugin(sbproxy_modules::PluginAction::linked(Box::new(
+            OutcomeAction(outcome),
+        )))
+    }
+
     fn response_action(status: u16, headers: Vec<(String, String)>, body: Bytes) -> Action {
         Action::Plugin(sbproxy_modules::PluginAction::linked(Box::new(
             OutcomeAction(ActionOutcome::Response {
@@ -1966,6 +1997,43 @@ mod plugin_action_tests {
             .expect("downstream response timeout")
             .expect("downstream client task");
         (result, response, ctx)
+    }
+
+    /// WOR-2632: the legacy `Responded` outcome claims the handler
+    /// already wrote a response through host state, but a linked
+    /// `ActionHandler` never receives a session or a response writer, so
+    /// nothing was written. H1/H2 answered `Ok(true)` and sent zero
+    /// bytes -- an empty exchange with no status in the access log --
+    /// while an H3 client got a defined 501 for the same outcome. Both
+    /// transports now answer the one refusal.
+    #[tokio::test]
+    async fn plugin_action_http1_refuses_the_legacy_responded_outcome() {
+        let action = outcome_action(ActionOutcome::Responded);
+        let pipeline = CompiledPipeline::empty_for_test();
+        let over_h3 = crate::dispatch::plugin_action_outcome_response(ActionOutcome::Responded)
+            .expect("the legacy outcome maps to a defined H3 response");
+
+        let (result, wire, ctx) =
+            exchange_with_ctx(&action, &pipeline, None, DEFAULT_TEST_REQUEST, |_| {}).await;
+
+        assert!(
+            matches!(result, Ok(true)),
+            "the action still settles the request rather than falling through to an upstream"
+        );
+        let text = String::from_utf8_lossy(&wire);
+        assert!(
+            text.starts_with(&format!("HTTP/1.1 {} ", over_h3.status)),
+            "H1 must answer the status H3 answers, got: {text}"
+        );
+        assert!(
+            text.contains(sbproxy_plugin::UNSUPPORTED_ACTION_OUTCOME_CODE),
+            "the refusal carries the stable plugin-outcome reason, got: {text}"
+        );
+        assert_eq!(
+            ctx.response_status,
+            Some(over_h3.status),
+            "the access log, metrics, and traces all read the status off the context"
+        );
     }
 
     #[tokio::test]

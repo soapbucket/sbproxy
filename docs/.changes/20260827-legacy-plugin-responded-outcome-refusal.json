@@ -1,0 +1,4 @@
+{
+  "type": "fixed",
+  "message": "**A plugin action that returns the legacy `ActionOutcome::Responded` now gets the same defined 501 on every transport.** The variant says the handler wrote a response through host state, but `ActionHandler::handle` never receives a session or a response writer, so nothing was written. HTTP/1.1 and HTTP/2 treated the outcome as handled and sent zero bytes, leaving the client with an empty exchange and the access log with no status, while HTTP/3 already answered a defined 501. Both now answer 501 with the stable `unsupported_action_outcome` reason and record the status on the request context. Return `ActionOutcome::Response { status, headers, body }` instead."
+}
