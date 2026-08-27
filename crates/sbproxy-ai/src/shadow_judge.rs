@@ -467,16 +467,31 @@ impl JudgeRegistry {
             }
         }
         // Carry the spend over so a re-cap is not a way to buy a fresh
-        // allowance. The highest spend among the budgets these targets
-        // held is the conservative reading when they are being merged.
-        let carried = targets
+        // allowance. When targets are being merged onto one budget the
+        // carry is the *sum* of the distinct budgets they held, not the
+        // largest: taking the largest would forget every other block's
+        // spend and hand the judge back allowance it had already used.
+        // Deduplicated by pointer, because two targets that already
+        // shared a budget hold one spend between them and counting it
+        // twice would be the opposite error.
+        let mut distinct: Vec<&Arc<JudgeBudget>> = Vec::new();
+        for target in targets {
+            let Some(budget) = budgets.get(target) else {
+                continue;
+            };
+            if !distinct.iter().any(|held| Arc::ptr_eq(held, budget)) {
+                distinct.push(budget);
+            }
+        }
+        let carried = distinct
             .iter()
-            .filter_map(|target| budgets.get(target))
             .map(|budget| budget.snapshot().spent_usd)
-            .fold(0.0_f64, f64::max);
+            .sum::<f64>()
+            .min(cap_usd);
+        drop(distinct);
         let replacement = Arc::new(JudgeBudget::new(cap_usd, window));
         if carried > 0.0 {
-            replacement.admit(carried.min(cap_usd));
+            replacement.admit(carried);
         }
         for target in targets {
             budgets.insert(target.clone(), Arc::clone(&replacement));

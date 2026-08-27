@@ -2120,8 +2120,13 @@ mod tests {
         );
     }
 
-    /// WOR-2651: the three strategies whose order a cache-affinity
-    /// lease must not jump, and a sample of the ones it may.
+    /// WOR-2651: every strategy whose order a cache-affinity lease must
+    /// not jump, and a sample of the ones it may.
+    ///
+    /// All three arms of the predicate are exercised, because a
+    /// predicate wider than its test is how the `fallback_chain` gap
+    /// this test was written to close survived in the first place:
+    /// deleting an untested arm leaves the suite green.
     ///
     /// Red before the fix on the `fallback_chain` arm: the dispatch
     /// site excluded `cascade` and `cost_quality` and never excluded
@@ -2136,9 +2141,16 @@ mod tests {
             ]
         }))
         .expect("cascade fixture");
+        let cost_quality: crate::cost_quality::CostQualityConfig =
+            serde_json::from_value(serde_json::json!({
+                "cheap_provider": "cheap",
+                "frontier_provider": "frontier"
+            }))
+            .expect("cost_quality fixture");
         for strategy in [
             RoutingStrategy::FallbackChain,
             RoutingStrategy::Cascade(cascade),
+            RoutingStrategy::CostQuality(cost_quality),
         ] {
             let name = strategy_name(&strategy);
             assert!(
