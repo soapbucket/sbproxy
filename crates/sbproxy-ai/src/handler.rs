@@ -3717,7 +3717,6 @@ mod tests {
         assert!(error.contains("targets[1]"), "{error}");
     }
 
-    #[test]
     /// WOR-2654: the cap has no default, and the refusal says why.
     /// Red without it in the way that matters: a judge block that
     /// parsed with no cap would bill an operator an amount nobody
