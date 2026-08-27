@@ -2130,7 +2130,10 @@ mod tests {
     #[test]
     fn the_authored_orderings_own_their_candidate_order() {
         let cascade: CascadeConfig = serde_json::from_value(serde_json::json!({
-            "tiers": [{"provider": "cheap"}, {"provider": "frontier"}]
+            "tiers": [
+                {"provider_id": "cheap", "model": "cheap-model", "quality_threshold": 0.5},
+                {"provider_id": "frontier", "model": "frontier-model", "quality_threshold": 0.9}
+            ]
         }))
         .expect("cascade fixture");
         for strategy in [
