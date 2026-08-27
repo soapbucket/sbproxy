@@ -9539,6 +9539,49 @@ mod tests {
         assert_eq!(status, 400, "{body}");
     }
 
+    /// WOR-2654: the shadow report's `window` vocabulary is closed, and
+    /// the refusal names the whole accepted set. Every other refusal
+    /// this surface adds is pinned by name and this one was not, which
+    /// left the accepted set free to drift from the message describing
+    /// it.
+    #[test]
+    fn the_shadow_report_refuses_a_window_it_does_not_serve() {
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+
+        for window in ["15m", "1h", "24h", "7d", "30d"] {
+            let (status, _, body) = handle_admin_request(
+                "GET",
+                &format!("/api/ai/shadow/report?window={window}"),
+                &state,
+                Some(&auth),
+                None,
+            );
+            assert_eq!(status, 200, "{window} is an accepted window: {body}");
+        }
+
+        let (status, _, body) = handle_admin_request(
+            "GET",
+            "/api/ai/shadow/report?window=90d",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 400, "{body}");
+        for window in ["15m", "1h", "24h", "7d", "30d"] {
+            assert!(
+                body.contains(window),
+                "the refusal has to name every window it does serve, and it omits \
+                 {window}: {body}"
+            );
+        }
+
+        // GET only, so a write verb cannot reach a read surface.
+        let (status, _, body) =
+            handle_admin_request("POST", "/api/ai/shadow/report", &state, Some(&auth), None);
+        assert_eq!(status, 405, "{body}");
+    }
+
     #[test]
     fn requests_export_csv_neutralizes_spreadsheet_formula_prefixes() {
         // Caller-controlled text lands in these cells; a leading `=`,
