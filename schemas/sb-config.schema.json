@@ -8038,6 +8038,26 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0.0
+        },
+        "authority_hints": {
+          "description": "Entity URLs of this entity's superiors, published in the entity statement as `authority_hints`.\n\nOpenID Federation 1.0 s3 makes this required for every entity that is not itself a Trust Anchor, and a peer's resolver walks it: `compose_trust_chain` reads `authority_hints` from the leaf it fetched and returns no chain when the array is empty. A statement published without it is anchor-shaped, so no peer can chain this proxy to anything.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "peer_trust": {
+          "description": "Inbound peer verification. Absent leaves the proxy publishing its own identity and verifying nobody.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/FederationPeerTrustConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false
@@ -8062,6 +8082,73 @@
         "kid": {
           "description": "Key identifier stamped into the protected JWS header.",
           "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "FederationPeerTrustConfig": {
+      "description": "`proxy.federation.peer_trust`: verify the entity a request claims to come from against pinned trust anchors, on the request path.\n\nA peer names itself in a header. The proxy fetches that entity's self-signed configuration, walks its `authority_hints` up to one of the anchors below through the governed `egress.federation` client, validates every signature and linkage in the chain, checks any required trust marks, and either stamps the verified entity id onto the request or refuses it. Every step publishes the decision events and metrics `docs/federation.md` documents.",
+      "type": "object",
+      "required": [
+        "trust_anchors"
+      ],
+      "properties": {
+        "required": {
+          "description": "Refuse a request that names no peer, or whose peer does not resolve to an anchor.\n\n`false` still refuses a request whose named peer fails to resolve: an unverifiable claim is worse than no claim. What it permits is a request that makes no claim at all, which is the shape for a proxy that federates with some callers and serves ordinary traffic from the rest.",
+          "default": false,
+          "type": "boolean"
+        },
+        "header": {
+          "description": "Request header the peer names itself in.",
+          "default": "x-federation-entity-id",
+          "type": "string"
+        },
+        "trust_anchors": {
+          "description": "Pinned trust anchors. At least one is required.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/FederationTrustAnchorConfig"
+          }
+        },
+        "required_trust_marks": {
+          "description": "Trust-mark identifiers a verified peer must additionally carry, each signed by an anchor above and published in the peer's own entity configuration.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "max_chain_depth": {
+          "description": "Maximum statements in an accepted chain.",
+          "default": 5,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "cache_ttl_secs": {
+          "description": "How long a resolved peer decision is reused before the chain is walked again. A chain walk is several outbound HTTPS fetches, so re-running it per request would put a peer's availability on this proxy's request path.",
+          "default": 600,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "FederationTrustAnchorConfig": {
+      "description": "One pinned OpenID Federation trust anchor.",
+      "type": "object",
+      "required": [
+        "entity_id",
+        "jwks"
+      ],
+      "properties": {
+        "entity_id": {
+          "description": "The anchor's entity URL.",
+          "type": "string"
+        },
+        "jwks": {
+          "description": "The anchor's published JWKS, as the `{\"keys\": [...]}` object. This is the pin: every chain is verified against these keys, so they come from the operator rather than from the network."
         }
       },
       "additionalProperties": false
