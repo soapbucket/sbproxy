@@ -2,6 +2,8 @@
 
 mod async_kv;
 mod async_redis;
+pub mod embedded;
+mod embedded_metrics;
 mod file;
 mod memory;
 mod redb_store;
@@ -11,6 +13,9 @@ mod sqlite;
 
 pub use async_kv::AsyncKVStore;
 pub use async_redis::{AsyncRedisConfig, AsyncRedisKVStore, RedisScanPage};
+#[cfg(feature = "redb-store")]
+pub use embedded::EmbeddedKvStore;
+pub use embedded::{CasOutcome, EphemeralKv, KvEntry, KvNamespace, MemoryKv, PersistentKv};
 pub use file::FileKVStore;
 pub use memory::MemoryKVStore;
 pub use redb_store::RedbKVStore;

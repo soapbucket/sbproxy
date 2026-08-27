@@ -1,0 +1,4 @@
+{
+  "type": "added",
+  "message": "Added a shared embedded state store, a `PersistentKv` and `EphemeralKv` pair backed by redb, so subsystems that need durable state get one ACID store rather than a database dependency each."
+}

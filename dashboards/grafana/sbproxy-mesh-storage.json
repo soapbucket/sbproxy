@@ -973,6 +973,136 @@
         }
       ],
       "description": "Failed storage operations as a fraction of all of them. The latency histogram is observed on success and on failure alike, so the denominator contains the numerator and this really is bounded to 0 and 1. Anything sustained above one percent is worth a ticket. Anything near 1 means the store is effectively down and the mesh is running without shared state, which is the SBPROXY-STORAGE-BACKEND-ERRORS condition. Returns nothing rather than zero when there is no storage traffic to divide."
+    },
+    {
+      "id": 13,
+      "title": "Embedded Store Operations",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 37
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "min": 0,
+          "noValue": "No embedded store is configured on any scraped process. Configure agent_registry, notifications or event_ingest to populate this."
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (store, op) (rate(sbproxy_embedded_store_operations_total{outcome=\"ok\"}[5m]))",
+          "legendFormat": "{{store}} {{op}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Successful reads and writes against each embedded store, by store and operation. The agent registry, the outbound notifier and the event-ingest reconciler all share one redb-backed store type, so one panel answers the health question for every one of them. No data means no subsystem that uses an embedded store is configured on any scraped process, which is what a default deployment looks like rather than a stalled store."
+    },
+    {
+      "id": 14,
+      "title": "Embedded Store Errors and Refusals",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 37
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "min": 0,
+          "noValue": "No errors, refusals or evictions recorded."
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (store, op) (rate(sbproxy_embedded_store_operations_total{outcome=\"error\"}[5m]))",
+          "legendFormat": "error {{store}} {{op}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (store) (rate(sbproxy_embedded_store_operations_total{outcome=\"rejected\"}[5m]))",
+          "legendFormat": "refused {{store}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum by (store) (rate(sbproxy_embedded_store_operations_total{op=\"evict\"}[5m]))",
+          "legendFormat": "evicted {{store}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Two different problems on one axis, kept apart by the outcome label. An error is a fault: the redb transaction failed, or a record could not be decoded, and the subsystem above it did not get the write it asked for. A refusal is the bounded in-memory store working as designed, turning away a write because it is at its entry cap; a sustained refusal rate means a dedup window is too small for the traffic, not that the store is broken. Evictions are the TTL sweep reclaiming expired entries and are healthy at any rate."
     }
   ],
   "templating": {

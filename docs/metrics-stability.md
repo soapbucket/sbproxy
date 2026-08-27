@@ -239,6 +239,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_cors_refusals_total` | Counter | `stable` | `beta` | `reason` | Responses the CORS middleware refused to add headers to, by reason. |
 | `sbproxy_credential_resolution_duration_seconds` | Histogram | `stable` | `beta` | `cache`, `outcome` | Wall-clock latency of one bound-credential resolution, by which cache layer answered and the real outcome. |
 | `sbproxy_egress_refused_total` | Counter | `stable` | `beta` | `purpose`, `reason`, `tenant`, `origin` | Outbound dials refused by purpose-scoped egress authorization, by purpose, closed reason, tenant, and origin. |
+| `sbproxy_embedded_store_operations_total` | Counter | `stable` | `beta` | `store`, `op`, `outcome` | Embedded key-value store operations, by store, operation, and outcome (ok, error, or a bounded ephemeral store refusing a write at its cap). |
 | `sbproxy_errors_total` | Counter | `stable` | `beta` | `hostname`, `error_type` | Total errors. |
 | `sbproxy_events_dropped_total` | Counter | `stable` | `beta` | `sink`, `reason` | Proxy events the events: egress did not deliver, by sink (file or webhook) and closed reason. |
 | `sbproxy_evidence_seq_tenant_cap_total` | Counter | `stable` | `beta` | none | Evidence sequence lookups for a tenant past the tracked-tenant cap, sharing the overflow counter. |

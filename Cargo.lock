@@ -9424,6 +9424,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "sbproxy-plugin",
+ "sbproxy-util",
  "tempfile",
  "tokio",
  "tracing",

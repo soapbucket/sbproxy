@@ -12,6 +12,10 @@ sqlite-store = ["dep:rusqlite"]
 
 [dependencies]
 sbproxy-plugin.workspace = true
+# `secure_fs` puts the 0o600 in the open(2) call that creates an embedded
+# store file, rather than chmod-ing after redb's own umask-dependent
+# `File::create`. See storage::embedded::EmbeddedKvStore::open.
+sbproxy-util.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
 hex.workspace = true
@@ -38,3 +42,6 @@ rusqlite = { workspace = true, optional = true }
 [dev-dependencies]
 rcgen = { workspace = true }
 tempfile = "3"
+# `time` is only needed by the embedded ephemeral-store tests, which sleep
+# past a TTL to prove an expired entry reads as absent.
+tokio = { workspace = true, features = ["rt", "macros", "sync", "net", "time"] }

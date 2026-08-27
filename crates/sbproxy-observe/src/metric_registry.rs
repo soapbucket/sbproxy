@@ -2313,6 +2313,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_embedded_store_operations_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_kv_op"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["store", "op", "outcome"],
+        description: "Embedded key-value store operations, by store, operation, and outcome (ok, error, or a bounded ephemeral store refusing a write at its cap).",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_errors_total",
         kind: MetricKind::Counter,
         writer: Writer::Field("errors_total"),
