@@ -28,7 +28,7 @@
 //!
 //! This list exists so a reviewer auditing the contract above can walk
 //! every path that needs dial-time re-validation without grepping.
-//! Ten call sites across the workspace, split by whether the caller
+//! Twelve call sites across the workspace, split by whether the caller
 //! actually pins what it validated.
 //!
 //! Pinned: the caller takes the [`SocketAddr`]s back and dials those.
@@ -48,6 +48,16 @@
 //!   dial may reach, through `resolve_to_addrs`. The refusal carries no
 //!   address, port, or reason: the peer URL can itself be what a probe
 //!   is asking about.
+//! - `sbproxy-mcp-gateway::cimd`: a CIMD `client_id` is an https URL
+//!   supplied by an unauthenticated `/authorize` caller. The module
+//!   resolves it itself and pins a `reqwest::dns::Resolve` to the
+//!   resolved set, so it calls [`validate_dialable_addrs`] rather than
+//!   [`validate_url_resolved`]. Its refusal reaches the caller as a
+//!   fixed string; the address stays in the log.
+//! - `sbproxy-mcp-gateway::egress`: the OAuth broker's upstream
+//!   endpoints. Operator-configured except for the `jwks_uri` taken
+//!   from a fetched authorization-server metadata document, which is
+//!   remote-controlled. Pins the same way.
 //!
 //! Not pinned. Each is defensible for its own reason, and each is a
 //! place the rebinding window is still open:
@@ -121,25 +131,116 @@ fn is_link_local_v6(ip: &Ipv6Addr) -> bool {
     (segments[0] & 0xFFC0) == 0xFE80
 }
 
+/// Canonicalize an address before any private-range check.
+///
+/// An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) names an IPv4
+/// destination. A dual-stack socket built for a `SocketAddr::V6` with no
+/// `IPV6_V6ONLY` set connects to that IPv4 address on both Linux and
+/// macOS, so every range check has to see the IPv4 form or the v6-shaped
+/// spelling of `10.0.0.5` walks past the RFC 1918 block.
+///
+/// This is the one place the workspace unwraps that form. Any guard that
+/// does its own range test (a dial-time re-check on a pinned resolver,
+/// for instance) must run its input through here first; the shared
+/// checks [`is_private_ip`] and [`validate_dialable_addrs`] already do.
+///
+/// ```
+/// # use std::net::IpAddr;
+/// # use sbproxy_security::ssrf::canonical_ip;
+/// let mapped: IpAddr = "::ffff:10.0.0.5".parse().unwrap();
+/// assert_eq!(canonical_ip(mapped), "10.0.0.5".parse::<IpAddr>().unwrap());
+/// ```
+pub fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        other => other,
+    }
+}
+
 /// Check if an IP address is private/internal and should be blocked.
 ///
-/// IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) are unwrapped before the
-/// check so that an attacker cannot bypass the IPv4 link-local /
-/// loopback / RFC 1918 blocks by submitting the v6-shaped form.
+/// IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) are unwrapped by
+/// [`canonical_ip`] before the check so that an attacker cannot bypass
+/// the IPv4 link-local / loopback / RFC 1918 blocks by submitting the
+/// v6-shaped form.
 pub fn is_private_ip(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => is_private_ipv4(v4),
+    match canonical_ip(*ip) {
+        IpAddr::V4(v4) => is_private_ipv4(&v4),
         IpAddr::V6(v6) => {
-            // IPv4-mapped IPv6: unwrap and re-check as IPv4.
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return is_private_ipv4(&v4);
-            }
             v6.is_loopback()           // ::1
             || v6.is_unspecified()     // ::
-            || is_ula(v6)              // fc00::/7
-            || is_link_local_v6(v6) // fe80::/10
+            || is_ula(&v6)             // fc00::/7
+            || is_link_local_v6(&v6) // fe80::/10
         }
     }
+}
+
+/// Reserved space that is never a legitimate dial target, on top of the
+/// private ranges [`is_private_ip`] covers.
+///
+/// Kept separate because [`is_private_ip`] answers "is this the
+/// operator's internal network", which several callers pair with an
+/// `allow_private_cidrs` allowlist, while this answers "can a socket
+/// meaningfully reach this at all". Only the dial-time check below
+/// consults it.
+fn is_reserved_non_dialable(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_multicast()
+                // 0.0.0.0/8 ("this network", RFC 1122): kernels route
+                // the whole /8 to localhost.
+                || v4.octets()[0] == 0
+                // 240.0.0.0/4, reserved for future use (RFC 1112).
+                || v4.octets()[0] >= 240
+        }
+        IpAddr::V6(v6) => {
+            v6.is_multicast()
+                // The deprecated IPv4-compatible form `::a.b.c.d`
+                // (RFC 4291 s2.5.5.1). `canonical_ip` deliberately does
+                // not unwrap it, because `::1` would canonicalize to
+                // `0.0.0.1` and lose the loopback match. The whole
+                // `::/96` block is reserved, so refuse it outright.
+                || (v6.to_ipv4().is_some() && v6.to_ipv4_mapped().is_none())
+        }
+    }
+}
+
+/// Re-check a set of already-resolved addresses immediately before a dial.
+///
+/// This is the dial-time half of the contract in the module docs, for a
+/// caller that resolves the host itself (a pinned `reqwest::dns::Resolve`,
+/// say) rather than going through [`validate_url_resolved`]. Every
+/// address is canonicalized with [`canonical_ip`] first, then tested
+/// against [`is_private_ip`] and the reserved non-dialable space.
+///
+/// Returns the first offending address so the caller can log it without
+/// putting it on the wire: for a caller whose input URL is
+/// attacker-supplied, the refusal reason is itself the answer to a
+/// probe.
+///
+/// # Errors
+///
+/// Returns `Err(ip)` naming the first address that must not be dialed.
+///
+/// ```
+/// # use std::net::SocketAddr;
+/// # use sbproxy_security::ssrf::validate_dialable_addrs;
+/// let mapped: SocketAddr = "[::ffff:169.254.169.254]:80".parse().unwrap();
+/// assert!(validate_dialable_addrs(&[mapped]).is_err());
+/// let public: SocketAddr = "8.8.8.8:443".parse().unwrap();
+/// assert!(validate_dialable_addrs(&[public]).is_ok());
+/// ```
+pub fn validate_dialable_addrs(addrs: &[SocketAddr]) -> Result<(), IpAddr> {
+    for addr in addrs {
+        let ip = canonical_ip(addr.ip());
+        if is_private_ip(&ip) || is_reserved_non_dialable(&ip) {
+            return Err(ip);
+        }
+    }
+    Ok(())
 }
 
 /// IPv4-only private/reserved check, factored out so the v6-mapped path
@@ -562,6 +663,77 @@ mod tests {
         assert!(!is_private_ip(&mapped));
     }
 
+    // --- dial-time re-validation ---
+
+    #[test]
+    fn canonical_ip_unwraps_the_mapped_form_and_leaves_the_rest() {
+        assert_eq!(
+            canonical_ip("::ffff:10.0.4.7".parse().unwrap()),
+            "10.0.4.7".parse::<IpAddr>().unwrap()
+        );
+        // Not a mapped address: must survive untouched, or the ::1
+        // loopback match is lost.
+        assert_eq!(
+            canonical_ip("::1".parse().unwrap()),
+            "::1".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            canonical_ip("8.8.8.8".parse().unwrap()),
+            "8.8.8.8".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn dial_check_refuses_the_v6_spelling_of_every_private_v4_range() {
+        for mapped in [
+            "[::ffff:10.0.4.7]:443",
+            "[::ffff:127.0.0.1]:443",
+            "[::ffff:169.254.169.254]:80",
+            "[::ffff:192.168.1.1]:443",
+            "[::ffff:172.16.0.1]:443",
+            "[::ffff:100.64.0.1]:443",
+        ] {
+            let addr: SocketAddr = mapped.parse().expect("literal parses");
+            let blocked = validate_dialable_addrs(&[addr]);
+            assert!(blocked.is_err(), "{mapped} must not be dialable");
+        }
+    }
+
+    #[test]
+    fn dial_check_refuses_reserved_space_and_admits_a_public_address() {
+        for reserved in [
+            "224.0.0.1:443",   // multicast
+            "0.1.2.3:443",     // 0.0.0.0/8
+            "240.0.0.1:443",   // 240.0.0.0/4
+            "[ff02::1]:443",   // v6 multicast
+            "[::1.2.3.4]:443", // deprecated IPv4-compatible
+        ] {
+            let addr: SocketAddr = reserved.parse().expect("literal parses");
+            assert!(
+                validate_dialable_addrs(&[addr]).is_err(),
+                "{reserved} must not be dialable"
+            );
+        }
+        let public: SocketAddr = "8.8.8.8:443".parse().expect("literal parses");
+        assert!(validate_dialable_addrs(&[public]).is_ok());
+        let public_v6: SocketAddr = "[2001:4860:4860::8888]:443"
+            .parse()
+            .expect("literal parses");
+        assert!(validate_dialable_addrs(&[public_v6]).is_ok());
+    }
+
+    #[test]
+    fn dial_check_refuses_a_set_where_only_one_address_is_private() {
+        let public: SocketAddr = "8.8.8.8:443".parse().expect("literal parses");
+        let mapped: SocketAddr = "[::ffff:10.0.0.5]:443".parse().expect("literal parses");
+        // Happy eyeballs may pick either, so one bad address poisons the
+        // whole set.
+        assert_eq!(
+            validate_dialable_addrs(&[public, mapped]),
+            Err("10.0.0.5".parse().expect("literal parses"))
+        );
+    }
+
     // --- validate_url_resolved ---
 
     #[test]
@@ -635,6 +807,12 @@ mod caller_status_guard {
         "validate_url(",
         "validate_url_with_allowlist(",
         "validate_url_resolved(",
+        // A caller that resolves the host itself and pins the dial has
+        // no `validate_url*` call to find. Two of those exist
+        // (`sbproxy-mcp-gateway`'s CIMD fetcher and its OAuth egress),
+        // and the guard was blind to both until they were routed
+        // through this entry point.
+        "validate_dialable_addrs(",
     ];
 
     /// The doc block spells its count as a word, so the guard has to
