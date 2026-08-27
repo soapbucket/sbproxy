@@ -6089,10 +6089,7 @@ fn apply_operator_service_tier(
     // than only the tier-capable ones is the fail-closed half: a vendor that
     // honors it somewhere undocumented still cannot be steered by a caller.
     let caller_tier = object.remove("service_tier");
-    let operator_tier = surface
-        .supports_service_tier()
-        .then(|| sbproxy_ai::service_tier::resolved_wire_tier(provider))
-        .flatten();
+    let operator_tier = resolved_operator_tier(provider, surface);
     match operator_tier {
         Some((field, value)) => {
             object.insert(field.clone(), serde_json::Value::String(value.clone()));
@@ -6112,22 +6109,47 @@ fn apply_operator_service_tier(
     }
 }
 
-/// The service tier a request was served under, as the admin request
-/// row records it.
+/// The `(wire field, wire value)` this provider resolves to on this
+/// surface, or `None` when the surface has no tier axis or the entry
+/// declares no tier.
 ///
-/// Same two conditions [`apply_operator_service_tier`] applies, read
-/// off a provider rather than a returned pair, because the raced
-/// dispatch resolves its winner after the loop that applied the tier
-/// has ended.
-fn served_service_tier(
+/// One expression, called by the enforcer that writes the field and by
+/// the recorder that stamps the admin row. Two copies of the same gate
+/// would drift the moment either was narrowed, and the failure that
+/// drift produces is a row claiming a tier the request was not served
+/// under, which is exactly what putting the tier on the row was for.
+fn resolved_operator_tier(
     provider: &sbproxy_ai::provider::ProviderConfig,
     surface: &sbproxy_ai::handler::AiSurface,
-) -> Option<compact_str::CompactString> {
+) -> Option<(String, String)> {
     surface
         .supports_service_tier()
         .then(|| sbproxy_ai::service_tier::resolved_wire_tier(provider))
         .flatten()
-        .map(|(_, value)| compact_str::CompactString::new(value))
+}
+
+/// The service tier a request was served under, as the admin request
+/// row records it.
+///
+/// Gated on [`resolved_operator_tier`], so the row is absent exactly
+/// when no tier was written, but it records the operator's own
+/// spelling (`flex`, `standard`, `priority`) rather than the vendor's.
+/// The two differ: OpenAI's catalog spells `standard` as `default` on
+/// the wire, and an operator reading their own request log should see
+/// the word they wrote in the config rather than the one the vendor
+/// happens to use. `docs/admin-api-reference.md` says so on the row.
+///
+/// Read off a provider rather than off the returned pair, because the
+/// raced dispatch resolves its winner after the loop that applied the
+/// tier has ended.
+fn served_service_tier(
+    provider: &sbproxy_ai::provider::ProviderConfig,
+    surface: &sbproxy_ai::handler::AiSurface,
+) -> Option<compact_str::CompactString> {
+    resolved_operator_tier(provider, surface)?;
+    provider
+        .service_tier
+        .map(|tier| compact_str::CompactString::new(tier.to_string()))
 }
 
 /// Derive one caller-scoped prompt-cache lease identity for a request.
@@ -12660,9 +12682,7 @@ pub(super) async fn handle_ai_proxy(
         // credential source and the cache tokens. Overwritten per
         // attempt, so a failover leaves the tier of the provider that
         // actually served rather than the one that did not.
-        ctx.ai_service_tier = operator_tier
-            .as_ref()
-            .map(|(_, value)| compact_str::CompactString::new(value));
+        ctx.ai_service_tier = served_service_tier(provider, &surface);
         let resolved_model = if !model.is_empty() {
             let mapped = provider.map_model(&model);
             if mapped != model {
@@ -23083,6 +23103,51 @@ origins:
             context.ai_service_tier.as_deref(),
             Some("flex"),
             "the row records the operator's tier, never the caller's"
+        );
+    }
+
+    /// The row records the operator's own spelling and the wire carries
+    /// the vendor's. OpenAI's catalog spells the `standard` tier
+    /// `default`, so this is the one case where the two differ, and
+    /// `docs/admin-api-reference.md` promises the row shows what the
+    /// operator wrote.
+    #[tokio::test]
+    async fn the_row_records_the_operators_spelling_and_the_wire_the_vendors() {
+        let (upstream_url, hits, captured) = capturing_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+        )
+        .await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai-standard",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key",
+                "service_tier": "standard"
+            }]
+        }))
+        .expect("service tier proxy config");
+
+        let context = dispatch_chat_request_context(
+            &config,
+            serde_json::json!({
+                "model": "fixture-model",
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }),
+        )
+        .await;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let body = captured_upstream_json(captured).await;
+        assert_eq!(
+            body["service_tier"], "default",
+            "the vendor's own spelling goes on the wire: {body}"
+        );
+        assert_eq!(
+            context.ai_service_tier.as_deref(),
+            Some("standard"),
+            "and the operator's own spelling goes on the row"
         );
     }
 
