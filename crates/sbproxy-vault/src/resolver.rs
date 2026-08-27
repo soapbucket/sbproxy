@@ -260,12 +260,26 @@ fn read_bounded_secret_file(path: &str, max_bytes: usize) -> Result<String> {
     file.take(read_limit)
         .read_to_end(&mut bytes)
         .with_context(|| format!("failed to read secret file: {path}"))?;
-    if bytes.len() > max_bytes {
-        anyhow::bail!("resolved secret exceeds the {max_bytes}-byte limit");
-    }
     let value = String::from_utf8(bytes)
         .with_context(|| format!("secret file is not valid UTF-8 text: {path}"))?;
-    Ok(value.trim().to_string())
+    // `resolve` trims before it measures, so this path has to as well:
+    // otherwise `echo "$TOKEN" > token` refuses a secret that is exactly at
+    // the limit, for its trailing newline alone, with a message naming the
+    // byte count rather than the whitespace.
+    //
+    // Trimming cannot smuggle an oversized secret through. The read window
+    // is one byte past the limit, so only a value that filled it can have
+    // been truncated, and truncation moves bytes off the end: trailing
+    // whitespace inside a full window means the value already ended. A
+    // leading run of whitespace is the one shape that would push real bytes
+    // past the window, and that is refused rather than silently shortened.
+    let trimmed = value.trim();
+    let truncated_by_leading_whitespace =
+        value.len() > max_bytes && value.starts_with(char::is_whitespace);
+    if trimmed.len() > max_bytes || truncated_by_leading_whitespace {
+        anyhow::bail!("resolved secret exceeds the {max_bytes}-byte limit");
+    }
+    Ok(trimmed.to_string())
 }
 
 #[cfg(test)]
@@ -415,6 +429,30 @@ mod tests {
         let error = resolver
             .resolve_bounded(&oversized_reference, 8)
             .expect_err("the ninth byte must be refused");
+        assert!(error.to_string().contains("8-byte limit"), "{error:#}");
+    }
+
+    /// `echo "$TOKEN" > token` writes a trailing newline, so the bounded
+    /// path has to measure what it returns, the way `resolve` already does.
+    /// Trimming must not turn into a way past the ceiling: a value that
+    /// filled the read window behind leading whitespace is refused rather
+    /// than handed back silently truncated.
+    #[test]
+    fn bounded_file_resolution_measures_the_trimmed_value() {
+        let resolver = resolver_no_backend();
+
+        let newline_terminated = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(newline_terminated.path(), b"12345678\n").unwrap();
+        let reference = format!("file:{}", newline_terminated.path().display());
+        assert_eq!(resolver.resolve_bounded(&reference, 8).unwrap(), "12345678");
+        assert_eq!(resolver.resolve(&reference).unwrap(), "12345678");
+
+        let leading_whitespace = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(leading_whitespace.path(), b"   123456789012").unwrap();
+        let reference = format!("file:{}", leading_whitespace.path().display());
+        let error = resolver
+            .resolve_bounded(&reference, 8)
+            .expect_err("a value the read window truncated must never be returned");
         assert!(error.to_string().contains("8-byte limit"), "{error:#}");
     }
 
