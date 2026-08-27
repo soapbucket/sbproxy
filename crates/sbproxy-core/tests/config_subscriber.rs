@@ -616,7 +616,7 @@ async fn a_bundle_reading_this_nodes_environment_is_refused() {
     let (mut subscriber, stub) =
         applied_baseline(dir, "envref-local.test", "envref-authority.test").await;
     let identity_before = pipeline_identity();
-    let denied_before = fetch_total("denied_path");
+    let refused_before = fetch_total("confinement_refused");
 
     stub.serve(
         sign(
@@ -637,8 +637,15 @@ origins:
         .expect("encode"),
     );
 
-    assert_eq!(subscriber.poll_once().await, CycleResult::DeniedPath);
-    assert_eq!(fetch_total("denied_path"), denied_before + 1);
+    // Its own cycle result and its own metric label: a confinement
+    // refusal names no denied path, so an operator reading `denied_path`
+    // would go hunting through AUTHORITY_DENIED_PATHS for a path that is
+    // not there (WOR-2433 re-review).
+    assert_eq!(
+        subscriber.poll_once().await,
+        CycleResult::ConfinementRefused
+    );
+    assert_eq!(fetch_total("confinement_refused"), refused_before + 1);
     assert_eq!(pipeline_identity(), identity_before, "no reload may happen");
     assert!(serves("envref-authority.test"), "revision 5 keeps serving");
     assert_eq!(subscriber.revision(), 5, "the cursor must not move");

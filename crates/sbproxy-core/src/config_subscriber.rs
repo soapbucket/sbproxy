@@ -64,6 +64,7 @@
 //! | Merged document does not compile or cannot be constructed | Reject the candidate. `compile_failed`. |
 //! | Merged document carries an unresolved `${VAR}` | Reject the candidate. `compile_failed`. |
 //! | Bundle names a subscriber-owned path | Reject the candidate. `denied_path`. |
+//! | Bundle reaches for this node's environment, secrets, or filesystem | Reject the candidate. `confinement_refused`. |
 //! | Another reload in flight | Skip the cycle. `reload_busy`. |
 //! | Cold boot, no cache, `overlay` | Boot on the local document with a loud warning. |
 //! | Cold boot, no cache, `replace` (or `require_bundle_on_boot`) | Refuse to start. |
@@ -425,6 +426,15 @@ pub enum CycleResult {
     CompileFailed,
     /// The bundle named a path the subscriber owns outright.
     DeniedPath,
+    /// The bundle reached for a host resource this node owns: a secret
+    /// read straight off this node's environment or filesystem, or a
+    /// path the proxy would open (WOR-2433).
+    ///
+    /// Distinct from [`Self::DeniedPath`], which means the bundle set a
+    /// config path this node reserves. A confinement refusal names no
+    /// such path, so an operator reading `denied_path` would go looking
+    /// through `AUTHORITY_DENIED_PATHS` for something that is not there.
+    ConfinementRefused,
     /// Another reload held the reload lock. Nothing was examined.
     ReloadBusy,
 }
@@ -440,6 +450,7 @@ impl CycleResult {
             Self::VerifyFailed => "verify_failed",
             Self::CompileFailed => "compile_failed",
             Self::DeniedPath => "denied_path",
+            Self::ConfinementRefused => "confinement_refused",
             Self::ReloadBusy => "reload_busy",
         }
     }
@@ -864,7 +875,7 @@ impl ConfigSubscriber {
                 revision = bundle.revision,
                 "config bundle reaches for a host resource this node owns; refusing it",
             );
-            return Err(CycleResult::DeniedPath);
+            return Err(CycleResult::ConfinementRefused);
         }
         let merged = match merge_config(
             base_yaml,
