@@ -717,22 +717,29 @@ pub(crate) would leave items whose only callers are cfg(test) code, which
 same-file constant `AI_TOOLKIT_EVENT_ID_MAX_BYTES` was narrowed to
 pub(crate) before recording this result.
 
-314 -> 316 on the WOR-2606 storage tree. Both additions are
-`sbproxy-middleware/src/idempotency.rs`'s `EntryState` and `TryClaim`,
+No move on the WOR-2606 storage tree, after one. WOR-2609 added
+`EntryState` and `TryClaim` to `sbproxy-middleware/src/idempotency.rs`,
 the return types of the `IdempotencyCache` trait's `peek` and
-`try_claim`. The trait is pub and is meant to be implemented outside
-this file (`sbproxy-core` carries one such impl today), so an
-implementor has to be able to name what it returns; the only
-cross-file caller in tree is that impl, which lives in a test module.
-Narrowing either to pub(crate) would make the trait unimplementable
-from outside the crate, which is the opposite of what the item is for.
-They come out of this bucket the first time an out-of-crate backend
-lands.
+`try_claim`, and both landed in both buckets: the trait is pub, so
+narrowing either to pub(crate) makes it unimplementable from outside
+the crate, and the only cross-file consumer in tree was a test double
+in `sbproxy-core`. The first read of that was "raise the baseline by
+two and record why", which is what the count is there to make somebody
+argue for.
 
-The unreferenced bucket moved 1462 -> 1464 in the same change and for
-the same two items: `EntryState` and `TryClaim` are named 27 and 19
-times inside `idempotency.rs` and nowhere else in production, because
-the only thing that reads them is the module that defines the trait.
-They stay pub for the reason above. The third candidate that change
-produced, `IdempotencyOutcome::is_in_flight`, had no caller but a test
-and was deleted rather than baselined.
+The argument did not hold, because the reason both items looked
+write-only was a 2000-line file rather than an over-exposed item. The
+two backends that consume them, `InMemoryIdempotencyCache` and
+`KvIdempotencyCache`, sat in the same file as the trait, so every
+production reference was an in-file one and the scanner correctly saw
+nothing outside. Moving the backends to
+`idempotency/backends.rs`, which the file wanted anyway (the protocol
+and its two implementations are different things to read), puts the
+production consumers where they always were logically and both counts
+return to 314 and 1462.
+
+Worth naming for the next person who reads a two-item move: the
+question the bucket asks is "does anything but a test name this", and
+a file large enough to contain both the declaration and every caller
+answers it wrongly by construction. Splitting the file is a real fix
+for that; adding a caller would not have been.
