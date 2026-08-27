@@ -1668,6 +1668,36 @@ pub(super) async fn request_filter(
     // load balancer this node is usually not the one that published the
     // token, and a local-only lookup would 404 the CA (WOR-2310).
     let path: String = session.req_header().uri.path().to_string();
+    if path == sbproxy_federation::WELL_KNOWN_FEDERATION_PATH {
+        if let Some(issuer) = ctx.pipeline.federation_issuer.as_ref() {
+            if session.req_header().method != http::Method::GET {
+                send_error(session, 405, "method not allowed").await?;
+                ctx.response_status = Some(405);
+                return Ok(true);
+            }
+            match issuer.current() {
+                Ok(document) => {
+                    send_response(
+                        session,
+                        200,
+                        sbproxy_federation::ENTITY_STATEMENT_CONTENT_TYPE,
+                        document.compact_jws.as_bytes(),
+                    )
+                    .await?;
+                    ctx.response_status = Some(200);
+                }
+                Err(error) => {
+                    tracing::error!(
+                        error = %error,
+                        "failed to produce OpenID Federation entity statement"
+                    );
+                    send_error(session, 503, "entity statement unavailable").await?;
+                    ctx.response_status = Some(503);
+                }
+            }
+            return Ok(true);
+        }
+    }
     if let Some(token) = sbproxy_tls::challenges::extract_challenge_token(&path) {
         if let Some(store) = reload::challenge_store() {
             if let Some(key_auth) = store.get_async(token).await {

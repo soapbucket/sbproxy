@@ -1436,6 +1436,11 @@ pub struct ProxyServerConfig {
     /// `docs/migration-credentials.md`.
     #[serde(default)]
     pub credentials: Vec<CredentialBlock>,
+    /// OpenID Federation entity-statement serving for this proxy process.
+    /// Absent, or present with `enabled: false`, leaves the well-known
+    /// endpoint unmounted.
+    #[serde(default)]
+    pub federation: Option<FederationConfig>,
     /// Durable payment settlement. When absent, the proxy keeps its
     /// existing non-settlement crawl-ledger behavior exactly. When
     /// present, a paid request reaches the origin only after its
@@ -1449,6 +1454,49 @@ pub struct ProxyServerConfig {
     /// in never reaches a first request.
     #[serde(default)]
     pub payments: Option<crate::payments::PaymentsConfig>,
+}
+
+const fn default_federation_lifetime_secs() -> u64 {
+    3600
+}
+
+const fn default_federation_refresh_margin_secs() -> u64 {
+    300
+}
+
+/// `proxy.federation`: the signing identity served by the normal proxy
+/// listener at `/.well-known/openid-federation`.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FederationConfig {
+    /// Whether the process mounts the well-known entity-statement route.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Externally visible HTTPS entity identifier used for `iss` and `sub`.
+    pub entity_id: String,
+    /// Private signing-key location and JWS header selection.
+    pub signing_key: FederationSigningKeyConfig,
+    /// Public JWKS embedded in the signed entity statement.
+    pub published_jwks: serde_json::Value,
+    /// Lifetime of each generated entity statement.
+    #[serde(default = "default_federation_lifetime_secs")]
+    pub lifetime_secs: u64,
+    /// Time before expiry at which the cached statement is regenerated.
+    #[serde(default = "default_federation_refresh_margin_secs")]
+    pub refresh_margin_secs: u64,
+}
+
+/// Private-key reference and protected JWS header fields for federation
+/// entity-statement signing.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FederationSigningKeyConfig {
+    /// PEM file read only when a runtime pipeline is constructed.
+    pub pem_file: String,
+    /// Asymmetric JWS algorithm name, such as `ES256`.
+    pub algorithm: String,
+    /// Key identifier stamped into the protected JWS header.
+    pub kid: String,
 }
 
 /// Web Bot Auth signing identity for the proxy. See the
@@ -2089,6 +2137,7 @@ impl Default for ProxyServerConfig {
             attestation: None,
             tenants: Vec::new(),
             credentials: Vec::new(),
+            federation: None,
             payments: None,
         }
     }

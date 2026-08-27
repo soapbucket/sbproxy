@@ -8418,6 +8418,7 @@ dependencies = [
  "sbproxy-classifiers",
  "sbproxy-config",
  "sbproxy-extension",
+ "sbproxy-federation",
  "sbproxy-httpkit",
  "sbproxy-keystore",
  "sbproxy-mcp-gateway",

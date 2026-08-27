@@ -123,6 +123,7 @@ sbproxy-util.workspace = true
 # ends with " for url ({url})" (WOR-2629).
 sbproxy-httpkit.workspace = true
 sbproxy-config.workspace = true
+sbproxy-federation.workspace = true
 sbproxy-tls.workspace = true
 sbproxy-modules.workspace = true
 sbproxy-mcp-gateway.workspace = true

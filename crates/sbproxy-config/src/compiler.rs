@@ -2217,6 +2217,50 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
     // WOR-2199: a bind address the operator cannot express is a bind
     // address they cannot restrict, and one they misspell must not fall
     // back to every interface.
+    if let Some(federation) = config_file.proxy.federation.as_ref().filter(|cfg| cfg.enabled) {
+        if !federation.entity_id.starts_with("https://") {
+            anyhow::bail!("config compile: proxy.federation.entity_id must use https");
+        }
+        if federation.signing_key.pem_file.trim().is_empty()
+            || federation.signing_key.kid.trim().is_empty()
+        {
+            anyhow::bail!(
+                "config compile: proxy.federation.signing_key pem_file and kid must not be empty"
+            );
+        }
+        if !matches!(
+            federation.signing_key.algorithm.as_str(),
+            "ES256"
+                | "ES384"
+                | "RS256"
+                | "RS384"
+                | "RS512"
+                | "PS256"
+                | "PS384"
+                | "PS512"
+                | "EdDSA"
+        ) {
+            anyhow::bail!(
+                "config compile: proxy.federation.signing_key.algorithm is not allowed"
+            );
+        }
+        if federation
+            .published_jwks
+            .get("keys")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(Vec::is_empty)
+        {
+            anyhow::bail!("config compile: proxy.federation.published_jwks.keys must not be empty");
+        }
+        if federation.lifetime_secs == 0
+            || federation.refresh_margin_secs >= federation.lifetime_secs
+        {
+            anyhow::bail!(
+                "config compile: proxy.federation.refresh_margin_secs must be less than lifetime_secs"
+            );
+        }
+    }
+
     config_file.proxy.validate_bind_address()?;
 
     config_file
