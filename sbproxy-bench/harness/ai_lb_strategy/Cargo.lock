@@ -6642,6 +6642,7 @@ name = "sbproxy-classifier-client"
 version = "0.1.0"
 dependencies = [
  "hyper-util",
+ "prometheus",
  "sbproxy-classifier-proto",
  "sbproxy-security",
  "thiserror 2.0.18",
