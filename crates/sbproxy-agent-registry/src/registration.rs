@@ -1,0 +1,1280 @@
+//! Agent self-registration: what a submitter sends, what is minted for
+//! them, and the owner-approval state machine that decides it.
+//!
+//! # The shape, in one paragraph
+//!
+//! A submitter sends metadata describing the agent. The queue mints a
+//! kebab-case slug, an OAuth-style `client_id`, a one-time `client_secret`,
+//! and a registration access token, stores Argon2id hashes of the two
+//! secrets, and parks the record in `Pending`. An operator approves or
+//! rejects it. Approval is what makes the agent eligible to appear in a
+//! published catalog; rejection and revocation burn the slug permanently, so
+//! a rejected submitter cannot resubmit under the same name and get a
+//! different answer from a different reviewer.
+//!
+//! # Which store holds what, and why it matters
+//!
+//! The registration records are [`PersistentKv`]: a restart that forgot a
+//! pending queue would silently re-open decisions an operator already made,
+//! and a restart that forgot an approval would revoke an agent nobody
+//! revoked.
+//!
+//! The duplicate-detection window is [`EphemeralKv`]: it exists to collapse
+//! a submitter's retry into one queue entry over the following hour, and a
+//! restart genuinely should forget it. Storing it durably would keep a
+//! fingerprint alive past the window it describes and turn a legitimate
+//! resubmission into a permanent refusal.
+//!
+//! # Secrets
+//!
+//! Plaintext secrets exist exactly once, in the response to the call that
+//! minted them. What is stored is an Argon2id hash at OWASP's recommended
+//! parameters (19 MiB, two iterations, one lane). [`RegistrationView`] is
+//! the shape every read path returns and it has no field a hash could
+//! occupy, so a listing endpoint cannot leak one by forgetting to strip it.
+
+use std::sync::Arc;
+
+use argon2::password_hash::rand_core::{OsRng, RngCore};
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::{Algorithm, Argon2, Params, Version};
+use base64::Engine;
+use chrono::{DateTime, Duration, Utc};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use ulid::Ulid;
+
+use sbproxy_platform::storage::{CasOutcome, EphemeralKv, KvNamespace, PersistentKv};
+
+use crate::error::{RegistryError, Result};
+
+/// Prefix on a minted client secret, so an operator reading a log or a
+/// paste can tell one from a registration access token at a glance.
+const CLIENT_SECRET_PREFIX: &str = "sk_agent_";
+
+/// Prefix on a minted registration access token.
+const REGISTRATION_ACCESS_TOKEN_PREFIX: &str = "rat_";
+
+/// Longest vendor string a submission may carry.
+const MAX_VENDOR_BYTES: usize = 128;
+
+/// Longest operator-supplied reason on a decision.
+const MAX_REASON_BYTES: usize = 4 * 1024;
+
+/// Most list entries any one metadata array may carry.
+const MAX_LIST_ENTRIES: usize = 16;
+
+/// Longest single list entry, in bytes.
+const MAX_LIST_ENTRY_BYTES: usize = 253;
+
+/// Purpose taxonomy a submission declares.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Purpose {
+    /// Collecting training data.
+    Training,
+    /// Building a search index.
+    Search,
+    /// Answering a user's question right now.
+    Assistant,
+    /// Research crawling.
+    Research,
+    /// Archival and preservation.
+    Archival,
+    /// Declined to say.
+    Unknown,
+}
+
+/// What a submission is asking to be allowed to do.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RequestedScope {
+    /// Ordinary crawling of public routes.
+    #[serde(rename = "crawl:public")]
+    CrawlPublic,
+    /// Crawling routes behind a paywall or a membership.
+    #[serde(rename = "crawl:gated")]
+    CrawlGated,
+    /// Embedding or quoting public content.
+    #[serde(rename = "embed:public")]
+    EmbedPublic,
+    /// Invoking MCP tools.
+    #[serde(rename = "mcp:tools")]
+    McpTools,
+}
+
+/// What a submitter describes their agent as.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentMetadata {
+    /// Display name of the operator behind the agent.
+    pub vendor: String,
+    /// Purpose bucket.
+    pub purpose: Purpose,
+    /// The submitter's published abuse or documentation URL. HTTPS only.
+    pub contact_url: String,
+    /// User-Agent fragments the agent will send. At least one.
+    pub expected_user_agents: Vec<String>,
+    /// Reverse-DNS suffixes a forward-confirmed lookup should land in.
+    #[serde(default)]
+    pub expected_reverse_dns_suffixes: Vec<String>,
+    /// Web Bot Auth thumbprints, `<alg>:<thumbprint>`.
+    #[serde(default)]
+    pub expected_keyids: Vec<String>,
+    /// Scopes being asked for. At least one.
+    pub requested_scopes: Vec<RequestedScope>,
+}
+
+impl AgentMetadata {
+    /// Refuse anything outside the documented ranges before a slug is
+    /// minted or a queue slot is taken.
+    ///
+    /// Ordering matters: validation runs before any store write, so a
+    /// malformed submission costs one parse rather than a durable record
+    /// somebody has to clean up.
+    pub fn validate(&self) -> Result<()> {
+        bounded("vendor", &self.vendor, 1, MAX_VENDOR_BYTES)?;
+        bounded("contact_url", &self.contact_url, 1, 512)?;
+        if !self.contact_url.starts_with("https://") {
+            return Err(RegistryError::Invalid {
+                field: "contact_url",
+                detail: "must be an https:// URL".into(),
+            });
+        }
+        bounded_list(
+            "expected_user_agents",
+            &self.expected_user_agents,
+            1,
+            MAX_LIST_ENTRIES,
+        )?;
+        bounded_list(
+            "expected_reverse_dns_suffixes",
+            &self.expected_reverse_dns_suffixes,
+            0,
+            MAX_LIST_ENTRIES,
+        )?;
+        bounded_list(
+            "expected_keyids",
+            &self.expected_keyids,
+            0,
+            MAX_LIST_ENTRIES,
+        )?;
+        for keyid in &self.expected_keyids {
+            if !keyid.contains(':') {
+                return Err(RegistryError::Invalid {
+                    field: "expected_keyids",
+                    detail: "each thumbprint must be <alg>:<thumbprint>".into(),
+                });
+            }
+        }
+        if self.requested_scopes.is_empty() || self.requested_scopes.len() > 8 {
+            return Err(RegistryError::Invalid {
+                field: "requested_scopes",
+                detail: "must name between one and eight scopes".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn bounded(field: &'static str, value: &str, min: usize, max: usize) -> Result<()> {
+    if value.len() < min || value.len() > max {
+        return Err(RegistryError::Invalid {
+            field,
+            detail: format!("must be {min}..={max} bytes, got {}", value.len()),
+        });
+    }
+    Ok(())
+}
+
+fn bounded_list(field: &'static str, values: &[String], min: usize, max: usize) -> Result<()> {
+    if values.len() < min || values.len() > max {
+        return Err(RegistryError::Invalid {
+            field,
+            detail: format!("must hold {min}..={max} entries, got {}", values.len()),
+        });
+    }
+    for value in values {
+        bounded(field, value, 1, MAX_LIST_ENTRY_BYTES)?;
+    }
+    Ok(())
+}
+
+/// Where a registration is in its life.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalState {
+    /// Submitted, waiting on a human.
+    Pending,
+    /// A reviewer approved it.
+    Approved,
+    /// A reviewer refused it. Terminal, and the slug stays burned.
+    Rejected,
+    /// An approved registration was later withdrawn. Terminal, and the slug
+    /// stays burned.
+    Revoked,
+}
+
+impl ApprovalState {
+    /// Wire label, and the value the metrics recorder uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+            Self::Revoked => "revoked",
+        }
+    }
+
+    /// Whether no further transition is possible from here.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Rejected | Self::Revoked)
+    }
+}
+
+/// The stored record. Never returned to a caller: see [`RegistrationView`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RegistrationRecord {
+    agent_id: String,
+    client_id: String,
+    client_secret_hash: String,
+    previous_client_secret_hash: Option<String>,
+    previous_secret_valid_until: Option<DateTime<Utc>>,
+    registration_access_token_hash: String,
+    metadata_hash: String,
+    metadata: AgentMetadata,
+    state: ApprovalState,
+    reason: Option<String>,
+    decided_by: Option<String>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    rotated_at: Option<DateTime<Utc>>,
+}
+
+/// What every read path returns.
+///
+/// This type has no field a credential hash could occupy, which is the
+/// point: a listing endpoint cannot leak one by forgetting to strip it,
+/// because there is nowhere for it to go.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct RegistrationView {
+    /// The minted slug.
+    pub agent_id: String,
+    /// The OAuth-style identifier, stable across secret rotations.
+    pub client_id: String,
+    /// What the submitter said about the agent.
+    pub metadata: AgentMetadata,
+    /// Where the registration is in its life.
+    pub state: ApprovalState,
+    /// Operator-supplied justification on the last decision.
+    pub reason: Option<String>,
+    /// Who made the last decision, when an admin session identified one.
+    pub decided_by: Option<String>,
+    /// When it was submitted.
+    pub created_at: DateTime<Utc>,
+    /// When it last changed.
+    pub updated_at: DateTime<Utc>,
+    /// When its secret was last rotated.
+    pub rotated_at: Option<DateTime<Utc>>,
+}
+
+impl From<&RegistrationRecord> for RegistrationView {
+    fn from(record: &RegistrationRecord) -> Self {
+        Self {
+            agent_id: record.agent_id.clone(),
+            client_id: record.client_id.clone(),
+            metadata: record.metadata.clone(),
+            state: record.state,
+            reason: record.reason.clone(),
+            decided_by: record.decided_by.clone(),
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+            rotated_at: record.rotated_at,
+        }
+    }
+}
+
+/// What a submitter gets back, once.
+///
+/// `Debug` is hand written: a derived one would print both secrets, and
+/// this value is the return of a handler that logs its own outcome.
+#[derive(Clone, Serialize)]
+#[non_exhaustive]
+pub struct RegistrationSecrets {
+    /// The minted slug.
+    pub agent_id: String,
+    /// The OAuth-style identifier.
+    pub client_id: String,
+    /// The plaintext client secret. Not stored, and never returned again.
+    pub client_secret: String,
+    /// The plaintext registration access token, which is what authenticates
+    /// a later self-service rotation. Not stored, never returned again.
+    pub registration_access_token: String,
+    /// Always true at creation: an approval is a human decision.
+    pub pending_approval: bool,
+    /// When the registration was accepted into the queue.
+    pub created_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for RegistrationSecrets {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RegistrationSecrets")
+            .field("agent_id", &self.agent_id)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"<redacted>")
+            .field("registration_access_token", &"<redacted>")
+            .field("pending_approval", &self.pending_approval)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
+}
+
+/// What a rotation returns.
+#[derive(Clone, Serialize)]
+#[non_exhaustive]
+pub struct RotatedSecret {
+    /// The slug whose secret rotated.
+    pub agent_id: String,
+    /// The fresh plaintext client secret.
+    pub client_secret: String,
+    /// When the previous secret stops being accepted.
+    pub previous_secret_valid_until: DateTime<Utc>,
+    /// When the rotation happened.
+    pub rotated_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for RotatedSecret {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RotatedSecret")
+            .field("agent_id", &self.agent_id)
+            .field("client_secret", &"<redacted>")
+            .field(
+                "previous_secret_valid_until",
+                &self.previous_secret_valid_until,
+            )
+            .field("rotated_at", &self.rotated_at)
+            .finish()
+    }
+}
+
+/// Argon2id at OWASP's recommended parameters: 19 MiB, two iterations, one
+/// lane.
+fn hasher() -> Result<Argon2<'static>> {
+    let params = Params::new(19 * 1024, 2, 1, None)
+        .map_err(|error| RegistryError::Backend(format!("argon2 parameters rejected: {error}")))?;
+    Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params))
+}
+
+/// Hash a plaintext credential into a PHC string.
+fn hash_credential(plaintext: &str) -> Result<String> {
+    let salt = SaltString::generate(&mut OsRng);
+    let hash = hasher()?
+        .hash_password(plaintext.as_bytes(), &salt)
+        .map_err(|error| RegistryError::Backend(format!("argon2 hash failed: {error}")))?;
+    Ok(hash.to_string())
+}
+
+/// Constant-time verify a plaintext credential against a stored PHC string.
+fn verify_credential(plaintext: &str, encoded: &str) -> Result<bool> {
+    let parsed = PasswordHash::new(encoded)
+        .map_err(|error| RegistryError::Backend(format!("stored hash unreadable: {error}")))?;
+    Ok(hasher()?
+        .verify_password(plaintext.as_bytes(), &parsed)
+        .is_ok())
+}
+
+/// Collapse a vendor name to a kebab-case slug prefix.
+///
+/// ASCII only, non-alphanumerics collapse to one hyphen, and an empty
+/// result becomes `agent` rather than an empty prefix, so the composed slug
+/// is always a legal store key.
+fn vendor_slug(vendor: &str) -> String {
+    let mut out = String::with_capacity(vendor.len());
+    let mut previous_was_dash = false;
+    for character in vendor.chars() {
+        if character.is_ascii_alphanumeric() {
+            out.push(character.to_ascii_lowercase());
+            previous_was_dash = false;
+        } else if !previous_was_dash {
+            out.push('-');
+            previous_was_dash = true;
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "agent".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Mint `<vendor-slug>-<ulid>`. The ULID is what makes two simultaneous
+/// registrations of the same vendor name two distinct agents.
+fn mint_agent_id(vendor: &str) -> String {
+    format!("{}-{}", vendor_slug(vendor), Ulid::new())
+}
+
+fn mint_secret(prefix: &str) -> String {
+    let mut buffer = [0u8; 32];
+    OsRng.fill_bytes(&mut buffer);
+    format!(
+        "{prefix}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buffer)
+    )
+}
+
+/// Fingerprint metadata for the duplicate-detection window.
+///
+/// Canonical JSON over the sorted arrays, so the same submission in a
+/// different array order fingerprints identically and a retry with the
+/// fields shuffled is still recognized as a retry.
+fn metadata_fingerprint(metadata: &AgentMetadata) -> Result<String> {
+    let mut canonical = metadata.clone();
+    canonical.expected_user_agents.sort();
+    canonical.expected_reverse_dns_suffixes.sort();
+    canonical.expected_keyids.sort();
+    canonical.requested_scopes.sort_by_key(|scope| *scope as u8);
+    let bytes = serde_json_canonicalizer::to_vec(&canonical).map_err(|error| {
+        RegistryError::Backend(format!("could not canonicalize metadata: {error}"))
+    })?;
+    let mut digest = Sha256::new();
+    digest.update(&bytes);
+    Ok(hex::encode(digest.finalize()))
+}
+
+/// The registration queue, over the shared embedded store.
+pub struct RegistrationQueue {
+    store: Arc<dyn PersistentKv>,
+    dedup: Arc<dyn EphemeralKv>,
+    registrations: KvNamespace,
+    burned: KvNamespace,
+    dedup_window: KvNamespace,
+    duplicate_window: Duration,
+    rotation_grace: Duration,
+}
+
+/// One decision, as a value, so the four things that vary between approve,
+/// reject, and revoke travel together instead of as a row of positional
+/// arguments nobody can read at the call site.
+struct DecisionRequest<'a> {
+    agent_id: &'a str,
+    action: &'static str,
+    target: ApprovalState,
+    from: &'static [ApprovalState],
+    reason: Option<String>,
+    decided_by: Option<String>,
+    now: DateTime<Utc>,
+}
+
+impl RegistrationQueue {
+    /// Namespace holding one JSON record per registration.
+    const REGISTRATIONS: &'static str = "agent_registrations";
+    /// Namespace holding one marker per burned slug. Separate from the
+    /// records so a burn survives any future record compaction, and so the
+    /// "is this slug available" question is one point lookup rather than a
+    /// scan of every terminal record.
+    const BURNED: &'static str = "agent_slugs_burned";
+    /// Namespace holding the duplicate-detection window.
+    const DEDUP: &'static str = "agent_registration_dedup";
+
+    /// Build a queue over a durable store and an ephemeral dedup window.
+    pub fn new(
+        store: Arc<dyn PersistentKv>,
+        dedup: Arc<dyn EphemeralKv>,
+        duplicate_window: Duration,
+        rotation_grace: Duration,
+    ) -> Result<Self> {
+        let namespace = |name: &'static str| {
+            KvNamespace::new(name).map_err(|error| RegistryError::Backend(error.to_string()))
+        };
+        Ok(Self {
+            store,
+            dedup,
+            registrations: namespace(Self::REGISTRATIONS)?,
+            burned: namespace(Self::BURNED)?,
+            dedup_window: namespace(Self::DEDUP)?,
+            duplicate_window,
+            rotation_grace,
+        })
+    }
+
+    async fn load(&self, agent_id: &str) -> Result<(RegistrationRecord, u64)> {
+        let entry = self
+            .store
+            .get(&self.registrations, agent_id)
+            .await
+            .map_err(|error| RegistryError::Backend(error.to_string()))?
+            .ok_or_else(|| RegistryError::NotFound(agent_id.to_string()))?;
+        let record = serde_json::from_slice(&entry.value).map_err(|error| {
+            RegistryError::Backend(format!("stored registration is unreadable: {error}"))
+        })?;
+        Ok((record, entry.revision))
+    }
+
+    /// Write a record back only if nothing else has changed it since it was
+    /// read, so two reviewers deciding the same registration at once cannot
+    /// both win.
+    async fn store_if_unchanged(
+        &self,
+        record: &RegistrationRecord,
+        expected_revision: u64,
+    ) -> Result<()> {
+        let bytes = serde_json::to_vec(record).map_err(|error| {
+            RegistryError::Backend(format!("could not encode registration: {error}"))
+        })?;
+        match self
+            .store
+            .put_if_revision(
+                &self.registrations,
+                &record.agent_id,
+                &bytes,
+                expected_revision,
+            )
+            .await
+            .map_err(|error| RegistryError::Backend(error.to_string()))?
+        {
+            CasOutcome::Applied { .. } => Ok(()),
+            CasOutcome::Conflict { .. } => Err(RegistryError::Conflict(record.agent_id.clone())),
+            CasOutcome::NotFound => Err(RegistryError::NotFound(record.agent_id.clone())),
+        }
+    }
+
+    async fn burn(&self, agent_id: &str) -> Result<()> {
+        self.store
+            .put(&self.burned, agent_id, b"1")
+            .await
+            .map(|_| ())
+            .map_err(|error| RegistryError::Backend(error.to_string()))
+    }
+
+    async fn is_burned(&self, agent_id: &str) -> Result<bool> {
+        Ok(self
+            .store
+            .get(&self.burned, agent_id)
+            .await
+            .map_err(|error| RegistryError::Backend(error.to_string()))?
+            .is_some())
+    }
+
+    /// Accept a submission into the queue.
+    ///
+    /// The order is validate, fingerprint, check the window, mint, insert.
+    /// Minting after the window check means a recognized retry costs no
+    /// Argon2id work and produces no new slug, which is what makes the
+    /// window worth having.
+    pub async fn register(
+        &self,
+        metadata: AgentMetadata,
+        now: DateTime<Utc>,
+    ) -> Result<(RegistrationSecrets, RegistrationView)> {
+        metadata.validate()?;
+        let fingerprint = metadata_fingerprint(&metadata)?;
+
+        if let Some(existing) = self
+            .dedup
+            .get(&self.dedup_window, &fingerprint)
+            .await
+            .map_err(|error| RegistryError::Backend(error.to_string()))?
+        {
+            let agent_id = String::from_utf8_lossy(&existing).to_string();
+            // A window entry that outlived its record, or that names a
+            // registration a reviewer has already decided, is stale rather
+            // than a duplicate: fall through and let the resubmission take
+            // a fresh slot.
+            if let Ok((record, _)) = self.load(&agent_id).await {
+                if record.state == ApprovalState::Pending {
+                    return Err(RegistryError::DuplicateMetadata(agent_id));
+                }
+            }
+        }
+
+        let agent_id = mint_agent_id(&metadata.vendor);
+        if self.is_burned(&agent_id).await? {
+            // A ULID collision is not reachable in practice; refusing is
+            // still the right answer, because minting a second slug here
+            // would mean a burned name could be reissued by retrying.
+            return Err(RegistryError::SlugBurned(agent_id));
+        }
+
+        let client_secret = mint_secret(CLIENT_SECRET_PREFIX);
+        let registration_access_token = mint_secret(REGISTRATION_ACCESS_TOKEN_PREFIX);
+        let record = RegistrationRecord {
+            agent_id: agent_id.clone(),
+            client_id: Ulid::new().to_string(),
+            client_secret_hash: hash_credential(&client_secret)?,
+            previous_client_secret_hash: None,
+            previous_secret_valid_until: None,
+            registration_access_token_hash: hash_credential(&registration_access_token)?,
+            metadata_hash: fingerprint.clone(),
+            metadata,
+            state: ApprovalState::Pending,
+            reason: None,
+            decided_by: None,
+            created_at: now,
+            updated_at: now,
+            rotated_at: None,
+        };
+
+        let bytes = serde_json::to_vec(&record).map_err(|error| {
+            RegistryError::Backend(format!("could not encode registration: {error}"))
+        })?;
+        let landed = self
+            .store
+            .insert_if_absent(&self.registrations, &agent_id, &bytes)
+            .await
+            .map_err(|error| RegistryError::Backend(error.to_string()))?;
+        if landed.is_none() {
+            return Err(RegistryError::Conflict(agent_id));
+        }
+
+        let window = self
+            .duplicate_window
+            .to_std()
+            .unwrap_or(std::time::Duration::from_secs(0));
+        if !window.is_zero() {
+            self.dedup
+                .put_with_ttl(
+                    &self.dedup_window,
+                    &fingerprint,
+                    agent_id.as_bytes(),
+                    window,
+                )
+                .await
+                .map_err(|error| RegistryError::Backend(error.to_string()))?;
+        }
+
+        Ok((
+            RegistrationSecrets {
+                agent_id: record.agent_id.clone(),
+                client_id: record.client_id.clone(),
+                client_secret,
+                registration_access_token,
+                pending_approval: true,
+                created_at: now,
+            },
+            RegistrationView::from(&record),
+        ))
+    }
+
+    /// Read one registration.
+    pub async fn get(&self, agent_id: &str) -> Result<RegistrationView> {
+        Ok(RegistrationView::from(&self.load(agent_id).await?.0))
+    }
+
+    /// List every registration, newest submission last, optionally filtered
+    /// to one state.
+    pub async fn list(&self, state: Option<ApprovalState>) -> Result<Vec<RegistrationView>> {
+        let stored = self
+            .store
+            .list(&self.registrations)
+            .await
+            .map_err(|error| RegistryError::Backend(error.to_string()))?;
+        let mut out = Vec::with_capacity(stored.len());
+        for (_, entry) in stored {
+            let record: RegistrationRecord = serde_json::from_slice(&entry.value).map_err(|e| {
+                RegistryError::Backend(format!("stored registration is unreadable: {e}"))
+            })?;
+            if state.is_none_or(|wanted| wanted == record.state) {
+                out.push(RegistrationView::from(&record));
+            }
+        }
+        out.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.agent_id.cmp(&right.agent_id))
+        });
+        Ok(out)
+    }
+
+    /// Apply a decision to a pending or approved registration.
+    ///
+    /// The three decisions differ only in the four fields of
+    /// [`DecisionRequest`], so they share one implementation: the read, the
+    /// legality check, the compare-and-swap write, and the burn are the same
+    /// four steps in the same order every time, and a copy per decision is
+    /// where a missing burn or a missing legality check comes from.
+    async fn decide(&self, request: DecisionRequest<'_>) -> Result<RegistrationView> {
+        if let Some(reason) = request.reason.as_deref() {
+            bounded("reason", reason, 0, MAX_REASON_BYTES)?;
+        }
+        let (mut record, revision) = self.load(request.agent_id).await?;
+        if !request.from.contains(&record.state) {
+            return Err(RegistryError::InvalidTransition {
+                action: request.action,
+                state: record.state.as_str(),
+            });
+        }
+        record.state = request.target;
+        record.reason = request.reason;
+        record.decided_by = request.decided_by;
+        record.updated_at = request.now;
+        self.store_if_unchanged(&record, revision).await?;
+        if request.target.is_terminal() {
+            self.burn(request.agent_id).await?;
+        }
+        Ok(RegistrationView::from(&record))
+    }
+
+    /// Approve a pending registration.
+    pub async fn approve(
+        &self,
+        agent_id: &str,
+        reason: Option<String>,
+        decided_by: Option<String>,
+        now: DateTime<Utc>,
+    ) -> Result<RegistrationView> {
+        self.decide(DecisionRequest {
+            agent_id,
+            action: "approve",
+            target: ApprovalState::Approved,
+            from: &[ApprovalState::Pending],
+            reason,
+            decided_by,
+            now,
+        })
+        .await
+    }
+
+    /// Reject a pending registration. The slug is burned.
+    pub async fn reject(
+        &self,
+        agent_id: &str,
+        reason: String,
+        decided_by: Option<String>,
+        now: DateTime<Utc>,
+    ) -> Result<RegistrationView> {
+        self.decide(DecisionRequest {
+            agent_id,
+            action: "reject",
+            target: ApprovalState::Rejected,
+            from: &[ApprovalState::Pending],
+            reason: Some(reason),
+            decided_by,
+            now,
+        })
+        .await
+    }
+
+    /// Revoke a registration. The slug is burned.
+    pub async fn revoke(
+        &self,
+        agent_id: &str,
+        reason: Option<String>,
+        decided_by: Option<String>,
+        now: DateTime<Utc>,
+    ) -> Result<RegistrationView> {
+        self.decide(DecisionRequest {
+            agent_id,
+            action: "revoke",
+            target: ApprovalState::Revoked,
+            from: &[ApprovalState::Pending, ApprovalState::Approved],
+            reason,
+            decided_by,
+            now,
+        })
+        .await
+    }
+
+    /// Rotate a registration's client secret, authenticated by the
+    /// registration access token the submitter was given.
+    ///
+    /// The previous secret keeps working until the grace window ends, which
+    /// is what lets a fleet of workers pick the new one up without a
+    /// synchronized restart. A registration that is not approved cannot
+    /// rotate: there is nothing yet for the secret to authenticate against.
+    pub async fn rotate_secret(
+        &self,
+        agent_id: &str,
+        registration_access_token: &str,
+        now: DateTime<Utc>,
+    ) -> Result<RotatedSecret> {
+        let (mut record, revision) = match self.load(agent_id).await {
+            Ok(loaded) => loaded,
+            // An unknown id and a wrong token answer identically, so the
+            // endpoint is not an oracle for which slugs exist.
+            Err(RegistryError::NotFound(_)) => return Err(RegistryError::Unauthorized),
+            Err(other) => return Err(other),
+        };
+        if !verify_credential(
+            registration_access_token,
+            &record.registration_access_token_hash,
+        )? {
+            return Err(RegistryError::Unauthorized);
+        }
+        if record.state != ApprovalState::Approved {
+            return Err(RegistryError::InvalidTransition {
+                action: "rotate",
+                state: record.state.as_str(),
+            });
+        }
+
+        let client_secret = mint_secret(CLIENT_SECRET_PREFIX);
+        let previous_secret_valid_until = now + self.rotation_grace;
+        record.previous_client_secret_hash = Some(record.client_secret_hash.clone());
+        record.previous_secret_valid_until = Some(previous_secret_valid_until);
+        record.client_secret_hash = hash_credential(&client_secret)?;
+        record.rotated_at = Some(now);
+        record.updated_at = now;
+        self.store_if_unchanged(&record, revision).await?;
+
+        Ok(RotatedSecret {
+            agent_id: agent_id.to_string(),
+            client_secret,
+            previous_secret_valid_until,
+            rotated_at: now,
+        })
+    }
+
+    /// Whether `presented` is this agent's current secret, or its previous
+    /// one inside the rotation grace window.
+    ///
+    /// Only an approved registration authenticates. A pending one has not
+    /// been allowed yet and a terminal one has been withdrawn, and treating
+    /// either as valid would make the approval gate decorative.
+    pub async fn verify_client_secret(
+        &self,
+        agent_id: &str,
+        presented: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let Ok((record, _)) = self.load(agent_id).await else {
+            return Ok(false);
+        };
+        if record.state != ApprovalState::Approved {
+            return Ok(false);
+        }
+        if verify_credential(presented, &record.client_secret_hash)? {
+            return Ok(true);
+        }
+        match (
+            record.previous_client_secret_hash.as_deref(),
+            record.previous_secret_valid_until,
+        ) {
+            (Some(previous), Some(valid_until)) if now < valid_until => {
+                verify_credential(presented, previous)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// How many registrations sit in each state, for the admin summary and
+    /// the gauge.
+    pub async fn counts(&self) -> Result<Vec<(ApprovalState, usize)>> {
+        let all = self.list(None).await?;
+        let mut counts = Vec::new();
+        for state in [
+            ApprovalState::Pending,
+            ApprovalState::Approved,
+            ApprovalState::Rejected,
+            ApprovalState::Revoked,
+        ] {
+            counts.push((state, all.iter().filter(|view| view.state == state).count()));
+        }
+        Ok(counts)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sbproxy_platform::storage::{EmbeddedKvStore, MemoryKv};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn now() -> DateTime<Utc> {
+        DateTime::from_timestamp(1_700_000_000, 0).expect("fixed instant")
+    }
+
+    fn temp_path() -> String {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!(
+            "{}/sbproxy_agent_registry_test_{}_{}.redb",
+            std::env::temp_dir().display(),
+            std::process::id(),
+            n
+        )
+    }
+
+    fn queue(path: &str) -> RegistrationQueue {
+        let store = EmbeddedKvStore::open(path, "agent_registry").expect("open store");
+        RegistrationQueue::new(
+            Arc::new(store),
+            Arc::new(MemoryKv::new("agent_registry")),
+            Duration::hours(1),
+            Duration::days(30),
+        )
+        .expect("queue")
+    }
+
+    fn metadata() -> AgentMetadata {
+        AgentMetadata {
+            vendor: "Acme Research Labs".into(),
+            purpose: Purpose::Research,
+            contact_url: "https://acme.example.com/bots".into(),
+            expected_user_agents: vec!["AcmeBot/1.0".into()],
+            expected_reverse_dns_suffixes: vec![".bots.acme.example.com".into()],
+            expected_keyids: vec!["ed25519:THUMBPRINT".into()],
+            requested_scopes: vec![RequestedScope::CrawlPublic],
+        }
+    }
+
+    #[test]
+    fn vendor_slug_collapses_and_trims() {
+        assert_eq!(vendor_slug("Acme Research Labs"), "acme-research-labs");
+        assert_eq!(vendor_slug("  acme!@#labs  "), "acme-labs");
+        assert_eq!(vendor_slug(""), "agent");
+        assert_eq!(vendor_slug("!!!"), "agent");
+    }
+
+    #[test]
+    fn the_fingerprint_ignores_array_order_and_notices_a_real_change() {
+        let mut a = metadata();
+        let mut b = metadata();
+        a.expected_user_agents = vec!["AcmeBot/1.0".into(), "AcmeBot/2.0".into()];
+        b.expected_user_agents = vec!["AcmeBot/2.0".into(), "AcmeBot/1.0".into()];
+        assert_eq!(
+            metadata_fingerprint(&a).expect("a"),
+            metadata_fingerprint(&b).expect("b")
+        );
+
+        b.vendor = "Different Inc".into();
+        assert_ne!(
+            metadata_fingerprint(&a).expect("a"),
+            metadata_fingerprint(&b).expect("b")
+        );
+    }
+
+    #[test]
+    fn metadata_validation_refuses_the_shapes_the_docs_forbid() {
+        let mut meta = metadata();
+        meta.contact_url = "http://acme.example.com".into();
+        assert!(matches!(
+            meta.validate(),
+            Err(RegistryError::Invalid {
+                field: "contact_url",
+                ..
+            })
+        ));
+
+        let mut meta = metadata();
+        meta.expected_user_agents.clear();
+        assert!(meta.validate().is_err());
+
+        let mut meta = metadata();
+        meta.vendor = "v".repeat(MAX_VENDOR_BYTES + 1);
+        assert!(meta.validate().is_err());
+
+        let mut meta = metadata();
+        meta.expected_keyids = vec!["no-colon".into()];
+        assert!(meta.validate().is_err());
+
+        let mut meta = metadata();
+        meta.requested_scopes.clear();
+        assert!(meta.validate().is_err());
+    }
+
+    /// A minted secret exists once. What the store keeps is a hash, and the
+    /// only way back is a verify, so a store file that leaks does not hand
+    /// anyone a usable credential.
+    #[tokio::test]
+    async fn a_minted_secret_is_stored_only_as_a_hash() {
+        let path = temp_path();
+        let queue = queue(&path);
+        let (secrets, _) = queue.register(metadata(), now()).await.expect("register");
+
+        queue
+            .approve(&secrets.agent_id, None, Some("casey".into()), now())
+            .await
+            .expect("approve");
+
+        assert!(queue
+            .verify_client_secret(&secrets.agent_id, &secrets.client_secret, now())
+            .await
+            .expect("verify"));
+        assert!(!queue
+            .verify_client_secret(&secrets.agent_id, "sk_agent_wrong", now())
+            .await
+            .expect("verify"));
+
+        // Nothing readable in the store is the plaintext secret.
+        let raw = std::fs::read(&path).expect("read store file");
+        assert!(
+            !raw.windows(secrets.client_secret.len())
+                .any(|window| window == secrets.client_secret.as_bytes()),
+            "the plaintext client secret must never reach the store file"
+        );
+        assert!(
+            !raw.windows(secrets.registration_access_token.len())
+                .any(|window| window == secrets.registration_access_token.as_bytes()),
+            "the plaintext registration access token must never reach the store file"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The window is what turns a submitter's retry into one queue entry.
+    #[tokio::test]
+    async fn an_identical_resubmission_inside_the_window_is_refused() {
+        let path = temp_path();
+        let queue = queue(&path);
+        let (first, _) = queue.register(metadata(), now()).await.expect("first");
+
+        match queue.register(metadata(), now()).await {
+            Err(RegistryError::DuplicateMetadata(existing)) => {
+                assert_eq!(existing, first.agent_id);
+            }
+            other => panic!("expected a duplicate refusal, got {other:?}"),
+        }
+
+        // Once a reviewer has decided the first one, the window entry names
+        // a settled registration and a resubmission is a new question.
+        queue
+            .reject(&first.agent_id, "not a real crawler".into(), None, now())
+            .await
+            .expect("reject");
+        let (second, _) = queue
+            .register(metadata(), now())
+            .await
+            .expect("resubmission after a decision");
+        assert_ne!(second.agent_id, first.agent_id);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A rejection is final and the slug stays burned, so a submitter
+    /// cannot shop the same name around until a different reviewer says
+    /// yes.
+    #[tokio::test]
+    async fn a_rejection_is_terminal_and_burns_the_slug() {
+        let path = temp_path();
+        let queue = queue(&path);
+        let (secrets, _) = queue.register(metadata(), now()).await.expect("register");
+
+        queue
+            .reject(
+                &secrets.agent_id,
+                "unverifiable".into(),
+                Some("casey".into()),
+                now(),
+            )
+            .await
+            .expect("reject");
+
+        assert!(
+            queue
+                .is_burned(&secrets.agent_id)
+                .await
+                .expect("burn check"),
+            "a rejected slug is burned"
+        );
+        assert!(matches!(
+            queue.approve(&secrets.agent_id, None, None, now()).await,
+            Err(RegistryError::InvalidTransition {
+                action: "approve",
+                state: "rejected"
+            })
+        ));
+        assert!(matches!(
+            queue.revoke(&secrets.agent_id, None, None, now()).await,
+            Err(RegistryError::InvalidTransition { .. })
+        ));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Two reviewers deciding the same registration at once is the reason
+    /// the store carries revisions. Whichever lands first wins, and the
+    /// second is told rather than silently overwriting a terminal state.
+    #[tokio::test]
+    async fn a_second_reviewer_cannot_overwrite_a_decision_it_did_not_see() {
+        let path = temp_path();
+        let queue = queue(&path);
+        let (secrets, _) = queue.register(metadata(), now()).await.expect("register");
+
+        // Both reviewers read the pending record.
+        let (record, stale_revision) = queue.load(&secrets.agent_id).await.expect("load");
+        assert_eq!(record.state, ApprovalState::Pending);
+
+        // The first decision lands.
+        queue
+            .reject(&secrets.agent_id, "unverifiable".into(), None, now())
+            .await
+            .expect("reject");
+
+        // The second reviewer writes back against the revision it read.
+        let mut stale = record;
+        stale.state = ApprovalState::Approved;
+        assert!(matches!(
+            queue.store_if_unchanged(&stale, stale_revision).await,
+            Err(RegistryError::Conflict(_))
+        ));
+        assert_eq!(
+            queue.get(&secrets.agent_id).await.expect("get").state,
+            ApprovalState::Rejected
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Rotation is self-service and the registration access token is what
+    /// authenticates it. A wrong token and an unknown id answer the same,
+    /// so the endpoint cannot be used to enumerate slugs.
+    #[tokio::test]
+    async fn rotation_needs_the_registration_access_token_and_keeps_the_old_secret_working() {
+        let path = temp_path();
+        let queue = queue(&path);
+        let (secrets, _) = queue.register(metadata(), now()).await.expect("register");
+        queue
+            .approve(&secrets.agent_id, None, None, now())
+            .await
+            .expect("approve");
+
+        assert!(matches!(
+            queue
+                .rotate_secret(&secrets.agent_id, "rat_wrong", now())
+                .await,
+            Err(RegistryError::Unauthorized)
+        ));
+        assert!(matches!(
+            queue
+                .rotate_secret("no-such-agent", "rat_wrong", now())
+                .await,
+            Err(RegistryError::Unauthorized)
+        ));
+
+        let rotated = queue
+            .rotate_secret(&secrets.agent_id, &secrets.registration_access_token, now())
+            .await
+            .expect("rotate");
+        assert_ne!(rotated.client_secret, secrets.client_secret);
+
+        // Inside the grace window both secrets authenticate.
+        assert!(queue
+            .verify_client_secret(&secrets.agent_id, &rotated.client_secret, now())
+            .await
+            .expect("new secret"));
+        assert!(queue
+            .verify_client_secret(&secrets.agent_id, &secrets.client_secret, now())
+            .await
+            .expect("old secret inside grace"));
+
+        // Past it, only the new one does.
+        let after = rotated.previous_secret_valid_until + Duration::seconds(1);
+        assert!(queue
+            .verify_client_secret(&secrets.agent_id, &rotated.client_secret, after)
+            .await
+            .expect("new secret"));
+        assert!(!queue
+            .verify_client_secret(&secrets.agent_id, &secrets.client_secret, after)
+            .await
+            .expect("old secret past grace"));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// An approval gate that a pending or revoked agent can authenticate
+    /// through is decorative.
+    #[tokio::test]
+    async fn only_an_approved_registration_authenticates() {
+        let path = temp_path();
+        let queue = queue(&path);
+        let (secrets, _) = queue.register(metadata(), now()).await.expect("register");
+
+        assert!(
+            !queue
+                .verify_client_secret(&secrets.agent_id, &secrets.client_secret, now())
+                .await
+                .expect("pending"),
+            "a pending registration must not authenticate"
+        );
+
+        queue
+            .approve(&secrets.agent_id, None, None, now())
+            .await
+            .expect("approve");
+        assert!(queue
+            .verify_client_secret(&secrets.agent_id, &secrets.client_secret, now())
+            .await
+            .expect("approved"));
+
+        queue
+            .revoke(
+                &secrets.agent_id,
+                Some("key compromised".into()),
+                None,
+                now(),
+            )
+            .await
+            .expect("revoke");
+        assert!(
+            !queue
+                .verify_client_secret(&secrets.agent_id, &secrets.client_secret, now())
+                .await
+                .expect("revoked"),
+            "a revoked registration must stop authenticating immediately"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The queue is the operator's record of decisions they made. A restart
+    /// that forgot it would re-open every one of them.
+    #[tokio::test]
+    async fn the_queue_survives_a_restart() {
+        let path = temp_path();
+        let agent_id = {
+            let queue = queue(&path);
+            let (secrets, _) = queue.register(metadata(), now()).await.expect("register");
+            queue
+                .approve(
+                    &secrets.agent_id,
+                    Some("looks real".into()),
+                    Some("casey".into()),
+                    now(),
+                )
+                .await
+                .expect("approve");
+            secrets.agent_id
+        };
+
+        let queue = queue(&path);
+        let view = queue.get(&agent_id).await.expect("get after restart");
+        assert_eq!(view.state, ApprovalState::Approved);
+        assert_eq!(view.decided_by.as_deref(), Some("casey"));
+        assert_eq!(
+            queue
+                .list(Some(ApprovalState::Approved))
+                .await
+                .expect("list")
+                .len(),
+            1
+        );
+        assert!(queue
+            .list(Some(ApprovalState::Pending))
+            .await
+            .expect("list")
+            .is_empty());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn a_view_carries_no_credential_material() {
+        let path = temp_path();
+        let queue = queue(&path);
+        let (secrets, view) = queue.register(metadata(), now()).await.expect("register");
+        let json = serde_json::to_string(&view).expect("serialize view");
+        assert!(!json.contains("hash"), "no hash field reaches a read path");
+        assert!(!json.contains(&secrets.client_secret));
+        assert!(!json.contains(&secrets.registration_access_token));
+
+        // The one shape that does carry plaintext refuses to print it.
+        let debug = format!("{secrets:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains(&secrets.client_secret));
+
+        std::fs::remove_file(&path).ok();
+    }
+}

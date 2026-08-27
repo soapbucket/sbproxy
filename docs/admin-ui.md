@@ -216,6 +216,31 @@ with the full lifecycle inline.
   `key_management` has no keystore backend configured at all, every
   call here returns `409`, surfaced as "Policy controls unavailable."
 
+## Agents (`/agents`)
+
+The owner-approval queue for agents that registered themselves, and the
+signed catalog of agents somebody else vouched for. A pending registration
+is a question an operator has to answer, and before this page the only way
+to see one was a curl against the admin API.
+
+- **Shows:** `GET /admin/agent-registry` for the five counts,
+  `GET /admin/agent-registry/registrations` for the queue, and
+  `GET /admin/agent-registry/catalog` for the verified catalog.
+- **Mutations:** `POST /admin/agent-registry/registrations/{agent_id}/approve`,
+  `.../reject`, `.../revoke`, and `POST /admin/agent-registry/refresh` to
+  reverify the feed on disk. The reject button stays disabled until a reason
+  is typed, because a rejection burns the agent id permanently.
+- **Empty/error notes:** every route answers `404` when
+  `proxy.agent_registry` is absent or disabled, and the page renders that as
+  "not configured" rather than as an error. A configured registry with no
+  feed says so instead of showing an empty catalog that looks like a
+  publisher outage. Secret rotation is deliberately not on this page: it
+  authenticates with the agent's own registration access token, which an
+  operator does not hold.
+
+See [agent-registry.md](agent-registry.md) for the config block and the feed
+verification chain.
+
 ## Credentials (`/credentials`)
 
 ![The Credentials page: provider secrets as metadata rows with lifecycle actions](assets/admin-credentials.png)

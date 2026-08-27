@@ -82,6 +82,8 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_a2a_denied_total` | Counter | `stable` | `beta` | `route`, `reason` | A2A hops denied by the a2a policy, labeled by route and reason. |
 | `sbproxy_a2a_hops_total` | Counter | `stable` | `beta` | `route`, `spec`, `decision` | A2A hops observed by the proxy, labeled by route, spec, and policy decision. |
 | `sbproxy_a2a_methods_total` | Counter | `stable` | `beta` | `route`, `method` | A2A 1.0 JSON-RPC methods observed by the proxy, labeled by route and method. |
+| `sbproxy_agent_registry_entries` | Gauge | `stable` | `beta` | `collection` | Agents the registry currently knows about, by collection: the verified catalog, or one of the registration queue's four states. |
+| `sbproxy_agent_registry_operations_total` | Counter | `stable` | `beta` | `op`, `outcome` | Agent registry and registration-queue operations by operation and outcome, including every refusal the queue's state machine and the feed verifier produce. |
 | `sbproxy_acme_renewal_duration_seconds` | Histogram | `stable` | `beta` | `result` | ACME renewal full-flow duration, by outcome. |
 | `sbproxy_acme_renewals_total` | Counter | `stable` | `beta` | `result` | ACME certificate renewal attempts, by outcome. |
 | `sbproxy_active_connections` | Gauge | `stable` | `stable` | none | Current active connections. |

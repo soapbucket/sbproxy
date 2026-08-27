@@ -2498,6 +2498,74 @@ export interface AdminUsersResponse {
   users: AdminUser[];
 }
 
+/** Where a registration sits in the owner-approval queue. */
+export type AgentRegistrationState =
+  | "pending"
+  | "approved"
+  | "rejected"
+  | "revoked";
+
+/** What a submitter said about their agent. Mirrors the server's
+ *  `AgentMetadata`; no credential material appears here, because the
+ *  server's read shape has nowhere to put any. */
+export interface AgentMetadata {
+  vendor: string;
+  purpose: string;
+  contact_url: string;
+  expected_user_agents: string[];
+  expected_reverse_dns_suffixes: string[];
+  expected_keyids: string[];
+  requested_scopes: string[];
+}
+
+/** One row of the approval queue. */
+export interface AgentRegistration {
+  agent_id: string;
+  client_id: string;
+  metadata: AgentMetadata;
+  state: AgentRegistrationState;
+  reason: string | null;
+  decided_by: string | null;
+  created_at: string;
+  updated_at: string;
+  rotated_at: string | null;
+}
+
+/** One agent the verified catalog names. */
+export interface AgentCatalogEntry {
+  agent_id: string;
+  vendor: string;
+  purpose: string;
+  expected_user_agents: string[];
+  expected_reverse_dns_suffixes: string[];
+  expected_keyids: string[];
+  reputation_score: number;
+  flags: string[];
+}
+
+/** `GET /admin/agent-registry/catalog`. */
+export interface AgentCatalogResponse {
+  generated_at: string | null;
+  expires_at: string | null;
+  expired: boolean;
+  entries: AgentCatalogEntry[];
+}
+
+/** `GET /admin/agent-registry`. `feed_configured` and `bootstrap_keys` are
+ *  what separate "the publisher sent nothing" from "no feed is wired up". */
+export interface AgentRegistrySummary {
+  catalog_entries: number;
+  catalog_generated_at: string | null;
+  catalog_expires_at: string | null;
+  catalog_expired: boolean;
+  pending: number;
+  approved: number;
+  rejected: number;
+  revoked: number;
+  feed_configured: boolean;
+  bootstrap_keys: number;
+}
+
 /** A configured RBAC operator, as reported by `/api/operators`. Never
  *  carries a password_hash. Config-only: managed by editing
  *  `proxy.admin.operators` and reloading, not through this API. */
@@ -2996,6 +3064,35 @@ export const api = {
   // Configured RBAC operators only (excludes the top-level admin
   // credential). password_hash is never returned.
   operators: () => getJson<OperatorSummary[]>("/api/operators"),
+
+  // Agent registry (WOR-2664). Every one of these is 404 when
+  // `proxy.agent_registry` is absent or disabled, which is what the view
+  // renders as "not configured" rather than as an error.
+  agentRegistrySummary: () =>
+    getJson<AgentRegistrySummary>("/admin/agent-registry"),
+  agentRegistryCatalog: () =>
+    getJson<AgentCatalogResponse>("/admin/agent-registry/catalog"),
+  agentRegistryRefresh: () =>
+    sendJson<{ entries: number }>("POST", "/admin/agent-registry/refresh"),
+  agentRegistrations: (state?: AgentRegistrationState) =>
+    getJson<{ items: AgentRegistration[] }>(
+      state
+        ? `/admin/agent-registry/registrations?state=${encodeURIComponent(state)}`
+        : "/admin/agent-registry/registrations",
+    ),
+  // The reason is optional on approve and revoke and required on reject;
+  // the server enforces that, and the view disables the button rather than
+  // letting an operator discover it from a 400.
+  agentRegistrationDecide: (
+    agentId: string,
+    decision: "approve" | "reject" | "revoke",
+    reason?: string,
+  ) =>
+    sendJson<AgentRegistration>(
+      "POST",
+      `/admin/agent-registry/registrations/${encodeURIComponent(agentId)}/${decision}`,
+      reason ? { reason } : {},
+    ),
 
   // Attested metering (WOR-2131). All three are tenant-scoped server-side
   // from the authenticated operator; passing `tenant` narrows further and

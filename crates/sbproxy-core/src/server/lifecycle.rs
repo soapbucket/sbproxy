@@ -3358,6 +3358,25 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
             admin_state_inner = admin_state_inner.with_prompt_persistence(p);
         }
 
+        // WOR-2664: the agent registry. Construction is fail-loud rather
+        // than fail-soft, unlike the prompt persistence above: a registry
+        // that could not open its store would answer every approval query
+        // with an empty queue, and an operator reading "no pending
+        // registrations" cannot tell that from a broken store. Prompt
+        // persistence degrades to ephemeral mutations, which is a smaller
+        // lie, so it warns and continues.
+        if let Some(registry_cfg) = server_config
+            .agent_registry
+            .as_ref()
+            .filter(|cfg| cfg.enabled)
+        {
+            registry_cfg
+                .validate()
+                .map_err(|message| anyhow::anyhow!("{message}"))?;
+            let registry = build_agent_registry(registry_cfg)?;
+            admin_state_inner = admin_state_inner.with_agent_registry(registry);
+        }
+
         // WOR-27: register the synthetic-pipeline probe and spawn its
         // driver loop when the operator opted in. Registration runs
         // sync; the driver loop calls `tokio::spawn` and therefore
@@ -7970,4 +7989,64 @@ origins:
         let logged = captured_warnings(CLEAN);
         assert!(logged.is_empty(), "got {logged}");
     }
+}
+
+/// Open the agent registry's embedded store and restore its cached catalog.
+///
+/// `open_shared` rather than `open`: a config reload builds a candidate
+/// generation while the live one still holds the file, and redb locks it
+/// exclusively, so an unconditional open would make every reload of a config
+/// with an agent registry fail.
+///
+/// The restore runs on a throwaway current-thread runtime. Every operation it
+/// performs is a synchronous redb transaction behind an `async fn`, so there
+/// is nothing for a driver to poll; this exists because `run` has no ambient
+/// runtime, not because the work is asynchronous.
+fn build_agent_registry(
+    cfg: &sbproxy_config::AgentRegistryConfig,
+) -> anyhow::Result<std::sync::Arc<sbproxy_agent_registry::AgentRegistry>> {
+    use sbproxy_platform::storage::{EmbeddedKvStore, MemoryKv};
+
+    let store = EmbeddedKvStore::open_shared(&cfg.store_path, "agent_registry").map_err(|e| {
+        anyhow::anyhow!(
+            "agent_registry.store_path {}: {e}",
+            cfg.store_path.display()
+        )
+    })?;
+    let bootstrap = sbproxy_agent_registry::BootstrapKeys::from_pairs(
+        cfg.bootstrap_keys
+            .iter()
+            .map(|(kid, public_key)| (kid.clone(), public_key.clone())),
+    )
+    .map_err(|e| anyhow::anyhow!("agent_registry.bootstrap_keys: {e}"))?;
+
+    let options = sbproxy_agent_registry::AgentRegistryOptions {
+        feed_path: cfg.feed_path.clone(),
+        key_directory_path: cfg.key_directory_path.clone(),
+        bootstrap_keys: bootstrap,
+        stale_grace: chrono::Duration::seconds(cfg.stale_grace_secs as i64),
+        duplicate_window: chrono::Duration::seconds(cfg.duplicate_window_secs as i64),
+        rotation_grace: chrono::Duration::seconds(cfg.rotation_grace_secs as i64),
+    };
+    let registry = std::sync::Arc::new(
+        sbproxy_agent_registry::AgentRegistry::new(
+            store,
+            std::sync::Arc::new(MemoryKv::new("agent_registry")),
+            options,
+        )
+        .map_err(|e| anyhow::anyhow!("agent_registry: {e}"))?,
+    );
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .map_err(|e| anyhow::anyhow!("agent_registry boot runtime: {e}"))?;
+    let restored = runtime
+        .block_on(registry.boot())
+        .map_err(|e| anyhow::anyhow!("agent_registry could not read its store: {e}"))?;
+    tracing::info!(
+        path = %cfg.store_path.display(),
+        restored_entries = restored,
+        "agent registry opened"
+    );
+    Ok(registry)
 }

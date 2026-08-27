@@ -450,6 +450,65 @@ impl AiPromptRolloutSelectedData {
     }
 }
 
+/// The content-safe payload of an `agent_registration_decided` event.
+///
+/// The explicit field allowlist is the privacy boundary, and it is the whole
+/// of it: this type has no field a minted client secret, a registration
+/// access token, an Argon2id hash, or a submitter's contact URL could occupy.
+/// A queue decision is worth putting on a SIEM feed; the credential material
+/// the same call site is holding is not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct AgentRegistrationDecidedData {
+    /// The minted agent slug the decision applies to.
+    pub agent_id: String,
+    /// What happened: `submitted`, `approved`, `rejected`, or `revoked`.
+    pub decision: String,
+    /// The registration's state after the decision.
+    pub state: String,
+    /// The admin operator that decided, when an admin session resolved one.
+    pub decided_by: Option<String>,
+}
+
+impl AgentRegistrationDecidedData {
+    /// Build a bounded decision payload. Every string is truncated to the
+    /// same identifier bound the toolkit events use, so a submitter cannot
+    /// widen an event by sending a long vendor name.
+    pub fn new(agent_id: &str, decision: &str, state: &str, decided_by: Option<&str>) -> Self {
+        Self {
+            agent_id: bounded_ai_toolkit_event_id(agent_id),
+            decision: bounded_ai_toolkit_event_id(decision),
+            state: bounded_ai_toolkit_event_id(state),
+            decided_by: decided_by.map(bounded_ai_toolkit_event_id),
+        }
+    }
+
+    /// Wrap this payload in the exact typed event envelope.
+    pub fn into_proxy_event(
+        self,
+        hostname: impl Into<String>,
+        tenant_id: impl Into<String>,
+    ) -> ProxyEvent {
+        let mut data = serde_json::Map::with_capacity(4);
+        data.insert("agent_id".to_owned(), self.agent_id.into());
+        data.insert("decision".to_owned(), self.decision.into());
+        data.insert("state".to_owned(), self.state.into());
+        data.insert(
+            "decided_by".to_owned(),
+            match self.decided_by {
+                Some(actor) => actor.into(),
+                None => serde_json::Value::Null,
+            },
+        );
+        ProxyEvent::new(
+            EventType::AgentRegistrationDecided,
+            hostname.into(),
+            tenant_id.into(),
+            serde_json::Value::Object(data),
+        )
+    }
+}
+
 fn bounded_ai_toolkit_event_id(value: &str) -> String {
     sbproxy_util::truncate_utf8(value, AI_TOOLKIT_EVENT_ID_MAX_BYTES).to_owned()
 }
@@ -531,6 +590,13 @@ pub enum EventType {
     /// the prompt and version and carry a cohort digest, but never prompt
     /// content or the raw cohort key.
     AiPromptRolloutSelected,
+    /// Event name `agent_registration_decided`. A self-registered agent
+    /// entered the owner-approval queue, or an operator approved, rejected,
+    /// or revoked one (WOR-2664). Its payload is the agent id, the decision,
+    /// the resulting state, and the acting operator when an admin session
+    /// resolved one; never a minted secret, a registration access token, or
+    /// a credential hash.
+    AgentRegistrationDecided,
 }
 
 impl ProxyEvent {
@@ -573,7 +639,7 @@ impl ProxyEvent {
 /// mode this prevents is a twenty-third event type that no `events:` sink
 /// can ever be told to deliver, which looks exactly like a working sink
 /// to everyone except the operator waiting for the event.
-pub const ALL_EVENT_TYPES: [EventType; 22] = [
+pub const ALL_EVENT_TYPES: [EventType; 23] = [
     EventType::RequestStarted,
     EventType::RequestCompleted,
     EventType::RequestError,
@@ -596,6 +662,7 @@ pub const ALL_EVENT_TYPES: [EventType; 22] = [
     EventType::AiWorkflowOperation,
     EventType::AiEvaluationOperation,
     EventType::AiPromptRolloutSelected,
+    EventType::AgentRegistrationDecided,
 ];
 
 impl EventType {
@@ -630,6 +697,7 @@ impl EventType {
             Self::AiWorkflowOperation => "ai_workflow_operation",
             Self::AiEvaluationOperation => "ai_evaluation_operation",
             Self::AiPromptRolloutSelected => "ai_prompt_rollout_selected",
+            Self::AgentRegistrationDecided => "agent_registration_decided",
         }
     }
 
@@ -668,6 +736,7 @@ impl EventType {
             Self::AiWorkflowOperation => 19,
             Self::AiEvaluationOperation => 20,
             Self::AiPromptRolloutSelected => 21,
+            Self::AgentRegistrationDecided => 22,
         }
     }
 
@@ -719,6 +788,9 @@ impl EventType {
                 | Self::AiWorkflowOperation
                 | Self::AiEvaluationOperation
                 | Self::AiPromptRolloutSelected
+                // The agent registry publishes one per queue decision:
+                // submission, approval, rejection, revocation.
+                | Self::AgentRegistrationDecided
         )
         // `CacheHit` and `CacheMiss` are deliberately absent: wiring
         // them per-request would put an NDJSON line on every configured
@@ -1009,6 +1081,10 @@ mod tests {
             (
                 EventType::AiPromptRolloutSelected,
                 "\"ai_prompt_rollout_selected\"",
+            ),
+            (
+                EventType::AgentRegistrationDecided,
+                "\"agent_registration_decided\"",
             ),
         ];
 

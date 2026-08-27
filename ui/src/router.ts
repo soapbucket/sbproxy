@@ -22,6 +22,12 @@ const routes = [
     meta: { title: "Keys", documentation: "key-management" },
   },
   {
+    path: "/agents",
+    name: "agents",
+    component: () => import("./views/AgentsView.vue"),
+    meta: { title: "Agents", documentation: "agent-registry" },
+  },
+  {
     path: "/credentials",
     name: "credentials",
     component: () => import("./views/CredentialsView.vue"),

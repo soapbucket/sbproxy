@@ -1,6 +1,6 @@
 # SBproxy documentation
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-27*
 
 SBproxy is an open source Enterprise AI Gateway for API, MCP and agent, and AI model traffic. Every feature in this repository ships under Apache-2.0.
 
@@ -115,6 +115,7 @@ Route AI, govern the AI that calls you, and run AI models yourself.
 - [a2a-gateway.md](a2a-gateway.md) - the `a2a` action and policy: envelope trust, per-hop chain limits, push-notification target validation, typed AgentCard, and modality negotiation helpers.
 - [agent-orchestration.md](agent-orchestration.md) - governed agent discovery and bounded finite-state workflows through the live authenticated toolkit runtime; not the same A2A as the entry above.
 - [agent-skills.md](agent-skills.md) - Agent Skills v0.2.0 well-known projection: schema, integrity, archive safety, no-script-execution contract.
+- [agent-registry.md](agent-registry.md) - agent identity: a signed catalog of known agents plus an owner-approval queue for agents that register themselves, both on one embedded store with no database behind it.
 - [cloudflare-code-mode.md](cloudflare-code-mode.md) - typed TypeScript module emission for Cloudflare Code Mode agents over the MCP federation registry.
 - [content-for-agents.md](content-for-agents.md) - operator guide to agent-aware content delivery: shape negotiation, body transforms, well-known license posture.
 - [rsl.md](rsl.md) - RSL 1.0 licensing cookbook: expressing license stance via YAML and the resulting `/licenses.xml` projection.

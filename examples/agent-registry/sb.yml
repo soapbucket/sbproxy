@@ -1,0 +1,120 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Agent identity: an owner-approval queue for agents that ask to register,
+# and a signed catalog of agents somebody else already vouched for.
+#
+# Two questions, two halves. "Which agent is this" is the catalog, refreshed
+# from a feed a publisher signs. "Did we agree to let it in" is the queue,
+# where admission is a decision a human made rather than a side effect of a
+# request arriving.
+#
+# Both halves keep their state in one embedded redb file. There is no
+# database here, no broker, and no sidecar: the file named by `store_path` is
+# the whole deployment footprint, and it is created owner-only.
+#
+# Setup:
+#   make run CONFIG=examples/agent-registry/sb.yml
+#
+# Nothing is registered yet, so the summary is all zeros:
+#   curl -s -u admin:admin http://127.0.0.1:9090/admin/agent-registry | jq
+#   {
+#     "catalog_entries": 0,
+#     "catalog_generated_at": null,
+#     "catalog_expires_at": null,
+#     "catalog_expired": false,
+#     "pending": 0,
+#     "approved": 0,
+#     "rejected": 0,
+#     "revoked": 0,
+#     "feed_configured": false,
+#     "bootstrap_keys": 0
+#   }
+#
+# Submit a registration. The response carries the only copy of the minted
+# secret and the registration access token there will ever be; what the store
+# keeps is an Argon2id hash of each.
+#   curl -s -u admin:admin -X POST \
+#     http://127.0.0.1:9090/admin/agent-registry/registrations \
+#     -H 'Content-Type: application/json' \
+#     -d '{"agent_metadata":{
+#           "vendor":"Acme Research Labs",
+#           "purpose":"research",
+#           "contact_url":"https://acme.example.com/bots",
+#           "expected_user_agents":["AcmeBot/1.0"],
+#           "expected_reverse_dns_suffixes":[".bots.acme.example.com"],
+#           "requested_scopes":["crawl:public"]}}' | jq
+#
+# Send the same body again inside the hour and it is recognized as a retry,
+# not a second agent:
+#   HTTP/1.1 409  {"error":"a registration with identical metadata is already
+#                  pending as acme-research-labs-01J...","code":"duplicate"}
+#
+# See what is waiting on you:
+#   curl -s -u admin:admin \
+#     'http://127.0.0.1:9090/admin/agent-registry/registrations?state=pending' | jq
+#
+# Approve it. Substitute the agent_id from the submission above.
+#   curl -s -u admin:admin -X POST \
+#     http://127.0.0.1:9090/admin/agent-registry/registrations/$AGENT_ID/approve \
+#     -H 'Content-Type: application/json' -d '{"reason":"contact page checks out"}' | jq
+#
+# Or refuse it, which burns the slug permanently so the same name cannot be
+# resubmitted until a different reviewer says yes. A reason is required:
+#   curl -s -u admin:admin -X POST \
+#     http://127.0.0.1:9090/admin/agent-registry/registrations/$AGENT_ID/reject \
+#     -H 'Content-Type: application/json' -d '{"reason":"contact url 404s"}' | jq
+#
+# Every one of those four decisions publishes an `agent_registration_decided`
+# event on the `events:` egress and moves
+# `sbproxy_agent_registry_entries{collection=...}`.
+#
+# The agent rotates its own secret later, presenting the registration access
+# token it was given at submission. The previous secret keeps working for
+# `rotation_grace_secs`, so a fleet picks the new one up without a
+# synchronized restart:
+#   curl -s -X POST \
+#     http://127.0.0.1:9090/admin/agent-registry/registrations/$AGENT_ID/rotate \
+#     -u admin:admin -H 'Content-Type: application/json' \
+#     -d "{\"registration_access_token\":\"$RAT\"}" | jq
+#
+# The catalog half is commented out below because it needs a feed only a
+# publisher can produce. Uncomment it once you have the two files, and see
+# docs/agent-registry.md for the document shapes and the verification chain.
+
+proxy:
+  http_bind_port: 8080
+
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    password: admin
+
+  agent_registry:
+    enabled: true
+    # One file holds the catalog cache and the registration queue. Created
+    # owner-only; point it at a persistent volume in production.
+    store_path: /tmp/sbproxy-agent-registry.redb
+    # An identical resubmission inside this window is a retry of the pending
+    # registration rather than a second one. Deliberately not durable: a
+    # restart forgets the window, which is what makes a legitimate
+    # resubmission possible after a decision.
+    duplicate_window_secs: 3600
+    # How long a rotated-away client secret keeps authenticating.
+    rotation_grace_secs: 2592000
+    # The catalog half. Both files are operator-managed: sbproxy verifies
+    # them, it does not fetch them.
+    #
+    # feed_path: /etc/sbproxy/agent-feed.json
+    # key_directory_path: /etc/sbproxy/agent-feed-keys.json
+    # stale_grace_secs: 86400
+    # bootstrap_keys:
+    #   sb-bootstrap-2026-h1: "REPLACE_WITH_THE_PUBLISHERS_BASE64_ED25519_PUBLIC_KEY"
+
+origins:
+  "test.sbproxy.dev":
+    action:
+      type: static
+      status: 200
+      content_type: text/plain
+      body: |
+        ok

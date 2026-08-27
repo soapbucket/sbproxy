@@ -6877,6 +6877,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "sbproxy-plugin",
+ "sbproxy-util",
  "tokio",
  "tracing",
  "url",

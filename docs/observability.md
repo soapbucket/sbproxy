@@ -1,5 +1,5 @@
 # Observability
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-27*
 
 SBproxy ships metrics, logs, and traces from one process. This guide covers the Wave 1 substrate: the SLO catalog, the metric label budget, the log schema and redaction policy, the trace propagation contract, the health endpoints, the dashboards, and the reference Compose stack you can boot in one command.
 
@@ -600,7 +600,7 @@ Agent-to-agent lines additionally carry the run correlation columns, so a multi-
 
 Read `a2a_identity_verified` before aggregating on `a2a_context_id`. An unverified caller picks its own context id, so it can merge its usage into another caller's run or shard one run across unbounded distinct ids. A per-run total computed without that filter is a number the caller chose. The `sbproxy_a2a_hops_total` metric splits hops the same way with its `allow:verified` and `allow:unverified` decision labels.
 
-`event_type` is the `EventType` enum from `crates/sbproxy-observe/src/events.rs`, and it is closed at 18 values: `request_started`, `request_completed`, `request_error`, `auth_denied`, `policy_denied`, `cache_hit`, `cache_miss`, `provider_selected`, `budget_exceeded`, `guardrail_triggered`, `config_reloaded`, `egress_refused`, `mcp_governance_decision`, `key_minted`, `key_revoked`, `key_rotated`, `key_blocked`, `credential_resolved`. The same enum drives the `events:` webhook sink, so a log line's `event_type` and the event names an operator can subscribe to under `events.types:` are the same closed set; [events.md](events.md#the-typed-proxy-events) has the per-event table and is the page to trust if the two ever diverge.
+`event_type` is the `EventType` enum from `crates/sbproxy-observe/src/events.rs`, and it is closed at 23 values: `request_started`, `request_completed`, `request_error`, `auth_denied`, `policy_denied`, `cache_hit`, `cache_miss`, `provider_selected`, `budget_exceeded`, `guardrail_triggered`, `config_reloaded`, `egress_refused`, `mcp_governance_decision`, `key_minted`, `key_revoked`, `key_rotated`, `key_blocked`, `credential_resolved`, `credential_fallback`, `ai_workflow_operation`, `ai_evaluation_operation`, `ai_prompt_rollout_selected`, `agent_registration_decided`. (This sentence said 18 and named 18 while the enum held 22, which is the drift a hand-maintained list produces; it is now the whole set.) The same enum drives the `events:` webhook sink, so a log line's `event_type` and the event names an operator can subscribe to under `events.types:` are the same closed set; [events.md](events.md#the-typed-proxy-events) has the per-event table and is the page to trust if the two ever diverge.
 
 ### Redaction policy
 

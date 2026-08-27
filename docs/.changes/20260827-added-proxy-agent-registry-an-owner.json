@@ -1,0 +1,4 @@
+{
+  "type": "added",
+  "message": "Added `proxy.agent_registry`: an owner-approval queue for agents that register themselves, plus a signed agent catalog verified with Ed25519 over canonical JSON, both on one embedded store with no database behind them. Decisions publish an `agent_registration_decided` event and appear on a new Agents page in the admin console."
+}

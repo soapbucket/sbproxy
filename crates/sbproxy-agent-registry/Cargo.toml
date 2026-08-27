@@ -1,0 +1,49 @@
+[package]
+name = "sbproxy-agent-registry"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Signed agent-catalog subscriber and the owner-approval queue for agent self-registration, both on the shared embedded store."
+
+[dependencies]
+# The shared embedded store. This crate holds no database of its own: the
+# catalog cache and the registration queue are namespaces inside one
+# PersistentKv, and the duplicate-registration window is an EphemeralKv.
+sbproxy-platform.workspace = true
+# Typed decision events. An approval or a revocation is a governance
+# decision, and the epic's bar is that one reaches the SIEM feed rather than
+# only a local log. No cycle: sbproxy-observe knows nothing about this crate.
+sbproxy-observe.workspace = true
+
+anyhow.workspace = true
+async-trait.workspace = true
+arc-swap.workspace = true
+base64.workspace = true
+chrono = { workspace = true, features = ["serde"] }
+hex.workspace = true
+prometheus.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+# RFC 8785 canonical JSON. The feed signature covers the canonical form of
+# the body with `signature` removed, and the metadata fingerprint that drives
+# duplicate detection covers the canonical form of the submitted metadata.
+serde_json_canonicalizer.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+ulid.workspace = true
+
+# Ed25519 feed and key-directory verification.
+ed25519-dalek = "2"
+# Argon2id at-rest hashing for minted client secrets and registration access
+# tokens, at the parameters OWASP's password-storage guidance recommends.
+argon2.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }

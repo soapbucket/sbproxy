@@ -1902,6 +1902,12 @@ pub struct ProxyServerConfig {
     /// when the proxy is unable to service its own requests.
     #[serde(default)]
     pub synthetic_probe: Option<SyntheticProbeConfig>,
+    /// Optional agent registry: a signed catalog of known agents plus an
+    /// owner-approval queue for agents that ask to register themselves.
+    /// Disabled by default. State lives in one embedded redb file named by
+    /// `store_path`; nothing here needs a database or a sidecar.
+    #[serde(default)]
+    pub agent_registry: Option<AgentRegistryConfig>,
     /// Scripting runtime limits. Today this block carries the Lua
     /// sandbox knobs (execution-time budget, memory budget, pattern
     /// API gating); other languages (CEL, JavaScript, WebAssembly)
@@ -2616,6 +2622,7 @@ impl Default for ProxyServerConfig {
             correlation_id: CorrelationIdConfig::default(),
             mtls: None,
             synthetic_probe: None,
+            agent_registry: None,
             scripting: ScriptingConfig::default(),
             extensions: HashMap::new(),
             http_client_timeouts: HttpClientTimeoutsConfig::default(),
@@ -5097,6 +5104,136 @@ impl SyntheticProbeConfig {
             self.stale_after_secs
         }
     }
+}
+
+/// Agent registry: the signed catalog subscriber plus the owner-approval
+/// queue for agent self-registration.
+///
+/// Both halves keep their state in one embedded redb file at `store_path`.
+/// The catalog is refreshed from `feed_path`, verified against
+/// `key_directory_path`, which is itself verified against `bootstrap_keys`.
+/// A registry with no feed configured still runs: the approval queue is
+/// useful on its own, and the catalog then serves whatever the store last
+/// cached.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRegistryConfig {
+    /// Master switch. Disabled by default, so a config that names the block
+    /// without turning it on opens no store file.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to the embedded store file holding the catalog cache and the
+    /// registration queue. Created owner-only if absent.
+    pub store_path: std::path::PathBuf,
+    /// Path to the signed catalog feed. Absent means no refresh is
+    /// possible and `POST /admin/agent-registry/refresh` says so.
+    #[serde(default)]
+    pub feed_path: Option<std::path::PathBuf>,
+    /// Path to the signed key directory that names the feed signing keys.
+    #[serde(default)]
+    pub key_directory_path: Option<std::path::PathBuf>,
+    /// Bootstrap public keys, keyed by the key id the directory's signature
+    /// names, valued as base64 of the raw 32-byte Ed25519 public key.
+    ///
+    /// Bootstrap keys vouch for the feed publisher's key directory, which in
+    /// turn vouches for the per-period keys that sign individual feeds. Only
+    /// public material appears here, so this block belongs in version
+    /// control with the rest of the config.
+    ///
+    /// An empty map means no key directory can be trusted and therefore no
+    /// feed can be applied. The registry refuses rather than falling back to
+    /// a key shipped in the binary, because a build carrying a known public
+    /// key is a build where whoever holds the private half signs
+    /// directories.
+    #[serde(default)]
+    pub bootstrap_keys: std::collections::BTreeMap<String, String>,
+    /// How far past its own `expires_at` a feed may still be applied.
+    /// Zero, the default, means the publisher's expiry is honored exactly.
+    #[serde(default)]
+    pub stale_grace_secs: u64,
+    /// How long an identical resubmission is treated as a retry of the
+    /// pending one rather than a new registration. One hour by default.
+    #[serde(default = "default_agent_registry_duplicate_window_secs")]
+    pub duplicate_window_secs: u64,
+    /// How long a rotated-away client secret keeps authenticating. Thirty
+    /// days by default, so a fleet can pick up a new secret without a
+    /// synchronized restart.
+    #[serde(default = "default_agent_registry_rotation_grace_secs")]
+    pub rotation_grace_secs: u64,
+}
+
+impl AgentRegistryConfig {
+    /// Refuse a block that cannot do what it appears to promise.
+    ///
+    /// Two shapes are accepted at parse and are nonetheless wrong. A feed
+    /// path with no key directory has nothing to verify against, and a feed
+    /// path with no bootstrap keys has nothing to verify the directory
+    /// against; either way every refresh would fail at runtime, and an
+    /// operator would read the resulting empty catalog as the publisher
+    /// having nothing to say.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        match (self.feed_path.is_some(), self.key_directory_path.is_some()) {
+            (true, false) => {
+                return Err(
+                    "agent_registry.feed_path is set without key_directory_path, so no feed \
+                     could ever be verified"
+                        .to_string(),
+                )
+            }
+            (false, true) => {
+                return Err(
+                    "agent_registry.key_directory_path is set without feed_path, so there is \
+                     nothing to verify"
+                        .to_string(),
+                )
+            }
+            _ => {}
+        }
+        if self.feed_path.is_some() && self.bootstrap_keys.is_empty() {
+            return Err(
+                "agent_registry names a feed but no bootstrap_keys, so the key directory it \
+                 depends on can never be trusted"
+                    .to_string(),
+            );
+        }
+        for (kid, public_key) in &self.bootstrap_keys {
+            if kid.trim().is_empty() {
+                return Err("agent_registry.bootstrap_keys needs a non-empty key id".to_string());
+            }
+            if public_key.trim().is_empty() {
+                return Err(format!(
+                    "agent_registry bootstrap key {kid} has an empty public key"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Default for AgentRegistryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            store_path: std::path::PathBuf::from("agent-registry.redb"),
+            feed_path: None,
+            key_directory_path: None,
+            bootstrap_keys: std::collections::BTreeMap::new(),
+            stale_grace_secs: 0,
+            duplicate_window_secs: default_agent_registry_duplicate_window_secs(),
+            rotation_grace_secs: default_agent_registry_rotation_grace_secs(),
+        }
+    }
+}
+
+fn default_agent_registry_duplicate_window_secs() -> u64 {
+    3_600
+}
+
+fn default_agent_registry_rotation_grace_secs() -> u64 {
+    30 * 24 * 3_600
 }
 
 fn default_synthetic_hostname() -> String {
