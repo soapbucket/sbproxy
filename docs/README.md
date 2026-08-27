@@ -159,6 +159,7 @@ Point a framework you already run at the gateway: chat completions through the O
 - [exposed-credentials.md](exposed-credentials.md) - the `exposed_credentials` policy: detect known-leaked basic-auth passwords and tag or block.
 - [agent-budget.md](agent-budget.md) - `agent_budget` policy: semantic rate-limit primitive keyed on resolved agent identity.
 - [content-digest.md](content-digest.md) - `content_digest` policy: RFC 9530 request-body verification for integrity-critical inboxes.
+- [anomaly-detection.md](anomaly-detection.md) - the rolling per-agent-class histogram that flags long-tail TLS fingerprints, headless libraries, and per-address rate spikes, and the reputation score it feeds.
 - [headless-detection.md](headless-detection.md) - header-only headless / stealth-browser indicator heuristics surfaced under `request.agent.headless_*`.
 - [feature-flags.md](feature-flags.md) - the sticky-bucketing flag store plus the `flag_enabled(name, key)` CEL helper.
 

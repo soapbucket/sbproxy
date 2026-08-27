@@ -204,6 +204,8 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_audit_chain_read_total` | Counter | `stable` | `beta` | `channel`, `outcome` | Audit-chain read attempts, by verification outcome (verified, broken, unreadable, denied). |
 | `sbproxy_audit_emit_duration_seconds` | Histogram | `stable` | `beta` | `channel`, `outcome` | Wall-clock latency of one audit-channel emission. |
 | `sbproxy_audit_write_failures_total` | Counter | `stable` | `beta` | `channel` | Audit emissions that did not reach a sink they were promised, by audit channel; healthy systems read 0. |
+| `sbproxy_agent_reputation_score` | Gauge | `stable` | `beta` | `agent_class` | Agent-class reputation in [0.0, 1.0] over the anomaly detector's rolling window; 1.0 is a class that has produced nothing. |
+| `sbproxy_anomaly_detected_total` | Counter | `stable` | `beta` | `kind`, `severity` | Behavioral anomalies flagged by a registered detector hook, by kind and severity. |
 | `sbproxy_auth_results_total` | Counter | `stable` | `stable` | `origin`, `auth_type`, `result` | Auth check results. |
 | `sbproxy_boilerplate_stripped_bytes_total` | Counter | `stable` | `beta` | `hostname` | Bytes removed by the boilerplate transform, by hostname. |
 | `sbproxy_bot_auth_directory_fetch_failures_total` | Counter | `stable` | `beta` | `url` | Bot-auth hosted key-directory fetches that failed (the verifier serves stale or fails per nonce_policy). |

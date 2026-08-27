@@ -6,6 +6,7 @@ import {
   parsePrometheus,
   findFamily,
   groupByLabel,
+  groupByLabels,
   sumSamples,
   histogramAvgByLabel,
   histogramQuantileByLabels,
@@ -146,6 +147,15 @@ const introspectionFamily = computed(() =>
 );
 const kyaFamily = computed(() =>
   findFamily(families.value, "sbproxy_kya_verdicts_total"),
+);
+/* WOR-2666: what the anomaly detector flagged, and what each agent
+ * class scores as a result. Nothing on the request path reads the
+ * score, so this card and the Grafana panel are what it is for. */
+const anomalyFamily = computed(() =>
+  findFamily(families.value, "sbproxy_anomaly_detected_total"),
+);
+const reputationFamily = computed(() =>
+  findFamily(families.value, "sbproxy_agent_reputation_score"),
 );
 
 const tokenFamily = computed(() =>
@@ -298,6 +308,32 @@ const authCallouts = computed(() => {
   push("ext_authz", extAuthzFamily.value, "outcome");
   push("introspection", introspectionFamily.value, "result");
   push("kya", kyaFamily.value, "verdict");
+  return rows;
+});
+
+/* Verdicts by kind and severity, then the score each class currently
+ * carries. Severity colours the row: an `info` verdict is a note, a
+ * `critical` one is a page. */
+const anomalies = computed(() => {
+  const rows: { key: string; value: number; color?: string }[] = [];
+  for (const row of groupByLabels(anomalyFamily.value, ["kind", "severity"])) {
+    rows.push({
+      key: row.key,
+      value: row.value,
+      color: /critical/.test(row.key)
+        ? "var(--sb-err)"
+        : /warn/.test(row.key)
+          ? "var(--sb-warn)"
+          : undefined,
+    });
+  }
+  for (const row of groupByLabel(reputationFamily.value, "agent_class")) {
+    rows.push({
+      key: `reputation / ${row.key}`,
+      value: Math.round(row.value * 100) / 100,
+      color: row.value < 0.5 ? "var(--sb-err)" : "var(--sb-ok)",
+    });
+  }
   return rows;
 });
 
@@ -632,6 +668,7 @@ const hasAnyPanel = computed(
     cacheResults.value.length ||
     authResults.value.length ||
     authCallouts.value.length ||
+    anomalies.value.length ||
     bytesByDirection.value.length ||
     tokensByDirection.value.length ||
     tokensByProvider.value.length ||
@@ -848,6 +885,13 @@ function formatPct(v: number): string {
         <div class="sb-card" v-if="authResults.length">
           <h3>Auth results</h3>
           <MiniBars :items="authResults" />
+        </div>
+        <div class="sb-card" v-if="anomalies.length">
+          <h3>
+            Anomalies
+            <span v-if="selectedOrigin" class="sb-eyebrow">all origins</span>
+          </h3>
+          <MiniBars :items="anomalies" />
         </div>
         <div class="sb-card" v-if="authCallouts.length">
           <h3>

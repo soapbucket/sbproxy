@@ -1,0 +1,64 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Behavioral anomaly detection over the signals the proxy already has.
+#
+# The detector keeps a rolling 28-day histogram per agent class of the
+# TLS fingerprint, the resolver source, the headless-library detection,
+# and the per-address request rate, and flags what sits in the long
+# tail. It is comparative, not a rule list: it catches a crawler
+# claiming to be GPTBot whose TLS fingerprint no GPTBot has ever used,
+# without anyone having written that fingerprint down first.
+#
+# The cost of that is stated plainly: it says nothing until it has a
+# baseline. `min_observations` is the floor, and the window is in
+# memory, so a restart empties it and the detector is quiet again until
+# it has re-learned one. There is no persistence option, because the
+# alternative is a database the proxy cannot start without.
+#
+# This example lowers `min_observations` to 5 so a handful of curls is
+# enough to see a verdict. Leave it at the default of 50 in production.
+#
+# Run:
+#   make run CONFIG=examples/anomaly-detection/sb.yml
+#
+# Test:
+#   # Nothing is flagged while the detector has no baseline.
+#   for i in $(seq 1 20); do
+#     curl -s -o /dev/null -H 'Host: anomaly.local' http://127.0.0.1:8080/get
+#   done
+#
+#   # Then watch what it has flagged, and what the classes score.
+#   curl -s http://127.0.0.1:9090/metrics | grep -E 'sbproxy_anomaly_detected_total|sbproxy_agent_reputation_score'
+
+proxy:
+  http_bind_port: 8080
+  admin:
+    enabled: true
+    port: 9090
+
+  anomaly:
+    enabled: true
+
+    # Observations a dimension needs before anything is called an
+    # outlier. Five is a demo number: below the default of 50 the
+    # histogram cannot tell "rare" from "first time ever", and a
+    # detector that flags every first sighting is one nobody reads.
+    min_observations: 5
+
+    # Share of the window below which a value is an outlier. The
+    # default of 0.01 means a fingerprint has to have been under 1% of
+    # its class's traffic before it is flagged.
+    outlier_frequency: 0.01
+
+    # One address past its class's per-address mean by this multiple
+    # today is a rate spike. Past five times this, it is critical.
+    rate_spike_multiplier: 10.0
+
+    # Mean per-address rate below which the spike check does not
+    # engage, so a single burst against an idle class is not a spike.
+    rate_spike_min_mean: 5.0
+
+origins:
+  "anomaly.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev

@@ -60,6 +60,13 @@ pub mod ai_extensions;
 pub(crate) mod ai_toolkit_runtime;
 /// Boot wiring for the alert evaluation loop (dispatcher + engine + drain).
 pub mod alerting;
+/// WOR-2666: behavioral anomaly detection over the signals the request
+/// path already collects, and the agent-class reputation it feeds.
+///
+/// Not behind `agent-class`: the detector reads the signals it is
+/// given and produces nothing when they are absent, so a build without
+/// the resolver still detects rate spikes and headless libraries.
+pub mod anomaly;
 /// Lowering `proxy.attestation` into the metering vocabulary the
 /// request path runs on: the resolved role, the two posture axes, the
 /// queue and ledger locations, and the operator's complete position on

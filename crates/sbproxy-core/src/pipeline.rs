@@ -2999,6 +2999,25 @@ impl CompiledPipeline {
         // unknown or extension-provided backends drop through to `None` with a
         // warning so a pipeline lifecycle hook can swap in its own
         // implementation post-compile.
+        // WOR-2666: install (or remove) the anomaly detector. Done here
+        // rather than at first use so a reload that turns the block off
+        // takes the detector out with it, and so the one hook
+        // registration this process makes happens on the config path
+        // where every other module is built.
+        if !matches!(mode, PipelineConstructionMode::Validation) {
+            let detector = config
+                .server
+                .anomaly
+                .as_ref()
+                .filter(|anomaly| anomaly.enabled)
+                .map(|anomaly| {
+                    Arc::new(crate::anomaly::AnomalyDetector::new(
+                        crate::anomaly::AnomalySettings::from_config(anomaly),
+                    ))
+                });
+            crate::anomaly::install(detector);
+        }
+
         let (cache_reserve, cache_reserve_admission) = build_cache_reserve(
             &config.server.cache_reserve,
             matches!(mode, PipelineConstructionMode::Validation),

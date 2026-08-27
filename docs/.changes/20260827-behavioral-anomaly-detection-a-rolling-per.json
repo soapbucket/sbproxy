@@ -1,0 +1,4 @@
+{
+  "type": "added",
+  "message": "Behavioral anomaly detection: a rolling per-agent-class window over the TLS fingerprint, headless-library, and per-address rate signals the proxy already collects, flagging what sits in the long tail. `AnomalyDetectorHook` had been declared and dispatched since Wave 5 with nothing implementing it, so the verdict loop ran over an empty list on every request. Verdicts now reach `sbproxy_anomaly_detected_total`, a structured log line, and a per-class reputation score."
+}

@@ -52,7 +52,7 @@
     "to": "now"
   },
   "refresh": "10s",
-  "version": 2,
+  "version": 3,
   "schemaVersion": 39,
   "panels": [
     {
@@ -1091,6 +1091,116 @@
         }
       ],
       "description": "Know Your Agent token verification, by verdict. `revoked` and `expired` are agents presenting credentials their issuer has withdrawn; `insufficient_balance` is a verified agent refused because its spend balance is below the origin's floor; `directory_unavailable` means the issuer's JWKS or denylist could not be fetched and no cached copy was still inside its stale-grace window. Absent until an origin configures a `kya` provider."
+    },
+    {
+      "id": 17,
+      "title": "Behavioral Anomalies",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 72
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (kind, severity) (rate(sbproxy_anomaly_detected_total[5m]))",
+          "legendFormat": "{{kind}} / {{severity}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Observations the anomaly detector put in the long tail for their agent class, by kind and severity. `ja4_outlier` is a TLS fingerprint the class has essentially never presented; `headless_library` is a headless browser showing up where one does not belong, and never reports below `warn`; `request_rate_spike` is one address far past its class's per-address mean. Absent until `proxy.anomaly.enabled` is true, and quiet for a while after every restart: the window is in memory, so a deploy costs the detector its baseline and it says nothing until it has re-learned one."
+    },
+    {
+      "id": 18,
+      "title": "Agent Reputation",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 72
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "min by (agent_class) (sbproxy_agent_reputation_score)",
+          "legendFormat": "{{agent_class}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Reputation per agent class, 1.0 down to 0.0, over the detector's rolling 28-day window. A critical verdict costs five times a warning, and weight decays by rolling out of the window rather than on a timer, so a class that stops misbehaving recovers on its own. Nothing on the request path reads this number: it is published for an operator to act on, because what a request should do when its class scores 0.4 has not been decided."
     }
   ],
   "templating": {

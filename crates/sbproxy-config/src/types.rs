@@ -1807,6 +1807,16 @@ pub struct ProxyServerConfig {
     /// `l2_cache_settings` (alias).
     #[serde(default, rename = "l2_cache_settings", alias = "l2_cache")]
     pub l2_cache: Option<L2CacheConfig>,
+    /// WOR-2666: optional behavioral anomaly detection.
+    ///
+    /// When `enabled`, the proxy keeps a rolling per-agent-class
+    /// histogram of the categorical signals it already collects (TLS
+    /// fingerprint, ML classification, headless-library detection) plus
+    /// a per-IP request rate, and flags observations that sit in the
+    /// long tail. Absent or disabled, no histogram is built and the
+    /// detector hook is not installed.
+    #[serde(default)]
+    pub anomaly: Option<AnomalyConfig>,
     /// Optional Cache Reserve (long-tail cold tier) configuration.
     ///
     /// When `enabled`, response-cache entries that pass the admission
@@ -2605,6 +2615,7 @@ impl Default for ProxyServerConfig {
             secrets: None,
             key_management: None,
             l2_cache: None,
+            anomaly: None,
             cache_reserve: None,
             response_cache_store: None,
             compression_state: None,
@@ -5652,6 +5663,90 @@ impl std::fmt::Debug for L2CacheParams {
             .field("key_file_configured", &self.key_file.is_some())
             .finish()
     }
+}
+
+// --- Anomaly detection config (WOR-2666) ---
+
+/// Behavioral anomaly detection over the signals the proxy already
+/// collects.
+///
+/// The detector is comparative, not a rule set: it learns what a given
+/// agent class normally looks like and flags what does not fit. That
+/// makes it useful exactly where a signature list is not, and it also
+/// means it says nothing at all until it has a baseline, which
+/// [`Self::min_observations`] is the floor for.
+///
+/// # What it cannot survive
+///
+/// The histogram is in memory and has no persistence option. A restart
+/// empties the window, and the detector is silent again until it has
+/// re-learned a baseline. That is a deliberate consequence of the rule
+/// that nothing here may require an external store: the alternative is
+/// a database the proxy cannot start without. Operators running short
+/// deployments, or restarting often, should expect the detector to
+/// spend a meaningful fraction of its life below
+/// `min_observations` and read `sbproxy_anomaly_detected_total`
+/// accordingly.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AnomalyConfig {
+    /// Master switch. When `false`, no histogram is built and no
+    /// detector hook is installed.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Observations a dimension needs before the detector will call
+    /// anything an outlier.
+    ///
+    /// Below this the histogram cannot tell "rare" from "first time
+    /// ever", and a detector that flags every first sighting is a
+    /// detector nobody reads.
+    #[serde(default = "default_anomaly_min_observations")]
+    pub min_observations: u64,
+
+    /// Relative frequency below which an observed value is an outlier.
+    /// Defaults to `0.01`: a fingerprint has to have been under 1% of
+    /// the window's traffic for its class before it is flagged.
+    #[serde(default = "default_anomaly_outlier_frequency")]
+    pub outlier_frequency: f64,
+
+    /// Multiple of the per-IP mean at which today's request count for
+    /// one IP is a rate spike. Defaults to `10.0`.
+    #[serde(default = "default_anomaly_rate_spike_multiplier")]
+    pub rate_spike_multiplier: f64,
+
+    /// Mean per-IP rate below which the rate-spike check does not
+    /// engage, so a single burst against an idle class is not a spike.
+    #[serde(default = "default_anomaly_rate_spike_min_mean")]
+    pub rate_spike_min_mean: f64,
+}
+
+impl Default for AnomalyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_observations: default_anomaly_min_observations(),
+            outlier_frequency: default_anomaly_outlier_frequency(),
+            rate_spike_multiplier: default_anomaly_rate_spike_multiplier(),
+            rate_spike_min_mean: default_anomaly_rate_spike_min_mean(),
+        }
+    }
+}
+
+fn default_anomaly_min_observations() -> u64 {
+    50
+}
+
+fn default_anomaly_outlier_frequency() -> f64 {
+    0.01
+}
+
+fn default_anomaly_rate_spike_multiplier() -> f64 {
+    10.0
+}
+
+fn default_anomaly_rate_spike_min_mean() -> f64 {
+    5.0
 }
 
 // --- Cache Reserve Config ---

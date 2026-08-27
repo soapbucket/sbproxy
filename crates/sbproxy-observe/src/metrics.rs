@@ -606,6 +606,18 @@ pub struct ProxyMetrics {
     /// Counter `sbproxy_cache_reserve_misses_total` of reserve misses
     /// (hot cache and reserve both empty), labelled by origin.
     pub cache_reserve_misses: IntCounterVec,
+    /// WOR-2666: counter `sbproxy_anomaly_detected_total` of behavioral
+    /// anomalies flagged, by kind and severity.
+    ///
+    /// `AnomalyDetectorHook`'s own documentation has promised this
+    /// family since the trait shipped; nothing emitted it until an
+    /// implementation existed to emit it for.
+    pub anomaly_detected: Option<IntCounterVec>,
+    /// WOR-2666: gauge `sbproxy_agent_reputation_score` in `[0.0, 1.0]`
+    /// per agent class, where 1.0 is a class that has produced no
+    /// anomalies inside the rolling window. Read by an operator, not by
+    /// the request path.
+    pub agent_reputation_score: Option<GaugeVec>,
     /// WOR-2673: counter `sbproxy_cache_reserve_errors_total` of reserve
     /// operations the backend refused, by operation.
     ///
@@ -691,6 +703,27 @@ pub struct ProxyMetrics {
 /// is missing. A refusal logs the family name and yields `None`; the
 /// recorders below are no-ops against `None`, so the only consequence is
 /// a series that does not appear.
+/// [`registered_counter_vec`] for a gauge. Same contract, same reason.
+fn registered_gauge_vec(
+    registry: &Registry,
+    name: &'static str,
+    help: &'static str,
+    labels: &[&str],
+) -> Option<GaugeVec> {
+    let gauge = match GaugeVec::new(Opts::new(name, help), labels) {
+        Ok(gauge) => gauge,
+        Err(error) => {
+            tracing::error!(metric = name, %error, "metric family could not be built");
+            return None;
+        }
+    };
+    if let Err(error) = registry.register(Box::new(gauge.clone())) {
+        tracing::error!(metric = name, %error, "metric family could not be registered");
+        return None;
+    }
+    Some(gauge)
+}
+
 fn registered_counter_vec(
     registry: &Registry,
     name: &'static str,
@@ -1094,6 +1127,20 @@ impl ProxyMetrics {
         )
         .unwrap();
 
+        let anomaly_detected = registered_counter_vec(
+            &registry,
+            "sbproxy_anomaly_detected_total",
+            "Behavioral anomalies flagged, by kind and severity",
+            &["kind", "severity"],
+        );
+
+        let agent_reputation_score = registered_gauge_vec(
+            &registry,
+            "sbproxy_agent_reputation_score",
+            "Agent-class reputation in [0.0, 1.0]; 1.0 is a class with no anomalies in the window",
+            &["agent_class"],
+        );
+
         let cache_reserve_errors = registered_counter_vec(
             &registry,
             "sbproxy_cache_reserve_errors_total",
@@ -1328,6 +1375,8 @@ impl ProxyMetrics {
             cache_reserve_misses,
             cache_reserve_writes,
             cache_reserve_errors,
+            anomaly_detected,
+            agent_reputation_score,
             cache_reserve_evictions,
             synthetic_probe_failures,
             mirror_state_drift,
@@ -1654,6 +1703,30 @@ pub fn record_auth(origin: &str, auth_type: &str, allowed: bool) {
         .auth_results
         .with_label_values(&[origin.as_str(), auth_type, result])
         .inc();
+}
+
+/// Record one flagged behavioral anomaly (WOR-2666).
+///
+/// `kind` and `severity` are the closed label sets
+/// [`sbproxy_plugin::AnomalyVerdict`] documents. Both come from the
+/// hook rather than from a request, so neither is attacker-controlled.
+pub fn record_anomaly_detected(kind: &str, severity: &str) {
+    if let Some(counter) = metrics().anomaly_detected.as_ref() {
+        counter.with_label_values(&[kind, severity]).inc();
+    }
+}
+
+/// Publish one agent class's reputation score (WOR-2666).
+///
+/// `agent_class` goes through the cardinality limiter: it is a closed
+/// taxonomy value in every path that reaches this today, and the
+/// limiter is what keeps that from being an invariant held by
+/// convention.
+pub fn set_agent_reputation_score(agent_class: &str, score: f64) {
+    let agent_class = sanitize_label("agent_class", agent_class);
+    if let Some(gauge) = metrics().agent_reputation_score.as_ref() {
+        gauge.with_label_values(&[agent_class.as_str()]).set(score);
+    }
 }
 
 /// Record one cache-reserve operation the backend refused (WOR-2673).

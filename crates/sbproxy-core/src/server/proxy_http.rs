@@ -4803,14 +4803,15 @@ impl ProxyHttp for SbProxy {
                     client_ip: ctx.client_ip,
                 };
                 for hook in hooks.iter() {
-                    let verdicts = hook.analyze(&view).await;
-                    if !verdicts.is_empty() {
-                        debug!(
-                            hostname = %ctx.hostname,
-                            verdict_count = verdicts.len(),
-                            "anomaly detector hook returned {} verdicts",
-                            verdicts.len()
-                        );
+                    // WOR-2666: every verdict is counted on
+                    // `sbproxy_anomaly_detected_total` and logged at a
+                    // level its severity earns. Before this the
+                    // verdicts were summarized in one `debug!` and
+                    // dropped, so a detector could flag a critical
+                    // anomaly on every request and nothing an operator
+                    // watches would move.
+                    for verdict in hook.analyze(&view).await {
+                        crate::anomaly::record_verdict(ctx.hostname.as_str(), &verdict);
                     }
                 }
             }

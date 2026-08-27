@@ -53,6 +53,7 @@
         "secrets": null,
         "key_management": null,
         "l2_cache_settings": null,
+        "anomaly": null,
         "cache_reserve": null,
         "response_cache_store": null,
         "compression_state": null,
@@ -681,6 +682,18 @@
           "anyOf": [
             {
               "$ref": "#/definitions/L2CacheConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "anomaly": {
+          "description": "WOR-2666: optional behavioral anomaly detection.\n\nWhen `enabled`, the proxy keeps a rolling per-agent-class histogram of the categorical signals it already collects (TLS fingerprint, ML classification, headless-library detection) plus a per-IP request rate, and flags observations that sit in the long tail. Absent or disabled, no histogram is built and the detector hook is not installed.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AnomalyConfig"
             },
             {
               "type": "null"
@@ -6304,6 +6317,43 @@
             "string",
             "null"
           ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "AnomalyConfig": {
+      "description": "Behavioral anomaly detection over the signals the proxy already collects.\n\nThe detector is comparative, not a rule set: it learns what a given agent class normally looks like and flags what does not fit. That makes it useful exactly where a signature list is not, and it also means it says nothing at all until it has a baseline, which [`Self::min_observations`] is the floor for.\n\n# What it cannot survive\n\nThe histogram is in memory and has no persistence option. A restart empties the window, and the detector is silent again until it has re-learned a baseline. That is a deliberate consequence of the rule that nothing here may require an external store: the alternative is a database the proxy cannot start without. Operators running short deployments, or restarting often, should expect the detector to spend a meaningful fraction of its life below `min_observations` and read `sbproxy_anomaly_detected_total` accordingly.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Master switch. When `false`, no histogram is built and no detector hook is installed.",
+          "default": false,
+          "type": "boolean"
+        },
+        "min_observations": {
+          "description": "Observations a dimension needs before the detector will call anything an outlier.\n\nBelow this the histogram cannot tell \"rare\" from \"first time ever\", and a detector that flags every first sighting is a detector nobody reads.",
+          "default": 50,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "outlier_frequency": {
+          "description": "Relative frequency below which an observed value is an outlier. Defaults to `0.01`: a fingerprint has to have been under 1% of the window's traffic for its class before it is flagged.",
+          "default": 0.01,
+          "type": "number",
+          "format": "double"
+        },
+        "rate_spike_multiplier": {
+          "description": "Multiple of the per-IP mean at which today's request count for one IP is a rate spike. Defaults to `10.0`.",
+          "default": 10.0,
+          "type": "number",
+          "format": "double"
+        },
+        "rate_spike_min_mean": {
+          "description": "Mean per-IP rate below which the rate-spike check does not engage, so a single burst against an idle class is not a spike.",
+          "default": 5.0,
+          "type": "number",
+          "format": "double"
         }
       },
       "additionalProperties": false
