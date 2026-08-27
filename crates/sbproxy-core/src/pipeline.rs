@@ -5194,7 +5194,7 @@ origins:
         assert_eq!(idem.claim_lease_secs, 300);
         assert_eq!(idem.claim_wait, std::time::Duration::from_millis(500));
 
-        // Zero is refused rather than normalised. A zero lease expires
+        // Zero is refused rather than normalized. A zero lease expires
         // the instant it is taken, which turns single-flight off
         // without saying so.
         let zero = r#"

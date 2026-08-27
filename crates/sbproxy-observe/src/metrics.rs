@@ -4861,9 +4861,18 @@ pub fn record_rate_limit_decision(policy: &str, result: &'static str) {
 ///
 /// `result` is a closed set in two halves. The first half is the
 /// request's outcome, and exactly one of these is recorded per request
-/// through the middleware, so they sum to the request count:
+/// the middleware *resolves*, so they sum to the middleware's own
+/// throughput rather than to the origin's request count. A request the
+/// middleware skips records nothing: an oversize request or response
+/// body, a multipart body, and a full buffering pool each go upstream
+/// uncached and are visible only as an `x-sbproxy-idempotency:
+/// SKIPPED-*` response header. `docs/configuration.md` says the same
+/// thing in the operator's terms.
 ///
-/// * `not_applicable` - no idempotency key on the request.
+/// * `not_applicable` - no idempotency key on the request. Recorded on
+///   the AI proxy path, which has the whole body before it decides;
+///   the streaming proxy path never engages the middleware for a
+///   keyless request and records nothing.
 /// * `miss` - this request took the key and goes upstream.
 /// * `takeover` - the same, on a key whose previous holder never came
 ///   back. A nonzero rate means requests are dying mid-flight.
@@ -4879,9 +4888,12 @@ pub fn record_rate_limit_decision(policy: &str, result: &'static str) {
 /// * `abandoned` - the holder ended without storing a response, so
 ///   there was nothing to wait for. Same 409, opposite thing to look
 ///   at: requests are failing rather than running long.
-/// * `in_flight` - a live claim was found on a path that cannot wait
-///   (the GraphQL late path, which has already committed the body);
-///   answered 409 immediately.
+/// * `in_flight` - a live claim was found by a request that cannot wait
+///   for it, so no wait was attempted; answered 409
+///   `ledger.idempotency_in_flight` immediately. Two populations: the
+///   GraphQL late path, which has already committed the body and has
+///   nowhere to re-send it, and a request that could not take a waiter
+///   slot because the waiter pool was full.
 ///
 /// The second half is diagnostic and additive rather than terminal. A
 /// request can record one of these as well as its outcome:

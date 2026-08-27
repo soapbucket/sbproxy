@@ -5611,8 +5611,14 @@ hashes the request body, and:
 
 The `x-sbproxy-idempotency` response header carries one of `HIT`,
 `CONFLICT`, `IN-FLIGHT`, `SKIPPED-OVERSIZE-REQUEST`,
-`SKIPPED-OVERSIZE-RESPONSE`, or `SKIPPED-POOL-FULL`. A first call that
-goes upstream carries no marker.
+`SKIPPED-OVERSIZE-RESPONSE`, `SKIPPED-POOL-FULL`, or
+`SKIPPED-MULTIPART`. A first call that goes upstream carries no marker.
+
+`SKIPPED-MULTIPART` is the one that surprises people: a multipart
+request bypasses the cache because the v1 cache stores raw bytes, and a
+client retry may regenerate its MIME boundaries, so two byte-identical
+uploads hash differently and would read as a conflict rather than as a
+replay. Nothing is cached and the request goes upstream.
 
 The middleware runs ahead of policy enforcement so a cached replay
 does not consume a rate-limit slot.
@@ -5676,9 +5682,9 @@ every slot the origin had.
 
 ### Reading the metrics
 
-Every request through the middleware lands exactly one *outcome* value
-on `sbproxy_idempotency_cache_results_total{backend,result}`, so those
-values sum to the request count:
+Every request the middleware *resolves* lands exactly one *outcome*
+value on `sbproxy_idempotency_cache_results_total{backend,result}`, so
+those values sum to the number of requests the middleware resolved:
 
 | `result` | What happened |
 |---|---|
@@ -5690,7 +5696,7 @@ values sum to the request count:
 | `conflict` | Same key, different body. Answered 409 `ledger.idempotency_conflict`. |
 | `wait_timeout` | The wait budget ran out while the holder was still working. Answered 409 `ledger.idempotency_in_flight`. |
 | `abandoned` | The holder ended without storing a response. Same 409, and the client's retry is what takes the key over. |
-| `in_flight` | A live claim was found on the GraphQL late path, which cannot wait. Answered 409 immediately. |
+| `in_flight` | A live claim was found by a request that cannot wait for it, so no wait was attempted. Answered 409 `ledger.idempotency_in_flight` immediately. Two populations: the GraphQL late path, which has already committed the body, and a request that could not take a waiter slot because the waiter pool was full. |
 
 Three further values are diagnostic and are counted *in addition* to
 the outcome, so they do not sum with the table above:
@@ -5700,6 +5706,18 @@ the outcome, so they do not sum with the table above:
 | `error` | A store-side read or write failed. The numerator for "the cache is not working". |
 | `fenced` | A publish was refused because another request owns the key or has already answered it. |
 | `single_flight_unsupported` | The configured store has no atomic create, so overlapping first requests are not serialized. |
+
+That denominator is not the origin's request count, and the difference
+matters when you build the dashboard. A request the middleware **skips**
+records nothing at all: an oversize request or response body, a
+multipart body, and a full buffering pool each go upstream uncached and
+appear only as an `x-sbproxy-idempotency: SKIPPED-*` response header.
+A request with **no idempotency key** records `not_applicable` on the AI
+proxy path, which sees the whole body before it decides, and records
+nothing on the streaming proxy path, which never engages the middleware
+for a keyless request. So `sum(rate(...))` is the middleware's own
+throughput, not the origin's, and `not_applicable` counts keyless AI
+requests only.
 
 A nonzero `takeover` or `abandoned` rate means requests are dying
 between claiming a key and answering it. A nonzero `wait_timeout` means
@@ -5729,7 +5747,7 @@ origins:
 | `backend` | enum | `memory` | `memory` (per-origin, per-replica) or `redis` (binds to `proxy.l2_cache_settings`, alias `l2_cache`, for cluster-wide replay). |
 | `max_request_body_bytes` | int | 1048576 (1 MiB) | Per-request cap on buffered body bytes. Bodies larger than this skip the cache; response carries `x-sbproxy-idempotency: SKIPPED-OVERSIZE-REQUEST`. |
 | `max_response_body_bytes` | int | 1048576 (1 MiB) | Per-response cap on cached body bytes. Responses larger than this stream through uncached. |
-| `max_concurrent_buffers` | int | 256 | Per-origin cap on concurrent buffered requests, and separately on requests waiting for another request's claim. When either pool is exhausted, new requests skip the cache; response carries `x-sbproxy-idempotency: SKIPPED-POOL-FULL`. Worst-case memory per origin is roughly `2 * max_concurrent_buffers * max_request_body_bytes`. |
+| `max_concurrent_buffers` | int | 256 | Per-origin cap on concurrent buffered requests, and separately on requests waiting for another request's claim. The two pools answer a full pool differently, deliberately: a full **buffering** pool skips the cache and the request goes upstream uncached, carrying `x-sbproxy-idempotency: SKIPPED-POOL-FULL`; a full **waiter** pool answers 409 `ledger.idempotency_in_flight` with `x-sbproxy-idempotency: IN-FLIGHT` and `Retry-After: 1` immediately, because a request that cannot wait for the holder must not be allowed upstream to duplicate the side effect. Worst-case memory per origin is roughly `2 * max_concurrent_buffers * max_request_body_bytes`. |
 | `claim_lease_secs` | int | 60 | How long the request holding a key keeps it before another may take it over. The bound on how long one crashed request can wedge one key. Raise it above the slowest response this origin produces. `0` is refused at config-load time. |
 | `claim_wait_ms` | int | 3000 | How long an overlapping request waits for the holder's response before answering 409 `ledger.idempotency_in_flight`. `0` answers 409 immediately, which is the floor the draft describes. |
 
