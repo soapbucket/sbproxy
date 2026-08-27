@@ -577,6 +577,46 @@ origins:
             timeout_ms: 5000
             task_timeout_ms: 5000
             model: {MODEL_STANDARD}
+  # The two streaming claims need a strategy that defines a *next*
+  # candidate, and `fallback_chain`'s declared priority order is also
+  # what makes "the first one" deterministic in a test. Measured against
+  # this same binary: with `round_robin` a pre-header elapse refuses the
+  # request with 502 naming the budget rather than handing it on, and
+  # with `fallback_chain` it is handed to the declared successor. Same
+  # `pre_header_timeout_ms`, same stubs, different strategy.
+  "stream.local":
+    tenant_id: acme
+    action:
+      type: ai_proxy
+      routing:
+        strategy: fallback_chain
+      resilience:
+        pre_header_timeout_ms: 400
+      providers:
+        - name: stall-primary
+          provider_type: openai
+          api_key: {TENANT_KEY}
+          base_url: "{flex_url}"
+          allow_private_base_url: true
+          models: [{MODEL_STALL}]
+        - name: stall-backup
+          provider_type: openai
+          api_key: {TENANT_KEY}
+          base_url: "{flex_backup_url}"
+          allow_private_base_url: true
+          models: [{MODEL_STALL}]
+        - name: stream-primary
+          provider_type: openai
+          api_key: {TENANT_KEY}
+          base_url: "{standard_url}"
+          allow_private_base_url: true
+          models: [{MODEL_STREAM}]
+        - name: stream-backup
+          provider_type: openai
+          api_key: {TENANT_KEY}
+          base_url: "{standard_backup_url}"
+          allow_private_base_url: true
+          models: [{MODEL_STREAM}]
 "#
     )
 }
@@ -613,10 +653,11 @@ struct Behavior {
     /// streaming request on the pooled `MODEL_STALL` id has to be moved
     /// to `openai-flex-backup` on the pre-header budget.
     flex_stalls: bool,
-    /// **Both** members of the `MODEL_STREAM` pool answer headers plus
-    /// one frame and then die. Both, so "nothing moved after the commit
-    /// point" is falsifiable from a single dial count rather than
-    /// depending on which member the rotation happened to pick.
+    /// The first member of the `MODEL_STREAM` chain answers headers plus
+    /// one frame and then dies. Only the first: the successor behind it
+    /// stays healthy on purpose, so "nothing moved after the commit
+    /// point" is a claim about a gateway that had a good option and did
+    /// not take it.
     standard_dies_mid_stream: bool,
 }
 
@@ -678,10 +719,7 @@ fn start_gateway(behavior: Behavior) -> Gateway {
             openai_reply(MODEL_STALL, "flex backup"),
         )
     });
-    let standard_backup = ScriptedUpstream::start(move |request, _index| {
-        if behavior.standard_dies_mid_stream {
-            return Reply::DieMidStream(truncated_stream_frame());
-        }
+    let standard_backup = ScriptedUpstream::start(|request, _index| {
         if wants_stream(request) {
             return Reply::Sse(sse_frames("standard backup"));
         }
@@ -1408,17 +1446,14 @@ fn cache_affinity_returns_a_caller_to_the_provider_that_holds_its_warm_prefix() 
 
 /// WOR-2650, the half that has to move: a provider that accepts the
 /// connection and then goes quiet is bounded by the pre-header budget
-/// and the request moves to a sibling. Before that budget existed the
-/// only bound was the attempt's own `timeout_ms`, which has to be long
-/// enough for a real completion, so nothing failed over for as long as
-/// it ran.
+/// and the request is handed to the next candidate. Before that budget
+/// existed the only bound was the attempt's own `timeout_ms`, which has
+/// to be long enough for a real completion, so nothing moved for as
+/// long as it ran.
 ///
-/// Two requests, not one. `MODEL_STALL` is served by a two-member pool
-/// under `round_robin`, so across two requests the stalling member is
-/// picked first at least once whichever end of the rotation the fresh
-/// harness starts at. That makes "the stalled member was dialed and the
-/// caller still got an answer" a claim about this feature rather than
-/// about a coin toss.
+/// Runs against the `stream.local` origin, whose `fallback_chain` order
+/// makes "the next candidate" both defined and deterministic: the first
+/// declared provider stalls, the second answers, on every request.
 #[test]
 fn a_stream_that_never_produces_a_first_byte_fails_over_before_the_commit_point() {
     let gateway = start_gateway(Behavior {
@@ -1426,43 +1461,44 @@ fn a_stream_that_never_produces_a_first_byte_fails_over_before_the_commit_point(
         ..Behavior::default()
     });
 
-    for attempt in 0..2 {
-        let started = std::time::Instant::now();
-        let response = gateway
-            .proxy
-            .post_json(
-                "/v1/chat/completions",
-                "sota.local",
-                &json!({
-                    "model": MODEL_STALL,
-                    "stream": true,
-                    "messages": [{"role": "user", "content": "stream please"}]
-                }),
-                &[],
-            )
-            .expect("streaming request");
-        let elapsed = started.elapsed();
-        assert_eq!(
-            response.status,
-            200,
-            "attempt {attempt}: a stalled candidate should have been replaced, not \
-             relayed: {}",
-            String::from_utf8_lossy(&response.body)
-        );
-        assert!(
-            elapsed < Duration::from_secs(20),
-            "attempt {attempt}: the pre-header budget is 400ms and the failover has to \
-             happen on it, not on the 30s HTTP client default; took {elapsed:?}"
-        );
-    }
+    let started = std::time::Instant::now();
+    let response = gateway
+        .proxy
+        .post_json(
+            "/v1/chat/completions",
+            "stream.local",
+            &json!({
+                "model": MODEL_STALL,
+                "stream": true,
+                "messages": [{"role": "user", "content": "stream please"}]
+            }),
+            &[],
+        )
+        .expect("streaming request");
+    let elapsed = started.elapsed();
 
+    assert_eq!(
+        response.status,
+        200,
+        "a stalled candidate should have been replaced, not relayed: {}",
+        String::from_utf8_lossy(&response.body)
+    );
+    assert!(
+        response.text().unwrap_or_default().contains("flex backup"),
+        "the successor's answer is the one the caller reads"
+    );
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "the pre-header budget is 400ms and the handoff has to happen on it, not on \
+         the 30s HTTP client default; took {elapsed:?}"
+    );
     assert!(
         !gateway.flex.seen().is_empty(),
         "the stalled member was never dialed, so nothing here was a failover"
     );
     assert!(
         !gateway.flex_backup.seen().is_empty(),
-        "the sibling never answered, so the request was not moved"
+        "the successor never answered, so the request was not handed on"
     );
 }
 
@@ -1473,11 +1509,10 @@ fn a_stream_that_never_produces_a_first_byte_fails_over_before_the_commit_point(
 /// truncated, rather than being silently restarted somewhere else with
 /// a second copy of the answer.
 ///
-/// `MODEL_STREAM` is a two-member pool and **both** members die the
-/// same way, so the assertion is a dial count rather than a guess about
-/// which member the rotation picked: exactly one provider was ever
-/// asked. A post-commit failover, or a retry of the same provider,
-/// would make it two.
+/// The chain has a healthy successor sitting right behind the one that
+/// dies, and it is the successor's dial count that carries the claim: a
+/// post-commit failover, or a retry of the same provider, would make it
+/// non-zero.
 #[test]
 fn a_stream_that_dies_after_the_first_byte_is_not_failed_over() {
     let gateway = start_gateway(Behavior {
@@ -1489,7 +1524,7 @@ fn a_stream_that_dies_after_the_first_byte_is_not_failed_over() {
     // second attempt.
     let _ = gateway.proxy.post_json(
         "/v1/chat/completions",
-        "sota.local",
+        "stream.local",
         &json!({
             "model": MODEL_STREAM,
             "stream": true,
@@ -1498,14 +1533,15 @@ fn a_stream_that_dies_after_the_first_byte_is_not_failed_over() {
         &[],
     );
 
-    let dials = gateway.standard.seen().len() + gateway.standard_backup.seen().len();
     assert_eq!(
-        dials,
-        1,
-        "a committed stream was retried or moved: {} dial(s) on openai-standard and {} \
-         on openai-standard-backup",
         gateway.standard.seen().len(),
-        gateway.standard_backup.seen().len()
+        1,
+        "the committed provider was retried"
+    );
+    assert!(
+        gateway.standard_backup.seen().is_empty(),
+        "a committed stream was moved to the chain's next candidate, which would hand \
+         the caller a second copy of an answer it is already reading"
     );
 }
 

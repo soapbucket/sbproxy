@@ -1,6 +1,6 @@
 # LLM-aware resilience
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-27*
 
 Status-code retries treat every `5xx` the same and ignore the LLM-specific
 failure modes a provider signals in the response: a context-window
@@ -164,6 +164,15 @@ action:
       priority: 2
       timeout_ms: 180000
 ```
+
+"The next candidate" is whatever this origin's routing strategy makes
+next, so the budget is only half of the arrangement. `fallback_chain`,
+as above, defines a declared successor and hands the request to it. A
+strategy that spreads requests rather than ordering them, `round_robin`
+among them, has no successor to hand it to: the elapse still bounds the
+attempt, and it is still labeled below, but the caller gets the refusal
+rather than the sibling. Pair the budget with a strategy that names an
+order.
 
 The failover it takes is labeled, so it does not disappear into the
 generic transport bucket:
