@@ -21,7 +21,13 @@ const PROMPT_MARKER: &str = "group-f-wire-private-prompt";
 const ADMIN_AUTH: &str = "Basic YWRtaW46c2VjcmV0";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
-const FIXTURE_IO_TIMEOUT: Duration = Duration::from_millis(500);
+// Read budget for the stub upstream. It bounds a genuinely stalled request
+// and nothing else: a loaded runner delivers a request body in bursts, and a
+// stub that gives up between bursts answers a request it never received,
+// which the proxy reports as a 502 that has nothing to do with the code
+// under test. The budget only holds once the accepted socket is in blocking
+// mode; see `read_complete_request`.
+const FIXTURE_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_FIXTURE_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_HTTP_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_CAPTURED_CHILD_OUTPUT_BYTES: usize = 32 * 1024;
@@ -74,6 +80,25 @@ impl Drop for TestRoot {
 #[derive(Default)]
 struct UpstreamObservation {
     prompt_requests: AtomicUsize,
+    accepted_connections: AtomicUsize,
+    unread_requests: AtomicUsize,
+    response_write_failures: AtomicUsize,
+}
+
+/// Why the fixture stopped reading one request. Only [`Self::Complete`]
+/// may be answered: a stub that writes a 200 over a request it never
+/// finished reading turns a slow delivery into a 502 the test then
+/// reports as a failure of the code under test.
+#[derive(Debug)]
+enum RequestReadOutcome {
+    /// The framing said the request ended here.
+    Complete,
+    /// The peer closed before the framing was satisfied.
+    Eof,
+    /// [`FIXTURE_IO_TIMEOUT`] expired with the request unfinished.
+    Stalled,
+    /// [`MAX_FIXTURE_REQUEST_BYTES`] was reached first.
+    Ceiling,
 }
 
 struct OpenAiFixture {
@@ -96,14 +121,25 @@ impl OpenAiFixture {
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let _ = stream.set_read_timeout(Some(FIXTURE_IO_TIMEOUT));
-                        let request = read_bounded_http_request(&mut stream).unwrap_or_default();
+                        thread_observation
+                            .accepted_connections
+                            .fetch_add(1, Ordering::AcqRel);
+                        let Some(request) = read_complete_request(&mut stream) else {
+                            thread_observation
+                                .unread_requests
+                                .fetch_add(1, Ordering::AcqRel);
+                            continue;
+                        };
                         if contains_bytes(&request, PROMPT_MARKER.as_bytes()) {
                             thread_observation
                                 .prompt_requests
                                 .fetch_add(1, Ordering::AcqRel);
                         }
-                        let _ = write_openai_response(&mut stream);
+                        if write_openai_response(&mut stream).is_err() {
+                            thread_observation
+                                .response_write_failures
+                                .fetch_add(1, Ordering::AcqRel);
+                        }
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(5));
@@ -127,6 +163,24 @@ impl OpenAiFixture {
     fn prompt_requests(&self) -> usize {
         self.observation.prompt_requests.load(Ordering::Acquire)
     }
+
+    /// What the fixture saw, for a failure that would otherwise be a bare
+    /// status code. A gap between accepted connections and answered
+    /// requests says the proxy dialed and the fixture could not read what
+    /// it sent, which is a different bug from the proxy never dialing.
+    fn wire_summary(&self) -> String {
+        format!(
+            "upstream fixture: accepted={} answered={} unread={} write_failures={}",
+            self.observation
+                .accepted_connections
+                .load(Ordering::Acquire),
+            self.observation.prompt_requests.load(Ordering::Acquire),
+            self.observation.unread_requests.load(Ordering::Acquire),
+            self.observation
+                .response_write_failures
+                .load(Ordering::Acquire),
+        )
+    }
 }
 
 impl Drop for OpenAiFixture {
@@ -138,33 +192,66 @@ impl Drop for OpenAiFixture {
     }
 }
 
-fn read_bounded_http_request(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
+/// One whole request off an accepted connection, or `None` when the
+/// fixture could not read one. Answering anything else writes a 200 over
+/// a request the proxy is still sending, which it reports as a 502.
+///
+/// The first two lines are the reason this fixture was flaky under load.
+/// The listener is non-blocking so the accept loop can poll the stop
+/// flag, Darwin hands back an accepted socket that inherited that
+/// `O_NONBLOCK`, and `set_read_timeout` does not apply to a non-blocking
+/// socket. Left that way the first read returns `WouldBlock` microseconds
+/// after the accept, before the proxy's request has landed, and the read
+/// budget is never the thing that bounds the read.
+fn read_complete_request(stream: &mut TcpStream) -> Option<Vec<u8>> {
+    stream.set_nonblocking(false).ok()?;
+    stream.set_read_timeout(Some(FIXTURE_IO_TIMEOUT)).ok()?;
+    match read_bounded_http_request(stream) {
+        Ok((request, RequestReadOutcome::Complete)) => Some(request),
+        Ok((request, outcome)) => {
+            eprintln!(
+                "upstream fixture read no complete request: {outcome:?} after {} bytes",
+                request.len()
+            );
+            None
+        }
+        Err(error) => {
+            eprintln!("upstream fixture could not read a request: {error}");
+            None
+        }
+    }
+}
+
+fn read_bounded_http_request(stream: &mut TcpStream) -> io::Result<(Vec<u8>, RequestReadOutcome)> {
     let mut request = Vec::new();
     let mut chunk = [0_u8; 4096];
     while request.len() < MAX_FIXTURE_REQUEST_BYTES {
         let remaining = MAX_FIXTURE_REQUEST_BYTES - request.len();
         let read_limit = remaining.min(chunk.len());
         match stream.read(&mut chunk[..read_limit]) {
-            Ok(0) => break,
+            Ok(0) => return Ok((request, RequestReadOutcome::Eof)),
             Ok(read) => {
                 request.extend_from_slice(&chunk[..read]);
                 if http_request_is_complete(&request) {
-                    break;
+                    return Ok((request, RequestReadOutcome::Complete));
                 }
             }
+            // On a blocking socket both kinds mean the same thing: the
+            // `SO_RCVTIMEO` budget expired. macOS reports the expiry as
+            // `WouldBlock` and other platforms as `TimedOut`.
             Err(error)
                 if matches!(
                     error.kind(),
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) =>
             {
-                break;
+                return Ok((request, RequestReadOutcome::Stalled));
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error),
         }
     }
-    Ok(request)
+    Ok((request, RequestReadOutcome::Ceiling))
 }
 
 fn http_request_is_complete(request: &[u8]) -> bool {
@@ -172,6 +259,20 @@ fn http_request_is_complete(request: &[u8]) -> bool {
         return false;
     };
     let headers = String::from_utf8_lossy(&request[..header_end]);
+    // The proxy forwards a rewritten AI body chunked, with no
+    // Content-Length, so the terminating zero-length chunk is the only
+    // end marker there is. Without this arm the reader waits out the whole
+    // read budget on every request that arrives.
+    let chunked = headers.lines().any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.trim().eq_ignore_ascii_case("transfer-encoding")
+                && value.to_ascii_lowercase().contains("chunked")
+        })
+    });
+    if chunked {
+        let body = &request[header_end + 4..];
+        return body.ends_with(b"0\r\n\r\n") || find_bytes(body, b"\r\n0\r\n\r\n").is_some();
+    }
     let content_length = headers.lines().find_map(|line| {
         let (name, value) = line.split_once(':')?;
         name.trim()
@@ -179,12 +280,18 @@ fn http_request_is_complete(request: &[u8]) -> bool {
             .then(|| value.trim().parse::<usize>().ok())
             .flatten()
     });
-    content_length.is_some_and(|length| {
-        header_end
-            .checked_add(4)
-            .and_then(|body_start| body_start.checked_add(length))
-            .is_some_and(|expected| request.len() >= expected)
-    })
+    let Some(length) = content_length else {
+        // No Transfer-Encoding and no Content-Length is a request with no
+        // body (RFC 9112 section 6), and the header terminator is the end
+        // of it. Reading on would spend the whole budget waiting for bytes
+        // the peer is never going to send, and the fixture serves one
+        // connection at a time.
+        return true;
+    };
+    header_end
+        .checked_add(4)
+        .and_then(|body_start| body_start.checked_add(length))
+        .is_some_and(|expected| request.len() >= expected)
 }
 
 fn write_openai_response(stream: &mut TcpStream) -> io::Result<()> {
@@ -433,6 +540,14 @@ impl BoundedChildOutput {
             std::thread::spawn(move || drain_child_output(stderr, stderr_state)),
         ];
         Self { state, drains }
+    }
+
+    fn retained_snapshot(&self) -> Vec<u8> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.retained.clone()
     }
 
     fn finish(self) -> BoundedOutputSummary {
@@ -705,6 +820,26 @@ impl ProxyChild {
         )
     }
 
+    /// Print what the child has logged so far. A panicking test never
+    /// reaches the shutdown scan, so this scans the buffer itself rather
+    /// than reprinting a private marker on the way out.
+    fn print_retained_output(&self, context: &str) {
+        let Some(output) = self.output.as_ref() else {
+            eprintln!("{context}: the child output scanner was already finished");
+            return;
+        };
+        let retained = output.retained_snapshot();
+        if let Err(error) = assert_private_markers_absent(&retained, "child output") {
+            eprintln!("{context}: {error}, so it is withheld here");
+            return;
+        }
+        eprintln!(
+            "{context}: shipped child logged {} retained bytes\n{}",
+            retained.len(),
+            String::from_utf8_lossy(&retained)
+        );
+    }
+
     fn shutdown(mut self) -> Result<BoundedOutputSummary, String> {
         let stop_result = self.stop_child();
         let Some(output) = self.output.take() else {
@@ -753,6 +888,28 @@ impl Drop for ProxyChild {
     }
 }
 
+/// Say what a wire failure was before the assertion reports it as a bare
+/// status code. The child's own log line names the reason the AI request
+/// did not reach the provider, and the fixture counters separate "the
+/// proxy never dialed" from "the fixture could not read what it sent".
+fn explain_unexpected_ai_status(
+    response: &HttpResponse,
+    proxy: &ProxyChild,
+    upstream: &OpenAiFixture,
+    context: &str,
+) {
+    if response.status == 200 {
+        return;
+    }
+    eprintln!(
+        "{context}: the shipped child answered {} with {}",
+        response.status,
+        String::from_utf8_lossy(&response.body)
+    );
+    eprintln!("{context}: {}", upstream.wire_summary());
+    proxy.print_retained_output(context);
+}
+
 enum StartFailure {
     EarlyExit(std::process::ExitStatus),
     Timeout,
@@ -782,7 +939,7 @@ fn wait_for_ready(
 
 fn proxy_readiness_probe(port: u16, token: &str) -> bool {
     let address = SocketAddr::from(([127, 0, 0, 1], port));
-    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(250)) else {
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_secs(2)) else {
         return false;
     };
     let _ = stream.set_read_timeout(Some(FIXTURE_IO_TIMEOUT));
@@ -1153,6 +1310,12 @@ fn group_f_admin_chargeback_wire_preserves_v1_and_negotiates_typed_v2() {
         let response = proxy
             .post_ai(key)
             .expect("drive one real AI completion through the configured sink");
+        explain_unexpected_ai_status(
+            &response,
+            &proxy,
+            &upstream,
+            &format!("sequential AI request {index}"),
+        );
         assert_eq!(response.status, 200);
         let _ = wait_for_record_count(&proxy, (index + 1) as u64)
             .expect("observe the sequential live sink commit");
@@ -1241,10 +1404,16 @@ fn group_f_admin_chargeback_wire_paginates_and_refuses_oversized_pages() {
     let proxy = ProxyChild::start_with_config(&root, &upstream, &oversized)
         .expect("start shipped child with oversized live chargeback fixture");
 
-    for _ in 0..3 {
+    for index in 0..3 {
         let response = proxy
             .post_ai("wire-key-a")
             .expect("drive paged AI completion through the configured sink");
+        explain_unexpected_ai_status(
+            &response,
+            &proxy,
+            &upstream,
+            &format!("paged AI request {index}"),
+        );
         assert_eq!(response.status, 200);
     }
     let first_page = proxy
@@ -1294,10 +1463,16 @@ fn group_f_admin_chargeback_wire_paginates_and_refuses_oversized_pages() {
     );
 
     const OVERSIZED_RECORD_COUNT: u64 = 800;
-    for _ in 3..OVERSIZED_RECORD_COUNT {
+    for index in 3..OVERSIZED_RECORD_COUNT {
         let response = proxy
             .post_ai("wire-key-a")
             .expect("drive oversized AI completion through the configured sink");
+        explain_unexpected_ai_status(
+            &response,
+            &proxy,
+            &upstream,
+            &format!("oversized AI request {index}"),
+        );
         assert_eq!(response.status, 200);
     }
     let ready_path = "/admin/ai-chargeback?schema_version=2&limit=1";
