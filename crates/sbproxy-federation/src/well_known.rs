@@ -198,13 +198,25 @@ impl WellKnownIssuer {
     /// Build the issuer from operator config. Returns a typed error
     /// when the supplied PEM does not parse as the requested
     /// algorithm's key shape.
+    /// Also verifies, once, that the key this issuer signs with is a
+    /// key `published_jwks` actually publishes. The invariant was
+    /// stated on [`SigningKeyConfig`] and enforced by nothing: an
+    /// operator who rotated `kid` and forgot the JWKS served HTTP 200
+    /// with a well-formed JWS that every peer rejected with
+    /// `UnknownKid`, for the whole document lifetime, with nothing on
+    /// this side going red. Signing a throwaway statement and running
+    /// the crate's own verifier over it is the cheapest way to be sure,
+    /// and it costs one signature at startup.
     pub fn new(config: FederationServerConfig) -> FederationResult<Self> {
         let encoding_key = load_encoding_key(&config.signing_key)?;
-        Ok(Self {
+        let issuer = Self {
             config,
             cached: RwLock::new(None),
             encoding_key,
-        })
+        };
+        let document = issuer.current()?;
+        crate::verify_entity_statement(&document.compact_jws, &issuer.config.published_jwks)?;
+        Ok(issuer)
     }
 
     /// Borrow the operator-supplied config, mainly for tests that
@@ -532,6 +544,26 @@ mod tests {
     /// A bogus PEM surfaces as a typed `InvalidSigningKey` rather
     /// than a panic. The operator gets a useful error message
     /// instead of a backtrace when they paste in the wrong key.
+    #[test]
+    fn a_signing_kid_absent_from_published_jwks_is_refused_at_construction() {
+        // The rotation mistake: `kid` moved, the JWKS did not. Nothing
+        // on this side went red, the endpoint served HTTP 200, and
+        // every peer got UnknownKid for a full document lifetime.
+        let mut config = sample_config(
+            "fed-2026q2",
+            Duration::from_secs(3600),
+            Duration::from_secs(360),
+        );
+        config.signing_key.kid = "fed-2026q3".to_string();
+        let Err(error) = WellKnownIssuer::new(config) else {
+            panic!("a key the JWKS does not publish must be refused");
+        };
+        assert!(
+            matches!(error, FederationError::UnknownKid { .. }),
+            "got {error:?}"
+        );
+    }
+
     #[test]
     fn invalid_pem_returns_typed_error() {
         let mut cfg = sample_config(

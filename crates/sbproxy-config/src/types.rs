@@ -2028,6 +2028,89 @@ pub struct FederationConfig {
     /// Time before expiry at which the cached statement is regenerated.
     #[serde(default = "default_federation_refresh_margin_secs")]
     pub refresh_margin_secs: u64,
+    /// Entity URLs of this entity's superiors, published in the entity
+    /// statement as `authority_hints`.
+    ///
+    /// OpenID Federation 1.0 s3 makes this required for every entity
+    /// that is not itself a Trust Anchor, and a peer's resolver walks
+    /// it: `compose_trust_chain` reads `authority_hints` from the leaf
+    /// it fetched and returns no chain when the array is empty. A
+    /// statement published without it is anchor-shaped, so no peer can
+    /// chain this proxy to anything.
+    #[serde(default)]
+    pub authority_hints: Vec<String>,
+    /// Inbound peer verification. Absent leaves the proxy publishing
+    /// its own identity and verifying nobody.
+    #[serde(default)]
+    pub peer_trust: Option<FederationPeerTrustConfig>,
+}
+
+const fn default_federation_peer_cache_ttl_secs() -> u64 {
+    600
+}
+
+const fn default_federation_max_chain_depth() -> usize {
+    5
+}
+
+fn default_federation_peer_header() -> String {
+    "x-federation-entity-id".to_string()
+}
+
+/// `proxy.federation.peer_trust`: verify the entity a request claims to
+/// come from against pinned trust anchors, on the request path.
+///
+/// A peer names itself in a header. The proxy fetches that entity's
+/// self-signed configuration, walks its `authority_hints` up to one of
+/// the anchors below through the governed `egress.federation` client,
+/// validates every signature and linkage in the chain, checks any
+/// required trust marks, and either stamps the verified entity id onto
+/// the request or refuses it. Every step publishes the decision events
+/// and metrics `docs/federation.md` documents.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FederationPeerTrustConfig {
+    /// Refuse a request that names no peer, or whose peer does not
+    /// resolve to an anchor.
+    ///
+    /// `false` still refuses a request whose named peer fails to
+    /// resolve: an unverifiable claim is worse than no claim. What it
+    /// permits is a request that makes no claim at all, which is the
+    /// shape for a proxy that federates with some callers and serves
+    /// ordinary traffic from the rest.
+    #[serde(default)]
+    pub required: bool,
+    /// Request header the peer names itself in.
+    #[serde(default = "default_federation_peer_header")]
+    pub header: String,
+    /// Pinned trust anchors. At least one is required.
+    pub trust_anchors: Vec<FederationTrustAnchorConfig>,
+    /// Trust-mark identifiers a verified peer must additionally carry,
+    /// each signed by an anchor above and published in the peer's own
+    /// entity configuration.
+    #[serde(default)]
+    pub required_trust_marks: Vec<String>,
+    /// Maximum statements in an accepted chain.
+    #[serde(default = "default_federation_max_chain_depth")]
+    pub max_chain_depth: usize,
+    /// How long a resolved peer decision is reused before the chain is
+    /// walked again. A chain walk is several outbound HTTPS fetches, so
+    /// re-running it per request would put a peer's availability on
+    /// this proxy's request path.
+    #[serde(default = "default_federation_peer_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
+}
+
+/// One pinned OpenID Federation trust anchor.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FederationTrustAnchorConfig {
+    /// The anchor's entity URL.
+    pub entity_id: String,
+    /// The anchor's published JWKS, as the `{"keys": [...]}` object.
+    /// This is the pin: every chain is verified against these keys, so
+    /// they come from the operator rather than from the network.
+    pub jwks: serde_json::Value,
 }
 
 /// Private-key reference and protected JWS header fields for federation

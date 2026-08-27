@@ -14,6 +14,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// Decode one base64url segment of a compact JWS.
+fn base64_url_decode(segment: &str) -> Vec<u8> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(segment)
+        .expect("compact JWS segment is base64url")
+}
+
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_sbproxy")
 }
@@ -117,6 +125,8 @@ fn security_boundary_single_process_serves_its_configured_entity_statement() {
           use: sig
     lifetime_secs: 3600
     refresh_margin_secs: 300
+    authority_hints:
+      - https://anchor.test
 origins:
   "federation.test":
     action:
@@ -140,8 +150,29 @@ origins:
             .contains("content-type: application/entity-statement+jwt"),
         "{response}"
     );
+    let lowered = response.to_ascii_lowercase();
+    // The proxy serves this through the crate's own handler body, so
+    // the cache directive and the two well-known metric writers come
+    // from one place. A hand-rolled response left peers and CDNs with
+    // no directive at all and every `sbproxy_federation_*` family flat.
+    assert!(
+        lowered.contains("cache-control: public, max-age="),
+        "the served configuration must carry its remaining lifetime: {response}"
+    );
+    assert!(lowered.contains("vary: accept"), "{response}");
     let body = response.split("\r\n\r\n").nth(1).unwrap_or_default();
     assert_eq!(body.split('.').count(), 3, "body must be a compact JWS");
+
+    // `authority_hints` is what a peer's resolver walks. Without it the
+    // statement is anchor-shaped and no peer can chain this entity.
+    let claims = body.split('.').nth(1).expect("compact JWS has a payload");
+    let claims = base64_url_decode(claims);
+    let claims: serde_json::Value = serde_json::from_slice(&claims).expect("payload is JSON");
+    assert_eq!(
+        claims["authority_hints"],
+        serde_json::json!(["https://anchor.test"]),
+        "{claims}"
+    );
 
     let _ = child.kill();
     let _ = child.wait();

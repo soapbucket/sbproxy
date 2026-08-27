@@ -2261,6 +2261,68 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
                 "config compile: proxy.federation.refresh_margin_secs must be less than lifetime_secs"
             );
         }
+        for hint in &federation.authority_hints {
+            if !hint.starts_with("https://") {
+                anyhow::bail!(
+                    "config compile: proxy.federation.authority_hints entries must use https"
+                );
+            }
+        }
+        if let Some(peer_trust) = federation.peer_trust.as_ref() {
+            if peer_trust.trust_anchors.is_empty() {
+                anyhow::bail!(
+                    "config compile: proxy.federation.peer_trust.trust_anchors must not be empty; \
+                     a peer chain verified against no pinned anchor verifies nothing"
+                );
+            }
+            for anchor in &peer_trust.trust_anchors {
+                if !anchor.entity_id.starts_with("https://") {
+                    anyhow::bail!(
+                        "config compile: proxy.federation.peer_trust.trust_anchors[].entity_id must use https"
+                    );
+                }
+                if anchor
+                    .jwks
+                    .get("keys")
+                    .and_then(serde_json::Value::as_array)
+                    .is_none_or(Vec::is_empty)
+                {
+                    anyhow::bail!(
+                        "config compile: proxy.federation.peer_trust.trust_anchors[].jwks.keys must not be empty"
+                    );
+                }
+            }
+            if peer_trust.header.trim().is_empty()
+                || peer_trust
+                    .header
+                    .bytes()
+                    .any(|byte| !byte.is_ascii_graphic() || byte == b':')
+            {
+                anyhow::bail!(
+                    "config compile: proxy.federation.peer_trust.header must be a header name"
+                );
+            }
+            if peer_trust.max_chain_depth == 0 {
+                anyhow::bail!(
+                    "config compile: proxy.federation.peer_trust.max_chain_depth must be greater than zero"
+                );
+            }
+            if peer_trust.cache_ttl_secs == 0 {
+                anyhow::bail!(
+                    "config compile: proxy.federation.peer_trust.cache_ttl_secs must be greater than zero"
+                );
+            }
+            if peer_trust.required && federation.authority_hints.is_empty() {
+                // Not fatal to the peer check itself, but it means this
+                // proxy demands a chain from every caller while
+                // publishing a statement no caller can chain. Refusing
+                // is cheaper than the asymmetry.
+                anyhow::bail!(
+                    "config compile: proxy.federation.peer_trust.required needs \
+                     proxy.federation.authority_hints, or peers cannot chain this entity back"
+                );
+            }
+        }
     }
 
     config_file.proxy.validate_bind_address()?;

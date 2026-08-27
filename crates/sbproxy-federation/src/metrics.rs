@@ -138,6 +138,33 @@ pub static WELL_KNOWN_CACHE_REMAINING_SECONDS: LazyLock<Option<IntGauge>> = Lazy
     )
 });
 
+/// Request-path peer decisions, labeled by `outcome`.
+///
+/// `trusted` is a caller whose named entity chained to a pinned anchor
+/// and satisfied every required trust mark. `refused` is one that named
+/// an entity and did not, or named none while
+/// `proxy.federation.peer_trust.required` is on. The two chain-walk
+/// families above count the fetch-and-verify work; this one counts the
+/// admission decision the proxy actually made, which is the number an
+/// operator alerts on.
+pub static PEER_DECISIONS_TOTAL: LazyLock<Option<IntCounterVec>> = LazyLock::new(|| {
+    registered(
+        register_int_counter_vec!(
+            "sbproxy_federation_peer_decisions_total",
+            "OpenID Federation peer-trust admission decisions on the proxy request path.",
+            &["outcome"]
+        ),
+        "sbproxy_federation_peer_decisions_total",
+    )
+});
+
+/// Record a request-path peer-trust decision.
+pub fn record_peer_decision(outcome: &str) {
+    if let Some(family) = PEER_DECISIONS_TOTAL.as_ref() {
+        family.with_label_values(&[outcome]).inc();
+    }
+}
+
 /// Record an entity-statement verification outcome. A no-op when the
 /// family did not register; see `registered`.
 pub fn record_entity_statement_verification(outcome: &str) {
@@ -190,6 +217,8 @@ mod tests {
         record_trust_chain_resolution("resolved");
         record_well_known_serve("served");
         record_well_known_cache_remaining(3300);
+        record_peer_decision("trusted");
+        record_peer_decision("refused");
         assert_eq!(
             WELL_KNOWN_CACHE_REMAINING_SECONDS
                 .as_ref()

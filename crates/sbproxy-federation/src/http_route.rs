@@ -56,28 +56,55 @@ use crate::ENTITY_STATEMENT_CONTENT_TYPE;
 /// the `sbproxy_federation_well_known_serves_total{outcome="unavailable"}`
 /// counter; see `docs/federation.md`.
 pub async fn entity_configuration_handler(State(issuer): State<Arc<WellKnownIssuer>>) -> Response {
+    let served = serve_entity_configuration(&issuer);
+    let Some(body) = served.body else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let mut response = (
+        StatusCode::OK,
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static(ENTITY_STATEMENT_CONTENT_TYPE),
+            ),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_str(&served.cache_control)
+                    .unwrap_or_else(|_| HeaderValue::from_static("public, max-age=0")),
+            ),
+        ],
+        body,
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .entry(header::VARY)
+        .or_insert(HeaderValue::from_static("Accept"));
+    response
+}
+
+/// The well-known handler's whole body, minus the axum plumbing.
+///
+/// This is where the two metric writers, the `Cache-Control` value, and
+/// the decision log lines live, so a host that does not speak axum
+/// serves the same document with the same instrumentation. sbproxy's
+/// own request path is one of those hosts: it is Pingora, and while it
+/// hand-rolled this response the five `sbproxy_federation_*` families
+/// read flat zero on the only binary that ships the crate, and peers
+/// got no cache directive at all.
+///
+/// `body` is `None` when the issuer could not produce a configuration,
+/// which is the caller's cue to answer 503 with no body: a peer probing
+/// the well-known endpoint must not learn the error category.
+pub fn serve_entity_configuration(issuer: &WellKnownIssuer) -> ServedEntityConfiguration {
     let now = chrono::Utc::now();
     match issuer.current_at(now) {
         Ok(doc) => {
             let max_age = doc.cache_max_age_secs(now);
             crate::metrics::record_well_known_serve("served");
-            crate::metrics::record_well_known_cache_remaining(max_age as i64);
-            let mut response = (
-                StatusCode::OK,
-                [
-                    (
-                        header::CONTENT_TYPE,
-                        HeaderValue::from_static(ENTITY_STATEMENT_CONTENT_TYPE),
-                    ),
-                    (
-                        header::CACHE_CONTROL,
-                        HeaderValue::from_str(&format!("public, max-age={max_age}"))
-                            .unwrap_or_else(|_| HeaderValue::from_static("public, max-age=0")),
-                    ),
-                ],
-                doc.compact_jws.clone(),
-            )
-                .into_response();
+            crate::metrics::record_well_known_cache_remaining(
+                i64::try_from(max_age).unwrap_or(i64::MAX),
+            );
             // Stamp a structured tracing field so operators can
             // grep for federation-config serves alongside the
             // other gateway access logs.
@@ -87,11 +114,11 @@ pub async fn entity_configuration_handler(State(issuer): State<Arc<WellKnownIssu
                 cache_max_age_secs = max_age,
                 "served well-known entity configuration"
             );
-            response
-                .headers_mut()
-                .entry(header::VARY)
-                .or_insert(HeaderValue::from_static("Accept"));
-            response
+            ServedEntityConfiguration {
+                status: 200,
+                cache_control: format!("public, max-age={max_age}"),
+                body: Some(doc.compact_jws.clone()),
+            }
         }
         Err(err) => {
             crate::metrics::record_well_known_serve("unavailable");
@@ -100,9 +127,28 @@ pub async fn entity_configuration_handler(State(issuer): State<Arc<WellKnownIssu
                 error = %err,
                 "failed to produce entity configuration; returning 503"
             );
-            StatusCode::SERVICE_UNAVAILABLE.into_response()
+            ServedEntityConfiguration {
+                status: 503,
+                cache_control: "no-store".to_string(),
+                body: None,
+            }
         }
     }
+}
+
+/// What [`serve_entity_configuration`] decided, in transport-neutral
+/// form.
+#[derive(Debug, Clone)]
+pub struct ServedEntityConfiguration {
+    /// HTTP status to answer with.
+    pub status: u16,
+    /// `Cache-Control` value. Peers and CDNs refetch on every use
+    /// without one, and the remaining lifetime is the only honest
+    /// number to give them.
+    pub cache_control: String,
+    /// The compact JWS, or `None` when the issuer could not produce
+    /// one.
+    pub body: Option<String>,
 }
 
 #[cfg(test)]

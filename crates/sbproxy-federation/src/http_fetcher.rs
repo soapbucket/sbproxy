@@ -52,7 +52,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use reqwest::Client;
+
 use sbproxy_security::egress::{CachedSystemResolver, EgressPurpose};
 use sbproxy_security::governed_egress::GovernedEgress;
 use url::Url;
@@ -113,39 +113,21 @@ pub trait FederationFetcher: Send + Sync {
 ///
 /// See the module docs for the two layers and for what the unconfigured
 /// case does and does not cover.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ReqwestFederationFetcher {
-    /// Client used for a hop that carries no pin set, which happens only
-    /// when a caller supplied its own through [`Self::with_client`].
-    /// `None` is the production shape: every dial is made on a client
-    /// this fetcher built from the addresses the SSRF check resolved.
-    client: Option<Client>,
+    /// No state. Every dial is made on a client this fetcher builds
+    /// per hop from the addresses the SSRF check resolved, because a
+    /// shared client cannot be pinned to one hostname and a pin is the
+    /// whole point.
+    _private: (),
 }
 
 impl ReqwestFederationFetcher {
     /// Build a fetcher that dials only what the SSRF check resolved and
     /// never follows a redirect it has not re-authorized.
+    #[must_use]
     pub fn new() -> Self {
-        Self { client: None }
-    }
-
-    /// Build a fetcher around a caller-supplied `reqwest::Client`.
-    ///
-    /// Use this only when a test or operator deliberately needs a
-    /// different transport policy (a stub in tests, a custom DNS
-    /// resolver in an air-gapped deployment). The supplied client is
-    /// used for a hop that carries no pin set, which is what happens
-    /// when no `egress.federation:` allowlist is armed; the
-    /// private-address refusal described in this module's docs runs
-    /// either way and is not something this constructor can opt out of.
-    /// Build
-    /// it with `redirect(Policy::none())`: a client with a redirect
-    /// policy of its own follows the hop before the governed loop can
-    /// refuse it.
-    pub fn with_client(client: Client) -> Self {
-        Self {
-            client: Some(client),
-        }
+        Self { _private: () }
     }
 
     /// Compose the well-known URL for an entity. Errors when
@@ -208,7 +190,7 @@ impl ReqwestFederationFetcher {
             .resolve_to_addrs(host, &resolved.addrs)
             .build()
             .map_err(|_| FederationError::FetchFailed(format!("{what} client build failed")))?;
-        let dial = self.client.as_ref().unwrap_or(&pinned);
+        let dial = &pinned;
         let request = dial
             .get(url.clone())
             .header(http::header::ACCEPT, "application/entity-statement+jwt")
@@ -244,12 +226,6 @@ impl ReqwestFederationFetcher {
         }
         String::from_utf8(response.body)
             .map_err(|_| FederationError::FetchFailed(format!("{what} response is not UTF-8")))
-    }
-}
-
-impl Default for ReqwestFederationFetcher {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

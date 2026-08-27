@@ -20,6 +20,10 @@ pub mod admin_cluster;
 /// Administrative metadata, inspection, and lifecycle controls for external
 /// AI compression session state.
 pub mod admin_compression;
+/// OpenID Federation operator surface (`GET /admin/federation`): what
+/// this proxy publishes as its entity configuration and what it
+/// requires of a peer.
+pub mod admin_federation;
 /// WOR-1553/1554: key + credential lifecycle REST API mounted on the
 /// admin server (`/admin/keys`, `/admin/credentials`).
 pub mod admin_keys;
@@ -65,6 +69,9 @@ pub mod alerting;
 /// queue and ledger locations, and the operator's complete position on
 /// what they charge for.
 pub mod attestation;
+/// OpenID Federation peer trust on the request path: the compiled
+/// `proxy.federation.peer_trust` decision.
+pub(crate) mod federation_peer;
 
 /// WOR-2100: runtime assembly for authoritative payment settlement.
 ///

@@ -84,7 +84,9 @@ pub use entity_statement::{
 };
 pub use errors::{FederationError, FederationResult};
 pub use http_fetcher::{FederationFetcher, ReqwestFederationFetcher, DEFAULT_FETCH_TIMEOUT};
-pub use http_route::entity_configuration_handler;
+pub use http_route::{
+    entity_configuration_handler, serve_entity_configuration, ServedEntityConfiguration,
+};
 pub use jwk::{jwk_thumbprint_sha256, FederationKeySet};
 pub use metadata_policy::{apply_block_policy, apply_field_policy, compose_policies};
 pub use trust_chain::{ResolvedTrustChain, TrustAnchor, TrustAnchorStore, TrustChainResolver};

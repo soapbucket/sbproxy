@@ -5089,6 +5089,13 @@ pub fn handle_admin_request(
     if let Some(response) = crate::admin_cache::dispatch(method, path, body) {
         return response;
     }
+    // OpenID Federation identity and peer trust. Behind the
+    // operator-auth gate: which anchors are pinned and how many peer
+    // decisions are cached is operational state, not something the
+    // published entity configuration already says.
+    if let Some(response) = crate::admin_federation::dispatch(method, path) {
+        return response;
+    }
 
     // Classifier cache and bounded unavailable-stage health. This is kept
     // behind the operator-auth gate because configured origin identifiers and

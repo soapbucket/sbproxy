@@ -1998,6 +1998,10 @@ pub struct CompiledPipeline {
     pub config: CompiledConfig,
     /// Signed OpenID Federation issuer mounted by this pipeline generation.
     pub(crate) federation_issuer: Option<Arc<sbproxy_federation::WellKnownIssuer>>,
+    /// Compiled `proxy.federation.peer_trust`: the request-path peer
+    /// decision. `None` when the operator configured no anchors.
+    pub(crate) federation_peer_verifier:
+        Option<Arc<crate::federation_peer::FederationPeerVerifier>>,
     /// Dynamic hooks loaded and compiled with this pipeline generation.
     #[allow(dead_code)]
     pub(crate) extension_registry: Arc<DynamicBundleRegistry>,
@@ -2326,6 +2330,7 @@ impl Default for CompiledPipeline {
         Self {
             config,
             federation_issuer: None,
+            federation_peer_verifier: None,
             extension_registry,
             ai_extension_chain,
             ai_toolkit: sbproxy_ai::toolkit::AiToolkitRuntime::disabled(),
@@ -2427,13 +2432,37 @@ fn build_federation_issuer(
             },
             published_jwks,
             metadata: sbproxy_federation::EntityMetadata::default(),
-            authority_hints: Vec::new(),
+            // OpenID Federation 1.0 s3 makes this required for an
+            // entity that is not a Trust Anchor, and a peer's
+            // `compose_trust_chain` walks it: an empty array is a
+            // statement nobody can chain.
+            authority_hints: config.authority_hints.clone(),
             trust_marks: Vec::new(),
             metadata_policy: None,
             lifetime: std::time::Duration::from_secs(config.lifetime_secs),
             refresh_margin: std::time::Duration::from_secs(config.refresh_margin_secs),
         })?;
     Ok(Some(Arc::new(issuer)))
+}
+
+/// Compile `proxy.federation.peer_trust` into the request-path
+/// verifier. `None` in validation mode, which never dials anything.
+fn build_federation_peer_verifier(
+    config: Option<&sbproxy_config::FederationConfig>,
+    mode: PipelineConstructionMode,
+) -> anyhow::Result<Option<Arc<crate::federation_peer::FederationPeerVerifier>>> {
+    let Some(config) = config.filter(|config| config.enabled) else {
+        return Ok(None);
+    };
+    if matches!(mode, PipelineConstructionMode::Validation) {
+        return Ok(None);
+    }
+    let Some(peer_trust) = config.peer_trust.as_ref() else {
+        return Ok(None);
+    };
+    Ok(Some(Arc::new(
+        crate::federation_peer::FederationPeerVerifier::new(peer_trust)?,
+    )))
 }
 
 /// Process-lifetime runtime for tasks owned by published pipeline generations.
@@ -3178,6 +3207,8 @@ impl CompiledPipeline {
 
         let router = HostRouter::new(&config);
         let federation_issuer = build_federation_issuer(config.server.federation.as_ref(), mode)?;
+        let federation_peer_verifier =
+            build_federation_peer_verifier(config.server.federation.as_ref(), mode)?;
 
         // --- Shared response cache backend ---
         //
@@ -3482,6 +3513,7 @@ impl CompiledPipeline {
         let pipeline = Self {
             config,
             federation_issuer,
+            federation_peer_verifier,
             extension_registry,
             ai_extension_chain,
             ai_toolkit,
