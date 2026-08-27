@@ -841,3 +841,9 @@ three ported crates or in the two seams they reach:
 `OlpLicenseClaims`, `OLP_JWS_TYP`, `InMemorySessionStore`, and
 `ConfigBundle::is_expired_at` left the wider bucket, the first two because
 the CoMP bridge now names the OSS OLP wire format from outside `olp.rs`.
+
+2026-08-27 (WOR-2661 infra cluster merged with main at 970e6655): unreferenced
+1508 -> 1507, recomputed against the merged tree. The move is main's, not this
+branch's: #1214 lowered its own baseline 1462 -> 1461 in the same commit, and
+this merge carries that one item through. tests-only holds at 322. The unwrap
+ratchet moves separately in this merge and is described in its own commit.

@@ -1,6 +1,6 @@
 # Access log
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-27*
 
 ![a GET and a POST proxied through an origin that emits a structured JSON access-log line for each](assets/access-log.gif)
 
@@ -262,7 +262,7 @@ restricts the rule set; accepted names are `email`, `us_ssn`,
 | `host` | string? | Client-supplied `Host` header. May differ from `origin` (the matched virtual-host pattern, which can be a wildcard) and from `upstream_host` (where the proxy forwarded to). |
 | `user_agent` | string? | Client `User-Agent` header. Pulled out as a primary field because nearly every analytics consumer wants it; the header allowlist still works as a redundant capture path. |
 | `referer` | string? | Client `Referer` header (the canonical RFC 7231 misspelling). |
-| `upstream_status` | int? | Upstream's response status code, when it differs from `status`. Populated when a retry chain, fallback, or `response_modifier` rewrote the status the client sees; absent when the proxy passed the upstream status through unchanged. |
+| `upstream_status` | int? | The status on the upstream response as the proxy received it, present on any row where that differs from `status`. Absent when the proxy passed the upstream status through unchanged, and absent when no upstream answered at all. Anything that replaces the status the client sees, after an upstream has answered, puts a value here, so treat the difference as the rule rather than memorizing a list: a `fallback_origin` on its `on_status` trigger, a `status` response modifier, a metering refusal under `failure_mode: closed`, a `closed` transform that failed after the response header had already committed, and a Proxy-Wasm filter answering with its own local response all qualify. `fallback_origin`'s `on_error` trigger does not: it fires before any upstream answered, so there is no upstream status to record. Two translations happen before this is recorded and so do not show up here: a Proxy-Wasm filter rewriting `:status` on the upstream's own response, and the gRPC-to-HTTP status mapping on a `transcode` origin. |
 | `response_content_type` | string? | Response `Content-Type` as sent to the client. |
 | `response_content_encoding` | string? | Response `Content-Encoding` (`gzip`, `br`, `zstd`, ...) when the body was compressed; absent when uncompressed. |
 | `bytes_in` | int | Inbound request body bytes (post header-decode). |
@@ -292,7 +292,7 @@ restricts the rule set; accepted names are `email`, `us_ssn`,
 | `key_mode` | string? | Inbound credential mode: `none`, `minted`, or `native`. |
 | `credential_source` | string? | Which secret the AI attempt presented upstream, the outbound counterpart to `key_mode`: `provider_entry` (the provider entry's own `api_key`), `native_caller` (a caller-owned native provider key), or `fallback` (the operator's `fallback_credential_id`, presented after the entry's own key was refused). Absent on requests the AI gateway did not dispatch. Never credential material. See [multi-tenant.md](multi-tenant.md#when-a-tenants-provider-key-is-refused). |
 | `served_from_cache` | bool? | `true` when the response came from cache (hot or reserve) without contacting the upstream. |
-| `fallback_triggered` | bool? | `true` when the primary upstream failed and a `fallback_origin` served the response. |
+| `fallback_triggered` | bool? | `true` when a `fallback_origin` served the response instead of the primary upstream: either the primary failed outright (`on_error`) or it answered with a status listed under `on_status`. On the second, the primary's own status is in `upstream_status`. |
 | `retry_count` | int? | Number of upstream retries attempted before the terminal outcome. `0` means the first attempt succeeded. |
 | `error_class` | string? | Compact failure label when the response was not a 2xx (`auth_denied`, `rate_limited`, `waf_blocked`, `upstream_5xx`, `upstream_timeout`, `validator_failed`, ...). Absent for successful requests; see [Calling it](#calling-it) above for a worked example. |
 
