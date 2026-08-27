@@ -143,6 +143,7 @@ impl ResolvedTrustChain {
     pub fn metadata_policies(&self) -> impl Iterator<Item = &crate::MetadataPolicy> {
         self.statements
             .iter()
+            .rev()
             .filter_map(|s| s.claims.metadata_policy.as_ref())
     }
 }
@@ -799,5 +800,45 @@ mod tests {
         let resolved = resolver.resolve(&chain).unwrap();
         // The fixture chain has none. Empty iterator.
         assert_eq!(resolved.metadata_policies().count(), 0);
+    }
+
+    /// The policy iterator's public contract is anchor-to-leaf even
+    /// though statements are stored leaf-to-anchor.
+    #[test]
+    fn security_boundary_metadata_policies_iterate_anchor_to_leaf() {
+        fn statement(entity_id: &str, marker: &str) -> EntityStatement {
+            let now = chrono::Utc::now().timestamp();
+            EntityStatement {
+                claims: EntityStatementClaims {
+                    iss: entity_id.to_string(),
+                    sub: entity_id.to_string(),
+                    iat: now,
+                    exp: now + 3600,
+                    jwks: FederationKeySet::empty(),
+                    authority_hints: vec![],
+                    metadata: EntityMetadata::default(),
+                    metadata_policy: Some(crate::MetadataPolicy(serde_json::json!({
+                        "marker": marker
+                    }))),
+                    trust_marks: vec![],
+                },
+                compact_jws: "fixture".to_string(),
+            }
+        }
+
+        let resolved = ResolvedTrustChain {
+            statements: vec![
+                statement("https://leaf.example", "leaf"),
+                statement("https://intermediate.example", "intermediate"),
+                statement("https://anchor.example", "anchor"),
+            ],
+            trust_anchor_id: "https://anchor.example".to_string(),
+        };
+        let markers: Vec<&str> = resolved
+            .metadata_policies()
+            .map(|policy| policy.0["marker"].as_str().unwrap())
+            .collect();
+
+        assert_eq!(markers, vec!["anchor", "intermediate", "leaf"]);
     }
 }

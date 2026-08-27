@@ -223,6 +223,12 @@ fn verify_trust_mark_inner(
     // Step 1: header peek.
     let header = jsonwebtoken::decode_header(compact_jws)
         .map_err(|_| FederationError::VerificationFailed)?;
+    if !ALLOWED_ALGORITHMS.contains(&header.alg) {
+        return Err(FederationError::AlgorithmNotAllowed(format!(
+            "{:?}",
+            header.alg
+        )));
+    }
     // Step 2: typ check.
     if header.typ.as_deref() != Some(TRUST_MARK_TYP) {
         return Err(FederationError::WrongTyp(header.typ));
@@ -230,7 +236,7 @@ fn verify_trust_mark_inner(
     // Step 3: kid check.
     let kid = header.kid.ok_or(FederationError::MissingKid)?;
     // Step 4 + 5: lookup + verify.
-    let key = issuer_jwks.decoding_key_for(&kid)?;
+    let key = issuer_jwks.decoding_key_for_algorithm(&kid, header.alg)?;
     let mut validation = Validation::new(header.alg);
     validation.algorithms = vec![header.alg];
     validation.leeway = 300;
@@ -250,9 +256,15 @@ fn verify_trust_mark_inner(
     if !payload_has_exp {
         validation.validate_exp = false;
     }
-    let decoded = jsonwebtoken::decode::<TrustMarkClaims>(compact_jws, &key, &validation)
+    let decoded = jsonwebtoken::decode::<serde_json::Value>(compact_jws, &key, &validation)
         .map_err(|_| FederationError::VerificationFailed)?;
-    let claims = decoded.claims;
+    for required in ["iss", "sub", "iat", "id"] {
+        if decoded.claims.get(required).is_none() {
+            return Err(FederationError::MissingClaim(required));
+        }
+    }
+    let claims: TrustMarkClaims = serde_json::from_value(decoded.claims)
+        .map_err(|_| FederationError::VerificationFailed)?;
     // Step 6: required-field checks (empty strings rejected even
     // though serde admits them).
     if claims.iss.is_empty() {
@@ -263,6 +275,12 @@ fn verify_trust_mark_inner(
     }
     if claims.id.is_empty() {
         return Err(FederationError::MissingClaim("id"));
+    }
+    let now = chrono::Utc::now().timestamp();
+    if claims.iat > now.saturating_add(validation.leeway as i64)
+        || claims.exp.is_some_and(|exp| exp <= claims.iat)
+    {
+        return Err(FederationError::VerificationFailed);
     }
     Ok(SignedTrustMark {
         claims,
@@ -478,5 +496,86 @@ mod tests {
         let jws = sign_trust_mark(&claims, &key, Algorithm::ES256, "mark-key-1").unwrap();
         let err = verify_trust_mark(&jws, &issuer_jwks).unwrap_err();
         assert!(matches!(err, FederationError::MissingClaim("id")));
+    }
+
+    /// The verifier's asymmetric allowlist is enforced before an
+    /// attacker-controlled `kid` can influence key selection.
+    #[test]
+    fn security_boundary_trust_mark_verifier_rejects_an_algorithm_outside_the_allowlist() {
+        let claims = sample_claims();
+        let mut header = jsonwebtoken::Header::new(Algorithm::HS256);
+        header.typ = Some(TRUST_MARK_TYP.to_string());
+        header.kid = Some("attacker-selected-kid".to_string());
+        let jws = jsonwebtoken::encode(&header, &claims, &EncodingKey::from_secret(b"secret"))
+            .expect("encode adversarial trust mark");
+
+        let err = verify_trust_mark(&jws, &FederationKeySet::empty())
+            .expect_err("an attacker-selected algorithm must be rejected");
+        assert!(matches!(err, FederationError::AlgorithmNotAllowed(_)));
+    }
+
+    /// A trust-mark JWK cannot declare one algorithm while the header
+    /// selects another compatible key operation.
+    #[test]
+    fn security_boundary_trust_mark_verifier_binds_the_header_algorithm_to_the_jwk() {
+        let (key, mut jwk) = fixture_key_and_jwk("mark-key-1");
+        let claims = sample_claims();
+        let jws = sign_trust_mark(&claims, &key, Algorithm::ES256, "mark-key-1").unwrap();
+        jwk["alg"] = serde_json::json!("ES384");
+        let mut issuer_jwks = FederationKeySet::empty();
+        issuer_jwks.push(jwk);
+
+        verify_trust_mark(&jws, &issuer_jwks)
+            .expect_err("a JWK alg/header alg mismatch must be rejected");
+    }
+
+    /// Encryption-only keys cannot authenticate trust marks.
+    #[test]
+    fn security_boundary_trust_mark_verifier_rejects_an_encryption_only_jwk() {
+        let (key, mut jwk) = fixture_key_and_jwk("mark-key-1");
+        let claims = sample_claims();
+        let jws = sign_trust_mark(&claims, &key, Algorithm::ES256, "mark-key-1").unwrap();
+        jwk["use"] = serde_json::json!("enc");
+        let mut issuer_jwks = FederationKeySet::empty();
+        issuer_jwks.push(jwk);
+
+        verify_trust_mark(&jws, &issuer_jwks)
+            .expect_err("an encryption-only JWK must not verify a signature");
+    }
+
+    /// `iat` is mandatory even though `exp` is optional for trust marks.
+    #[test]
+    fn security_boundary_trust_mark_verifier_requires_iat() {
+        let (key, jwk) = fixture_key_and_jwk("mark-key-1");
+        let mut payload = serde_json::to_value(sample_claims()).unwrap();
+        payload
+            .as_object_mut()
+            .expect("claims serialize as an object")
+            .remove("iat");
+        let mut header = jsonwebtoken::Header::new(Algorithm::ES256);
+        header.typ = Some(TRUST_MARK_TYP.to_string());
+        header.kid = Some("mark-key-1".to_string());
+        let jws = jsonwebtoken::encode(&header, &payload, &key).unwrap();
+        let mut issuer_jwks = FederationKeySet::empty();
+        issuer_jwks.push(jwk);
+
+        let err = verify_trust_mark(&jws, &issuer_jwks).unwrap_err();
+        assert!(matches!(err, FederationError::MissingClaim("iat")));
+    }
+
+    /// Future-issued marks are rejected outside the configured clock skew.
+    #[test]
+    fn security_boundary_trust_mark_verifier_rejects_a_future_iat() {
+        let (key, jwk) = fixture_key_and_jwk("mark-key-1");
+        let mut claims = sample_claims();
+        let now = chrono::Utc::now().timestamp();
+        claims.iat = now + 3600;
+        claims.exp = Some(now + 7200);
+        let jws = sign_trust_mark(&claims, &key, Algorithm::ES256, "mark-key-1").unwrap();
+        let mut issuer_jwks = FederationKeySet::empty();
+        issuer_jwks.push(jwk);
+
+        verify_trust_mark(&jws, &issuer_jwks)
+            .expect_err("a future-issued trust mark must be rejected");
     }
 }

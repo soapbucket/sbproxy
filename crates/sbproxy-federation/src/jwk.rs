@@ -97,6 +97,71 @@ impl FederationKeySet {
             }),
         }
     }
+
+    /// Resolve a verifier key while enforcing the JWK's declared signing
+    /// purpose and its compatibility with the selected JWS algorithm.
+    pub(crate) fn decoding_key_for_algorithm(
+        &self,
+        kid: &str,
+        algorithm: jsonwebtoken::Algorithm,
+    ) -> Result<jsonwebtoken::DecodingKey, FederationError> {
+        let jwk = self
+            .find_by_kid(kid)
+            .ok_or_else(|| FederationError::UnknownKid(kid.to_string()))?;
+        if jwk.get("use").and_then(serde_json::Value::as_str).is_some_and(|usage| usage != "sig")
+        {
+            return Err(FederationError::VerificationFailed);
+        }
+        if let Some(operations) = jwk.get("key_ops") {
+            let permits_verify = operations
+                .as_array()
+                .is_some_and(|ops| ops.iter().any(|op| op.as_str() == Some("verify")));
+            if !permits_verify {
+                return Err(FederationError::VerificationFailed);
+            }
+        }
+        let algorithm_name = match algorithm {
+            jsonwebtoken::Algorithm::HS256 => "HS256",
+            jsonwebtoken::Algorithm::HS384 => "HS384",
+            jsonwebtoken::Algorithm::HS512 => "HS512",
+            jsonwebtoken::Algorithm::ES256 => "ES256",
+            jsonwebtoken::Algorithm::ES384 => "ES384",
+            jsonwebtoken::Algorithm::RS256 => "RS256",
+            jsonwebtoken::Algorithm::RS384 => "RS384",
+            jsonwebtoken::Algorithm::RS512 => "RS512",
+            jsonwebtoken::Algorithm::PS256 => "PS256",
+            jsonwebtoken::Algorithm::PS384 => "PS384",
+            jsonwebtoken::Algorithm::PS512 => "PS512",
+            jsonwebtoken::Algorithm::EdDSA => "EdDSA",
+        };
+        if jwk
+            .get("alg")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|declared| declared != algorithm_name)
+        {
+            return Err(FederationError::VerificationFailed);
+        }
+        let kty = jwk.get("kty").and_then(serde_json::Value::as_str);
+        let crv = jwk.get("crv").and_then(serde_json::Value::as_str);
+        let compatible = match algorithm {
+            jsonwebtoken::Algorithm::ES256 => kty == Some("EC") && crv == Some("P-256"),
+            jsonwebtoken::Algorithm::ES384 => kty == Some("EC") && crv == Some("P-384"),
+            jsonwebtoken::Algorithm::RS256
+            | jsonwebtoken::Algorithm::RS384
+            | jsonwebtoken::Algorithm::RS512
+            | jsonwebtoken::Algorithm::PS256
+            | jsonwebtoken::Algorithm::PS384
+            | jsonwebtoken::Algorithm::PS512 => kty == Some("RSA"),
+            jsonwebtoken::Algorithm::EdDSA => kty == Some("OKP") && crv == Some("Ed25519"),
+            jsonwebtoken::Algorithm::HS256
+            | jsonwebtoken::Algorithm::HS384
+            | jsonwebtoken::Algorithm::HS512 => false,
+        };
+        if !compatible {
+            return Err(FederationError::VerificationFailed);
+        }
+        self.decoding_key_for(kid)
+    }
 }
 
 fn jwk_str<'a>(

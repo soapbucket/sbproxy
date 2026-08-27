@@ -107,13 +107,17 @@ impl ReqwestFederationFetcher {
     /// `entity_id` is not a valid HTTPS URL (the spec mandates
     /// HTTPS for federation endpoints; we reject http:// up-front).
     fn well_known_url(entity_id: &str) -> FederationResult<Url> {
-        let mut url = Url::parse(entity_id).map_err(|e| {
-            FederationError::FetchFailed(format!("invalid entity_id `{entity_id}`: {e}"))
-        })?;
+        let mut url = Url::parse(entity_id)
+            .map_err(|_| FederationError::FetchFailed("invalid federation entity URL".into()))?;
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(FederationError::FetchFailed(
+                "federation entity URL must not contain credentials".into(),
+            ));
+        }
         if url.scheme() != "https" {
-            return Err(FederationError::FetchFailed(format!(
-                "entity_id `{entity_id}` is not https; the federation fetcher refuses plaintext"
-            )));
+            return Err(FederationError::FetchFailed(
+                "federation entity URL must use https".into(),
+            ));
         }
         // Append the well-known path; reqwest's `join` would drop a
         // trailing-slash-less path's tail, so do it manually.
@@ -148,21 +152,24 @@ impl FederationFetcher for ReqwestFederationFetcher {
             .header(http::header::ACCEPT, "application/entity-statement+jwt")
             .send()
             .await
-            .map_err(|e| FederationError::FetchFailed(format!("GET {url}: {e}")))?;
+            .map_err(|_| FederationError::FetchFailed("federation entity request failed".into()))?;
         if !resp.status().is_success() {
             return Err(FederationError::FetchFailed(format!(
-                "GET {url} returned HTTP {}",
+                "federation entity request returned HTTP {}",
                 resp.status()
             )));
         }
         let mut bytes = Vec::new();
-        while let Some(chunk) = resp.chunk().await.map_err(|e| FederationError::FetchFailed(format!("reading body from {url}: {e}")))? {
+        while let Some(chunk) = resp.chunk().await.map_err(|_| {
+            FederationError::FetchFailed("federation entity response read failed".into())
+        })? {
             bytes.extend_from_slice(&chunk);
             if bytes.len() > 1_048_576 { // 1 MiB cap
-                return Err(FederationError::FetchFailed(format!("response too large from {url}")));
+                return Err(FederationError::FetchFailed("federation entity response exceeds 1 MiB".into()));
             }
         }
-        String::from_utf8(bytes).map_err(|e| FederationError::FetchFailed(format!("invalid utf8 from {url}: {e}")))
+        String::from_utf8(bytes)
+            .map_err(|_| FederationError::FetchFailed("federation entity response is not UTF-8".into()))
     }
 
     async fn fetch_subordinate_statement(
@@ -170,15 +177,18 @@ impl FederationFetcher for ReqwestFederationFetcher {
         fetch_endpoint: &str,
         subordinate: &str,
     ) -> FederationResult<String> {
-        let mut url = Url::parse(fetch_endpoint).map_err(|e| {
-            FederationError::FetchFailed(format!(
-                "invalid federation_fetch_endpoint `{fetch_endpoint}`: {e}"
-            ))
+        let mut url = Url::parse(fetch_endpoint).map_err(|_| {
+            FederationError::FetchFailed("invalid federation fetch endpoint URL".into())
         })?;
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(FederationError::FetchFailed(
+                "federation fetch endpoint must not contain credentials".into(),
+            ));
+        }
         if url.scheme() != "https" {
-            return Err(FederationError::FetchFailed(format!(
-                "federation_fetch_endpoint `{fetch_endpoint}` is not https"
-            )));
+            return Err(FederationError::FetchFailed(
+                "federation fetch endpoint must use https".into(),
+            ));
         }
         url.query_pairs_mut().append_pair("sub", subordinate);
         let mut resp = self
@@ -188,21 +198,25 @@ impl FederationFetcher for ReqwestFederationFetcher {
             .header(http::header::ACCEPT, "application/entity-statement+jwt")
             .send()
             .await
-            .map_err(|e| FederationError::FetchFailed(format!("GET {url}: {e}")))?;
+            .map_err(|_| FederationError::FetchFailed("subordinate statement request failed".into()))?;
         if !resp.status().is_success() {
             return Err(FederationError::FetchFailed(format!(
-                "GET {url} returned HTTP {}",
+                "subordinate statement request returned HTTP {}",
                 resp.status()
             )));
         }
         let mut bytes = Vec::new();
-        while let Some(chunk) = resp.chunk().await.map_err(|e| FederationError::FetchFailed(format!("reading body from {url}: {e}")))? {
+        while let Some(chunk) = resp.chunk().await.map_err(|_| {
+            FederationError::FetchFailed("subordinate statement response read failed".into())
+        })? {
             bytes.extend_from_slice(&chunk);
             if bytes.len() > 1_048_576 { // 1 MiB cap
-                return Err(FederationError::FetchFailed(format!("response too large from {url}")));
+                return Err(FederationError::FetchFailed("subordinate statement response exceeds 1 MiB".into()));
             }
         }
-        String::from_utf8(bytes).map_err(|e| FederationError::FetchFailed(format!("invalid utf8 from {url}: {e}")))
+        String::from_utf8(bytes).map_err(|_| {
+            FederationError::FetchFailed("subordinate statement response is not UTF-8".into())
+        })
     }
 }
 
@@ -262,5 +276,31 @@ mod tests {
     fn well_known_url_rejects_garbage() {
         let err = ReqwestFederationFetcher::well_known_url("not a url").unwrap_err();
         assert!(matches!(err, FederationError::FetchFailed(_)));
+    }
+
+    /// Credential-bearing URLs are invalid federation identifiers and
+    /// the returned error cannot reflect their secret-bearing userinfo.
+    #[test]
+    fn security_boundary_fetcher_rejects_credentials_without_echoing_them() {
+        let err = ReqwestFederationFetcher::well_known_url(
+            "https://federation-user:FETCH_SECRET_CANARY@example.com",
+        )
+        .expect_err("credential-bearing entity IDs must be rejected");
+        let message = err.to_string();
+        assert!(!message.contains("FETCH_SECRET_CANARY"), "{message}");
+    }
+
+    /// Malformed attacker text can contain log delimiters and secrets;
+    /// neither is copied into the bounded operator-facing error.
+    #[test]
+    fn security_boundary_fetcher_sanitizes_malformed_url_errors() {
+        let err = ReqwestFederationFetcher::well_known_url(
+            "not a url\nFETCH_SECRET_CANARY",
+        )
+        .expect_err("malformed entity IDs must be rejected");
+        let message = err.to_string();
+        assert!(!message.contains("FETCH_SECRET_CANARY"), "{message}");
+        assert!(!message.contains('\n'), "{message}");
+        assert!(message.len() <= 160, "fetch error must stay bounded: {message}");
     }
 }

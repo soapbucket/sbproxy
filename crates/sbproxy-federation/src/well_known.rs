@@ -129,8 +129,11 @@ impl std::fmt::Debug for SigningKeyConfig {
 /// `Cache-Control: max-age` without re-parsing the JWS.
 #[derive(Clone)]
 pub struct EntityConfigurationDocument {
+    /// Original compact entity-statement JWS served on the wire.
     pub compact_jws: String,
+    /// Wall-clock instant stamped into the JWS `iat` claim.
     pub issued_at: DateTime<Utc>,
+    /// Wall-clock instant stamped into the JWS `exp` claim.
     pub expires_at: DateTime<Utc>,
 }
 

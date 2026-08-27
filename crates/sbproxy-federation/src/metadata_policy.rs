@@ -274,14 +274,10 @@ fn check_superset_of(current: &Value, required: &Value, field_name: &str) -> Fed
 /// composer that walks from anchor down: each step's policy is
 /// merged onto the running composed policy.
 ///
-/// Field-by-field, the deeper (subordinate) policy overrides
-/// individual operators of the same name from the shallower
-/// (superior) policy. This matches the §6.1 rule that subordinate
-/// statements refine the superior's policy but cannot loosen
-/// stricter constraints (`one_of` narrowing, `subset_of` shrinking)
-/// in directions the spec marks as invalid. Today we permit any
-/// override; a future revision can add the spec's compatibility
-/// guard.
+/// Field-by-field, a deeper (subordinate) policy may add a new operator
+/// or monotonically strengthen an existing one. It cannot replace a
+/// fixed value/default, widen `one_of` or `subset_of`, weaken
+/// `superset_of`, clear `essential`, or discard a superior `add` value.
 pub fn compose_policies(superior: &Value, subordinate: &Value) -> FederationResult<Value> {
     let s = superior.as_object().ok_or_else(|| {
         FederationError::PolicyShape("superior metadata_policy must be a JSON object".into())
@@ -302,7 +298,11 @@ pub fn compose_policies(superior: &Value, subordinate: &Value) -> FederationResu
                     new_ops.as_object(),
                 ) {
                     for (op, val) in new_ops_obj {
-                        prev_ops.insert(op.clone(), val.clone());
+                        let composed = match prev_ops.get(op) {
+                            Some(previous) => compose_operator(field, op, previous, val)?,
+                            None => val.clone(),
+                        };
+                        prev_ops.insert(op.clone(), composed);
                     }
                 } else {
                     out_block.insert(field.clone(), new_ops.clone());
@@ -313,6 +313,43 @@ pub fn compose_policies(superior: &Value, subordinate: &Value) -> FederationResu
         }
     }
     Ok(Value::Object(out))
+}
+
+fn compose_operator(
+    field: &str,
+    operator: &str,
+    superior: &Value,
+    subordinate: &Value,
+) -> FederationResult<Value> {
+    if superior == subordinate {
+        return Ok(superior.clone());
+    }
+    match operator {
+        "add" => apply_add_operator(superior, subordinate, field),
+        "one_of" | "subset_of" => {
+            check_subset_of(subordinate, superior, field)?;
+            Ok(subordinate.clone())
+        }
+        "superset_of" => {
+            check_superset_of(subordinate, superior, field)?;
+            Ok(subordinate.clone())
+        }
+        "essential" => match (superior.as_bool(), subordinate.as_bool()) {
+            (Some(false), Some(true)) => Ok(Value::Bool(true)),
+            (Some(_), Some(_)) => Err(FederationError::PolicyShape(format!(
+                "subordinate metadata_policy cannot clear `essential` for `{field}`"
+            ))),
+            _ => Err(FederationError::PolicyShape(format!(
+                "`essential` for `{field}` must be a boolean"
+            ))),
+        },
+        "value" | "default" => Err(FederationError::PolicyShape(format!(
+            "subordinate metadata_policy conflicts with superior `{operator}` for `{field}`"
+        ))),
+        other => Err(FederationError::PolicyShape(format!(
+            "unsupported metadata_policy operator `{other}` for `{field}`"
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -486,5 +523,80 @@ mod tests {
         let policy = json!({"grant_types_supported": {"add": ["refresh_token"]}});
         let err = apply_block_policy(&leaf, &policy).unwrap_err();
         assert!(matches!(err, FederationError::PolicyShape(_)));
+    }
+
+    fn policy_for(operator: &str, value: Value) -> Value {
+        let mut operators = Map::new();
+        operators.insert(operator.to_string(), value);
+        json!({"openid_provider": {"field": Value::Object(operators)}})
+    }
+
+    /// Every value required by the superior's `add` remains required
+    /// after a subordinate contributes its own additions.
+    #[test]
+    fn security_boundary_composition_unions_add_values() {
+        let composed = compose_policies(
+            &policy_for("add", json!(["superior"])),
+            &policy_for("add", json!(["subordinate"])),
+        )
+        .unwrap();
+        assert_eq!(
+            composed["openid_provider"]["field"]["add"],
+            json!(["superior", "subordinate"])
+        );
+    }
+
+    #[test]
+    fn security_boundary_composition_rejects_a_changed_value() {
+        let result = compose_policies(
+            &policy_for("value", json!("superior")),
+            &policy_for("value", json!("subordinate")),
+        );
+        assert!(result.is_err(), "a subordinate cannot replace `value`");
+    }
+
+    #[test]
+    fn security_boundary_composition_rejects_a_changed_default() {
+        let result = compose_policies(
+            &policy_for("default", json!("superior")),
+            &policy_for("default", json!("subordinate")),
+        );
+        assert!(result.is_err(), "conflicting defaults must be deterministic");
+    }
+
+    #[test]
+    fn security_boundary_composition_rejects_a_wider_one_of() {
+        let result = compose_policies(
+            &policy_for("one_of", json!(["a"])),
+            &policy_for("one_of", json!(["a", "b"])),
+        );
+        assert!(result.is_err(), "a subordinate cannot widen `one_of`");
+    }
+
+    #[test]
+    fn security_boundary_composition_rejects_a_wider_subset_of() {
+        let result = compose_policies(
+            &policy_for("subset_of", json!(["a"])),
+            &policy_for("subset_of", json!(["a", "b"])),
+        );
+        assert!(result.is_err(), "a subordinate cannot widen `subset_of`");
+    }
+
+    #[test]
+    fn security_boundary_composition_rejects_a_weaker_superset_of() {
+        let result = compose_policies(
+            &policy_for("superset_of", json!(["a", "b"])),
+            &policy_for("superset_of", json!(["a"])),
+        );
+        assert!(result.is_err(), "a subordinate cannot weaken `superset_of`");
+    }
+
+    #[test]
+    fn security_boundary_composition_cannot_clear_essential() {
+        let result = compose_policies(
+            &policy_for("essential", json!(true)),
+            &policy_for("essential", json!(false)),
+        );
+        assert!(result.is_err(), "a subordinate cannot clear `essential`");
     }
 }

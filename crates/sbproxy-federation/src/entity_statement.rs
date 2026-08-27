@@ -55,7 +55,9 @@ const ALLOWED_ALGORITHMS: &[Algorithm] = &[
 /// so the caller can store the statement verbatim for cache replay.
 #[derive(Clone)]
 pub struct EntityStatement {
+    /// Verified entity-statement claims.
     pub claims: EntityStatementClaims,
+    /// Original compact JWS retained for cache replay.
     pub compact_jws: String,
 }
 
@@ -289,6 +291,12 @@ fn verify_entity_statement_inner(
     // Step 1: header peek.
     let header = jsonwebtoken::decode_header(compact_jws)
         .map_err(|_| FederationError::VerificationFailed)?;
+    if !ALLOWED_ALGORITHMS.contains(&header.alg) {
+        return Err(FederationError::AlgorithmNotAllowed(format!(
+            "{:?}",
+            header.alg
+        )));
+    }
     // Step 2: typ check.
     if header.typ.as_deref() != Some(ENTITY_STATEMENT_TYP) {
         return Err(FederationError::WrongTyp(header.typ));
@@ -296,7 +304,7 @@ fn verify_entity_statement_inner(
     // Step 3: kid check.
     let kid = header.kid.ok_or(FederationError::MissingKid)?;
     // Step 4 + 5: key lookup + signature verification.
-    let key = verifier_keys.decoding_key_for(&kid)?;
+    let key = verifier_keys.decoding_key_for_algorithm(&kid, header.alg)?;
     let mut validation = Validation::new(header.alg);
     validation.algorithms = vec![header.alg];
     // OIDF does not mandate aud / iss validation on the JWS layer; the
@@ -309,9 +317,15 @@ fn verify_entity_statement_inner(
     validation.validate_nbf = false;
     validation.validate_aud = false;
     validation.required_spec_claims.clear();
-    let decoded = jsonwebtoken::decode::<EntityStatementClaims>(compact_jws, &key, &validation)
+    let decoded = jsonwebtoken::decode::<serde_json::Value>(compact_jws, &key, &validation)
         .map_err(|_| FederationError::VerificationFailed)?;
-    let claims = decoded.claims;
+    for required in ["iss", "sub", "iat", "exp", "jwks"] {
+        if decoded.claims.get(required).is_none() {
+            return Err(FederationError::MissingClaim(required));
+        }
+    }
+    let claims: EntityStatementClaims = serde_json::from_value(decoded.claims)
+        .map_err(|_| FederationError::VerificationFailed)?;
     // Step 6: required-field checks. jsonwebtoken's serde decode
     // already enforces that the fields are present; the explicit
     // checks below surface typed errors for the empty-string edge
@@ -324,6 +338,10 @@ fn verify_entity_statement_inner(
     }
     if claims.jwks.keys.is_empty() {
         return Err(FederationError::MissingClaim("jwks"));
+    }
+    let now = chrono::Utc::now().timestamp();
+    if claims.iat > now.saturating_add(validation.leeway as i64) || claims.exp <= claims.iat {
+        return Err(FederationError::VerificationFailed);
     }
     Ok(EntityStatement {
         claims,
@@ -535,5 +553,101 @@ mod tests {
         trust_keys.push(jwk);
         let err = verify_entity_statement(&jws, &trust_keys).unwrap_err();
         assert!(matches!(err, FederationError::MissingClaim("jwks")));
+    }
+
+    /// The verifier owns the algorithm policy. It must reject a
+    /// symmetric header before looking up the attacker-selected `kid`.
+    #[test]
+    fn security_boundary_entity_verifier_rejects_an_algorithm_outside_the_allowlist() {
+        let (_, jwk) = mint_es256_keypair();
+        let claims = sample_claims(jwk);
+        let mut header = Header::new(Algorithm::HS256);
+        header.typ = Some(ENTITY_STATEMENT_TYP.to_string());
+        header.kid = Some("attacker-selected-kid".to_string());
+        let jws = jsonwebtoken::encode(&header, &claims, &EncodingKey::from_secret(b"secret"))
+            .expect("encode adversarial JWS");
+
+        let err = verify_entity_statement(&jws, &FederationKeySet::empty())
+            .expect_err("an attacker-selected algorithm must be rejected");
+        assert!(matches!(err, FederationError::AlgorithmNotAllowed(_)));
+    }
+
+    /// A JWK that declares a different algorithm cannot be used merely
+    /// because its curve happens to verify the header-selected algorithm.
+    #[test]
+    fn security_boundary_entity_verifier_binds_the_header_algorithm_to_the_jwk() {
+        let (key, mut jwk) = mint_es256_keypair();
+        let claims = sample_claims(jwk.clone());
+        let jws = sign_entity_statement(&claims, &key, Algorithm::ES256, "test-key-1").unwrap();
+        jwk["alg"] = serde_json::json!("ES384");
+        let mut trust_keys = FederationKeySet::empty();
+        trust_keys.push(jwk);
+
+        verify_entity_statement(&jws, &trust_keys)
+            .expect_err("a JWK alg/header alg mismatch must be rejected");
+    }
+
+    /// Encryption-only JWKs are not eligible to verify entity statements.
+    #[test]
+    fn security_boundary_entity_verifier_rejects_an_encryption_only_jwk() {
+        let (key, mut jwk) = mint_es256_keypair();
+        let claims = sample_claims(jwk.clone());
+        let jws = sign_entity_statement(&claims, &key, Algorithm::ES256, "test-key-1").unwrap();
+        jwk["use"] = serde_json::json!("enc");
+        let mut trust_keys = FederationKeySet::empty();
+        trust_keys.push(jwk);
+
+        verify_entity_statement(&jws, &trust_keys)
+            .expect_err("an encryption-only JWK must not verify a signature");
+    }
+
+    fn entity_jws_without_claim(claim: &'static str) -> (String, FederationKeySet) {
+        let (key, jwk) = mint_es256_keypair();
+        let claims = sample_claims(jwk.clone());
+        let mut payload = serde_json::to_value(claims).unwrap();
+        payload
+            .as_object_mut()
+            .expect("claims serialize as an object")
+            .remove(claim);
+        let mut header = Header::new(Algorithm::ES256);
+        header.typ = Some(ENTITY_STATEMENT_TYP.to_string());
+        header.kid = Some("test-key-1".to_string());
+        let jws = jsonwebtoken::encode(&header, &payload, &key).unwrap();
+        let mut trust_keys = FederationKeySet::empty();
+        trust_keys.push(jwk);
+        (jws, trust_keys)
+    }
+
+    /// Missing temporal claims are typed protocol failures rather than
+    /// opaque decode failures.
+    #[test]
+    fn security_boundary_entity_verifier_requires_iat() {
+        let (jws, trust_keys) = entity_jws_without_claim("iat");
+        let err = verify_entity_statement(&jws, &trust_keys).unwrap_err();
+        assert!(matches!(err, FederationError::MissingClaim("iat")));
+    }
+
+    #[test]
+    fn security_boundary_entity_verifier_requires_exp() {
+        let (jws, trust_keys) = entity_jws_without_claim("exp");
+        let err = verify_entity_statement(&jws, &trust_keys).unwrap_err();
+        assert!(matches!(err, FederationError::MissingClaim("exp")));
+    }
+
+    /// A statement issued beyond the five-minute skew allowance is not
+    /// valid yet, even when its expiry and signature are otherwise valid.
+    #[test]
+    fn security_boundary_entity_verifier_rejects_a_future_iat() {
+        let (key, jwk) = mint_es256_keypair();
+        let mut claims = sample_claims(jwk.clone());
+        let now = chrono::Utc::now().timestamp();
+        claims.iat = now + 3600;
+        claims.exp = now + 7200;
+        let jws = sign_entity_statement(&claims, &key, Algorithm::ES256, "test-key-1").unwrap();
+        let mut trust_keys = FederationKeySet::empty();
+        trust_keys.push(jwk);
+
+        verify_entity_statement(&jws, &trust_keys)
+            .expect_err("a future-issued statement must be rejected");
     }
 }
