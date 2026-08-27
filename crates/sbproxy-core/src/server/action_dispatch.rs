@@ -9966,8 +9966,14 @@ mod mcp_scope_enforcement_tests {
     #[test]
     fn a_token_carrying_the_operation_scope_is_admitted() {
         let both = claims("mcp.read mcp.call");
-        assert_eq!(mcp_scope_refusal("tools/call", &advertised(), Some(&both)), None);
-        assert_eq!(mcp_scope_refusal("tools/list", &advertised(), Some(&both)), None);
+        assert_eq!(
+            mcp_scope_refusal("tools/call", &advertised(), Some(&both)),
+            None
+        );
+        assert_eq!(
+            mcp_scope_refusal("tools/list", &advertised(), Some(&both)),
+            None
+        );
         let read_only = claims("mcp.read");
         assert_eq!(
             mcp_scope_refusal("tools/list", &advertised(), Some(&read_only)),

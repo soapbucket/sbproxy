@@ -224,6 +224,9 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_cert_store_degraded` | Gauge | `stable` | `beta` | `backend` | 1 when the configured certificate store could not be opened and an in-memory fallback is in use, 0 when the configured backend opened. |
 | `sbproxy_circuit_breaker_transitions_total` | Counter | `stable` | `beta` | `origin`, `from_state`, `to_state` | Circuit breaker state transitions, by origin and from/to state. |
 | `sbproxy_clock_skew_seconds` | Gauge | `config_only` (nothing emits this yet) | `alpha` | none | Local clock offset from the SNTP reference, in seconds. |
+| `sbproxy_comp_marketplace_manifest_serves_total` | Counter | `stable` | `beta` | `outcome` | IAB CoMP marketplace manifest serves, by outcome. Written by the `sbproxy-licensing` router; empty on a deployment that does not mount it. |
+| `sbproxy_comp_marketplace_quote_requests_total` | Counter | `stable` | `beta` | `outcome` | IAB CoMP marketplace quote outcomes. Written by the `sbproxy-licensing` router; empty on a deployment that does not mount it. |
+| `sbproxy_comp_marketplace_redeem_requests_total` | Counter | `stable` | `beta` | `outcome` | IAB CoMP marketplace redeem outcomes. Written by the `sbproxy-licensing` router; empty on a deployment that does not mount it. |
 | `sbproxy_compression_decisions_total` | Counter | `stable` | `beta` | `codec`, `result` | Compression middleware decisions, by codec and outcome. |
 | `sbproxy_compression_ratio` | Histogram | `stable` | `beta` | `codec` | Achieved compression ratio (post_size / pre_size) when compression was applied. |
 | `sbproxy_config_authority_announce_total` | Counter | `stable` | `beta` | `result` | Config revision announcements published to the cluster, by result. |
@@ -244,6 +247,11 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_errors_total` | Counter | `stable` | `beta` | `hostname`, `error_type` | Total errors. |
 | `sbproxy_events_dropped_total` | Counter | `stable` | `beta` | `sink`, `reason` | Proxy events the events: egress did not deliver, by sink (file or webhook) and closed reason. |
 | `sbproxy_evidence_seq_tenant_cap_total` | Counter | `stable` | `beta` | none | Evidence sequence lookups for a tenant past the tracked-tenant cap, sharing the overflow counter. |
+| `sbproxy_federation_entity_statement_verifications_total` | Counter | `stable` | `beta` | `outcome` | OpenID Federation entity-statement JWS verification outcomes, covering both self-signed entity configurations and subordinate statements. |
+| `sbproxy_federation_trust_chain_resolutions_total` | Counter | `stable` | `beta` | `outcome` | OpenID Federation trust-chain resolution outcomes, one per resolver call. |
+| `sbproxy_federation_trust_mark_verifications_total` | Counter | `stable` | `beta` | `outcome` | OpenID Federation trust-mark JWS verification outcomes. Offline signature check only; live revocation status is a separate call this crate does not make. |
+| `sbproxy_federation_well_known_cache_remaining_seconds` | Gauge | `stable` | `beta` | none | Remaining lifetime of the entity configuration most recently served from cache, in seconds, sampled on every successful serve. Pinned near zero means the refresh margin is too close to the lifetime for the request rate. |
+| `sbproxy_federation_well_known_serves_total` | Counter | `stable` | `beta` | `outcome` | GET /.well-known/openid-federation outcomes. |
 | `sbproxy_gateway_reconcile_duration_seconds` | Histogram | `stable` | `beta` | `kind` | Gateway API reconcile latency in seconds, by the Kubernetes resource kind that triggered the pass. Answers whether a reconcile is outrunning the resync interval. |
 | `sbproxy_gateway_reconcile_total` | Counter | `stable` | `beta` | `kind`, `result` | Gateway API reconcile attempts, by triggering resource kind and outcome. `kind` is one of GatewayClass, Gateway, HTTPRoute, GRPCRoute, or periodic, so cardinality is bounded by a closed set. |
 | `sbproxy_gateway_status_writes_total` | Counter | `stable` | `beta` | `kind`, `result` | Patches to the `/status` subresource, by resource kind and outcome. A rising error count here is usually RBAC missing the status subresource rather than anything wrong with the reconcile. |
@@ -277,6 +285,11 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_managed_replica_attempts_total` | Counter | `stable` | `beta` | `provider`, `deployment`, `route_class`, `outcome` | Managed model replica attempts by provider, deployment, route class, and bounded outcome. |
 | `sbproxy_managed_replica_failovers_total` | Counter | `stable` | `beta` | `provider`, `deployment`, `reason` | Safe pre-output managed replica handovers by provider, deployment, and bounded reason. |
 | `sbproxy_mcp_federation_peers_up` | Gauge | `stable` | `beta` | none | Live MCP federation peers as of the last refresh. |
+| `sbproxy_mcp_gateway_authorize_requests_total` | Counter | `stable` | `beta` | `outcome` | MCP OAuth broker /authorize outcomes. Coarse by design: the per-rejection reason is in the paired decision-event log line, not a second label. |
+| `sbproxy_mcp_gateway_dpop_proofs_total` | Counter | `stable` | `beta` | `outcome` | RFC 9449 DPoP proof verification outcomes at the MCP OAuth broker. |
+| `sbproxy_mcp_gateway_revocation_introspection_requests_total` | Counter | `stable` | `beta` | `endpoint`, `outcome` | MCP OAuth broker /revoke and /introspect outcomes, by endpoint. |
+| `sbproxy_mcp_gateway_sessions_active` | Gauge | `stable` | `beta` | none | In-flight authorization sessions held by the MCP OAuth broker's in-memory session store. A deployment on the storage-backed store leaves this at zero: counting there needs a SCAN. |
+| `sbproxy_mcp_gateway_token_requests_total` | Counter | `stable` | `beta` | `outcome` | MCP OAuth broker /token outcomes. Coarse by design: the per-rejection reason is in the paired decision-event log line, not a second label. |
 | `sbproxy_mcp_policy_hook_invocations_total` | Counter | `stable` | `beta` | `verdict`, `mcp_server`, `tool_name` | MCP pre-tool-call policy hook invocations by verdict, upstream MCP server, and tool. |
 | `sbproxy_mcp_resource_fetch_total` | Counter | `stable` | `beta` | `result` | MCP resource-fetch attempts, by outcome. |
 | `sbproxy_mcp_poison_indicators_total` | Counter | `stable` | `beta` | `field`, `indicator`, `kind` | Static tool-poisoning indicators in advertised MCP tool text, by field and indicator. |

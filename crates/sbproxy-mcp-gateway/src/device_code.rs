@@ -219,7 +219,13 @@ pub enum DevicePollOutcome {
     /// The user denied consent.
     Denied,
     /// This caller atomically consumed the approved state.
-    Authorized(DeviceCodeState),
+    ///
+    /// Boxed because the state is two orders of magnitude larger than
+    /// any other variant here, and every poll that is not the one
+    /// winning poll returns one of those. Carrying the approved state
+    /// inline would make the whole enum that size on every `Pending`
+    /// and `SlowDown` answer.
+    Authorized(Box<DeviceCodeState>),
 }
 
 // --- Store ---
@@ -448,7 +454,7 @@ impl DeviceCodeStore {
                 {
                     self.remove_reverse_index(device_code, &state.user_code)
                         .await;
-                    return Ok(DevicePollOutcome::Authorized(state));
+                    return Ok(DevicePollOutcome::Authorized(Box::new(state)));
                 }
                 continue;
             }
@@ -1258,11 +1264,12 @@ mod tests {
             None,
         );
 
-        // 1. /device_authorization
+        // 1. /device_authorization. The config advertises
+        // `scopes_supported`, so a supported scope is required here.
         let (status, body) = post_form(
             app.clone(),
             "/mcp/oauth/device_authorization",
-            "client_id=cli",
+            "client_id=cli&scope=read",
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -1300,10 +1307,13 @@ mod tests {
     async fn missing_or_unknown_action_never_approves() {
         for action in ["", "&action=unexpected"] {
             let app = build_app(enabled_config());
+            // `enabled_config` advertises `scopes_supported`, so device
+            // authorization now requires a supported scope. This test is
+            // about the verify action, not about scope, so ask for one.
             let (status, body) = post_form(
                 app.clone(),
                 "/mcp/oauth/device_authorization",
-                "client_id=cli",
+                "client_id=cli&scope=read",
             )
             .await;
             assert_eq!(status, StatusCode::OK);

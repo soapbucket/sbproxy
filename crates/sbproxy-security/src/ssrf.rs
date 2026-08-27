@@ -28,7 +28,7 @@
 //!
 //! This list exists so a reviewer auditing the contract above can walk
 //! every path that needs dial-time re-validation without grepping.
-//! Nine call sites across the workspace, split by whether the caller
+//! Ten call sites across the workspace, split by whether the caller
 //! actually pins what it validated.
 //!
 //! Pinned: the caller takes the [`SocketAddr`]s back and dials those.
@@ -41,6 +41,13 @@
 //!   `allow_private_url` typo cannot quietly open the private range.
 //! - `sbproxy-observe::event_sink`, `deliver_batch`: revalidates on
 //!   every batch, not once at startup, and pins the collector.
+//! - `sbproxy-federation::http_fetcher`, `governed_get`: an OpenID
+//!   Federation peer URL arrives signed by another entity in the trust
+//!   chain rather than from this operator's config, so it is validated
+//!   on every fetch and the returned addresses become the only ones the
+//!   dial may reach, through `resolve_to_addrs`. The refusal carries no
+//!   address, port, or reason: the peer URL can itself be what a probe
+//!   is asking about.
 //!
 //! Not pinned. Each is defensible for its own reason, and each is a
 //! place the rebinding window is still open:

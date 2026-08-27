@@ -324,8 +324,8 @@ fn verify_entity_statement_inner(
             return Err(FederationError::MissingClaim(required));
         }
     }
-    let claims: EntityStatementClaims = serde_json::from_value(decoded.claims)
-        .map_err(|_| FederationError::VerificationFailed)?;
+    let claims: EntityStatementClaims =
+        serde_json::from_value(decoded.claims).map_err(|_| FederationError::VerificationFailed)?;
     // Step 6: required-field checks. jsonwebtoken's serde decode
     // already enforces that the fields are present; the explicit
     // checks below surface typed errors for the empty-string edge

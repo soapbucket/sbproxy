@@ -30,7 +30,7 @@
 //! * **When `egress.federation:` is configured.**
 //!   [`sbproxy_security::governed_egress::GovernedEgress`] adds the
 //!   operator's host, scheme, and port allowlist for
-//!   [`EgressPurpose::Federation`], re-authorizes every redirect hop
+//!   `sbproxy_security::egress::EgressPurpose::Federation`, re-authorizes every redirect hop
 //!   against it before any second connect, bounds the chain, and counts
 //!   each refusal on the `sbproxy_egress_refused_total` /
 //!   `GET /api/egress` surfaces.
@@ -136,8 +136,9 @@ impl ReqwestFederationFetcher {
     /// resolver in an air-gapped deployment). The supplied client is
     /// used for a hop that carries no pin set, which is what happens
     /// when no `egress.federation:` allowlist is armed; the
-    /// private-address refusal in [`Self::governed_get`] runs either
-    /// way and is not something this constructor can opt out of. Build
+    /// private-address refusal described in this module's docs runs
+    /// either way and is not something this constructor can opt out of.
+    /// Build
     /// it with `redirect(Policy::none())`: a client with a redirect
     /// policy of its own follows the hop before the governed loop can
     /// refuse it.
@@ -470,13 +471,14 @@ mod tests {
     /// neither is copied into the bounded operator-facing error.
     #[test]
     fn security_boundary_fetcher_sanitizes_malformed_url_errors() {
-        let err = ReqwestFederationFetcher::well_known_url(
-            "not a url\nFETCH_SECRET_CANARY",
-        )
-        .expect_err("malformed entity IDs must be rejected");
+        let err = ReqwestFederationFetcher::well_known_url("not a url\nFETCH_SECRET_CANARY")
+            .expect_err("malformed entity IDs must be rejected");
         let message = err.to_string();
         assert!(!message.contains("FETCH_SECRET_CANARY"), "{message}");
         assert!(!message.contains('\n'), "{message}");
-        assert!(message.len() <= 160, "fetch error must stay bounded: {message}");
+        assert!(
+            message.len() <= 160,
+            "fetch error must stay bounded: {message}"
+        );
     }
 }

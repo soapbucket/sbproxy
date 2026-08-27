@@ -14,6 +14,9 @@ use serde::{Deserialize, Serialize};
 /// at startup.
 #[derive(Debug, thiserror::Error)]
 pub enum StartupConfigError {
+    /// A `base_path` of `/` or empty would mount the broker's routes
+    /// over every path on the origin, capturing traffic the operator
+    /// meant for something else.
     #[error("MCP OAuth base_path must not be root or empty")]
     InvalidBrokerPath,
     /// Device approval cannot mint an access token without an

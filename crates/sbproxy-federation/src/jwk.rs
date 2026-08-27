@@ -108,7 +108,10 @@ impl FederationKeySet {
         let jwk = self
             .find_by_kid(kid)
             .ok_or_else(|| FederationError::UnknownKid(kid.to_string()))?;
-        if jwk.get("use").and_then(serde_json::Value::as_str).is_some_and(|usage| usage != "sig")
+        if jwk
+            .get("use")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|usage| usage != "sig")
         {
             return Err(FederationError::VerificationFailed);
         }

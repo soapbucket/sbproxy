@@ -240,9 +240,18 @@ fn evict_response(
 mod tests {
     use super::*;
 
-    static CACHE_RESERVE_DEGRADATION_TEST_LOCK: std::sync::Mutex<()> =
-        std::sync::Mutex::new(());
+    static CACHE_RESERVE_DEGRADATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Serializes the tests below against each other. They install a
+    /// process-global pipeline and read a process-global gauge, so two
+    /// running at once read each other's state.
+    ///
+    /// Held across `await` on purpose, which is why every caller carries
+    /// an `await_holding_lock` allow. The tests run on a
+    /// `current_thread` runtime with no other task on it, so there is
+    /// nothing for the held guard to starve; an async mutex here would
+    /// only move the same serialization behind a type that suggests
+    /// concurrency the tests must not have.
     fn cache_reserve_degradation_test_guard() -> std::sync::MutexGuard<'static, ()> {
         CACHE_RESERVE_DEGRADATION_TEST_LOCK
             .lock()
@@ -342,6 +351,7 @@ origins:
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)] // deliberate: see the guard's doc comment
     async fn cache_reserve_degradation_runtime_failure_updates_sanitized_admin_state() {
         let _guard = cache_reserve_degradation_test_guard();
         let directory = tempfile::tempdir().expect("temporary reserve parent");
@@ -357,7 +367,11 @@ origins:
             .expect("filesystem reserve is active");
 
         backend
-            .put("runtime-failure", bytes::Bytes::from_static(b"hello"), reserve_metadata())
+            .put(
+                "runtime-failure",
+                bytes::Bytes::from_static(b"hello"),
+                reserve_metadata(),
+            )
             .await
             .expect_err("regular-file root must reject the reserve write");
 
@@ -379,6 +393,7 @@ origins:
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)] // deliberate: see the guard's doc comment
     async fn cache_reserve_degradation_success_clears_failure_state_and_gauge() {
         let _guard = cache_reserve_degradation_test_guard();
         let directory = tempfile::tempdir().expect("temporary reserve parent");
@@ -393,22 +408,28 @@ origins:
             .clone()
             .expect("filesystem reserve is active");
         backend
-            .put("recoverable", bytes::Bytes::from_static(b"hello"), reserve_metadata())
+            .put(
+                "recoverable",
+                bytes::Bytes::from_static(b"hello"),
+                reserve_metadata(),
+            )
             .await
             .expect_err("first write must fail");
 
         std::fs::remove_file(&root).expect("remove blocking root fixture");
         backend
-            .put("recoverable", bytes::Bytes::from_static(b"hello"), reserve_metadata())
+            .put(
+                "recoverable",
+                bytes::Bytes::from_static(b"hello"),
+                reserve_metadata(),
+            )
             .await
             .expect("later successful operation recovers the reserve");
 
         let scrape = sbproxy_observe::metrics().render();
         assert!(
             scrape.lines().any(|line| {
-                line.starts_with(
-                    "sbproxy_cache_reserve_degraded{backend=\"filesystem\"} 0",
-                )
+                line.starts_with("sbproxy_cache_reserve_degraded{backend=\"filesystem\"} 0")
             }),
             "successful operation must clear the degraded gauge: {scrape}"
         );

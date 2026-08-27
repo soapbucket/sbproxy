@@ -1016,7 +1016,7 @@ async fn handle_device_code_grant(
         .poll_and_consume(&device_code, req_client_id, crate::device_code::unix_now())
         .await
     {
-        Ok(crate::device_code::DevicePollOutcome::Authorized(state)) => state,
+        Ok(crate::device_code::DevicePollOutcome::Authorized(state)) => *state,
         Ok(crate::device_code::DevicePollOutcome::Missing) => {
             return oauth_error(
                 StatusCode::BAD_REQUEST,

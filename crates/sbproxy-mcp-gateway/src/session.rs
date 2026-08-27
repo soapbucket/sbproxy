@@ -128,6 +128,7 @@ impl InMemorySessionStore {
         let now = Instant::now();
         let mut guard = self.inner.lock().await;
         guard.retain(|_, entry| entry.expires_at > now);
+        crate::metrics::record_sessions_active(guard.len());
     }
 
     #[cfg(test)]
@@ -157,13 +158,16 @@ impl SessionStore for InMemorySessionStore {
                 expires_at: now + self.ttl,
             },
         );
+        crate::metrics::record_sessions_active(guard.len());
         Ok(())
     }
 
     async fn take(&self, state: &str) -> Option<Session> {
         let now = Instant::now();
         let mut guard = self.inner.lock().await;
-        let entry = guard.remove(state)?;
+        let entry = guard.remove(state);
+        crate::metrics::record_sessions_active(guard.len());
+        let entry = entry?;
         if entry.expires_at <= now {
             // Expired row: drop on the floor.
             return None;

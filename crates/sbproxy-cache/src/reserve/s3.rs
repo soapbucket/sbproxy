@@ -182,10 +182,7 @@ impl S3Reserve {
     ) -> Self {
         let clients = OnceCell::new();
         let _ = clients.set((s3, kms));
-        Self {
-            config,
-            clients,
-        }
+        Self { config, clients }
     }
 
     /// Compute the full S3 object key for a logical reserve key.
@@ -203,14 +200,20 @@ impl S3Reserve {
 
     /// Return the cached AWS clients, building them on first call.
     async fn clients(&self) -> anyhow::Result<(aws_sdk_s3::Client, aws_sdk_kms::Client)> {
-        let (s3, kms) = self.clients.get_or_init(|| async {
-            let region = aws_sdk_s3::config::Region::new(self.config.region.clone());
-            let aws_cfg = aws_config::defaults(aws_config::BehaviorVersion::latest())
-                .region(region)
-                .load()
-                .await;
-            (aws_sdk_s3::Client::new(&aws_cfg), aws_sdk_kms::Client::new(&aws_cfg))
-        }).await;
+        let (s3, kms) = self
+            .clients
+            .get_or_init(|| async {
+                let region = aws_sdk_s3::config::Region::new(self.config.region.clone());
+                let aws_cfg = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                    .region(region)
+                    .load()
+                    .await;
+                (
+                    aws_sdk_s3::Client::new(&aws_cfg),
+                    aws_sdk_kms::Client::new(&aws_cfg),
+                )
+            })
+            .await;
         Ok((s3.clone(), kms.clone()))
     }
 }
@@ -460,9 +463,7 @@ impl CacheReserveBackend for S3Reserve {
         } else if mode == Some("sse-kms") {
             self.config.max_size_bytes
         } else {
-            self.config
-                .max_size_bytes
-                .saturating_add(AES_GCM_TAG_LEN)
+            self.config.max_size_bytes.saturating_add(AES_GCM_TAG_LEN)
         };
         if let Some(declared) = resp.content_length() {
             if declared < 0 || exceeds_size_limit(declared as u64, stored_size_limit) {
@@ -474,8 +475,8 @@ impl CacheReserveBackend for S3Reserve {
         let mut body = resp.body;
         let mut body_bytes = Vec::new();
         while let Some(chunk) = body.next().await {
-            let chunk = chunk
-                .map_err(|e| anyhow::anyhow!("S3 GetObject body stream failed: {e}"))?;
+            let chunk =
+                chunk.map_err(|e| anyhow::anyhow!("S3 GetObject body stream failed: {e}"))?;
             if exceeds_size_limit(
                 (body_bytes.len() as u64).saturating_add(chunk.len() as u64),
                 stored_size_limit,
@@ -918,8 +919,8 @@ mod mock_trait_tests {
             builder.build()
         });
         let s3 = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&get_rule]);
-        let kms_rule = mock!(aws_sdk_kms::Client::decrypt)
-            .then_output(|| DecryptOutput::builder().build());
+        let kms_rule =
+            mock!(aws_sdk_kms::Client::decrypt).then_output(|| DecryptOutput::builder().build());
         let kms = mock_client!(aws_sdk_kms, RuleMode::Sequential, &[&kms_rule]);
         let mut config = sample_config();
         config.max_size_bytes = 4;
@@ -944,8 +945,8 @@ mod mock_trait_tests {
             builder.build()
         });
         let s3 = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&get_rule]);
-        let kms_rule = mock!(aws_sdk_kms::Client::decrypt)
-            .then_output(|| DecryptOutput::builder().build());
+        let kms_rule =
+            mock!(aws_sdk_kms::Client::decrypt).then_output(|| DecryptOutput::builder().build());
         let kms = mock_client!(aws_sdk_kms, RuleMode::Sequential, &[&kms_rule]);
         let mut config = sample_config();
         config.max_size_bytes = 4;
@@ -1026,11 +1027,7 @@ mod mock_trait_tests {
         let capture_for_put = Arc::clone(&captured);
         let put_rule = mock!(aws_sdk_s3::Client::put_object).then_compute_output(move |request| {
             let mut capture = capture_for_put.lock().expect("capture lock");
-            capture.body = request
-                .body()
-                .bytes()
-                .expect("in-memory put body")
-                .to_vec();
+            capture.body = request.body().bytes().expect("in-memory put body").to_vec();
             capture.metadata = request.metadata().cloned().unwrap_or_default();
             PutObjectOutput::builder().build()
         });
@@ -1045,7 +1042,11 @@ mod mock_trait_tests {
         let put_kms = mock_client!(aws_sdk_kms, RuleMode::Sequential, &[&generate_rule]);
         let writer = S3Reserve::with_clients(sample_config(), put_s3, put_kms);
         writer
-            .put("original", Bytes::from_static(b"hello world"), sample_metadata())
+            .put(
+                "original",
+                Bytes::from_static(b"hello world"),
+                sample_metadata(),
+            )
             .await
             .expect("write fixture");
 
@@ -1076,8 +1077,7 @@ mod mock_trait_tests {
         let config = sample_config();
         let meta_blob = encode_meta_blob(&sample_metadata()).expect("encode metadata");
         let aad = envelope_aad_v2(&config, "k", "reserve/k", &meta_blob);
-        let ciphertext =
-            aes256gcm_encrypt(&FAKE_DATA_KEY, &nonce, plaintext, &aad).expect("seal");
+        let ciphertext = aes256gcm_encrypt(&FAKE_DATA_KEY, &nonce, plaintext, &aad).expect("seal");
 
         let b64 = base64::engine::general_purpose::STANDARD;
         let metadata = meta_pairs(

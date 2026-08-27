@@ -75,13 +75,15 @@ pub static RFC7009_RFC7662_REQUESTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::n
     .expect("sbproxy_mcp_gateway_revocation_introspection_requests_total registers exactly once")
 });
 
-/// Sessions currently held by whichever `SessionStore` the deployment
-/// wired up, sampled at read time. Only [`crate::session::InMemorySessionStore`]
-/// can report this cheaply (it is a `HashMap` behind a lock already
-/// walked on every `put`); the storage-backed `RedisSessionStore` does
-/// not expose a count without an expensive `SCAN`, so this stays a
-/// gauge callers update explicitly rather than one this module derives
-/// on its own.
+/// Sessions currently held by [`crate::session::InMemorySessionStore`],
+/// written on every `put`, `take`, and purge.
+///
+/// What it cannot see: a deployment running the storage-backed
+/// `RedisSessionStore`. That store cannot report a count without an
+/// expensive `SCAN`, so it leaves the gauge alone and the panel reading
+/// this family stays at whatever the in-memory store last wrote, which
+/// on a Redis-only deployment is zero. Read it as "in-memory sessions",
+/// not as "sessions".
 pub static SESSIONS_ACTIVE: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!(
         "sbproxy_mcp_gateway_sessions_active",
@@ -103,6 +105,11 @@ pub fn record_token(outcome: &str) {
 /// Record a DPoP proof verification outcome.
 pub fn record_dpop(outcome: &str) {
     DPOP_PROOFS_TOTAL.with_label_values(&[outcome]).inc();
+}
+
+/// Record the live in-memory authorization-session count.
+pub fn record_sessions_active(live: usize) {
+    SESSIONS_ACTIVE.set(live as i64);
 }
 
 /// Record a `/revoke` or `/introspect` outcome.

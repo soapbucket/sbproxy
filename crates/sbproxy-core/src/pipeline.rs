@@ -918,7 +918,7 @@ impl CacheReserveHealthState {
             }
             let now = chrono::Utc::now();
             state.state = CacheReserveHealthStatus::Healthy;
-            state.since = now.clone();
+            state.since = now;
             state.recovered_at = Some(now);
             state.last_operation = Some(operation);
             state.reason_code = None;
@@ -2409,14 +2409,13 @@ fn build_federation_issuer(
         "EdDSA" => jsonwebtoken::Algorithm::EdDSA,
         _ => anyhow::bail!("proxy.federation signing algorithm is not allowed"),
     };
-    let pem = std::fs::read(&config.signing_key.pem_file).map_err(|error| {
-        anyhow::anyhow!("read proxy.federation signing-key PEM: {error}")
-    })?;
+    let pem = std::fs::read(&config.signing_key.pem_file)
+        .map_err(|error| anyhow::anyhow!("read proxy.federation signing-key PEM: {error}"))?;
     let published_jwks: sbproxy_federation::FederationKeySet =
         serde_json::from_value(config.published_jwks.clone())
             .map_err(|_| anyhow::anyhow!("parse proxy.federation published_jwks"))?;
-    let issuer = sbproxy_federation::WellKnownIssuer::new(
-        sbproxy_federation::FederationServerConfig {
+    let issuer =
+        sbproxy_federation::WellKnownIssuer::new(sbproxy_federation::FederationServerConfig {
             entity_id: config.entity_id.clone(),
             signing_key: sbproxy_federation::SigningKeyConfig {
                 pem,
@@ -2430,8 +2429,7 @@ fn build_federation_issuer(
             metadata_policy: None,
             lifetime: std::time::Duration::from_secs(config.lifetime_secs),
             refresh_margin: std::time::Duration::from_secs(config.refresh_margin_secs),
-        },
-    )?;
+        })?;
     Ok(Some(Arc::new(issuer)))
 }
 

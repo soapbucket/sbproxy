@@ -2224,7 +2224,12 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
     // WOR-2199: a bind address the operator cannot express is a bind
     // address they cannot restrict, and one they misspell must not fall
     // back to every interface.
-    if let Some(federation) = config_file.proxy.federation.as_ref().filter(|cfg| cfg.enabled) {
+    if let Some(federation) = config_file
+        .proxy
+        .federation
+        .as_ref()
+        .filter(|cfg| cfg.enabled)
+    {
         if !federation.entity_id.starts_with("https://") {
             anyhow::bail!("config compile: proxy.federation.entity_id must use https");
         }
@@ -2237,19 +2242,9 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         }
         if !matches!(
             federation.signing_key.algorithm.as_str(),
-            "ES256"
-                | "ES384"
-                | "RS256"
-                | "RS384"
-                | "RS512"
-                | "PS256"
-                | "PS384"
-                | "PS512"
-                | "EdDSA"
+            "ES256" | "ES384" | "RS256" | "RS384" | "RS512" | "PS256" | "PS384" | "PS512" | "EdDSA"
         ) {
-            anyhow::bail!(
-                "config compile: proxy.federation.signing_key.algorithm is not allowed"
-            );
+            anyhow::bail!("config compile: proxy.federation.signing_key.algorithm is not allowed");
         }
         if federation
             .published_jwks

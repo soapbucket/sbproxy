@@ -179,6 +179,14 @@ fn url_form_encode(s: &str) -> String {
 /// payload is `payload`. The signature segment is a placeholder; the
 /// broker only inspects the payload for the corpus entries that
 /// reach the JWT-parsing path.
+/// The ES256 keypair the broker signs its own access tokens with in
+/// these fixtures. The public half is the JWK inlined beside it.
+const BROKER_PRIVATE_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgevZzL1gdAFr88hb2\n\
+OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
+1RTwjmYSi9R/zpBnuQ4EiMnCqfMPWiZqB4QdbAd0E7oH50VpuZ1P087G\n\
+-----END PRIVATE KEY-----";
+
 fn fixture_jwt(payload: serde_json::Value) -> String {
     let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(serde_json::to_vec(&serde_json::json!({"alg":"none","typ":"JWT"})).expect("hdr"));
@@ -674,16 +682,62 @@ async fn op_token_exchange_no_client_id(e: &Entry, outcome: Outcome) {
 }
 
 async fn op_token_exchange_deep_chain(e: &Entry, outcome: Outcome) {
-    // base_config sets max_chain_depth to 2.
-    let app = build_default_app();
-    let token = fixture_jwt(serde_json::json!({
-        "iss": "https://idp.example",
-        "sub": "alice",
-        "act": {
-            "sub": "service-a",
-            "act": {"sub": "service-b"},
+    // The subject token has to be one the broker itself minted and
+    // signed: the exchange refuses an unverifiable subject before it
+    // ever counts the chain, so an `alg: none` fixture here would be
+    // blocked for the wrong reason and this case would stop covering
+    // the depth cap it is named for.
+    let mut cfg = base_config();
+    cfg.external_base_url = "https://broker.example".to_string();
+    cfg.broker_signing_key = Some(sbproxy_mcp_gateway::JwkKey::Pem {
+        pem: BROKER_PRIVATE_PEM.to_string(),
+        alg: "ES256".to_string(),
+        kid: Some("broker-key".to_string()),
+        // A PEM private key alone cannot verify: the broker needs the
+        // matching public JWK to check its own signature.
+        public_jwk: Some(serde_json::json!({
+            "kty": "EC", "crv": "P-256",
+            "x": "EVs_o5-uQbTjL3chynL4wXgUg2R9q9UU8I5mEovUf84",
+            "y": "kGe5DgSIycKp8w9aJmoHhB1sB3QTugfnRWm5nU_TzsY",
+            "kid": "broker-key", "use": "sig", "alg": "ES256"
+        })),
+    });
+    let issuer = sbproxy_mcp_gateway::well_known::broker_issuer(&cfg);
+    cfg.subject_token_issuers = vec![issuer.clone()];
+    // max_chain_depth is 2 and the handler refuses at depth >= max, so
+    // a 2-deep `act` chain is exactly the first one over the line.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock is after the epoch")
+        .as_secs() as i64;
+    let token = sbproxy_mcp_gateway::mint_at_jwt(
+        &sbproxy_mcp_gateway::AtJwtClaims {
+            iss: issuer,
+            sub: "alice".to_string(),
+            aud: serde_json::Value::String(cfg.resource_uri.clone()),
+            exp: now + 300,
+            iat: now,
+            jti: "corpus-deep-chain-jti".to_string(),
+            client_id: "original-client".to_string(),
+            scope: Some("tools:call".to_string()),
+            auth_time: None,
+            acr: None,
+            amr: None,
+            act: Some(serde_json::json!({
+                "sub": "service-a",
+                "act": {"sub": "service-b"},
+            })),
+            cnf: None,
+            actor: None,
+            principal: None,
+            tnx: None,
+            purpose: None,
         },
-    }));
+        cfg.broker_signing_key.as_ref().expect("broker signing key"),
+    )
+    .expect("broker-signed subject token");
+    let store = InMemorySessionStore::arc(Duration::from_secs(60));
+    let app = broker_router(Arc::new(cfg), store);
     let body = format!(
         "grant_type={}&subject_token={}&subject_token_type={}&client_id=cli",
         url_form_encode("urn:ietf:params:oauth:grant-type:token-exchange"),

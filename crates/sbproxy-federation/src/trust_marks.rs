@@ -263,8 +263,8 @@ fn verify_trust_mark_inner(
             return Err(FederationError::MissingClaim(required));
         }
     }
-    let claims: TrustMarkClaims = serde_json::from_value(decoded.claims)
-        .map_err(|_| FederationError::VerificationFailed)?;
+    let claims: TrustMarkClaims =
+        serde_json::from_value(decoded.claims).map_err(|_| FederationError::VerificationFailed)?;
     // Step 6: required-field checks (empty strings rejected even
     // though serde admits them).
     if claims.iss.is_empty() {

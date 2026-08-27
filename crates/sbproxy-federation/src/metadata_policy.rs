@@ -561,7 +561,10 @@ mod tests {
             &policy_for("default", json!("superior")),
             &policy_for("default", json!("subordinate")),
         );
-        assert!(result.is_err(), "conflicting defaults must be deterministic");
+        assert!(
+            result.is_err(),
+            "conflicting defaults must be deterministic"
+        );
     }
 
     #[test]
