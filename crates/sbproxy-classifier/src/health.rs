@@ -1640,15 +1640,23 @@ async fn write_response(
     outcome: &mut Option<crate::metrics::OutcomeGuard>,
     #[cfg(test)] control: Option<&HttpTestControl>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if body.len() > MAX_RESPONSE_BYTES {
-        finish_http_failure(
-            outcome,
-            command,
-            crate::metrics::Stage::Limit,
-            crate::metrics::Reason::ResourceLimit,
-        );
-        return Ok(());
-    }
+    // An over-cap body used to close the socket with nothing written, so a
+    // Prometheus scrape of an oversized registry saw an empty reply and
+    // marked the target down with no status to explain it. Say 507 with a
+    // fixed body instead; the failure is still recorded either way.
+    let (status, content_type, body, response_outcome) = if body.len() > MAX_RESPONSE_BYTES {
+        (
+            507u16,
+            "text/plain",
+            format!("response exceeds the {MAX_RESPONSE_BYTES}-byte limit\n"),
+            HttpResponseOutcome::Failure(
+                crate::metrics::Stage::Limit,
+                crate::metrics::Reason::ResourceLimit,
+            ),
+        )
+    } else {
+        (status, content_type, body, response_outcome)
+    };
     let response = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}",
         reason = status_reason(status),

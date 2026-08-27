@@ -302,7 +302,9 @@ fn requests_total() -> Option<&'static IntCounterVec> {
         .get_or_init(|| {
             build_counter_vec(
                 "sbproxy_classifier_requests_total",
-                "Requests handled by the rich classifier sidecar, by transport and command.",
+                "Successful rich classifier sidecar requests, by transport and command. Only \
+                 `OutcomeGuard::success` increments it, so an error rate needs \
+                 `sbproxy_classifier_attempts_total` as its denominator, not this.",
                 &["transport", "cmd"],
             )
         })
