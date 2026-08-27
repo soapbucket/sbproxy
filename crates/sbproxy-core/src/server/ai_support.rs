@@ -1850,26 +1850,31 @@ impl SseUsageScanner {
     }
 }
 
-/// Record post-dispatch usage against every configured budget scope
-/// for this request. Tokens come from the upstream `usage` block;
-/// cost is estimated against the model the request actually
-/// executed against using the embedded price catalog in
-/// `sbproxy-ai/src/budget.rs`.
-/// Build and publish a per-surface `AiBillingEvent` for a request
-/// that has just returned a response from the upstream.
+// Two doc blocks stood here with no item under them, left behind by
+// functions that moved. rustdoc attaches an orphan to whatever item
+// follows, so they documented `proxy_status_error_token` as the
+// BudgetTracker's only writer. Deleted rather than moved: the WOR-2212
+// invariant they carried is stated where it is enforced, on
+// `debit_budget_without_billing_event`.
+
+/// The RFC 9209 `error` token for an AI cascade that dispatched no
+/// tier because the calling credential's `provider` allow/block policy
+/// excluded every one of them (WOR-2685).
 ///
-/// Phase 8 of the AI deep-integration plan: every dispatched AI
-/// request emits a billing event onto the observability bus and into
-/// the in-process `BudgetTracker`. Non-chat surfaces (image, audio,
-/// moderations, reranking, files, batches, fine-tuning) ship today
-/// as `PerCall` events with `cost_usd = 0.0`; per-unit pricing for
-/// images, audio seconds, and rerank documents lands when the
-/// pricing tables ship.
+/// The token is the whole of what the caller is told. The server-side
+/// diagnosis names the credential's allow and block lists and the
+/// providers the routing plan asked for, and none of that may cross
+/// the boundary: which providers exist behind the gateway that this
+/// caller may not reach is another tenant's configuration as far as
+/// this caller is concerned. A closed token says "your credential, not
+/// our upstream" and says nothing else.
 ///
-/// This is the **only** writer into the in-process `BudgetTracker`
-/// (WOR-2212). Every dispatch path that spends budget reaches it, and
-/// a second writer beside it is the bug that made a configured budget
-/// enforce at half its value for as long as one existed.
+/// An RFC 9209 extension token, which section 2.3 provides for. It
+/// rides the same `map_upstream_failure` path as the registered ones
+/// so the `Proxy-Status` header and an enabled `problem_details` body
+/// both carry it with no new rendering code.
+pub(super) const CREDENTIAL_PROVIDER_LOCKED_TOKEN: &str = "credential_provider_locked";
+
 /// Map an HTTP status code to a stable RFC 9209 `Proxy-Status`
 /// `error` token. Returns `None` for status codes that don't have
 /// a canonical proxy-error mapping (the header is still emitted
@@ -1892,6 +1897,14 @@ pub(super) fn proxy_status_error_token(status: u16) -> Option<&'static str> {
 pub(super) fn map_upstream_failure(e: &Error) -> (u16, Option<&'static str>) {
     use pingora_error::ErrorType as Et;
     match &e.etype {
+        // WOR-2685: a credential provider lock. Still a 502, because
+        // the cascade is the whole of dispatch on that path and the
+        // request did end without an upstream response, but the token
+        // separates it from the transport failures it used to be
+        // indistinguishable from.
+        Et::Custom(name) if *name == CREDENTIAL_PROVIDER_LOCKED_TOKEN => {
+            (502, Some(CREDENTIAL_PROVIDER_LOCKED_TOKEN))
+        }
         // Connect-phase timeouts surface as 504 with the canonical
         // `connection_timeout` token.
         Et::ConnectTimedout | Et::TLSHandshakeTimedout | Et::ReadTimedout | Et::WriteTimedout => {

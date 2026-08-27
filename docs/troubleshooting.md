@@ -66,6 +66,7 @@ Check:
 - Confirm `sbproxy_requests_total{hostname="...",status="502"}` is rising for one origin only. If every origin is failing at once, suspect DNS or an egress network change instead of one dead backend.
 - If the origin is a `load_balancer`, check which targets are ejected via `GET /api/health/targets` on the admin server. Active health checks, outlier detection, and the circuit breaker each eject targets independently; with every target ejected the LB falls back to the unfiltered list rather than failing the client.
 - Give the origin `retry` (connect errors and 502/503 are retryable), and consider a `fallback_origin` block so callers get a degraded response instead of the 502 while the upstream heals. See [degradation.md](degradation.md) and `examples/fallback-origin/`.
+- One 502 on an AI route is not an upstream failure at all: a confidence cascade whose every tier names a provider the calling credential's `provider` policy excludes never reaches an upstream. With `proxy_status` on, that 502 carries `error="credential_provider_locked"` instead of `http_request_error`; see "AI requests fail with provider error" below for what to change.
 
 ## A circuit breaker keeps opening
 
@@ -105,6 +106,10 @@ Check in order:
 4. If using a fallback chain, check that at least one provider in the chain has available capacity. The log will show which provider was attempted last.
 5. If the error is "context window exceeded," the requested model does not support the token count in the prompt. Add a model with a larger context window to the provider list.
 6. `sbproxy_ai_provider_errors_total{provider,error_kind}` splits the failures into transport, timeout, 4xx, 5xx, and parse classes, and `sbproxy_ai_failovers_total` shows whether the routing chain is absorbing them.
+7. If the route uses a confidence cascade and the client gets a 502 with no upstream ever contacted, grep the server log for `cascade exhausted`. Two shapes, and they point at different knobs:
+   - `cascade exhausted: every candidate tier was excluded by the credential's provider policy (allowed=..., blocked=...); routing plan requested provider(s) ..., which this credential cannot reach` means the credential is the cause. Widen `allowed_providers` on the virtual key, drop the name from its block list, or point the cascade's tiers at a provider the credential can reach. The line is logged with `event="ai.cascade.credential_lock"`. The admin Routing Decisions row for that request carries the shorter `credential_provider_lock: <providers>` rather than this whole sentence, because the allow and block lists belong in the log and not in a console column; the request's attributed `outcome` is `credential_provider_lock`; and the refusal reaches a configured `events:` sink as a `policy_denied` record.
+   - `cascade exhausted without dispatching any tier (skipped: openai (data_posture), anthropic (credential_lock), ...)` means the causes were mixed, and each tier's own reason is named. `data_posture` is the request's `x-sbproxy-require-zdr` / `x-sbproxy-disallow-data-collection` header or the origin's `data_posture:` block, not the credential; `not_found` is a routing plan naming a provider that is not configured; `disabled` and `unhealthy` are the provider entry's `enabled` switch and the resilience layer.
+   - `sbproxy_ai_cascade_tier_outcomes_total{outcome="credential_lock"}` counts the first shape without the log, which is what to alert on when a credential policy drifts away from a routing plan across a fleet.
 
 ## Rate limiter rejecting requests unexpectedly
 

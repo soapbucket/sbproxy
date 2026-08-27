@@ -664,7 +664,13 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["tier", "outcome"],
-        description: "Cascade routing tier outcomes (accepted | retry | cost_cap).",
+        // Comma-separated because this renders into a Markdown table
+        // cell in `docs/metrics-stability.md`, where an unescaped pipe
+        // opens a new column. WOR-2685 split the pre-dispatch
+        // exclusions out of `retry`, which had been carrying five
+        // meanings that were never retries.
+        description: "Cascade routing tier outcomes (accepted, retry, cost_cap, \
+                      credential_lock, data_posture, disabled, not_found, unhealthy).",
         dead_reason: None,
     },
     MetricCapability {
@@ -2337,6 +2343,17 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &[],
         description: "Evidence sequence lookups for a tenant past the tracked-tenant cap, sharing the overflow counter.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_fallback_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_fallback_served"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["trigger", "origin", "tenant"],
+        description: "fallback_origin responses served, by trigger (`status` when the primary answered with a status listed under `on_status`, `error` when it failed outright and `on_error` caught it), origin, and tenant. A fallback is a degraded response by construction, so its rate is the first number worth alerting on when a primary starts failing; before this the only evidence was a boolean on an access-log row.",
         dead_reason: None,
     },
     MetricCapability {

@@ -160,4 +160,39 @@ describe("auth guard", () => {
     expect(auth.sessionExpired.value).toBe(true);
     vi.unstubAllGlobals();
   });
+
+  it("sends the operator to the login route when a request comes back 401 mid-session", async () => {
+    vi.spyOn(api, "session").mockResolvedValue({
+      authenticated: true,
+      username: "admin",
+      role: "admin",
+    } as never);
+    const auth = useAuth();
+    await auth.refresh();
+    await router.push("/logs");
+    expect(router.currentRoute.value.path).toBe("/logs");
+
+    // WOR-2688: the server answers the console's 401s without
+    // `WWW-Authenticate` now, so nothing but this app asks for credentials.
+    // Flipping the auth flag is not enough on its own: the route guard only
+    // runs on a navigation, so without this the operator sits on /logs with
+    // the chrome gone and no way back to a sign-in form.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 401,
+        text: async () => "unauthorized",
+      }),
+    );
+    await expect(api.keys()).rejects.toThrow();
+
+    await vi.waitFor(() => {
+      expect(router.currentRoute.value.name).toBe("login");
+    });
+    // And the page they were reading rides along, so signing back in
+    // returns them to it.
+    expect(router.currentRoute.value.query.next).toBe("/logs");
+    vi.unstubAllGlobals();
+  });
 });

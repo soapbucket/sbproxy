@@ -22,6 +22,10 @@
 //   *    /echo                - Echo request details as JSON
 //
 //   GET  /status/:code        - Return specified HTTP status code
+//   GET  /status-empty/:code  - Return specified HTTP status code with a
+//                               genuinely empty (Content-Length: 0) body,
+//                               plus a marker header (WOR-2686 fallback
+//                               header-leak / body-mismatch regression case)
 //   GET  /delay/:ms           - Delay response by N milliseconds
 //   POST /json                - Parse and re-emit JSON body
 //   GET  /html                - Return sample HTML page
@@ -176,6 +180,21 @@ async function handleRequest(req, res) {
     if (statusMatch) {
         const code = parseInt(statusMatch[1], 10);
         return sendJSON(res, code, { status: code, message: http.STATUS_CODES[code] || 'Unknown' });
+    }
+
+    // --- Status code, genuinely bodyless (WOR-2686) ---
+    // A real backend that answers with `Content-Length: 0` and no body
+    // bytes at all, the way httpbin.org/status/:code does for the
+    // status codes it is asked to simulate. Also stamps a marker header
+    // that must never survive an `on_status` fallback rewrite.
+    const statusEmptyMatch = path.match(/^\/status-empty\/(\d+)$/);
+    if (statusEmptyMatch) {
+        const code = parseInt(statusEmptyMatch[1], 10);
+        res.writeHead(code, {
+            'Content-Length': '0',
+            'X-Origin-Marker': 'should-not-leak-through-fallback',
+        });
+        return res.end();
     }
 
     // --- Delay ---

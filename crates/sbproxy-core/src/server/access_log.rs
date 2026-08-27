@@ -580,7 +580,7 @@ pub(super) fn emit_access_log(
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
-    let upstream_status = ctx.response_status.filter(|upstream| *upstream != status);
+    let upstream_status = logged_upstream_status(ctx, status);
 
     let context = AccessLogContext {
         // WOR-2407: name the config that served this request, and the
@@ -1046,6 +1046,45 @@ pub(super) fn intent_label(intent: crate::hooks::IntentCategory) -> String {
     intent.as_str().to_string()
 }
 
+/// The `upstream_status` field: the status the primary upstream
+/// answered with, but only when it differs from the status the client
+/// saw.
+///
+/// A free function rather than an expression inline in `emit_access_log`
+/// because the bug it fixes was invisible in place. It read
+/// `ctx.response_status` and filtered it against `status`, and `status`
+/// comes from `final_response_status`, which *prefers*
+/// `ctx.response_status`: the two were the same number by construction,
+/// so the field was `None` on every request the proxy had ever served,
+/// including the fallback and `response_modifier` cases the field's own
+/// documentation names. Reading `ctx.upstream_status`, which nothing but
+/// `response_filter` writes, is what makes the comparison mean something
+/// (WOR-2686).
+///
+/// What `ctx.upstream_status` actually holds, since the difference
+/// matters to anyone reading a log row: the status on the upstream
+/// response *as it entered `response_filter`'s header stages*, recorded
+/// after the Proxy-Wasm response-header filter
+/// (`proxy_http.rs`, `filter_response_headers`) and the gRPC-to-HTTP
+/// status translation, and before every stage below it. A Proxy-Wasm
+/// filter that rewrites a `500` to a `200` therefore reports the
+/// filter's value here, not the origin's. `None` when no upstream
+/// answered at all.
+///
+/// This surfaces on any request where the two differ, which is a rule
+/// rather than a list: a `fallback_origin` on its `on_status` trigger,
+/// a `status` response modifier, the WOR-2145 metering refusal, a
+/// closed transform aborting a committed response, and the Proxy-Wasm
+/// local-response paths all qualify once an upstream has answered.
+/// `fallback_origin`'s `on_error` trigger cannot, because it fires
+/// before any upstream response exists and leaves this `None`.
+/// `docs/access-log.md` states the rule for operators rather than
+/// enumerating the sites, so the two cannot drift apart as sites are
+/// added.
+pub(super) fn logged_upstream_status(ctx: &RequestContext, status: u16) -> Option<u16> {
+    ctx.upstream_status.filter(|upstream| *upstream != status)
+}
+
 /// Map a status code to a coarse failure label suitable for an ML
 /// feature. `None` for 2xx; categorical strings otherwise. Specific
 /// failure modes (waf_blocked, rate_limited, ...) are stamped at the
@@ -1099,6 +1138,17 @@ pub(super) fn ai_outcome_label(
             // ceiling trimmed, and a real exhaustion on a
             // ceiling-enabled origin cannot be told apart from them.
             "price_ceiling_block" => "price_ceiling_block",
+            // WOR-2685: a cascade whose every tier the calling
+            // credential's provider policy excluded returns 502, and
+            // the status arm below reads any 5xx as `upstream_5xx`. No
+            // upstream was contacted: the refusal is the gateway's, on
+            // a condition that will not heal by itself. Without its own
+            // value it lands in `upstream_5xx` beside real provider
+            // outages, so an operator paging on those is woken by a
+            // credential whose provider policy drifted away from its
+            // routing plan, and the alert this PR's own changelog and
+            // troubleshooting entry tell them to write matches nothing.
+            "credential_provider_lock" => "credential_provider_lock",
             "refusal" => "refusal",
             _ => "other",
         };
@@ -1472,6 +1522,63 @@ mod run_identity_tests {
 }
 
 #[cfg(test)]
+mod upstream_status_tests {
+    use super::logged_upstream_status;
+    use crate::context::RequestContext;
+
+    /// The primary's status reaches the access log when a fallback
+    /// replaced the status the client saw.
+    ///
+    /// The red proof is in the test body: the expression this replaced is
+    /// evaluated alongside the fixed one, so the regression is
+    /// demonstrated rather than remembered. On a fallback an on-call
+    /// engineer would otherwise see `status: 200, fallback_triggered:
+    /// true` and have no record anywhere of whether the primary answered
+    /// 502, 503 or 504, since the only other place that value appeared
+    /// was a `debug!` that `release_max_level_info` compiles out.
+    #[test]
+    fn a_fallback_puts_the_primary_status_on_the_access_log() {
+        let mut ctx = RequestContext::new();
+        ctx.upstream_status = Some(503);
+        // What the client saw, and therefore what `final_response_status`
+        // hands `emit_access_log` as `status`.
+        ctx.response_status = Some(200);
+        let status = ctx.response_status.expect("the fallback set it");
+
+        let before_the_fix = ctx.response_status.filter(|upstream| *upstream != status);
+        assert_eq!(
+            before_the_fix, None,
+            "the old field filtered response_status against a number computed from \
+             response_status, so it could never be anything but None"
+        );
+
+        assert_eq!(logged_upstream_status(&ctx, status), Some(503));
+    }
+
+    /// A response the proxy passed through unchanged reports nothing, so
+    /// the field still means "the proxy rewrote this".
+    #[test]
+    fn an_unrewritten_status_reports_no_upstream_status() {
+        let mut ctx = RequestContext::new();
+        ctx.upstream_status = Some(200);
+        ctx.response_status = Some(200);
+
+        assert_eq!(logged_upstream_status(&ctx, 200), None);
+    }
+
+    /// No upstream answered at all: a short-circuited request, or an
+    /// `on_error` fallback, where `fail_to_proxy` fires before any
+    /// upstream response exists.
+    #[test]
+    fn no_upstream_response_reports_no_upstream_status() {
+        let mut ctx = RequestContext::new();
+        ctx.response_status = Some(502);
+
+        assert_eq!(logged_upstream_status(&ctx, 502), None);
+    }
+}
+
+#[cfg(test)]
 mod outcome_tests {
     use super::{ai_gateway_decision, ai_outcome_label};
 
@@ -1555,6 +1662,36 @@ mod outcome_tests {
         // An unknown override degrades to `other` rather than leaking an
         // unbounded label.
         assert_eq!(ai_outcome_label(200, Some("bogus"), false), "other");
+    }
+
+    /// WOR-2685: the closed label an AI cascade's credential provider
+    /// lock is broken down by, on `sbproxy_ai_requests_attributed_total`,
+    /// on `sbproxy_ai_gateway_decisions_total`'s rejection reason, and
+    /// in the durable usage rollup. Stamping `ctx.ai_outcome` is only
+    /// half the wiring: an override this match does not name falls
+    /// through to `other`, which is where every unclassified outcome
+    /// already is, so the series an operator alerts on would stay empty
+    /// forever while the requests piled up somewhere unreadable.
+    #[test]
+    fn outcome_label_separates_a_credential_provider_lock_from_an_upstream_failure() {
+        assert_eq!(
+            ai_outcome_label(502, None, true),
+            "upstream_5xx",
+            "a 502 with no override is still a plain upstream failure"
+        );
+        assert_eq!(
+            ai_outcome_label(502, Some("credential_provider_lock"), false),
+            "credential_provider_lock",
+            "a refusal the gateway made before contacting any provider must not read as an \
+             upstream outage"
+        );
+        // The second scrapeable surface the same label feeds: the
+        // rejection `reason` on `sbproxy_ai_gateway_decisions_total`.
+        assert_eq!(
+            ai_gateway_decision("credential_provider_lock", 0, true),
+            Some(("rejected", "credential_provider_lock")),
+            "a cascade that never reached a provider is a rejection, named by its own reason"
+        );
     }
 }
 
