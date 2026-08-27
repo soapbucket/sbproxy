@@ -10932,7 +10932,11 @@ pub(super) async fn handle_ai_proxy(
                 let quality_req = crate::hooks::QualityRequest {
                     origin: hostname.to_string(),
                     model_id: (!model.is_empty()).then(|| model.clone()),
-                    prompt: extracted_prompt.clone(),
+                    // Moved, not cloned: this is the last read of the
+                    // extracted prompt on the request path, and a copy here
+                    // is a second whole-prompt allocation outside the
+                    // fanout's live-byte budget.
+                    prompt: extracted_prompt,
                     candidate_providers,
                 };
                 match crate::quality_routing::select_from_quality_hook_async(
