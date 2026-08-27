@@ -397,8 +397,8 @@ where
 
 /// Deserialize a state list through the budgeted seed.
 ///
-/// `Vec<FsmState>`'s derived impl never reaches [`StatesVisitor`], which is
-/// the only place `MAX_FSM_STATES` is enforced, and it calls
+/// `Vec<FsmState>`'s derived impl never reaches the crate-private visitor
+/// that is the only place `MAX_FSM_STATES` is enforced, and it calls
 /// `FsmState::deserialize` per element, which starts a fresh budget each
 /// time and so turns the graph-byte and edge ceilings into per-state ones.
 /// Any request type carrying a bare state list wants
