@@ -81,7 +81,7 @@ impl McpSecurityContext {
 
     /// Build a context for a broker mounted inside the sbproxy request
     /// path, where `/admin/status` must not be served on the public
-    /// origin. See [`Self::mount_admin_status`].
+    /// origin. See the `mount_admin_status` field on this struct.
     #[must_use]
     pub fn in_process() -> Self {
         Self {

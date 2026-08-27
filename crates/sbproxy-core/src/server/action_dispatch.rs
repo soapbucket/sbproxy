@@ -12586,8 +12586,25 @@ mod mcp_catalog_snapshot_tests {
         }))
         .expect("integrated broker config compiles");
 
-        let response = mcp_http_exchange(&action, "GET", "/mcp/oauth/admin/status", "", b"").await;
+        // A real broker route answers, which is what proves the route
+        // tree is mounted in this process at all.
+        let response = mcp_http_exchange(
+            &action,
+            "GET",
+            "/mcp/oauth/.well-known/oauth-authorization-server",
+            "",
+            b"",
+        )
+        .await;
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+        // `/admin/status` is not one of them. The whole broker route
+        // tree is dispatched on the public MCP origin before the
+        // resource-server check, and the OAuth routes have to stay
+        // unauthenticated for the flow to work, so mounting it here
+        // would answer "which security controls are off" to anyone.
+        let refused = mcp_http_exchange(&action, "GET", "/mcp/oauth/admin/status", "", b"").await;
+        assert!(refused.starts_with("HTTP/1.1 404"), "{refused}");
     }
 
     #[tokio::test]

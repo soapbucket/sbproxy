@@ -142,7 +142,7 @@ struct IssuedQuote {
 /// be able to compute it from the quote it received. It is the SHA-256
 /// of the same canonical bytes the quote's own signature covers, in
 /// `sha256:<hex>` form, and the ordering contract on
-/// [`canonical_quote_signing_input`] applies to it too.
+/// `canonical_quote_signing_input` applies to it too.
 ///
 /// # Errors
 ///

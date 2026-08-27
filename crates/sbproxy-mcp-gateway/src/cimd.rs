@@ -467,7 +467,7 @@ fn validate_document(doc: &ClientIdMetadataDocument, client_id_url: &str) -> Res
 
 /// Fetches a CIMD document at `client_id_url`, enforcing the security
 /// envelope the broker requires. `allow_insecure_loopback` is the
-/// crate-internal test exemption described on [`enforce_fetch_envelope`];
+/// crate-internal test exemption described on `enforce_fetch_envelope`;
 /// production callers pass `false`.
 ///
 /// The envelope:
