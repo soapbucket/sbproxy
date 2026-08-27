@@ -154,19 +154,27 @@ origins:
         #
         # `max_spend_usd` is required and has no default. An unbounded
         # judge is the failure this key exists to prevent, so a `judge:`
-        # block without it is refused at config load. The cap
-        # auto-pauses judging until `spend_window` rolls, and
-        # `agreement.paused` on the report above says when it has.
+        # block without it is refused at config load. It is one ceiling
+        # for the whole block, not one per target: the two targets above
+        # draw on the same five dollars a day. The cap auto-pauses
+        # judging until `spend_window` rolls, and `agreement.paused` on
+        # the report above says when it has. `daily` is a rolling 24
+        # hours from process start, not midnight UTC.
         #
-        # Two things run today: the deterministic divergence pre-filter,
-        # so two identical answers are never billed for a judge call,
-        # and the cap itself. The judge prompt and the scoring loop are
-        # not implemented yet, and `agreement.status` reads
-        # `scoring_pending` rather than reporting a zero that would look
-        # like a tie. See docs/ai-gateway.md.
+        # `provider` names a providers[] entry on this action and is
+        # resolved against it at config load, so a typo is refused here
+        # rather than surfacing when the scorer ships.
+        #
+        # Nothing behind this key runs yet. The divergence pre-filter
+        # and the cap are implemented and tested and have no caller: the
+        # batch job that would call them is the judge prompt and the
+        # scoring loop, which are the scoped follow-up. Until then the
+        # whole runtime effect of this block is that `agreement.status`
+        # on the report reads `scoring_pending` instead of
+        # `not_configured`, and `judge_spend_cap_usd` appears in the
+        # row. Do not read the cap as a control in force. See
+        # docs/ai-gateway.md.
         judge:
           provider: judge-openai
-          model: gpt-4o-mini
           max_spend_usd: 5.0
           spend_window: daily
-          divergence_prefilter: true
