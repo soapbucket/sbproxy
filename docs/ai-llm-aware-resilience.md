@@ -195,7 +195,7 @@ it: alerting on
 `rate(sbproxy_ai_failovers_total{reason="pre_header_timeout"}[5m]) > 0`
 on such an origin reads zero through an incident in which every
 streaming request is failing at the budget. What always ticks is
-`sbproxy_ai_provider_errors_total{provider,kind="timeout"}`, which a
+`sbproxy_ai_provider_errors_total{provider,error_kind="timeout"}`, which a
 pre-header elapse is classified as, alongside the `502` the caller
 receives. Alert on that one where the budget cannot hand anything on.
 
