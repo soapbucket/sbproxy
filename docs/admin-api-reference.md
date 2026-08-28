@@ -595,12 +595,14 @@ Response body: an array of `RequestLogEntry`:
 | `routing_detail` | string | Why a per-request strategy picked that target. Bounded and operator-derived, never exemplar text or caller input. `semantic_route` writes the matched deployment with the winning exemplar's ordinal (or `centroid`) and the cosine score against the floor, for example `matched fast-pool exemplar 1 at 0.831 (floor 0.750)`, or the near-miss that sent the request to the fallback: `below floor: closest fast-pool at 0.612 (floor 0.750)`, `no user message to embed`, `embedder unavailable; routed to the default`, or `matched fast-pool at 0.831 but it is not eligible for this request` when the winner was filtered out before selection. Absent for strategies that do not decide per request. |
 | `provider`, `model` | string | AI provider and model when the AI gateway handled the request. |
 | `tokens_in`, `tokens_out` | int | Parsed prompt and completion tokens. |
+| `tokens_cached`, `tokens_cache_write` | int | Provider prompt-cache read and write tokens, when the provider reported them (OpenAI's `prompt_tokens_details.cached_tokens`, Anthropic's `cache_read_input_tokens` and `cache_creation_input_tokens`). Both are **subsets of `tokens_in`**, not additions to it, so do not sum them alongside it. Absent when the provider reported neither. |
 | `cost_usd_micros` | int | Estimated AI cost in millionths of a US dollar. |
 | `guardrail_category`, `guardrail_action` | string | Bounded guardrail outcome when a guardrail intervened. |
 | `api_key_id` | string | Canonical public id of the key that governed the request, when one resolved. Matches the access log column, the `sbproxy_inbound_key_requests_total{api_key_id}` label, and the `sbproxy.key_id` span attribute. Never the secret. |
 | `key_mode` | string | Inbound credential mode: `none`, `minted`, or `native`. |
 | `key_provider` | string | Recognized native provider label, present on `native` rows. |
 | `credential_source` | string | Which secret the AI attempt presented upstream, the outbound counterpart to `key_mode`: `provider_entry` (the provider entry's own `api_key`), `native_caller` (a caller-owned native provider key, forwarded verbatim), or `fallback` (the operator's `fallback_credential_id`, presented after the entry's own key was refused). Absent on rows the AI gateway did not dispatch. Never credential material. |
+| `service_tier` | string | The operator's service tier the attempt was served under, and therefore the tier that priced the tokens beside it: `flex`, `standard`, or `priority`, as written on the provider entry. Absent when the entry declares no tier, when the surface has no tier axis, and on rows the AI gateway did not dispatch. It is always the operator's: a caller's own `service_tier` field is stripped before dispatch and never reaches this row. The value the vendor sees on the wire can differ, since each vendor's catalog entry carries its own spelling. |
 | `tenant_id` | string | Origin-scoped tenant label (`__default__` when the origin declares none). |
 | `user_id` | string | Resolved end-user identifier when user capture resolved one, already capped and redacted. |
 | `error_class` | string | Coarse failure class (`auth_denied`, `rate_limited`, `upstream_5xx`, ...). Absent on success. |
@@ -663,6 +665,47 @@ PII redactor when configured, and an 8 KiB payload cap all apply, and
 configured credential carriers never reach capture surfaces. The
 durable content path is OTLP `trace_content:`; this endpoint is a
 runtime inspection sample.
+
+A sample carries `request_id`, `tenant_id`, `origin`, `captured_at`,
+`api_key_id` and `model` when they resolved, `input_messages[]` as
+`{role, content}`, `output_text` once the upstream answered, and
+`shadow_responses[]`. That last one is present only on a request whose
+origin configured a `shadow:` block: one entry per target that ran,
+each `{target, model, status, output_text}`, at most eight per sample,
+through the same redaction stack and payload cap as the primary's own
+answer. It is omitted rather than empty when nothing was retained, and
+a target's answer is never stored without the primary it is being
+compared against. See the shadow-eval section of
+[ai-gateway.md](ai-gateway.md) for what the pair is for.
+
+### `GET /api/ai/shadow/report`
+
+One row per shadow-eval target over a window, folded from a bounded
+in-process ring of the last 512 requests that reached per-target shadow
+admission. `window` takes `15m`, `1h` (the default), `24h`, `7d`, or
+`30d`; anything else is a `400` naming the accepted set. `GET` only, so
+read RBAC applies, and the view is deployment-wide for a tenant-scoped
+operator, matching the sibling spend and usage reports.
+
+```bash
+curl -s -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/api/ai/shadow/report?window=1h"
+```
+
+The response is `{"window_secs": <int>, "targets": [...]}`. Each target
+row leads with `provenance` (`requests_seen`, `sample_rate`,
+`pairs_retained`, `pairs_dropped` by closed reason, `responses_retained`,
+`evicted_before_primary`) and then carries `cost`, `latency` at p50 and
+p95, `finish_reasons`, `errors`, `agreement`, and `cost_to_decide_usd`.
+Every delta is computed over the retained pairs and nothing else. The
+field-by-field reading, the closed `pairs_dropped` vocabulary, and what
+`evicted_before_primary` means for the numbers above it are in the
+shadow-eval section of [ai-gateway.md](ai-gateway.md).
+
+It is a report and not a metric: the `sbproxy_ai_shadow_*` families
+carry the scrapeable series, and this answers what PromQL cannot, which
+is what one target cost relative to the primary that ran beside it. It
+clears on restart.
 
 The admin UI derives its Sessions list and detail pages from this ring. Those
 pages are a recent operational view, not durable trace storage, a timing
@@ -996,15 +1039,18 @@ curl -s -u "admin:${SB_ADMIN_PASSWORD}" \
 <!-- CAPTURE: curl -s -u admin:demo-change-me 'http://127.0.0.1:9090/api/requests/export?format=csv&tenant=acme' | head -3 -->
 
 ```text
-timestamp,origin,method,path,status,latency_ms,client_ip,request_id,trace_id,session_id,parent_session_id,cache_status,retry_count,failover_engaged,failover_from,failover_to,load_balancer_strategy,load_balancer_target,provider,model,tokens_in,tokens_out,cost_usd_micros,guardrail_category,guardrail_action,api_key_id,key_mode,key_provider,tenant_id,user_id,error_class,config_revision,policy_version,deny_reason,policy_decisions,properties,credential_source
-2026-08-21T01:11:55.226687+00:00,acme.ai.local,POST,/v1/chat/completions,200,1.887458,127.0.0.1:64696,01a021dfe05874f1b6ba866697bd518b,6531cb754eae46b5ba1b255f2c61eadb,,,disabled,0,false,,,round_robin,openai,openai,gpt-4o-mini,120,40,42,,,cfg:4:acme:13:acme.ai.local:acme-research,minted,,acme,sci@acme.test,,8cb4b33d8ffc,c:8cb4b33d8ffc:ae10235dbb7fdde7,,[],"{""feature"":""literature-scan""}",
-2026-08-21T01:11:55.214716+00:00,acme.ai.local,POST,/v1/chat/completions,200,1.116375,127.0.0.1:64695,01a021dfe04d7b11960a65be634aca3e,c4f486ae935b41fa854201f66422ad16,,,disabled,0,false,,,round_robin,openai,openai,gpt-4o,900,300,5250,,,cfg:4:acme:13:acme.ai.local:acme-platform,minted,,acme,ops@acme.test,,8cb4b33d8ffc,c:8cb4b33d8ffc:cd949575bc0dca2d,,[],"{""feature"":""incident-triage""}",
+timestamp,origin,method,path,status,latency_ms,client_ip,request_id,trace_id,session_id,parent_session_id,cache_status,retry_count,failover_engaged,failover_from,failover_to,load_balancer_strategy,load_balancer_target,provider,model,tokens_in,tokens_out,cost_usd_micros,guardrail_category,guardrail_action,api_key_id,key_mode,key_provider,tenant_id,user_id,error_class,config_revision,policy_version,deny_reason,policy_decisions,properties,credential_source,tokens_cached,tokens_cache_write,service_tier
+2026-08-21T01:11:55.226687+00:00,acme.ai.local,POST,/v1/chat/completions,200,1.887458,127.0.0.1:64696,01a021dfe05874f1b6ba866697bd518b,6531cb754eae46b5ba1b255f2c61eadb,,,disabled,0,false,,,round_robin,openai,openai,gpt-4o-mini,120,40,42,,,cfg:4:acme:13:acme.ai.local:acme-research,minted,,acme,sci@acme.test,,8cb4b33d8ffc,c:8cb4b33d8ffc:ae10235dbb7fdde7,,[],"{""feature"":""literature-scan""}",,,,
+2026-08-21T01:11:55.214716+00:00,acme.ai.local,POST,/v1/chat/completions,200,1.116375,127.0.0.1:64695,01a021dfe04d7b11960a65be634aca3e,c4f486ae935b41fa854201f66422ad16,,,disabled,0,false,,,round_robin,openai,openai,gpt-4o,900,300,5250,,,cfg:4:acme:13:acme.ai.local:acme-platform,minted,,acme,ops@acme.test,,8cb4b33d8ffc,c:8cb4b33d8ffc:cd949575bc0dca2d,,[],"{""feature"":""incident-triage""}",,,,
 ```
 
 The `globex` row is absent because the filter removed it, not because
 the export truncated. The last cell shows both structured-column rules
 at once: `properties` is JSON, and RFC 4180 doubles its inner quotes so
-the record still splits into 36 fields.
+the record still splits into 40 fields. The four trailing empty cells
+are the appended columns: this row's provider reported no prompt-cache
+activity, its entry declared no service tier, and the request was
+dispatched on the provider entry's own key.
 
 JSONL, filtered to one human, first line only:
 

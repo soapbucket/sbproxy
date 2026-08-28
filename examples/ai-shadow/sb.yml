@@ -51,8 +51,31 @@
 # The usage rows carry the rest of the comparison: `tag: shadow`,
 # `provider` naming the target, `shadow_of` joining back to the
 # primary, and `finish_reason`, `cost_usd`, and `latency_ms` per
-# target. Shadow response *text* is drained rather than retained, so
-# what you compare here is numbers, not answers.
+# target.
+#
+# One row per target over a window, provenance first:
+#
+#   curl -su admin:changeme \
+#     'http://127.0.0.1:9090/api/ai/shadow/report?window=1h' | jq
+#
+# Read `provenance` before the deltas under it: `requests_seen`,
+# the `sample_rate` applied, `pairs_retained`, and `pairs_dropped`
+# by reason (the three sum). Every delta below it is computed over
+# the retained pairs and nothing else, latency is p50 and p95 rather
+# than a mean, and `finish_reasons` is the cheapest way to catch a
+# candidate that truncates more often than the primary does.
+#
+# Comparing the two *answers* needs consent, so it rides the same
+# two-sided gate the primary content store uses: `capture_content`
+# below AND `allow_content_capture` on the calling key's policy.
+# With either side off the target's body is drained as before and
+# nothing is retained, not even half a pair. With both on, the pair
+# arrives together:
+#
+#   curl -su admin:changeme \
+#     http://127.0.0.1:9090/api/requests/$REQUEST_ID/content | jq
+#
+#   {"output_text": "...", "shadow_responses": [{"target": "anthropic", ...}]}
 
 proxy:
   http_bind_port: 8080
@@ -69,6 +92,10 @@ origins:
   "ai.local":
     action:
       type: ai_proxy
+      # Half the retention gate. The other half is the calling key's
+      # `allow_content_capture` policy, so an operator turning this on
+      # does not retroactively consent on every key's behalf.
+      capture_content: true
       routing:
         strategy: round_robin
       providers:
@@ -84,6 +111,14 @@ origins:
         - name: gemini
           api_key: ${GEMINI_API_KEY}
           default_model: gemini-2.5-flash
+          enabled: false
+        # The judge is a provider entry like any other, and a separate
+        # one on purpose: judging with a model under evaluation is how
+        # a candidate grades its own homework.
+        - name: judge-openai
+          provider_type: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
           enabled: false
       shadow:
         # Shadow evaluation is non-streaming only. Slow or failed shadow
@@ -112,3 +147,34 @@ origins:
             timeout_ms: 30000
             task_timeout_ms: 30000
             model: gemini-2.5-flash
+        # Scoring which answer was better is a batch job over the pairs
+        # retained above, never an inline call: the shadow leg is
+        # fire-and-forget, so by the time a candidate answers the caller
+        # has already been served and there is nothing to block on.
+        #
+        # `max_spend_usd` is required and has no default. An unbounded
+        # judge is the failure this key exists to prevent, so a `judge:`
+        # block without it is refused at config load. It is one ceiling
+        # for the whole block, not one per target: the two targets above
+        # draw on the same five dollars a day. The cap auto-pauses
+        # judging until `spend_window` rolls, and `agreement.paused` on
+        # the report above says when it has. `daily` is a rolling 24
+        # hours from process start, not midnight UTC.
+        #
+        # `provider` names a providers[] entry on this action and is
+        # resolved against it at config load, so a typo is refused here
+        # rather than surfacing when the scorer ships.
+        #
+        # Nothing behind this key runs yet. The divergence pre-filter
+        # and the cap are implemented and tested and have no caller: the
+        # batch job that would call them is the judge prompt and the
+        # scoring loop, which are the scoped follow-up. Until then the
+        # whole runtime effect of this block is that `agreement.status`
+        # on the report reads `scoring_pending` instead of
+        # `not_configured`, and `judge_spend_cap_usd` appears in the
+        # row. Do not read the cap as a control in force. See
+        # docs/ai-gateway.md.
+        judge:
+          provider: judge-openai
+          max_spend_usd: 5.0
+          spend_window: daily

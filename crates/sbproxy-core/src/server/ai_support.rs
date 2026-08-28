@@ -2391,6 +2391,124 @@ pub(super) fn shadow_usage_record_from_context(
     Some(sbproxy_ai::client::ShadowUsageRecord::new(event, sinks))
 }
 
+/// WOR-2654: the proxy's half of the shadow retention seam.
+///
+/// A target's answer reaches the redacted console store through here
+/// and nowhere else, so the redaction stack the primary's answer goes
+/// through (the always-on secret redactor, then the origin's PII rules,
+/// then the payload cap) is the same one the candidate's goes through.
+/// Held by the shadow task, which outlives the request, so the redactor
+/// is cloned rather than borrowed; `PiiRedactor` keeps its rules behind
+/// an `Arc` and the clone is a handle.
+/// The store key and the owning tenant are held here rather than
+/// passed across the seam, so the AI crate never handles the
+/// caller-controlled correlation id, and every write this sink makes
+/// is checked against the tenant the request was authorized as.
+pub(super) struct ContentCaptureShadowSink {
+    request_id: String,
+    tenant_id: String,
+    pii_redactor: Option<sbproxy_security::pii::PiiRedactor>,
+}
+
+impl sbproxy_ai::shadow_eval::ShadowResponseSink for ContentCaptureShadowSink {
+    fn retain(&self, target: &str, model: &str, status: u16, response_body: &[u8]) -> bool {
+        let completion = extract_completion_text(response_body);
+        let redacted = redact_ai_trace_content(&completion, self.pii_redactor.as_ref());
+        if redacted.trim().is_empty() {
+            return false;
+        }
+        crate::content_capture::attach_shadow_response(
+            &self.request_id,
+            &self.tenant_id,
+            crate::content_capture::ShadowResponseSample {
+                target: target.to_string(),
+                model: model.to_string(),
+                status,
+                output_text: redacted,
+            },
+        )
+    }
+}
+
+/// WOR-2654: build the request-scoped shadow evaluation context.
+///
+/// `capture_allowed` is the caller's own read of the content-recording
+/// gate (the origin's `capture_content` AND the governed key's
+/// `allow_content_capture`), passed in rather than recomputed so the
+/// retention decision and the primary's own capture decision cannot
+/// drift apart. When it is false the returned context still carries the
+/// pair key, so the aggregate view keeps working on a route that
+/// records no content at all, and carries no sink, so no response text
+/// is kept anywhere.
+///
+/// The pair key is [`crate::context::RequestContext::envelope_request_id`],
+/// the ULID the proxy mints at request entry, and never `request_id`:
+/// that one is the correlation header's value when the caller sent
+/// one, so joining a process-wide ledger on it would let a caller
+/// choose which of its requests the operator's comparison report sees.
+/// The retention sink still keys the content store on `request_id`,
+/// because that is the store's own key and the id an operator looks a
+/// request up by, but it carries the tenant so a colliding id cannot
+/// cross tenants.
+pub(super) fn shadow_eval_context(
+    config: &AiHandlerConfig,
+    ctx: &crate::context::RequestContext,
+    capture_allowed: bool,
+) -> sbproxy_ai::shadow_eval::ShadowEvalContext {
+    sbproxy_ai::shadow_eval::ShadowEvalContext {
+        pair_key: shadow_pair_key(ctx),
+        retention: (capture_allowed && !ctx.request_id.is_empty()).then(|| {
+            std::sync::Arc::new(ContentCaptureShadowSink {
+                request_id: ctx.request_id.to_string(),
+                tenant_id: ctx.tenant_id.to_string(),
+                pii_redactor: config.pii_redactor().cloned(),
+            }) as std::sync::Arc<dyn sbproxy_ai::shadow_eval::ShadowResponseSink>
+        }),
+    }
+}
+
+/// The pair ledger's join key for this request.
+///
+/// One place, so the dispatch side that opens a slot and the
+/// end-of-request hook that records the primary leg cannot key on
+/// different things and quietly stop pairing.
+pub(super) fn shadow_pair_key(ctx: &crate::context::RequestContext) -> Option<String> {
+    ctx.envelope_request_id.map(|id| id.to_string())
+}
+
+/// WOR-2654: record the primary half of a shadow pair.
+///
+/// Called from the end-of-request logging hook, which is the first
+/// point where the primary's realized cost exists: the shadow spawns
+/// while the response is still being assembled, so nothing at spawn
+/// time can supply it. A no-op on any request that did not reach a
+/// provider, and free on a deployment that has never configured a
+/// `shadow:` block anywhere (the ledger short-circuits on an atomic).
+pub(super) fn record_shadow_primary_leg(ctx: &crate::context::RequestContext, status: u16) {
+    let Some(provider) = ctx.ai_provider.clone() else {
+        return;
+    };
+    let Some(pair_key) = shadow_pair_key(ctx) else {
+        return;
+    };
+    sbproxy_ai::shadow_eval::ShadowPairLedger::global().record_primary(
+        pair_key.as_str(),
+        sbproxy_ai::shadow_eval::PrimaryLeg {
+            provider,
+            model: ctx.ai_model.clone().unwrap_or_default(),
+            cost_usd: ctx
+                .ai_cost_usd_micros
+                .map(|micros| micros as f64 / 1_000_000.0)
+                .unwrap_or(0.0),
+            latency_ms: ctx
+                .request_start
+                .map(|start| start.elapsed().as_millis() as u64)
+                .unwrap_or(0),
+            status,
+        },
+    );
+}
+
 /// WOR-1541: fold this request's realized outcome into the global routing
 /// feedback store, so the `outcome_aware` strategy scores providers by
 /// realized cost-per-success. No-op unless the origin opted in (the
@@ -2806,13 +2924,20 @@ pub(super) enum AiIdempotencyEngagement {
     /// Cache hit with a different body hash. The 409 conflict body
     /// has already been written to the session. Caller short-circuits.
     Conflict,
+    /// Another request holds this key and did not publish inside the
+    /// wait budget. The 409 in-flight body has already been written to
+    /// the session; the caller short-circuits without contacting a
+    /// provider (WOR-2609).
+    InFlight,
     /// Cache miss. The caller proceeds with the upstream call, then
     /// invokes `record_ai_idempotency` with the captured response so
     /// the next retry hits the cache.
     Miss {
         idem: std::sync::Arc<crate::pipeline::CompiledIdempotency>,
-        workspace_id: String,
-        key: String,
+        /// The held claim on the key. Publishing through
+        /// [`AiIdempotencyCapture::record`] consumes it; dropping it
+        /// releases the key so the next retry is not left waiting.
+        claim: sbproxy_middleware::idempotency::IdempotencyClaim,
         body_hash: [u8; 32],
         /// Permit on the per-origin pool semaphore. Held until the
         /// response side records (or abandons) the capture; dropped
@@ -2909,12 +3034,20 @@ pub(super) async fn engage_ai_idempotency(
     };
 
     let workspace_id = pipeline.config.origins[origin_idx].workspace_id.to_string();
-    let outcome = sbproxy_middleware::idempotency::check_request(
-        idem.cache.as_ref(),
+    // WOR-2609: this takes the key rather than reading it, and a request
+    // that finds another one holding it waits for that response instead
+    // of calling the provider a second time. Boxed because the AI
+    // request path sits at the worker's stack budget and an inline
+    // future here grows every caller's state machine.
+    let outcome = Box::pin(sbproxy_middleware::idempotency::check_request(
+        &idem.cache,
         &workspace_id,
         &session.req_header().headers,
         body_bytes,
-    );
+        idem.claim_lease_secs,
+        idem.claim_wait,
+    ))
+    .await;
 
     match outcome {
         sbproxy_middleware::idempotency::IdempotencyOutcome::NotApplicable => {
@@ -2924,18 +3057,25 @@ pub(super) async fn engage_ai_idempotency(
             Ok(AiIdempotencyEngagement::NotApplicable)
         }
         sbproxy_middleware::idempotency::IdempotencyOutcome::CacheHit(response) => {
-            Ok(AiIdempotencyEngagement::Replayed { response })
+            Ok(AiIdempotencyEngagement::Replayed {
+                response: *response,
+            })
         }
         sbproxy_middleware::idempotency::IdempotencyOutcome::Conflict => {
             let (status, content_type, body) = sbproxy_middleware::idempotency::conflict_response();
             send_response(session, status.as_u16(), content_type, &body).await?;
             Ok(AiIdempotencyEngagement::Conflict)
         }
-        sbproxy_middleware::idempotency::IdempotencyOutcome::Miss { key, body_hash } => {
+        sbproxy_middleware::idempotency::IdempotencyOutcome::InFlight => {
+            let (status, content_type, body) =
+                sbproxy_middleware::idempotency::in_flight_response();
+            send_response(session, status.as_u16(), content_type, &body).await?;
+            Ok(AiIdempotencyEngagement::InFlight)
+        }
+        sbproxy_middleware::idempotency::IdempotencyOutcome::Miss { claim, body_hash } => {
             Ok(AiIdempotencyEngagement::Miss {
                 idem,
-                workspace_id,
-                key,
+                claim,
                 body_hash,
                 permit,
             })
@@ -2991,8 +3131,9 @@ pub(super) async fn write_ai_cached_response(
 /// to keep five locals alive across the upstream call.
 pub(super) struct AiIdempotencyCapture {
     pub(super) idem: std::sync::Arc<crate::pipeline::CompiledIdempotency>,
-    pub(super) workspace_id: String,
-    pub(super) key: String,
+    /// The held claim. Dropping the capture without recording releases
+    /// the key rather than leaving retries to wait out the lease.
+    pub(super) claim: sbproxy_middleware::idempotency::IdempotencyClaim,
     pub(super) body_hash: [u8; 32],
     /// Per-origin pool permit held for the lifetime of the capture.
     /// Dropped here (on success or abandonment) so a new buffered
@@ -3004,17 +3145,22 @@ impl AiIdempotencyCapture {
     /// Persist the recorded response under `(workspace_id, key)`.
     /// `body` contains the final client-wire bytes after format adaptation
     /// and reversible restoration, so retries replay byte-identically.
+    /// The publish goes through `record_response_detached` because the
+    /// shared backend's write is a network round trip and this runs on
+    /// a proxy worker (WOR-2609). An in-process backend still writes
+    /// inline, so a caller that publishes and then looks is not racing
+    /// itself.
     pub(super) fn record(self, status: u16, headers: Vec<(String, String)>, body: Vec<u8>) {
-        sbproxy_middleware::idempotency::record_response(
-            self.idem.cache.as_ref(),
-            &self.workspace_id,
-            &self.key,
+        let ttl_secs = self.idem.ttl_secs;
+        let body_hash = self.body_hash;
+        sbproxy_middleware::idempotency::record_response_detached(
+            self.claim,
             sbproxy_middleware::idempotency::RecordedResponse {
                 status,
                 headers,
                 body,
-                body_hash: self.body_hash,
-                ttl_secs: self.idem.ttl_secs,
+                body_hash,
+                ttl_secs,
             },
         );
     }

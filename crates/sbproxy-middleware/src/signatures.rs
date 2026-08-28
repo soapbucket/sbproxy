@@ -156,7 +156,7 @@ impl SignatureAlgorithm {
 }
 
 /// Configuration for RFC 9421 message signature verification.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct MessageSignatureConfig {
     /// Required signature algorithm.
     pub algorithm: SignatureAlgorithm,
@@ -194,6 +194,23 @@ pub struct MessageSignatureConfig {
     /// outside it is refused before any crypto runs.
     #[serde(default = "default_skew_seconds")]
     pub clock_skew_seconds: u64,
+}
+
+/// Redacted `Debug` (WOR-2640). For `hmac_sha256` the `key` field is the
+/// shared secret itself, so a `{:?}` of this config is a signing key in
+/// a log line. It is redacted for every algorithm rather than only for
+/// HMAC, because the branch that decides which is which is the same
+/// branch a future variant gets wrong.
+impl std::fmt::Debug for MessageSignatureConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MessageSignatureConfig")
+            .field("algorithm", &self.algorithm)
+            .field("key_id", &self.key_id)
+            .field("key", &"[REDACTED]")
+            .field("required_components", &self.required_components)
+            .field("clock_skew_seconds", &self.clock_skew_seconds)
+            .finish()
+    }
 }
 
 fn default_skew_seconds() -> u64 {
@@ -3087,5 +3104,28 @@ mod tests {
             verifier.verify_request(&req),
             VerifyVerdict::Ok { .. }
         ));
+    }
+
+    /// WOR-2640: under `hmac_sha256` the `key` field is the shared
+    /// secret itself, so a `{:?}` of this config is a signing key in a
+    /// log line.
+    #[test]
+    fn debug_never_renders_the_verification_key() {
+        let cfg = MessageSignatureConfig {
+            algorithm: SignatureAlgorithm::HmacSha256,
+            key_id: "peer-1".to_string(),
+            key: "SENTINEL-SECRET-9f3a".to_string(),
+            required_components: vec![],
+            clock_skew_seconds: 30,
+        };
+        let rendered = format!("{cfg:?}");
+        assert!(
+            !rendered.contains("SENTINEL-SECRET-9f3a"),
+            "the HMAC key reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("peer-1"),
+            "the keyid must survive so a mismatch stays diagnosable: {rendered}"
+        );
     }
 }

@@ -540,7 +540,7 @@ impl AccessLogEntry {
     ) -> anyhow::Result<()> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            sbproxy_util::secure_fs::create_dir_all_owner_only(parent)?;
         }
         if path
             .metadata()
@@ -550,10 +550,11 @@ impl AccessLogEntry {
             rotate_access_log(path, max_backups, compress)?;
         }
         let line = self.redacted_json_line()?;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        // Owner-only, and tightened if an older build left the file at
+        // 0o644. Every request the proxy served is in here with its
+        // path, its identity, and its decision, which is the traffic
+        // record an operator asked to keep and not to publish.
+        let mut file = sbproxy_util::secure_fs::open_append_owner_only(path)?;
         writeln!(file, "{line}")?;
         Ok(())
     }
@@ -600,6 +601,7 @@ fn rotate_access_log(path: &Path, max_backups: usize, compress: bool) -> anyhow:
         }
     }
     if !path.exists() {
+        tighten_rotated_backups(path, max_backups);
         return Ok(());
     }
     if compress {
@@ -608,7 +610,52 @@ fn rotate_access_log(path: &Path, max_backups: usize, compress: bool) -> anyhow:
     } else {
         std::fs::rename(path, rotated_path(path, 1, false))?;
     }
+    tighten_rotated_backups(path, max_backups);
     Ok(())
+}
+
+/// Make every rotated backup owner-only, not just the one this
+/// rotation produced.
+///
+/// The uncompressed rotation is a `rename(2)`, which preserves the
+/// inode and therefore the mode. On a host upgraded from a build that
+/// wrote its access log at `0o644`, that carried the old mode forward
+/// forever: `max_backups: 10` with weekly rotation left ten
+/// world-readable files, each holding a week of every request's path,
+/// identity and decision, for ten more weeks, while the docs said a
+/// file at a wider mode is tightened when the sink opens it. Only the
+/// active file was ever reopened.
+///
+/// The sweep runs at rotation, where the paths are already computed,
+/// and it is best-effort per file: a backup on a filesystem with no
+/// permission bits, or one another account owns, must not stop the
+/// rotation that is keeping the live log bounded. Each failure is
+/// warned about by name so the gap is visible rather than silent.
+///
+/// Both suffixes are visited, not just the configured one. An operator
+/// who flips `compress: false` to `true` after upgrading leaves
+/// `access.log.1..N` behind as plain files: the rotation loop only ever
+/// shifts names in the current mode, so nothing renames them, nothing
+/// deletes them, and a sweep that followed the setting would never look
+/// at them either. They hold the same request records as the `.gz`
+/// files beside them. Same in reverse. `tighten_existing_owner_only`
+/// treats a missing file as success, so the extra call per index costs
+/// one `open(2)` that fails with `ENOENT` in the ordinary case.
+fn tighten_rotated_backups(path: &Path, max_backups: usize) {
+    for idx in 1..=max_backups {
+        for compressed in [false, true] {
+            let backup = rotated_path(path, idx, compressed);
+            if let Err(error) = sbproxy_util::secure_fs::tighten_existing_owner_only(&backup) {
+                tracing::warn!(
+                    path = %backup.display(),
+                    error = %error,
+                    "access log: a rotated backup could not be made owner-only; it holds the \
+                     same request records as the live log. See \
+                     https://sbproxy.dev/docs/access-log"
+                );
+            }
+        }
+    }
 }
 
 fn rotated_path(path: &Path, idx: usize, compress: bool) -> PathBuf {
@@ -622,7 +669,10 @@ fn rotated_path(path: &Path, idx: usize, compress: bool) -> PathBuf {
 
 fn gzip_file(src: &Path, dest: &Path) -> anyhow::Result<()> {
     let input = std::fs::File::open(src)?;
-    let output = std::fs::File::create(dest)?;
+    // The rotated copy holds the same records as the live file, so it
+    // gets the same mode. A rotation that widened the archive would
+    // hand away exactly what the live file withheld.
+    let output = sbproxy_util::secure_fs::create_truncate_owner_only(dest)?;
     let mut encoder = flate2::write::GzEncoder::new(output, flate2::Compression::default());
     let mut reader = std::io::BufReader::new(input);
     std::io::copy(&mut reader, &mut encoder)?;
@@ -1692,5 +1742,85 @@ mod tests {
         // Verify redaction markers appear.
         assert!(redacted.contains("sk-[REDACTED]"));
         assert!(redacted.contains("Bearer [REDACTED]"));
+    }
+
+    /// WOR-2626: the access log holds the path, the identity, and the
+    /// decision for every request served, and a rotated copy holds the
+    /// same records. Both must be owner-only, and so must a directory
+    /// the sink creates for itself.
+    ///
+    /// The active file is pre-created world-readable rather than left
+    /// to the ambient umask, so this stays red before the fix on a
+    /// runner whose umask is already `0o077` and the assertion is about
+    /// the sink rather than about the environment it ran in.
+    ///
+    /// What that covers is the *file* assertion, and only that one. The
+    /// directory assertion below is umask-dependent and cannot be made
+    /// otherwise from inside this crate: a directory has nowhere to put
+    /// a starting mode, because the mode it is *created* at is the
+    /// claim, and with the fix backed out `create_dir_all` under a
+    /// `0o077` umask produces `0o700` and the assertion passes green.
+    /// Pinning the umask needs `libc::umask`, which this crate's
+    /// `#![forbid(unsafe_code)]` refuses, so that half is proved in
+    /// `tests/durable_directory_modes.rs`, an integration test that is
+    /// its own crate and pins it.
+    #[cfg(unix)]
+    #[test]
+    fn the_access_log_and_its_rotated_copy_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fn mode_of(path: &Path) -> u32 {
+            std::fs::metadata(path)
+                .expect("stat the path under test")
+                .permissions()
+                .mode()
+                & 0o7777
+        }
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nested = dir.path().join("nested");
+        let path = nested.join("access.log");
+
+        // First write creates the directory and the file.
+        minimal_entry()
+            .emit_to_file(&path, 1024 * 1024, 3, true)
+            .expect("first write");
+        assert_eq!(
+            mode_of(&nested),
+            0o700,
+            "the sink's own directory is world-traversable"
+        );
+
+        // Second write reopens a file somebody left world-readable.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("loosen the active log");
+        minimal_entry()
+            .emit_to_file(&path, 1024 * 1024, 3, true)
+            .expect("second write");
+        assert_eq!(
+            mode_of(&path),
+            0o600,
+            "the active access log is {:o}, not owner-only",
+            mode_of(&path)
+        );
+
+        // A threshold of one byte rotates on the next write, so the
+        // records land in `access.log.1.gz` and must not widen on the
+        // way.
+        minimal_entry()
+            .emit_to_file(&path, 1, 3, true)
+            .expect("rotating write");
+        let rotated = nested.join("access.log.1.gz");
+        assert!(
+            rotated.exists(),
+            "rotation did not produce {}",
+            rotated.display()
+        );
+        assert_eq!(
+            mode_of(&rotated),
+            0o600,
+            "the rotated access log is {:o}, not owner-only",
+            mode_of(&rotated)
+        );
     }
 }

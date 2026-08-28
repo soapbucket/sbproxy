@@ -406,6 +406,41 @@ pub fn default_registry_optional(
             )
         }
     })));
+    // WOR-2626: what this build can enforce on the files its durable
+    // sinks write, exposed where an operator looks rather than only in
+    // a startup log line they have to have kept.
+    //
+    // Posture only, and no paths. A sink path can carry a tenant name,
+    // and `/health` is unauthenticated on purpose so a load balancer
+    // can reach it; the modes are compile-time constants that the
+    // published documentation already states, so naming them here
+    // discloses nothing the docs do not.
+    //
+    // A platform without permission bits reports `Degraded` rather
+    // than `Unhealthy`. The gap is real and worth surfacing, and it is
+    // not a reason to have a load balancer drain the instance: traffic
+    // flows perfectly well, the files are just inheriting an ACL.
+    registry.register(Arc::new(SyntheticProbe::new("durable_file_modes", || {
+        match sbproxy_util::secure_fs::enforcement() {
+            sbproxy_util::secure_fs::ModeEnforcement::Posix {
+                file_mode,
+                dir_mode,
+            } => (
+                ComponentStatus::Healthy,
+                Some(format!(
+                    "sink files {file_mode:04o}, directories this process creates {dir_mode:04o}"
+                )),
+            ),
+            sbproxy_util::secure_fs::ModeEnforcement::InheritedAcl => (
+                ComponentStatus::Degraded,
+                Some(
+                    "this platform has no POSIX permission bits; sink files inherit \
+                     their directory's ACL and no mode is applied"
+                        .to_string(),
+                ),
+            ),
+        }
+    })));
     registry
 }
 
@@ -658,5 +693,54 @@ mod tests {
         let comps = v["components"].as_array().unwrap();
         let probe = comps.iter().find(|c| c["name"] == "mesh_quorum").unwrap();
         assert_eq!(probe["status"], "healthy");
+    }
+
+    /// WOR-2626: the durable-sink mode posture is reported where an
+    /// operator looks, not only in a startup log line they had to have
+    /// kept. The brief asked for a health surface and the first pass
+    /// shipped only the log.
+    ///
+    /// Posture, never paths: `/health` is unauthenticated so a load
+    /// balancer can reach it, and a sink path can carry a tenant name.
+    /// The modes themselves are compile-time constants the published
+    /// docs already state.
+    #[test]
+    fn health_reports_the_durable_file_mode_posture_without_a_path() {
+        let registry = default_registry_optional(None, None);
+        let report = registry.evaluate();
+        let component = report
+            .components
+            .iter()
+            .find(|c| c.name == "durable_file_modes")
+            .expect("the durable-file-mode posture must be a health component");
+
+        assert!(
+            component.status.is_ready(),
+            "the posture is informational; it must not drain the instance"
+        );
+        let detail = component
+            .detail
+            .as_deref()
+            .expect("the posture must say what it is, not only that it exists");
+
+        match sbproxy_util::secure_fs::enforcement() {
+            sbproxy_util::secure_fs::ModeEnforcement::Posix { .. } => {
+                assert!(
+                    detail.contains("0600") && detail.contains("0700"),
+                    "the modes must be named: {detail}"
+                );
+            }
+            sbproxy_util::secure_fs::ModeEnforcement::InheritedAcl => {
+                assert!(
+                    detail.contains("ACL"),
+                    "the gap must be named rather than implied: {detail}"
+                );
+            }
+        }
+        assert!(
+            !detail.contains('/'),
+            "a sink path can carry a tenant name and must not reach an \
+             unauthenticated endpoint: {detail}"
+        );
     }
 }

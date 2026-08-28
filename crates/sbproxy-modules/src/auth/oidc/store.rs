@@ -50,7 +50,7 @@ use super::session::SessionClaims;
 /// the cookie does, plus the optional refresh token that should
 /// never leave the server, plus a wall-clock `last_seen_unix` so the
 /// store can evict idle sessions on a schedule.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRecord {
     /// Claims as projected from the ID token at login time. Same
     /// shape that the cookie carries.
@@ -62,6 +62,24 @@ pub struct SessionRecord {
     /// Wall-clock unix seconds of the last request that referenced
     /// this session. Updated by `touch`; consulted by `evict_idle`.
     pub last_seen_unix: u64,
+}
+
+/// Redacted `Debug` (WOR-2640). The refresh token is the one thing in
+/// this record that never leaves the server, per the field's own doc,
+/// and it mints access tokens for as long as the OP honors it. The
+/// claims and `last_seen_unix` stay: they are what a session-eviction
+/// or session-lookup diagnostic is about.
+impl std::fmt::Debug for SessionRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionRecord")
+            .field("claims", &self.claims)
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("last_seen_unix", &self.last_seen_unix)
+            .finish()
+    }
 }
 
 impl SessionRecord {
@@ -294,5 +312,31 @@ mod tests {
     fn evict_idle_on_empty_store_returns_zero() {
         let store = InMemorySessionStore::new();
         assert_eq!(store.evict_idle(10_000, 100).unwrap(), 0);
+    }
+
+    /// WOR-2640: the refresh token is the one field in a session record
+    /// that never leaves the server, and it mints access tokens for as
+    /// long as the OP honors it.
+    #[test]
+    fn debug_never_renders_a_stored_refresh_token() {
+        const SENTINEL: &str = "SENTINEL-SECRET-9f3a";
+        let record = SessionRecord::new(
+            sample_claims("subject-1", 1_000),
+            Some(SENTINEL.to_string()),
+            1_000,
+        );
+        let rendered = format!("{record:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the stored refresh token reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("subject-1"),
+            "the claims must survive so the session is nameable: {rendered}"
+        );
+        assert!(
+            rendered.contains("1000"),
+            "last_seen must survive so eviction is diagnosable: {rendered}"
+        );
     }
 }

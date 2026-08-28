@@ -16,6 +16,17 @@ use rusqlite::{params, Connection, OpenFlags};
 use super::KVStore;
 
 /// SQLite-backed key-value store.
+///
+/// Every method takes the connection mutex with
+/// `unwrap_or_else(|poisoned| poisoned.into_inner())` rather than
+/// unwrapping it. A poisoned mutex means some earlier caller panicked
+/// while holding it, and `std`'s default answer to that is to panic
+/// every subsequent caller too, which turns one panic into a
+/// store-wide outage for the life of the process. The connection is
+/// not left in a torn state by a panic here: `rusqlite` statements are
+/// individually atomic and this type holds no invariant across calls,
+/// so recovering the guard is the honest thing to do. It is the same
+/// posture `MemoryKVStore` gets for free from `parking_lot`.
 pub struct SqliteKVStore {
     conn: Mutex<Connection>,
 }
@@ -52,7 +63,10 @@ impl SqliteKVStore {
 
 impl KVStore for SqliteKVStore {
     fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        let conn = self.conn.lock().expect("lock poisoned");
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut stmt = conn
             .prepare_cached("SELECT value FROM kv WHERE key = ?1")
             .context("prepare SELECT")?;
@@ -67,7 +81,10 @@ impl KVStore for SqliteKVStore {
     }
 
     fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        let conn = self.conn.lock().expect("lock poisoned");
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.execute(
             "INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)",
             params![key, value],
@@ -76,15 +93,72 @@ impl KVStore for SqliteKVStore {
         Ok(())
     }
 
+    fn put_if_absent_with_ttl(&self, key: &[u8], value: &[u8], _ttl_secs: u64) -> Result<bool> {
+        // `INSERT OR IGNORE` against a PRIMARY KEY is one statement, so
+        // the existence test and the write are the same indivisible
+        // operation: exactly one of two simultaneous first requests
+        // creates the key. A row count of one means this caller did.
+        //
+        // The TTL is not modeled. SQLite has no expiry, and a caller
+        // that needs one carries the deadline inside the value and
+        // re-checks it on read, which the idempotency backend does.
+        // What that costs is space rather than correctness.
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let created = conn
+            .execute(
+                "INSERT OR IGNORE INTO kv (key, value) VALUES (?1, ?2)",
+                params![key, value],
+            )
+            .context("execute INSERT OR IGNORE")?;
+        Ok(created == 1)
+    }
+
+    fn compare_and_swap_with_ttl(
+        &self,
+        key: &[u8],
+        expected: &[u8],
+        value: &[u8],
+        _ttl_secs: u64,
+    ) -> Result<bool> {
+        // One statement again, so the comparison and the write cannot
+        // interleave. A backend with the create half but not the swap
+        // half wedges every key whose holder died, because taking a
+        // lapsed row over is a conditional replace.
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let swapped = conn
+            .execute(
+                "UPDATE kv SET value = ?2 WHERE key = ?1 AND value = ?3",
+                params![key, value, expected],
+            )
+            .context("execute conditional UPDATE")?;
+        Ok(swapped == 1)
+    }
+
+    fn supports_atomic_create(&self) -> bool {
+        true
+    }
+
     fn delete(&self, key: &[u8]) -> Result<()> {
-        let conn = self.conn.lock().expect("lock poisoned");
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.execute("DELETE FROM kv WHERE key = ?1", params![key])
             .context("execute DELETE")?;
         Ok(())
     }
 
     fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Bytes, Bytes)>> {
-        let conn = self.conn.lock().expect("lock poisoned");
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         // Compute the exclusive upper bound for the prefix range.
         // If every byte is 0xFF there is no upper bound - fall back to a full
@@ -162,6 +236,38 @@ mod tests {
 
     fn mem_store() -> SqliteKVStore {
         SqliteKVStore::new(":memory:").unwrap()
+    }
+
+    /// WOR-2609: the single-flight primitive, on a store the review
+    /// found inheriting the erroring default although `INSERT OR
+    /// IGNORE` creates atomically. An operator running
+    /// `proxy.l2_store: {type: sqlite}` with `idempotency.backend:
+    /// redis` got the full pre-WOR-2609 stampede on a store perfectly
+    /// capable of preventing it.
+    #[test]
+    fn atomic_create_and_conditional_swap() {
+        let s = mem_store();
+
+        assert!(s.put_if_absent_with_ttl(b"claim", b"a", 60).unwrap());
+        assert!(
+            !s.put_if_absent_with_ttl(b"claim", b"b", 60).unwrap(),
+            "a present key must refuse a second creator"
+        );
+        assert_eq!(s.get(b"claim").unwrap().unwrap(), &b"a"[..]);
+
+        // Taking a key over is a conditional replace. Without it the
+        // create half alone wedges every key whose holder died.
+        assert!(
+            !s.compare_and_swap_with_ttl(b"claim", b"wrong", b"c", 60)
+                .unwrap(),
+            "a swap against the wrong bytes must be refused"
+        );
+        assert!(s
+            .compare_and_swap_with_ttl(b"claim", b"a", b"c", 60)
+            .unwrap());
+        assert_eq!(s.get(b"claim").unwrap().unwrap(), &b"c"[..]);
+
+        assert!(s.supports_atomic_create());
     }
 
     #[test]

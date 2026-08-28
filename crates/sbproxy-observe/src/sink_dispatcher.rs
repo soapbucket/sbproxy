@@ -454,7 +454,7 @@ impl SinkOutput for FileSink {
             // WOR-1100: a failed mkdir means the subsequent append also
             // fails and the log line is silently lost. Count + log it
             // so the blackhole is visible.
-            if let Err(e) = std::fs::create_dir_all(parent) {
+            if let Err(e) = sbproxy_util::secure_fs::create_dir_all_owner_only(parent) {
                 crate::metrics::record_telemetry_dropped("file_sink", "mkdir_failed");
                 warn_file_sink_io(
                     parent,
@@ -491,11 +491,10 @@ impl SinkOutput for FileSink {
                 }
             }
         }
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-        {
+        // Owner-only, reasserted on every open: this sink reopens per
+        // line, so a file another process loosened between two writes
+        // is tightened again on the next one.
+        match sbproxy_util::secure_fs::open_append_owner_only(&self.path) {
             Ok(mut f) => append_line(&mut f, &self.path, line),
             Err(e) => {
                 crate::metrics::record_telemetry_dropped("file_sink", "open_failed");
@@ -896,5 +895,68 @@ mod tests {
         assert_eq!(otlp_severity_number(LogLevel::Warn), 13);
         assert_eq!(otlp_severity_number(LogLevel::Error), 17);
         assert_eq!(otlp_severity_number(LogLevel::Fatal), 17);
+    }
+
+    /// WOR-2626: the compiled file sink is where an audit or telemetry
+    /// record lands, so its file and the directory it creates for it
+    /// are owner-only.
+    ///
+    /// The sink reopens per line, which is what makes the second write
+    /// meaningful: a file loosened between two records is tightened on
+    /// the next one rather than inherited. Pre-creating it at `0o644`
+    /// keeps the test red before the fix on any umask.
+    ///
+    /// What that covers is the *file* assertion, and only that one. The
+    /// directory assertion below is umask-dependent and cannot be made
+    /// otherwise from inside this crate: a directory has nowhere to put
+    /// a starting mode, because the mode it is *created* at is the
+    /// claim, and with the fix backed out `create_dir_all` under a
+    /// `0o077` umask produces `0o700` and the assertion passes green.
+    /// Pinning the umask needs `libc::umask`, which this crate's
+    /// `#![forbid(unsafe_code)]` refuses, so that half is proved in
+    /// `tests/durable_directory_modes.rs`, an integration test that is
+    /// its own crate and pins it.
+    #[cfg(unix)]
+    #[test]
+    fn the_file_sink_and_its_directory_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fn mode_of(path: &std::path::Path) -> u32 {
+            std::fs::metadata(path)
+                .expect("stat the path under test")
+                .permissions()
+                .mode()
+                & 0o7777
+        }
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let nested = dir.path().join("nested");
+        let path = nested.join("audit.log");
+
+        FileSink::new(&path).write_line("the first audit record");
+        assert_eq!(
+            mode_of(&nested),
+            0o700,
+            "the sink's own directory is world-traversable"
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("loosen the sink file");
+        FileSink::new(&path).write_line("the second audit record");
+
+        assert_eq!(
+            mode_of(&path),
+            0o600,
+            "the file sink target is {:o}, not owner-only",
+            mode_of(&path)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path)
+                .expect("read back")
+                .lines()
+                .count(),
+            2,
+            "tightening must not cost the records"
+        );
     }
 }

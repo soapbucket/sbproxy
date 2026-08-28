@@ -346,7 +346,7 @@ where
 /// level means giving `CredentialAttrs` a deny of its own, which is a
 /// separate change with its own blast radius across every provider
 /// that flattens it.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct ApiKeyEntry {
     /// The API key secret a caller presents in the configured header
     /// or query parameter.
@@ -355,6 +355,20 @@ pub struct ApiKeyEntry {
     /// `Principal`'s `attrs` block.
     #[serde(flatten, default)]
     pub attrs: CredentialAttrs,
+}
+
+/// Redacted `Debug` (WOR-2640). `secret` is the inbound API key
+/// itself: whoever holds it authenticates as this principal. The
+/// operator-attached `attrs` stay, because they are what name which
+/// entry a config-load diagnostic is talking about and none of them
+/// authenticates anything.
+impl std::fmt::Debug for ApiKeyEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiKeyEntry")
+            .field("secret", &"[REDACTED]")
+            .field("attrs", &self.attrs)
+            .finish()
+    }
 }
 
 /// API key auth config - validates requests carry a known key
@@ -537,7 +551,7 @@ pub struct BasicAuthProvider {
 /// Permissive on unknown keys, for the same reason as [`ApiKeyEntry`]:
 /// serde refuses `deny_unknown_fields` alongside the flattened `attrs`
 /// below at compile time.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct BasicAuthUser {
     /// Username portion of the credential.
     pub username: String,
@@ -549,6 +563,19 @@ pub struct BasicAuthUser {
     /// `{username, password, project, ...}` without nesting.
     #[serde(flatten, default)]
     pub attrs: CredentialAttrs,
+}
+
+/// Redacted `Debug` (WOR-2640). The password is a reusable inbound
+/// credential. The username stays: it is the identifier that says
+/// which entry failed and it authenticates nothing on its own.
+impl std::fmt::Debug for BasicAuthUser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BasicAuthUser")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field("attrs", &self.attrs)
+            .finish()
+    }
 }
 
 /// Realm advertised when the operator configured none.
@@ -662,7 +689,7 @@ impl BasicAuthProvider {
 /// Permissive on unknown keys, for the same reason as [`ApiKeyEntry`]:
 /// serde refuses `deny_unknown_fields` alongside the flattened `attrs`
 /// below at compile time. The provider around it does refuse them.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct BearerToken {
     /// The bearer secret a caller presents in
     /// `Authorization: Bearer <secret>`.
@@ -671,6 +698,17 @@ pub struct BearerToken {
     /// `Principal`'s `attrs` block.
     #[serde(flatten, default)]
     pub attrs: CredentialAttrs,
+}
+
+/// Redacted `Debug` (WOR-2640). `secret` is the bearer token a caller
+/// presents, which is the whole credential.
+impl std::fmt::Debug for BearerToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BearerToken")
+            .field("secret", &"[REDACTED]")
+            .field("attrs", &self.attrs)
+            .finish()
+    }
 }
 
 /// Bearer token authentication.
@@ -833,7 +871,7 @@ impl BearerAuth {
 /// module's `provider_config_from_value` for why `type:` is not declared
 /// as a field here. `attrs` is a nested block rather than a flattened one,
 /// which is what lets this struct carry the deny at all.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JwtAuth {
     /// Shared HMAC secret for verifying tokens (used with HS-family algorithms).
@@ -898,6 +936,34 @@ pub struct JwtAuth {
     /// behavior; JWS-only configurations need no changes.
     #[serde(default)]
     pub jwe: Option<JweConfig>,
+}
+
+/// Redacted `Debug` (WOR-2640). Under the HS family, `secret` is the
+/// HMAC key, and an HMAC key is both the verifier and the signer: an
+/// attacker who reads it mints tokens this proxy accepts. Every other
+/// field stays, because which issuer, which audience, and which
+/// algorithm list were configured is exactly what a rejected-token
+/// diagnostic is about.
+///
+/// Presence rather than a flat marker, because "no secret configured"
+/// and "wrong secret configured" are different misconfigurations with
+/// the same symptom.
+impl std::fmt::Debug for JwtAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JwtAuth")
+            .field("secret", &self.secret.as_ref().map(|_| "[REDACTED]"))
+            .field("jwks_url", &self.jwks_url)
+            .field("required_claims", &self.required_claims)
+            .field("audience", &self.audience)
+            .field("issuer", &self.issuer)
+            .field("algorithms", &self.algorithms)
+            .field("attrs", &self.attrs)
+            .field("roles_claim", &self.roles_claim)
+            .field("require_dpop", &self.require_dpop)
+            .field("require_mtls_bound", &self.require_mtls_bound)
+            .field("jwe", &self.jwe)
+            .finish_non_exhaustive()
+    }
 }
 
 impl JwtAuth {
@@ -1286,12 +1352,27 @@ impl<'de> Deserialize<'de> for DigestAuth {
 }
 
 /// A username/password pair for digest auth.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct DigestAuthUser {
     /// Username portion of the credential.
     pub username: String,
     /// Password portion of the credential.
     pub password: String,
+}
+
+/// Redacted `Debug` (WOR-2640). The `password` field carries either a
+/// plaintext password or the precomputed `HA1` hash, depending on which
+/// of the two configured shapes an operator wrote. Both are reusable:
+/// an `HA1` is sufficient to answer a digest challenge, so redacting
+/// only the plaintext one would leave the credential in the log
+/// whenever the operator chose the other shape.
+impl std::fmt::Debug for DigestAuthUser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DigestAuthUser")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Deserialize digest users from either:
@@ -1776,6 +1857,10 @@ mod tests {
         assert_eq!(auth.auth_type(), "forward_auth");
     }
 
+    /// The variant name, and, since WOR-2640, the fact that a
+    /// populated entry does not print its key. Asserting only the
+    /// variant name is what let a `Debug` over a live credential pass
+    /// this test for as long as it existed.
     #[test]
     fn auth_debug_api_key() {
         let auth = Auth::ApiKey(ApiKeyAuth {
@@ -1785,6 +1870,10 @@ mod tests {
         });
         let debug = format!("{:?}", auth);
         assert!(debug.contains("ApiKey"));
+        assert!(
+            !debug.contains("key1"),
+            "the configured API key reached Debug: {debug}"
+        );
     }
 
     #[test]
@@ -1805,11 +1894,15 @@ mod tests {
     #[test]
     fn auth_debug_bearer() {
         let auth = Auth::Bearer(BearerAuth {
-            tokens: bearer_entries(&["tok"]),
+            tokens: bearer_entries(&["tok-SENTINEL"]),
             ..Default::default()
         });
         let debug = format!("{:?}", auth);
         assert!(debug.contains("Bearer"));
+        assert!(
+            !debug.contains("tok-SENTINEL"),
+            "the configured bearer token reached Debug: {debug}"
+        );
     }
 
     #[test]
@@ -3518,6 +3611,91 @@ mod tests {
         assert!(
             text.contains("authentication[1]"),
             "the error must say which entry carried it: {text}"
+        );
+    }
+
+    /// WOR-2640: the inbound credential entries all held a reusable
+    /// secret behind a derived `Debug`. A provider-construction error
+    /// or an `anyhow` context is one hop from the admin log, and these
+    /// are the values a caller presents to authenticate.
+    ///
+    /// Each half is asserted: the secret is gone, and the identifier
+    /// that says which entry failed is still there. A `Debug` that
+    /// redacted everything would be safe and useless.
+    #[test]
+    fn debug_never_renders_an_inbound_credential() {
+        const SENTINEL: &str = "SENTINEL-SECRET-9f3a";
+
+        let api_key = ApiKeyEntry {
+            secret: SENTINEL.to_string(),
+            attrs: CredentialAttrs::default(),
+        };
+        let rendered = format!("{api_key:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the API key reached Debug: {rendered}"
+        );
+
+        let bearer = BearerToken {
+            secret: SENTINEL.to_string(),
+            attrs: CredentialAttrs::default(),
+        };
+        let rendered = format!("{bearer:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the bearer token reached Debug: {rendered}"
+        );
+
+        let basic = BasicAuthUser {
+            username: "alice".to_string(),
+            password: SENTINEL.to_string(),
+            attrs: CredentialAttrs::default(),
+        };
+        let rendered = format!("{basic:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the basic password reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("alice"),
+            "the username must survive so the entry is nameable: {rendered}"
+        );
+
+        let digest = DigestAuthUser {
+            username: "bob".to_string(),
+            password: SENTINEL.to_string(),
+        };
+        let rendered = format!("{digest:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the digest password reached Debug: {rendered}"
+        );
+        assert!(rendered.contains("bob"), "the username must survive");
+
+        let jwt = JwtAuth {
+            secret: Some(SENTINEL.to_string()),
+            issuer: Some("https://idp.example.com".to_string()),
+            ..Default::default()
+        };
+        let rendered = format!("{jwt:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the JWT HMAC secret reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("https://idp.example.com"),
+            "the issuer must survive so a rejected token is diagnosable: {rendered}"
+        );
+        // Presence, not value: "no secret configured" and "wrong secret
+        // configured" are different faults with the same symptom.
+        assert!(
+            rendered.contains("REDACTED"),
+            "a configured secret must render as present: {rendered}"
+        );
+        let rendered = format!("{:?}", JwtAuth::default());
+        assert!(
+            rendered.contains("secret: None"),
+            "an absent secret must be distinguishable from a present one: {rendered}"
         );
     }
 }

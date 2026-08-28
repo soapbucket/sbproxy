@@ -1298,6 +1298,92 @@ fn verify_graphql_inbound_body_binding(
     verified
 }
 
+/// Everything `response_body_filter` has in hand when a claimed
+/// request's response ends, each part `None` when that part was never
+/// captured (WOR-2609).
+///
+/// Grouped so the publish decision is one named function with one
+/// argument rather than a six-tuple inline in a two-thousand-line
+/// filter, which is what made the seam untestable in process.
+pub(crate) struct IdempotencyPublishParts {
+    /// The captured response body, absent when the response outgrew
+    /// `max_response_body_bytes` and streamed uncached.
+    pub(crate) body: Option<bytes::BytesMut>,
+    /// The captured status.
+    pub(crate) status: Option<u16>,
+    /// The captured response headers.
+    pub(crate) headers: Option<Vec<(String, String)>>,
+    /// The claim this request took, absent once a disengage path has
+    /// dropped it.
+    pub(crate) claim: Option<sbproxy_middleware::idempotency::IdempotencyClaim>,
+    /// The origin's response TTL, absent when the origin is gone from
+    /// under a reload.
+    pub(crate) ttl_secs: Option<u64>,
+    /// SHA-256 of the request body this response answers.
+    pub(crate) body_hash: [u8; 32],
+}
+
+/// What the publish decision did, so a test can name it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum IdempotencyPublish {
+    /// The response was stored under the claim.
+    Published,
+    /// Something was missing, so the claim was released instead of
+    /// published and the key is free for the client's retry.
+    ReleasedIncomplete,
+    /// No claim was held; nothing to do.
+    NoClaim,
+}
+
+/// Publish a claimed request's captured response, or release the claim.
+///
+/// This is the proxy path's publish seam, and it is a named function
+/// rather than an inline block because nothing in process reached it
+/// before: the only coverage of a claimed request's round trip through
+/// a live proxy is `e2e/tests/idempotency.rs`, and a future edit that
+/// let `claim` be `None` while the other three were `Some` would
+/// silently stop caching every proxied response with thirteen thousand
+/// unit tests still green.
+///
+/// All five parts have to be present. When any is missing the claim is
+/// dropped on the spot rather than left to time out, so a partial
+/// capture costs the client one retry instead of a lease of 409s.
+pub(crate) fn publish_captured_idempotent_response(
+    parts: IdempotencyPublishParts,
+) -> IdempotencyPublish {
+    let IdempotencyPublishParts {
+        body,
+        status,
+        headers,
+        claim,
+        ttl_secs,
+        body_hash,
+    } = parts;
+    let Some(claim) = claim else {
+        return IdempotencyPublish::NoClaim;
+    };
+    let (Some(body), Some(status), Some(headers), Some(ttl_secs)) =
+        (body, status, headers, ttl_secs)
+    else {
+        // Dropping the handle releases the key. Explicit rather than
+        // implicit so the reason is in the code and not only in a
+        // comment about what falls out of scope.
+        drop(claim);
+        return IdempotencyPublish::ReleasedIncomplete;
+    };
+    sbproxy_middleware::idempotency::record_response_detached(
+        claim,
+        sbproxy_middleware::idempotency::RecordedResponse {
+            status,
+            headers,
+            body: body.to_vec(),
+            body_hash,
+            ttl_secs,
+        },
+    );
+    IdempotencyPublish::Published
+}
+
 /// Engage idempotency only after GraphQL validation has established the final
 /// authoritative request body.
 ///
@@ -1307,7 +1393,13 @@ fn verify_graphql_inbound_body_binding(
 /// `upstream_request_filter`. This late path preserves the cached response
 /// payload and conflict semantics while ensuring an older entry never bypasses
 /// the current validation rules.
-fn engage_validated_graphql_idempotency(
+///
+/// Async because the claim itself is: a shared backend answers it over
+/// the network, and a proxy worker that blocks on one stops serving
+/// every other connection assigned to it (WOR-2606). What this path
+/// still cannot do is *wait* for a key another request holds, because
+/// the body is already committed and there is nowhere to re-send it.
+async fn engage_validated_graphql_idempotency(
     request_headers: &http::HeaderMap,
     method: &http::Method,
     authoritative_body: &[u8],
@@ -1350,19 +1442,67 @@ fn engage_validated_graphql_idempotency(
     ctx.idempotency_permit = Some(permit);
 
     let body_hash = sbproxy_middleware::idempotency::hash_body(authoritative_body);
-    if let Some(cached) = idem.cache.get(&workspace, &key) {
-        ctx.idempotency_permit = None;
-        if cached.request_body_hash == body_hash {
-            ctx.idempotency_deferred_hit = Some(cached);
-        } else {
-            let (status, content_type, body) = sbproxy_middleware::idempotency::conflict_response();
+    // WOR-2609: this path runs in `upstream_request_filter`, which has
+    // already committed the body, so it cannot wait for a key another
+    // request holds the way the ordinary path does: there is nowhere to
+    // re-send what has already gone out. It answers the 409 that
+    // draft-ietf-httpapi-idempotency-key-header names as the floor, and
+    // the client's retry resolves normally once the holder publishes.
+    //
+    // The claim itself does go off the worker, through `claim_async`
+    // like every other call site. This one was missed in the first fix
+    // round, which left the one path that skipped the seam running up
+    // to six Redis round trips inside a Pingora worker while
+    // `blocks_on_io`'s own rustdoc said the request path did not.
+    match Box::pin(sbproxy_middleware::idempotency::claim_async(
+        &idem.cache,
+        &workspace,
+        &key,
+        idem.claim_lease_secs,
+    ))
+    .await
+    {
+        sbproxy_middleware::idempotency::ClaimState::Completed(cached) => {
+            ctx.idempotency_permit = None;
+            if cached.request_body_hash == body_hash {
+                ctx.idempotency_deferred_hit = Some(*cached);
+            } else {
+                let (status, content_type, body) =
+                    sbproxy_middleware::idempotency::conflict_response();
+                ctx.validator_failed = Some((
+                    status.as_u16(),
+                    String::from_utf8_lossy(&body).into_owned(),
+                    content_type.to_string(),
+                ));
+            }
+            return true;
+        }
+        sbproxy_middleware::idempotency::ClaimState::InFlight { .. } => {
+            ctx.idempotency_permit = None;
+            // The only place `in_flight` is recorded, and the only
+            // place the value's documented meaning occurs: a live claim
+            // found on a path that cannot wait. Every other overlap
+            // waits first and lands on `coalesced`, `wait_timeout` or
+            // `abandoned`. The value was declared in the metric's
+            // rustdoc and in the configuration reference and recorded
+            // nowhere, so an operator alerting on it got a series that
+            // never appeared.
+            sbproxy_observe::metrics::record_idempotency_cache_result(
+                idem.cache.backend_label(),
+                "in_flight",
+            );
+            let (status, content_type, body) =
+                sbproxy_middleware::idempotency::in_flight_response();
             ctx.validator_failed = Some((
                 status.as_u16(),
                 String::from_utf8_lossy(&body).into_owned(),
                 content_type.to_string(),
             ));
+            return true;
         }
-        return true;
+        sbproxy_middleware::idempotency::ClaimState::Claimed(held) => {
+            ctx.idempotency_claim = Some(held);
+        }
     }
 
     ctx.idempotency_miss = Some((key, body_hash));
@@ -4353,12 +4493,14 @@ impl ProxyHttp for SbProxy {
                 .graphql_validated_request_body
                 .clone()
                 .unwrap_or_default();
-            if engage_validated_graphql_idempotency(
+            if Box::pin(engage_validated_graphql_idempotency(
                 &session.req_header().headers,
                 &upstream_request.method,
                 &authoritative_body,
                 ctx,
-            ) {
+            ))
+            .await
+            {
                 return Err(pingora_error::Error::explain(
                     pingora_error::ErrorType::InternalError,
                     "validated GraphQL idempotency response",
@@ -7829,32 +7971,31 @@ impl ProxyHttp for SbProxy {
                 }
             }
             if end_of_stream {
-                if let Some((key, body_hash)) = ctx.idempotency_miss.take() {
+                if let Some((_key, body_hash)) = ctx.idempotency_miss.take() {
                     let buf = ctx.idempotency_response_body_buf.take();
                     let status = ctx.idempotency_response_status.take();
                     let headers = ctx.idempotency_response_headers.take();
-                    let workspace = ctx.idempotency_workspace.clone().unwrap_or_default();
-                    if let (Some(buf), Some(status), Some(headers)) = (buf, status, headers) {
-                        let pipeline = ctx.pipeline.clone();
-                        if let Some(idem) = ctx
-                            .origin_idx
-                            .and_then(|i| pipeline.idempotencies.get(i))
-                            .and_then(|opt| opt.as_ref())
-                        {
-                            sbproxy_middleware::idempotency::record_response(
-                                idem.cache.as_ref(),
-                                &workspace,
-                                &key,
-                                sbproxy_middleware::idempotency::RecordedResponse {
-                                    status,
-                                    headers,
-                                    body: buf.to_vec(),
-                                    body_hash,
-                                    ttl_secs: idem.ttl_secs,
-                                },
-                            );
-                        }
-                    }
+                    // Taken unconditionally, and deliberately so: every
+                    // one of these four is either all present or the
+                    // response was never captured, and a claim that
+                    // cannot be published has to be released rather than
+                    // left to time out. Taking it here drops it on the
+                    // spot when the tuple does not match (WOR-2609).
+                    let claim = ctx.idempotency_claim.take();
+                    let pipeline = ctx.pipeline.clone();
+                    let ttl = ctx
+                        .origin_idx
+                        .and_then(|i| pipeline.idempotencies.get(i))
+                        .and_then(|opt| opt.as_ref())
+                        .map(|idem| idem.ttl_secs);
+                    publish_captured_idempotent_response(IdempotencyPublishParts {
+                        body: buf,
+                        status,
+                        headers,
+                        claim,
+                        ttl_secs: ttl,
+                        body_hash,
+                    });
                 }
             }
         }
@@ -8846,6 +8987,13 @@ impl ProxyHttp for SbProxy {
         // so reading it recorded a failure for every successful call.
         record_routing_feedback(ctx, status_u16);
 
+        // WOR-2654: the primary half of any shadow pair this request
+        // opened. Same `status_u16` as above and for the same reason:
+        // the AI path never reaches the `response_filter` that sets
+        // `ctx.response_status`, so reading that field would report
+        // every paired primary as a failure.
+        record_shadow_primary_leg(ctx, status_u16);
+
         // WOR-2145: cut the attested consumption receipt.
         //
         // Here rather than in `response_filter` because this is the
@@ -8979,6 +9127,15 @@ impl ProxyHttp for SbProxy {
                 model: ctx.ai_model.clone(),
                 tokens_in: ctx.ai_tokens_in,
                 tokens_out: ctx.ai_tokens_out,
+                // WOR-2658: both are subsets of `tokens_in` rather than
+                // additions to it, so a reader summing the row does not
+                // double-count a cached prefix.
+                tokens_cached: ctx.ai_tokens_cached,
+                tokens_cache_write: ctx.ai_tokens_cache_write,
+                // WOR-2658: the tier that priced them, beside the
+                // tokens. Always the operator's; the caller's own
+                // `service_tier` field never survives dispatch.
+                service_tier: ctx.ai_service_tier.as_ref().map(ToString::to_string),
                 cost_usd_micros: ctx.ai_cost_usd_micros,
                 guardrail_category: ctx.ai_guardrail_category.clone(),
                 guardrail_action: ctx.ai_guardrail_action.clone(),
@@ -9490,6 +9647,122 @@ fn apply_response_status_override(
         if reason.is_some() {
             response.set_reason_phrase(reason).ok();
         }
+    }
+}
+
+#[cfg(test)]
+mod idempotency_publish_seam_tests {
+    use super::*;
+    use sbproxy_middleware::idempotency::{
+        claim, ClaimState, EntryState, IdempotencyCache, InMemoryIdempotencyCache,
+    };
+    use std::sync::Arc;
+
+    fn cache() -> Arc<dyn IdempotencyCache> {
+        Arc::new(InMemoryIdempotencyCache::new())
+    }
+
+    fn parts(held: sbproxy_middleware::idempotency::IdempotencyClaim) -> IdempotencyPublishParts {
+        IdempotencyPublishParts {
+            body: Some(bytes::BytesMut::from(&b"{\"ok\":true}"[..])),
+            status: Some(201),
+            headers: Some(vec![(
+                "content-type".to_string(),
+                "application/json".to_string(),
+            )]),
+            claim: Some(held),
+            ttl_secs: Some(600),
+            body_hash: sbproxy_middleware::idempotency::hash_body(b"req"),
+        }
+    }
+
+    /// WOR-2609: the proxy path's publish seam, in process.
+    ///
+    /// The only thing that asserted a claimed request's round trip
+    /// through a live proxy was `e2e/tests/idempotency.rs`, which no
+    /// per-PR lane runs. A future edit that let one of the five parts
+    /// be `None` while the others were present would silently stop
+    /// caching every proxied response with thirteen thousand unit tests
+    /// still green, so the decision is a named function and this names
+    /// it back.
+    #[tokio::test]
+    async fn a_complete_capture_publishes_under_the_claim() {
+        let cache = cache();
+        let ClaimState::Claimed(held) = claim(&cache, "ws", "k", 60) else {
+            panic!("expected to take the key");
+        };
+        assert_eq!(
+            publish_captured_idempotent_response(parts(held)),
+            IdempotencyPublish::Published
+        );
+        match cache.peek("ws", "k") {
+            EntryState::Completed(stored) => {
+                assert_eq!(stored.status, 201);
+                assert_eq!(stored.body, b"{\"ok\":true}");
+            }
+            other => panic!("the captured response was not published, got {other:?}"),
+        }
+    }
+
+    /// A partial capture releases the key on the spot instead of
+    /// leaving the client's retries to answer 409 for the rest of the
+    /// lease. One missing part per case, because the guard is an
+    /// all-or-nothing tuple and a test that only drops one part cannot
+    /// see the arity change that broke it.
+    #[tokio::test]
+    async fn a_partial_capture_releases_rather_than_publishing() {
+        for (label, mutate) in [
+            (
+                "no body",
+                Box::new(|p: &mut IdempotencyPublishParts| p.body = None)
+                    as Box<dyn Fn(&mut IdempotencyPublishParts)>,
+            ),
+            (
+                "no status",
+                Box::new(|p: &mut IdempotencyPublishParts| p.status = None),
+            ),
+            (
+                "no headers",
+                Box::new(|p: &mut IdempotencyPublishParts| p.headers = None),
+            ),
+            (
+                "no ttl",
+                Box::new(|p: &mut IdempotencyPublishParts| p.ttl_secs = None),
+            ),
+        ] {
+            let cache = cache();
+            let ClaimState::Claimed(held) = claim(&cache, "ws", "k", 60) else {
+                panic!("expected to take the key");
+            };
+            let mut p = parts(held);
+            mutate(&mut p);
+            assert_eq!(
+                publish_captured_idempotent_response(p),
+                IdempotencyPublish::ReleasedIncomplete,
+                "{label}: a partial capture must not publish"
+            );
+            assert_eq!(
+                cache.peek("ws", "k"),
+                EntryState::Absent,
+                "{label}: the key must be free for the client's retry"
+            );
+        }
+    }
+
+    /// A disengage path that already dropped the claim leaves nothing
+    /// to publish and nothing to release.
+    #[tokio::test]
+    async fn no_claim_is_not_a_publish() {
+        let cache = cache();
+        let ClaimState::Claimed(held) = claim(&cache, "ws", "k", 60) else {
+            panic!("expected to take the key");
+        };
+        let mut p = parts(held);
+        p.claim = None;
+        assert_eq!(
+            publish_captured_idempotent_response(p),
+            IdempotencyPublish::NoClaim
+        );
     }
 }
 

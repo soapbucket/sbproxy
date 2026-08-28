@@ -572,6 +572,16 @@ pub struct RequestContext {
     /// into `response_body_filter` so the captured upstream response
     /// can be stored under the same `(workspace, key)` pair.
     pub idempotency_miss: Option<(String, [u8; 32])>,
+    /// The claim this request holds on its idempotency key, when it is
+    /// the request that will produce the response (WOR-2609).
+    ///
+    /// It lives on the context rather than in a local because it is
+    /// taken in `request_filter` and published in
+    /// `response_body_filter`. Dropping the context releases the key, so
+    /// a request that dies, is cancelled, or returns early anywhere
+    /// between those two points does not leave every retry of the same
+    /// key answering 409 until the lease runs out.
+    pub idempotency_claim: Option<sbproxy_middleware::idempotency::IdempotencyClaim>,
     /// Buffer the upstream response body accumulates into while the
     /// proxy captures a cache-miss response for later replay.
     pub idempotency_response_body_buf: Option<BytesMut>,
@@ -1313,6 +1323,20 @@ pub struct RequestContext {
     /// reported no cache write, which includes every provider that only
     /// reports reads.
     pub ai_tokens_cache_write: Option<u64>,
+    /// Operator service tier this request was served under (WOR-2652),
+    /// as the value written on the wire.
+    ///
+    /// WOR-2658 asks the per-request usage record to name the tier
+    /// beside the provider, the model, and the credential that paid.
+    /// The tier reached only
+    /// `sbproxy_ai_service_tier_decisions_total{disposition}` and the
+    /// outbound body, so an operator reading one request could see a
+    /// bill without seeing which tier priced it. `None` when the
+    /// surface has no tier axis, when the provider declares none, or
+    /// when the request never reached a provider. The caller's own
+    /// `service_tier` field is stripped unconditionally and never
+    /// lands here.
+    pub ai_service_tier: Option<compact_str::CompactString>,
     /// Rate-limiter bucket for the authenticated virtual key, set only
     /// when the key carries a tokens-per-minute cap (WOR-1833). The
     /// request-completion path uses it to charge the response's token
@@ -1903,6 +1927,7 @@ impl RequestContext {
             idempotency_buffering: false,
             idempotency_workspace: None,
             idempotency_miss: None,
+            idempotency_claim: None,
             idempotency_response_body_buf: None,
             idempotency_response_status: None,
             idempotency_response_headers: None,
@@ -2027,6 +2052,7 @@ impl RequestContext {
             ai_tokens_out: None,
             ai_tokens_cached: None,
             ai_tokens_cache_write: None,
+            ai_service_tier: None,
             ai_key_tpm_bucket: None,
             ai_lane_priority: None,
             managed_model_permit: None,

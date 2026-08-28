@@ -1453,7 +1453,7 @@ origins:
 | `message_signatures` | object | | RFC 9421 HTTP message signatures. |
 | `olp` | object | | RSL Open License Protocol token issuer and public-key endpoints. |
 | `web_bot_auth_publish` | object | | Publish a Web Bot Auth key directory and Signature Agent Card on this origin. |
-| `idempotency` | object | | RFC 8594 idempotency middleware. See [Idempotency](#idempotency). |
+| `idempotency` | object | | `Idempotency-Key` middleware. See [Idempotency](#idempotency). |
 | `connection_pool` | object | | Only `idle_timeout_secs` is read, as the legacy spelling of `timeouts.idle_ms`. `max_connections` and `max_lifetime_secs` fail config load. See [Connection pool](#connection-pool). |
 | `timeouts` | object | | Upstream transport deadlines (connect, read, write, idle), in milliseconds. See [Upstream timeouts](#upstream-timeouts). |
 | `extensions` | object | | Opaque map for out-of-tree origin-level blocks. |
@@ -5705,22 +5705,144 @@ See [`examples/api-deprecation/`](https://github.com/soapbucket/sbproxy/tree/mai
 
 ## Idempotency
 
-The `idempotency:` block opts the origin into RFC 8594-style cached
-retries. The middleware reads the `Idempotency-Key` request header,
+The `idempotency:` block opts the origin into cached retries per
+`draft-ietf-httpapi-idempotency-key-header`. The middleware reads the
+`Idempotency-Key` request header,
 hashes the request body, and:
 
-- **First call** under a given key: forwards the request upstream and
-  caches the response under `(tenant, origin, key)` keyed by the body
-  hash. Two origins never see each other's entries, including on the
-  `redis` backend where they share one store.
+- **First call** under a given key: claims the key, forwards the
+  request upstream, and caches the response under
+  `(tenant, origin, key)` keyed by the body hash. Two origins never see
+  each other's entries, including on the `redis` backend where they
+  share one store.
 - **Replay** with the same key + same body: returns the cached
   response with `x-sbproxy-idempotency: HIT`. The upstream is not
   contacted.
 - **Conflict** (same key, different body): returns 409 with the
-  `ledger.idempotency_conflict` JSON body per the RFC.
+  `ledger.idempotency_conflict` JSON body and
+  `x-sbproxy-idempotency: CONFLICT`.
+- **Overlap** (a second request arrives while the first is still
+  running): waits for the first request's response and replays it. If
+  the first request has not finished within `claim_wait_ms`, the second
+  gets 409 with `ledger.idempotency_in_flight`,
+  `x-sbproxy-idempotency: IN-FLIGHT`, and `Retry-After: 1`. It never
+  reaches the upstream.
+
+The `x-sbproxy-idempotency` response header carries one of `HIT`,
+`CONFLICT`, `IN-FLIGHT`, `SKIPPED-OVERSIZE-REQUEST`,
+`SKIPPED-OVERSIZE-RESPONSE`, `SKIPPED-POOL-FULL`, or
+`SKIPPED-MULTIPART`. A first call that goes upstream carries no marker.
+
+`SKIPPED-MULTIPART` is the one that surprises people: a multipart
+request bypasses the cache because the v1 cache stores raw bytes, and a
+client retry may regenerate its MIME boundaries, so two byte-identical
+uploads hash differently and would read as a conflict rather than as a
+replay. Nothing is cached and the request goes upstream.
 
 The middleware runs ahead of policy enforcement so a cached replay
 does not consume a rate-limit slot.
+
+### Overlapping requests reach the upstream once
+
+A client that times out locally and fires fifty retries of one POST
+produces one upstream call and fifty identical responses. The key is
+claimed, not merely looked up, so only the request holding it goes
+upstream; the rest wait on that claim and replay its answer.
+
+The claim is a lease, held for `claim_lease_secs` (sixty by default).
+A request that finishes, fails, or is cancelled releases the key
+immediately, so the next retry proceeds without waiting. A process that
+dies mid-request cannot release anything, and its key is takeable again
+once the lease runs out: the lease is the bound on how long one crashed
+request can make one key answer 409, and nothing else.
+
+Size it above the slowest response this origin produces. An upstream
+that routinely takes longer than the lease can have a retry take the
+key over while the original is still running, which is one duplicate
+call per overlap. The default is sized for the slow tail of a normal
+API call; an origin fronting an AI completion, a long-poll, or a
+payment with a 3DS step-up wants a larger value.
+
+The lease and the response TTL are two different lifetimes. A response
+is stored under `ttl_secs`, which is hours, and it is written whether
+or not the claim row survived: an upstream slower than the lease still
+caches its answer, so the client's next retry is a replay rather than
+another call. What the lease governs is who gets to write. A request
+that stalled past its lease and was replaced cannot overwrite the
+answer its successor already sent, and a refusal on those grounds is
+counted under `result="fenced"`.
+
+A request that arrives during an overlap and carries a *different*
+body still gets `ledger.idempotency_conflict` rather than a replay: the
+body hash is compared against the response that eventually lands, so a
+key reused with different content is never answered with somebody
+else's result.
+
+Two exceptions worth knowing. Requests on a GraphQL origin with
+validation enabled engage idempotency after validation, at a point in
+the pipeline that cannot wait, so an overlap there answers
+`ledger.idempotency_in_flight` immediately instead of waiting out
+`claim_wait_ms`. And single-flight across replicas needs a store that
+can create a key atomically: `redb`, `sqlite`, and `redis` all can, and
+so does the in-memory backend within one process. If `proxy.l2_store`
+points at a backend that cannot, the proxy warns once at startup naming
+the store, counts every affected request under
+`sbproxy_idempotency_cache_results_total{result="single_flight_unsupported"}`,
+and falls back to replay-only behavior rather than pretending.
+
+A request that is waiting on somebody else's claim holds a slot in its
+own pool, sized by `max_concurrent_buffers` but separate from the
+buffering pool. Worst-case memory per origin is therefore roughly
+`2 * max_concurrent_buffers * max_request_body_bytes`. The two are
+separate because they bound different things: buffering is microseconds
+on the way upstream, while a wait is up to `claim_wait_ms` of doing
+nothing, and one shared pool let a retry storm on a single key spend
+every slot the origin had.
+
+### Reading the metrics
+
+Every request the middleware *resolves* lands exactly one *outcome*
+value on `sbproxy_idempotency_cache_results_total{backend,result}`, so
+those values sum to the number of requests the middleware resolved:
+
+| `result` | What happened |
+|---|---|
+| `not_applicable` | No idempotency key on the request. |
+| `miss` | This request took the key and went upstream. |
+| `takeover` | The same, on a key whose previous holder never came back. |
+| `hit` | A stored response was replayed. |
+| `coalesced` | A stored response was replayed after waiting for the request producing it. One upstream call served both. |
+| `conflict` | Same key, different body. Answered 409 `ledger.idempotency_conflict`. |
+| `wait_timeout` | The wait budget ran out while the holder was still working. Answered 409 `ledger.idempotency_in_flight`. |
+| `abandoned` | The holder ended without storing a response. Same 409, and the client's retry is what takes the key over. |
+| `in_flight` | A live claim was found by a request that cannot wait for it, so no wait was attempted. Answered 409 `ledger.idempotency_in_flight` immediately. Two populations: the GraphQL late path, which has already committed the body, and a request that could not take a waiter slot because the waiter pool was full. |
+
+Three further values are diagnostic and are counted *in addition* to
+the outcome, so they do not sum with the table above:
+
+| `result` | What happened |
+|---|---|
+| `error` | A store-side read or write failed. The numerator for "the cache is not working". |
+| `fenced` | A publish was refused because another request owns the key or has already answered it. |
+| `single_flight_unsupported` | The configured store has no atomic create, so overlapping first requests are not serialized. |
+
+That denominator is not the origin's request count, and the difference
+matters when you build the dashboard. A request the middleware **skips**
+records nothing at all: an oversize request or response body, a
+multipart body, and a full buffering pool each go upstream uncached and
+appear only as an `x-sbproxy-idempotency: SKIPPED-*` response header.
+A request with **no idempotency key** records `not_applicable` on the AI
+proxy path, which sees the whole body before it decides, and records
+nothing on the streaming proxy path, which never engages the middleware
+for a keyless request. So `sum(rate(...))` is the middleware's own
+throughput, not the origin's, and `not_applicable` counts keyless AI
+requests only.
+
+A nonzero `takeover` or `abandoned` rate means requests are dying
+between claiming a key and answering it. A nonzero `wait_timeout` means
+overlapping retries are outliving `claim_wait_ms`. A nonzero `fenced`
+rate means responses are arriving after their lease lapsed, which is
+the signal to raise `claim_lease_secs`.
 
 ```yaml
 origins:
@@ -5731,6 +5853,8 @@ origins:
       ttl_secs: 86400               # default (24 h)
       methods: [POST, PUT, PATCH]   # default
       backend: memory               # or `redis`
+      claim_lease_secs: 60          # default
+      claim_wait_ms: 3000           # default
 ```
 
 | Field | Type | Default | Description |
@@ -5742,7 +5866,9 @@ origins:
 | `backend` | enum | `memory` | `memory` (per-origin, per-replica) or `redis` (binds to `proxy.l2_cache_settings`, alias `l2_cache`, for cluster-wide replay). |
 | `max_request_body_bytes` | int | 1048576 (1 MiB) | Per-request cap on buffered body bytes. Bodies larger than this skip the cache; response carries `x-sbproxy-idempotency: SKIPPED-OVERSIZE-REQUEST`. |
 | `max_response_body_bytes` | int | 1048576 (1 MiB) | Per-response cap on cached body bytes. Responses larger than this stream through uncached. |
-| `max_concurrent_buffers` | int | 256 | Per-origin cap on concurrent buffered requests. When the pool is exhausted, new requests skip the cache; response carries `x-sbproxy-idempotency: SKIPPED-POOL-FULL`. Worst-case memory per origin is roughly `max_concurrent_buffers * max_request_body_bytes`. |
+| `max_concurrent_buffers` | int | 256 | Per-origin cap on concurrent buffered requests, and separately on requests waiting for another request's claim. The two pools answer a full pool differently, deliberately: a full **buffering** pool skips the cache and the request goes upstream uncached, carrying `x-sbproxy-idempotency: SKIPPED-POOL-FULL`; a full **waiter** pool answers 409 `ledger.idempotency_in_flight` with `x-sbproxy-idempotency: IN-FLIGHT` and `Retry-After: 1` immediately, because a request that cannot wait for the holder must not be allowed upstream to duplicate the side effect. Worst-case memory per origin is roughly `2 * max_concurrent_buffers * max_request_body_bytes`. |
+| `claim_lease_secs` | int | 60 | How long the request holding a key keeps it before another may take it over. The bound on how long one crashed request can wedge one key. Raise it above the slowest response this origin produces. `0` is refused at config-load time. |
+| `claim_wait_ms` | int | 3000 | How long an overlapping request waits for the holder's response before answering 409 `ledger.idempotency_in_flight`. `0` answers 409 immediately, which is the floor the draft describes. |
 
 The `memory` backend is per-origin and per-replica: suitable for
 single-instance deployments and clusters with sticky routing. The
@@ -5753,7 +5879,7 @@ config-load error rather than silently downgrading.
 
 See [`examples/idempotency/`](https://github.com/soapbucket/sbproxy/tree/main/examples/idempotency).
 
-Spec: <https://www.rfc-editor.org/rfc/rfc8594.html>.
+Spec: <https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/>.
 
 > **AI gateway note.** The AI proxy path (`action: ai_proxy`) engages
 > the same middleware: when the origin has an `idempotency:` block,
