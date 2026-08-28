@@ -246,6 +246,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_config_history_entries` | Gauge | `stable` | `beta` | none | Entries currently held in the config revision ring. |
 | `sbproxy_config_lkg_revision` | Gauge | `stable` | `beta` | none | Config ring revision the last-known-good pointer names, or -1 when it names none. |
 | `sbproxy_config_soak_verdict_total` | Counter | `stable` | `beta` | `verdict`, `signal` | Config soak outcomes, by verdict and reporting signal. |
+| `sbproxy_config_apply_total` | Counter | `stable` | `beta` | `outcome` | Config rollback attempts, by outcome: applied for an operator rollback, reverted for an automatic one after a failed soak, rejected for a refusal. |
 | `sbproxy_config_rejected_total` | Counter | `stable` | `beta` | `reason` | Config candidates refused before applying, by reason. |
 | `sbproxy_config_fallback_active` | Gauge | `stable` | `beta` | none | 1 while this node serves a config its boot fallback restored from the revision ring. |
 | `sbproxy_config_reload_total` | Counter | `stable` | `beta` | `result` | Config reload attempts, by result. |

@@ -6968,7 +6968,8 @@
             "max_error_rate_delta": 0.05,
             "require_no_degraded_subsystems": true,
             "require_upstream_health": true,
-            "probe": null
+            "probe": null,
+            "auto_revert": false
           },
           "allOf": [
             {
@@ -7042,6 +7043,11 @@
               "type": "null"
             }
           ]
+        },
+        "auto_revert": {
+          "description": "Whether a failed soak re-applies the last known good revision on its own. **Off by default**, and the only key in this block that is (WOR-2461).\n\n# Why this one defaults off\n\nA node that undoes an operator's change without being asked is surprising in a way that costs trust, and the failure mode is asymmetric: a flapping upstream during a deploy window reverts a good config, the operator re-applies it, it reverts again, and the safety feature is now the incident. With it off the soak still runs and still promotes, so the operator gets a correct last-known-good pointer, a metric, an event, and an alert, with none of that risk. Calibrate the thresholds against real traffic with this off before arming it.\n\nJunos `commit confirmed` is the closest prior art and it is deliberately not what this is: there the operator opts in per commit and the rollback timer is armed for that one change. Here the opt-in is per node and standing, which is a bigger promise, so it is off until someone makes it.\n\n# It arms only for a diff an arc-swap can undo\n\nA `Restart` or `Breaking` diff (listener ports, admin block, cluster identity, an origin's action or auth type) cannot be undone by swapping the pipeline pointer back, and half-reverting would leave the process in a state neither config describes. Those get boot fallback and `POST /admin/config/rollback` instead. The stored `blast_radius` on the ring entry decides it.",
+          "default": false,
+          "type": "boolean"
         }
       },
       "additionalProperties": false

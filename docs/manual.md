@@ -162,6 +162,11 @@ sbproxy apply -p <plan-file> [--admin-url <url>] [--validate-only]
 sbproxy config {migrate|import-litellm|print}
 sbproxy config history [--admin-url <url>] [--format text|json]
 sbproxy config show <revision> [--admin-url <url>] [--format text|json]
+sbproxy config rollback [--to <rev|digest|last-known-good>] [--expected-current <rev>]
+                        [--confirm <rev>] [--lineage <uuid>] [--force]
+                        [--admin-url <url>] [--format text|json]
+sbproxy config diff [<rev>] [--from <rev>] [--to <rev>] [--admin-url <url>]
+                        [--format text|json]
 sbproxy config authority init --dir <path> [--key-id <id>] [--authority-id <id>]
                               [--force] [--format text|json]
 sbproxy config authority publish -f <payload.yml> [--mode overlay|replace]
@@ -591,6 +596,50 @@ stored document, selected from the same ring by the revision number
 `proxy.config_history.keep` is no longer available. `--format json` on
 `show` prints the admin API's full detail envelope (`entry`, `document`,
 `plan_text`) rather than just the document.
+
+### `config rollback` / `config diff` - move a running proxy back to a stored revision
+
+Same admin-API plumbing as `config history`, and the same requirement:
+`proxy.config_history.enabled` on the node being talked to.
+
+```bash
+# What would change, before anything does. Reads only.
+sbproxy config diff 41
+sbproxy config diff --from 38 --to 41
+
+# Back to whatever the soak last promoted.
+sbproxy config rollback --to last-known-good
+
+# To a named revision, refusing if somebody else moved this node first.
+sbproxy config rollback --to 41 --expected-current 43
+
+# A restart-class or breaking rollback needs the revision typed back.
+sbproxy config rollback --to 41 --confirm 41
+```
+
+`--to` accepts a revision number, a content digest, or the literal
+`last-known-good`, which is the default. The restored document is applied
+through the ordinary reload transaction and soaks like any other candidate,
+history stays append-only (the rollback appends a new entry and marks the
+revision it left as `reverted`), and the node's own config **file** is not
+rewritten, which the text output says in a warning line. Fix the source of
+truth before the next reload trigger re-applies it.
+
+`--expected-current` is optimistic concurrency: the call is refused when
+that is not the revision running, so two operators reaching for rollback
+during one incident do not silently undo each other. Omitting it proceeds.
+
+`config diff` takes the target as a positional or as `--to`, and defaults
+`--from` to what the proxy is running. Two stored revisions need not be
+adjacent. It exits `0` when the two documents are identical and `2` when
+they differ, following `plan`'s convention, so a script can branch on
+whether a rollback is a no-op.
+
+| Exit code | `config rollback` |
+|---|---|
+| 0 | Applied. |
+| 4 | Refused: an unknown revision, a stale `--expected-current`, a lineage break, an unconfirmed restart-class change, or a document that no longer compiles. The refusal body names what is available or both sides of the mismatch. |
+| 7 | The admin API could not be reached. Nothing was applied. |
 
 ### `projections render` - serve-time documents on demand
 

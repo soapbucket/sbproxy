@@ -2390,6 +2390,19 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_config_apply_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_config_apply"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["outcome"],
+        description: "Config rollback attempts, by outcome: applied for an operator rollback, \
+                      reverted for an automatic one after a failed soak, rejected for a \
+                      refusal.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_config_rejected_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_config_rejection"),

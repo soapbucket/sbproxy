@@ -1253,6 +1253,7 @@ proxy:
       max_error_rate_delta: 0.05
       require_no_degraded_subsystems: true
       require_upstream_health: true
+      auto_revert: false
       probe:
         url: http://127.0.0.1:8080/healthz
         expect_status: 200
@@ -1289,6 +1290,7 @@ moves the last-known-good pointer.
 | `max_error_rate_delta` | float | `0.05` | How far the error rate may rise, against the rate measured when the window armed, before the request-outcome signal fails. Between 0 and 1. |
 | `require_no_degraded_subsystems` | bool | `true` | Whether a reload that published while a subsystem stayed on prior state fails its soak. |
 | `require_upstream_health` | bool | `true` | Whether an open upstream circuit breaker fails the soak. |
+| `auto_revert` | bool | `false` | Whether a failed soak re-applies the last known good on its own. The one key in this block that defaults off. See [auto_revert](#auto_revert). |
 | `probe.url` | string | unset | An HTTP `GET` the soak issues on its own cadence. Absent by default. |
 | `probe.expect_status` | int | `200` | Status that response must carry. |
 | `probe.interval_secs` | int | `10` | Seconds between probe ticks. Must be at least 1. |
@@ -1362,6 +1364,164 @@ proves the chain executes and proves nothing about whether any upstream is
 reachable. That is why it sits alongside the upstream-health signal rather
 than replacing it, and why an operator who wants a real upstream exercised
 still declares `probe.url`.
+
+#### auto_revert
+
+`soak.auto_revert` is the only key in the `soak` block that ships off, and
+it is off because it is the only slice of this feature that acts on
+production without an operator.
+
+With it off the soak still runs and still promotes. You get a correct
+last-known-good pointer, `sbproxy_config_soak_verdict_total`, a
+`config_soak_verdict` event, and an alert, and none of the risk. That is
+the setting most deployments should run, and running it for a while first
+is what lets you calibrate `min_requests` and `max_error_rate_delta`
+against your real traffic before handing a node permission to undo a
+change nobody asked it to undo. The failure mode is asymmetric: a flapping
+upstream during a deploy window reverts a good config, the operator
+re-applies it, it reverts again, and now the safety feature is the
+incident.
+
+Junos `commit confirmed` is the closest prior art and it is deliberately
+not what this is. There the operator opts in per commit, and the rollback
+timer is armed for that one change; if the commit is not confirmed within
+the window (ten minutes by default) the device rolls back to the previous
+configuration on its own. Here the opt-in is per node and standing, which
+is a larger promise, so it is off until somebody makes it. The per-change
+half of the Junos ergonomic is `POST /admin/config/confirm`, which is
+already on.
+
+**Arming is gated by blast radius.** An in-process revert is an arc-swap.
+A `Restart` or `Breaking` change (listener ports, the `proxy.admin` block,
+cluster identity, an origin's action or auth type) is not something
+swapping the pipeline pointer back can undo, and half-reverting one would
+leave the process in a state neither configuration describes: the listener
+still bound to the port the failing config asked for, the admin server
+still holding credentials from the config you rolled away from. So a
+failure of that class does not arm. The node logs the radius at WARN and
+leaves boot fallback and `POST /admin/config/rollback` as the answer, and
+`GET /admin/config/history` shows the radius per revision, so "why did it
+not revert" is answerable without reading logs.
+
+Some of that class never reaches a soak at all. `proxy.cluster` and its
+subtree are refused outright by the reload transaction's own restart
+fingerprint, which names the changed fields and declines to publish, so
+those documents never apply and never arm a window. Measured against the
+blast-radius matrix: 24 of its 67 rules classify `Restart` or `Breaking`,
+the restart fingerprint covers 2 of those 24, and the remaining 22 do
+apply and are exactly what the arming gate is for.
+
+Three further refusals, all of which log and none of which retry:
+
+* A revision an earlier automatic revert restored, now failing its own
+  soak, escalates instead of reverting to itself. The node has
+  demonstrated that both its new configuration and its last known good
+  fail the same signals, which is an operator's problem and not something
+  a second swap fixes.
+* A revert whose document no longer compiles leaves the running pipeline
+  serving. Nothing is retried on a timer: a revert that cannot apply once
+  will not apply on the next tick, and looping on it would turn one bad
+  config into a reload storm.
+* An `inconclusive` verdict never reverts. A window where every signal
+  abstained measured nothing, and reverting on no information is the false
+  positive that gets this switched off.
+
+A revert counts on `sbproxy_config_apply_total{outcome="reverted"}`, which
+is disjoint from the `applied` a manual rollback counts, so "did anything
+roll this fleet back without an operator" is one query.
+
+#### rollback
+
+`POST /admin/config/rollback` re-applies a revision the ring already
+holds. It is the escape hatch, and it is needed whatever else is armed.
+
+```bash
+# Back to whatever the soak last promoted.
+sbproxy config rollback --to last-known-good
+
+# To a specific revision, refusing if somebody else moved this node first.
+sbproxy config rollback --to 41 --expected-current 43
+
+# A restart-class rollback needs the revision typed back.
+sbproxy config rollback --to 41 --confirm 41
+```
+
+A rollback is an **ordinary candidate**. It resolves, it compiles, it
+publishes through the same reload transaction every other apply goes
+through, and it soaks. Rolling back into a second bad config is a real
+thing that happens under pressure, and a privileged path that skipped
+validation is how rolling back becomes the incident. Argo Rollouts takes
+the other position for container images, letting a promotion back to a
+recently running ReplicaSet skip the analysis steps, on the reasoning
+that the thing being rolled back to was running minutes ago. That
+reasoning does not carry here: this ring keeps revisions for weeks, and a
+rollback target from October is not evidence about now.
+
+| Body field | Meaning |
+|---|---|
+| `revision` | Roll back to this ring revision number. |
+| `digest` | Roll back to this content digest. |
+| `target` | `"last-known-good"`, the default. An empty body `{}` means this. |
+| `expected_current` | Refuse unless this is the revision running now. |
+| `lineage` | Refuse unless this is the ring's lineage, absent `force`. |
+| `confirm_revision` | Name the target revision back to accept a `restart` or `breaking` rollback. |
+| `force` | Proceed across a lineage break. |
+
+`revision`, `digest`, and `target` are mutually exclusive; naming two is a
+`400` rather than a silent precedence rule.
+
+`expected_current` is the HAProxy Data Plane API's discipline: it stamps a
+version onto the configuration and requires every mutating call to carry
+the version it expects, erroring on a mismatch rather than taking
+last-writer-wins. Two operators reaching for rollback during the same
+incident is not hypothetical, and without it the second silently undoes
+the first. Omitting it proceeds, so a caller written before it existed
+keeps working.
+
+History stays append-only. A successful rollback **appends** a new entry
+carrying the restored document rather than rewinding the ring, so the
+rollback is itself visible in history and a second rollback can undo it.
+The revision you rolled away from is marked `reverted`. The
+last-known-good pointer does not move on a rollback: what is good is
+whatever a soak promoted, and the rollback's own candidate soaks like any
+other before it can become that.
+
+**The node's config file is not rewritten.** The ring holds what this node
+applied, and on an authority-owned or git-sourced node the local file is a
+pointer rather than the document, so rewriting it would break the
+relationship you configured. Every response says so
+(`config_file_unchanged`) and names it in `warnings`, because it is the
+half of the recovery this route cannot do: the next filesystem event,
+SIGHUP, `source:` poll, or authority bundle re-applies whatever the source
+of truth still says. Fix the source of truth before then.
+
+Two more things the response carries. A rollback whose stored
+`secrets_fingerprint` differs from the one running warns, because the
+secret backends moved since that document applied and a `vault://`
+reference inside it may resolve to something else now. And a rollback
+whose document no longer constructs on this build is refused with the
+compile error and the running configuration keeps serving; the refused
+candidate is kept under `rejected/` with `rollback` as its stage.
+
+`GET /admin/config/diff?from=<a>&to=<b>` renders a plan between two stored
+revisions, or between what is running and one stored revision when `from`
+is omitted. Junos has both forms and the second is the one people want
+mid-incident (`show | compare rollback n` against one stored revision,
+`show system rollback 3 compare 1` between two that need not be adjacent);
+Cisco's `show archive config differences` is the same idea. Both sides
+accept a revision number or `last-known-good`. It reads: no reload, no
+ring write, no pointer move.
+
+```bash
+sbproxy config diff 41                 # 41 against what is running
+sbproxy config diff --from 38 --to 41  # two stored revisions
+```
+
+Rollback is authenticated exactly like `POST /admin/reload` and goes
+through the same RBAC gate, so a read-only operator cannot roll a node
+back. Every attempt, accepted or refused, publishes a `config_rollback`
+event carrying the trigger, the actor, and both revisions, because who
+rolled the gateway back and to what is an audit question.
 
 #### boot
 
@@ -1449,6 +1609,10 @@ flowchart TD
     T -->|"passed"| U["state: good,\nlkg pointer advances"]
     T -->|"failed"| V["state: failed,\nlkg pointer does not move"]
     T -->|"inconclusive\n(every signal abstained)"| W["state stays applied,\nlkg pointer does not move"]
+    V --> X{"soak.auto_revert armed,\nand the diff hitless or reload class?"}
+    X -->|"no (the default,\nor a restart/breaking diff)"| Y["nothing serving changes;\nWARN names the radius"]
+    X -->|"yes"| Z["re-apply the lkg blob\nthrough the same transaction"]
+    Z --> D
 ```
 
 A candidate that never applies is kept too, under `rejected/<digest>.json`,
