@@ -173,6 +173,26 @@ ignore = [
   # RUSTSEC-2026-0195: unbounded namespace-declaration allocation in
   # `NsReader` (memory-exhaustion DoS).
   "RUSTSEC-2026-0195",
+
+  # --- RUSTSEC-2026-0258: h2 0.3.27 unbounded empty DATA frames (WOR-2673) --
+  # `vulnerability`-class, ignored with a tighter rationale like the
+  # quick-xml pair above. Path: h2 0.3.27 -> hyper 0.14.32 ->
+  # aws-smithy-http-client 1.1.13's legacy client feature, pulled in only
+  # because `aws-smithy-mocks` (a dev-dependency of sbproxy-cache's S3 + KMS
+  # cache-reserve tests) depends on `aws-smithy-http-client` without
+  # `default-features = false`. The production AWS clients (aws-config,
+  # aws-sdk-s3, aws-sdk-kms, and sbproxy-vault's aws-sdk-secretsmanager /
+  # aws-sdk-sts) all select `default-https-client`, which resolves through
+  # the separate, patched `h2 0.4.16` / hyper-rustls 0.27 stack instead; the
+  # vulnerable h2 0.3.27 copy is reachable only from `#[cfg(test)]` code that
+  # never opens a real socket (aws-smithy-mocks intercepts requests at the
+  # SDK's operation layer, in-process). Low severity even if it were live: an
+  # unbounded queue of empty DATA frames from a peer the test process never
+  # dials. Revisit when `aws-smithy-mocks` depends on a version of
+  # `aws-smithy-http-client` built with `default-features = false`, or drops
+  # the legacy client entirely; both v0.2.6 and the current v0.3.0 still pull
+  # it as of this writing.
+  "RUSTSEC-2026-0258",
 ]
 
 # --- Advisories this file structurally CANNOT gate -----------------------

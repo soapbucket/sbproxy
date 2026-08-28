@@ -530,6 +530,79 @@
 lanes that landed in #1195, not by this branch; merging main into the batch is
 where the count first became visible to a gate.
 
+2026-08-22 (WOR-2662): unreferenced bucket 1424 -> 1452, tests-only bucket
+unchanged at 295. `sbproxy-mcp-gateway` is a whole-crate port of a
+previously-shipped, already-proven OAuth 2.1 broker (23 files, ~14.7k lines),
+landing as one complete unit rather than growing call-site-first the way
+OSS-native work does. The 28 items behind this bump are the crate's own
+intentional integration-extension points, each with an in-crate convenience
+wrapper that already has a real caller: `InMemoryCimdCache` has
+`EphemeralKvCimdCache` beside it for multi-replica CIMD sharing;
+`InMemorySessionStore` has `RedisSessionStore::with_storage` /
+`with_storage_arc` for injecting any `EphemeralKv` backend; `CimdToDcrCache`
+has `PersistentKvDcrCache` for durable DCR-registration caching; the PKCE
+primitives (`pkce::CodeChallenge::from_verifier_s256`, `VERIFIER_MIN_LEN`,
+`VERIFIER_MAX_LEN`) and the RFC 9068 claim helpers (`at_jwt::MAX_PURPOSE_CHARS`,
+`AtJwtClaims::with_agent_profile`) are the pieces a caller building a custom
+grant flow reaches for directly rather than through this crate's own HTTP
+handlers; `well_known::patch_par_endpoint`, `device_code`'s
+`normalize_user_code`/`format_user_code`/`resolve_user_code`, and
+`par::{from_form, is_well_formed_request_uri}` are the same shape, each a
+building block its own module's public handler already composes above it. The
+two `metrics.rs` statics (`DPOP_PROOFS_TOTAL`, `SESSIONS_ACTIVE`) are consumed
+by name only from this same file's `record_*` helpers and its own test, which
+is why they still show as file-local even though the counters they back are
+live (`docs/mcp-oauth-gateway.md` and the shipped Grafana dashboard both name
+them). None of this is scaffolding nothing calls: it is the exact shape
+`sbproxy-storage::RedisStore` and `sbproxy-plugin`'s traits already take
+elsewhere in this workspace, a wider surface than any single in-tree caller
+exercises because the caller is meant to live outside the tree.
+
+2026-08-22 (WOR-2663): unreferenced bucket 1452 -> 1458, tests-only bucket
+unchanged at 295. `sbproxy-federation` is a whole-crate port of a
+previously-shipped, already-proven OpenID Federation 1.0 implementation (11
+files, ~4.3k lines). The scanner first flagged a seventh item,
+`EntityStatementClaims::is_self_signed`, whose only cross-file consumer was a
+test; that one was wired to a real production call site in this same PR
+(`TrustChainResolver::resolve` and `compose_trust_chain` now call it instead
+of duplicating its `iss == sub` check inline) rather than justified here,
+which is why the tests-only bucket does not move. The six behind this bump:
+`jwk::FederationKeySet::find_by_kid` is the public lookup-by-kid step
+`decoding_key_for` composes above, kept public because a consumer resolving
+its own key material without a full JWS decode is a real use OIDF's
+`kid`-first key model expects. `TrustChainResolver::metadata_policies`
+returns the anchor-to-leaf iterator this crate's own
+`apply_block_policy`/`compose_policies` operators are shaped to consume once
+a caller drives the composition across a resolved chain; that driver is not
+built in this PR, matching how the metadata-policy stage of the original
+enterprise crate shipped one PR ahead of its first caller. Similarly,
+`EntityConfigurationDocument::remaining_lifetime` is the raw-`Duration`
+sibling of `cache_max_age_secs` (which the well-known route does call
+cross-file); a consumer that wants the `Duration` instead of the wire-form
+seconds integer reaches for this one directly. The four `metrics.rs` statics
+(`ENTITY_STATEMENT_VERIFICATIONS_TOTAL`, `TRUST_MARK_VERIFICATIONS_TOTAL`,
+`TRUST_CHAIN_RESOLUTIONS_TOTAL`, `WELL_KNOWN_SERVES_TOTAL`) are the same
+shape WOR-2662 already justified above for `DPOP_PROOFS_TOTAL` and
+`SESSIONS_ACTIVE`: consumed by name only from this same file's `record_*`
+helpers and its own test, live counters `docs/federation.md` and the shipped
+Grafana dashboard both name. The fifth static,
+`WELL_KNOWN_CACHE_REMAINING_SECONDS`, is set directly from `http_route.rs`
+and so is already outside either bucket.
+
+2026-08-22 (WOR-2673): tests-only bucket 295 -> 296.
+`crates/sbproxy-cache/src/reserve/s3.rs`'s `S3Reserve::with_clients` is the
+dependency-injection seam that lets the mock-driven test suite hand the
+backend a pre-built `aws_smithy_mocks` client pair instead of dialing real S3
+and KMS endpoints. It has to be `pub`, not `pub(crate)`, because
+`crates/sbproxy-cache/tests/mock_s3_kms.rs` is a separate compilation unit
+that only sees the crate's public surface, and porting that black-box
+integration file (mirroring the sibling `RedisReserve`/`FsReserve` pattern of
+one file testing internals plus one testing the public contract) was an
+explicit goal of this change. Production construction goes through
+`S3Reserve::new`, which resolves AWS credentials through the standard chain
+lazily on first use instead of taking pre-built clients; `with_clients` has
+no production caller by design, the same way the enterprise implementation
+this backend was ported from kept its equivalent constructor test-only.
 # 2026-08-22 (WOR-2585/2586/2587, unreferenced bucket): 1424 -> 1426. The
 # Cedar policy engine's port into sbproxy-extension added two pub items
 # that nothing outside their own defining file names, and neither can be
@@ -717,6 +790,98 @@ pub(crate) would leave items whose only callers are cfg(test) code, which
 same-file constant `AI_TOOLKIT_EVENT_ID_MAX_BYTES` was narrowed to
 pub(crate) before recording this result.
 
+2026-08-22 (WOR-2661 merge reconciliation): the two parent branches measured
+the unreferenced bucket independently at 1458 and 1425. The merged tree is
+1459, one above the infra branch alone because Cedar's public types remain
+present. The tests-only bucket remains 296. The baselines record the merged
+tree rather than either parent so both ratchets continue to reject regressions.
+
+2026-08-22 (WOR-2661 MCP security repair): unreferenced bucket 1459 ->
+1457. The live MCP action now consumes the gateway runtime, resource-server
+provider, and verified certificate identity across crate boundaries. Lowering
+the ratchet keeps those integration gains.
+
+2026-08-27 (WOR-2661 infra cluster merged with main at 074a980f): tests-only
+296 -> 322 and unreferenced 1457 -> 1508, both recomputed against the merged
+tree rather than carried from either parent.
+
+Most of the move is not new debt, it is the corrected scanner arriving. This
+branch recorded 296 and 1457 while `is_test_path` still read
+`crates/<name>/examples/*.rs` as production source. Re-measuring this
+branch's own pre-merge tree with the merged scanner gives 306 and 1474, so 10
+and 17 of the deltas are the same "guard narrower than its claim" correction
+the 2026-08-22 WOR-2672 entry above describes, landing on a branch that was
+measured before it. Main's side of the merge accounts for the rest of the
+ground: main itself measures 314 and 1462 at 074a980f, exactly its own
+recorded baselines.
+
+What the infra cluster contributes over main is +9/-1 in the tests-only
+bucket and +50/-4 in the wider one, and every addition sits in one of the
+three ported crates or in the two seams they reach:
+
+  * Named only by an integration test under `crates/<name>/tests/`, so `pub`
+    is the only visibility that compiles and there is no narrowing to do:
+    `S3Reserve::with_clients`, `TrustChainResolver::from_anchors`,
+    `MasterKey`, `router_full_with_par`,
+    `McpResourceServerProvider::{metadata_document_json, rfc6750_error_code}`,
+    and the two DPoP TTL defaults in `sbproxy-mcp-gateway/src/config.rs`.
+  * Named from another crate's `#[cfg(test)]` block rather than from an
+    integration test, so `pub` is still the only visibility that compiles but
+    the reason is a different one: `MockEphemeralKv::exists_call_count`, on
+    `sbproxy-storage`'s `mock` feature, read by `sbproxy-licensing`'s
+    revocation tests. An earlier revision of this file named it
+    `MockStorage::exists_call_count` and filed it under the bucket above;
+    neither the type name nor the category was right.
+  * Field types of the pub config tree, constructed by serde and the schema
+    generator rather than by name: `FederationSigningKeyConfig`.
+  * The rest are `sbproxy-mcp-gateway`, `sbproxy-federation`, and
+    `sbproxy-licensing` items that make up the standalone embedding API each
+    crate's doc page publishes (`docs/mcp-oauth-gateway.md`,
+    `docs/federation.md`, `docs/comp-marketplace.md`), reached today only
+    from inside their own file because the OSS request path mounts one seam
+    per crate: `action: mcp`'s verifier, `proxy.federation`'s entity
+    statement, and the CoMP OLP bridge. Narrowing them is a real cleanup and
+    a real API decision for each item, not a merge-time edit, so it is left
+    to a pass of its own rather than done in the dark here.
+
+`OlpLicenseClaims`, `OLP_JWS_TYP`, `InMemorySessionStore`, and
+`ConfigBundle::is_expired_at` left the wider bucket, the first two because
+the CoMP bridge now names the OSS OLP wire format from outside `olp.rs`.
+
+2026-08-27 (WOR-2661 infra cluster merged with main at 970e6655): unreferenced
+1508 -> 1507, recomputed against the merged tree. The move is main's, not this
+branch's: #1214 lowered its own baseline 1462 -> 1461 in the same commit, and
+this merge carries that one item through. tests-only holds at 322. The unwrap
+ratchet moves separately in this merge and is described in its own commit.
+
+2026-08-27 (WOR-2661 infra cluster, review fix round): tests-only 322 -> 323.
+Net of five additions and one removal. The additions that stayed inside the
+count are `sbproxy-licensing`'s `quote_acceptance_hash`, which a CoMP buyer
+client has to be able to compute (a redeem is now bound to the quote by that
+value) and which only the crate's own e2e test names today, and
+`sbproxy-mcp-gateway`'s `DEFAULT_AUTHORIZE_REQUESTS_PER_MINUTE`, whose only
+consumers are in its own file, matching the sibling
+`DEFAULT_REVOCATION_REQUESTS_PER_MINUTE` it is paired with. Both would be
+narrower as `pub(crate)` and both would then be the odd one out in a block of
+documented, published defaults, which is the trade this line records.
+`ReqwestFederationFetcher::with_client` went the other way and was deleted: it
+had no caller anywhere, and its doc described a pin it actually bypassed.
+The other additions this round (`ssrf::canonical_ip`,
+`ssrf::validate_dialable_addrs`, `serve_entity_configuration`,
+`ServedEntityConfiguration`, `McpResourceServerProvider::with_local_jwks`,
+`JwksDocument::to_key_set`, `McpSecurityContext::in_process`,
+`metrics::record_peer_decision`, `metrics::record_broker_decision`, and the
+`proxy.federation.peer_trust` config types) are all reached from production
+code and do not touch this count.
+
+Unreferenced 1507 -> 1508 in the same round, one item:
+`ssrf::canonical_ip`. It is named from production code (both
+`sbproxy-mcp-gateway` dial guards call it) but only ever through
+`is_private_ip` and `validate_dialable_addrs` in its own file plus those two
+crate-external sites, and the scanner counts the ones inside `ssrf.rs`. It is
+public deliberately: it is the single place the workspace unwraps an
+IPv4-mapped IPv6 address, and a guard that writes its own range check has to
+be able to reach it or the mapped-address hole comes back.
 No move on the WOR-2606 storage tree, after one. WOR-2609 added
 `EntryState` and `TryClaim` to `sbproxy-middleware/src/idempotency.rs`,
 the return types of the `IdempotencyCache` trait's `peek` and
@@ -811,6 +976,27 @@ not a caller, so the item is exactly as unreferenced as it was; holding
 1476 would make deleting one comment line turn the gate red for no real
 regression. The number moves when a caller appears.
 
+2026-08-27 (WOR-2661 infra cluster merged with main at 1216bebf): the two
+parents counted the unreferenced bucket from different absolute bases, 1508 on
+this branch and 1461 on main. The merged tree measures 1508, so the committed
+baseline is unchanged and main's one-item gain is already inside it. Tests-only
+holds at 323.
+
+2026-08-27 (WOR-2661 infra cluster merged with main at dad92758): the two
+parents counted the unreferenced bucket from different absolute bases, 1508 on
+this branch and 1477 on main after the shadow-eval surface landed. The merged
+tree measures 1523, which is the committed baseline: it is the sum of both
+parents' items, not a concession by either. Recomputed against the merged tree
+rather than taken from a side, because neither parent's number describes it.
+Tests-only holds at 323 on both parents and on the merge.
+
+The infra cluster itself added nothing to either bucket. Every `pub` item the
+round introduced was given a real consumer instead: `metadata_policies` was
+deleted rather than kept beside the superiors-only version, `FetchBudget`'s two
+accessors report what a refused walk spent on the decision event, and
+`uses_local_jwks` is read at boot to log whether the MCP resource server
+resolved its keys in process or will fetch them.
+
 2026-08-27 (WOR-2666): tests-only baseline 314 -> 315, recounted after
 merging the shadow-eval entry above rather than carried over from the
 pre-merge run. One addition: `AnomalyReputationConfig` in
@@ -829,3 +1015,12 @@ which owns the reuse decision. `AnomalyDetector::tracked_keys` is
 private: `analyze_on` publishes it to the gauge and the tests in that
 file assert on it, and nothing outside the module has a reason to ask.
 The unreferenced baseline is unchanged at 1475.
+
+2026-08-27 (WOR-2661 infra cluster merged with main at fb91152e): recounted
+against the merged tree rather than carried from either parent. Tests-only
+324, unreferenced 1520. The tests-only number is the sum the two parents
+imply: 323 on this branch plus main's one `AnomalyReputationConfig`. The
+unreferenced number is two below this branch's 1522 and forty-seven above
+main's 1473, because main's anomaly and auth-provider work gave out-of-file
+consumers to two items this branch had left file-local; neither parent's
+figure describes the merged tree, so neither was taken.

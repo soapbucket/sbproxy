@@ -520,6 +520,18 @@ pub struct EgressTopLevelConfig {
     /// only way to arm a token endpoint.
     #[serde(default)]
     pub token_exchange: Option<EgressPurposeConfig>,
+    /// Arms `EgressPurpose::Federation`: the OpenID Federation fetcher's
+    /// entity-configuration and subordinate-statement GETs
+    /// (`crates/sbproxy-federation`). Unlike every other sub-block here,
+    /// omitting this one does not leave the purpose unguarded: the
+    /// fetcher refuses a peer that resolves to a private, loopback, or
+    /// link-local address whether or not an allowlist is armed, and it
+    /// never follows a redirect it has not re-authorized. What this
+    /// sub-block adds on top is the host, scheme, and port allowlist, so
+    /// a federation peer outside the trust anchors an operator wrote
+    /// down cannot be dialed at all.
+    #[serde(default)]
+    pub federation: Option<EgressPurposeConfig>,
     /// Arms `EgressPurpose::Telemetry` (WOR-2481): the OTLP trace, metric,
     /// and log exporter endpoints. Authorized once at boot, where each
     /// exporter is constructed. A config reload re-verifies the
@@ -2154,11 +2166,11 @@ pub struct ProxyServerConfig {
     ///
     /// When `enabled`, response-cache entries that pass the admission
     /// filter are mirrored to the configured backend: memory,
-    /// filesystem, Redis, or object storage (S3, Google Cloud Storage,
+    /// filesystem, Redis, object storage (S3, Google Cloud Storage,
     /// Azure Blob, or a local directory, with optional at-rest
-    /// sealing). On a hot miss the proxy consults the reserve before
-    /// falling through to origin and promotes the entry back into the
-    /// hot tier on hit.
+    /// sealing), or S3 with AWS KMS envelope encryption. On a hot miss
+    /// the proxy consults the reserve before falling through to origin
+    /// and promotes the entry back into the hot tier on hit.
     #[serde(default)]
     pub cache_reserve: Option<CacheReserveConfig>,
     /// Optional selection of the shared response-cache backing store.
@@ -2325,6 +2337,11 @@ pub struct ProxyServerConfig {
     /// `docs/migration-credentials.md`.
     #[serde(default)]
     pub credentials: Vec<CredentialBlock>,
+    /// OpenID Federation entity-statement serving for this proxy process.
+    /// Absent, or present with `enabled: false`, leaves the well-known
+    /// endpoint unmounted.
+    #[serde(default)]
+    pub federation: Option<FederationConfig>,
     /// Durable payment settlement. When absent, the proxy keeps its
     /// existing non-settlement crawl-ledger behavior exactly. When
     /// present, a paid request reaches the origin only after its
@@ -2338,6 +2355,198 @@ pub struct ProxyServerConfig {
     /// in never reaches a first request.
     #[serde(default)]
     pub payments: Option<crate::payments::PaymentsConfig>,
+}
+
+const fn default_federation_lifetime_secs() -> u64 {
+    3600
+}
+
+const fn default_federation_refresh_margin_secs() -> u64 {
+    300
+}
+
+/// `proxy.federation`: the signing identity served by the normal proxy
+/// listener at `/.well-known/openid-federation`.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FederationConfig {
+    /// Whether the process mounts the well-known entity-statement route.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Externally visible HTTPS entity identifier used for `iss` and `sub`.
+    pub entity_id: String,
+    /// Private signing-key location and JWS header selection.
+    pub signing_key: FederationSigningKeyConfig,
+    /// Public JWKS embedded in the signed entity statement.
+    pub published_jwks: serde_json::Value,
+    /// Lifetime of each generated entity statement.
+    #[serde(default = "default_federation_lifetime_secs")]
+    pub lifetime_secs: u64,
+    /// Time before expiry at which the cached statement is regenerated.
+    #[serde(default = "default_federation_refresh_margin_secs")]
+    pub refresh_margin_secs: u64,
+    /// Entity URLs of this entity's superiors, published in the entity
+    /// statement as `authority_hints`.
+    ///
+    /// OpenID Federation 1.0 s3 makes this required for every entity
+    /// that is not itself a Trust Anchor, and a peer's resolver walks
+    /// it: `compose_trust_chain` reads `authority_hints` from the leaf
+    /// it fetched and returns no chain when the array is empty. A
+    /// statement published without it is anchor-shaped, so no peer can
+    /// chain this proxy to anything.
+    #[serde(default)]
+    pub authority_hints: Vec<String>,
+    /// Inbound peer verification. Absent leaves the proxy publishing
+    /// its own identity and verifying nobody.
+    #[serde(default)]
+    pub peer_trust: Option<FederationPeerTrustConfig>,
+}
+
+const fn default_federation_peer_cache_ttl_secs() -> u64 {
+    600
+}
+
+/// Default total fetch budget for one trust-chain walk.
+fn default_federation_max_chain_fetches() -> usize {
+    16
+}
+
+/// Default total byte budget for one trust-chain walk (2 MiB).
+fn default_federation_max_chain_bytes() -> u64 {
+    2 * 1024 * 1024
+}
+
+/// Default wall-clock budget for one trust-chain walk.
+fn default_federation_max_chain_duration_ms() -> u64 {
+    5_000
+}
+
+/// Default cap on `authority_hints` per entity configuration.
+fn default_federation_max_authority_hints() -> usize {
+    8
+}
+
+/// Default per-source chain-walk rate, in walks per minute.
+fn default_federation_peer_walks_per_minute() -> u32 {
+    30
+}
+
+const fn default_federation_max_chain_depth() -> usize {
+    5
+}
+
+fn default_federation_peer_header() -> String {
+    "x-federation-entity-id".to_string()
+}
+
+/// `proxy.federation.peer_trust`: verify the entity a request claims to
+/// come from against pinned trust anchors, on the request path.
+///
+/// A peer names itself in a header. The proxy fetches that entity's
+/// self-signed configuration, walks its `authority_hints` up to one of
+/// the anchors below through the governed `egress.federation` client,
+/// validates every signature and linkage in the chain, checks any
+/// required trust marks, and either stamps the verified entity id onto
+/// the request or refuses it. Every step publishes the decision events
+/// and metrics `docs/federation.md` documents.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FederationPeerTrustConfig {
+    /// Refuse a request that names no peer, or whose peer does not
+    /// resolve to an anchor.
+    ///
+    /// `false` still refuses a request whose named peer fails to
+    /// resolve: an unverifiable claim is worse than no claim. What it
+    /// permits is a request that makes no claim at all, which is the
+    /// shape for a proxy that federates with some callers and serves
+    /// ordinary traffic from the rest.
+    #[serde(default)]
+    pub required: bool,
+    /// Request header the peer names itself in.
+    #[serde(default = "default_federation_peer_header")]
+    pub header: String,
+    /// Pinned trust anchors. At least one is required.
+    pub trust_anchors: Vec<FederationTrustAnchorConfig>,
+    /// Trust-mark identifiers a verified peer must additionally carry,
+    /// each signed by an anchor above and published in the peer's own
+    /// entity configuration.
+    #[serde(default)]
+    pub required_trust_marks: Vec<String>,
+    /// Maximum statements in an accepted chain.
+    #[serde(default = "default_federation_max_chain_depth")]
+    pub max_chain_depth: usize,
+    /// How long a resolved peer decision is reused before the chain is
+    /// walked again. A chain walk is several outbound HTTPS fetches, so
+    /// re-running it per request would put a peer's availability on
+    /// this proxy's request path.
+    #[serde(default = "default_federation_peer_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
+    /// Total outbound fetches one chain walk may spend.
+    ///
+    /// This is the bound that matters, and it is not `max_chain_depth`.
+    /// `authority_hints` is an array: one entity naming five thousand
+    /// superiors costs five thousand fetches at depth 1, and a depth
+    /// cap never fires. A well-formed chain spends about two fetches
+    /// per level, so the default covers a four-level federation that
+    /// has to try a second superior at one level.
+    #[serde(default = "default_federation_max_chain_fetches")]
+    pub max_chain_fetches: usize,
+    /// Total bytes one chain walk may read across every fetch.
+    ///
+    /// Each fetch is separately capped at 1 MiB by the fetcher; this
+    /// bounds the sum, so a peer serving a maximum-size document at
+    /// every hop cannot make one request hold the product of the two.
+    #[serde(default = "default_federation_max_chain_bytes")]
+    pub max_chain_bytes: u64,
+    /// Wall-clock budget for one chain walk, in milliseconds.
+    ///
+    /// Every fetch has its own connect and read timeout. Without an
+    /// aggregate deadline, a peer that answers just inside the
+    /// per-fetch timeout at every hop holds the request open for the
+    /// product of the two. The walk stops here whatever it has found.
+    #[serde(default = "default_federation_max_chain_duration_ms")]
+    pub max_chain_duration_ms: u64,
+    /// Most `authority_hints` a single entity configuration may
+    /// publish before the walk refuses the document.
+    ///
+    /// Refused rather than truncated: silently ignoring an operator's
+    /// superiors turns a configuration error into an unexplained
+    /// refusal further down.
+    #[serde(default = "default_federation_max_authority_hints")]
+    pub max_authority_hints: usize,
+    /// Chain walks one source address may start per minute.
+    ///
+    /// The decision cache is keyed on the peer address and the claimed
+    /// entity id, so a caller that rotates the entity id it claims
+    /// misses the cache every time. This is what stops that from
+    /// becoming one walk per request.
+    #[serde(default = "default_federation_peer_walks_per_minute")]
+    pub walks_per_minute: u32,
+}
+
+/// One pinned OpenID Federation trust anchor.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FederationTrustAnchorConfig {
+    /// The anchor's entity URL.
+    pub entity_id: String,
+    /// The anchor's published JWKS, as the `{"keys": [...]}` object.
+    /// This is the pin: every chain is verified against these keys, so
+    /// they come from the operator rather than from the network.
+    pub jwks: serde_json::Value,
+}
+
+/// Private-key reference and protected JWS header fields for federation
+/// entity-statement signing.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FederationSigningKeyConfig {
+    /// PEM file read only when a runtime pipeline is constructed.
+    pub pem_file: String,
+    /// Asymmetric JWS algorithm name, such as `ES256`.
+    pub algorithm: String,
+    /// Key identifier stamped into the protected JWS header.
+    pub kid: String,
 }
 
 /// Web Bot Auth signing identity for the proxy. See the
@@ -2983,6 +3192,7 @@ impl Default for ProxyServerConfig {
             attestation: None,
             tenants: Vec::new(),
             credentials: Vec::new(),
+            federation: None,
             payments: None,
         }
     }
@@ -6520,7 +6730,7 @@ fn default_anomaly_rate_spike_min_mean() -> f64 {
 /// promotes the entry back into the hot tier on hit.
 ///
 /// Backend selection is open-ended via [`CacheReserveBackendConfig`]
-/// so the in-tree memory / filesystem / redis backends can be
+/// so the in-tree memory / filesystem / redis / s3 backends can be
 /// extended without touching this schema.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -6590,6 +6800,36 @@ pub enum CacheReserveBackendConfig {
         /// `"sbproxy:reserve:"`.
         #[serde(default)]
         key_prefix: Option<String>,
+    },
+    /// S3-backed reserve with AWS KMS envelope encryption. A cold,
+    /// cross-region-replicable tier; cross-region replication itself
+    /// is configured at the bucket level, outside this schema.
+    /// Credentials resolve through the standard AWS chain (env,
+    /// profile, IMDS, container credentials), never through this
+    /// config block.
+    S3 {
+        /// Source S3 bucket.
+        bucket: String,
+        /// AWS region the bucket lives in.
+        region: String,
+        /// KMS key ID, ARN, or alias used to wrap/unwrap the
+        /// per-object data key (or, in `sse_kms_bucket_default` mode,
+        /// passed as `ssekms_key_id`).
+        kms_key_id: String,
+        /// Optional key prefix prepended to every object (e.g.
+        /// `"reserve/"`).
+        #[serde(default)]
+        prefix: Option<String>,
+        /// Optional replication target bucket name, surfaced for
+        /// diagnostics only. Cross-region replication is configured
+        /// at the bucket level and this backend never acts on it.
+        #[serde(default)]
+        replication_target_bucket: Option<String>,
+        /// When `true`, upload plaintext and rely on S3 SSE-KMS
+        /// bucket-default encryption instead of local envelope
+        /// encryption. Defaults to `false`.
+        #[serde(default)]
+        sse_kms_bucket_default: bool,
     },
     /// WOR-2673: object storage. One variant covers S3, Google Cloud
     /// Storage, Azure Blob Storage, and a local directory, because they

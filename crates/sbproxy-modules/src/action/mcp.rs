@@ -65,7 +65,7 @@
 //! that upstream, using the inbound `Principal` (tenant, virtual
 //! key, team, role, project, sub) to pick the matching ACL row.
 //! WOR-1065 + WOR-1066: the policy is default-deny; an operator who
-//! wants the legacy open-by-default behaviour sets
+//! wants the legacy open-by-default behavior sets
 //! `default_allow: true` on each policy. WOR-2314: once any
 //! `rbac_policies` are declared, every federated server must carry
 //! an `rbac:` label; an unlabeled server is a config compile error
@@ -900,7 +900,7 @@ pub enum McpVersioningModeConfig {
 /// MCP session management config (WOR-1642).
 #[derive(Debug, Clone, Deserialize)]
 pub struct McpSessionConfig {
-    /// Master switch. `false` keeps the stateless behaviour even if
+    /// Master switch. `false` keeps the stateless behavior even if
     /// the block is present.
     #[serde(default)]
     pub enabled: bool,
@@ -957,9 +957,18 @@ pub struct McpDualLlmQuarantineConfig {
 pub struct McpOAuthConfig {
     /// Issuer URLs a client can obtain a token from.
     pub authorization_servers: Vec<String>,
-    /// Optional list of scopes the resource recognises.
+    /// Optional list of scopes the resource recognizes.
     #[serde(default)]
     pub scopes_supported: Vec<String>,
+    /// Complementary resource-server verifier applied to protected MCP
+    /// requests on this same action path. Its authorization_servers and
+    /// scopes must match the discovery values above.
+    #[serde(default)]
+    pub resource_server: Option<sbproxy_mcp_gateway::McpResourceServerConfig>,
+    /// Optional OAuth broker mounted in-process under its configured
+    /// base_path. No second listener or sidecar is required.
+    #[serde(default)]
+    pub broker: Option<sbproxy_mcp_gateway::McpGatewayConfig>,
 }
 
 /// Server identity advertised by the gateway during MCP initialization.
@@ -978,7 +987,7 @@ pub struct McpServerInfoConfig {
 pub struct McpFederatedServerConfig {
     /// Upstream MCP endpoint. Either a full URL
     /// (`https://example.com/mcp`) or a bare hostname; bare hostnames
-    /// are normalised to `https://<host>/mcp`.
+    /// are normalized to `https://<host>/mcp`.
     pub origin: String,
     /// Optional namespace label for this upstream. It sets the server name
     /// used to disambiguate name collisions, and, when `namespace: always`
@@ -1904,6 +1913,10 @@ pub struct McpAction {
     /// OAuth Protected Resource Metadata (RFC 9728) for auth discovery,
     /// or `None` when the gateway advertises no OAuth surface (WOR-806).
     pub oauth: Option<McpOAuthConfig>,
+    /// Compiled bearer/DPoP/mTLS verifier for protected MCP requests.
+    pub resource_server: Option<Arc<sbproxy_mcp_gateway::McpResourceServerProvider>>,
+    /// In-process OAuth broker for this MCP action.
+    pub oauth_broker: Option<Arc<sbproxy_mcp_gateway::McpGatewayRuntime>>,
     modern_http: Option<CompiledModernHttpSecurity>,
     /// Process-wide sliding-window quota store for per-tool quotas
     /// declared on `rbac_policies[].tool_quotas[]` (WOR-1065). One
@@ -4472,7 +4485,7 @@ impl McpAction {
         Self::from_parsed(cfg)
     }
 
-    /// Compile an `McpAction` from already-deserialised config. Split
+    /// Compile an `McpAction` from already-deserialized config. Split
     /// out from `from_config` so unit tests skip the JSON round-trip.
     pub fn from_parsed(cfg: McpActionConfig) -> anyhow::Result<Self> {
         if cfg.mode != "gateway" {
@@ -4484,6 +4497,108 @@ impl McpAction {
         if cfg.federated_servers.is_empty() {
             anyhow::bail!("mcp action: federated_servers must not be empty");
         }
+        if let Some(oauth) = cfg.oauth.as_ref() {
+            if let (Some(resource), Some(broker)) =
+                (oauth.resource_server.as_ref(), oauth.broker.as_ref())
+            {
+                if resource.resource_uri != broker.resource_uri {
+                    anyhow::bail!(
+                        "mcp action: oauth broker and resource_server resource_uri must match"
+                    );
+                }
+            }
+        }
+        // In-process: the broker's route tree is dispatched on the
+        // public MCP origin ahead of the resource-server check, so its
+        // `/admin/status` route must not be mounted here.
+        let oauth_security = sbproxy_mcp_gateway::McpSecurityContext::in_process();
+        let resource_server = cfg
+            .oauth
+            .as_ref()
+            .and_then(|oauth| oauth.resource_server.clone().map(|resource| (oauth, resource)))
+            .map(|(oauth, resource)| {
+                if resource.authorization_servers != oauth.authorization_servers {
+                    anyhow::bail!(
+                        "mcp action: oauth.resource_server.authorization_servers must match oauth.authorization_servers"
+                    );
+                }
+                if let Some(broker) = oauth.broker.as_ref() {
+                    let expected_issuer = format!("{}{}", broker.external_base_url.trim_end_matches('/'), broker.base_path);
+                    if !resource.authorization_servers.contains(&expected_issuer) {
+                        anyhow::bail!(
+                            "mcp action: colocated broker issuer ({}) is not in resource_server.authorization_servers",
+                            expected_issuer
+                        );
+                    }
+                }
+                if resource.scopes_supported != oauth.scopes_supported {
+                    anyhow::bail!(
+                        "mcp action: oauth.resource_server.scopes_supported must match oauth.scopes_supported"
+                    );
+                }
+                // A colocated verifier must not dial the broker's JWKS
+                // URL. That URL is this proxy's own external base URL,
+                // which inside a pod or behind a load balancer resolves
+                // to a private address or a VIP the pod cannot hairpin,
+                // and the OAuth egress policy refuses both: every MCP
+                // request 401'd with `JwksUnavailable`. The key is in
+                // this process; hand it over directly.
+                let colocated_jwks = oauth.broker.as_ref().and_then(|broker| {
+                    (resource.jwks_url == colocated_broker_jwks_url(broker))
+                        .then(|| sbproxy_mcp_gateway::broker_jwks(broker.broker_signing_key.as_ref()))
+                });
+                let provider =
+                    sbproxy_mcp_gateway::McpResourceServerProvider::new_with_security_context(
+                        resource,
+                        oauth_security.clone(),
+                    )?;
+                let provider = match colocated_jwks {
+                    Some(document) => {
+                        let key_set = document.to_key_set().map_err(|error| {
+                            anyhow::anyhow!(
+                                "mcp action: oauth.broker.broker_signing_key.public_jwk is not a JWK jsonwebtoken can read: {error}"
+                            )
+                        })?;
+                        provider.with_local_jwks(key_set).map_err(|error| {
+                            anyhow::anyhow!("mcp action: {error}")
+                        })?
+                    }
+                    None => provider,
+                };
+                // Say at boot which mode the verifier is in. The
+                // colocated binding is a string equality between two
+                // operator-supplied values and its failure is silent
+                // and total: the verifier falls back to fetching this
+                // proxy's own JWKS URL, which inside a pod resolves to
+                // an address the OAuth egress policy refuses, and every
+                // MCP request 401s. An operator who sees `fetch` here
+                // when they configured the colocated shape has their
+                // answer before the first request.
+                tracing::info!(
+                    target: "mcp_gateway::decision",
+                    event = "mcp_resource_server_jwks_source",
+                    source = if provider.uses_local_jwks() {
+                        "in_process"
+                    } else {
+                        "fetch"
+                    },
+                    "MCP resource server key source resolved"
+                );
+                Ok(Arc::new(provider))
+            })
+            .transpose()?;
+        let oauth_broker = cfg
+            .oauth
+            .as_ref()
+            .and_then(|oauth| oauth.broker.clone())
+            .map(|broker| {
+                sbproxy_mcp_gateway::McpGatewayRuntime::new_with_security_context(
+                    broker,
+                    oauth_security.clone(),
+                )
+            })
+            .transpose()?
+            .map(Arc::new);
         let modern_http = cfg
             .modern_http
             .as_ref()
@@ -5098,6 +5213,8 @@ impl McpAction {
             lethal_trifecta,
             progressive_discovery: cfg.progressive_discovery,
             oauth: cfg.oauth,
+            resource_server,
+            oauth_broker,
             modern_http,
             quota_store: Arc::new(ToolQuotaStore::new()),
             refresh_interval: cfg.refresh_interval.unwrap_or(Duration::from_secs(60)),
@@ -5650,7 +5767,7 @@ impl McpAction {
 
     /// Per-server timeout for `tools/call`. `None` when not configured;
     /// the dispatcher uses an unbounded await in that case (matching
-    /// pre-WOR-186 behaviour for upstreams that don't opt in).
+    /// pre-WOR-186 behavior for upstreams that don't opt in).
     pub fn timeout_for_server(&self, server_name: &str) -> Option<Duration> {
         self.prefix_for(server_name)?.timeout
     }
@@ -6100,6 +6217,29 @@ fn to_provider_tool(
             "input_schema": schema,
         }),
     }
+}
+
+/// The JWKS URL a colocated broker serves for itself.
+///
+/// Extracted from the resource-server wiring so the string equality
+/// that decides whether the verifier takes its key set in process is
+/// something a test can call. When the two sides of that comparison
+/// drift the failure is silent and total: the verifier falls back to
+/// fetching, the OAuth egress policy refuses this proxy's own private
+/// or VIP address, and every MCP request 401s with `JwksUnavailable`
+/// in exactly the deployment `docs/mcp.md` presents as the shape to
+/// use.
+///
+/// Both sides are trimmed of a trailing slash, so
+/// `https://mcp.example.com/` and `https://mcp.example.com` derive the
+/// same URL. An operator's `jwks_url` still has to match the derived
+/// string exactly; this function is what a test compares against.
+fn colocated_broker_jwks_url(broker: &sbproxy_mcp_gateway::McpGatewayConfig) -> String {
+    format!(
+        "{}{}/.well-known/jwks.json",
+        broker.external_base_url.trim_end_matches('/'),
+        broker.base_path.trim_end_matches('/')
+    )
 }
 
 #[cfg(test)]
@@ -6985,6 +7125,35 @@ mod tests {
     }
 
     #[test]
+    fn oauth_broker_and_resource_server_must_share_the_rfc8707_resource() {
+        let value = json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "federated_servers": [{"origin": "github.example.com"}],
+            "oauth": {
+                "authorization_servers": ["https://issuer.example"],
+                "resource_server": {
+                    "resource_uri": "https://mcp.example/resource-a",
+                    "authorization_servers": ["https://issuer.example"],
+                    "jwks_url": "https://issuer.example/jwks",
+                    "audience": "https://mcp.example/resource-a"
+                },
+                "broker": {
+                    "base_path": "/mcp/oauth",
+                    "external_base_url": "https://mcp.example",
+                    "upstream_authorization_server_url": "https://issuer.example/authorize",
+                    "upstream_redirect_uri": "https://mcp.example/mcp/oauth/callback",
+                    "resource_uri": "https://mcp.example/resource-b",
+                    "allowed_redirect_uris": ["https://client.example/callback"],
+                    "session_ttl_secs": 600
+                }
+            }
+        });
+        let error = McpAction::from_config(value).unwrap_err().to_string();
+        assert!(error.contains("resource_uri must match"), "{error}");
+    }
+
+    #[test]
     fn rejects_empty_federated_servers() {
         let value = json!({
             "type": "mcp",
@@ -7284,7 +7453,7 @@ mod tests {
     }
 
     #[test]
-    fn bare_hostname_normalises_to_https_mcp() {
+    fn bare_hostname_normalizes_to_https_mcp() {
         // Internal helper test: protects the wire-shape doc.
         assert_eq!(
             normalize_origin("github.example.com").unwrap(),
@@ -7483,7 +7652,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unrecognised_protocol_pin_is_rejected() {
+    fn an_unrecognized_protocol_pin_is_rejected() {
         let value = json!({
             "type": "mcp",
             "federated_servers": [
@@ -7498,7 +7667,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unrecognised_downgrade_mode_is_rejected_by_serde() {
+    fn an_unrecognized_downgrade_mode_is_rejected_by_serde() {
         let value = json!({
             "type": "mcp",
             "federated_servers": [
@@ -10450,5 +10619,174 @@ allow := false if {
             PolicyDecision::Allow,
             "a server this action does not federate must not be judged by its Cedar hook"
         );
+    }
+
+    /// The colocated JWKS binding, pinned against the example the docs
+    /// tell operators to copy.
+    ///
+    /// The binding is a string equality between two operator-supplied
+    /// config values. Nothing went red when the two sides drifted, and
+    /// the failure mode is silent and total: the verifier falls back to
+    /// fetching its own JWKS URL, the OAuth egress policy refuses this
+    /// proxy's private or VIP address, and every MCP request 401s.
+    /// These tests are the thing that goes red.
+    mod colocated_jwks_binding {
+        use super::super::colocated_broker_jwks_url;
+
+        /// A broker config carrying just the two fields the derivation
+        /// reads.
+        ///
+        /// The tests call the shipped function rather than repeating
+        /// its `format!`. Repeating it meant all four stayed green if
+        /// the production derivation changed, which is the whole
+        /// failure this binding has: it is a string equality between
+        /// two operator-supplied values, and nothing went red when the
+        /// two sides drifted.
+        fn broker_config(
+            external_base_url: &str,
+            base_path: &str,
+        ) -> sbproxy_mcp_gateway::McpGatewayConfig {
+            sbproxy_mcp_gateway::McpGatewayConfig {
+                external_base_url: external_base_url.to_string(),
+                base_path: base_path.to_string(),
+                ..sbproxy_mcp_gateway::McpGatewayConfig::default()
+            }
+        }
+
+        /// The shipped example's `jwks_url` must be exactly what the
+        /// wiring derives, or the example is the broken shape.
+        #[test]
+        fn the_shipped_example_jwks_url_is_the_one_the_wiring_derives() {
+            let sb_yml = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(std::path::Path::parent)
+                .expect("crates/sbproxy-modules -> crates -> repo root")
+                .join("examples/mcp-oauth-broker/sb.yml");
+            let raw = std::fs::read_to_string(&sb_yml)
+                .expect("examples/mcp-oauth-broker/sb.yml is readable");
+            let doc: serde_yaml::Value =
+                serde_yaml::from_str(&raw).expect("the example parses as YAML");
+
+            // Walk to the one `oauth` block rather than assuming an
+            // index, so reordering the example does not silently stop
+            // testing it.
+            fn find_oauth(value: &serde_yaml::Value) -> Option<&serde_yaml::Value> {
+                match value {
+                    serde_yaml::Value::Mapping(map) => {
+                        if let Some(found) = map.get(serde_yaml::Value::from("oauth")) {
+                            return Some(found);
+                        }
+                        map.values().find_map(find_oauth)
+                    }
+                    serde_yaml::Value::Sequence(items) => items.iter().find_map(find_oauth),
+                    _ => None,
+                }
+            }
+            let oauth = find_oauth(&doc).expect("the example carries an oauth block");
+            let broker = oauth
+                .get("broker")
+                .expect("the example carries oauth.broker");
+            let base_url = broker
+                .get("external_base_url")
+                .and_then(serde_yaml::Value::as_str)
+                .expect("external_base_url");
+            let base_path = broker
+                .get("base_path")
+                .and_then(serde_yaml::Value::as_str)
+                .expect("base_path");
+            let configured = oauth
+                .get("resource_server")
+                .and_then(|rs| rs.get("jwks_url"))
+                .and_then(serde_yaml::Value::as_str)
+                .expect("resource_server.jwks_url");
+
+            let derived = colocated_broker_jwks_url(&broker_config(base_url, base_path));
+            assert_eq!(
+                configured, derived,
+                "examples/mcp-oauth-broker/sb.yml sets a jwks_url the colocated shortcut will not \
+                 match, so the example ships the deployment that 401s every request"
+            );
+        }
+
+        /// A trailing slash on either side must not break the match.
+        /// This is the negative case the re-review asked for: it is the
+        /// most likely way an operator's config drifts from the derived
+        /// string.
+        #[test]
+        fn a_trailing_slash_on_either_side_still_derives_the_same_url() {
+            let expected = "https://mcp.example.com/mcp/oauth/.well-known/jwks.json";
+            for (base, path) in [
+                ("https://mcp.example.com", "/mcp/oauth"),
+                ("https://mcp.example.com/", "/mcp/oauth"),
+                ("https://mcp.example.com", "/mcp/oauth/"),
+                ("https://mcp.example.com/", "/mcp/oauth/"),
+            ] {
+                let derived = colocated_broker_jwks_url(&broker_config(base, path));
+                assert_eq!(derived, expected, "base={base} path={path}");
+            }
+        }
+
+        /// And the shape that does not match must not silently take the
+        /// local key set: a different host is a different authorization
+        /// server, and handing it this broker's keys would verify
+        /// tokens it never minted.
+        #[test]
+        fn a_different_host_does_not_match_the_colocated_url() {
+            let derived =
+                colocated_broker_jwks_url(&broker_config("https://mcp.example.com", "/mcp/oauth"));
+            assert_ne!(
+                derived, "https://idp.example.com/mcp/oauth/.well-known/jwks.json",
+                "a jwks_url on another host must not satisfy the colocated binding"
+            );
+        }
+
+        /// The provider built from the shipped example's shape takes
+        /// its key set in process and makes no outbound client.
+        ///
+        /// The two tests above compare strings. This one asserts the
+        /// consequence: `uses_local_jwks` is what the request path
+        /// reads, and a binding that silently stopped matching leaves
+        /// it false while every other assertion still passes.
+        #[test]
+        fn the_colocated_shape_yields_a_provider_that_verifies_in_process() {
+            let jwks_url =
+                colocated_broker_jwks_url(&broker_config("https://mcp.example.com", "/mcp/oauth"));
+            let jwks_url = jwks_url.as_str();
+            let cfg: sbproxy_mcp_gateway::McpResourceServerConfig =
+                serde_json::from_value(serde_json::json!({
+                    "resource_uri": "https://mcp.example.com/",
+                    "authorization_servers": ["https://mcp.example.com/mcp/oauth"],
+                    "jwks_url": jwks_url,
+                    "audience": "https://mcp.example.com/",
+                    "issuer": "https://mcp.example.com/mcp/oauth",
+                    "scopes_supported": ["mcp.read", "mcp.call"],
+                }))
+                .expect("the example's resource_server block deserializes");
+            let provider = sbproxy_mcp_gateway::McpResourceServerProvider::new(cfg)
+                .expect("the example's resource_server block is valid");
+            assert!(
+                !provider.uses_local_jwks(),
+                "a provider with no key set handed to it must fall back to the fetch"
+            );
+
+            let key_set: jsonwebtoken::jwk::JwkSet = serde_json::from_value(serde_json::json!({
+                "keys": [{
+                    "kty": "EC", "crv": "P-256", "kid": "broker-2026-08",
+                    "alg": "ES256", "use": "sig",
+                    "x": "DpZdjog3y9hgIyKgEPltBi5ptXKUeuRwVOAPSmoQAu4",
+                    "y": "bfVVYV9slbMcg4dvtvYbeekYtpFXsYCWcIa9RCrBmTc"
+                }]
+            }))
+            .expect("fixture JWK set");
+            let bound = provider
+                .with_local_jwks(key_set)
+                .expect("a non-empty key set binds");
+            assert!(
+                bound.uses_local_jwks(),
+                "the colocated binding must leave the verifier reading the in-process key set; \
+                 inside a pod the proxy's own jwks_url resolves to an address the OAuth egress \
+                 policy refuses, so a fetch here 401s every MCP request"
+            );
+        }
     }
 }

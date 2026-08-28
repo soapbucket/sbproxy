@@ -3,7 +3,7 @@
 
 Cache Reserve is a long-tail cold tier sitting under the per-origin response cache. Items evicted from the hot cache are admitted into the reserve subject to a sample rate and size threshold; on a hot miss the proxy consults the reserve before falling through to origin and promotes the entry back into the hot tier on hit.
 
-SBproxy ships four reserve backends out of the box: memory, filesystem, redis, and object storage (S3, Google Cloud Storage, Azure Blob, or a local directory).
+SBproxy ships five reserve backends out of the box: memory, filesystem, redis, object storage (S3, Google Cloud Storage, Azure Blob, or a local directory), and a dedicated S3 backend with AWS KMS envelope encryption.
 
 ## Configuration
 
@@ -38,6 +38,7 @@ origins:
 | `filesystem` | `path` | One body file plus a sidecar metadata JSON per key, fanned out by SHA-256 hash. Survives restarts. |
 | `redis` | `redis_url`, optional `key_prefix` | Connection pooling via `ConnectionManager`. Entries self-evict on the server side via `PEXPIREAT`. |
 | `object_store` | `backend`, plus `bucket` (or `path` for `local`) | S3, GCS, Azure Blob, or a local directory, through one backend. Optional at-rest sealing. See below. |
+| `s3` | `bucket`, `region`, `kms_key_id`, optional `prefix`, `replication_target_bucket`, `sse_kms_bucket_default` | A cold, cross-region-replicable tier. AWS KMS envelope encryption by default; see [s3](#s3) below. |
 
 The pipeline ignores unknown backend types with a warning.
 
@@ -87,6 +88,28 @@ Three behaviors are worth knowing before you point this at a bucket:
 - **An entry sealed under a key the process no longer holds is a miss, not an error.** Dropping a key from `previous_keys` retires its entries; the request falls through to origin.
 - **The expiry sweep runs on a timer, and it is not the recommended answer at scale.** The proxy calls `evict_expired` every fifteen minutes from its background tasks, so a small reserve does expire without any bucket configuration. Expiry lives inside the object, so the sweep reads each candidate rather than judging it from the listing, and it examines at most 1,000 objects per call. It keeps a cursor: a pass that hits the cap records where it stopped and the next one resumes after it, wrapping to the start when a pass reaches the end. So a large reserve is walked forward across ticks rather than re-examined from the top, and the arithmetic is worth doing before you rely on it: a million objects is about ten days of ticks per full pass, and an entry that expires just behind the cursor waits for the next lap. **Configure a bucket lifecycle rule** (S3 lifecycle expiration, GCS object lifecycle management, Azure blob lifecycle) on the reserve prefix for any deployment large enough for that to matter. The sweep is the answer for small reserves and for correctness after a TTL change.
 - **Objects are named by digest, not by key.** An entry is written at `{prefix}{ab}/{cd}/{hex(sha256(cache key))}`. A cache key runs to a couple of hundred bytes, and encoding one inline puts the object name past `NAME_MAX` on the `local` backend and eventually past S3's 1,024-byte key limit; the two levels of fan-out keep the directory entry count per prefix bounded. The digest is also the associated data an entry is sealed under, so an object copied to another entry's path fails to authenticate.
+
+#### s3
+
+The AWS-SDK backend, for a deployment that wants KMS-wrapped envelope encryption rather than the local sealing `object_store` offers.
+
+```yaml
+proxy:
+  cache_reserve:
+    enabled: true
+    backend:
+      type: s3
+      bucket: sbproxy-cache-reserve-prod
+      region: us-west-2
+      kms_key_id: alias/sbproxy-cache-reserve
+      prefix: "reserve/"
+```
+
+Every `put` calls `KMS:GenerateDataKey` to mint a fresh 256-bit data key, seals the body locally with AES-256-GCM, and stores the KMS-wrapped data key alongside the ciphertext as S3 object metadata. `get` sends the wrapped key back through `KMS:Decrypt` and decrypts in-process. This envelope-encryption pattern keeps KMS request volume bounded to one call per object rather than one per byte, and lets the master key rotate without rewriting object bodies. Deployments that prefer S3's bucket-default SSE-KMS encryption instead can set `sse_kms_bucket_default: true`; in that mode the body uploads in plaintext and S3 encrypts at rest, and neither `put` nor `get` calls KMS.
+
+AWS credentials resolve through the standard chain (environment, shared profile, EC2/ECS instance role, container credentials); nothing under `backend:` carries a secret. Cross-region replication is configured at the bucket level with an S3 replication rule and IAM role; `replication_target_bucket` is a diagnostics-only hint this backend does not act on.
+
+`evict_expired` lists the bucket and issues one `HeadObject` per listed key to read its expiry. That does not scale to a large bucket: past 100,000 objects a log line suggests configuring an S3 lifecycle rule instead of relying on this sweep.
 
 ### Admission filter
 
@@ -289,6 +312,15 @@ Each counter is labeled by `origin`; the errors counter carries `operation` as w
 
 The errors counter is the one to alert on, and the reason it exists is the failure semantics below: every reserve error is swallowed and the request is served anyway, so without a counter a reserve that is failing every write is indistinguishable from a cache with a poor hit rate. A sustained non-zero `put` rate against a healthy `get` rate usually means expired write credentials or a changed bucket policy; a non-zero rate on all three means the store is unreachable. The "Cache Reserve Traffic" and "Cache Reserve Errors" panels on the `SBProxy Overview` dashboard draw all five.
 
+Two more report the tier's health rather than its traffic:
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `sbproxy_cache_reserve_degraded` | gauge | `backend` | `1` while the reserve is degraded, `0` while it is healthy. This is the alerting signal: a reserve that is failing every operation still serves every request, so nothing else goes red. |
+| `sbproxy_cache_reserve_health_transitions_total` | counter | `backend`, `to` | One tick per healthy-to-degraded or degraded-to-healthy edge, not one per operation. A high rate with the gauge near zero is a reserve flapping. |
+
+Each transition also publishes a `cache.reserve.health` decision-audit record (see [events.md](events.md)), so the change reaches a SIEM without a Prometheus scrape.
+
 ## When the reserve helps
 
 - **Long-tail content.** Pages that get one hit per hour drop out of an LRU primary quickly. The reserve keeps them around so the second hit still serves from cache instead of paying the origin round trip.
@@ -311,6 +343,8 @@ Two `operation` values are not per-origin, and each carries a sentinel `origin` 
 |---|---|---|
 | `init` | `__init__` | The backend never built, so no call site runs. Every other `sbproxy_cache_reserve_*` family reads flat zero from here on, which is byte-for-byte what "no reserve configured" looks like. This is the series that tells the two apart, and it is the most likely real failure of the feature |
 | `sweep` | `__sweep__` | The expiry sweep could not list or delete. Entries stay until the next tick or a lifecycle rule removes them |
+
+None of those fails a request, which is the point and also the problem: an operator has no per-request signal that the reserve stopped working. `GET /admin/cache` carries a `reserve` object with the current state, when it entered that state, when it last recovered, the operation that set it, and a bounded reason code and error string. See [admin-api-reference.md](admin-api-reference.md#get-admincache). The "Cache Reserve Backend State" tile in [`dashboards/grafana/sbproxy-mesh-storage.json`](../dashboards/grafana/sbproxy-mesh-storage.json) points there for the reason.
 
 ## Tuning
 

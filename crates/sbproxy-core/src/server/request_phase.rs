@@ -1723,6 +1723,138 @@ pub(super) async fn request_filter(
     // load balancer this node is usually not the one that published the
     // token, and a local-only lookup would 404 the CA (WOR-2310).
     let path: String = session.req_header().uri.path().to_string();
+    if path == sbproxy_federation::WELL_KNOWN_FEDERATION_PATH {
+        if let Some(issuer) = ctx.pipeline.federation_issuer.as_ref() {
+            if session.req_header().method != http::Method::GET {
+                send_error(session, 405, "method not allowed").await?;
+                ctx.response_status = Some(405);
+                return Ok(true);
+            }
+            // The crate's own handler body, so the two well-known
+            // metric writers, the Cache-Control value, and the decision
+            // log line all come from one place. Hand-rolling this
+            // response is what left every `sbproxy_federation_*` family
+            // flat on the only binary that ships the crate, and left
+            // peers with no cache directive at all.
+            let served = sbproxy_federation::serve_entity_configuration(issuer);
+            match served.body {
+                Some(document) => {
+                    send_response_with_headers(
+                        session,
+                        200,
+                        sbproxy_federation::ENTITY_STATEMENT_CONTENT_TYPE,
+                        document.as_bytes(),
+                        &[
+                            ("cache-control".to_string(), served.cache_control.clone()),
+                            ("vary".to_string(), "Accept".to_string()),
+                        ],
+                    )
+                    .await?;
+                    ctx.response_status = Some(200);
+                }
+                None => {
+                    send_error(session, 503, "entity statement unavailable").await?;
+                    ctx.response_status = Some(503);
+                }
+            }
+            return Ok(true);
+        }
+    }
+
+    // OpenID Federation peer trust. A caller names the entity it claims
+    // to be; the proxy asks whether an anchor the operator pinned
+    // vouches for that entity, walking the peer's `authority_hints`
+    // through the governed `egress.federation` fetcher and validating
+    // every signature in the chain. Runs before authentication because
+    // it is an admission decision about the caller's whole identity,
+    // not about one credential.
+    if let Some(verifier) = ctx.pipeline.federation_peer_verifier.clone() {
+        let claimed = session
+            .req_header()
+            .headers
+            .get(verifier.header())
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        // The raw socket peer, deliberately not `ctx.client_ip`: by this
+        // point a trusted forwarding header may have replaced that with
+        // a client-supplied value, and this address is the key of the
+        // rate limit that stops a caller rotating the entity id it
+        // claims from driving one chain walk per request. A limit an
+        // attacker can re-key is not one. A connection with no inet
+        // peer (a unix socket) shares one bucket rather than escaping
+        // the limit.
+        let walk_source = session
+            .client_addr()
+            .and_then(|addr| addr.as_inet())
+            .map(|addr| addr.ip().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        match claimed {
+            Some(entity_id) => {
+                match verifier.verify(&walk_source, &entity_id).await {
+                    crate::federation_peer::PeerVerdict::Trusted {
+                        entity_id,
+                        trust_anchor_id,
+                    } => {
+                        sbproxy_federation::metrics::record_peer_decision("trusted");
+                        tracing::info!(
+                            target: "sbproxy_federation::decision",
+                            event = "federation_peer_decision",
+                            outcome = "trusted",
+                            entity_id = %entity_id,
+                            trust_anchor_id = %trust_anchor_id,
+                            "federation peer verified against a pinned anchor"
+                        );
+                        // Rewrite the header to the verified value so an
+                        // upstream reading it reads what the chain
+                        // proved rather than what the caller wrote.
+                        let header_name = verifier.header().to_string();
+                        session.req_header_mut().remove_header(header_name.as_str());
+                        session
+                            .req_header_mut()
+                            .insert_header(header_name, entity_id.as_str())?;
+                    }
+                    crate::federation_peer::PeerVerdict::Refused(reason) => {
+                        sbproxy_federation::metrics::record_peer_decision("refused");
+                        tracing::warn!(
+                            target: "sbproxy_federation::decision",
+                            event = "federation_peer_decision",
+                            outcome = "refused",
+                            reason = reason,
+                            "federation peer refused"
+                        );
+                        // The reason names what the chain walk found
+                        // about a URL the caller chose, so it stays in
+                        // the log.
+                        send_error(session, 403, "federation peer not trusted").await?;
+                        ctx.response_status = Some(403);
+                        return Ok(true);
+                    }
+                }
+            }
+            None if verifier.required() => {
+                sbproxy_federation::metrics::record_peer_decision("refused");
+                tracing::warn!(
+                    target: "sbproxy_federation::decision",
+                    event = "federation_peer_decision",
+                    outcome = "refused",
+                    reason = "no_peer_named",
+                    "federation peer required but the request names none"
+                );
+                send_error(session, 403, "federation peer not trusted").await?;
+                ctx.response_status = Some(403);
+                return Ok(true);
+            }
+            None => {
+                // No claim, and none required. The request continues as
+                // ordinary traffic; nothing downstream sees a
+                // federation identity.
+                let header_name = verifier.header().to_string();
+                session.req_header_mut().remove_header(header_name.as_str());
+            }
+        }
+    }
     if let Some(token) = sbproxy_tls::challenges::extract_challenge_token(&path) {
         if let Some(store) = reload::challenge_store() {
             if let Some(key_auth) = store.get_async(token).await {

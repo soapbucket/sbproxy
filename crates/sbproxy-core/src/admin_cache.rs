@@ -85,7 +85,20 @@ fn semantic_debug(path: &str) -> Resp {
 /// `GET /admin/cache`: response-cache status. `enabled` is false when no
 /// origin turned on response caching (the pipeline holds no backend).
 fn cache_stats() -> Resp {
-    let store = crate::reload::current_pipeline().cache_store.clone();
+    let pipeline = crate::reload::current_pipeline();
+    let store = pipeline.cache_store.clone();
+    let reserve = pipeline.cache_reserve_health.snapshot();
+    let reserve_json = json!({
+        "configured": reserve.configured,
+        "active": reserve.active,
+        "backend": reserve.backend,
+        "state": reserve.state.as_str(),
+        "since": reserve.since.to_rfc3339(),
+        "recovered_at": reserve.recovered_at.map(|time| time.to_rfc3339()),
+        "last_operation": reserve.last_operation,
+        "reason_code": reserve.reason_code,
+        "last_error": reserve.last_error,
+    });
     let body = match store {
         Some(s) => {
             let backend = s.backend_name();
@@ -96,9 +109,10 @@ fn cache_stats() -> Resp {
                 "enabled": true,
                 "backend": backend,
                 "prefix_purge_supported": prefix_purge,
+                "reserve": reserve_json,
             })
         }
-        None => json!({ "enabled": false }),
+        None => json!({ "enabled": false, "reserve": reserve_json }),
     };
     (200, "application/json", body.to_string())
 }
@@ -226,6 +240,65 @@ fn evict_response(
 mod tests {
     use super::*;
 
+    static CACHE_RESERVE_DEGRADATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Serializes the tests below against each other. They install a
+    /// process-global pipeline and read a process-global gauge, so two
+    /// running at once read each other's state.
+    ///
+    /// Held across `await` on purpose, which is why every caller carries
+    /// an `await_holding_lock` allow. The tests run on a
+    /// `current_thread` runtime with no other task on it, so there is
+    /// nothing for the held guard to starve; an async mutex here would
+    /// only move the same serialization behind a type that suggests
+    /// concurrency the tests must not have.
+    fn cache_reserve_degradation_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        CACHE_RESERVE_DEGRADATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn install_cache_reserve_test_pipeline(cache_reserve_yaml: &str) {
+        let yaml = format!(
+            r#"
+proxy:
+  cache_reserve:
+{cache_reserve_yaml}
+origins:
+  "reserve.test":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: ok
+"#
+        );
+        let compiled = sbproxy_config::compile_config(&yaml).expect("test config compiles");
+        let pipeline = crate::pipeline::CompiledPipeline::from_config(compiled)
+            .expect("test pipeline compiles");
+        crate::reload::load_pipeline(pipeline);
+    }
+
+    fn reserve_admin_document() -> serde_json::Value {
+        let (status, content_type, body) = cache_stats();
+        assert_eq!(status, 200);
+        assert_eq!(content_type, "application/json");
+        serde_json::from_str(&body).expect("cache admin response is JSON")
+    }
+
+    fn reserve_metadata() -> sbproxy_cache::ReserveMetadata {
+        let now = std::time::SystemTime::now();
+        sbproxy_cache::ReserveMetadata {
+            created_at: now,
+            expires_at: now + std::time::Duration::from_secs(3600),
+            content_type: Some("text/plain".to_string()),
+            headers: Vec::new(),
+            vary_fingerprint: None,
+            size: 5,
+            status: 200,
+        }
+    }
+
     #[test]
     fn dispatch_ignores_unowned_paths() {
         assert!(dispatch("GET", "/admin/keys", None).is_none());
@@ -245,5 +318,130 @@ mod tests {
         let (status, _, body) = cache_purge(None);
         assert_eq!(status, 409);
         assert!(body.contains("not enabled"));
+    }
+
+    #[test]
+    fn cache_reserve_degradation_initialization_failure_is_admin_visible() {
+        let _guard = cache_reserve_degradation_test_guard();
+        install_cache_reserve_test_pipeline(
+            r#"    enabled: true
+    backend:
+      type: s3
+      bucket: ""
+      region: us-east-1
+      kms_key_id: alias/CACHE_RESERVE_SECRET_CANARY
+"#,
+        );
+
+        let document = reserve_admin_document();
+        let reserve = document
+            .get("reserve")
+            .expect("configured reserve has an admin state even when construction fails");
+        assert_eq!(reserve["configured"], true);
+        assert_eq!(reserve["active"], false);
+        assert_eq!(reserve["backend"], "s3");
+        assert_eq!(reserve["state"], "degraded");
+        assert_eq!(reserve["last_operation"], "initialize");
+        assert_eq!(reserve["reason_code"], "invalid_configuration");
+        let last_error = reserve["last_error"]
+            .as_str()
+            .expect("degraded reserve publishes a sanitized summary");
+        assert!(last_error.len() <= 160, "last error must stay bounded");
+        assert!(!last_error.contains("CACHE_RESERVE_SECRET_CANARY"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)] // deliberate: see the guard's doc comment
+    async fn cache_reserve_degradation_runtime_failure_updates_sanitized_admin_state() {
+        let _guard = cache_reserve_degradation_test_guard();
+        let directory = tempfile::tempdir().expect("temporary reserve parent");
+        let root = directory.path().join("CACHE_RESERVE_SECRET_CANARY");
+        std::fs::write(&root, b"not a directory").expect("blocking root fixture");
+        let path = serde_json::to_string(root.to_str().expect("UTF-8 path")).unwrap();
+        install_cache_reserve_test_pipeline(&format!(
+            "    enabled: true\n    backend:\n      type: filesystem\n      path: {path}\n"
+        ));
+        let backend = crate::reload::current_pipeline_full()
+            .cache_reserve
+            .clone()
+            .expect("filesystem reserve is active");
+
+        backend
+            .put(
+                "runtime-failure",
+                bytes::Bytes::from_static(b"hello"),
+                reserve_metadata(),
+            )
+            .await
+            .expect_err("regular-file root must reject the reserve write");
+
+        let document = reserve_admin_document();
+        let reserve = document
+            .get("reserve")
+            .expect("runtime reserve failure must update admin state");
+        assert_eq!(reserve["configured"], true);
+        assert_eq!(reserve["active"], true);
+        assert_eq!(reserve["backend"], "filesystem");
+        assert_eq!(reserve["state"], "degraded");
+        assert_eq!(reserve["last_operation"], "put");
+        assert_eq!(reserve["reason_code"], "backend_io");
+        let last_error = reserve["last_error"]
+            .as_str()
+            .expect("runtime failure publishes a sanitized summary");
+        assert!(last_error.len() <= 160, "last error must stay bounded");
+        assert!(!last_error.contains("CACHE_RESERVE_SECRET_CANARY"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)] // deliberate: see the guard's doc comment
+    async fn cache_reserve_degradation_success_clears_failure_state_and_gauge() {
+        let _guard = cache_reserve_degradation_test_guard();
+        let directory = tempfile::tempdir().expect("temporary reserve parent");
+        let root = directory.path().join("recoverable-reserve-root");
+        std::fs::write(&root, b"not a directory").expect("blocking root fixture");
+        let path = serde_json::to_string(root.to_str().expect("UTF-8 path")).unwrap();
+        install_cache_reserve_test_pipeline(&format!(
+            "    enabled: true\n    backend:\n      type: filesystem\n      path: {path}\n"
+        ));
+        let backend = crate::reload::current_pipeline_full()
+            .cache_reserve
+            .clone()
+            .expect("filesystem reserve is active");
+        backend
+            .put(
+                "recoverable",
+                bytes::Bytes::from_static(b"hello"),
+                reserve_metadata(),
+            )
+            .await
+            .expect_err("first write must fail");
+
+        std::fs::remove_file(&root).expect("remove blocking root fixture");
+        backend
+            .put(
+                "recoverable",
+                bytes::Bytes::from_static(b"hello"),
+                reserve_metadata(),
+            )
+            .await
+            .expect("later successful operation recovers the reserve");
+
+        let scrape = sbproxy_observe::metrics().render();
+        assert!(
+            scrape.lines().any(|line| {
+                line.starts_with("sbproxy_cache_reserve_degraded{backend=\"filesystem\"} 0")
+            }),
+            "successful operation must clear the degraded gauge: {scrape}"
+        );
+        let document = reserve_admin_document();
+        let reserve = document
+            .get("reserve")
+            .expect("recovered reserve retains current admin state");
+        assert_eq!(reserve["state"], "healthy");
+        assert!(reserve["last_error"].is_null());
+        assert!(
+            reserve["recovered_at"].is_string(),
+            "recovery time must distinguish recovered from never-failed"
+        );
     }
 }

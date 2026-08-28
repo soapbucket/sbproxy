@@ -32,7 +32,7 @@ use compact_str::CompactString;
 use sbproxy_cache::{
     CacheReserveBackend, CacheStore, EncryptedCacheStore, FileCacheConfig, FileCacheStore,
     FsReserve, MemcachedConfig, MemcachedStore, MemoryCacheStore, MemoryReserve, RedisCacheStore,
-    RedisReserve,
+    RedisReserve, S3Reserve, S3ReserveConfig,
 };
 use sbproxy_config::{CompiledConfig, Parameter, RequestModifierConfig};
 use sbproxy_extension::bundle::{BundleRegistry, DynamicBundleRegistry};
@@ -795,36 +795,385 @@ impl ReserveAdmission {
     }
 }
 
+/// Closed Cache Reserve health vocabulary shared by metrics and admin state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CacheReserveHealthStatus {
+    /// No reserve is configured for this pipeline generation.
+    Inactive,
+    /// The configured backend is active and its latest operation succeeded.
+    Healthy,
+    /// Construction or the latest backend operation failed.
+    Degraded,
+}
+
+impl CacheReserveHealthStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inactive => "inactive",
+            Self::Healthy => "healthy",
+            Self::Degraded => "degraded",
+        }
+    }
+}
+
+/// Write `sbproxy_cache_reserve_degraded{backend}` for one generation.
+///
+/// The family is optional because a build or registration failure
+/// drops it rather than ending the process (see
+/// `sbproxy_observe::metrics::ProxyMetrics::cache_reserve_degraded`),
+/// so every write goes through here rather than repeating the
+/// `Option` check and the healthy-versus-degraded mapping at each of
+/// the three call sites.
+fn set_reserve_degraded_gauge(backend: &str, state: CacheReserveHealthStatus) {
+    if let Some(family) = sbproxy_observe::metrics().cache_reserve_degraded.as_ref() {
+        family
+            .with_label_values(&[backend])
+            .set(i64::from(state == CacheReserveHealthStatus::Degraded));
+    }
+}
+
+/// Bounded operator-facing snapshot of one pipeline generation's reserve.
+#[derive(Debug, Clone)]
+pub(crate) struct CacheReserveHealthSnapshot {
+    pub(crate) configured: bool,
+    pub(crate) active: bool,
+    pub(crate) backend: &'static str,
+    pub(crate) state: CacheReserveHealthStatus,
+    pub(crate) since: chrono::DateTime<chrono::Utc>,
+    pub(crate) recovered_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) last_operation: Option<&'static str>,
+    pub(crate) reason_code: Option<&'static str>,
+    pub(crate) last_error: Option<String>,
+}
+
+/// Transition state shared by the observed backend, admin, and metrics.
+pub(crate) struct CacheReserveHealthState {
+    inner: std::sync::RwLock<CacheReserveHealthSnapshot>,
+    /// Whether the reserve is currently degraded, readable without the
+    /// lock.
+    ///
+    /// Every successful reserve operation calls `mark_healthy`, and
+    /// taking the `RwLock` write guard there just to read one field
+    /// serialized all reserve traffic through one writer. This is the
+    /// same fact, on a relaxed atomic: the read is a fast path that
+    /// only decides whether a transition is possible, and the write
+    /// guard is still what makes the transition itself atomic.
+    degraded: AtomicBool,
+    published: AtomicBool,
+    audit_enabled: AtomicBool,
+}
+
+impl CacheReserveHealthState {
+    fn inactive() -> Arc<Self> {
+        Arc::new(Self {
+            inner: std::sync::RwLock::new(CacheReserveHealthSnapshot {
+                configured: false,
+                active: false,
+                backend: "none",
+                state: CacheReserveHealthStatus::Inactive,
+                since: chrono::Utc::now(),
+                recovered_at: None,
+                last_operation: None,
+                reason_code: None,
+                last_error: None,
+            }),
+            degraded: AtomicBool::new(false),
+            published: AtomicBool::new(false),
+            audit_enabled: AtomicBool::new(false),
+        })
+    }
+
+    fn configured(backend: &'static str, active: bool) -> Arc<Self> {
+        Arc::new(Self {
+            inner: std::sync::RwLock::new(CacheReserveHealthSnapshot {
+                configured: true,
+                active,
+                backend,
+                state: CacheReserveHealthStatus::Healthy,
+                since: chrono::Utc::now(),
+                recovered_at: None,
+                last_operation: Some("initialize"),
+                reason_code: None,
+                last_error: None,
+            }),
+            degraded: AtomicBool::new(false),
+            published: AtomicBool::new(false),
+            audit_enabled: AtomicBool::new(false),
+        })
+    }
+
+    pub(crate) fn snapshot(&self) -> CacheReserveHealthSnapshot {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn mark_degraded(
+        &self,
+        operation: &'static str,
+        reason_code: &'static str,
+        last_error: &'static str,
+    ) {
+        let transition = {
+            let mut state = self
+                .inner
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let transition = state.state != CacheReserveHealthStatus::Degraded;
+            state.state = CacheReserveHealthStatus::Degraded;
+            if transition {
+                state.since = chrono::Utc::now();
+            }
+            state.last_operation = Some(operation);
+            state.reason_code = Some(reason_code);
+            state.last_error = Some(last_error.to_string());
+            self.degraded.store(true, Ordering::Release);
+            transition.then(|| state.clone())
+        };
+        if let Some(state) = transition {
+            self.observe_transition(&state);
+        }
+    }
+
+    fn mark_healthy(&self, operation: &'static str) {
+        // Fast path on every successful reserve operation, which is the
+        // overwhelming majority of them: no lock at all unless a
+        // recovery is actually possible.
+        if !self.degraded.load(Ordering::Acquire) {
+            return;
+        }
+        let transition = {
+            let mut state = self
+                .inner
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Re-check under the lock: two threads can both see the
+            // atomic set and only one of them owns the transition.
+            if state.state != CacheReserveHealthStatus::Degraded {
+                return;
+            }
+            self.degraded.store(false, Ordering::Release);
+            let now = chrono::Utc::now();
+            state.state = CacheReserveHealthStatus::Healthy;
+            state.since = now;
+            state.recovered_at = Some(now);
+            state.last_operation = Some(operation);
+            state.reason_code = None;
+            state.last_error = None;
+            state.clone()
+        };
+        self.observe_transition(&transition);
+    }
+
+    pub(crate) fn activate(&self, audit_enabled: bool) {
+        if self.published.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.audit_enabled.store(audit_enabled, Ordering::Release);
+        let state = self.snapshot();
+        if !state.configured {
+            return;
+        }
+        set_reserve_degraded_gauge(state.backend, state.state);
+        if state.state == CacheReserveHealthStatus::Degraded {
+            self.observe_transition(&state);
+        }
+    }
+
+    pub(crate) fn retire(&self) {
+        if !self.published.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        self.audit_enabled.store(false, Ordering::Release);
+        let state = self.snapshot();
+        if state.configured {
+            set_reserve_degraded_gauge(state.backend, CacheReserveHealthStatus::Healthy);
+        }
+    }
+
+    fn observe_transition(&self, state: &CacheReserveHealthSnapshot) {
+        if !self.published.load(Ordering::Acquire) {
+            return;
+        }
+        let state_label = state.state.as_str();
+        let reason = state.reason_code.unwrap_or("recovered");
+        set_reserve_degraded_gauge(state.backend, state.state);
+        if let Some(family) = sbproxy_observe::metrics()
+            .cache_reserve_health_transitions
+            .as_ref()
+        {
+            family
+                .with_label_values(&[state.backend, state_label, reason])
+                .inc();
+        }
+
+        use sbproxy_observe::decision::{DecisionEngine, DecisionEvent, DecisionOutcome};
+        let outcome = if state.state == CacheReserveHealthStatus::Degraded {
+            DecisionOutcome::Error
+        } else {
+            DecisionOutcome::Allow
+        };
+        sbproxy_observe::decision::record_decision(
+            DecisionEvent::CacheReserveHealth,
+            DecisionEngine::BuiltIn,
+            outcome,
+            "__cache_reserve__",
+            sbproxy_observe::decision::DEFAULT_TENANT,
+        );
+        let decision_reason = format!(
+            "backend={};state={state_label};operation={};reason={reason}",
+            state.backend,
+            state.last_operation.unwrap_or("unknown")
+        );
+        if self.audit_enabled.load(Ordering::Acquire) {
+            crate::policy_bus::emit_decision_audit_detailed(
+                DecisionEvent::CacheReserveHealth,
+                DecisionEngine::BuiltIn,
+                outcome,
+                "cache-reserve-health",
+                "__cache_reserve__",
+                "__cache_reserve__",
+                sbproxy_observe::decision::DEFAULT_TENANT,
+                &decision_reason,
+                sbproxy_observe::decision::DecisionDetails::cache_reserve_health(
+                    state.backend,
+                    state_label,
+                    reason,
+                ),
+            );
+        }
+        if state.state == CacheReserveHealthStatus::Degraded {
+            tracing::warn!(
+                backend = state.backend,
+                operation = state.last_operation.unwrap_or("unknown"),
+                reason,
+                event = "cache.reserve.health",
+                "Cache Reserve backend degraded"
+            );
+        } else {
+            tracing::info!(
+                backend = state.backend,
+                operation = state.last_operation.unwrap_or("unknown"),
+                event = "cache.reserve.health",
+                "Cache Reserve backend recovered"
+            );
+        }
+    }
+
+    fn runtime_failure(&self, operation: &'static str) {
+        let backend = self.snapshot().backend;
+        let (reason, summary) = if backend == "s3" {
+            ("s3_or_kms", "S3 or KMS reserve operation failed")
+        } else {
+            ("backend_io", "cache reserve backend operation failed")
+        };
+        self.mark_degraded(operation, reason, summary);
+    }
+}
+
+/// Decorates every backend operation with one shared health transition seam.
+struct ObservedCacheReserve {
+    inner: Arc<dyn CacheReserveBackend>,
+    health: Arc<CacheReserveHealthState>,
+}
+
+#[async_trait::async_trait]
+impl CacheReserveBackend for ObservedCacheReserve {
+    async fn put(
+        &self,
+        key: &str,
+        value: bytes::Bytes,
+        metadata: sbproxy_cache::ReserveMetadata,
+    ) -> anyhow::Result<()> {
+        let result = self.inner.put(key, value, metadata).await;
+        match &result {
+            Ok(()) => self.health.mark_healthy("put"),
+            Err(_) => self.health.runtime_failure("put"),
+        }
+        result
+    }
+
+    async fn get(
+        &self,
+        key: &str,
+    ) -> anyhow::Result<Option<(bytes::Bytes, sbproxy_cache::ReserveMetadata)>> {
+        let result = self.inner.get(key).await;
+        match &result {
+            Ok(_) => self.health.mark_healthy("get"),
+            Err(_) => self.health.runtime_failure("get"),
+        }
+        result
+    }
+
+    async fn delete(&self, key: &str) -> anyhow::Result<()> {
+        let result = self.inner.delete(key).await;
+        match &result {
+            Ok(()) => self.health.mark_healthy("delete"),
+            Err(_) => self.health.runtime_failure("delete"),
+        }
+        result
+    }
+
+    async fn evict_expired(&self, before: std::time::SystemTime) -> anyhow::Result<u64> {
+        let result = self.inner.evict_expired(before).await;
+        match &result {
+            Ok(_) => self.health.mark_healthy("evict_expired"),
+            Err(_) => self.health.runtime_failure("evict_expired"),
+        }
+        result
+    }
+}
+
 /// Build the OSS Cache Reserve backend from the YAML config block.
 ///
-/// Returns `(None, None)` when the block is absent, disabled, or
-/// targets an extension-provided backend the pipeline does not know how
-/// to instantiate. Failures during construction (e.g. an invalid
-/// Redis URL) are logged at `warn` level and surfaced as `(None, None)`
-/// so a misconfigured reserve degrades to plain hot-cache behavior
-/// rather than failing the whole config load.
+/// Returns the optional backend, its admission settings, and a health state
+/// that survives even when construction fails. Failures during construction
+/// are logged at `warn` level and leave the backend absent so a misconfigured
+/// reserve degrades to plain hot-cache behavior rather than failing config
+/// load, while metrics and admin still expose the degraded configuration.
 fn build_cache_reserve(
     cfg: &Option<sbproxy_config::CacheReserveConfig>,
     validating: bool,
 ) -> (
     Option<Arc<dyn CacheReserveBackend>>,
     Option<ReserveAdmission>,
+    Arc<CacheReserveHealthState>,
 ) {
     let Some(cfg) = cfg.as_ref() else {
-        return (None, None);
+        return (None, None, CacheReserveHealthState::inactive());
     };
     if !cfg.enabled {
-        return (None, None);
-    }
-    let Some(backend) = cfg.backend.as_ref() else {
-        tracing::warn!("cache_reserve.enabled = true but no backend configured; ignoring");
-        return (None, None);
+        return (None, None, CacheReserveHealthState::inactive());
     };
     let admission = ReserveAdmission {
         sample_rate: cfg.sample_rate.clamp(0.0, 1.0),
         min_ttl: cfg.min_ttl,
         max_size_bytes: cfg.max_size_bytes,
     };
+    let Some(backend) = cfg.backend.as_ref() else {
+        tracing::warn!("cache_reserve.enabled = true but no backend configured; ignoring");
+        let health = CacheReserveHealthState::configured("none", false);
+        health.mark_degraded(
+            "initialize",
+            "missing_backend",
+            "cache reserve backend is not configured",
+        );
+        return (None, None, health);
+    };
+    let backend_name = match backend {
+        sbproxy_config::CacheReserveBackendConfig::Memory => "memory",
+        sbproxy_config::CacheReserveBackendConfig::Filesystem { .. } => "filesystem",
+        sbproxy_config::CacheReserveBackendConfig::Redis { .. } => "redis",
+        sbproxy_config::CacheReserveBackendConfig::S3 { .. } => "s3",
+        // One label for the whole variant. The `s3` arm above is the
+        // dedicated AWS-SDK backend, so splitting this one by its
+        // `backend:` field would put two different code paths under the
+        // same `backend="s3"` series.
+        sbproxy_config::CacheReserveBackendConfig::ObjectStore { .. } => "object_store",
+        sbproxy_config::CacheReserveBackendConfig::Other => "other",
+    };
+    let mut init_failure = None;
     let built: Option<Arc<dyn CacheReserveBackend>> = match backend {
         sbproxy_config::CacheReserveBackendConfig::Memory => Some(Arc::new(MemoryReserve::new())),
         sbproxy_config::CacheReserveBackendConfig::Filesystem { path } => {
@@ -842,6 +1191,36 @@ fn build_cache_reserve(
             Ok(r) => Some(Arc::new(r)),
             Err(e) => {
                 tracing::warn!(error = %e, "cache_reserve redis backend init failed; reserve disabled");
+                init_failure = Some((
+                    "invalid_configuration",
+                    "cache reserve initialization failed",
+                ));
+                None
+            }
+        },
+        sbproxy_config::CacheReserveBackendConfig::S3 {
+            bucket,
+            region,
+            kms_key_id,
+            prefix,
+            replication_target_bucket,
+            sse_kms_bucket_default,
+        } => match S3Reserve::new(S3ReserveConfig {
+            bucket: bucket.clone(),
+            region: region.clone(),
+            kms_key_id: kms_key_id.clone(),
+            prefix: prefix.clone(),
+            replication_target_bucket: replication_target_bucket.clone(),
+            sse_kms_bucket_default: *sse_kms_bucket_default,
+            max_size_bytes: cfg.max_size_bytes,
+        }) {
+            Ok(r) => Some(Arc::new(r)),
+            Err(e) => {
+                tracing::warn!(error = %e, "cache_reserve s3 backend init failed; reserve disabled");
+                init_failure = Some((
+                    "invalid_configuration",
+                    "cache reserve initialization failed",
+                ));
                 None
             }
         },
@@ -880,11 +1259,23 @@ fn build_cache_reserve(
             tracing::warn!(
                 "cache_reserve backend type is unknown; a pipeline lifecycle hook may attach an implementation"
             );
+            init_failure = Some((
+                "unsupported_backend",
+                "cache reserve backend is not available",
+            ));
             None
         }
     };
-    if built.is_some() {
-        (built, Some(admission))
+    let health = CacheReserveHealthState::configured(backend_name, built.is_some());
+    if let Some((reason, summary)) = init_failure {
+        health.mark_degraded("initialize", reason, summary);
+    }
+    if let Some(inner) = built {
+        let observed: Arc<dyn CacheReserveBackend> = Arc::new(ObservedCacheReserve {
+            inner,
+            health: Arc::clone(&health),
+        });
+        (Some(observed), Some(admission), health)
     } else {
         if !validating {
             // WOR-2673 review F5. An operator asked for a reserve and
@@ -897,7 +1288,7 @@ fn build_cache_reserve(
             // `warn!` is the only record.
             sbproxy_observe::metrics::record_cache_reserve_error(CACHE_RESERVE_INIT_ORIGIN, "init");
         }
-        (None, None)
+        (None, None, health)
     }
 }
 
@@ -1901,6 +2292,12 @@ impl McpInjectRegistry {
 pub struct CompiledPipeline {
     /// The underlying compiled config (origins, host_map, server settings).
     pub config: CompiledConfig,
+    /// Signed OpenID Federation issuer mounted by this pipeline generation.
+    pub(crate) federation_issuer: Option<Arc<sbproxy_federation::WellKnownIssuer>>,
+    /// Compiled `proxy.federation.peer_trust`: the request-path peer
+    /// decision. `None` when the operator configured no anchors.
+    pub(crate) federation_peer_verifier:
+        Option<Arc<crate::federation_peer::FederationPeerVerifier>>,
     /// Dynamic hooks loaded and compiled with this pipeline generation.
     #[allow(dead_code)]
     pub(crate) extension_registry: Arc<DynamicBundleRegistry>,
@@ -2070,6 +2467,8 @@ pub struct CompiledPipeline {
     /// path doesn't have to re-walk `config.server.cache_reserve` on
     /// every put.
     pub cache_reserve_admission: Option<ReserveAdmission>,
+    /// Shared configured/runtime health state for the reserve backend.
+    pub(crate) cache_reserve_health: Arc<CacheReserveHealthState>,
     /// Optional pipeline hooks bundle.
     ///
     /// All fields default to `None`. Stock classifier config can install the
@@ -2226,6 +2625,8 @@ impl Default for CompiledPipeline {
         .expect("linked extension inventory must be valid");
         Self {
             config,
+            federation_issuer: None,
+            federation_peer_verifier: None,
             extension_registry,
             ai_extension_chain,
             ai_toolkit: sbproxy_ai::toolkit::AiToolkitRuntime::disabled(),
@@ -2270,6 +2671,7 @@ impl Default for CompiledPipeline {
             origin_cache_stores: HashMap::new(),
             cache_reserve: None,
             cache_reserve_admission: None,
+            cache_reserve_health: CacheReserveHealthState::inactive(),
             hooks: crate::hooks::Hooks::default(),
             trusted_proxy_cidrs: Vec::new(),
             tls_fingerprint_config: TlsFingerprintConfig::default(),
@@ -2287,6 +2689,92 @@ impl Default for CompiledPipeline {
 enum PipelineConstructionMode {
     Runtime,
     Validation,
+}
+
+fn build_federation_issuer(
+    config: Option<&sbproxy_config::FederationConfig>,
+    mode: PipelineConstructionMode,
+) -> anyhow::Result<Option<Arc<sbproxy_federation::WellKnownIssuer>>> {
+    let Some(config) = config.filter(|config| config.enabled) else {
+        return Ok(None);
+    };
+    // Parse the published key set even in validation mode. Only the
+    // PEM read is skipped below, because that touches the filesystem
+    // for a private key `sbproxy validate` has no business reading.
+    // Returning early here meant a malformed JWK validated clean and
+    // then refused to boot, which is the exact class
+    // `construct_examples` exists to close.
+    let published: sbproxy_federation::FederationKeySet =
+        serde_json::from_value(config.published_jwks.clone()).map_err(|error| {
+            anyhow::anyhow!("proxy.federation.published_jwks is not a JWK set: {error}")
+        })?;
+    if matches!(mode, PipelineConstructionMode::Validation) {
+        let _ = published;
+        return Ok(None);
+    }
+    let algorithm = match config.signing_key.algorithm.as_str() {
+        "ES256" => jsonwebtoken::Algorithm::ES256,
+        "ES384" => jsonwebtoken::Algorithm::ES384,
+        "RS256" => jsonwebtoken::Algorithm::RS256,
+        "RS384" => jsonwebtoken::Algorithm::RS384,
+        "RS512" => jsonwebtoken::Algorithm::RS512,
+        "PS256" => jsonwebtoken::Algorithm::PS256,
+        "PS384" => jsonwebtoken::Algorithm::PS384,
+        "PS512" => jsonwebtoken::Algorithm::PS512,
+        "EdDSA" => jsonwebtoken::Algorithm::EdDSA,
+        _ => anyhow::bail!("proxy.federation signing algorithm is not allowed"),
+    };
+    let pem = std::fs::read(&config.signing_key.pem_file)
+        .map_err(|error| anyhow::anyhow!("read proxy.federation signing-key PEM: {error}"))?;
+    let published_jwks: sbproxy_federation::FederationKeySet =
+        serde_json::from_value(config.published_jwks.clone())
+            .map_err(|_| anyhow::anyhow!("parse proxy.federation published_jwks"))?;
+    let issuer =
+        sbproxy_federation::WellKnownIssuer::new(sbproxy_federation::FederationServerConfig {
+            entity_id: config.entity_id.clone(),
+            signing_key: sbproxy_federation::SigningKeyConfig {
+                pem,
+                algorithm,
+                kid: config.signing_key.kid.clone(),
+            },
+            published_jwks,
+            metadata: sbproxy_federation::EntityMetadata::default(),
+            // OpenID Federation 1.0 s3 makes this required for an
+            // entity that is not a Trust Anchor, and a peer's
+            // `compose_trust_chain` walks it: an empty array is a
+            // statement nobody can chain.
+            authority_hints: config.authority_hints.clone(),
+            trust_marks: Vec::new(),
+            metadata_policy: None,
+            lifetime: std::time::Duration::from_secs(config.lifetime_secs),
+            refresh_margin: std::time::Duration::from_secs(config.refresh_margin_secs),
+        })?;
+    Ok(Some(Arc::new(issuer)))
+}
+
+/// Compile `proxy.federation.peer_trust` into the request-path
+/// verifier. `None` in validation mode, which never dials anything.
+fn build_federation_peer_verifier(
+    config: Option<&sbproxy_config::FederationConfig>,
+    mode: PipelineConstructionMode,
+) -> anyhow::Result<Option<Arc<crate::federation_peer::FederationPeerVerifier>>> {
+    let Some(config) = config.filter(|config| config.enabled) else {
+        return Ok(None);
+    };
+    let Some(peer_trust) = config.peer_trust.as_ref() else {
+        return Ok(None);
+    };
+    if matches!(mode, PipelineConstructionMode::Validation) {
+        // Build the verifier and drop it. Construction is what parses
+        // every pinned anchor's `jwks` into a `FederationKeySet`, and
+        // it dials nothing, so validation gets the key-shape refusal
+        // and the process gets no verifier.
+        let _ = crate::federation_peer::FederationPeerVerifier::new(peer_trust)?;
+        return Ok(None);
+    }
+    Ok(Some(Arc::new(
+        crate::federation_peer::FederationPeerVerifier::new(peer_trust)?,
+    )))
 }
 
 /// Process-lifetime runtime for tasks owned by published pipeline generations.
@@ -3126,6 +3614,9 @@ impl CompiledPipeline {
         }
 
         let router = HostRouter::new(&config);
+        let federation_issuer = build_federation_issuer(config.server.federation.as_ref(), mode)?;
+        let federation_peer_verifier =
+            build_federation_peer_verifier(config.server.federation.as_ref(), mode)?;
 
         // --- Shared response cache backend ---
         //
@@ -3194,10 +3685,10 @@ impl CompiledPipeline {
         // --- Cache Reserve cold tier ---
         //
         // Built from the top-level `cache_reserve:` block. The OSS
-        // backends (memory / filesystem / redis) are instantiated here;
-        // unknown or extension-provided backends drop through to `None` with a
-        // warning so a pipeline lifecycle hook can swap in its own
-        // implementation post-compile.
+        // backends (memory / filesystem / redis / object-store / s3) are
+        // instantiated here; unknown or extension-provided backends drop
+        // through to `None` with a warning so a pipeline lifecycle hook can
+        // swap in its own implementation post-compile.
         // WOR-2666: the settings the anomaly detector will be installed
         // with, resolved here and applied at the very end of this
         // function.
@@ -3219,7 +3710,7 @@ impl CompiledPipeline {
                 .map(crate::anomaly::AnomalySettings::from_config)
         });
 
-        let (cache_reserve, cache_reserve_admission) = build_cache_reserve(
+        let (cache_reserve, cache_reserve_admission, cache_reserve_health) = build_cache_reserve(
             &config.server.cache_reserve,
             matches!(mode, PipelineConstructionMode::Validation),
         );
@@ -3452,6 +3943,8 @@ impl CompiledPipeline {
 
         let pipeline = Self {
             config,
+            federation_issuer,
+            federation_peer_verifier,
             extension_registry,
             ai_extension_chain,
             ai_toolkit,
@@ -3494,6 +3987,7 @@ impl CompiledPipeline {
             origin_cache_stores,
             cache_reserve,
             cache_reserve_admission,
+            cache_reserve_health,
             hooks,
             trusted_proxy_cidrs,
             tls_fingerprint_config,
@@ -5221,7 +5715,7 @@ mod object_store_reserve_tests {
     #[test]
     fn a_local_object_store_block_builds_a_backend() {
         let dir = tempfile::TempDir::new().expect("temp dir");
-        let (reserve, admission) =
+        let (reserve, admission, _health) =
             build_cache_reserve(&reserve_config(local_backend(dir.path(), None)), false);
         assert!(
             reserve.is_some(),
@@ -5236,7 +5730,7 @@ mod object_store_reserve_tests {
         // a sealing key reads files and dials secret backends. `sbproxy
         // validate` does neither, so it stops at the shape.
         let dir = tempfile::TempDir::new().expect("temp dir");
-        let (reserve, admission) =
+        let (reserve, admission, _health) =
             build_cache_reserve(&reserve_config(local_backend(dir.path(), None)), true);
         assert!(reserve.is_none());
         assert!(admission.is_none());
@@ -5250,7 +5744,7 @@ mod object_store_reserve_tests {
             key: None,
             previous_keys: Vec::new(),
         };
-        let (reserve, _) = build_cache_reserve(
+        let (reserve, _, _health) = build_cache_reserve(
             &reserve_config(local_backend(dir.path(), Some(encryption))),
             false,
         );
@@ -5271,7 +5765,7 @@ mod object_store_reserve_tests {
             key: Some(format!("file:{}", key_file.display())),
             previous_keys: Vec::new(),
         };
-        let (reserve, _) = build_cache_reserve(
+        let (reserve, _, _health) = build_cache_reserve(
             &reserve_config(local_backend(dir.path(), Some(encryption))),
             false,
         );
@@ -5453,7 +5947,7 @@ mod object_store_reserve_tests {
             key: Some("${SBPROXY_RESERVE_KEY}".to_string()),
             previous_keys: Vec::new(),
         };
-        let (reserve, _) = build_cache_reserve(
+        let (reserve, _, _health) = build_cache_reserve(
             &reserve_config(local_backend(dir.path(), Some(encryption))),
             false,
         );
@@ -5476,7 +5970,7 @@ mod object_store_reserve_tests {
             prefix: None,
             encryption: None,
         };
-        let (reserve, _) = build_cache_reserve(&reserve_config(backend), false);
+        let (reserve, _, _health) = build_cache_reserve(&reserve_config(backend), false);
         assert!(
             reserve.is_none(),
             "a leftover local `path` on a cloud backend must be refused, not ignored"
@@ -5494,7 +5988,7 @@ mod object_store_reserve_tests {
             prefix: None,
             encryption: None,
         };
-        let (reserve, _) = build_cache_reserve(&reserve_config(backend), false);
+        let (reserve, _, _health) = build_cache_reserve(&reserve_config(backend), false);
         assert!(reserve.is_none());
     }
 
@@ -5509,7 +6003,7 @@ mod object_store_reserve_tests {
             prefix: None,
             encryption: None,
         };
-        let (reserve, _) = build_cache_reserve(&reserve_config(backend), false);
+        let (reserve, _, _health) = build_cache_reserve(&reserve_config(backend), false);
         assert!(reserve.is_none());
     }
 

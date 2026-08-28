@@ -208,6 +208,7 @@ proxy:
   scripting: { ... }
   key_management: { ... }
   cache_reserve: { ... }
+  federation: { ... }
   tenants: [ ... ]
   credentials: [ ... ]
 
@@ -367,6 +368,9 @@ egress:
     hosts: ["cloud.langfuse.com"]
   model_artifacts: { ... }
   token_exchange: { ... }
+  federation:
+    mode: deny_by_default
+    hosts: ["anchor.example", "intermediate.example"]
   telemetry:
     mode: deny_by_default
     hosts: ["otel-collector.internal"]
@@ -382,6 +386,7 @@ egress:
 | `usage_sinks` | `usage_sink`, `webhook` | Langfuse, Datadog, and object-store usage-sink deliveries (`usage_sink`), plus webhook usage-sink deliveries and the `events:` webhook sink (`webhook`, a separate purpose the same sub-block arms with one allowlist). |
 | `model_artifacts` | `model_artifact` | The model-host artifact fetcher's HTTP downloads. |
 | `token_exchange` | `token_exchange` | Every OAuth token-endpoint call this proxy makes: the non-MCP outbound-credential resolver's, and the MCP run-as-user token exchange's. A per-server `egress:` block gates that server's upstream connects and OpenAPI tool calls; it does not reach this purpose, so this sub-block is the only way to arm a token endpoint. |
+| `federation` | `federation` | The OpenID Federation fetcher's entity-configuration and subordinate-statement GETs. Reached only when `proxy.federation.peer_trust` is configured: a proxy that publishes its own entity statement and verifies nobody makes no federation fetch at all, so the purpose reports armed with zero sightings and that is the correct reading, not a broken control. This is also the one sub-block whose absence does not leave the purpose unguarded: a peer URL that resolves to a private, loopback, or link-local address is refused before any connect either way, and the dial is pinned to the addresses that check resolved. What the block adds is the host, scheme, and port allowlist, which is what stops a peer discovered through the chain from being dialed at all unless an operator named it. See [federation.md](federation.md). |
 | `telemetry` | `telemetry` | The OTLP trace, metric, and log exporter endpoints. Authorized once at boot, where each exporter is constructed; a denied endpoint refuses boot with a fatal error naming it. A config reload re-verifies the still-running trace and metric exporters against the new allowlist and refuses the reload, naming the endpoint, if either is now denied; the log exporter is rebuilt on every reload and re-authorizes itself then. |
 
 Each sub-block accepts `mode` (`deny_by_default` or `allow_by_default`,
@@ -451,7 +456,7 @@ proxy:
 | `notifications` | object | unset | Outbound webhook subscriptions with per-destination filters, signing keys, retries, and a durable deadletter queue. Boot-only. See [Notification fields](#notification-fields). |
 | `l2_cache_settings` | object | | Optional shared-state backend. Alias: `l2_cache`. |
 | `anomaly` | object | unset | Behavioral anomaly detection over the TLS fingerprint, resolver source, headless-library signal, and per-address rate, plus the per-agent-class reputation score it feeds and the optional admission thresholds that read it. Disabled by default. See [anomaly-detection.md](anomaly-detection.md). |
-| `cache_reserve` | object | unset | Optional cold-tier response cache backed by memory, filesystem, Redis, or object storage (S3, GCS, Azure Blob, or a local directory), with optional at-rest sealing. See [cache-reserve.md](cache-reserve.md). |
+| `cache_reserve` | object | unset | Optional cold-tier response cache backed by memory, filesystem, Redis, object storage (S3, GCS, Azure Blob, or a local directory) with optional at-rest sealing, or S3 with AWS KMS envelope encryption. See [cache-reserve.md](cache-reserve.md). |
 | `compression_state` | object | unset | Process-owned Local AI summary-state path. See [compression_state](#compression_state). |
 | `config_history` | object | unset | Durable local ring of every applied config revision, kept for inspection and future rollback. Disabled by default. See [config_history](#config_history). |
 | `response_cache_store` | object | unset | Picks the backing store for the shared response cache and optionally encrypts entries at rest. See [Choosing the backing store](#choosing-the-backing-store). When unset, the store is Redis if `l2_cache_settings` is configured and an in-process map otherwise. |
@@ -470,6 +475,7 @@ proxy:
 | `credentials` | list | `[]` | Proxy-scope credentials inherited by tenant and origin scopes. |
 | `extensions` | object | | Opaque map for out-of-tree top-level config blocks. The proxy never parses them. |
 | `payments` | object | unset | Durable settlement for paid requests: SQLite intent/attempt/proof/receipt store, challenge binding key, authorization timeout, and the infra-failure posture. Absent keeps every payment provider config-only. See [payments.md](payments.md#getting-paid-proxypayments). |
+| `federation` | object | unset | OpenID Federation identity this proxy publishes at `/.well-known/openid-federation`, and the pinned anchors it verifies a peer against. `peer_trust` runs a chain walk on the request path, so its `max_chain_fetches`, `max_chain_bytes`, `max_chain_duration_ms`, `max_authority_hints`, and `walks_per_minute` keys are what bound the outbound requests one unauthenticated caller can cause; `max_chain_depth` is a depth cap and not one of them. See [federation.md](federation.md#configuring-proxyfederation). |
 | `attestation` | object | unset | Receipt attestation for this node: whether it writes signed, hash-chained receipts, and its failure/enforcement posture. `role: claim` and `role: both` are refused at load because the claim half is not implemented, so an origin may narrow `role` but not widen it into that half. Backs the `/api/meter/*` operator surface. See [metering.md](metering.md#configuration). |
 
 ### Choosing a bind address
@@ -6837,7 +6843,7 @@ engine name you choose.
 | Model, tokenizer and rule-pack weights | `model_path`, `tokenizer_path`, `model_signature_path`, `tokenizer_signature_path`, `rule_pack_path`, `onnx_model_path` |
 | Extension code | `extensions.bundles_dir`, `sources.path` (a `type: directory` source, and a `type: git` source whose `path` leaves the repository) |
 | A binary this node runs | `serve.cache_dir`, `acquire.path`, `lora_adapters.source` (any value that is not an `hf:Org/Repo` reference) |
-| Node identity and node state | `tls_cert_file`, `tls_key_file`, `cert_file`, `key_file`, `ca_file`, `client_ca_file`, `tls.cert`, `tls.key`, `authority_dir`, `signing_key_file`, `verifying_key_file`, `verifying_keys_file`, `state_dir`, `state_path`, `store_dir`, `store.path`, `model_host.store_path`, `catalog_file`, `cache.directory`, `engines.*.path`, `socket_path`, `tls_certificate_path`, `jwt_path`, `auth.path`, `service_account_key_file.path`, `external_account_file.path`, `backends.path`, `proxy.ai_providers_file` |
+| Node identity and node state | `tls_cert_file`, `tls_key_file`, `cert_file`, `key_file`, `ca_file`, `client_ca_file`, `tls.cert`, `tls.key`, `authority_dir`, `signing_key_file`, `verifying_key_file`, `verifying_keys_file`, `signing_key.pem_file`, `state_dir`, `state_path`, `store_dir`, `store.path`, `model_host.store_path`, `catalog_file`, `cache.directory`, `engines.*.path`, `socket_path`, `tls_certificate_path`, `jwt_path`, `auth.path`, `service_account_key_file.path`, `external_account_file.path`, `backends.path`, `proxy.ai_providers_file` |
 | Durable sinks and evidence | `audit.path`, `audit.config_path`, `audit.key_path`, `audit.admin_path`, `output.path`, `events.path`, `request_events.path`, `session_ledger.path`, `usage_rollups.path`, `usage_sinks.path`, `ledger.path`, `queue.path`, `config_history.dir`, `revocation_store.path`, `cache_path`, `storage_path`, `compression_state.local_path`, `prompt_persistence_path`, `backend.path` |
 | Trust anchors and sockets | `acme.ca_root`, `levers.endpoint` (a `unix://` value only) |
 

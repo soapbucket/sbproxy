@@ -4532,7 +4532,7 @@ mod tests {
                         result.expect(concat!($name, " must succeed"));
                     }
                 }
-                before.assert_exact_terminal_delta($expected, $name);
+                before.assert_exact_terminal_delta($expected, $name).await;
             }};
         }
 
@@ -4667,15 +4667,17 @@ mod tests {
             .await
             .expect_err("embed shape limit must fail");
             assert_eq!(status.code(), tonic::Code::ResourceExhausted, "{name}");
-            before.assert_exact_terminal_delta(
-                OutcomeExpectation::failure(
-                    Transport::Grpc,
-                    MetricCommand::Embed,
-                    Stage::Limit,
-                    Reason::ResourceLimit,
-                ),
-                name,
-            );
+            before
+                .assert_exact_terminal_delta(
+                    OutcomeExpectation::failure(
+                        Transport::Grpc,
+                        MetricCommand::Embed,
+                        Stage::Limit,
+                        Reason::ResourceLimit,
+                    ),
+                    name,
+                )
+                .await;
         }
         assert_grpc_case!(
             "embed unknown model",
@@ -4758,10 +4760,12 @@ mod tests {
             )
             .await
             .expect(name);
-            before.assert_exact_terminal_delta(
-                OutcomeExpectation::success(Transport::Grpc, MetricCommand::ModelInfo),
-                name,
-            );
+            before
+                .assert_exact_terminal_delta(
+                    OutcomeExpectation::success(Transport::Grpc, MetricCommand::ModelInfo),
+                    name,
+                )
+                .await;
         }
         assert_grpc_case!(
             "model info unknown",
@@ -4913,15 +4917,17 @@ mod tests {
         .await
         .expect_err("a malformed unary protobuf body must fail before the handler");
         assert_eq!(malformed_status.code(), tonic::Code::InvalidArgument);
-        malformed_before.assert_exact_terminal_delta(
-            OutcomeExpectation::failure(
-                Transport::Grpc,
-                MetricCommand::Version,
-                Stage::Decode,
-                Reason::MalformedFrame,
-            ),
-            "malformed unary protobuf body",
-        );
+        malformed_before
+            .assert_exact_terminal_delta(
+                OutcomeExpectation::failure(
+                    Transport::Grpc,
+                    MetricCommand::Version,
+                    Stage::Decode,
+                    Reason::MalformedFrame,
+                ),
+                "malformed unary protobuf body",
+            )
+            .await;
 
         // StreamSafety clean end, each closed input limit, an inbound stream
         // error, terminal body-write failure, and cancellation all traverse
@@ -4951,10 +4957,12 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        before.assert_exact_terminal_delta(
-            OutcomeExpectation::success(Transport::Grpc, MetricCommand::StreamSafety),
-            "stream safety clean end",
-        );
+        before
+            .assert_exact_terminal_delta(
+                OutcomeExpectation::success(Transport::Grpc, MetricCommand::StreamSafety),
+                "stream safety clean end",
+            )
+            .await;
 
         for (name, input) in [
             (
@@ -5007,15 +5015,17 @@ mod tests {
             .into_inner();
             let status = bounded_stream_terminal_error(name, &mut stream, 8).await;
             assert_eq!(status.code(), tonic::Code::ResourceExhausted, "{name}");
-            before.assert_exact_terminal_delta(
-                OutcomeExpectation::failure(
-                    Transport::Grpc,
-                    MetricCommand::StreamSafety,
-                    Stage::Limit,
-                    Reason::ResourceLimit,
-                ),
-                name,
-            );
+            before
+                .assert_exact_terminal_delta(
+                    OutcomeExpectation::failure(
+                        Transport::Grpc,
+                        MetricCommand::StreamSafety,
+                        Stage::Limit,
+                        Reason::ResourceLimit,
+                    ),
+                    name,
+                )
+                .await;
         }
 
         let before = outcomes.snapshot();
@@ -5040,15 +5050,17 @@ mod tests {
         )
         .await;
         assert_eq!(status.code(), tonic::Code::ResourceExhausted);
-        before.assert_exact_terminal_delta(
-            OutcomeExpectation::failure(
-                Transport::Grpc,
-                MetricCommand::StreamSafety,
-                Stage::Limit,
-                Reason::ResourceLimit,
-            ),
-            "stream chunk-count limit",
-        );
+        before
+            .assert_exact_terminal_delta(
+                OutcomeExpectation::failure(
+                    Transport::Grpc,
+                    MetricCommand::StreamSafety,
+                    Stage::Limit,
+                    Reason::ResourceLimit,
+                ),
+                "stream chunk-count limit",
+            )
+            .await;
 
         let inbound_fault = controls.arm_next(GrpcFault::InboundStreamError {
             code: tonic::Code::DataLoss,
@@ -5070,15 +5082,17 @@ mod tests {
             .expect_err("inbound status must not become clean EOF");
         assert_eq!(status.code(), tonic::Code::DataLoss);
         inbound_fault.assert_consumed_exactly_once();
-        before.assert_exact_terminal_delta(
-            OutcomeExpectation::failure(
-                Transport::Grpc,
-                MetricCommand::StreamSafety,
-                Stage::Read,
-                Reason::Io,
-            ),
-            "stream inbound error",
-        );
+        before
+            .assert_exact_terminal_delta(
+                OutcomeExpectation::failure(
+                    Transport::Grpc,
+                    MetricCommand::StreamSafety,
+                    Stage::Read,
+                    Reason::Io,
+                ),
+                "stream inbound error",
+            )
+            .await;
 
         let stream_write_fault = controls.arm_next(GrpcFault::ResponseWrite {
             command: MetricCommand::StreamSafety,
@@ -5100,15 +5114,17 @@ mod tests {
             .expect_err("stream body write failure must be terminal");
         assert_eq!(status.code(), tonic::Code::Unavailable);
         stream_write_fault.assert_consumed_exactly_once();
-        before.assert_exact_terminal_delta(
-            OutcomeExpectation::failure(
-                Transport::Grpc,
-                MetricCommand::StreamSafety,
-                Stage::Write,
-                Reason::Io,
-            ),
-            "stream response write failure",
-        );
+        before
+            .assert_exact_terminal_delta(
+                OutcomeExpectation::failure(
+                    Transport::Grpc,
+                    MetricCommand::StreamSafety,
+                    Stage::Write,
+                    Reason::Io,
+                ),
+                "stream response write failure",
+            )
+            .await;
 
         let before = outcomes.snapshot();
         let cancellation_connection = reset_stream_safety_after_first_verdict(server.address).await;
@@ -5255,15 +5271,17 @@ mod tests {
         .await
         .expect_err("the call beyond running plus queue must be refused");
         assert_eq!(refused.code(), tonic::Code::ResourceExhausted);
-        queue_full_before.assert_exact_terminal_delta(
-            OutcomeExpectation::failure(
-                Transport::Grpc,
-                MetricCommand::Quality,
-                Stage::Admission,
-                Reason::QueueFull,
-            ),
-            "quality queue full",
-        );
+        queue_full_before
+            .assert_exact_terminal_delta(
+                OutcomeExpectation::failure(
+                    Transport::Grpc,
+                    MetricCommand::Quality,
+                    Stage::Admission,
+                    Reason::QueueFull,
+                ),
+                "quality queue full",
+            )
+            .await;
 
         release_first_worker.release();
         bounded_external("held classify completes after release", first)
@@ -5337,15 +5355,17 @@ mod tests {
             .unwrap()
             .expect_err("holder caller deadline expires while its worker stays live");
         assert_eq!(holder_status.code(), tonic::Code::DeadlineExceeded);
-        holder_before.assert_exact_terminal_delta(
-            OutcomeExpectation::failure(
-                Transport::Grpc,
-                MetricCommand::Classify,
-                Stage::Worker,
-                Reason::Deadline,
-            ),
-            "running classify caller deadline before matrix snapshots",
-        );
+        holder_before
+            .assert_exact_terminal_delta(
+                OutcomeExpectation::failure(
+                    Transport::Grpc,
+                    MetricCommand::Classify,
+                    Stage::Worker,
+                    Reason::Deadline,
+                ),
+                "running classify caller deadline before matrix snapshots",
+            )
+            .await;
         worker_faults
             .wait_for_active_workers("classify", 1, std::time::Duration::from_secs(3))
             .await
@@ -5360,15 +5380,17 @@ mod tests {
                     .await
                     .expect_err($name);
                 assert_eq!(status.code(), tonic::Code::DeadlineExceeded, $name);
-                before.assert_exact_terminal_delta(
-                    OutcomeExpectation::failure(
-                        Transport::Grpc,
-                        $command,
-                        Stage::Admission,
-                        Reason::Deadline,
-                    ),
-                    $name,
-                );
+                before
+                    .assert_exact_terminal_delta(
+                        OutcomeExpectation::failure(
+                            Transport::Grpc,
+                            $command,
+                            Stage::Admission,
+                            Reason::Deadline,
+                        ),
+                        $name,
+                    )
+                    .await;
             }};
         }
         assert_deadline!(
@@ -5753,37 +5775,39 @@ mod tests {
         assert_eq!(classify_successes, 4);
         assert_eq!(quality_refusals, 4);
         assert_eq!(classify_refusals, 4);
-        terminal_before.assert_exact_terminal_multiset_delta(
-            &[
-                (
-                    OutcomeExpectation::success(Transport::Grpc, MetricCommand::Quality),
-                    4,
-                ),
-                (
-                    OutcomeExpectation::success(Transport::Grpc, MetricCommand::Classify),
-                    4,
-                ),
-                (
-                    OutcomeExpectation::failure(
-                        Transport::Grpc,
-                        MetricCommand::Quality,
-                        Stage::Admission,
-                        Reason::ResourceLimit,
+        terminal_before
+            .assert_exact_terminal_multiset_delta(
+                &[
+                    (
+                        OutcomeExpectation::success(Transport::Grpc, MetricCommand::Quality),
+                        4,
                     ),
-                    4,
-                ),
-                (
-                    OutcomeExpectation::failure(
-                        Transport::Grpc,
-                        MetricCommand::Classify,
-                        Stage::Admission,
-                        Reason::ResourceLimit,
+                    (
+                        OutcomeExpectation::success(Transport::Grpc, MetricCommand::Classify),
+                        4,
                     ),
-                    4,
-                ),
-            ],
-            "process-wide mixed-service pre-decode pressure",
-        );
+                    (
+                        OutcomeExpectation::failure(
+                            Transport::Grpc,
+                            MetricCommand::Quality,
+                            Stage::Admission,
+                            Reason::ResourceLimit,
+                        ),
+                        4,
+                    ),
+                    (
+                        OutcomeExpectation::failure(
+                            Transport::Grpc,
+                            MetricCommand::Classify,
+                            Stage::Admission,
+                            Reason::ResourceLimit,
+                        ),
+                        4,
+                    ),
+                ],
+                "process-wide mixed-service pre-decode pressure",
+            )
+            .await;
     }
 
     async fn raw_h2_connection_is_accepted(stream: &mut tokio::net::TcpStream) -> bool {
@@ -6084,15 +6108,17 @@ mod tests {
             raw_connection_is_closed(&mut plus_one, std::time::Duration::from_secs(3)).await,
             "the refused socket must reach EOF/reset after any bounded control frames"
         );
-        refusal_before.assert_exact_terminal_delta(
-            OutcomeExpectation::failure(
-                Transport::Grpc,
-                MetricCommand::Unknown,
-                Stage::Admission,
-                Reason::ResourceLimit,
-            ),
-            "gRPC connection limit",
-        );
+        refusal_before
+            .assert_exact_terminal_delta(
+                OutcomeExpectation::failure(
+                    Transport::Grpc,
+                    MetricCommand::Unknown,
+                    Stage::Admission,
+                    Reason::ResourceLimit,
+                ),
+                "gRPC connection limit",
+            )
+            .await;
 
         let expiry_before = outcomes.snapshot();
         deadline_clock.advance(std::time::Duration::from_millis(201));
@@ -6111,18 +6137,20 @@ mod tests {
             .wait_for_active_connections(0, std::time::Duration::from_secs(3))
             .await
             .expect("deadline expiry returns all production permits");
-        expiry_before.assert_exact_terminal_multiset_delta(
-            &[(
-                OutcomeExpectation::failure(
-                    Transport::Grpc,
-                    MetricCommand::Unknown,
-                    Stage::Read,
-                    Reason::Deadline,
-                ),
-                CONNECTION_BUDGET as u64,
-            )],
-            "gRPC handshake and established-idle connection expiry",
-        );
+        expiry_before
+            .assert_exact_terminal_multiset_delta(
+                &[(
+                    OutcomeExpectation::failure(
+                        Transport::Grpc,
+                        MetricCommand::Unknown,
+                        Stage::Read,
+                        Reason::Deadline,
+                    ),
+                    CONNECTION_BUDGET as u64,
+                )],
+                "gRPC handshake and established-idle connection expiry",
+            )
+            .await;
         for stream in &mut held {
             assert!(
                 raw_connection_is_closed(stream, std::time::Duration::from_secs(3)).await,
@@ -6203,15 +6231,17 @@ mod tests {
         .await
         .expect_err("the decoded request reaches the smaller application text cap");
         assert_eq!(status.code(), tonic::Code::ResourceExhausted);
-        before.assert_exact_terminal_delta(
-            OutcomeExpectation::failure(
-                Transport::Grpc,
-                MetricCommand::Quality,
-                Stage::Limit,
-                Reason::ResourceLimit,
-            ),
-            "classifier service exact decode ceiling",
-        );
+        before
+            .assert_exact_terminal_delta(
+                OutcomeExpectation::failure(
+                    Transport::Grpc,
+                    MetricCommand::Quality,
+                    Stage::Limit,
+                    Reason::ResourceLimit,
+                ),
+                "classifier service exact decode ceiling",
+            )
+            .await;
         let before = outcomes.snapshot();
         let plus_one_quality = quality_request_with_encoded_len(DECODE_CEILING + 1);
         assert_eq!(plus_one_quality.encoded_len(), DECODE_CEILING + 1);
@@ -6222,15 +6252,17 @@ mod tests {
         .await
         .expect_err("the generated classifier service must reject before its handler");
         assert_eq!(status.code(), tonic::Code::OutOfRange);
-        before.assert_exact_terminal_delta(
-            OutcomeExpectation::failure(
-                Transport::Grpc,
-                MetricCommand::Quality,
-                Stage::Decode,
-                Reason::ResourceLimit,
-            ),
-            "classifier service decode plus one",
-        );
+        before
+            .assert_exact_terminal_delta(
+                OutcomeExpectation::failure(
+                    Transport::Grpc,
+                    MetricCommand::Quality,
+                    Stage::Decode,
+                    Reason::ResourceLimit,
+                ),
+                "classifier service decode plus one",
+            )
+            .await;
         assert_eq!(
             ingress.decoded_messages(MetricCommand::Quality),
             quality_decodes_before + 1,
@@ -6249,15 +6281,17 @@ mod tests {
         .await
         .expect_err("the decoded request reaches the smaller application text cap");
         assert_eq!(status.code(), tonic::Code::ResourceExhausted);
-        before.assert_exact_terminal_delta(
-            OutcomeExpectation::failure(
-                Transport::Grpc,
-                MetricCommand::Classify,
-                Stage::Limit,
-                Reason::ResourceLimit,
-            ),
-            "inference service exact decode ceiling",
-        );
+        before
+            .assert_exact_terminal_delta(
+                OutcomeExpectation::failure(
+                    Transport::Grpc,
+                    MetricCommand::Classify,
+                    Stage::Limit,
+                    Reason::ResourceLimit,
+                ),
+                "inference service exact decode ceiling",
+            )
+            .await;
         let before = outcomes.snapshot();
         let plus_one_classify = classify_request_with_encoded_len(DECODE_CEILING + 1);
         assert_eq!(plus_one_classify.encoded_len(), DECODE_CEILING + 1);
@@ -6268,15 +6302,17 @@ mod tests {
         .await
         .expect_err("the generated inference service must reject before its handler");
         assert_eq!(status.code(), tonic::Code::OutOfRange);
-        before.assert_exact_terminal_delta(
-            OutcomeExpectation::failure(
-                Transport::Grpc,
-                MetricCommand::Classify,
-                Stage::Decode,
-                Reason::ResourceLimit,
-            ),
-            "inference service decode plus one",
-        );
+        before
+            .assert_exact_terminal_delta(
+                OutcomeExpectation::failure(
+                    Transport::Grpc,
+                    MetricCommand::Classify,
+                    Stage::Decode,
+                    Reason::ResourceLimit,
+                ),
+                "inference service decode plus one",
+            )
+            .await;
         assert_eq!(
             ingress.decoded_messages(MetricCommand::Classify),
             inference_decodes_before + 1,
@@ -6307,15 +6343,17 @@ mod tests {
             .unwrap()
             .expect_err("the finite outer request deadline must terminate the call");
         assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
-        timeout_before.assert_exact_terminal_delta(
-            OutcomeExpectation::failure(
-                Transport::Grpc,
-                MetricCommand::Quality,
-                Stage::Handler,
-                Reason::Deadline,
-            ),
-            "live outer request timeout",
-        );
+        timeout_before
+            .assert_exact_terminal_delta(
+                OutcomeExpectation::failure(
+                    Transport::Grpc,
+                    MetricCommand::Quality,
+                    Stage::Handler,
+                    Reason::Deadline,
+                ),
+                "live outer request timeout",
+            )
+            .await;
         held_quality_timeout.release_all();
         ingress
             .wait_for_active_request_permits(0, std::time::Duration::from_secs(3))
@@ -6346,15 +6384,17 @@ mod tests {
         .unwrap()
         .expect_err("the finite outer timeout must also terminate InferenceService");
         assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
-        inference_timeout_before.assert_exact_terminal_delta(
-            OutcomeExpectation::failure(
-                Transport::Grpc,
-                MetricCommand::Classify,
-                Stage::Handler,
-                Reason::Deadline,
-            ),
-            "live InferenceService outer request timeout",
-        );
+        inference_timeout_before
+            .assert_exact_terminal_delta(
+                OutcomeExpectation::failure(
+                    Transport::Grpc,
+                    MetricCommand::Classify,
+                    Stage::Handler,
+                    Reason::Deadline,
+                ),
+                "live InferenceService outer request timeout",
+            )
+            .await;
         held_classify_timeout.release_all();
         ingress
             .wait_for_active_request_permits(0, std::time::Duration::from_secs(3))
@@ -6398,15 +6438,17 @@ mod tests {
             raw_connection_is_closed(&mut aged, std::time::Duration::from_secs(3)).await,
             "max-age expiry drains GOAWAY through EOF/reset"
         );
-        age_before.assert_exact_terminal_delta(
-            OutcomeExpectation::failure(
-                Transport::Grpc,
-                MetricCommand::Unknown,
-                Stage::Read,
-                Reason::Deadline,
-            ),
-            "gRPC maximum connection age",
-        );
+        age_before
+            .assert_exact_terminal_delta(
+                OutcomeExpectation::failure(
+                    Transport::Grpc,
+                    MetricCommand::Unknown,
+                    Stage::Read,
+                    Reason::Deadline,
+                ),
+                "gRPC maximum connection age",
+            )
+            .await;
         age_server.stop().await;
     }
 

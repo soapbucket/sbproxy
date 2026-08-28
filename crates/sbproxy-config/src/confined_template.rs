@@ -784,9 +784,10 @@ fn compression_lever_endpoint_is_a_host_path(value: &str, _sibling_type: Option<
 /// **Node identity and node state.** `tls_cert_file`, `tls_key_file`,
 /// `cert_file`, `key_file`, `ca_file`, `client_ca_file`, `tls.cert`,
 /// `tls.key`, `authority_dir`, `signing_key_file`,
-/// `verifying_key_file`, `verifying_keys_file`, `state_dir`,
-/// `state_path`, `store_dir`, `store.path`, `model_host.store_path`,
-/// `model_host.catalog_file`, `cache.directory`, `engines.*.path`,
+/// `verifying_key_file`, `verifying_keys_file`, `signing_key.pem_file`,
+/// `state_dir`, `state_path`, `store_dir`, `store.path`,
+/// `model_host.store_path`, `model_host.catalog_file`,
+/// `cache.directory`, `engines.*.path`,
 /// `socket_path`, `tls_certificate_path`, `jwt_path`, `auth.path`,
 /// `service_account_key_file.path`, `external_account_file.path` and
 /// `backends.path`. The PEM triple is scoped `Anywhere` rather than
@@ -847,6 +848,16 @@ fn compression_lever_endpoint_is_a_host_path(value: &str, _sibling_type: Option<
 ///
 /// * `proxy.ai_providers_file` - `crates/sbproxy-config/src/types.rs:1905`,
 ///   read at boot by `crates/sbproxy-core/src/server/lifecycle.rs:1663`
+/// * `proxy.federation.signing_key.pem_file` -
+///   `crates/sbproxy-config/src/types.rs:2260`, read with `std::fs::read`
+///   when the OpenID Federation pipeline is constructed
+///   (`crates/sbproxy-core/src/pipeline.rs:2471`). It is the private key
+///   this node signs entity statements with, so the document that names
+///   it picks which key on the host speaks for this entity. Scoped
+///   `Under("signing_key")` rather than `Anywhere` because
+///   `proxy.federation.signing_key` is the only mapping that carries the
+///   key; the other `signing_key` in the schema,
+///   `origins.*.olp.signing_key`, is a leaf string with nothing under it.
 ///
 /// A document that may name one of these can name any path the proxy
 /// process can open, which is a host-file read, or write, handed to
@@ -1084,6 +1095,12 @@ const HOST_FILE_KEYS: &[HostFileKey] = &[
         scope: KeyScope::Anywhere,
         key: "verifying_keys_file",
         remedy: "leave the trusted-key set to the layer this node owns",
+        host_path_value: None,
+    },
+    HostFileKey {
+        scope: KeyScope::Under("signing_key"),
+        key: "pem_file",
+        remedy: "leave this node's federation signing key to the layer it owns",
         host_path_value: None,
     },
     HostFileKey {
@@ -3004,6 +3021,10 @@ mod tests {
         (
             "verifying_keys_file",
             "proxy:\n  config_authority:\n    upstream:\n      verifying_keys_file: /etc/sbproxy/trusted-keys.json\n",
+        ),
+        (
+            "signing_key.pem_file",
+            "proxy:\n  federation:\n    signing_key:\n      pem_file: /etc/sbproxy/federation-signing.pem\n",
         ),
         (
             "state_dir",
