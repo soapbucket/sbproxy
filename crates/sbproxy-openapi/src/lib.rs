@@ -1259,6 +1259,7 @@ mod tests {
             deprecation: None,
             message_signatures: None,
             olp: None,
+            comp: None,
             web_bot_auth_publish: None,
             idempotency: None,
             timeouts: sbproxy_config::UpstreamTimeouts::default(),

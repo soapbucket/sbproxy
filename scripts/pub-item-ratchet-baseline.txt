@@ -1031,3 +1031,22 @@ AWS-SDK cache-reserve backend, which the object-storage backend replaces.
 The item was reachable only from its own tests and the mock-SDK integration
 file, both of which were removed with it. Unreferenced 1520 -> 1519, the
 same removal.
+
+2026-08-28 (WOR-2673, licensing wiring): tests-only 323 -> 322. Wiring
+`sbproxy-licensing` into the proxy gave the CoMP marketplace surface its
+first production consumers: `sbproxy_core::pipeline::build_comp_marketplace`
+builds it from `origins.<host>.comp`, `request_phase` serves the three
+well-known endpoints through it, and `admin_licensing` reads it. Items
+that previously only the crate's own tests and its example named now
+have a caller inside a shipped binary.
+
+Unreferenced 1519 -> 1523, all four the nested config structs of
+`origins.<host>.comp`: `CompPublisherConfig`, `CompTierConfig`,
+`CompTierPricingConfig`, `CompRateCapsConfig`, and `CompBuyerKeyConfig`.
+Narrowing is not available to them: they are field types of a `pub`
+schema struct in `sbproxy-config`, which is one of the three public
+crates, and `schemars` derives a JSON Schema node per type. Every other
+nested config struct in `types.rs` sits in this same bucket for the same
+reason. `COMP_ACCEPTANCE_SKEW_SECS` is not among them: it is re-exported
+from `comp/mod.rs` beside `COMP_QUOTE_VALIDITY_SECS`, which is where an
+operator reading the five-minute window in the docs would look for it.

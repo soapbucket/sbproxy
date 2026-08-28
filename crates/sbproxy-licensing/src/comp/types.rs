@@ -55,16 +55,49 @@ pub struct CompManifest {
     pub rsl_url: String,
     /// Manifest assembly timestamp (UTC, RFC 3339).
     pub generated_at: String,
-    /// Integrity hash of the manifest, supplied by the operator.
+    /// Integrity hash of the manifest: the SHA-256 of this manifest's
+    /// JSON with the field itself cleared, in `sha256:<hex>` form.
     ///
-    /// The intended value is the SHA-256 of the canonical JSON of this
-    /// manifest with the field cleared, in `sha256:<base64-no-pad>`
-    /// form. Nothing in this crate computes it and nothing verifies it:
-    /// it is carried through to the buyer as the operator wrote it, and
-    /// the shipped example carries a placeholder. Treat it as a value
-    /// an out-of-band process fills in, not as something a consumer can
-    /// check against this document.
+    /// [`compute_manifest_hash`] produces it and the proxy stamps it on
+    /// the manifest it serves. Nothing verifies it on the way in: a
+    /// manifest handed to [`CompManifest`] from anywhere but that path
+    /// carries whatever its author wrote. Read the ordering contract on
+    /// [`compute_manifest_hash`] before recomputing it in another
+    /// language.
     pub manifest_hash: String,
+}
+
+/// Compute a manifest's `manifest_hash`.
+///
+/// The SHA-256 of `serde_json`'s rendering of the manifest with
+/// `manifest_hash` cleared to the empty string, rendered as
+/// `sha256:<lowercase hex>`.
+///
+/// # Ordering contract
+///
+/// The bytes hashed are this crate's `serde` rendering, so field order
+/// is the declaration order of [`CompManifest`] and its nested types,
+/// not sorted-key canonical JSON (RFC 8785 JCS). That is the same
+/// contract `canonical_quote_signing_input` documents for quote
+/// signatures, and for the same reason: moving to JCS is a wire break
+/// for every client that has already implemented against this. A
+/// non-Rust client that wants to recompute this value has to reproduce
+/// the declaration order.
+///
+/// # Errors
+///
+/// Returns [`crate::LicensingError::Encode`] when the manifest cannot
+/// be serialized, which cannot happen for a manifest built from config.
+pub fn compute_manifest_hash(manifest: &CompManifest) -> Result<String, crate::LicensingError> {
+    use sha2::{Digest, Sha256};
+
+    let mut bare = manifest.clone();
+    bare.manifest_hash = String::new();
+    let bytes = serde_json::to_vec(&bare)
+        .map_err(|error| crate::LicensingError::Encode(format!("manifest hash: {error}")))?;
+    let digest = Sha256::digest(&bytes);
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    Ok(format!("sha256:{hex}"))
 }
 
 /// Publisher block of the manifest.
@@ -308,7 +341,7 @@ pub struct CompPaymentProof {
 
 /// Body of a redeem response. Wraps a bridged OLP license token (see
 /// [`super::olp_bridge`]).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompRedeemResponse {
     /// Compact JWS license token.
     pub license_token: String,
@@ -324,9 +357,59 @@ pub struct CompRedeemResponse {
     pub route_glob: String,
 }
 
+/// Redacted `Debug` (WOR-2673). `license_token` is a bearer
+/// credential: every reader of a log line, a panic message, or a
+/// `dbg!` that printed it would hold the licensed access it grants for
+/// the whole of its TTL. Everything else here is what an operator
+/// reconciles revenue against and none of it authorizes anything, so
+/// it stays. Curated and `finish_non_exhaustive`, so a
+/// credential-shaped field added later is absent rather than printed.
+impl std::fmt::Debug for CompRedeemResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompRedeemResponse")
+            .field("license_token", &"[REDACTED]")
+            .field("token_type", &self.token_type)
+            .field("expires_in", &self.expires_in)
+            .field("license", &self.license)
+            .field("agent_id", &self.agent_id)
+            .field("route_glob", &self.route_glob)
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WOR-2673, and the entry this type has in
+    /// `scripts/secret-debug-registry.txt`. `license_token` is a bearer
+    /// credential: a `{:?}` that printed it would hand every reader of
+    /// a log line, a `dbg!`, or a panic message the licensed access it
+    /// grants for the whole of its TTL.
+    #[test]
+    fn a_redeem_response_does_not_print_its_token() {
+        const SENTINEL: &str = "SENTINEL-LICENSE-TOKEN-4c1a";
+
+        let response = CompRedeemResponse {
+            license_token: SENTINEL.into(),
+            token_type: "Bearer".into(),
+            expires_in: 3600,
+            license: "urn:rsl:pay-per-inference:default".into(),
+            agent_id: "agent_9f2c1b".into(),
+            route_glob: "/api/v1/inference/**".into(),
+        };
+        let rendered = format!("{response:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the minted license token reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("agent_9f2c1b")
+                && rendered.contains("urn:rsl:pay-per-inference:default"),
+            "the agent id and the license URN must survive: they are what an operator \
+             reconciles a mint against, and neither authorizes anything: {rendered}"
+        );
+    }
 
     #[test]
     fn manifest_round_trips() {

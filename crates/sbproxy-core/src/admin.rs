@@ -5204,6 +5204,13 @@ pub fn handle_admin_request(
     if let Some(response) = crate::admin_federation::dispatch(method, path) {
         return response;
     }
+    // CoMP marketplace bridges. Same reason the federation route above
+    // is here: the crate's own /admin/status is never mounted, because
+    // this binary serves the CoMP well-known endpoints off the request
+    // path instead of the crate's axum router (WOR-2673).
+    if let Some(response) = crate::admin_licensing::dispatch(method, path) {
+        return response;
+    }
     // MCP OAuth brokers. The crate's own /admin/status is deliberately
     // not mounted in process, because the broker's route tree sits on
     // the public MCP origin ahead of the resource-server check. This is
@@ -13787,6 +13794,7 @@ origins:
                 deprecation: None,
                 message_signatures: None,
                 olp: None,
+                comp: None,
                 web_bot_auth_publish: None,
                 idempotency: None,
                 timeouts: sbproxy_config::UpstreamTimeouts::default(),

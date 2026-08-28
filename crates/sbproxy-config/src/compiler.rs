@@ -1210,6 +1210,173 @@ pub(crate) fn validate_decision_script(
 /// supported engine. WASM is rejected with a pointer to the reason:
 /// inline `source` is text, and a WASM log field would need a compiled
 /// module path instead.
+/// Validate one origin's `comp:` block (WOR-2673).
+///
+/// Every refusal here is a catalog an operator would otherwise publish
+/// and then watch fail one buyer at a time: a tier nobody can redeem, a
+/// price that does not apply to its own pricing model, a buyer key that
+/// is not a key. The bridge itself is built at pipeline construction
+/// and needs secrets to do it; this runs on a machine that has none.
+fn validate_comp_marketplace(
+    comp: &crate::types::CompMarketplaceConfig,
+    olp: Option<&crate::types::OlpConfig>,
+) -> Result<()> {
+    // The bridge has no issuer of its own. It signs the license token it
+    // returns with the origin's OLP key so that the origin's own
+    // `/.well-known/olp/introspect` verifies it; without that block
+    // there is nothing to sign with and nothing to verify against.
+    if !olp.is_some_and(|olp| olp.enabled) {
+        anyhow::bail!(
+            "config compile: comp.enabled needs olp.enabled on the same origin. The bridge \
+             mints its license tokens with olp.signing_key so this origin's own \
+             /.well-known/olp/introspect verifies them"
+        );
+    }
+    if comp.master_key.trim().is_empty() {
+        anyhow::bail!("config compile: comp.master_key must not be empty");
+    }
+    if comp.rotation_id.trim().is_empty() {
+        anyhow::bail!("config compile: comp.rotation_id must not be empty");
+    }
+    if comp.publisher.name.trim().is_empty() || comp.publisher.contact.trim().is_empty() {
+        anyhow::bail!(
+            "config compile: comp.publisher.name and comp.publisher.contact are required"
+        );
+    }
+    if comp.tiers.is_empty() {
+        anyhow::bail!(
+            "config compile: comp.tiers must not be empty; a manifest with no tiers publishes \
+             nothing a buyer can quote"
+        );
+    }
+    let mut seen: Vec<&str> = Vec::with_capacity(comp.tiers.len());
+    for tier in &comp.tiers {
+        if tier.id.trim().is_empty() {
+            anyhow::bail!("config compile: comp.tiers[].id must not be empty");
+        }
+        if seen.contains(&tier.id.as_str()) {
+            anyhow::bail!(
+                "config compile: comp.tiers[].id '{}' appears twice; a quote request names a \
+                 tier by id and would resolve to whichever came first",
+                tier.id
+            );
+        }
+        seen.push(tier.id.as_str());
+        if tier.license.trim().is_empty() {
+            anyhow::bail!(
+                "config compile: comp.tiers[{}].license must name the license URN the minted \
+                 token grants",
+                tier.id
+            );
+        }
+        match tier.authorization.as_str() {
+            "public" | "cap" | "olp" => {}
+            other => anyhow::bail!(
+                "config compile: comp.tiers[{}].authorization '{other}' is not one of public, \
+                 cap, olp",
+                tier.id
+            ),
+        }
+        match tier.shape.as_str() {
+            "html" | "json-envelope" | "bulk-archive" => {}
+            other => anyhow::bail!(
+                "config compile: comp.tiers[{}].shape '{other}' is not one of html, \
+                 json-envelope, bulk-archive",
+                tier.id
+            ),
+        }
+        match tier.pricing.model.as_str() {
+            "free" => {}
+            "per_request" => {
+                if tier.pricing.amount_micros.is_none() {
+                    anyhow::bail!(
+                        "config compile: comp.tiers[{}].pricing.model is per_request, which \
+                         prices from amount_micros; set it or the tier quotes at zero",
+                        tier.id
+                    );
+                }
+            }
+            "flat_rate" => {
+                if tier.pricing.amount.is_none() {
+                    anyhow::bail!(
+                        "config compile: comp.tiers[{}].pricing.model is flat_rate, which \
+                         prices from amount; set it or the tier quotes at zero",
+                        tier.id
+                    );
+                }
+            }
+            other => anyhow::bail!(
+                "config compile: comp.tiers[{}].pricing.model '{other}' is not one of free, \
+                 per_request, flat_rate",
+                tier.id
+            ),
+        }
+        if tier.pricing.currency.trim().len() != 3 {
+            anyhow::bail!(
+                "config compile: comp.tiers[{}].pricing.currency must be a three-letter ISO 4217 \
+                 code",
+                tier.id
+            );
+        }
+    }
+    // `redeem` only mints for OLP-authorized tiers. A catalog of `cap`
+    // and `public` tiers behind a bridge whose whole job is minting is
+    // an endpoint that refuses every request it is given.
+    if !comp.tiers.iter().any(|tier| tier.authorization == "olp") {
+        anyhow::bail!(
+            "config compile: comp.tiers has no tier with authorization: olp, and redeem can \
+             only mint a license token for an OLP tier"
+        );
+    }
+    if comp.buyer_keys.is_empty() {
+        anyhow::bail!(
+            "config compile: comp.buyer_keys must not be empty; a redeem request is refused \
+             unless its signing kid resolves here, so an empty list refuses every redeem"
+        );
+    }
+    let mut seen_kids: Vec<&str> = Vec::with_capacity(comp.buyer_keys.len());
+    for key in &comp.buyer_keys {
+        if key.kid.trim().is_empty() {
+            anyhow::bail!("config compile: comp.buyer_keys[].kid must not be empty");
+        }
+        if seen_kids.contains(&key.kid.as_str()) {
+            anyhow::bail!(
+                "config compile: comp.buyer_keys[].kid '{}' appears twice",
+                key.kid
+            );
+        }
+        seen_kids.push(key.kid.as_str());
+        let decoded = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            key.public_key.trim(),
+        )
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "config compile: comp.buyer_keys[{}].public_key is not base64url without \
+                 padding: {error}",
+                key.kid
+            )
+        })?;
+        if decoded.len() != 32 {
+            anyhow::bail!(
+                "config compile: comp.buyer_keys[{}].public_key decoded to {} bytes; an Ed25519 \
+                 public key is 32",
+                key.kid,
+                decoded.len()
+            );
+        }
+    }
+    if let Some(hash) = comp.manifest_hash.as_deref() {
+        if !hash.starts_with("sha256:") {
+            anyhow::bail!(
+                "config compile: comp.manifest_hash must be `sha256:<hex>`; leave it unset to \
+                 have the proxy compute it over the manifest it publishes"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn validate_custom_log_fields(fields: &[crate::CustomLogFieldConfig]) -> Result<()> {
     let mut seen = std::collections::HashSet::new();
     for field in fields {
@@ -1945,6 +2112,16 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         if let Some(obs) = origin.observability.as_ref() {
             validate_custom_log_fields(&obs.log.custom_fields)
                 .with_context(|| format!("origin `{host}` observability.log"))?;
+        }
+    }
+
+    // WOR-2673: the CoMP marketplace bridge. Validated here rather than
+    // at pipeline build so `sbproxy validate` catches a catalog nobody
+    // can buy from, on a machine that holds none of the secrets.
+    for (host, origin) in &config_file.origins {
+        if let Some(comp) = origin.comp.as_ref().filter(|comp| comp.enabled) {
+            validate_comp_marketplace(comp, origin.olp.as_ref())
+                .with_context(|| format!("origin `{host}` comp"))?;
         }
     }
 
@@ -4690,6 +4867,7 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         deprecation,
         message_signatures: config.message_signatures,
         olp: config.olp,
+        comp: config.comp,
         web_bot_auth_publish: config.web_bot_auth_publish,
         idempotency: config.idempotency,
         // Resolved upstream transport deadlines; see

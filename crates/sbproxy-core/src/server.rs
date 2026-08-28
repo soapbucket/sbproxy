@@ -7058,7 +7058,7 @@ pub(crate) mod a2a_body_phase;
 // The ProxyHttp trait impl lives in the `proxy_http` submodule
 //. A trait impl needs no re-import to take effect.
 mod proxy_http;
-mod request_phase;
+pub(crate) mod request_phase;
 
 // --- Access log emission helpers ---
 //

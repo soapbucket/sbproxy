@@ -2314,6 +2314,16 @@ pub struct CompiledPipeline {
     /// decision. `None` when the operator configured no anchors.
     pub(crate) federation_peer_verifier:
         Option<Arc<crate::federation_peer::FederationPeerVerifier>>,
+    /// WOR-2673: one CoMP marketplace bridge per origin, parallel to
+    /// `config.origins`, `None` where the origin has no `comp:` block.
+    ///
+    /// The bridge is stateful: it holds the issued-quote ledger a
+    /// redeem is checked against, so it lives for a whole pipeline
+    /// generation rather than being rebuilt per request. A reload
+    /// therefore starts a fresh ledger, which is the same restart
+    /// semantics `redeem_allows_quote_unknown_to_this_process`
+    /// documents and `docs/comp-marketplace.md` states.
+    pub(crate) comp_marketplaces: Vec<Option<Arc<sbproxy_licensing::comp::CompMarketplace>>>,
     /// Dynamic hooks loaded and compiled with this pipeline generation.
     #[allow(dead_code)]
     pub(crate) extension_registry: Arc<DynamicBundleRegistry>,
@@ -2643,6 +2653,7 @@ impl Default for CompiledPipeline {
             config,
             federation_issuer: None,
             federation_peer_verifier: None,
+            comp_marketplaces: Vec::new(),
             extension_registry,
             ai_extension_chain,
             ai_toolkit: sbproxy_ai::toolkit::AiToolkitRuntime::disabled(),
@@ -2706,6 +2717,193 @@ enum PipelineConstructionMode {
     Runtime,
     Validation,
 }
+
+/// Build one CoMP marketplace bridge per origin (WOR-2673).
+///
+/// The vector is parallel to `config.origins`, so the request path
+/// indexes it with the origin index it already resolved rather than
+/// looking a hostname up a second time.
+///
+/// `sbproxy validate` gets an all-`None` vector. Construction resolves
+/// two secrets (the CoMP master key, and the origin's OLP signing seed)
+/// through the process secret resolver, which reads files and dials
+/// secret backends; validation does neither. Everything a validation
+/// run can check about this block is checked in `compile_config`
+/// instead, so the shape refusals still fire there.
+fn build_comp_marketplaces(
+    config: &CompiledConfig,
+    mode: PipelineConstructionMode,
+) -> anyhow::Result<Vec<Option<Arc<sbproxy_licensing::comp::CompMarketplace>>>> {
+    let mut built = Vec::with_capacity(config.origins.len());
+    for origin in &config.origins {
+        let Some(comp) = origin.comp.as_ref().filter(|comp| comp.enabled) else {
+            built.push(None);
+            continue;
+        };
+        if matches!(mode, PipelineConstructionMode::Validation) {
+            built.push(None);
+            continue;
+        }
+        let marketplace = build_comp_marketplace(origin, comp)
+            .map_err(|error| anyhow::anyhow!("origin {} comp: {error:#}", origin.hostname))?;
+        built.push(Some(Arc::new(marketplace)));
+    }
+    Ok(built)
+}
+
+/// Build one origin's bridge from its `comp:` and `olp:` blocks.
+///
+/// A failure here aborts config load rather than degrading. That is the
+/// opposite of the cache reserve's posture, and deliberately so: a
+/// degraded cache reserve costs latency, while a marketplace bridge
+/// that silently did not come up would leave `/.well-known/iab-comp/*`
+/// answering 404 to buyers who have already been onboarded, with the
+/// publisher's own dashboards reading zero because zero is also what
+/// "nobody bought anything today" looks like.
+fn build_comp_marketplace(
+    origin: &sbproxy_config::CompiledOrigin,
+    comp: &sbproxy_config::CompMarketplaceConfig,
+) -> anyhow::Result<sbproxy_licensing::comp::CompMarketplace> {
+    use anyhow::Context as _;
+    use sbproxy_licensing::comp::{
+        compute_manifest_hash, CompAuthorization, CompEndpoints, CompManifest, CompMarketplace,
+        CompPricing, CompPricingModel, CompPublisher, CompRateCaps, CompTier,
+        InMemoryBuyerKeyRegistry, OlpBridgeSigner, COMP_VERSION,
+    };
+    use sbproxy_licensing::keys::{KeyManager, MasterKey};
+    use sbproxy_licensing::revocation::{InMemoryRevocation, Revocation};
+
+    // The `comp:` block is refused at compile without an enabled `olp:`
+    // block, so this is a config built in memory rather than loaded.
+    let olp = origin
+        .olp
+        .as_ref()
+        .filter(|olp| olp.enabled)
+        .ok_or_else(|| anyhow::anyhow!("comp.enabled needs olp.enabled on the same origin"))?;
+
+    // --- Quote-signing key ---
+    let master = resolve_at_rest_key_material(&comp.master_key, "comp.master_key")
+        .context("comp.master_key")?;
+    let keys = KeyManager::new(
+        MasterKey::new(master).map_err(|error| anyhow::anyhow!("comp.master_key: {error}"))?,
+    );
+    keys.set_active(&comp.rotation_id)
+        .map_err(|error| anyhow::anyhow!("comp.rotation_id: {error}"))?;
+
+    // --- OLP bridge signer ---
+    //
+    // The same seed, kid, scope, and TTL the origin's own OLP issuer
+    // uses, so the token this bridge returns verifies against that
+    // origin's `/.well-known/olp/introspect` with no extra trust
+    // configuration. That wire-format compatibility is the entire
+    // reason this crate does not ship a second OLP issuer.
+    let seed = crate::server::request_phase::decode_ed25519_seed(&olp.signing_key)
+        .map_err(|error| anyhow::anyhow!("olp.signing_key: {error}"))?;
+    let bridge = Arc::new(OlpBridgeSigner::new(
+        seed,
+        olp.key_id.clone(),
+        olp.issuer.clone(),
+        olp.default_scope.clone(),
+        olp.default_ttl_secs,
+    ));
+
+    // --- Buyer keys ---
+    let buyer_keys = Arc::new(InMemoryBuyerKeyRegistry::new());
+    for key in &comp.buyer_keys {
+        buyer_keys
+            .insert_base64url(key.kid.clone(), &key.public_key)
+            .map_err(|error| anyhow::anyhow!("comp.buyer_keys: {error}"))?;
+    }
+
+    // --- Manifest ---
+    let host = origin.hostname.as_str();
+    let tiers = comp
+        .tiers
+        .iter()
+        .map(|tier| {
+            Ok(CompTier {
+                id: tier.id.clone(),
+                name: tier.name.clone(),
+                description: tier.description.clone(),
+                license: tier.license.clone(),
+                shape: tier.shape.clone(),
+                pricing: CompPricing {
+                    model: match tier.pricing.model.as_str() {
+                        "free" => CompPricingModel::Free,
+                        "per_request" => CompPricingModel::PerRequest,
+                        "flat_rate" => CompPricingModel::FlatRate,
+                        other => anyhow::bail!("comp.tiers[{}].pricing.model '{other}'", tier.id),
+                    },
+                    currency: tier.pricing.currency.clone(),
+                    amount: tier.pricing.amount,
+                    amount_micros: tier.pricing.amount_micros,
+                },
+                authorization: match tier.authorization.as_str() {
+                    "public" => CompAuthorization::Public,
+                    "cap" => CompAuthorization::Cap,
+                    "olp" => CompAuthorization::Olp,
+                    other => anyhow::bail!("comp.tiers[{}].authorization '{other}'", tier.id),
+                },
+                rate_caps: tier.rate_caps.as_ref().map(|caps| CompRateCaps {
+                    max_rps: caps.max_rps,
+                    max_bytes_per_day: caps.max_bytes_per_day,
+                }),
+                route_glob: tier.route_glob.clone(),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let mut manifest = CompManifest {
+        comp_version: COMP_VERSION.to_string(),
+        publisher: CompPublisher {
+            name: comp.publisher.name.clone(),
+            // Always this origin's hostname. It is the host the three
+            // endpoints answer on, so a configurable second value could
+            // only ever disagree with where the buyer actually is.
+            domain: host.to_string(),
+            contact: comp.publisher.contact.clone(),
+            verified_at: comp.publisher.verified_at.clone(),
+        },
+        tiers,
+        endpoints: CompEndpoints {
+            manifest: format!("https://{host}{COMP_MANIFEST_PATH}"),
+            quote: format!("https://{host}{COMP_QUOTE_PATH}"),
+            redeem: format!("https://{host}{COMP_REDEEM_PATH}"),
+        },
+        robots_url: format!("https://{host}/robots.txt"),
+        llms_url: format!("https://{host}/llms.txt"),
+        rsl_url: format!("https://{host}/licenses.xml"),
+        generated_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        manifest_hash: String::new(),
+    };
+    manifest.manifest_hash = match comp.manifest_hash.clone() {
+        Some(supplied) => supplied,
+        None => compute_manifest_hash(&manifest)
+            .map_err(|error| anyhow::anyhow!("comp manifest hash: {error}"))?,
+    };
+
+    // In-memory revocation, matching this crate's documented default.
+    // A deployment that needs a denylist shared across replicas swaps
+    // in `RedisRevocation` over the workspace `EphemeralKv`; that is a
+    // library seam rather than a config key today, and
+    // `docs/comp-marketplace.md` says so.
+    let revocation: Arc<dyn Revocation> = Arc::new(InMemoryRevocation::new());
+
+    let marketplace =
+        CompMarketplace::new(keys, Arc::new(manifest), revocation, bridge, buyer_keys);
+    Ok(if comp.allow_unknown_quotes {
+        marketplace.allowing_unknown_quotes()
+    } else {
+        marketplace
+    })
+}
+
+/// `GET` path of the CoMP manifest, per IAB CoMP 1.0.
+pub(crate) const COMP_MANIFEST_PATH: &str = "/.well-known/iab-comp/manifest.json";
+/// `POST` path of the CoMP quote endpoint.
+pub(crate) const COMP_QUOTE_PATH: &str = "/.well-known/iab-comp/quote";
+/// `POST` path of the CoMP redeem endpoint.
+pub(crate) const COMP_REDEEM_PATH: &str = "/.well-known/iab-comp/redeem";
 
 fn build_federation_issuer(
     config: Option<&sbproxy_config::FederationConfig>,
@@ -3633,6 +3831,7 @@ impl CompiledPipeline {
         let federation_issuer = build_federation_issuer(config.server.federation.as_ref(), mode)?;
         let federation_peer_verifier =
             build_federation_peer_verifier(config.server.federation.as_ref(), mode)?;
+        let comp_marketplaces = build_comp_marketplaces(&config, mode)?;
 
         // --- Shared response cache backend ---
         //
@@ -3961,6 +4160,7 @@ impl CompiledPipeline {
             config,
             federation_issuer,
             federation_peer_verifier,
+            comp_marketplaces,
             extension_registry,
             ai_extension_chain,
             ai_toolkit,
@@ -6384,6 +6584,7 @@ origins:
                 deprecation: None,
                 message_signatures: None,
                 olp: None,
+                comp: None,
                 web_bot_auth_publish: None,
                 idempotency: None,
                 timeouts: sbproxy_config::UpstreamTimeouts::default(),
@@ -7361,6 +7562,7 @@ origins:
                 deprecation: None,
                 message_signatures: None,
                 olp: None,
+                comp: None,
                 web_bot_auth_publish: None,
                 idempotency: None,
                 timeouts: sbproxy_config::UpstreamTimeouts::default(),

@@ -9470,6 +9470,18 @@
             }
           ]
         },
+        "comp": {
+          "description": "WOR-2673: IAB Content Authorization Marketplace Protocol (CoMP) bridge. When set, the proxy serves `/.well-known/iab-comp/{manifest.json,quote,redeem}` on this origin, so an AI buyer can read the licensing catalog, get a signed price, and redeem a paid acceptance for an OLP license token without any publisher-specific integration.\n\nRequires this origin's [`Self::olp`] block: the bridge mints with that issuer's signing key, so the token it hands back is one this same origin's `/.well-known/olp/introspect` verifies.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CompMarketplaceConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "web_bot_auth_publish": {
           "description": "WOR-805 AC#4: opt in to publishing SBproxy's own Web Bot Auth signing-key directory at `/.well-known/http-message-signatures-directory` and the Signature Agent Card discovery doc. Verifiers that fetch the directory can then verify the signatures SBproxy attaches to outbound requests when the corresponding `MessageSignatureSigner` runs upstream of the proxy.",
           "default": null,
@@ -11321,6 +11333,240 @@
           "additionalProperties": false
         }
       ]
+    },
+    "CompMarketplaceConfig": {
+      "description": "WOR-2673: IAB Content Authorization Marketplace Protocol (CoMP) bridge, on a per-origin basis.\n\nCoMP is the discovery-and-purchase front door to the license tokens the origin's `olp:` block already issues. It publishes a signed catalog of licensing tiers, prices a buyer's requested volume into a signed quote, and converts a signed, paid acceptance of that quote into an OLP license token. Three well-known endpoints:\n\n* `GET  /.well-known/iab-comp/manifest.json` * `POST /.well-known/iab-comp/quote` * `POST /.well-known/iab-comp/redeem`\n\nYAML key: `origins.<host>.comp`. See `docs/comp-marketplace.md`.\n\nThe bridge does not carry its own OLP issuer. It signs the license token it returns with the same key `origins.<host>.olp.signing_key` names, under the same `kid`, so the token verifies against the origin's own `/.well-known/olp/introspect` with no extra trust configuration. `olp.enabled: true` on the same origin is therefore required, and the config compiler refuses the block without it.",
+      "type": "object",
+      "required": [
+        "master_key",
+        "publisher",
+        "rotation_id"
+      ],
+      "properties": {
+        "enabled": {
+          "description": "Master toggle. When false the three well-known endpoints 404.",
+          "default": false,
+          "type": "boolean"
+        },
+        "master_key": {
+          "description": "Master key the CoMP quote-signing key is derived from, as a hex- or base64-encoded value of at least 32 bytes.\n\nResolved like every other config secret: a provider URI (`secret://backend/name`, `vault://...`), a `file:/path` reference, or a whole-value `${ENV_VAR}`. HKDF-SHA256 expands it into one Ed25519 signing key per [`Self::rotation_id`], so rotation is a label change rather than the minting and distribution of a new raw seed.\n\nThis is not the OLP token key. Quote signatures live in their own `comp-...` kid namespace precisely so a quote signature can never be replayed as a license token.",
+          "type": "string"
+        },
+        "rotation_id": {
+          "description": "Rotation label the active quote-signing key is derived under, for example `2026-q3-001`. Bumping it derives and publishes a new `comp-<rotation_id>` kid; the previous one keeps verifying until the process restarts.",
+          "type": "string"
+        },
+        "publisher": {
+          "description": "Publisher identity the manifest advertises.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CompPublisherConfig"
+            }
+          ]
+        },
+        "tiers": {
+          "description": "Licensing tiers the manifest publishes. At least one is required, and at least one must be `authorization: olp`, since that is the only kind `redeem` can mint a token for.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CompTierConfig"
+          }
+        },
+        "buyer_keys": {
+          "description": "Buyer verification keys, by `kid`. A redeem request is signed by the buyer and refused unless its `kid` resolves here, so this list is the onboarding boundary: a buyer whose key is absent cannot redeem anything at any price.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CompBuyerKeyConfig"
+          }
+        },
+        "manifest_hash": {
+          "description": "SHA-256 of the canonical JSON of the manifest, in `sha256:<hex>` form, published in the manifest itself.\n\nComputed over the manifest with this field cleared when it is omitted, which is what the CoMP field is specified to be. Set it explicitly only when an out-of-band process (a signed catalog feed, a marketplace aggregator) owns the value.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "allow_unknown_quotes": {
+          "description": "Honor a redeem whose `quote_id` this process never issued. Defaults to `false`.\n\nThe bridge keeps its issued-quote ledger in memory, matching the no-external-store rule this port ships under, so a reload or a restart forgets every quote it signed. With the default, a buyer holding a quote from before that restart is refused and has to ask for a new one, which costs it one round trip.\n\nTurning this on removes that refusal, and removes with it the only thing standing between an onboarded buyer key and a token per call with a fabricated `quote_id`, no quote, and no price. A deployment that turns it on should be running a shared revocation denylist, because that check is then the only durable one left. See `docs/comp-marketplace.md`.",
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "CompPublisherConfig": {
+      "description": "Publisher identity block of the CoMP manifest.",
+      "type": "object",
+      "required": [
+        "contact",
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "description": "Legal or trading name of the publisher.",
+          "type": "string"
+        },
+        "contact": {
+          "description": "Licensing contact address a buyer can reach a human at.",
+          "type": "string"
+        },
+        "verified_at": {
+          "description": "RFC 3339 timestamp of the publisher's marketplace verification, when a marketplace has issued one. Advisory; nothing in the proxy checks it.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "CompTierConfig": {
+      "description": "One licensing tier in the CoMP manifest.",
+      "type": "object",
+      "required": [
+        "authorization",
+        "description",
+        "id",
+        "license",
+        "name",
+        "pricing",
+        "route_glob",
+        "shape"
+      ],
+      "properties": {
+        "id": {
+          "description": "Stable tier identifier a buyer names in a quote request.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Display name.",
+          "type": "string"
+        },
+        "description": {
+          "description": "One-line description of what the tier licenses.",
+          "type": "string"
+        },
+        "license": {
+          "description": "License URN this tier grants, stamped into the minted token's `license_urn` claim.",
+          "type": "string"
+        },
+        "shape": {
+          "description": "Content shape: `html`, `json-envelope`, or `bulk-archive`.",
+          "type": "string"
+        },
+        "authorization": {
+          "description": "Acquisition flow: `public`, `cap`, or `olp`. Only `olp` tiers can be redeemed for a license token.",
+          "type": "string"
+        },
+        "route_glob": {
+          "description": "Route allow-list glob echoed to the buyer. Advisory: the marketplace bridge publishes it, and the origin's own policies enforce access.",
+          "type": "string"
+        },
+        "pricing": {
+          "description": "Pricing block.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CompTierPricingConfig"
+            }
+          ]
+        },
+        "rate_caps": {
+          "description": "Rate ceiling advertised for the tier.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CompRateCapsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "CompTierPricingConfig": {
+      "description": "Pricing block of a CoMP tier.",
+      "type": "object",
+      "required": [
+        "currency",
+        "model"
+      ],
+      "properties": {
+        "model": {
+          "description": "`free`, `per_request`, or `flat_rate`.",
+          "type": "string"
+        },
+        "currency": {
+          "description": "ISO 4217 currency code.",
+          "type": "string"
+        },
+        "amount": {
+          "description": "Whole-unit amount. For `free` and `flat_rate`.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "amount_micros": {
+          "description": "Micro-unit amount (millionths of a currency unit). For `per_request`.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "CompRateCapsConfig": {
+      "description": "Rate ceiling advertised for a CoMP tier.",
+      "type": "object",
+      "required": [
+        "max_bytes_per_day",
+        "max_rps"
+      ],
+      "properties": {
+        "max_rps": {
+          "description": "Maximum requests per second.",
+          "type": "number",
+          "format": "double"
+        },
+        "max_bytes_per_day": {
+          "description": "Maximum bytes per day.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "CompBuyerKeyConfig": {
+      "description": "One onboarded buyer's verification key.",
+      "type": "object",
+      "required": [
+        "kid",
+        "public_key"
+      ],
+      "properties": {
+        "kid": {
+          "description": "Key id the buyer names in its redeem signature header.",
+          "type": "string"
+        },
+        "public_key": {
+          "description": "Ed25519 public key, base64url without padding, 32 bytes decoded. Public by definition, so it carries no secret and is not resolved through the secret layer.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
     },
     "WebBotAuthPublishConfig": {
       "description": "WOR-808 PR7: Open License Protocol (OLP) issuer configuration.\n\nWhen set, the proxy stands up two well-known endpoints on the origin:\n\n- `POST /.well-known/olp/token` issues a license token signed with the configured Ed25519 key, body shaped per RFC 6749 (`access_token` + `token_type: \"License\"` + `expires_in`). - `GET /.well-known/olp/key` publishes the verification JWK set (RFC 7517) so external introspectors can verify tokens without contacting the issuer per-token.\n\nWOR-805 AC#4: Web Bot Auth publish config. When enabled the proxy serves two unauthenticated well-known endpoints on this origin:\n\n* `GET /.well-known/http-message-signatures-directory`: JWKS document carrying SBproxy's own Ed25519 signing-key public key. Verifiers (Cloudflare, AWS WAF, any third-party origin that runs a Web Bot Auth verifier) fetch this to verify the `Signature-Input` + `Signature` headers SBproxy attaches to outbound requests. * `GET /.well-known/web-bot-auth/agent-card`: the discovery document that points verifiers at the directory; carries the operator-facing agent name, description, and contact URL.\n\n`public_key_hex` is the 32-byte Ed25519 public key, hex-encoded (the SECRET side never crosses this config; the signer that runs upstream of the proxy holds it). `key_id` is the `kid` the signer advertises and the directory JWK publishes.\n\nOperators who do not configure this block expose neither endpoint; requests to those paths fall through to the upstream proxy (or return 404 if no route matches).",

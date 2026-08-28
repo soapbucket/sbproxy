@@ -12,11 +12,12 @@ use sbproxy_platform::storage::KVStore;
 use smallvec::SmallVec;
 
 use crate::types::{
-    AccessLogConfig, AgentClassesConfig, AgentSkillEntry, AgentsJsonConfig, CompressionConfig,
-    CorsConfig, ErrorPageEntry, HstsConfig, IdempotencyConfig, MessageSignaturesConfig,
-    MirrorConfig, OlpConfig, OriginAttestationConfig, ProblemDetailsConfig, ProxyServerConfig,
-    ProxyStatusConfig, ProxyWasmFilterAttachment, RequestModifierConfig, ResponseCacheConfig,
-    ResponseModifierConfig, SessionConfig, UpstreamTimeouts, WebBotAuthPublishConfig,
+    AccessLogConfig, AgentClassesConfig, AgentSkillEntry, AgentsJsonConfig, CompMarketplaceConfig,
+    CompressionConfig, CorsConfig, ErrorPageEntry, HstsConfig, IdempotencyConfig,
+    MessageSignaturesConfig, MirrorConfig, OlpConfig, OriginAttestationConfig,
+    ProblemDetailsConfig, ProxyServerConfig, ProxyStatusConfig, ProxyWasmFilterAttachment,
+    RequestModifierConfig, ResponseCacheConfig, ResponseModifierConfig, SessionConfig,
+    UpstreamTimeouts, WebBotAuthPublishConfig,
 };
 
 /// Fully compiled, immutable origin ready for request processing.
@@ -125,6 +126,12 @@ pub struct CompiledOrigin {
     /// `/.well-known/olp/token` (issuance) and
     /// `/.well-known/olp/key` (JWK publication). See [`OlpConfig`].
     pub olp: Option<OlpConfig>,
+    /// WOR-2673: IAB CoMP marketplace bridge config. When `Some` with
+    /// `enabled = true`, the data-plane serves
+    /// `/.well-known/iab-comp/{manifest.json,quote,redeem}` on this
+    /// origin and mints license tokens with the same key the `olp`
+    /// block above names. See [`CompMarketplaceConfig`].
+    pub comp: Option<CompMarketplaceConfig>,
     /// WOR-805 AC#4: Web Bot Auth publish config. When `Some` with
     /// `enabled = true`, the data-plane serves
     /// `/.well-known/http-message-signatures-directory` and

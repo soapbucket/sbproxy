@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-08-27*
+*Last modified: 2026-08-28*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -1459,6 +1459,7 @@ origins:
 | `traffic_capture` | object | | Not supported. Setting it fails config load. Use `mirror` for live request mirroring. |
 | `message_signatures` | object | | RFC 9421 HTTP message signatures. |
 | `olp` | object | | RSL Open License Protocol token issuer and public-key endpoints. |
+| `comp` | object | | IAB CoMP marketplace bridge: `/.well-known/iab-comp/{manifest.json,quote,redeem}` on this origin, minting license tokens with the `olp` block's key. Requires `olp.enabled`. See [comp-marketplace.md](comp-marketplace.md). |
 | `web_bot_auth_publish` | object | | Publish a Web Bot Auth key directory and Signature Agent Card on this origin. |
 | `idempotency` | object | | `Idempotency-Key` middleware. See [Idempotency](#idempotency). |
 | `connection_pool` | object | | Only `idle_timeout_secs` is read, as the legacy spelling of `timeouts.idle_ms`. `max_connections` and `max_lifetime_secs` fail config load. See [Connection pool](#connection-pool). |

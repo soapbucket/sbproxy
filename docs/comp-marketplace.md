@@ -1,16 +1,17 @@
 # CoMP marketplace bridge
 
-*Last modified: 2026-08-27*
+*Last modified: 2026-08-28*
 
-[`sbproxy-licensing`](../crates/sbproxy-licensing) is a standalone
-crate implementing the IAB Content Authorization Marketplace Protocol
-(CoMP) v1.0: a publisher-facing manifest of licensable content tiers,
-a signed price quote, and a redeem endpoint that turns a buyer's
-signed acceptance and payment proof into a license token. It ships as
-a library plus a small axum surface (three well-known routes and an
-admin-status route), not as a `type:` you configure under `origins:`
-on an sbproxy proxy today; see [Honest limits](#honest-limits) for
-exactly what that means.
+The CoMP marketplace bridge implements the IAB Content Authorization
+Marketplace Protocol v1.0: a publisher-facing manifest of licensable
+content tiers, a signed price quote, and a redeem endpoint that turns a
+buyer's signed acceptance and payment proof into a license token.
+
+Set `origins.<host>.comp` and the proxy serves all three endpoints on
+that origin. The same code also ships as a library
+([`sbproxy-licensing`](../crates/sbproxy-licensing)) with its own axum
+router, for a publisher who wants to run the marketplace as its own
+process; see [Running it standalone](#running-it-standalone).
 
 If you already run [rsl.md](rsl.md)'s `/licenses.xml` and
 [ai-crawl-control.md](ai-crawl-control.md)'s pay-per-crawl challenge,
@@ -92,7 +93,125 @@ deployment genuinely cannot know its real expiry. An operator whose
 threat model needs restart-survival for quote expiry reaches for
 `RedisRevocation` and revokes proactively.
 
-## Quickstart
+## Configuration
+
+```yaml
+origins:
+  "api.example.com":
+    action: { type: proxy, url: "https://upstream.example.com" }
+
+    # Required. The bridge has no issuer of its own: it mints with this
+    # key, under this kid, so the token it hands a buyer verifies
+    # against this same origin's /.well-known/olp/introspect.
+    olp:
+      enabled: true
+      signing_key: "${OLP_SIGNING_KEY}"
+      key_id: 2026-q3
+      issuer: https://api.example.com
+      default_scope: ai-input
+      default_ttl_secs: 86400
+
+    comp:
+      enabled: true
+
+      # HKDF input for the quote-signing key. Takes the same reference
+      # forms as every other secret in the config: file:, vault://,
+      # secret://, and a whole-value ${VAR}. At least 32 bytes resolved.
+      master_key: "${COMP_MASTER_KEY}"
+      # Rotate by bumping this label. A new comp-<rotation_id> kid is
+      # derived and published; the previous one keeps verifying until
+      # the process restarts.
+      rotation_id: 2026-q3-001
+
+      publisher:
+        name: Example Publishing Co.
+        contact: licensing@example.com
+
+      tiers:
+        - id: tier_ai_inference
+          name: AI inference
+          description: Per-request inference access.
+          license: urn:rsl:pay-per-inference:default
+          shape: json-envelope        # html | json-envelope | bulk-archive
+          authorization: olp          # public | cap | olp
+          route_glob: "/api/v1/inference/**"
+          pricing:
+            model: per_request        # free | per_request | flat_rate
+            currency: USD
+            amount_micros: 2500
+
+      # The onboarding boundary. A redeem is refused unless its signing
+      # kid resolves here, so an empty list refuses every redeem.
+      buyer_keys:
+        - kid: buyer-acme-001
+          public_key: "hs4tRbkr8h8L5rG3xVoOEZUJ8Rk0aG3hFXhtQmiFf9E"
+```
+
+`examples/comp-marketplace/` is a runnable version of the same thing.
+
+| Key | Type | Default | Behavior |
+|---|---|---|---|
+| `enabled` | bool | `false` | Master toggle. When false the three well-known paths fall through to the origin's normal pipeline. |
+| `master_key` | secret ref | required | HKDF input for the quote-signing key. At least 32 bytes resolved; refused shorter. |
+| `rotation_id` | string | required | Label the active `comp-<rotation_id>` kid derives under. |
+| `publisher.name` | string | required | Publisher name the manifest advertises. |
+| `publisher.contact` | string | required | Licensing contact a buyer can reach a human at. |
+| `publisher.verified_at` | RFC 3339 | unset | Marketplace verification timestamp. Advisory; nothing checks it. |
+| `tiers[]` | list | required | At least one, and at least one with `authorization: olp`, since that is the only kind `redeem` can mint for. |
+| `buyer_keys[]` | list | required | `kid` plus a base64url-without-padding Ed25519 public key, 32 bytes decoded. |
+| `manifest_hash` | string | computed | `sha256:<hex>` over the manifest with the field cleared. Set it only when an out-of-band process owns the value. |
+| `allow_unknown_quotes` | bool | `false` | See [What the default refuses](#what-the-default-refuses). |
+
+The publisher domain and the three endpoint URLs are not configurable:
+they are this origin's hostname, because that is where the endpoints
+actually answer, and a second configurable value could only ever
+disagree with it.
+
+Every refusal below fires at config load, so `sbproxy validate` catches
+them on a machine that holds none of the secrets: a `comp:` block with
+no enabled `olp:` block, an empty `master_key` or `rotation_id`, an
+empty `tiers` list, a duplicate tier id, an `authorization` /
+`shape` / `pricing.model` outside its vocabulary, a `per_request` tier
+with no `amount_micros` or a `flat_rate` tier with no `amount`, a
+currency that is not three letters, an empty `buyer_keys` list, a
+duplicate kid, and a `public_key` that is not 32 base64url bytes.
+
+## What the default refuses
+
+The bridge keeps its issued-quote ledger in memory, matching the
+no-external-store rule this feature ships under. A reload or a restart
+therefore forgets every quote it signed.
+
+By default a redeem naming a `quote_id` this process never issued is
+refused with `403 {"error":"unknown_quote"}`. That costs a buyer holding
+a quote from before a restart one extra round trip: it asks for a new
+quote and redeems that. What it buys is the thing the refusal is there
+for. Without it, an onboarded buyer key plus a fabricated `quote_id`, a
+fabricated `accepted_quote_hash`, and a shape-valid payment proof mints
+a license token per call, forever, and the publisher's reconciliation
+shows no quote for the revenue.
+
+`allow_unknown_quotes: true` restores the older behavior. A deployment
+that sets it should also be running a shared revocation denylist, since
+that check is then the only durable one left.
+
+Two more refusals bound the request in time, both on the buyer's own
+`accepted_at`:
+
+- More than five minutes ahead of the bridge's clock is refused. The
+  allowance is deliberate, so a buyer whose clock runs a minute fast is
+  not refused; anything past it is refused rather than clamped.
+- Older than a whole quote validity window plus that allowance is
+  refused: no quote this bridge would still honor existed when the
+  acceptance was signed.
+- A timestamp the bridge cannot parse is refused rather than read as
+  "now". Treating an unreadable value as the current time turns a
+  bounded window into no window at all.
+
+## Running it standalone
+
+The same three endpoints, plus a `GET /admin/status`, mount as an axum
+router for a publisher who runs the marketplace as its own process:
 
 ```rust,ignore
 use std::sync::Arc;
@@ -114,10 +233,10 @@ let olp_bridge = Arc::new(OlpBridgeSigner::from_hex_seed(
 let manifest = Arc::new(/* build your CompManifest */);
 let revocation = Arc::new(InMemoryRevocation::new());
 let buyer_keys = Arc::new(InMemoryBuyerKeyRegistry::new());
-// buyer_keys.insert(kid, verifying_key) per onboarded buyer
+// buyer_keys.insert_base64url(kid, public_key)? per onboarded buyer
 
-let marketplace = Arc::new(CompMarketplace::new(keys.clone(), manifest, revocation, olp_bridge, buyer_keys));
-let app = sbproxy_licensing::router(marketplace, keys); // mounts the well-known + admin-status routes
+let marketplace = Arc::new(CompMarketplace::new(keys, manifest, revocation, olp_bridge, buyer_keys));
+let app = sbproxy_licensing::router(marketplace); // well-known + admin-status routes
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
@@ -131,9 +250,10 @@ for the exact `curl` commands.
 ## Metrics
 
 Every family carries the `sbproxy_comp_marketplace_` prefix and
-registers into the process-wide Prometheus registry, so a host that
-already scrapes `/metrics` picks these up the moment it mounts this
-crate's router.
+registers into the process-wide Prometheus registry, so `/metrics` on a
+proxy with a `comp:` block carries them. Every writer is in
+`comp/serve.rs`, which is the one body both the proxy request path and
+the standalone router call, so the counters move on either surface.
 
 | Metric | Type | Labels | What it means |
 |---|---|---|---|
@@ -148,47 +268,58 @@ draws all three plus a redeem rejection-rate stat; see
 ## Structured logging (decision events)
 
 Every quote and redeem call emits a structured `tracing::info!` event
-(module target `sbproxy_licensing::comp::router`) with `event` set to
+(module target `sbproxy_licensing::comp::serve`) with `event` set to
 `comp_quote_decision` or `comp_redeem_decision`, `outcome` set to
 `quoted` / `rejected` or `minted` / `rejected`, and either the
 resulting `quote_id` / `license` / `agent_id` on success or a `reason`
-string (the `LicensingError`'s `Display` output) on rejection. None of
-these ever log a buyer's private key or the raw license token; grep
-for the `event` field rather than parsing prose.
+string (the `LicensingError`'s `Display` output) on rejection. Grep for
+the `event` field rather than parsing prose.
+
+No license token appears in any of them, and none can be added by
+accident: `CompRedeemResponse`'s `Debug` prints `[REDACTED]` in place
+of `license_token`, so a `?response` in a tracing macro, a `dbg!`, or a
+panic message cannot leak the bearer credential either. Every
+buyer-supplied string that does reach a log line (`tier_id`,
+`quote_id`, and the rendered rejection reason) goes through the same
+control-character-stripping sanitizer the federation peer decision
+uses, so a newline in a POST body cannot forge a log record.
 
 ## Admin status
 
-`GET /admin/status` (mounted by [`router`](../crates/sbproxy-licensing/src/lib.rs))
-returns the manifest's publisher domain and tier count, the active
-CoMP signing kid, and how many CoMP kids are currently trusted for
-verification. Unauthenticated by design, matching the manifest route
-itself: everything in the response is already public in the manifest
-this process serves.
+On a proxy, `GET /admin/licensing` under the admin API lists every
+origin with a bridge configured: the publisher name and domain, the
+tier count and how many of those are OLP-redeemable, the active CoMP
+signing kid (`null` until a rotation is activated, which is when every
+quote request fails closed), how many kids still verify, the published
+manifest hash, and the three endpoint URLs. Behind the operator-auth
+gate: the manifest half is already public, but which origins have a
+bridge at all is operational state. No key material and no minted token
+appears in the response. See
+[admin-api-reference.md](admin-api-reference.md#get-adminlicensing).
+
+A console page for it is deferred to the admin console epic; the route
+is the surface today.
+
+Standalone hosts get `GET /admin/status` from
+[`router`](../crates/sbproxy-licensing/src/lib.rs) instead, with the
+same fields for the single marketplace that process serves.
+Unauthenticated by design there, matching the manifest route itself.
 
 ## Honest limits
 
-- **Not a config-driven `origins:` surface.** Unlike
-  [cap.md](cap.md) or the OLP block documented in
-  [glossary.md](glossary.md), there is no `type: comp` you set on an
-  sbproxy origin today. This crate is a library plus a small
-  standalone axum surface a host process embeds; a publisher runs it
-  either as its own process in front of (or alongside) their sbproxy
-  deployment, or mounts `sbproxy_licensing::router` into their own
-  axum app.
-- **A quote_id this process never issued still redeems.** `redeem`
-  compares `buyer_acceptance.accepted_quote_hash` against the quote the
-  ledger holds for that `quote_id`, so a buyer cannot redeem a quote it
-  altered or one that has expired. It cannot make that comparison for a
-  `quote_id` the ledger has never seen, and it admits rather than
-  refuses in that case, because the ledger is same-process and refusing
-  would break every redeem across a restart. Concretely: a key already
-  in your `BuyerKeyRegistry` can mint a license per call with a
-  fabricated `quote_id`, a fabricated `accepted_quote_hash`, and a
-  payment proof that only has to be shape-valid. Onboarding a buyer key
-  is the trust decision; quoting is not a second one. Revoke through
-  [`RedisRevocation`](../crates/sbproxy-licensing/src/revocation.rs) and
-  treat the OLP token's own audit trail as the record of what was
-  minted.
+- **The quote ledger does not survive a restart.** It is in memory, by
+  design: no Postgres, no ClickHouse, no NATS. With the default a buyer
+  holding a quote from before a reload is refused and pays one extra
+  round trip for a fresh one; with `allow_unknown_quotes: true` it is
+  admitted, and so is a fabricated id. See
+  [What the default refuses](#what-the-default-refuses). There is no
+  third option today that keeps both properties; one would need a
+  durable quote store, which is separate scope.
+- **Revocation is in-memory by default too.** A `quote_id` revoked on
+  one replica is not revoked on the others until a deployment composes
+  [`RedisRevocation`](../crates/sbproxy-licensing/src/revocation.rs)
+  over the workspace `EphemeralKv`. That is a library seam rather than
+  a config key today.
 - **Quote and redeem signatures are not JCS.** The bytes both
   signatures cover are `serde_json::to_vec` of the Rust struct, so the
   field order is the struct's declaration order rather than the sorted

@@ -3019,6 +3019,112 @@ pub(super) async fn request_filter(
         }
     }
 
+    // --- WOR-2673: IAB CoMP marketplace bridge ---
+    //
+    // When the origin opts in (`comp.enabled: true`), serve the three
+    // CoMP 1.0 well-known endpoints:
+    //
+    // * `GET  /.well-known/iab-comp/manifest.json` -> the signed
+    //   licensing catalog: publisher identity, tiers, prices, and the
+    //   URLs of the other two endpoints.
+    // * `POST /.well-known/iab-comp/quote` -> a signed price for a
+    //   named tier and a requested volume.
+    // * `POST /.well-known/iab-comp/redeem` -> a buyer's signed, paid
+    //   acceptance of a quote, exchanged for an OLP license token this
+    //   origin's own `/.well-known/olp/introspect` verifies.
+    //
+    // Every response body, header, metric, and decision-event line
+    // comes from `sbproxy_licensing::comp::serve`, the same three
+    // functions the crate's own axum router calls. Hand-rolling the
+    // bodies here is what left every `sbproxy_federation_*` family flat
+    // on this binary once already.
+    //
+    // An origin with no `comp:` block falls through to the normal
+    // pipeline rather than 404ing the path, because `/.well-known/` is
+    // a shared namespace and an upstream may serve its own document
+    // there.
+    {
+        let req_path = session.req_header().uri.path().to_string();
+        let is_comp_path = req_path == crate::pipeline::COMP_MANIFEST_PATH
+            || req_path == crate::pipeline::COMP_QUOTE_PATH
+            || req_path == crate::pipeline::COMP_REDEEM_PATH;
+        if is_comp_path {
+            if let Some(marketplace) = pipeline
+                .comp_marketplaces
+                .get(origin_idx)
+                .and_then(Option::as_ref)
+            {
+                let method = session.req_header().method.clone();
+                let expected = if req_path == crate::pipeline::COMP_MANIFEST_PATH {
+                    http::Method::GET
+                } else {
+                    http::Method::POST
+                };
+                if method != expected {
+                    send_error(session, 405, "method not allowed").await?;
+                    ctx.response_status = Some(405);
+                    return Ok(true);
+                }
+                let rendered = if req_path == crate::pipeline::COMP_MANIFEST_PATH {
+                    sbproxy_licensing::comp::serve_manifest(marketplace)
+                } else {
+                    // Bounded read. An unauthenticated caller must not
+                    // be able to make the process buffer, and a CoMP
+                    // body is a few hundred bytes of JSON. Past the cap
+                    // the request is refused rather than truncated:
+                    // truncation would turn an oversize body into a
+                    // `malformed` decision line, which reads in the
+                    // audit trail like a buyer with a broken client
+                    // rather than one sending 64 KiB.
+                    let mut buffer: Vec<u8> = Vec::new();
+                    let mut oversize = false;
+                    while let Some(chunk) = session.read_request_body().await? {
+                        if buffer.len() + chunk.len()
+                            > sbproxy_licensing::comp::COMP_REQUEST_BODY_LIMIT
+                        {
+                            oversize = true;
+                            break;
+                        }
+                        buffer.extend_from_slice(&chunk);
+                    }
+                    if oversize {
+                        send_response(
+                            session,
+                            413,
+                            "application/json",
+                            br#"{"error":"body_too_large"}"#,
+                        )
+                        .await?;
+                        ctx.response_status = Some(413);
+                        return Ok(true);
+                    }
+                    if req_path == crate::pipeline::COMP_QUOTE_PATH {
+                        sbproxy_licensing::comp::serve_quote(marketplace, &buffer)
+                    } else {
+                        sbproxy_licensing::comp::serve_redeem(marketplace, &buffer).await
+                    }
+                };
+                let mut headers = vec![(
+                    "cache-control".to_string(),
+                    rendered.cache_control.to_string(),
+                )];
+                if let Some(version) = rendered.comp_version {
+                    headers.push(("x-comp-version".to_string(), version.to_string()));
+                }
+                send_response_with_headers(
+                    session,
+                    rendered.status,
+                    rendered.content_type,
+                    &rendered.body,
+                    &headers,
+                )
+                .await?;
+                ctx.response_status = Some(rendered.status);
+                return Ok(true);
+            }
+        }
+    }
+
     // --- WOR-805 AC#4 wire: Web Bot Auth publish well-known ---
     //
     // When the origin opts in (`web_bot_auth_publish.enabled: true`),
@@ -6219,7 +6325,7 @@ async fn send_response_with_headers(
 /// `signing_key` string. PR1 accepts a 64-char lowercase hex string;
 /// the secret-resolver pass at config-load time substitutes any
 /// `vault://` reference into the raw bytes upstream of this point.
-fn decode_ed25519_seed(s: &str) -> Result<[u8; 32], String> {
+pub(crate) fn decode_ed25519_seed(s: &str) -> Result<[u8; 32], String> {
     let trimmed = s.trim();
     if trimmed.len() != 64 {
         return Err(format!(

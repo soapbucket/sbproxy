@@ -1,6 +1,6 @@
 # Admin API reference
 
-*Last modified: 2026-08-27*
+*Last modified: 2026-08-28*
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
@@ -3255,6 +3255,7 @@ model-host artifact cache above:
 | POST | `/admin/cache/key-policy/evict` | Drop one (or all) cached key policies so the next request re-reads the keystore. |
 | GET | `/admin/cache/semantic` | Recent semantic (embedding) cache lookup decisions per AI origin. |
 | GET | `/admin/federation` | OpenID Federation identity this proxy publishes, and what it requires of a peer. |
+| GET | `/admin/licensing` | CoMP marketplace bridges: what each configured origin publishes and which quote-signing key is live. |
 | GET | `/admin/mcp-oauth` | Every colocated MCP OAuth broker this proxy runs, and what each has wired in. |
 
 ### `GET /admin/cache`
@@ -3353,6 +3354,60 @@ the well-known route from the request path and never mounts that crate's
 router. An admin console page for it is separate scope, under the admin
 console epic; the JSON here is the operator surface today. See
 [federation.md](federation.md).
+
+### `GET /admin/licensing`
+
+CoMP marketplace bridges. Returns `{"enabled": false, "origins": []}`
+when no origin sets `comp`, so a poll can tell "off" from a typo in the
+path. Both `admin` and `read_only` operators may call it.
+
+```json
+{
+  "enabled": true,
+  "origins": [
+    {
+      "hostname": "api.example.com",
+      "publisher_domain": "api.example.com",
+      "publisher_name": "Example Publishing Co.",
+      "tier_count": 3,
+      "olp_tier_count": 1,
+      "active_signing_kid": "comp-2026-q3-001",
+      "trusted_kid_count": 1,
+      "manifest_hash": "sha256:9f2c...",
+      "generated_at": "2026-08-28T07:41:02Z",
+      "endpoints": {
+        "manifest": "https://api.example.com/.well-known/iab-comp/manifest.json",
+        "quote": "https://api.example.com/.well-known/iab-comp/quote",
+        "redeem": "https://api.example.com/.well-known/iab-comp/redeem"
+      }
+    }
+  ]
+}
+```
+
+Two fields are worth polling. `active_signing_kid` is `null` until a
+rotation has been activated, and every quote request fails closed until
+it is, so a null here explains an endpoint answering nothing but
+rejections. `olp_tier_count` is how many of `tier_count` a buyer can
+actually redeem for a license token: the difference is the `cap` and
+`public` tiers, which the manifest advertises and `redeem` cannot mint
+for. A catalog of twelve tiers with one redeem a day reads differently
+once you know eleven of them were never redeemable.
+
+`generated_at` and `manifest_hash` are stamped when the pipeline built
+the manifest, so they move on a config reload and not otherwise. No key
+material appears here, and no token this bridge has minted is retained
+anywhere this route can read.
+
+Behind operator auth for the same reason
+[`GET /admin/federation`](#get-adminfederation) is: sbproxy serves the
+CoMP well-known endpoints from the request path and never mounts the
+licensing crate's own axum router, so that crate's unauthenticated
+`GET /admin/status` never answers here. The manifest half of this
+response is already public; which origins have a bridge configured at
+all is not. An admin console page for it is separate scope, under the
+admin console epic; the JSON here is the operator surface today. See
+[comp-marketplace.md](comp-marketplace.md).
 
 ### `GET /admin/mcp-oauth`
 

@@ -27,6 +27,7 @@ pub mod admin_federation;
 /// WOR-1553/1554: key + credential lifecycle REST API mounted on the
 /// admin server (`/admin/keys`, `/admin/credentials`).
 pub mod admin_keys;
+pub mod admin_licensing;
 pub mod admin_mcp_oauth;
 /// Attested-metering operator surface (`/api/meter/*`), WOR-2131: units
 /// with their provenance, the mesh coverage a total was assembled from,

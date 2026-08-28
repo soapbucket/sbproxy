@@ -35,6 +35,16 @@ use super::types::{
 /// Maximum quote validity window. One hour.
 pub const COMP_QUOTE_VALIDITY_SECS: u64 = 3600;
 
+/// How far ahead of this bridge's clock a buyer's `accepted_at` may
+/// sit before the acceptance is refused.
+///
+/// Five minutes, the same allowance JWT verifiers conventionally give
+/// `nbf` and `iat`, and for the same reason: a buyer whose clock runs a
+/// minute fast is a normal deployment, not an attack. Anything past the
+/// window is refused rather than clamped, because the whole point of
+/// reading the field is that it bounds when the acceptance was made.
+pub const COMP_ACCEPTANCE_SKEW_SECS: u64 = 300;
+
 // --- Buyer-key registry ---
 
 /// Resolves a buyer kid to a verifying key for redeem-time signature
@@ -72,6 +82,48 @@ impl InMemoryBuyerKeyRegistry {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(kid.into(), key);
+    }
+
+    /// Register a buyer key from its base64url-without-padding
+    /// encoding, the form `origins.<host>.comp.buyer_keys[].public_key`
+    /// carries.
+    ///
+    /// Exists so a host that only has the config string does not have
+    /// to take its own `ed25519-dalek` dependency to hand this registry
+    /// a key. Every refusal an operator can cause is a typed error
+    /// here: the wrong alphabet, the wrong length, and a 32-byte value
+    /// that is not a point on the curve are three different mistakes
+    /// and read as three different messages.
+    ///
+    /// # Errors
+    ///
+    /// [`LicensingError::Malformed`] when the value is not
+    /// base64url-without-padding, does not decode to 32 bytes, or is
+    /// not a valid Ed25519 public key.
+    pub fn insert_base64url(
+        &self,
+        kid: impl Into<String>,
+        public_key: &str,
+    ) -> Result<(), LicensingError> {
+        let kid = kid.into();
+        let decoded = B64URL.decode(public_key.trim()).map_err(|error| {
+            LicensingError::Malformed(format!(
+                "buyer key '{kid}' is not base64url without padding: {error}"
+            ))
+        })?;
+        let bytes: [u8; 32] = decoded.as_slice().try_into().map_err(|_| {
+            LicensingError::Malformed(format!(
+                "buyer key '{kid}' decoded to {} bytes; an Ed25519 public key is 32",
+                decoded.len()
+            ))
+        })?;
+        let key = VerifyingKey::from_bytes(&bytes).map_err(|error| {
+            LicensingError::Malformed(format!(
+                "buyer key '{kid}' is not a valid Ed25519 point: {error}"
+            ))
+        })?;
+        self.insert(kid, key);
+        Ok(())
     }
 }
 
@@ -113,6 +165,21 @@ pub struct CompMarketplace {
     /// `retain`, so reading a map that survived another thread's panic
     /// is strictly better than refusing every redeem from here on.
     issued_quotes: std::sync::Mutex<HashMap<String, IssuedQuote>>,
+    /// Whether a redeem for a `quote_id` this process never issued is
+    /// honored (WOR-2673).
+    ///
+    /// `false` by default, which is the fail-closed reading: an
+    /// onboarded buyer key plus a fabricated id would otherwise mint a
+    /// token per call with no quote and no price behind it, and the
+    /// publisher's reconciliation would show no quote for the revenue.
+    ///
+    /// The cost of the default is real and worth stating: the ledger is
+    /// in memory, so a restart forgets every quote this bridge signed,
+    /// and a buyer holding a quote from thirty seconds ago is refused.
+    /// A single long-lived bridge that would rather absorb the
+    /// fabrication risk than the restart refusals sets this true; see
+    /// `origins.<host>.comp.allow_unknown_quotes`.
+    allow_unknown_quotes: bool,
 }
 
 /// How long an expired quote stays in the ledger as a tombstone.
@@ -177,12 +244,49 @@ impl CompMarketplace {
             olp_bridge,
             buyer_keys,
             issued_quotes: std::sync::Mutex::new(HashMap::new()),
+            allow_unknown_quotes: false,
         }
+    }
+
+    /// Honor a redeem whose `quote_id` this process never issued.
+    ///
+    /// The opt-out from the fail-closed default. What it buys: a buyer
+    /// holding a quote this bridge signed before a reload is honored
+    /// rather than refused, since the ledger is in memory and a reload
+    /// forgets it. What it costs: an onboarded buyer key plus a
+    /// fabricated `quote_id`, a fabricated `accepted_quote_hash`, and a
+    /// shape-valid payment proof then mints a license token per call
+    /// with no quote and no price behind it. A deployment that reaches for this should also be running
+    /// [`crate::revocation::RedisRevocation`], since the revocation
+    /// check is then the only durable thing standing between a
+    /// fabricated id and a token.
+    #[must_use]
+    pub fn allowing_unknown_quotes(mut self) -> Self {
+        self.allow_unknown_quotes = true;
+        self
     }
 
     /// The pinned manifest. Cloned cheaply via `Arc`.
     pub fn manifest(&self) -> Arc<CompManifest> {
         Arc::clone(&self.manifest)
+    }
+
+    /// The kid quotes are currently signed under, or `None` when no
+    /// rotation has been activated (every quote request fails closed
+    /// until one is).
+    ///
+    /// A read-only projection rather than an accessor for the
+    /// [`KeyManager`] itself: the manager can sign, and an operator
+    /// surface that only needs to answer "which key is live" should
+    /// not be handed the thing that mints signatures.
+    pub fn active_signing_kid(&self) -> Option<String> {
+        self.keys.active_kid()
+    }
+
+    /// How many CoMP kids currently verify: the active one plus any
+    /// rotation-window keys still trusted.
+    pub fn trusted_kid_count(&self) -> usize {
+        self.keys.jwks().len()
     }
 
     // --- Quote ---
@@ -297,30 +401,63 @@ impl CompMarketplace {
         }
 
         let now = unix_now();
+        // The acceptance's own timestamp, checked before the ledger so
+        // the refusal is the same whether or not this process still
+        // holds the quote. Unparseable is a refusal rather than a
+        // fallback to `now`: reading a value this bridge cannot read as
+        // the current time turns a bounded window into no window.
+        let accepted_at =
+            parse_rfc3339_to_unix(&request.buyer_acceptance.accepted_at).ok_or_else(|| {
+                LicensingError::Malformed(
+                    "buyer_acceptance.accepted_at is not an RFC 3339 timestamp".to_string(),
+                )
+            })?;
+        if accepted_at > now.saturating_add(COMP_ACCEPTANCE_SKEW_SECS) {
+            return Err(LicensingError::Expired {
+                exp: now.saturating_add(COMP_ACCEPTANCE_SKEW_SECS),
+                now: accepted_at,
+            });
+        }
+        // An acceptance older than a quote's whole validity window
+        // cannot be an acceptance of a live quote: no quote this bridge
+        // would still honor existed when it was signed.
+        if accepted_at < now.saturating_sub(COMP_QUOTE_VALIDITY_SECS + COMP_ACCEPTANCE_SKEW_SECS) {
+            return Err(LicensingError::Expired {
+                exp: accepted_at,
+                now,
+            });
+        }
+
         let issued = self
             .issued_quotes
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(&request.quote_id)
             .cloned();
-        if let Some(issued) = issued {
-            if issued.valid_until <= now {
-                return Err(LicensingError::Expired {
-                    exp: issued.valid_until,
-                    now,
-                });
+        match issued {
+            Some(issued) => {
+                if issued.valid_until <= now {
+                    return Err(LicensingError::Expired {
+                        exp: issued.valid_until,
+                        now,
+                    });
+                }
+                // Bind the redeem to the quote. Without this the whole
+                // request reduces to a syntactically valid body with a
+                // fabricated quote_id and a fabricated hash, redeemable
+                // on a loop by any onboarded buyer key.
+                if request.buyer_acceptance.accepted_quote_hash != issued.quote_hash {
+                    return Err(LicensingError::Malformed(
+                        "buyer_acceptance.accepted_quote_hash does not match the quote this \
+                         publisher issued for that quote_id"
+                            .to_string(),
+                    ));
+                }
             }
-            // Bind the redeem to the quote. Without this the whole
-            // request reduces to a syntactically valid body with a
-            // fabricated quote_id and a fabricated hash, redeemable on
-            // a loop by any onboarded buyer key.
-            if request.buyer_acceptance.accepted_quote_hash != issued.quote_hash {
-                return Err(LicensingError::Malformed(
-                    "buyer_acceptance.accepted_quote_hash does not match the quote this \
-                     publisher issued for that quote_id"
-                        .to_string(),
-                ));
+            None if !self.allow_unknown_quotes => {
+                return Err(LicensingError::UnknownQuote(request.quote_id.clone()));
             }
+            None => {}
         }
 
         verify_payment_proof(&request.payment_proof)?;
@@ -511,6 +648,121 @@ fn format_rfc3339(unix: u64) -> String {
     format!("{y:04}-{mo:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
+/// Parse a strict RFC 3339 timestamp into unix seconds.
+///
+/// Accepts `YYYY-MM-DDTHH:MM:SS` with an optional fractional-second
+/// part, followed by `Z`, `z`, or a `+HH:MM` / `-HH:MM` offset. `T` may
+/// be lowercase or a space, which RFC 3339 s5.6 permits.
+///
+/// Hand-rolled for the same reason [`format_rfc3339`] is: this crate
+/// carries no `chrono`, and a date library is a large dependency for
+/// one field. Deliberately strict rather than lenient. Every shape it
+/// does not accept is answered with a refusal by the one caller, so a
+/// parser that guessed would be a parser that let a bad timestamp
+/// through, which is the failure this check exists to prevent.
+///
+/// Returns `None` for anything it cannot read exactly, including
+/// out-of-range month, day, hour, minute, or second values and any
+/// timestamp before the unix epoch.
+fn parse_rfc3339_to_unix(value: &str) -> Option<u64> {
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    if bytes.len() < 19 {
+        return None;
+    }
+    let digits = |range: std::ops::Range<usize>| -> Option<i64> {
+        let slice = value.get(range)?;
+        if !slice.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        slice.parse::<i64>().ok()
+    };
+    if bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+    if !matches!(bytes[10], b'T' | b't' | b' ') {
+        return None;
+    }
+    if bytes[13] != b':' || bytes[16] != b':' {
+        return None;
+    }
+    let year = digits(0..4)?;
+    let month = digits(5..7)?;
+    let day = digits(8..10)?;
+    let hour = digits(11..13)?;
+    let minute = digits(14..16)?;
+    let second = digits(17..19)?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    // 60 for a leap second, which RFC 3339 s5.7 allows; it lands on the
+    // following minute, which is close enough for a skew window.
+    if hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+
+    let mut rest = value.get(19..)?;
+    if let Some(stripped) = rest.strip_prefix('.') {
+        let fraction_len = stripped.bytes().take_while(u8::is_ascii_digit).count();
+        if fraction_len == 0 {
+            return None;
+        }
+        rest = stripped.get(fraction_len..)?;
+    }
+    let offset_secs: i64 = match rest.as_bytes() {
+        [b'Z'] | [b'z'] => 0,
+        [sign @ (b'+' | b'-'), rest_bytes @ ..] if rest_bytes.len() == 5 => {
+            let text = std::str::from_utf8(rest_bytes).ok()?;
+            if text.as_bytes()[2] != b':' {
+                return None;
+            }
+            let hours: i64 = text.get(0..2)?.parse().ok()?;
+            let minutes: i64 = text.get(3..5)?.parse().ok()?;
+            if hours > 23 || minutes > 59 {
+                return None;
+            }
+            let magnitude = hours * 3600 + minutes * 60;
+            if *sign == b'+' {
+                magnitude
+            } else {
+                -magnitude
+            }
+        }
+        _ => return None,
+    };
+
+    let days = ymd_to_days(year, month as u32, day as u32)?;
+    let seconds = days
+        .checked_mul(86_400)?
+        .checked_add(hour * 3600 + minute * 60 + second)?
+        .checked_sub(offset_secs)?;
+    u64::try_from(seconds).ok()
+}
+
+/// Days since the unix epoch for a proleptic Gregorian date. The
+/// inverse of [`days_to_ymd`], and it rejects a day past the month's
+/// real length so `2026-02-30` is refused rather than rolled forward.
+fn ymd_to_days(year: i64, month: u32, day: u32) -> Option<i64> {
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let month_length = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if day == 0 || day > month_length {
+        return None;
+    }
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 } as i64;
+    let doy = (153 * mp + 2) / 5 + day as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468)
+}
+
 fn days_to_ymd(mut days: i64) -> (i32, u32, u32) {
     days += 719_468;
     let era = days.div_euclid(146_097);
@@ -602,6 +854,38 @@ mod tests {
         (mp, buyer_keys, buyer_signing)
     }
 
+    /// The same marketplace with the restart-survival opt-out on.
+    fn build_marketplace_allowing_unknown_quotes() -> (
+        Arc<CompMarketplace>,
+        Arc<InMemoryBuyerKeyRegistry>,
+        SigningKey,
+    ) {
+        let mgr = KeyManager::new(MasterKey::new(vec![0x33u8; 32]).unwrap());
+        mgr.set_active("2026-q2-001").unwrap();
+        let bridge = Arc::new(OlpBridgeSigner::new(
+            [0x44u8; 32],
+            "olp-2026-q2-001",
+            "https://api.example.com",
+            "ai-input",
+            3600,
+        ));
+        let revocation: Arc<dyn Revocation> = Arc::new(InMemoryRevocation::new());
+        let buyer_keys = Arc::new(InMemoryBuyerKeyRegistry::new());
+        let buyer_signing = SigningKey::from_bytes(&[0x55u8; 32]);
+        buyer_keys.insert("buyer-1", buyer_signing.verifying_key());
+        let mp = Arc::new(
+            CompMarketplace::new(
+                mgr,
+                build_manifest(),
+                revocation,
+                bridge,
+                buyer_keys.clone(),
+            )
+            .allowing_unknown_quotes(),
+        );
+        (mp, buyer_keys, buyer_signing)
+    }
+
     fn quote_request() -> CompQuoteRequest {
         CompQuoteRequest {
             comp_version: COMP_VERSION.into(),
@@ -645,7 +929,11 @@ mod tests {
             },
             buyer_acceptance: CompAcceptance {
                 accepted_quote_hash: accepted_quote_hash.into(),
-                accepted_at: "2026-05-02T14:35:00Z".into(),
+                // Stamped from the clock rather than frozen. A frozen
+                // date would have gone stale the moment the acceptance
+                // freshness window landed, and every redeem test would
+                // then be passing or failing for the wrong reason.
+                accepted_at: format_rfc3339(unix_now()),
                 buyer_legal_entity: "Acme AI Inc.".into(),
             },
             payment_proof: CompPaymentProof {
@@ -659,6 +947,138 @@ mod tests {
         let sig = signer.sign(&signing_input);
         req.buyer_signature.value = B64URL.encode(sig.to_bytes());
         req
+    }
+
+    /// WOR-2673 fail-closed: an acceptance stamped in the future.
+    ///
+    /// `accepted_at` is the buyer's own attestation of when it agreed
+    /// to the price, and it is the only timestamp in the redeem body.
+    /// Unchecked, a buyer with one onboarded key can stamp an
+    /// acceptance years ahead and keep the same body redeemable past
+    /// every window this bridge has, because nothing else in the
+    /// request goes stale.
+    #[tokio::test]
+    async fn an_acceptance_stamped_in_the_future_is_refused() {
+        let (mp, _, signer) = build_marketplace();
+        let quote = mp.quote(quote_request()).unwrap();
+        let hash = quote_hash(&canonical_quote_signing_input(&quote).unwrap());
+        let mut redeem = build_redeem_with_hash(quote.quote_id.clone(), &hash, &signer);
+        redeem.buyer_acceptance.accepted_at = format_rfc3339(unix_now() + 86_400);
+        resign(&mut redeem, &signer);
+        let error = mp
+            .redeem(redeem)
+            .await
+            .expect_err("an acceptance a day ahead of this clock must be refused");
+        assert!(
+            matches!(error, LicensingError::Expired { .. }),
+            "got {error:?}"
+        );
+    }
+
+    /// A small skew allowance is deliberate, so a buyer whose clock
+    /// runs a minute fast is not refused. The window is bounded.
+    #[tokio::test]
+    async fn an_acceptance_inside_the_skew_allowance_still_redeems() {
+        let (mp, _, signer) = build_marketplace();
+        let quote = mp.quote(quote_request()).unwrap();
+        let hash = quote_hash(&canonical_quote_signing_input(&quote).unwrap());
+        let mut redeem = build_redeem_with_hash(quote.quote_id.clone(), &hash, &signer);
+        redeem.buyer_acceptance.accepted_at =
+            format_rfc3339(unix_now() + COMP_ACCEPTANCE_SKEW_SECS / 2);
+        resign(&mut redeem, &signer);
+        mp.redeem(redeem)
+            .await
+            .expect("a clock a couple of minutes fast is not an attack");
+    }
+
+    /// An acceptance older than the quote's own validity window cannot
+    /// be an acceptance of that quote: the quote did not exist yet.
+    #[tokio::test]
+    async fn an_acceptance_older_than_the_quote_window_is_refused() {
+        let (mp, _, signer) = build_marketplace();
+        let quote = mp.quote(quote_request()).unwrap();
+        let hash = quote_hash(&canonical_quote_signing_input(&quote).unwrap());
+        let mut redeem = build_redeem_with_hash(quote.quote_id.clone(), &hash, &signer);
+        redeem.buyer_acceptance.accepted_at =
+            format_rfc3339(unix_now() - COMP_QUOTE_VALIDITY_SECS - 3_600);
+        resign(&mut redeem, &signer);
+        let error = mp
+            .redeem(redeem)
+            .await
+            .expect_err("an acceptance predating the quote must be refused");
+        assert!(
+            matches!(error, LicensingError::Expired { .. }),
+            "got {error:?}"
+        );
+    }
+
+    /// A timestamp this bridge cannot read is refused rather than
+    /// treated as "now". Reading an unparseable value as the current
+    /// time is what turns a strict window into no window at all.
+    #[tokio::test]
+    async fn an_unparseable_acceptance_timestamp_is_refused() {
+        let (mp, _, signer) = build_marketplace();
+        let quote = mp.quote(quote_request()).unwrap();
+        let hash = quote_hash(&canonical_quote_signing_input(&quote).unwrap());
+        for stamp in ["", "yesterday", "2026-05-02", "2026-13-02T14:35:00Z"] {
+            let mut redeem = build_redeem_with_hash(quote.quote_id.clone(), &hash, &signer);
+            redeem.buyer_acceptance.accepted_at = stamp.to_string();
+            resign(&mut redeem, &signer);
+            let error = mp
+                .redeem(redeem)
+                .await
+                .expect_err("an unreadable timestamp must be refused");
+            assert!(
+                matches!(error, LicensingError::Malformed(_)),
+                "'{stamp}' got {error:?}"
+            );
+        }
+    }
+
+    /// WOR-2673 fail-closed: a `quote_id` this process never issued.
+    ///
+    /// The ledger lives in memory, so a restart forgets every quote it
+    /// signed. Accepting an unknown id was the restart-survival answer,
+    /// and it is also a hole a buyer can drive through: an onboarded
+    /// key plus a fabricated id mints a token per call with no quote
+    /// and no price behind it. Refusing is the default; an operator who
+    /// runs one long-lived bridge and would rather lose the refusal
+    /// than the in-flight quotes sets `allow_unknown_quotes`.
+    #[tokio::test]
+    async fn a_quote_id_this_process_never_issued_is_refused_by_default() {
+        let (mp, _, signer) = build_marketplace();
+        let redeem = build_redeem("01JQFABRICATEDQUOTEID000000".to_string(), &signer);
+        let error = mp
+            .redeem(redeem)
+            .await
+            .expect_err("a fabricated quote_id must not mint a token");
+        assert!(
+            matches!(error, LicensingError::UnknownQuote(_)),
+            "got {error:?}"
+        );
+    }
+
+    /// The opt-out, for a deployment that would rather honor quotes it
+    /// issued before a restart. Same test, opposite expectation, so the
+    /// switch cannot silently stop switching anything.
+    #[tokio::test]
+    async fn allow_unknown_quotes_restores_the_restart_survival_behavior() {
+        let (mp, _, signer) = build_marketplace_allowing_unknown_quotes();
+        let redeem = build_redeem("01JQFABRICATEDQUOTEID000000".to_string(), &signer);
+        mp.redeem(redeem)
+            .await
+            .expect("the opt-out honors a quote_id this process does not hold");
+    }
+
+    /// Re-sign a redeem after mutating it, so the buyer signature still
+    /// covers the body under test. Without this every mutation above
+    /// would be refused as `SignatureInvalid` and prove nothing about
+    /// the check it is aimed at.
+    fn resign(request: &mut CompRedeemRequest, signer: &SigningKey) {
+        request.buyer_signature.value = String::new();
+        let signing_input = canonical_redeem_signing_input(request).unwrap();
+        let sig = signer.sign(&signing_input);
+        request.buyer_signature.value = B64URL.encode(sig.to_bytes());
     }
 
     #[test]
@@ -789,15 +1209,84 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn redeem_allows_quote_unknown_to_this_process() {
-        // A quote_id the in-process ledger never saw (e.g. minted
-        // before a restart) is not rejected on expiry grounds alone;
-        // this crate's no-external-store default cannot know its
-        // real expiry, so it falls through to the other redeem
-        // checks rather than failing closed on missing bookkeeping.
-        let (mp, _, signer) = build_marketplace();
+    async fn redeem_allows_quote_unknown_to_this_process_when_opted_in() {
+        // A quote_id the in-process ledger never saw (minted before a
+        // restart, say) falls through to the other redeem checks
+        // rather than failing closed on missing bookkeeping. That was
+        // the unconditional behavior until WOR-2673 wired this bridge
+        // into the proxy, where an onboarded buyer key plus a
+        // fabricated id minted a token per call with no quote behind
+        // it. It is now what `allow_unknown_quotes` buys, and the
+        // property it protects (a buyer holding a real quote across a
+        // restart is not refused) is unchanged where it is on.
+        let (mp, _, signer) = build_marketplace_allowing_unknown_quotes();
         let redeem = build_redeem("01JUNKNOWNQUOTEID000000000".into(), &signer);
         let res = mp.redeem(redeem).await.unwrap();
         assert_eq!(res.token_type, "Bearer");
+    }
+
+    /// The parser the acceptance window depends on, at its edges. A
+    /// lenient parser here would quietly widen every refusal above.
+    #[test]
+    fn the_rfc3339_parser_reads_exactly_what_it_claims_to() {
+        assert_eq!(parse_rfc3339_to_unix("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            parse_rfc3339_to_unix("2026-05-02T14:35:00Z"),
+            Some(1_777_732_500)
+        );
+        // Offsets move the instant, they do not decorate it.
+        assert_eq!(
+            parse_rfc3339_to_unix("2026-05-02T16:35:00+02:00"),
+            Some(1_777_732_500)
+        );
+        assert_eq!(
+            parse_rfc3339_to_unix("2026-05-02T12:35:00-02:00"),
+            Some(1_777_732_500)
+        );
+        // Fractional seconds are accepted and truncated.
+        assert_eq!(
+            parse_rfc3339_to_unix("2026-05-02T14:35:00.250Z"),
+            Some(1_777_732_500)
+        );
+        // A lowercase separator and a lowercase zone, both RFC 3339 5.6.
+        assert_eq!(
+            parse_rfc3339_to_unix("2026-05-02t14:35:00z"),
+            Some(1_777_732_500)
+        );
+        for bad in [
+            "",
+            "2026-05-02",
+            "2026-05-02T14:35Z",
+            "2026-13-02T14:35:00Z",
+            "2026-02-30T14:35:00Z",
+            "2026-05-02T24:00:00Z",
+            "2026-05-02T14:35:00",
+            "2026-05-02T14:35:00+0200",
+            "2026-05-02T14:35:00.Z",
+            "not a timestamp at all",
+            "1969-12-31T23:59:59Z",
+        ] {
+            assert_eq!(parse_rfc3339_to_unix(bad), None, "'{bad}' must not parse");
+        }
+    }
+
+    /// A minted token is a bearer credential. Its `Debug` must not
+    /// carry it, or a `dbg!`, a panic message, or a `?response` in a
+    /// tracing macro hands it to every reader of the log.
+    #[tokio::test]
+    async fn a_minted_response_does_not_print_its_token() {
+        let (mp, _, signer) = build_marketplace();
+        let quote = mp.quote(quote_request()).unwrap();
+        let redeem = build_redeem_for(&quote, &signer);
+        let response = mp.redeem(redeem).await.unwrap();
+        let rendered = format!("{response:?}");
+        assert!(
+            !rendered.contains(&response.license_token),
+            "the token must not appear in Debug output: {rendered}"
+        );
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+        // The fields an operator reconciles against are still there.
+        assert!(rendered.contains(&response.agent_id), "{rendered}");
+        assert!(rendered.contains(&response.license), "{rendered}");
     }
 }

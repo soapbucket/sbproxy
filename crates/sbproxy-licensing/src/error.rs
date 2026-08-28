@@ -50,6 +50,17 @@ pub enum LicensingError {
     #[error("unknown tier_id: {0}")]
     UnknownTier(String),
 
+    /// A redeem named a `quote_id` this process never issued.
+    ///
+    /// Its own variant rather than [`Self::Expired`]: an expired quote
+    /// is one this bridge signed and can name a `valid_until` for,
+    /// while an unknown one is a claim about a quote nothing here has
+    /// ever seen. They map to the same 403 but they are different
+    /// operator problems, and only one of them means someone is
+    /// fabricating quote ids.
+    #[error("unknown quote_id: {0}")]
+    UnknownQuote(String),
+
     /// A time-bounded object (a CoMP quote) is being redeemed after
     /// its `valid_until` has passed.
     #[error("expired (exp={exp}, now={now})")]
