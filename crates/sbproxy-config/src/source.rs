@@ -1801,10 +1801,20 @@ fn warn_unconfined_host_reference(
         &crate::confined_template::ConfinementPolicy::remote_document(),
     )
     .err()?;
-    // Only the two host-reaching refusals are worth a warning here. A
-    // YAML tag or a parse failure is the compiler's business and is
-    // reported by the compile that follows, and no other variant can
-    // occur under `remote_document`.
+    // Every host-reaching refusal warns; the two that do not are the
+    // compile's business and are reported by the compile that follows
+    // (`Parse` is a malformed document, `YamlTag` is a tag the compiler
+    // refuses on every path). No other variant can occur under
+    // `remote_document`, which grants `${VAR}` and the operator's own
+    // declared secret backends.
+    //
+    // `HostReachingDefault` was missing here for one round, which made
+    // the default path silent on the exact spelling the same round
+    // closed: `refuse_host_reaching_default` runs *before*
+    // `refuse_host_secret_reference` on a string, so
+    // `api_key: "${SB_NOPE:-env:AWS_SECRET_ACCESS_KEY}"` produced this
+    // variant and nothing else, and this function answered `None`
+    // (WOR-2433 re-review round 4).
     let summary = match &refusal {
         crate::confined_template::ConfinedTemplateError::HostSecretReference {
             path, form, ..
@@ -1818,6 +1828,14 @@ fn warn_unconfined_host_reference(
                 crate::extensions::sanitize_detail(path)
             )
         }
+        crate::confined_template::ConfinedTemplateError::HostReachingDefault {
+            path, form, ..
+        } => format!(
+            "`{}` writes a `${{VAR:-default}}` whose default is {form}",
+            crate::extensions::sanitize_detail(path)
+        ),
+        crate::confined_template::ConfinedTemplateError::Parse { .. }
+        | crate::confined_template::ConfinedTemplateError::YamlTag { .. } => return None,
         _ => return None,
     };
     if !first_report_of(&label, &summary) {
@@ -2300,6 +2318,50 @@ mod tests {
         assert!(
             !summary.contains("/etc/sbproxy/x.rego"),
             "the warning echoed the path: {summary}"
+        );
+    }
+
+    /// WOR-2433 re-review round 4, New 2. `confine` defaults to off, and
+    /// the docs say the warning "is the answer to what would
+    /// `confine: true` refuse if I turned it on". For a document that
+    /// reaches the host through a `${VAR:-default}` it was not: the walk
+    /// produced `HostReachingDefault`, this function rendered two
+    /// variants and returned `None` for everything else, and
+    /// `first_check_of_revision` then cached the silence for the life of
+    /// the process at that commit.
+    #[test]
+    fn an_unconfined_source_reaching_for_this_host_through_a_default_warns() {
+        let spec = GitSpec {
+            repo: "https://github.com/acme/warn-default.git",
+            revision: None,
+            path: "sb.yml",
+            credential: None,
+            verify_signature: false,
+            timeout: Duration::from_secs(60),
+        };
+
+        let (_, summary) = warn_unconfined_host_reference(
+            &spec,
+            "origins:\n  api:\n    authentication:\n      api_key: \"${SB_NOPE_2433:-env:AWS_SECRET_ACCESS_KEY}\"\n",
+            &revision_at("warn-default-1"),
+        )
+        .expect("a default that reaches this host is a finding like any other");
+        assert!(summary.contains("api_key"), "{summary}");
+        assert!(
+            !summary.contains("AWS_SECRET_ACCESS_KEY"),
+            "the warning echoed the default it refused: {summary}"
+        );
+
+        let (_, summary) = warn_unconfined_host_reference(
+            &spec,
+            "origins:\n  api:\n    action:\n      type: proxy\n      url: \"${SB_NOPE_2433:-/etc/sbproxy/x}\"\n",
+            &revision_at("warn-default-2"),
+        )
+        .expect("an absolute path in a default is a finding too");
+        assert!(summary.contains("url"), "{summary}");
+        assert!(
+            !summary.contains("/etc/sbproxy/x"),
+            "the warning echoed the path it refused: {summary}"
         );
     }
 
