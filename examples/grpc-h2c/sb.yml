@@ -15,12 +15,20 @@
 # TLS-fronted gRPC over `https_bind_port` does not need this flag
 # because ALPN negotiates h2 during the TLS handshake.
 #
+# This directory boots its own upstream: `fixture.py` is a Python
+# grpcio Echo service on :50051. `grpc-web.example.com` accepts
+# browser gRPC-Web. `grpc-json.example.com` transcodes REST/JSON
+# onto the same unary method (descriptor: echo.pb).
+#
 # Run:
+#   python3 fixture.py &
 #   make run CONFIG=examples/grpc-h2c/sb.yml
 #
-# Test (after starting any tonic-style gRPC server on :50051):
-#   grpcurl -plaintext -authority grpc.example.com \
-#       127.0.0.1:8080 your.Service/YourMethod
+# Test:
+#   curl -sS -H 'Host: grpc-json.example.com' \
+#       -H 'Content-Type: application/json' \
+#       -d '{"message":"hello"}' \
+#       http://127.0.0.1:8080/echo
 
 proxy:
   http_bind_port: 8080
@@ -43,3 +51,19 @@ origins:
     action:
       type: grpc
       url: "grpc://127.0.0.1:50051"
+  "grpc-web.example.com":
+    action:
+      type: grpc
+      url: "grpc://127.0.0.1:50051"
+      grpc_web: true
+  "grpc-json.example.com":
+    action:
+      type: grpc
+      url: "grpc://127.0.0.1:50051"
+      transcode:
+        descriptor_set: examples/grpc-h2c/echo.pb
+        routes:
+          - method: POST
+            path: /echo
+            grpc_method: sbproxy_e2e.echo.Echo.Hello
+            body: "*"

@@ -1,6 +1,6 @@
 //! OSS Confirm-to-AllowWithHeaders bridge.
 //!
-//! Per `docs/adr-policy-verdict-shape.md`, OSS routes a
+//! Per `docs/policy.md`, OSS routes a
 //! `PolicyDecision::Confirm` through the existing AllowWithHeaders
 //! mechanism with `X-Policy-Confirm: <reason>` stamped on the
 //! response. The enterprise pipeline parks the request before the

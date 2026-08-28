@@ -1,7 +1,7 @@
 //! Multi-policy chain reducer rules.
 //!
 //! Exercises the resolution rules from
-//! `docs/adr-policy-verdict-shape.md` against the public
+//! `docs/policy.md` against the public
 //! [`sbproxy_core::policy_dispatch`] surface. The dispatcher in
 //! `server.rs` calls into the same helpers; an integration test
 //! over the helpers covers the rules without booting Pingora.

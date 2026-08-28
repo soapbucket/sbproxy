@@ -8,7 +8,7 @@ use std::sync::Arc;
 ///
 /// Bound to the audit event bus (see
 /// `crates/sbproxy-core/src/policy_bus.rs`) and consumed asynchronously
-/// per `docs/adr-policy-audit-binding.md`. The OSS substrate ships an
+/// per `docs/events.md`. The OSS substrate ships an
 /// in-memory drain stub; the enterprise consumer adds tamper-evident
 /// chaining and KMS-signed Merkle root commits downstream of the bus.
 ///

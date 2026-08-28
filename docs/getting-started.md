@@ -1,8 +1,8 @@
 # Getting started
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-28*
 
-This walkthrough runs one local upstream through three gateway configurations. It needs SBproxy, `curl`, and `jq`. It makes no network request to an AI provider and needs no API key.
+This walkthrough runs one local upstream through three gateway configurations. It is the command path for [all-traffic-gateway.md](all-traffic-gateway.md). It needs SBproxy, `curl`, and `jq`. It makes no network request to an AI provider and needs no API key.
 
 On Windows, run the commands in Git Bash, or replace `curl` with `curl.exe` in PowerShell: the bare name is an alias for `Invoke-WebRequest` there and rejects flags like `-H`.
 

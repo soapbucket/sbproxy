@@ -1,6 +1,6 @@
 # API security
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-28*
 
 Most API breaches are not clever. They are an endpoint that forgot to check who
 was asking, a limit nobody set, or a field that was never supposed to be
@@ -403,9 +403,7 @@ field carries a key, matching against a list you supply as `passwords`,
 `dlp` handles the regulated-data case, and it has two limits worth knowing
 before you plan around it.
 
-It scans **requests only** - the URI, the headers, and (on by default, capped
-at 16 KiB) the buffered body, which is where most of the shapes in the example
-above actually show up. Setting `direction: response` or `both` is accepted
+It scans **requests only**: the URI and the headers. `scan_body` defaults true and `body_max_bytes` defaults 16384, but the header-phase policy chain snapshots an empty body, so a secret that appears only in the POST body is not seen. Setting `direction: response` or `both` is accepted
 and then warned about at load; the request-side scan still runs regardless.
 That is not a scheduling gap that a future release closes: `dlp` runs through
 the same request-only policy-enforcement phase every built-in policy shares,

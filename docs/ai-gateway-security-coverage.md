@@ -1,6 +1,6 @@
 # AI gateway security coverage
 
-*Last modified: 2026-08-27*
+*Last modified: 2026-08-28*
 
 This page proves what the gateway enforces in the AI traffic path, not what a
 feature list claims: every row below points at a named test or a signal you
@@ -321,9 +321,10 @@ whether or not `pii:` is configured. [ai-gateway.md](ai-gateway.md),
 
 **Proof.** `e2e/tests/redaction.rs::redaction_per_sink_fan_out`.
 
-**Limits.** The `dlp` policy scans the request URI, the request headers,
-and, on by default (`scan_body: true`), the buffered request body, capped
-at the first 16 KiB (`body_max_bytes`), where most PII shapes sit. Its
+**Limits.** The `dlp` policy scans the request URI and the request headers.
+`scan_body` defaults true and `body_max_bytes` defaults 16384, but the
+header-phase policy chain snapshots an empty body, so a secret that appears
+only in the POST body is not seen. Its
 actions are tag and block; it never masks. It is request-side only:
 `direction: response` or `both` is accepted and warned about at config
 load, and the request-side scan runs regardless, because the policy
