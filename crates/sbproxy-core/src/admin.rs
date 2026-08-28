@@ -3745,7 +3745,12 @@ fn handle_config_fallback_clear(state: &AdminState) -> (u16, &'static str, Strin
     // file itself, through the same path `POST /admin/reload` uses
     // (WOR-2459 fix round, Major 9).
     let reload = state.config_path.as_ref().map(|path| {
-        let outcome = crate::server::reload_from_config_path(&path.to_string_lossy());
+        // The unaudited variant: this handler writes the record, with
+        // the actor the HTTP layer has. Letting the shared path write
+        // its own too produced two entries for one apply, one of them
+        // naming `file_watcher` for a deliberate operator action
+        // (verification residual R3).
+        let outcome = crate::server::reload_from_config_path_unaudited(&path.to_string_lossy());
         // Audited here, at the admin call site, with the actor the HTTP
         // layer has. `reload_from_config_path` stamps its own entry under
         // `source: "file_watcher"`, which is right for a filesystem event

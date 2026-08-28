@@ -1528,7 +1528,7 @@ impl ConfigSoakConfig {
 /// dials, so `url` is a config-reachable fetch to any address this host
 /// can reach, loopback and link-local included. What keeps that bounded
 /// is that `proxy.config_history` sits on
-/// [`crate::config_merge::AUTHORITY_DENIED_PATHS`]: a config-authority
+/// `AUTHORITY_DENIED_PATHS`: a config-authority
 /// document cannot set this key, so the only writer is an operator with
 /// write access to the node's own configuration file, who can already
 /// point an origin anywhere. Treat it the way you treat an origin URL,

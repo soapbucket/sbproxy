@@ -359,7 +359,28 @@ impl Drop for ProviderRegistryRollback {
 /// operator correlate against their own signal-delivery or file-change
 /// history if they need to tell the two apart.
 pub fn reload_from_config_path(config_path: &str) -> anyhow::Result<ReloadOutcome> {
-    if let Some(refusal) = refuse_suspended_local_reload() {
+    let result = reload_from_config_path_unaudited(config_path);
+    if !matches!(&result, Err(error) if is_suspended_reload(error)) {
+        audit_reload_outcome("file_watcher", config_path, &result);
+    }
+    result
+}
+
+/// As [`reload_from_config_path`], without the `file_watcher` audit
+/// record, for a caller that writes its own.
+///
+/// `DELETE /admin/config/fallback` applies the config file as part of
+/// clearing the pin, and that is an operator action with an actor
+/// attached, not a filesystem event. Letting it inherit this function's
+/// record wrote *two* entries for one apply, one of them naming the
+/// wrong trigger and carrying no actor. The admin handler calls this and
+/// stamps its own `api` record instead (verification residual R3).
+///
+/// # Errors
+///
+/// As [`reload_from_config_path`].
+pub fn reload_from_config_path_unaudited(config_path: &str) -> anyhow::Result<ReloadOutcome> {
+    if let Some(refusal) = refuse_suspended_local_reload(config_path) {
         return Err(refusal);
     }
     // WOR-1101: stamp every reload outcome so operators can alert on
@@ -370,9 +391,23 @@ pub fn reload_from_config_path(config_path: &str) -> anyhow::Result<ReloadOutcom
         Ok(_) => sbproxy_observe::metrics::record_config_reload("success"),
         Err(_) => sbproxy_observe::metrics::record_config_reload("failure"),
     }
-    audit_reload_outcome("file_watcher", config_path, &result);
     result
 }
+
+/// Whether one reload error is the deliberate pinned-node suspension
+/// rather than a refused candidate.
+///
+/// Callers use it to keep a suspension out of the channels a fault
+/// belongs in: the ERROR log, and the `config_audit` rejection record.
+#[must_use]
+pub fn is_suspended_reload(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains(SUSPENDED_RELOAD_MARKER)
+}
+
+/// The phrase a suspended-reload refusal carries, so callers can tell it
+/// from a refused candidate without a second error type crossing the
+/// `anyhow` boundary this function's callers already live on.
+const SUSPENDED_RELOAD_MARKER: &str = "pinned to a configuration its boot fallback restored";
 
 /// Refuse a local reload while this node is pinned to a configuration its
 /// boot fallback restored, counting it on its own label.
@@ -390,20 +425,34 @@ pub fn reload_from_config_path(config_path: &str) -> anyhow::Result<ReloadOutcom
 ///
 /// Returns `None`, and costs one relaxed atomic load, on every node that
 /// is not pinned, which is every node almost always.
-fn refuse_suspended_local_reload() -> Option<anyhow::Error> {
+fn refuse_suspended_local_reload(config_path: &str) -> Option<anyhow::Error> {
     if !crate::config_boot::reload_suspended("file_watcher") {
         return None;
     }
     sbproxy_observe::metrics::record_config_reload("suspended");
+    // A `config_audit` record too. Returning before the transaction used
+    // to mean a suspended reload produced none at all, where before
+    // round 2 a SIGHUP refused on a pinned node produced one carrying
+    // its reason: a silent gap in a WOR-2486 surface. It is written with
+    // the suspension as its reason rather than as a rejection of the
+    // document, because the document was never examined (verification
+    // residual R7).
+    sbproxy_observe::ConfigAuditEntry::new("file_watcher", Vec::new(), Vec::new(), Vec::new())
+        .with_rejection_reason(format!(
+            "not applied: this node is {SUSPENDED_RELOAD_MARKER} from the revision ring, so \
+             local reloads are suspended"
+        ))
+        .emit();
     tracing::info!(
+        path = %config_path,
         "a local config reload was skipped: this node is pinned to a configuration its boot \
          fallback restored from the revision ring. clear the pin with \
          DELETE /admin/config/fallback to apply the file",
     );
     Some(anyhow::anyhow!(
-        "this node is pinned to a configuration its boot fallback restored from the revision \
-         ring; local config reloads (the file watcher and SIGHUP) are suspended until an \
-         operator clears the pin with DELETE /admin/config/fallback"
+        "this node is {SUSPENDED_RELOAD_MARKER} from the revision ring; local config reloads \
+         (the file watcher and SIGHUP) are suspended until an operator clears the pin with \
+         DELETE /admin/config/fallback"
     ))
 }
 
@@ -415,7 +464,7 @@ fn refuse_suspended_local_reload() -> Option<anyhow::Error> {
 /// the counter would leave the cadence operators alert on under-reporting
 /// every file-watch reload.
 fn reload_from_config_text(config_path: &str, yaml: &str) -> anyhow::Result<ReloadOutcome> {
-    if let Some(refusal) = refuse_suspended_local_reload() {
+    if let Some(refusal) = refuse_suspended_local_reload(config_path) {
         return Err(refusal);
     }
     let result = reload_from_config_yaml(config_path, yaml);
@@ -2470,7 +2519,7 @@ pub(super) fn start_config_watcher(config_path: String, loaded_digest: [u8; 32])
                 // that directory for as long as the pin holds. It says so
                 // once per event at debug rather than filling the ERROR
                 // channel operators read.
-                Err(_) if crate::config_boot::reload_suspended("file_watcher") => {
+                Err(ref e) if is_suspended_reload(e) => {
                     tracing::debug!(
                         path = %config_path,
                         "the config file changed, but this node is pinned to a configuration \
@@ -2537,6 +2586,19 @@ pub fn install_sighup_handler(config_path: String) {
                 // A degraded-but-applied reload already logged its own
                 // warning naming the subsystems; nothing to add here.
                 Ok(Ok(_outcome)) => {}
+                // A pinned node refusing SIGHUP is the fallback working,
+                // not a fault, and `logrotate` postrotate hooks send
+                // SIGHUP on a schedule, so a healthy pinned node would
+                // otherwise fill the ERROR channel once per rotation.
+                // The same arm the watcher already has, four lines down
+                // a different path (verification residual R4).
+                Ok(Err(ref e)) if is_suspended_reload(e) => {
+                    tracing::debug!(
+                        "SIGHUP arrived, but this node is pinned to a configuration its boot \
+                         fallback restored; clear the pin with DELETE /admin/config/fallback \
+                         to apply the file",
+                    );
+                }
                 Ok(Err(e)) => {
                     tracing::error!(error = %e, "SIGHUP reload failed; serving prior pipeline");
                 }
@@ -8822,17 +8884,17 @@ egress:
         assert_eq!(sample.observed, 0);
         assert!(sample.unhealthy.is_empty());
 
-        // And a config with no upstream-bearing origin at all passes the
-        // signal vacuously: there is no upstream that could be
-        // unhealthy, and unlike the unobserved case nothing is hidden.
+        // What it must not do is promote. A config with no forwarding
+        // origin at all leaves this signal with nothing examined, and in
+        // this module a pass promotes, so the honest answer is an
+        // abstention naming the emptiness (verification residual R1).
         let outcome = crate::config_soak::upstream_health_signal(
             &sbproxy_config::ConfigSoakConfig::default(),
             &sample,
         );
-        assert_eq!(
-            outcome,
-            crate::config_soak::SignalOutcome::Pass,
-            "a config that declares no upstream is vacuously healthy: {outcome:?}",
+        assert!(
+            matches!(outcome, crate::config_soak::SignalOutcome::Abstain(_)),
+            "a signal that examined nothing must not promote: {outcome:?}",
         );
     }
 
@@ -8931,11 +8993,15 @@ egress:
         reload_from_config_yaml(config_path.to_str().expect("utf-8"), yaml)
             .expect("a valid config publishes");
         let revision = recorder.entries()[0].revision;
-        // The synthetic-transaction driver reporting a healthy round
-        // trip: the signal a quiet node has, and the one that keeps this
-        // window out of Inconclusive.
+        // The operator's own probe reporting a healthy round trip. It
+        // dials a real URL the operator chose, so unlike the synthetic
+        // driver's non-network origin it is evidence about the world and
+        // promotes on its own. The synthetic driver cannot stand in here
+        // any more: this fixture declares no upstream, so the health
+        // signal abstains and a synthetic pass is discarded with it
+        // (verification residual R1).
         crate::config_soak::record_probe(
-            crate::config_soak::ProbeKind::Synthetic,
+            crate::config_soak::ProbeKind::Operator,
             crate::config_soak::ProbeObservation::Ok,
         );
 

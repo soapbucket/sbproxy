@@ -314,11 +314,21 @@ pub(crate) fn upstream_health_signal(
             sample.unobserved.join(", ")
         ));
     }
-    // Nothing left to be blind to and nothing unhealthy. `observed ==
-    // 0` here means the config declares no upstream-bearing origin at
-    // all, which is vacuously healthy rather than unknown: there is no
-    // upstream that could be down, and unlike the unobserved case above
-    // nothing is hidden.
+    if sample.observed == 0 {
+        // No forwarding origin at all: an emptied `origins:` map, or an
+        // all-`static` maintenance config. Tempting to call vacuously
+        // healthy, and wrong, because in this module a pass *promotes*.
+        // Passing here would make a revision this signal never examined
+        // the node's last known good and WOR-2459's boot target, which
+        // is promote-on-compile wearing the soak's name and the exact
+        // thing `degraded_signal` abstains to avoid (verification
+        // residual R1).
+        return SignalOutcome::Abstain(
+            "the running config declares no upstream at all, so this signal examined nothing"
+                .to_string(),
+        );
+    }
+    // Every forwarding origin was observable and none was unhealthy.
     SignalOutcome::Pass
 }
 
@@ -758,12 +768,19 @@ pub(crate) fn judge(
     // downgrades to an absence here, and an operator-declared probe,
     // which dials a real URL the operator chose, is unaffected
     // (WOR-2458 fix round, Blocker 3).
+    // Computed first, because whether a synthetic pass may promote
+    // depends on it. Keyed on the signal's own verdict rather than on
+    // `unobserved` alone: it abstains for two reasons, an origin it
+    // cannot see *and* a config with no upstream at all, and both mean
+    // the same thing here, that nothing has established the upstreams
+    // are reachable (verification residual R1).
+    let upstream = upstream_health_signal(config, health);
     // An operator who set `require_upstream_health: false` has said they
     // are not judging on upstream health, so there is nothing for a
     // synthetic pass to be masking and the downgrade does not apply.
     let synthetic = match window.synthetic_probe.as_ref() {
         Some(ProbeObservation::Ok)
-            if config.require_upstream_health && !health.unobserved.is_empty() =>
+            if config.require_upstream_health && matches!(upstream, SignalOutcome::Abstain(_)) =>
         {
             None
         }
@@ -774,10 +791,7 @@ pub(crate) fn judge(
             SoakSignal::DegradedSubsystems,
             degraded_signal(&window.degraded, config.require_no_degraded_subsystems),
         ),
-        (
-            SoakSignal::UpstreamHealth,
-            upstream_health_signal(config, health),
-        ),
+        (SoakSignal::UpstreamHealth, upstream),
         (
             SoakSignal::RequestOutcome,
             request_outcome_signal(config, window.baseline, current, window.baseline_error_rate),
@@ -1435,6 +1449,50 @@ mod tests {
             &opaque("shop/api"),
         );
         assert_eq!(verdict, SoakVerdict::Successful);
+    }
+
+    /// Verification residual R1. `observed == 0` with nothing
+    /// unobserved is a config that declares no forwarding origin at all:
+    /// an emptied `origins:` map, or an all-`static` maintenance page.
+    /// Passing there promotes a revision on a signal that examined
+    /// nothing, which is promote-on-compile wearing the soak's name and
+    /// contradicts this module's own rule that a clean construction is
+    /// not evidence. It abstains.
+    #[test]
+    fn a_config_with_no_upstream_at_all_abstains_rather_than_passing() {
+        let empty = UpstreamHealthSample::default();
+        let outcome = upstream_health_signal(&soak(50), &empty);
+        assert!(
+            matches!(outcome, SignalOutcome::Abstain(_)),
+            "a signal that examined nothing must not promote: {outcome:?}",
+        );
+        assert!(
+            outcome
+                .detail()
+                .expect("an abstention explains itself")
+                .contains("no upstream"),
+            "{outcome:?}",
+        );
+
+        // And it must not be rescued into a promotion by a synthetic
+        // pass either: an all-static config plus the driver is exactly
+        // the shape that would otherwise become WOR-2459's boot target
+        // on no evidence at all.
+        let mut quiet = window(soak(50), Vec::new());
+        quiet.synthetic_probe = Some(ProbeObservation::Ok);
+        let (verdict, _) = judge(
+            &quiet,
+            RequestCounts {
+                requests: 4,
+                errors: 0,
+            },
+            &empty,
+        );
+        assert_eq!(
+            verdict,
+            SoakVerdict::Inconclusive,
+            "nothing measured anything, so nothing is promoted",
+        );
     }
 
     /// The documented escape from a permanently inconclusive node: an

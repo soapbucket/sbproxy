@@ -573,6 +573,41 @@ mod tests {
         assert!(format!("{failure}").contains("empty"), "{failure}");
     }
 
+    /// Verification residual R5. The control was covered and its wiring
+    /// was not: every assertion drove `refuse_shared_files` directly, so
+    /// deleting the call from `walk_for_bootable` left the suite green.
+    /// A covered function is not a wired one.
+    #[cfg(unix)]
+    #[test]
+    fn the_walk_refuses_a_ring_whose_index_anyone_can_read() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let history = history(temp.path());
+        {
+            let mut store = RevisionStore::open(temp.path(), history.keep, None).expect("open");
+            store
+                .append(b"rescued: yes\n", metadata(1))
+                .expect("append");
+        }
+
+        // An ordinary ring boots, so the guard is not a blanket refusal.
+        walk_for_bootable(&history, 3, |_| Ok(())).expect("a 0600 ring boots");
+
+        // Widen the index, and the walk itself must refuse before it
+        // offers a single candidate.
+        let index = temp.path().join("index.json");
+        std::fs::set_permissions(&index, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let failure = walk_for_bootable(&history, 3, |_| {
+            panic!("no candidate may be compiled from a ring this walk should have refused")
+        })
+        .expect_err("the walk refuses a shared ring");
+        let BootWalkFailure::StoreUnavailable(reason) = &failure else {
+            panic!("expected StoreUnavailable, got {failure:?}");
+        };
+        assert!(reason.contains("index.json"), "{reason}");
+        assert!(reason.contains("644"), "the mode is named: {reason}");
+    }
+
     /// The walk boots the last known good entry first.
     #[test]
     fn the_walk_boots_the_last_known_good_entry_first() {
