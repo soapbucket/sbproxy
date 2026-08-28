@@ -2940,11 +2940,10 @@ through the same reload transaction every other apply goes through, and it
 soaks. A stored document that no longer constructs on this build is refused
 with the compile error and the running configuration keeps serving.
 
-```bash
-curl -sS -u admin:secret -X POST http://127.0.0.1:9090/admin/config/rollback \
-  -H 'content-type: application/json' \
-  -d '{"revision": 41, "expected_current": 43}'
-```
+The request body is a JSON object; an empty `{}` rolls back to the last
+known good. `sbproxy config rollback` is the same call with flags, and
+[manual.md](manual.md#config-rollback--config-diff---move-a-running-proxy-back-to-a-stored-revision)
+has the runnable form.
 
 | Body field | Type | Description |
 |---|---|---|
@@ -3013,11 +3012,6 @@ disjoint from the manual one.
 
 A plan between two stored config revisions, or between what is running and
 one stored revision. Reads only: no reload, no ring write, no pointer move.
-
-```bash
-curl -sS -u admin:secret \
-  'http://127.0.0.1:9090/admin/config/diff?from=38&to=41'
-```
 
 | Query parameter | Description |
 |---|---|
