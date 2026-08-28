@@ -737,34 +737,6 @@ fn a_malformed_target_is_refused_before_a_worker_starts() {
     .is_ok());
 }
 
-/// A `Debug` that prints a token is a token in a boot log.
-#[test]
-fn the_debug_impl_never_prints_a_credential() {
-    let nats = format!(
-        "{:?}",
-        IngestTarget::Nats {
-            address: "broker:4222".into(),
-            subject_prefix: "sb.events".into(),
-            token: Some("s3cret".into()),
-        }
-    );
-    assert!(!nats.contains("s3cret"));
-    assert!(nats.contains("authenticated: true"));
-
-    let clickhouse = format!(
-        "{:?}",
-        IngestTarget::ClickHouse {
-            url: "http://host:8123".into(),
-            database: "sbproxy".into(),
-            table: "events".into(),
-            user: Some("writer".into()),
-            password: Some("hunter2".into()),
-        }
-    );
-    assert!(!clickhouse.contains("hunter2"));
-    assert!(clickhouse.contains("authenticated: true"));
-}
-
 /// What the fake warehouse saw.
 #[derive(Debug, Default, Clone)]
 struct ClickHouseRequest {

@@ -1110,5 +1110,44 @@ pub(crate) mod metrics {
     }
 }
 
+/// The `Debug` redaction, pinned beside the impl it pins.
+///
+/// Here rather than in `tests.rs` because
+/// `scripts/check-secret-debug-registry.sh` looks for the pinning test in
+/// the file that declares the type, and a guard that cannot find its own
+/// proof is a guard nobody is protected by.
+#[cfg(test)]
+mod debug_redaction {
+    use super::*;
+
+    /// A `Debug` that prints a token is a token in a boot log.
+    #[test]
+    fn the_debug_impl_never_prints_a_credential() {
+        let nats = format!(
+            "{:?}",
+            IngestTarget::Nats {
+                address: "broker:4222".into(),
+                subject_prefix: "sb.events".into(),
+                token: Some("s3cret".into()),
+            }
+        );
+        assert!(!nats.contains("s3cret"));
+        assert!(nats.contains("authenticated: true"));
+
+        let clickhouse = format!(
+            "{:?}",
+            IngestTarget::ClickHouse {
+                url: "http://host:8123".into(),
+                database: "sbproxy".into(),
+                table: "events".into(),
+                user: Some("writer".into()),
+                password: Some("hunter2".into()),
+            }
+        );
+        assert!(!clickhouse.contains("hunter2"));
+        assert!(clickhouse.contains("authenticated: true"));
+    }
+}
+
 #[cfg(test)]
 mod tests;

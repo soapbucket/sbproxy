@@ -2068,10 +2068,31 @@ mod tests {
         assert!(!json.contains(&secrets.client_secret));
         assert!(!json.contains(&secrets.registration_access_token));
 
-        // The one shape that does carry plaintext refuses to print it.
+        // The two shapes that do carry plaintext refuse to print it.
         let debug = format!("{secrets:?}");
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains(&secrets.client_secret));
+        assert!(!debug.contains(&secrets.registration_access_token));
+
+        queue
+            .approve(&TenantScope::All, &secrets.agent_id, None, None, now())
+            .await
+            .expect("approve");
+        let rotated = queue
+            .rotate_secret(
+                &TenantScope::All,
+                &secrets.agent_id,
+                &secrets.registration_access_token,
+                now(),
+            )
+            .await
+            .expect("rotate");
+        let debug = format!("{rotated:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(
+            !debug.contains(&rotated.client_secret),
+            "a rotated secret must not reach a Debug either"
+        );
 
         std::fs::remove_file(&path).ok();
     }
