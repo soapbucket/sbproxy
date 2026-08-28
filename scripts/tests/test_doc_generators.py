@@ -8,6 +8,7 @@ import http.server
 from pathlib import Path
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -25,6 +26,26 @@ def write_executable(path: Path, contents: str) -> None:
     path.chmod(0o755)
 
 
+def reserve_port() -> int:
+    """A free loopback TCP port, the way the rest of the suites pick one.
+
+    These tests used to hardcode 18080 and 18091. Two gates could not run
+    at once because of it: a second worktree's run bound the same pair and
+    failed on "address already in use", so gate runs across worktrees were
+    serialized by a constant in this file. The recorder connects to the
+    port it is given, so the value only has to be free, not fixed.
+
+    Bind port zero, read what the kernel assigned, and close. There is a
+    window between the close and the fixture's own bind, which is the same
+    window every port-zero allocator in this repository lives with; the
+    kernel does not hand the same ephemeral port to two live listeners, and
+    a collision here fails loudly on bind rather than corrupting a result.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+
+
 class TemporaryRepository(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -33,6 +54,10 @@ class TemporaryRepository(unittest.TestCase):
         (self.root / "docs" / "tapes").mkdir(parents=True)
         (self.root / "docs" / "assets").mkdir(parents=True)
         (self.root / "examples").mkdir()
+        # Allocated per test, so concurrent gates in separate worktrees do
+        # not fight over one pair of constants.
+        self.main_port = reserve_port()
+        self.aux_port = reserve_port()
 
     def tearDown(self) -> None:
         # These tests start real listeners, and one of them deliberately
@@ -172,8 +197,12 @@ class RecordTapesTests(TemporaryRepository):
         }
 
     def write_recording(self) -> None:
-        (self.root / "main.yml").write_text("proxy:\n  http_bind_port: 18080\n")
-        (self.root / "aux.yml").write_text("proxy:\n  http_bind_port: 18091\n")
+        (self.root / "main.yml").write_text(
+            f"proxy:\n  http_bind_port: {self.main_port}\n"
+        )
+        (self.root / "aux.yml").write_text(
+            f"proxy:\n  http_bind_port: {self.aux_port}\n"
+        )
         (self.root / "docs" / "tapes" / "demo.tape").write_text(
             "# CONFIG: main.yml\n"
             "# AUX_CONFIG: aux.yml\n"
@@ -226,11 +255,11 @@ class RecordTapesTests(TemporaryRepository):
             result = self.run_script(
                 "record-tapes.sh",
                 "demo",
-                env=self.recorder_env(unrelated.pid, 18080),
+                env=self.recorder_env(unrelated.pid, self.main_port),
             )
 
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("18080", result.stdout + result.stderr)
+            self.assertIn(str(self.main_port), result.stdout + result.stderr)
             self.assertIsNone(
                 unrelated.poll(), "recorder killed the occupied port owner"
             )
@@ -341,12 +370,20 @@ class ConformanceRunnerSafetyTests(unittest.TestCase):
             def log_message(self, *_args: object) -> None:
                 pass
 
-        server = http.server.HTTPServer(("127.0.0.1", 18888), UnrelatedHandler)
+        # Reserved rather than fixed, so two gates in two worktrees can run
+        # this at the same time. The runner reads the same port from the
+        # environment below, so the test still occupies the port the runner
+        # is about to want, which is the whole point of the case.
+        callback_port = reserve_port()
+        server = http.server.HTTPServer(
+            ("127.0.0.1", callback_port), UnrelatedHandler
+        )
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
             env = os.environ.copy()
             env["SBPROXY_BIN"] = "/usr/bin/true"
+            env["SBPROXY_CONFORMANCE_CALLBACK_PORT"] = str(callback_port)
             result = subprocess.run(
                 [
                     "bash",
@@ -366,7 +403,7 @@ class ConformanceRunnerSafetyTests(unittest.TestCase):
             thread.join()
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("18888", result.stdout + result.stderr)
+        self.assertIn(str(callback_port), result.stdout + result.stderr)
         self.assertEqual(
             requests,
             [],

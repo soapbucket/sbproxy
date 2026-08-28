@@ -27,7 +27,14 @@ CASES_DIR="$SCRIPT_DIR/cases"
 SERVERS_DIR="$SCRIPT_DIR/servers"
 PROXY_PORT=18080
 PROXY_URL="http://localhost:$PROXY_PORT"
-CALLBACK_PORT=18888
+# 18888 stays the default because several redirect assertions below name
+# it literally as an expected Location target. It is overridable so a test
+# that has to occupy this port first can pick a free one instead of
+# colliding with a concurrent run: scripts/tests/test_doc_generators.py's
+# occupied-callback-port test does exactly that. A run that overrides it
+# and then reaches the redirect cases will fail on those literals, which
+# is the correct signal rather than a silent pass.
+CALLBACK_PORT="${SBPROXY_CONFORMANCE_CALLBACK_PORT:-18888}"
 CALLBACK_URL="http://127.0.0.1:$CALLBACK_PORT"
 LOG_DIR="$SCRIPT_DIR/logs"
 CERT_DIR="$SCRIPT_DIR/certs"
