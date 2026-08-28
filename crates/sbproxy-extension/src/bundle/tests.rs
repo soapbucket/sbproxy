@@ -14,8 +14,8 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 use super::{
-    build_proxy_wasm_filter, BundleLoadError, BundleRegistry, DynamicBundleRegistry,
-    ProxyWasmAction,
+    build_proxy_wasm_filter, build_rego_policy, BundleLoadError, BundleRegistry,
+    DynamicBundleRegistry, ProxyWasmAction,
 };
 
 const COMMIT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1292,6 +1292,79 @@ fn a_signed_rego_bundle_activates_and_registers_a_policy_hook() {
     assert!(
         registry.policy("rego_authz").is_some(),
         "the bundle's policy hook must register the same way a JS bundle policy hook does"
+    );
+}
+
+/// A rego manifest whose hook declares a `secret_vars` property and
+/// supplies the manifest's own default for it. The shape WOR-2433's
+/// re-review named: nothing in the operator's config mentions the
+/// variable this reads.
+fn rego_manifest_with_authored_secret_var(
+    name: &str,
+    type_name: &str,
+    digest: &str,
+    default: &str,
+) -> String {
+    format!(
+        "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: {name}\nversion: 1.0.0\nruntime: rego\nentry: policy.rego\nsha256: {digest}\nhooks:\n  - kind: policy\n    type: {type_name}\n    execution:\n      body_mode: none\n    secret_vars: [token]\n    config_schema:\n      type: object\n      properties:\n        token:\n          type: string\n          default: \"{default}\"\n"
+    )
+}
+
+#[test]
+fn a_signed_git_sourced_bundle_may_not_author_a_host_backed_secret_var() {
+    // Signature is not trust for this boundary. This bundle is fetched
+    // from git with `verify_signature: true` and pinned by an entry
+    // digest, which is every integrity guarantee the loader offers, and
+    // it still may not point one of its own config vars at this host's
+    // environment: the signature says the bytes are the ones that
+    // author published, not that this node's operator agreed to what
+    // they say (WOR-2433 re-review).
+    let host_value = std::env::var("PATH").expect("PATH is set in the test environment");
+    let repository = TempDir::new().unwrap();
+    let digest = hex::encode(Sha256::digest(VALID_REGO));
+    write_rego_bundle(
+        &repository.path().join("extensions"),
+        "git-bundle",
+        &rego_manifest_with_authored_secret_var("git-rego", "git_rego_policy", &digest, "env:PATH"),
+        VALID_REGO,
+    );
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let context = FetchContext::with_cloner(Box::new(TreeCloner {
+        source: repository.path().to_owned(),
+        calls: calls.clone(),
+    }));
+    let config = ExtensionBundlesConfig {
+        grants: Default::default(),
+        bundles_dir: None,
+        sources: vec![BundleSourceConfig::Git {
+            repo: "https://example.test/repo.git".to_owned(),
+            revision: "release-v1".to_owned(),
+            path: "extensions".to_owned(),
+            credential: None,
+            verify_signature: true,
+            timeout_secs: 17,
+            refresh_interval_secs: 0,
+        }],
+    };
+
+    let registry = DynamicBundleRegistry::load_with_context(
+        &config,
+        repository.path(),
+        &BTreeSet::new(),
+        &context,
+    )
+    .expect("the bundle itself is valid; only its config value is refused");
+    assert!(calls.lock().unwrap()[0].2, "the fetch verified a signature");
+
+    let hook = registry.policy("git_rego_policy").expect("hook registers");
+    let error = build_rego_policy(hook, serde_json::json!({}))
+        .expect_err("a manifest-authored secret var must be refused at build");
+
+    let rendered = error.to_string();
+    assert!(rendered.contains("git-rego"), "{rendered}");
+    assert!(
+        !rendered.contains(&host_value),
+        "the refusal echoed the host's environment"
     );
 }
 

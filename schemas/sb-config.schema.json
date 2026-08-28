@@ -294,6 +294,11 @@
               "default": false,
               "type": "boolean"
             },
+            "confine": {
+              "description": "Treat the fetched document as externally authored: it may not carry a host-backed secret reference (`env:NAME`, `file:PATH`, `vault://env/NAME`) and may not name a host path the proxy opens (WOR-2433).\n\nOff by default, and deliberately: turning it on for everybody would be a fail-closed upgrade on running fleets. A GitOps repository that names a host path anywhere would refuse its own config on the release that changed the default, and a node that boots into a refusal serves nothing. The host-path half also has no substitute spelling, because a path still has to be a path on this host, so the only place to move one is a layer this node owns.\n\nIt is not silent while it is off: a document that reaches for this host logs one warning naming the **first** finding the check reaches, at boot and again whenever a refresh brings a revision this process has not already checked, naming the source and the key and never the value. First rather than every, because the check stops at the first thing it refuses: a document naming both a host path and an `env:` reference reports one of them now and the other once you fix it.\n\nPer source leaf, not per tree. A `git_overlay` resolves each `kind: git` node with its own `confine`, so an overlay left unconfined keeps its own powers and warns on its own.\n\nTurn it on when the repository is written by somebody other than whoever runs this proxy; the document then gets the same treatment a config-authority bundle gets. A secret still has a spelling under it: `${VAR}` survives confinement and is substituted before the parse, which is what `proxy.cluster.security.shared_key` and every other secret-bearing field can use. See the `Confined fragments` section of docs/configuration.md.",
+              "default": false,
+              "type": "boolean"
+            },
             "timeout_secs": {
               "description": "Hard timeout for one fetch, in seconds. The child `git` process is killed when it expires; a config-load path with no timeout hangs startup.",
               "default": 60,

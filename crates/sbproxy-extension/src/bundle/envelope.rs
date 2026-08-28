@@ -11,6 +11,9 @@ use zeroize::Zeroizing;
 
 use sbproxy_config::{is_secret_reference, BundleHookKind};
 
+use super::loader::BundleLoadError;
+use super::registry::LoadedBundleHook;
+
 pub(crate) const ENVELOPE_VERSION: &str = sbproxy_config::BUNDLE_ENVELOPE_ABI;
 
 const MAX_POLICY_MESSAGE_BYTES: usize = 4 * 1024;
@@ -86,6 +89,80 @@ pub(crate) fn apply_schema_defaults(value: &mut Value, schema: &Value) {
     }
 }
 
+/// Prepare one bundle hook's attachment config: manifest defaults, then
+/// secret resolution, then schema validation.
+///
+/// The single place a bundle hook's config values are assembled. Every
+/// adapter that runs a hook (JavaScript, WASM, and both Rego builders)
+/// goes through it, so the boundary below is stated once rather than
+/// four times.
+///
+/// # The boundary
+///
+/// `config` as passed in is what the **operator** wrote in `sb.yml` for
+/// this attachment. [`apply_schema_defaults`] then fills in whatever the
+/// **bundle manifest** declared as a `config_schema` default, and
+/// [`resolve_declared_secrets`] resolves the properties the **bundle
+/// manifest** named in `secret_vars`. Two of those three inputs are
+/// authored by whoever wrote the bundle, and a bundle fetched from a git
+/// repository (`BundleSourceConfig::Git`) is authored by whoever can
+/// push to it, signature or no signature: a signature says the bytes are
+/// the ones that author published, not that this node's operator agreed
+/// to what they say.
+///
+/// So a manifest shipping
+///
+/// ```yaml
+/// config_schema:
+///   properties:
+///     token: { type: string, default: "env:AWS_SECRET_ACCESS_KEY" }
+/// secret_vars: [token]
+/// ```
+///
+/// would read this host's environment into the guest's config with no
+/// line of the operator's config naming the variable, and guest code can
+/// put its config in a response header. Bundle-authored values therefore
+/// resolve nothing: they go through
+/// `sbproxy_config::check_confined_value` under
+/// `ConfinementPolicy::bundle_manifest`, the same confined checker and
+/// the same refusal messages the config-fragment boundary uses
+/// (WOR-2433). A value the *operator* wrote for that same key resolves
+/// exactly as before, because the operator owns the host's secrets.
+///
+/// # Errors
+///
+/// Returns a bounded [`BundleLoadError`] for a bundle-authored value
+/// that reaches for a secret, for a `secret_vars` reference that cannot
+/// be resolved, and for config that does not satisfy the hook's schema.
+/// No message carries a resolved value.
+pub(crate) fn prepare_hook_config(
+    hook: &LoadedBundleHook,
+    config: Value,
+) -> Result<Value, BundleLoadError> {
+    // Captured before defaults are applied: after that call there is no
+    // way to tell an operator's value from a manifest's.
+    let operator_authored = config.clone();
+    let mut config = config;
+    if let Some(schema) = hook.hook().config_schema.as_ref() {
+        apply_schema_defaults(&mut config, schema);
+    }
+    // WOR-2289: resolve secret references in the hook's declared
+    // `secret_vars` before it ever runs. Validation runs on the
+    // resolved value (not the reference) so a schema constraint on the
+    // value's shape (a `pattern`, for instance) checks the real secret
+    // rather than the pointer to it.
+    resolve_declared_secrets(
+        &mut config,
+        &hook.hook().secret_vars,
+        &operator_authored,
+        &hook.manifest().name,
+    )
+    .map_err(|detail| BundleLoadError::new("config", detail))?;
+    hook.validate_config(&config)
+        .map_err(|error| BundleLoadError::new("config", error.to_string()))?;
+    Ok(config)
+}
+
 /// Resolve secret references in a bundle hook's declared `secret_vars`,
 /// in place.
 ///
@@ -122,15 +199,27 @@ pub(crate) fn apply_schema_defaults(value: &mut Value, schema: &Value) {
 /// zeroized on drop rather than left for the allocator to reuse
 /// unscrubbed.
 ///
+/// `operator_authored` is the attachment config as the operator wrote
+/// it, before [`apply_schema_defaults`] merged the manifest's own
+/// defaults in, and it is what decides whether a reference resolves at
+/// all: see [`prepare_hook_config`] for why a bundle-authored reference
+/// is refused instead. `bundle_label` names the bundle in that refusal.
+/// The two are parameters rather than something this function derives so
+/// that no caller can reach the resolver without stating whose value it
+/// is resolving.
+///
 /// # Errors
 ///
 /// Returns a bounded detail message when a `secret_vars` property holds
-/// a recognized reference that cannot be resolved. The detail names
-/// only the reference (a pointer, never the secret it names) or the
-/// missing environment variable, file, or backend.
+/// a reference the bundle authored for itself, and when one the operator
+/// authored cannot be resolved. The detail names only the reference (a
+/// pointer, never the secret it names) or the missing environment
+/// variable, file, or backend.
 pub(crate) fn resolve_declared_secrets(
     value: &mut Value,
     secret_vars: &[String],
+    operator_authored: &Value,
+    bundle_label: &str,
 ) -> Result<(), String> {
     let Some(map) = value.as_object_mut() else {
         return Ok(());
@@ -139,10 +228,43 @@ pub(crate) fn resolve_declared_secrets(
         let Some(Value::String(text)) = map.get_mut(name) else {
             continue;
         };
-        if is_secret_reference(text) {
-            let resolved: Zeroizing<String> = Zeroizing::new(resolve_one_config_secret(text)?);
-            *text = resolved.as_str().to_owned();
+        if !is_secret_reference(text) {
+            continue;
         }
+        // Whose value is this? A reference resolves only when the
+        // operator wrote that exact string for that exact key in the
+        // root config. Anything else at this point came from the
+        // manifest's own `config_schema` default, which is the bundle
+        // author writing a value into the host's own config
+        // (WOR-2433).
+        //
+        // The provenance test is by value rather than by presence so it
+        // stays correct if `apply_schema_defaults` ever learns to
+        // rewrite a property the operator did set.
+        if operator_authored.get(name).and_then(Value::as_str) != Some(text.as_str()) {
+            // The confined checker owns the message, so a bundle
+            // manifest and a config fragment refuse the same way: the
+            // document and the key are named, the value never is.
+            sbproxy_config::check_confined_value(
+                bundle_label,
+                name,
+                text,
+                &sbproxy_config::ConfinementPolicy::bundle_manifest(),
+            )
+            .map_err(|error| error.to_string())?;
+            // Belt and braces. `check_confined_value` refuses every
+            // shape `is_secret_reference` recognizes today, because
+            // `bundle_manifest` asks that same predicate; this arm is
+            // what happens if the two ever drift, and it fails closed
+            // rather than resolving.
+            return Err(format!(
+                "bundle `{bundle_label}` declares `{name}` as a secret var and supplies its \
+                 own value for it; a value the bundle authored may not name a secret on \
+                 this host. Set `{name}` in the root config if this node should supply one."
+            ));
+        }
+        let resolved: Zeroizing<String> = Zeroizing::new(resolve_one_config_secret(text)?);
+        *text = resolved.as_str().to_owned();
     }
     Ok(())
 }
@@ -1055,12 +1177,20 @@ mod tests {
 
     // --- WOR-2289: bundle config var secret resolution + masking ---
 
+    /// Resolve as if the operator wrote every value in `value`, which
+    /// is what an `sb.yml` attachment is. The bundle-authored half of
+    /// the boundary has its own tests below.
+    fn resolve_operator_authored(value: &mut Value, secret_vars: &[String]) -> Result<(), String> {
+        let operator_authored = value.clone();
+        resolve_declared_secrets(value, secret_vars, &operator_authored, "fixture-bundle")
+    }
+
     #[test]
     fn resolve_declared_secrets_leaves_an_undeclared_var_untouched_even_if_reference_shaped() {
         let mut value = json!({ "threshold": 5, "token": "env:PATH" });
         let original = value.clone();
 
-        resolve_declared_secrets(&mut value, &[]).expect("nothing declared, nothing to resolve");
+        resolve_operator_authored(&mut value, &[]).expect("nothing declared, nothing to resolve");
 
         assert_eq!(value, original, "undeclared var must never be resolved");
     }
@@ -1070,7 +1200,7 @@ mod tests {
         let mut value = json!({ "api_key": "not-a-reference" });
         let secret_vars = vec!["api_key".to_owned()];
 
-        resolve_declared_secrets(&mut value, &secret_vars).expect("literal needs no resolution");
+        resolve_operator_authored(&mut value, &secret_vars).expect("literal needs no resolution");
 
         assert_eq!(value["api_key"], "not-a-reference");
     }
@@ -1083,7 +1213,7 @@ mod tests {
         let mut value = json!({ "token": format!("file:{}", path.display()) });
         let secret_vars = vec!["token".to_owned()];
 
-        resolve_declared_secrets(&mut value, &secret_vars).expect("file reference resolves");
+        resolve_operator_authored(&mut value, &secret_vars).expect("file reference resolves");
 
         assert_eq!(value["token"], "DISTINCTIVE_FILE_SECRET_4b1c");
     }
@@ -1099,7 +1229,7 @@ mod tests {
         let mut value = json!({ "a": "env:PATH", "b": "${PATH}" });
         let secret_vars = vec!["a".to_owned(), "b".to_owned()];
 
-        resolve_declared_secrets(&mut value, &secret_vars).expect("env references resolve");
+        resolve_operator_authored(&mut value, &secret_vars).expect("env references resolve");
 
         assert_eq!(value["a"], expected);
         assert_eq!(value["b"], expected);
@@ -1120,7 +1250,7 @@ mod tests {
 
         let mut value = json!({ "token": "secret://fixture/token" });
         let secret_vars = vec!["token".to_owned()];
-        resolve_declared_secrets(&mut value, &secret_vars)
+        resolve_operator_authored(&mut value, &secret_vars)
             .expect("provider-uri reference resolves");
 
         assert_eq!(value["token"], "DISTINCTIVE_VAULT_SECRET_9e21");
@@ -1134,9 +1264,126 @@ mod tests {
         let mut value = json!({ "token": "vault://missing-backend/name" });
         let secret_vars = vec!["token".to_owned()];
 
-        let error = resolve_declared_secrets(&mut value, &secret_vars).unwrap_err();
+        let error = resolve_operator_authored(&mut value, &secret_vars).unwrap_err();
 
         assert!(error.contains("proxy.secrets.backends"), "{error}");
+    }
+
+    // --- WOR-2433: a bundle manifest may not author a secret reference ---
+
+    #[test]
+    fn a_value_the_manifest_authored_may_not_read_the_host_environment() {
+        // The attack: the manifest declares `token` in `secret_vars` and
+        // supplies its own default for it, so no line of the operator's
+        // config names the variable. PATH stands in for the credential;
+        // it is read here only to prove it never reaches the config or
+        // the error.
+        let host_value = std::env::var("PATH").expect("PATH is set in the test environment");
+        let mut value = json!({ "token": "env:PATH" });
+        let operator_authored = json!({});
+
+        let error = resolve_declared_secrets(
+            &mut value,
+            &["token".to_owned()],
+            &operator_authored,
+            "acme-bundle",
+        )
+        .expect_err("a manifest default may not resolve a host-backed reference");
+
+        assert_eq!(
+            value["token"], "env:PATH",
+            "the reference must be left exactly as authored, never resolved"
+        );
+        assert!(error.contains("acme-bundle"), "{error}");
+        assert!(error.contains("token"), "{error}");
+        assert!(
+            !error.contains(&host_value),
+            "the refusal echoed the host's value"
+        );
+    }
+
+    #[test]
+    fn a_value_the_manifest_authored_may_not_read_a_host_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("host-owned");
+        std::fs::write(&path, "DISTINCTIVE_HOST_FILE_SECRET_7c3d\n").unwrap();
+        let reference = format!("file:{}", path.display());
+        let mut value = json!({ "token": reference.clone() });
+
+        let error =
+            resolve_declared_secrets(&mut value, &["token".to_owned()], &json!({}), "acme-bundle")
+                .expect_err("a manifest default may not read a host file");
+
+        assert_eq!(value["token"], reference, "the path must not be opened");
+        assert!(
+            !error.contains("DISTINCTIVE_HOST_FILE_SECRET_7c3d"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_value_the_manifest_authored_may_not_name_an_operator_backend() {
+        // A provider URI is allowed everywhere else in the confined
+        // boundary, because it resolves against a backend the operator
+        // declared. It is refused here, with a resolver installed and
+        // the secret present, because the bundle would be choosing
+        // which of the operator's secrets its own guest code reads.
+        sbproxy_vault::reset_process_resolver_for_test();
+        let vault = sbproxy_vault::LocalVault::new();
+        vault
+            .set_secret("token", "DISTINCTIVE_BACKEND_SECRET_5f80")
+            .expect("fixture secret");
+        let mut manager = sbproxy_vault::VaultManager::new();
+        manager.register("fixture", Box::new(vault));
+        sbproxy_vault::install_process_resolver(std::sync::Arc::new(
+            sbproxy_vault::SecretResolver::new().with_manager(std::sync::Arc::new(manager)),
+        ));
+
+        let mut value = json!({ "token": "secret://fixture/token" });
+        let error =
+            resolve_declared_secrets(&mut value, &["token".to_owned()], &json!({}), "acme-bundle")
+                .expect_err("a manifest default may not name a declared backend either");
+
+        assert_eq!(value["token"], "secret://fixture/token");
+        assert!(
+            !error.contains("DISTINCTIVE_BACKEND_SECRET_5f80"),
+            "{error}"
+        );
+
+        sbproxy_vault::reset_process_resolver_for_test();
+    }
+
+    #[test]
+    fn the_same_key_still_resolves_when_the_operator_wrote_the_reference() {
+        // The other half of the boundary. The operator owns the host's
+        // secrets, so an operator-written reference for the very key the
+        // manifest declares resolves exactly as it did before.
+        let expected = std::env::var("PATH").expect("PATH is set in the test environment");
+        let operator_authored = json!({ "token": "env:PATH" });
+        let mut value = operator_authored.clone();
+
+        resolve_declared_secrets(
+            &mut value,
+            &["token".to_owned()],
+            &operator_authored,
+            "acme-bundle",
+        )
+        .expect("an operator-authored reference still resolves");
+
+        assert_eq!(value["token"], expected);
+    }
+
+    #[test]
+    fn a_manifest_default_that_is_not_a_reference_is_left_alone() {
+        // The refusal is scoped to references. A manifest supplying an
+        // ordinary default (a threshold, a label, a URL) is the feature
+        // working, not an attack, and must not be refused.
+        let mut value = json!({ "token": "a-literal-default", "threshold": 5 });
+
+        resolve_declared_secrets(&mut value, &["token".to_owned()], &json!({}), "acme-bundle")
+            .expect("a literal default is not a secret reference");
+
+        assert_eq!(value["token"], "a-literal-default");
     }
 
     #[test]
@@ -1174,7 +1421,7 @@ mod tests {
         let mut value = json!({ "token": format!("file:{}", path.display()), "label": "ok" });
         let secret_vars = vec!["token".to_owned()];
 
-        resolve_declared_secrets(&mut value, &secret_vars).expect("file reference resolves");
+        resolve_operator_authored(&mut value, &secret_vars).expect("file reference resolves");
         let masked = mask_declared_vars(&value, &secret_vars);
         let rendered = masked.to_string();
 
