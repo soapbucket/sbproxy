@@ -8987,6 +8987,13 @@ impl ProxyHttp for SbProxy {
         // so reading it recorded a failure for every successful call.
         record_routing_feedback(ctx, status_u16);
 
+        // WOR-2654: the primary half of any shadow pair this request
+        // opened. Same `status_u16` as above and for the same reason:
+        // the AI path never reaches the `response_filter` that sets
+        // `ctx.response_status`, so reading that field would report
+        // every paired primary as a failure.
+        record_shadow_primary_leg(ctx, status_u16);
+
         // WOR-2145: cut the attested consumption receipt.
         //
         // Here rather than in `response_filter` because this is the
@@ -9120,6 +9127,15 @@ impl ProxyHttp for SbProxy {
                 model: ctx.ai_model.clone(),
                 tokens_in: ctx.ai_tokens_in,
                 tokens_out: ctx.ai_tokens_out,
+                // WOR-2658: both are subsets of `tokens_in` rather than
+                // additions to it, so a reader summing the row does not
+                // double-count a cached prefix.
+                tokens_cached: ctx.ai_tokens_cached,
+                tokens_cache_write: ctx.ai_tokens_cache_write,
+                // WOR-2658: the tier that priced them, beside the
+                // tokens. Always the operator's; the caller's own
+                // `service_tier` field never survives dispatch.
+                service_tier: ctx.ai_service_tier.as_ref().map(ToString::to_string),
                 cost_usd_micros: ctx.ai_cost_usd_micros,
                 guardrail_category: ctx.ai_guardrail_category.clone(),
                 guardrail_action: ctx.ai_guardrail_action.clone(),

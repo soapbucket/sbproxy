@@ -164,17 +164,45 @@ action:
       timeout_ms: 180000
 ```
 
-The failover it takes is labeled, so it does not disappear into the
-generic transport bucket:
+"The next candidate" is whatever the attempt budget lets the request
+reach, so the budget is only half of the arrangement. The rule is not
+the strategy on its own. The attempt loop runs the whole provider order
+when any of three things is true: the strategy is `fallback_chain`, the
+origin sets `resilience.content_policy_fallback: true`, or the origin
+configures a typed fallback list (`context_window_fallbacks` or
+`content_policy_fallbacks`, both documented below). Otherwise the loop
+gets one attempt and there is no successor to hand anything to.
+
+So a `round_robin` origin with none of those three gets the refusal
+rather than the sibling: the elapse bounds the attempt and the caller
+sees a `502` naming the budget. The same origin with
+`context_window_fallbacks:` set does hand the elapse to the next
+candidate, even though nothing about that reroute is a context-window
+failure, because the key opened the budget. Size the budget knowing
+which of the two you are running.
+
+Where the request is handed on, the failover is labeled, so it does not
+disappear into the generic transport bucket:
 
 ```
 sbproxy_ai_failovers_total{from_provider="primary",to_provider="secondary",reason="pre_header_timeout"} 1
 ```
 
-The other `reason` values on that counter are `http_<status>` for an
-availability failover, `transport` for a connection-level failure,
-`managed_cold_fallback` for a managed local model that could not be
-brought up, and the typed reroute reasons the sections above cover.
+That series ticks only when a handoff happens. It is emitted at the
+handoff, so an origin whose attempt budget is one records nothing on
+it: alerting on
+`rate(sbproxy_ai_failovers_total{reason="pre_header_timeout"}[5m]) > 0`
+on such an origin reads zero through an incident in which every
+streaming request is failing at the budget. What always ticks is
+`sbproxy_ai_provider_errors_total{provider,error_kind="timeout"}`, which a
+pre-header elapse is classified as, alongside the `502` the caller
+receives. Alert on that one where the budget cannot hand anything on.
+
+The other `reason` values on the failover counter are `http_<status>`
+for an availability failover, `transport` for a connection-level
+failure, `managed_cold_fallback` for a managed local model that could
+not be brought up, and the typed reroute reasons the sections above
+cover.
 
 Three limits worth knowing before you size it. The key is ignored on
 non-streaming requests, which have no partial output to protect and keep

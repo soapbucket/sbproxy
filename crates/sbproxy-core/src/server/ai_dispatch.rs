@@ -2717,6 +2717,13 @@ fn try_spawn_governed_shadow_after_primary(
         return;
     }
     let usage = super::ai_support::shadow_usage_record_from_context(ctx);
+    // WOR-2654: the pair's join key, plus the retention sink when this
+    // request already passed the content-recording gate. The gate is
+    // read here with the same helper the primary's own capture uses, so
+    // a route that keeps the caller's answer keeps the candidate's and
+    // a route that keeps neither keeps neither.
+    let eval =
+        super::ai_support::shadow_eval_context(config, ctx, content_capture_allowed(config, ctx));
     let reservation_prefix = format!("{}:quota-pool", ctx.request_id);
     // Shared client on purpose. A shadow copy outlives the caller's
     // request and is the operator's evaluation traffic, so a caller's
@@ -2736,6 +2743,7 @@ fn try_spawn_governed_shadow_after_primary(
             quota.clone(),
             &reservation_prefix,
             reasoning_eligibility,
+            &eval,
         );
 }
 
@@ -3527,6 +3535,32 @@ fn carry_inbound_identity_into_stamped_principal(
 /// WOR-2096: both the origin flag and the governed key's policy must
 /// consent before any redacted content sample is retained. Fail closed:
 /// no effective policy (unkeyed or native traffic) means no capture.
+/// WOR-2651: whether a prompt-cache lease may re-order this request's
+/// candidates, and whether one may be recorded for it.
+///
+/// A free function rather than an expression inline in
+/// `handle_ai_proxy`, because the rule it encodes is four clauses long,
+/// is stated in prose in `docs/ai-gateway.md`, and was wrong: the
+/// dispatch site named `fallback_chain` among the excluded strategies
+/// in a comment and never tested for it. A rule with four arms wants a
+/// name and a test, not a chain of `is_none()` a reader has to hold
+/// against a paragraph.
+///
+/// - `configured`: the origin declared a `cache_affinity:` block.
+/// - `is_failover`: this is a retry after a candidate failed, where
+///   the point is to try somewhere *else*.
+/// - `has_routing_policy_plan`: an authored `routing_policy` named this
+///   request's providers in order.
+/// - `strategy_owns_order`: [`sbproxy_ai::routing::Router::owns_candidate_order`].
+fn cache_affinity_may_reorder(
+    configured: bool,
+    is_failover: bool,
+    has_routing_policy_plan: bool,
+    strategy_owns_order: bool,
+) -> bool {
+    configured && !is_failover && !has_routing_policy_plan && !strategy_owns_order
+}
+
 fn content_capture_allowed(config: &AiHandlerConfig, ctx: &RequestContext) -> bool {
     config.capture_content
         && ctx
@@ -6305,10 +6339,7 @@ fn apply_operator_service_tier(
     // than only the tier-capable ones is the fail-closed half: a vendor that
     // honors it somewhere undocumented still cannot be steered by a caller.
     let caller_tier = object.remove("service_tier");
-    let operator_tier = surface
-        .supports_service_tier()
-        .then(|| sbproxy_ai::service_tier::resolved_wire_tier(provider))
-        .flatten();
+    let operator_tier = resolved_operator_tier(provider, surface);
     match operator_tier {
         Some((field, value)) => {
             object.insert(field.clone(), serde_json::Value::String(value.clone()));
@@ -6326,6 +6357,49 @@ fn apply_operator_service_tier(
             None
         }
     }
+}
+
+/// The `(wire field, wire value)` this provider resolves to on this
+/// surface, or `None` when the surface has no tier axis or the entry
+/// declares no tier.
+///
+/// One expression, called by the enforcer that writes the field and by
+/// the recorder that stamps the admin row. Two copies of the same gate
+/// would drift the moment either was narrowed, and the failure that
+/// drift produces is a row claiming a tier the request was not served
+/// under, which is exactly what putting the tier on the row was for.
+fn resolved_operator_tier(
+    provider: &sbproxy_ai::provider::ProviderConfig,
+    surface: &sbproxy_ai::handler::AiSurface,
+) -> Option<(String, String)> {
+    surface
+        .supports_service_tier()
+        .then(|| sbproxy_ai::service_tier::resolved_wire_tier(provider))
+        .flatten()
+}
+
+/// The service tier a request was served under, as the admin request
+/// row records it.
+///
+/// Gated on [`resolved_operator_tier`], so the row is absent exactly
+/// when no tier was written, but it records the operator's own
+/// spelling (`flex`, `standard`, `priority`) rather than the vendor's.
+/// The two differ: OpenAI's catalog spells `standard` as `default` on
+/// the wire, and an operator reading their own request log should see
+/// the word they wrote in the config rather than the one the vendor
+/// happens to use. `docs/admin-api-reference.md` says so on the row.
+///
+/// Read off a provider rather than off the returned pair, because the
+/// raced dispatch resolves its winner after the loop that applied the
+/// tier has ended.
+fn served_service_tier(
+    provider: &sbproxy_ai::provider::ProviderConfig,
+    surface: &sbproxy_ai::handler::AiSurface,
+) -> Option<compact_str::CompactString> {
+    resolved_operator_tier(provider, surface)?;
+    provider
+        .service_tier
+        .map(|tier| compact_str::CompactString::new(tier.to_string()))
 }
 
 /// Derive one caller-scoped prompt-cache lease identity for a request.
@@ -9580,6 +9654,10 @@ pub(super) async fn handle_ai_proxy(
                 captured_at: chrono::Utc::now().to_rfc3339(),
                 input_messages: capture_messages,
                 output_text: None,
+                // WOR-2654: filled in by the shadow tasks as their
+                // targets answer, and only for a request that reached
+                // here, which is to say only under this same consent.
+                shadow_responses: Vec::new(),
             });
         }
     }
@@ -11792,18 +11870,19 @@ pub(super) async fn handle_ai_proxy(
     // composition this feature is for.
     //
     // "Whatever the strategy picked" excludes the four that own their
-    // ordering outright, which is the same set the block above skips plus
-    // `fallback_chain`. A cascade's tiers, cost_quality's cheap/frontier
-    // split, an authored routing-policy plan, and a priority-sorted failover
-    // chain are all orderings the operator wrote down on purpose; a lease
-    // jumping that queue would quietly defeat the strategy rather than
-    // compose with it. Nothing is recorded on those origins either, so the
-    // table never fills with leases no lookup will read.
-    let cache_affinity_applies = config.cache_affinity.is_some()
-        && !is_failover
-        && routing_policy_cascade.is_none()
-        && router.cascade_config().is_none()
-        && router.cost_quality_config().is_none();
+    // ordering outright. The rule and the check used to live apart: this
+    // comment named all four while the condition below tested three, so
+    // `fallback_chain` was documented as excluded and was not. The
+    // predicate is a named free function now, and the strategy half of
+    // it is `Router::owns_candidate_order`, so the next reader compares
+    // one sentence against one expression instead of a paragraph against
+    // a chain of `is_none()`.
+    let cache_affinity_applies = cache_affinity_may_reorder(
+        config.cache_affinity.is_some(),
+        is_failover,
+        routing_policy_cascade.is_some(),
+        router.owns_candidate_order(),
+    );
     // The key is derived once and reused at the record site below, so the
     // lease is written under the same identity it was read under.
     let cache_affinity_key = cache_affinity_applies
@@ -12625,6 +12704,11 @@ pub(super) async fn handle_ai_proxy(
                 provider.map_model(&model)
             };
             ctx.ai_provider = Some(provider.name.to_string());
+            // WOR-2658: the tier is read off the winner rather than
+            // from inside the racing loop, which cannot borrow `ctx`
+            // and would in any case stamp the last candidate built
+            // rather than the one that served.
+            ctx.ai_service_tier = served_service_tier(provider, &surface);
             if !resolved_model.is_empty() {
                 ctx.ai_model = Some(resolved_model.clone());
             }
@@ -12866,6 +12950,11 @@ pub(super) async fn handle_ai_proxy(
         // Map model name for this provider.
         let mut attempt_body = body.clone();
         let operator_tier = apply_operator_service_tier(provider, &surface, &mut attempt_body);
+        // WOR-2658: the row's fifth fact, beside provider, model,
+        // credential source and the cache tokens. Overwritten per
+        // attempt, so a failover leaves the tier of the provider that
+        // actually served rather than the one that did not.
+        ctx.ai_service_tier = served_service_tier(provider, &surface);
         let resolved_model = if !model.is_empty() {
             let mapped = provider.map_model(&model);
             if mapped != model {
@@ -20474,6 +20563,7 @@ mod external_guardrail_context_tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use super::cache_affinity_may_reorder;
     use crate::server::{ai_idempotency_body_is_wire, AI_IDEMPOTENCY_BODY_FORMAT_HEADER};
     use pingora_core::protocols::l4::stream::Stream;
     use pingora_proxy::Session;
@@ -23039,6 +23129,16 @@ origins:
     }
 
     async fn dispatch_chat_request(config: &sbproxy_ai::AiHandlerConfig, body: serde_json::Value) {
+        dispatch_chat_request_context(config, body).await;
+    }
+
+    /// [`dispatch_chat_request`], handing back the request context the
+    /// dispatch stamped, for the tests that assert what reached the
+    /// admin request row rather than what reached the upstream.
+    async fn dispatch_chat_request_context(
+        config: &sbproxy_ai::AiHandlerConfig,
+        body: serde_json::Value,
+    ) -> crate::context::RequestContext {
         let (mut session, client) = downstream_session(body).await;
         let mut context = crate::context::RequestContext::new();
         context.tenant_id = "tenant-a".into();
@@ -23055,6 +23155,7 @@ origins:
         drop(session);
         let response = live_downstream_body(client).await;
         assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+        context
     }
 
     /// WOR-2651: the control for the affinity test below.
@@ -23199,6 +23300,62 @@ origins:
         );
     }
 
+    /// WOR-2651, re-checked by WOR-2658: the four exclusions the docs
+    /// promise, as one table.
+    ///
+    /// Red before the fix on the `fallback_chain` row. The dispatch
+    /// site's own comment named that strategy among the excluded ones
+    /// and the condition never tested for it, so a priority-sorted
+    /// chain had its first candidate replaced by whichever provider
+    /// held the caller's lease, and recorded a fresh lease on every
+    /// success. `docs/ai-gateway.md` says of all four that "on those
+    /// origins no lease is read and none is recorded".
+    #[test]
+    fn cache_affinity_stands_aside_for_every_authored_ordering() {
+        // (configured, is_failover, routing_policy_plan, strategy_owns_order)
+        assert!(
+            cache_affinity_may_reorder(true, false, false, false),
+            "an ordinary strategy with a configured block is the whole point"
+        );
+        assert!(
+            !cache_affinity_may_reorder(false, false, false, false),
+            "no block, no affinity"
+        );
+        assert!(
+            !cache_affinity_may_reorder(true, true, false, false),
+            "a failover is trying somewhere else on purpose"
+        );
+        assert!(
+            !cache_affinity_may_reorder(true, false, true, false),
+            "an authored routing_policy plan names its providers in order"
+        );
+        assert!(
+            !cache_affinity_may_reorder(true, false, false, true),
+            "fallback_chain, cascade, and cost_quality each own their order"
+        );
+    }
+
+    /// The strategy half of the rule above, at the seam that decides it
+    /// rather than at the predicate that consumes it. A predicate that
+    /// takes the right boolean proves nothing if the router hands it
+    /// the wrong one.
+    #[test]
+    fn the_router_reports_a_fallback_chain_as_owning_its_order() {
+        assert!(
+            sbproxy_ai::routing::Router::new(
+                sbproxy_ai::routing::RoutingStrategy::FallbackChain,
+                2
+            )
+            .owns_candidate_order(),
+            "the arm that was missing"
+        );
+        assert!(!sbproxy_ai::routing::Router::new(
+            sbproxy_ai::routing::RoutingStrategy::RoundRobin,
+            2
+        )
+        .owns_candidate_order());
+    }
+
     /// WOR-2652: the security regression test.
     ///
     /// Before this change a caller POSTing `{"service_tier": "priority"}`
@@ -23248,6 +23405,125 @@ origins:
             1.0,
             "overwriting a caller's tier must be scrapeable"
         );
+    }
+
+    /// WOR-2658: the per-request record has to name the tier, not only
+    /// the metric. `sbproxy_ai_service_tier_decisions_total` counts
+    /// dispositions across the deployment and cannot answer what one
+    /// request was priced at, which is the question the admin request
+    /// row exists for.
+    #[tokio::test]
+    async fn the_request_context_records_the_tier_the_attempt_was_served_under() {
+        let (upstream_url, hits, _captured) = capturing_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+        )
+        .await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai-flex",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key",
+                "service_tier": "flex"
+            }]
+        }))
+        .expect("service tier proxy config");
+
+        let context = dispatch_chat_request_context(
+            &config,
+            serde_json::json!({
+                "model": "fixture-model",
+                "service_tier": "priority",
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }),
+        )
+        .await;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            context.ai_service_tier.as_deref(),
+            Some("flex"),
+            "the row records the operator's tier, never the caller's"
+        );
+    }
+
+    /// The row records the operator's own spelling and the wire carries
+    /// the vendor's. OpenAI's catalog spells the `standard` tier
+    /// `default`, so this is the one case where the two differ, and
+    /// `docs/admin-api-reference.md` promises the row shows what the
+    /// operator wrote.
+    #[tokio::test]
+    async fn the_row_records_the_operators_spelling_and_the_wire_the_vendors() {
+        let (upstream_url, hits, captured) = capturing_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+        )
+        .await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai-standard",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key",
+                "service_tier": "standard"
+            }]
+        }))
+        .expect("service tier proxy config");
+
+        let context = dispatch_chat_request_context(
+            &config,
+            serde_json::json!({
+                "model": "fixture-model",
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }),
+        )
+        .await;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let body = captured_upstream_json(captured).await;
+        assert_eq!(
+            body["service_tier"], "default",
+            "the vendor's own spelling goes on the wire: {body}"
+        );
+        assert_eq!(
+            context.ai_service_tier.as_deref(),
+            Some("standard"),
+            "and the operator's own spelling goes on the row"
+        );
+    }
+
+    /// A provider declaring no tier leaves the field absent rather than
+    /// inventing one, so a row reading `service_tier` empty means the
+    /// request was priced at the vendor's default.
+    #[tokio::test]
+    async fn a_provider_with_no_tier_leaves_the_row_field_absent() {
+        let (upstream_url, hits, _captured) = capturing_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+        )
+        .await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai-plain",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key"
+            }]
+        }))
+        .expect("plain proxy config");
+
+        let context = dispatch_chat_request_context(
+            &config,
+            serde_json::json!({
+                "model": "fixture-model",
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }),
+        )
+        .await;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(context.ai_service_tier, None);
     }
 
     /// One `sbproxy_ai_service_tier_decisions_total` disposition. Absent

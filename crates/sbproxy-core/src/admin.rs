@@ -445,6 +445,39 @@ pub struct RequestLogEntry {
     /// Completion tokens, when reported.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_out: Option<u64>,
+    /// Provider prompt-cache **read** tokens, when the provider
+    /// reported them (OpenAI's `prompt_tokens_details.cached_tokens`,
+    /// Anthropic's `cache_read_input_tokens`).
+    ///
+    /// WOR-2658: a subset of `tokens_in`, not an addition to it, and on
+    /// this row because this is the row that already names the provider,
+    /// the model, and the credential that paid. Before this the counts
+    /// existed only on the request-event envelope and the attribution
+    /// metric, so the one record an operator reads per request could
+    /// show a bill that dropped without showing the cache hit that
+    /// explains it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_cached: Option<u64>,
+    /// Provider prompt-cache **write** tokens (Anthropic's
+    /// `cache_creation_input_tokens`). Absent for providers that report
+    /// only cache reads. Also a subset of `tokens_in`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_cache_write: Option<u64>,
+    /// Operator service tier the AI attempt was served under (WOR-2652),
+    /// as the value written on the wire (`flex`, `priority`, and so on).
+    ///
+    /// WOR-2658: the fifth fact this row owes an operator, beside the
+    /// provider, the model, the credential that paid, and the cache
+    /// tokens. The tier reached only
+    /// `sbproxy_ai_service_tier_decisions_total{disposition}` and the
+    /// outbound body, so the row could show a bill without showing the
+    /// tier that priced it. Absent when the surface has no tier axis,
+    /// when the provider declares none, and on rows the AI gateway did
+    /// not dispatch. It is always the operator's tier: a caller's own
+    /// `service_tier` field is stripped before dispatch and never
+    /// reaches this row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
     /// Derived AI cost in micro-USD (WOR-1874).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_usd_micros: Option<u64>,
@@ -4428,7 +4461,7 @@ impl ExportFormat {
 /// the column index a spreadsheet or a billing importer has already
 /// bound to. Unlike the JSONL shape, a CSV row is positional, so the
 /// order is part of the contract.
-const EXPORT_CSV_COLUMNS: [&str; 37] = [
+const EXPORT_CSV_COLUMNS: [&str; 40] = [
     "timestamp",
     "origin",
     "method",
@@ -4469,6 +4502,13 @@ const EXPORT_CSV_COLUMNS: [&str; 37] = [
     // importer keyed on column position keeps working and a new one
     // reads which credential paid for the row.
     "credential_source",
+    // WOR-2658, appended after it for the same reason. Both are subsets
+    // of `tokens_in` rather than additions to it.
+    "tokens_cached",
+    "tokens_cache_write",
+    // WOR-2658, appended last for the same reason again: the tier that
+    // priced the row, beside the tokens it priced.
+    "service_tier",
 ];
 
 /// One row's value in `column`, as text.
@@ -4504,6 +4544,8 @@ fn export_csv_cell(entry: &RequestLogEntry, column: &str) -> String {
         "model" => text(&entry.model),
         "tokens_in" => number(&entry.tokens_in),
         "tokens_out" => number(&entry.tokens_out),
+        "tokens_cached" => number(&entry.tokens_cached),
+        "tokens_cache_write" => number(&entry.tokens_cache_write),
         "cost_usd_micros" => number(&entry.cost_usd_micros),
         "guardrail_category" => text(&entry.guardrail_category),
         "guardrail_action" => text(&entry.guardrail_action),
@@ -4511,6 +4553,7 @@ fn export_csv_cell(entry: &RequestLogEntry, column: &str) -> String {
         "key_mode" => entry.key_mode.clone(),
         "key_provider" => text(&entry.key_provider),
         "credential_source" => text(&entry.credential_source),
+        "service_tier" => text(&entry.service_tier),
         "tenant_id" => entry.tenant_id.clone(),
         "user_id" => text(&entry.user_id),
         "error_class" => text(&entry.error_class),
@@ -5567,6 +5610,57 @@ pub fn handle_admin_request(
             limit,
         );
         return match serde_json::to_string(&entries) {
+            Ok(body) => (200, "application/json", body),
+            Err(e) => (
+                500,
+                "application/json",
+                format!(r#"{{"error":"serialization failed: {e}"}}"#),
+            ),
+        };
+    }
+    // WOR-2654: the shadow-eval comparison view, one row per target.
+    // `window` accepts the spend vocabulary plus `15m`; the default is
+    // `1h`. GET-only, so read RBAC applies with no extra gating.
+    //
+    // Every row leads with provenance (requests seen, the sample rate
+    // applied, pairs retained, pairs dropped by reason) because the
+    // deltas under it are computed over the retained pairs alone and a
+    // delta over four pairs reads identically to one over four thousand
+    // once it is a single number. The source is a bounded process-local
+    // ring, so a window wider than the ring's turnover reports the ring;
+    // `requests_seen` is what says which happened.
+    if path_only == "/api/ai/shadow/report" {
+        if !method.eq_ignore_ascii_case("GET") {
+            return (
+                405,
+                "application/json",
+                r#"{"error":"method not allowed"}"#.to_string(),
+            );
+        }
+        let window_secs = match rl_query_param(path, "window") {
+            None => 3_600,
+            Some("15m") => 900,
+            Some(window) => match parse_spend_window(window) {
+                Some(secs) => secs,
+                None => {
+                    return (
+                        400,
+                        "application/json",
+                        r#"{"error":"unknown window (15m|1h|24h|7d|30d)"}"#.to_string(),
+                    );
+                }
+            },
+        };
+        let targets: Vec<sbproxy_ai::shadow_eval::TargetSummary> =
+            sbproxy_ai::shadow_eval::report_with_judge(
+                std::time::Duration::from_secs(window_secs),
+                &sbproxy_ai::shadow_judge::agreement_for,
+            );
+        let body = serde_json::json!({
+            "window_secs": window_secs,
+            "targets": targets,
+        });
+        return match serde_json::to_string(&body) {
             Ok(body) => (200, "application/json", body),
             Err(e) => (
                 500,
@@ -9377,16 +9471,36 @@ mod tests {
         // panics if the name is missing, and indexing panics if the row
         // is short, which is the pair this asserts.
         assert_eq!(header.len(), row.len(), "{header:?} vs {row:?}");
+        // The four columns appended since the original contract, in
+        // append order. An importer keyed on position keeps working
+        // because nothing before them moved.
         assert_eq!(
-            col("credential_source"),
-            header.len() - 1,
-            "credential_source is the appended column"
+            [
+                col("credential_source"),
+                col("tokens_cached"),
+                col("tokens_cache_write"),
+                col("service_tier"),
+            ],
+            [
+                header.len() - 4,
+                header.len() - 3,
+                header.len() - 2,
+                header.len() - 1,
+            ],
+            "the appended columns keep their append order: {header:?}"
         );
-        assert_eq!(
-            row[col("credential_source")],
-            "",
-            "a non-AI row leaves it empty rather than dropping the field"
-        );
+        for column in [
+            "credential_source",
+            "tokens_cached",
+            "tokens_cache_write",
+            "service_tier",
+        ] {
+            assert_eq!(
+                row[col(column)],
+                "",
+                "a non-AI row leaves {column} empty rather than dropping the field"
+            );
+        }
     }
 
     #[test]
@@ -9452,6 +9566,49 @@ mod tests {
             None,
         );
         assert_eq!(status, 400, "{body}");
+    }
+
+    /// WOR-2654: the shadow report's `window` vocabulary is closed, and
+    /// the refusal names the whole accepted set. Every other refusal
+    /// this surface adds is pinned by name and this one was not, which
+    /// left the accepted set free to drift from the message describing
+    /// it.
+    #[test]
+    fn the_shadow_report_refuses_a_window_it_does_not_serve() {
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+
+        for window in ["15m", "1h", "24h", "7d", "30d"] {
+            let (status, _, body) = handle_admin_request(
+                "GET",
+                &format!("/api/ai/shadow/report?window={window}"),
+                &state,
+                Some(&auth),
+                None,
+            );
+            assert_eq!(status, 200, "{window} is an accepted window: {body}");
+        }
+
+        let (status, _, body) = handle_admin_request(
+            "GET",
+            "/api/ai/shadow/report?window=90d",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 400, "{body}");
+        for window in ["15m", "1h", "24h", "7d", "30d"] {
+            assert!(
+                body.contains(window),
+                "the refusal has to name every window it does serve, and it omits \
+                 {window}: {body}"
+            );
+        }
+
+        // GET only, so a write verb cannot reach a read surface.
+        let (status, _, body) =
+            handle_admin_request("POST", "/api/ai/shadow/report", &state, Some(&auth), None);
+        assert_eq!(status, 405, "{body}");
     }
 
     #[test]
