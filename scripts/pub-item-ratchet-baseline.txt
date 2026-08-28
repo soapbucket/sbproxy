@@ -889,8 +889,85 @@ not given. `pipeline::CompiledFallback` had only ever been named inside
 `on_error` condition into a named function that takes one, so the type is
 now referenced from `server/proxy_http.rs` and leaves the bucket.
 
+2026-08-27 (WOR-2658 / WOR-2654, the shadow-eval comparison surface):
+unreferenced 1461 -> 1477, tests-only unchanged at 314. Recomputed
+against the tree after merging the WOR-2690 entry above, not carried
+over from the pre-merge run: the two entries move the same counter and
+only a recount can say what the merged tree holds.
+
+Four avoidable items were removed before recording this.
+`ShadowEvalContext::retains_responses` was deleted rather than narrowed,
+since the public field it wrapped says the same thing, and
+`ShadowPairLedger::is_armed` was removed, since its only reader was a
+test and the behavior it described is asserted through the report
+instead. `AiShadowJudge::model` and `AiShadowJudge::divergence_prefilter`
+were removed outright: both parsed and nothing read them, and a
+parse-only config key is worse than an absent one. `TargetSummary` was
+already reachable from `sbproxy-core` and is now named there explicitly
+so the scan can see it.
+
+The additions fall in two groups, and both were tried as pub(crate)
+first.
+
+Four are the nested blocks of the `GET /api/ai/shadow/report` response:
+`TargetProvenance`, `TargetCost`, `TargetLatency`, and `TargetErrors` in
+`sbproxy-ai/src/shadow_eval.rs`. They are pub because they are field
+types of the pub `TargetSummary`, which `sbproxy-core`'s admin handler
+returns. Nothing names them in Rust because nothing reads them in Rust:
+they exist to give that response its shape, and their consumer is the
+JSON an operator reads. The e2e
+(`e2e/tests/sota_gateway_integration.rs::
+the_shadow_report_leads_with_provenance_and_names_every_target`) asserts
+on the rendered JSON of `TargetProvenance` and `TargetLatency` and not
+on `TargetCost` or `TargetErrors`, whose fields are covered by
+`shadow_eval.rs`'s own tests rather than end to end. Narrowing any of
+them would leave a pub struct whose fields the crate returning it cannot
+reach.
+
+The rest are the batch judge's planning API in
+`sbproxy-ai/src/shadow_judge.rs`: `JUDGE_CALLS_PER_PAIR`, `Divergence`,
+`DivergenceKind`, `JudgeCandidate`, `classify_pair`, `JudgeAdmission`,
+`JudgeSpendSnapshot`, `JudgeBudget`, `JudgePair`, `PairPlan`,
+`JudgePlan`, and `plan_batch`. These have no production caller yet by
+design: the deterministic divergence pre-filter and the hard spend cap
+ship now, and the judge prompt and scoring loop are a scoped follow-up,
+WOR-2691, which names these twelve items as the delta it is answerable
+for. The shadow-eval section of `docs/ai-gateway.md` carries the same
+scope for an operator, and says in so many words that nothing behind the
+`judge:` key is running yet. Narrowing
+them to pub(crate) was tried and produced eleven `never used` errors
+under `-D warnings`, which is the #757 shape the 2026-08-25 entry above
+describes: an item whose only callers are cfg(test) code is dead code.
+They stay pub until the scorer calls them, and their contracts are
+pinned by in-file tests in the meantime.
+
+Deliberately not lowered to 1476, which is what the scan reads at the
+end of the fix round. The one item that left the bucket, `TargetCost`,
+left it because a comment in `sbproxy-ai/src/client.rs` names
+`TargetCost::delta_usd` while explaining why both vendors' cache
+spellings are read from one body. That is a comment naming the symbol,
+not a caller, so the item is exactly as unreferenced as it was; holding
+1476 would make deleting one comment line turn the gate red for no real
+regression. The number moves when a caller appears.
+
 2026-08-27 (WOR-2661 infra cluster merged with main at 1216bebf): the two
 parents counted the unreferenced bucket from different absolute bases, 1508 on
 this branch and 1461 on main. The merged tree measures 1508, so the committed
 baseline is unchanged and main's one-item gain is already inside it. Tests-only
 holds at 323.
+
+2026-08-27 (WOR-2661 infra cluster merged with main at dad92758): the two
+parents counted the unreferenced bucket from different absolute bases, 1508 on
+this branch and 1477 on main after the shadow-eval surface landed. The merged
+tree measures 1523, which is the committed baseline: it is the sum of both
+parents' items, not a concession by either. Recomputed against the merged tree
+rather than taken from a side, because neither parent's number describes it.
+Tests-only holds at 323 on both parents and on the merge.
+
+The infra cluster itself added nothing to either bucket. Every `pub` item the
+round introduced was given a real consumer instead: `metadata_policies` was
+deleted rather than kept beside the superiors-only version, `FetchBudget`'s two
+accessors report what a refused walk spent on the decision event, and
+`uses_local_jwks` is read at boot to log whether the MCP resource server
+resolved its keys in process or will fetch them.
+
