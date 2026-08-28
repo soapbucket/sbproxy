@@ -47,17 +47,45 @@ proxy:
                 use: sig
                 x: DpZdjog3y9hgIyKgEPltBi5ptXKUeuRwVOAPSmoQAu4
                 y: bfVVYV9slbMcg4dvtvYbeekYtpFXsYCWcIa9RCrBmTc
+      # A depth cap, not a fetch budget. The next four keys are the
+      # budget: authority_hints is an array, so one entity naming five
+      # thousand superiors would cost five thousand outbound GETs at
+      # depth 1 and this would never fire.
       max_chain_depth: 5
+      # Total outbound fetches one walk may spend, across every level.
+      # A well-formed chain costs about two per level.
+      max_chain_fetches: 16
+      # Total bytes one walk may read. Each fetch is capped at 1 MiB
+      # separately; this bounds the sum.
+      max_chain_bytes: 2097152
+      # Wall clock for the whole walk. Without it, a peer answering
+      # just inside each fetch's own timeout holds the request open
+      # for the product of the two.
+      max_chain_duration_ms: 5000
+      # Most superiors one entity configuration may name.
+      max_authority_hints: 8
+      # Chain walks one source address may start per minute. The
+      # decision cache is keyed on the source and the claimed entity
+      # id together, so a caller that rotates the entity id misses the
+      # cache; this is what bounds that.
+      walks_per_minute: 30
       cache_ttl_secs: 600
 # The federation fetcher's own egress. Without this block any public
 # address is reachable, which is the deliberate default: a federation
-# discovers its peers through the chain rather than listing them. Name
-# the anchors once you know them.
+# discovers its peers through the chain rather than listing them.
+#
+# If you do write it, it has to name every host a walk dials, and the
+# first fetch of any walk is the PEER's own entity configuration at the
+# peer's own host. An allowlist of anchors alone refuses every peer at
+# chain_unresolved, which reads like a broken federation rather than a
+# config mistake. This example is a closed federation with one member,
+# so both hosts are named.
 egress:
   federation:
     mode: deny_by_default
     hosts:
       - trust-anchor.example
+      - peer.example
 origins:
   "gateway.example.com":
     action:

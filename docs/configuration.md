@@ -466,7 +466,7 @@ proxy:
 | `credentials` | list | `[]` | Proxy-scope credentials inherited by tenant and origin scopes. |
 | `extensions` | object | | Opaque map for out-of-tree top-level config blocks. The proxy never parses them. |
 | `payments` | object | unset | Durable settlement for paid requests: SQLite intent/attempt/proof/receipt store, challenge binding key, authorization timeout, and the infra-failure posture. Absent keeps every payment provider config-only. See [payments.md](payments.md#getting-paid-proxypayments). |
-| `federation` | object | unset | OpenID Federation identity this proxy publishes at `/.well-known/openid-federation`, and the pinned anchors it verifies a peer against. See [federation.md](federation.md#configuring-proxyfederation). |
+| `federation` | object | unset | OpenID Federation identity this proxy publishes at `/.well-known/openid-federation`, and the pinned anchors it verifies a peer against. `peer_trust` runs a chain walk on the request path, so its `max_chain_fetches`, `max_chain_bytes`, `max_chain_duration_ms`, `max_authority_hints`, and `walks_per_minute` keys are what bound the outbound requests one unauthenticated caller can cause; `max_chain_depth` is a depth cap and not one of them. See [federation.md](federation.md#configuring-proxyfederation). |
 | `attestation` | object | unset | Receipt attestation for this node: whether it writes signed, hash-chained receipts, and its failure/enforcement posture. `role: claim` and `role: both` are refused at load because the claim half is not implemented, so an origin may narrow `role` but not widen it into that half. Backs the `/api/meter/*` operator surface. See [metering.md](metering.md#configuration). |
 
 ### Choosing a bind address

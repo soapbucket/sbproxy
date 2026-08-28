@@ -45,7 +45,13 @@ curl -si localhost:8080/.well-known/openid-federation
 - `GET /admin/federation` on the admin listener reports what is published
   and how many anchors are pinned.
 
-The trust half, with a real anchor:
+The trust half, with a real anchor. Note that `egress.federation.hosts`
+has to name every host a walk dials, and the first fetch of any walk is
+the peer's own entity configuration at the peer's own host: an allowlist
+of anchors alone refuses every peer at `chain_unresolved`. An open
+federation should leave the block off entirely; the unconditional layer
+still refuses every private, loopback, link-local, and CGNAT
+destination, and `max_chain_fetches` bounds what one walk can spend.
 
 - A request carrying `X-Federation-Entity-Id: https://peer.example` whose
   chain terminates at a pinned anchor is admitted, the header is rewritten

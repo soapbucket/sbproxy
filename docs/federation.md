@@ -97,6 +97,17 @@ before any second connect, the chain is bounded, and each refusal is
 counted on `sbproxy_egress_refused_total{purpose="federation"}`, logged,
 and stamped into `GET /api/egress`.
 
+**The list has to name every host the walk dials, peers included.** The
+first fetch of any walk is the peer's own entity configuration, at the
+peer's own host, and that hop is authorized against this list like every
+other. An allowlist naming only anchors and intermediates refuses every
+peer at `chain_unresolved`, which reads like a broken federation rather
+than a config mistake. So this block suits a closed federation whose
+members you enumerate. For an open one, leave it off: the unconditional
+first layer still refuses every private, loopback, link-local, and
+CGNAT destination, and the fetch budget above bounds what a walk can
+spend.
+
 What is left when you do not write that block: any *public* address is
 reachable. A federation deployment discovers its peers through the trust
 chain rather than listing them in advance, which is why the allowlist is
@@ -198,8 +209,29 @@ proxy:
 | `header` | no, `x-federation-entity-id` | Request header the peer names itself in. Matched case-insensitively. |
 | `trust_anchors` | yes | Pinned anchors, each with its `entity_id` and its published `jwks`. These keys are the pin: every chain is verified against them, and they come from your config rather than from the network. At least one is required. |
 | `required_trust_marks` | no, empty | Trust-mark ids a verified peer must additionally carry, each signed by the anchor the chain terminated at. |
-| `max_chain_depth` | no, 5 | Maximum statements in an accepted chain, and the fetch budget the composer walks with. |
-| `cache_ttl_secs` | no, 600 | How long a peer decision is reused before the chain is walked again. Refusals are cached too, so an unverified caller cannot make this proxy generate outbound traffic per request. |
+| `max_chain_depth` | no, 5 | Maximum statements in an accepted chain. This is a **depth** cap and not a fetch budget; see `max_chain_fetches` below for the one that bounds outbound requests. |
+| `max_chain_fetches` | no, 16 | Total outbound fetches one chain walk may spend, across every level. This is the bound that matters. `authority_hints` is an array, so one entity naming five thousand superiors would cost five thousand GETs at depth 1 and a depth cap would never fire. A well-formed chain spends about two fetches per level. |
+| `max_chain_bytes` | no, 2097152 | Total bytes one walk may read. Each fetch is separately capped at 1 MiB, so this bounds the sum: a peer serving a maximum-size document at every hop cannot make one request hold the product of the two. |
+| `max_chain_duration_ms` | no, 5000 | Wall-clock budget for one walk. Every fetch has its own timeout; without this, a peer answering just inside it at every hop holds the request open for the product. The walk stops here with whatever it has. |
+| `max_authority_hints` | no, 8 | Most superiors one entity configuration may name before the walk refuses the document. Refused rather than truncated, so ignoring an operator's superiors cannot turn into an unexplained refusal further down. |
+| `walks_per_minute` | no, 30 | Chain walks one **source address** may start per minute. The decision cache is keyed on the source and the claimed entity id together, so a caller that rotates the entity id misses the cache every time; this is what stops that from becoming one walk per request. |
+| `cache_ttl_secs` | no, 600 | How long a peer decision is reused before the chain is walked again. Refusals are cached too. The key is the source address **and** the claimed entity id: keying on the entity id alone would be defeated by rotating it, which is what `walks_per_minute` covers. |
+
+Every one of the four budget keys is refused at zero when the config
+compiles. A walk with no budget is the unbounded walk they exist to
+stop, and `walks_per_minute: 0` would disable the limit rather than
+tighten it.
+
+**What a walk costs, and what it cannot cost.** Nothing is walked from
+a document the proxy has only base64-decoded: each entity
+configuration's signature is checked before its `authority_hints` are
+read, against the pinned anchor's key set where the entity is an
+anchor and against the `jwks` the document itself publishes otherwise.
+Self-signature is not authentication, and it is not treated as any: it
+is what makes an unsigned blob carrying five thousand hints cost one
+fetch instead of five thousand. A configuration served at one URL that
+claims to be a different entity is refused outright, because the walk
+hands the verified `sub` back as the caller's identity.
 
 On a verified peer the proxy rewrites `header` to the entity id the
 chain proved, so an upstream reading it reads what was verified rather
@@ -314,15 +346,34 @@ admission decision on top of them is a fourth event at the same target:
 - `federation_peer_decision`, field `outcome` (`trusted` or `refused`).
   On `trusted` it also carries `entity_id`, the value the chain proved,
   and `trust_anchor_id`, the pinned anchor it reached. On `refused` it
-  carries `reason` (`no_peer_named`, `metadata_policy`, `trust_mark`,
-  or the chain-walk failure) and, for the policy and trust-mark
-  reasons, the `entity_type` or `trust_mark` at fault.
+  carries `reason`, which is one of exactly five fixed words:
 
-  This is the event that corresponds to the 403, and it fires once per
-  request, including on a cache hit where none of the three above run.
+  | `reason` | what happened |
+  |---|---|
+  | `malformed_entity_id` | the header value is not an `https://` URL, or is over 512 bytes. The one a caller trips most easily, and it is refused before anything is fetched or cached. |
+  | `no_peer_named` | the request carries no entity id and `required: true`. |
+  | `chain_unresolved` | the walk did not reach a pinned anchor. Covers a failed fetch, a signature that did not verify, and a spent fetch, byte, or time budget. |
+  | `metadata_policy` | the peer's published metadata violates what its superiors imposed. |
+  | `trust_mark` | a `required_trust_marks` entry is missing or not signed by the anchor. |
+
+  This is the event that corresponds to the 403, and it fires **once
+  per request**, including on a cache hit where none of the three above
+  run. `sbproxy_federation_peer_decisions_total` counts the same
+  decisions, so the two agree.
+
+  A `metadata_policy` or `trust_mark` refusal also emits a second,
+  separately named event, `federation_peer_decision_detail`, carrying
+  the `entity_type` or `trust_mark` at fault. It is a different `event`
+  value on purpose: counting `federation_peer_decision` used to include
+  those, so a SIEM rule grouping refusals by reason was skewed toward
+  two of the five, and only when the answer was not cached.
+
   The refusal deliberately does not echo the entity id the caller
   supplied: that string is attacker-chosen on an unauthenticated
-  request, and `reason` says what the walk found without it.
+  request, and `reason` says what the walk found without it. Every
+  peer-supplied string that does reach a log line, on this event and on
+  the three above, goes through the workspace log sanitizer first, so a
+  newline in a published document cannot forge a record.
 
 None of these ever log a private key or a raw JWS signature; `iss` /
 `sub` / `id` are the entity and trust-mark URLs the spec already
