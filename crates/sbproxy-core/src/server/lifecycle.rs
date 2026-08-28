@@ -3609,18 +3609,41 @@ pub fn run_with_fallback(
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(auto_threads);
+    // WOR-2699: worker stack size. Unset means the fork's
+    // `DEFAULT_THREAD_STACK_SIZE`, which is 8 MiB. A worker polls the
+    // whole request path on this stack, and the debug binary CI's smoke
+    // lane builds needs several times what the release binary does, so
+    // the ceiling has to be sized for the deeper of the two.
+    //
+    // Environment-only, like `SB_WORKER_THREADS` beside it: rarely
+    // changed, and the right value is deployment-shaped. Raising it
+    // costs reserved address space per worker thread and no resident
+    // memory, because a thread stack is committed page by page as it is
+    // touched. `docs/manual.md` carries the arithmetic.
+    //
+    // A value that is not a positive integer is ignored rather than
+    // fatal, matching `SB_WORKER_THREADS`. Pingora refuses anything
+    // below a page at config validation.
+    let worker_stack_bytes = std::env::var("SB_WORKER_STACK_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0);
     let conf = PingoraServerConf {
         threads,
         upstream_keepalive_pool_size: 256,
         upstream_connect_offload_threadpools: Some(2),
         grace_period_seconds: Some(grace_seconds),
         graceful_shutdown_timeout_seconds: Some(grace_seconds),
+        runtime_thread_stack_size: worker_stack_bytes,
         ..PingoraServerConf::default()
     };
     tracing::info!(
         threads = %conf.threads,
         upstream_pool = %conf.upstream_keepalive_pool_size,
         connect_offload = ?conf.upstream_connect_offload_threadpools,
+        worker_stack_bytes = conf
+            .runtime_thread_stack_size
+            .unwrap_or(pingora_runtime::DEFAULT_THREAD_STACK_SIZE),
         "pingora server config"
     );
     let mut server = Server::new_with_opt_and_conf(None, conf);

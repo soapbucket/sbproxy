@@ -82,6 +82,7 @@ CHECKS=(
   "pub items whose only consumer is a test||bash scripts/check-pub-item-ratchet.sh"
   "operator URLs at log lines||bash scripts/check-log-url-ratchet.sh"
   "unwrap/expect/panic in production code||bash scripts/check-unwrap-ratchet.sh"
+  "AI dispatch path stack budget||bash scripts/check-stack-budget-ratchet.sh"
   "secret-resolver drift||python3 scripts/check-secret-resolver-drift.py"
   "generated tapes and GIF wiring|make|make tapes-check"
 

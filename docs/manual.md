@@ -1,6 +1,6 @@
 # SBproxy Runtime Manual
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-28*
 
 Vendor: Soap Bucket LLC - [www.soapbucket.com](https://www.soapbucket.com)
 
@@ -1238,6 +1238,25 @@ Values that are not positive integers are ignored and the auto-detected value is
 
 In environments without cgroup CPU quotas (bare metal, macOS), the proxy falls back to the number of logical CPUs as reported by the OS.
 
+### Worker stack size
+
+Each Pingora worker polls the whole request path on one stack: the request filter, the module chain, the AI dispatch, the streaming relay, and every future they await are all live frames while a request is in flight. SBproxy gives each worker 8 MiB, which is the same size Linux gives a process's main thread by default. Override it with `SB_WORKER_STACK_BYTES`:
+
+```bash
+SB_WORKER_STACK_BYTES=16777216 sbproxy --config sb.yml
+```
+
+Values that are not positive integers are ignored and the default is used. Anything below one 4 KiB page is rejected at startup, because a thread that small cannot make a call.
+
+Raising this costs reserved address space, not memory. A thread stack is an anonymous mapping the kernel commits page by page as it is touched, so resident memory tracks how deep a request actually goes and not how much was reserved. Sixteen workers at 8 MiB reserve 128 MiB of a 64-bit process's 128 TiB address space and resident nothing extra.
+
+Two reasons to raise it:
+
+- The proxy logs `the request path is using most of a worker's stack`. That line is emitted once per process, when a request first passes three quarters of the worker stack, and it carries the bytes used and the stack size. It is a warning rather than an error: nothing has failed yet, but a stack overflow aborts the process without unwinding and leaves no diagnosis, so this is the last chance to act on it.
+- A debug build. Debug frames are several times larger than release frames, so a proxy built with `cargo build` (no `--release`) reaches depths the shipped binary never does.
+
+There is no equivalent config key or CLI flag; this is an environment-only knob for the same reason `SB_WORKER_THREADS` is.
+
 ### Startup sequence
 
 SBproxy initializes subsystems in a fixed order. A config or pipeline
@@ -1269,7 +1288,8 @@ plane, pipeline lifecycle hooks) log and degrade instead of blocking.
 9. **TLS**: initializes TLS state when `https_bind_port`,
    `tls_cert_file`, or an enabled `proxy.acme` block is present.
 10. **Listeners**: creates the Pingora server (worker count from
-    `SB_WORKER_THREADS` or auto-detection), binds the plain HTTP
+    `SB_WORKER_THREADS` or auto-detection, worker stack size from
+    `SB_WORKER_STACK_BYTES` or the 8 MiB default), binds the plain HTTP
     listener on `http_bind_port`, and adds the HTTPS listener (manual
     certs or the ACME dynamic-certificate resolver, with optional
     mTLS). No QUIC port is bound. Config compilation rejects

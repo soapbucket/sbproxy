@@ -7106,6 +7106,7 @@ pub(crate) mod a2a_body_phase;
 //. A trait impl needs no re-import to take effect.
 mod proxy_http;
 pub(crate) mod request_phase;
+pub(crate) mod stack_probe;
 
 // --- Access log emission helpers ---
 //

@@ -19,6 +19,7 @@ ten-minute build.
 | pub-item ratchet | `bash scripts/check-pub-item-ratchet.sh` |
 | unwrap/expect/panic ratchet | `bash scripts/check-unwrap-ratchet.sh` |
 | Operator URLs at log lines | `bash scripts/check-log-url-ratchet.sh` |
+| AI dispatch stack budget | `bash scripts/check-stack-budget-ratchet.sh` |
 | Spec citations | `bash scripts/check-spec-citations.sh` |
 | Env mutation | `bash scripts/check-env-mutation.sh` |
 | Durable file modes | `bash scripts/check-durable-file-modes.sh` |

@@ -1,0 +1,4 @@
+{
+  "type": "fixed",
+  "message": "Pingora worker threads now get an 8 MiB stack instead of tokio's 2 MiB default, so a debug build of the request path no longer aborts with a stack overflow. Override with `SB_WORKER_STACK_BYTES`."
+}

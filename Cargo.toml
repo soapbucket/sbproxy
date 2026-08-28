@@ -259,6 +259,10 @@ pingora-core = { version = "0.8", features = ["rustls"] }
 pingora-proxy = "0.8"
 pingora-http = "0.8"
 pingora-error = "0.8"
+# Direct dependency for `worker_stack`, which records where each worker
+# thread's stack starts. The request path reads it back to measure how
+# much of that stack it actually uses.
+pingora-runtime = "0.8"
 
 # URL parsing
 url = "2"

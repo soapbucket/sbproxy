@@ -520,6 +520,20 @@ jobs:
       - name: no new operator URL at a log line (WOR-2629)
         run: bash scripts/check-log-url-ratchet.sh
 
+      # The fourth ratchet of the same family, here for the same
+      # reasons: one integer in one file, compared against the merge
+      # base, and a reviewer reading any of these failures wants the
+      # others' numbers in the same log.
+      #
+      # This one guards a stack budget rather than a count of source
+      # sites, and it is the only one whose subject can take the process
+      # down. A stack overflow does not unwind, carries no backtrace and
+      # names no frame; all it leaves is "has overflowed its stack". The
+      # budget can fall and cannot rise, because raising it is always
+      # available and always the wrong first move.
+      - name: AI dispatch path stack budget only falls (WOR-2699)
+        run: bash scripts/check-stack-budget-ratchet.sh
+
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
