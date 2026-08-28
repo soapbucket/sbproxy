@@ -3875,25 +3875,6 @@ Different providers report streaming token counts in different SSE shapes. The s
 
 Unknown values warn once and fall back to `generic` so a typo never silently disables budget recording.
 
-### What a stream is billed
-
-Every way a stream can end goes through one settlement: a clean close, an upstream truncation or error, an output guardrail or stream-safety cut, and a client that hangs up mid-response. That settlement decides one set of numbers, and the budget caps, the receipt, the access log, the usage sinks, the verifiable ledger and the payment bridge all read that same set.
-
-**Where the numbers come from,** in order:
-
-1. The provider's own `usage` frame, when the stream carried one. That is the measured answer, and it is the one the billing event records.
-2. Otherwise the tokens this gateway counted for itself: the assistant text the stream actually delivered, run through the model's tokenizer, plus the prompt estimate computed on the request path. `sbproxy_ai_usage_parse_miss_total{provider, surface}` ticks every time a stream takes this branch.
-3. Otherwise nothing. A stream that carried no usage frame and delivered no assistant text has nothing to price, and its reservations are refunded in full.
-
-The fallback exists because most providers leave usage out of a stream. OpenAI and Azure OpenAI omit it unless the caller asks for `stream_options.include_usage`, and this gateway does not add that option to your request. Without a fallback, a caller could stream indefinitely against a token cap that never moved.
-
-**Estimated and measured are not the same thing, and are not reported as the same thing.** An estimated stream debits your budget caps, settles its rate-limit and governance reservations, and reports its token counts, but it prices no cost: a figure the provider never reported is not one this gateway invents. The billing event on the observability bus and in spend reports therefore carries measured usage only. Watch `sbproxy_ai_usage_parse_miss_total` to see how much of an origin's traffic is arriving this way, and pin `usage_parser` to the provider's own shape if the number is higher than you expect.
-
-**A partial stream is billed for what arrived.** A stream cut short by an upstream error, by a guardrail, or by the caller hanging up is settled from the frames received up to the cut: the provider's usage frame if one had already arrived, the tokenizer count of the delivered text if not. Nothing after the cut is billed, because nothing after the cut is read: the upstream body is dropped at the failure rather than left draining. The cut itself is visible on `sbproxy_ai_stream_post_commit_failures_total{provider, cause}` (see [LLM-aware resilience](ai-llm-aware-resilience.md#after-the-commit-point)) and, when the spend produced a rejected or abandoned outcome, on `sbproxy_ai_waste_total`.
-
-**A caller that hangs up mid-stream gets a `client_disconnected` receipt.** The relay learns it from its own write failing, drops the provider stream at that point, settles what it had received, and prices the request as a disconnect rather than as a delivered sale. What that costs is whatever the origin's `billable:` table says for `client_disconnected`; see [metering.md](metering.md#billable-the-outcome-table).
-
-
 ```yaml
 origins:
   "ai.example.com":
@@ -3924,6 +3905,57 @@ for chunk in stream:
     if chunk.choices[0].delta.content:
         print(chunk.choices[0].delta.content, end="")
 ```
+
+### What a stream is billed
+
+Every way a stream can end goes through one settlement: a clean close, an upstream truncation or error, an output guardrail or stream-safety cut, a client that hangs up mid-response, and a request the proxy itself abandons (a shutdown that drops in-flight streams, an outer timeout, or a panic in the relay). That settlement decides one set of numbers.
+
+**Where the numbers come from,** in order:
+
+1. The provider's own `usage` frame, when the stream carried one. That is the measured answer, and it is the one the billing event records.
+2. Otherwise the tokens this gateway counted for itself: the assistant text the stream actually delivered, run through the model's tokenizer, plus the prompt estimate computed on the request path. Every wire shape in the `usage_parser` table is covered, including Vertex / Gemini `candidates[].content.parts[]` and Bedrock's base64 `bytes` envelope. One SSE frame larger than 1 MiB is skipped, and the rest of the stream is still counted.
+3. Otherwise nothing. A stream that carried no usage frame and delivered no assistant text has nothing to price, and its reservations are refunded in full.
+
+`sbproxy_ai_usage_parse_miss_total{provider, surface, usage_source}` ticks on both of the last two, labeled `estimated` and `absent`. Watch the `absent` series in particular: it counts 2xx streams that were billed nothing at all.
+
+**Estimated and measured are not the same thing, and are not reported as the same thing.** Both are on your request context and both reach the access log, which carries a `usage_source` field of `measured`, `estimated` or `absent` beside `tokens_in` and `tokens_out`, so any one request can be attributed.
+
+What an estimate reaches:
+
+* your budget caps, both the token caps and `max_usd` (the estimate is priced from the model catalog for enforcement, not for reporting)
+* the tokens-per-minute reservation, the governance lease and the agent budget
+* the router's per-provider token signal
+* the access log
+
+What an estimate does not reach: the payment bridge, the usage sinks, the verifiable ledger, and the `AiBillingEvent` that carries spend reports. Those all report a customer-facing quantity, and a quantity you may have to defend in a dispute has to be one the provider stands behind. An estimated stream reports zero to them and prices no cost: a figure the provider never reported is not one this gateway invents.
+
+Two surfaces carry the counts without the marker, because their schemas have no provenance column yet: the request-event envelope and the admin console log row. Read `usage_source` from the access log when you need to know.
+
+**A partial stream is billed for what arrived.** A stream cut short by an upstream error, by a guardrail, or by the caller hanging up is settled from the frames received up to the cut: the provider's usage frame if one had already arrived, the tokenizer count of the delivered text if not. Nothing after the cut is billed, because nothing after the cut is read: the upstream body is dropped at the failure rather than left draining. The cut itself is visible on `sbproxy_ai_stream_post_commit_failures_total{provider, cause}` (see [LLM-aware resilience](ai-llm-aware-resilience.md#after-the-commit-point)) and, when the spend produced a rejected or abandoned outcome, on `sbproxy_ai_wasted_tokens_total` and `sbproxy_ai_wasted_cost_dollars_total`.
+
+**A caller that hangs up mid-stream gets a `client_disconnected` receipt.** The relay learns it from its own write failing, drops the provider stream at that point, settles what it had received, and prices the request as a disconnect rather than as a delivered sale. What that costs is whatever the origin's `billable:` table says for `client_disconnected`; see [metering.md](metering.md#billable-the-outcome-table). The same now holds for a non-streaming AI response the caller walked away from during the write.
+
+#### Asking the provider for a usage frame
+
+The fallback exists because most providers leave usage out of a stream. OpenAI and Azure OpenAI omit it unless the caller asks for `stream_options.include_usage`.
+
+Set `stream_include_usage: true` on the origin's action and the gateway adds that option for you:
+
+```yaml
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      stream_include_usage: true
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          base_url: https://api.openai.com/v1
+```
+
+Off by default, because it changes what your callers receive. With it on, the provider appends one extra terminal chunk before `[DONE]` whose `choices` is `[]` and whose `usage` is populated. A client that reads `chunk.choices[0]` unconditionally, which includes the Python example above, throws on that chunk; guard the index or filter empty `choices` first.
+
+The gateway adds the option only where it is understood: providers whose wire format is OpenAI's, on streaming chat completions, and only when the caller did not send `stream_options` itself. Anthropic, Vertex / Gemini, Bedrock, Cohere and Ollama have no such field. Among OpenAI-compatible upstreams, older Azure API versions and several self-hosted runtimes answer 400 to an unknown top-level body key, so test the flag against your own upstream before enabling it in production. The injection happens on the per-attempt body, after the model remap, so it does not move your prompt fingerprint or any cache key.
 
 ## Realtime
 

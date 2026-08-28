@@ -1740,7 +1740,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Alpha,
         registry: Registry::Default,
         labels: &["provider", "cause"],
-        description: "Streaming responses that failed after the gateway committed to a provider, by cause: `upstream_timeout` (a transport budget cut a running generation), `upstream_error` (a reset or truncated provider stream), `guardrail` (the gateway ended the stream on an output guardrail or stream-safety verdict). Failover is impossible past the commit point, so these are the failures `sbproxy_ai_failovers_total` can never carry. A caller that disconnects mid-stream is not counted: the failed downstream write aborts the relay before the counter is reached.",
+        description: "Streaming responses that failed after the gateway committed to a provider, by cause: `upstream_timeout` (a transport budget cut a running generation), `upstream_error` (a reset or truncated provider stream), `guardrail` (the gateway ended the stream on an output guardrail or stream-safety verdict), `client_disconnected` (the caller hung up and the relay's next write to it failed), `gateway_error` (the relay's own failure, correlating with no provider error), `abandoned` (the request was dropped before the relay reached an ending of its own). An upstream read failure takes precedence over the other causes. Failover is impossible past the commit point, so these are the failures `sbproxy_ai_failovers_total` can never carry.",
         dead_reason: None,
     },
     MetricCapability {
@@ -1835,8 +1835,8 @@ pub const METRICS: &[MetricCapability] = &[
         support: SupportLevel::Stable,
         compat: CompatTier::Beta,
         registry: Registry::Default,
-        labels: &["provider", "surface"],
-        description: "2xx AI responses on a token surface that carried no parseable usage block (budget debited from an estimate).",
+        labels: &["provider", "surface", "usage_source"],
+        description: "2xx AI responses on a token surface that carried no parseable usage block, by what was billed instead: `estimated` (the gateway's own tokenizer count of the delivered text) or `absent` (nothing could be counted, so nothing was billed).",
         dead_reason: None,
     },
     MetricCapability {

@@ -367,6 +367,56 @@ no surface carries the URL.
 find the `webhook` row for your collector, and add that host (and its port, if
 it is not 80 or 443) to `egress.usage_sinks.hosts`.
 
+### A streamed AI response with no provider usage frame is now billed from an estimate
+
+**Who this reaches.** Any origin with `action.type: ai_proxy` serving
+streaming requests, whatever `usage_parser` is set to, `none` included.
+
+**What changed.** A stream whose provider sent no `usage` frame used to
+settle at zero: no cap moved, every reservation was refunded, and a
+caller could stream indefinitely against a `max_tokens` cap that never
+budged. It is now priced from this gateway's own tokenizer count of the
+assistant text the stream delivered, plus the request-path prompt
+estimate, and marked `estimated`.
+
+**What that changes for you.** Token caps and `max_usd` caps on such
+origins start moving where they did not before, so a cap that never fired
+may now fire. The estimate is enforcement only: the payment bridge, the
+usage sinks, the verifiable ledger and the `AiBillingEvent` skip a
+request marked `estimated`, so nothing you invoice changes. The access
+log gains a `usage_source` field (`measured`, `estimated`, `absent`) and
+`sbproxy_ai_usage_parse_miss_total` gains a matching `usage_source`
+label, which is how you see how much of an origin's traffic this is.
+
+`usage_parser: none` is the case worth naming twice: it still disables
+reading the provider's frame, but it no longer means the origin is billed
+nothing.
+
+**What to do.** Nothing, if your caps were sized against measured
+traffic. If an origin's caps were effectively unenforced because its
+provider omits usage, check its headroom before upgrading, or set
+[`stream_include_usage: true`](configuration.md) so the provider reports
+its own numbers and the estimate is not used at all.
+
+### A mid-stream client disconnect now settles as `client_disconnected`
+
+**Who this reaches.** Deployments with `proxy.attestation` and a
+`billable:` outcome table, serving AI traffic.
+
+**What changed.** A caller that hung up while a response was being
+written used to produce a receipt reading `delivered` (when the 2xx
+header had already committed) or `origin_5xx` (when it had not). Both
+are now `client_disconnected`, for streamed and buffered AI responses
+alike.
+
+**What that changes for you.** Whatever your table says for
+`client_disconnected` now applies to that traffic. For a mid-stream
+disconnect the units are non-zero, so `partial` and `yes` are different
+answers and the row you wrote decides real money; see
+[metering.md](metering.md#billable-the-outcome-table). Origin error-rate
+dashboards built on `origin_5xx` will drop by the disconnect volume,
+which is the correction, not a regression.
+
 ### The usage ledger now `fsync`s every entry
 
 **Who this reaches.** Any config with a metering role, which is what makes
