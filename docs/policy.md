@@ -1,5 +1,5 @@
 # Policy engine
-*Last modified: 2026-08-27*
+*Last modified: 2026-08-28*
 
 The policy engine evaluates a list of policies on every request. Each policy returns one of four verdicts: `Allow`, `Deny`, `AllowWithHeaders`, or `Confirm`. The dispatcher folds the per-policy results into a single decision and applies it before the request reaches the upstream.
 
@@ -37,7 +37,7 @@ If you are deciding which policy stops which threat, start with the group headin
 - `sri`: enforces Subresource Integrity on scripts the origin serves. [api-security.md](api-security.md#browser-facing-misconfiguration).
 - `content_digest`: verifies an inbound body against its RFC 9530 `Content-Digest` header. [content-digest.md](content-digest.md).
 - `page_shield`: watches for third-party script drift on pages the origin serves. [api-security.md](api-security.md#browser-facing-misconfiguration).
-- `dlp`: scans the request URI, headers, and (on by default, capped at 16 KiB) the buffered request body for regulated-data shapes and tags or blocks. Requests only, and it detects rather than masks. [api-security.md](api-security.md#data-leaving-that-should-not).
+- `dlp`: scans the request URI and headers for regulated-data shapes and tags or blocks. `scan_body` defaults true, but the live request-filter chain snapshots an empty body, so a secret that appears only in the POST body is not seen. Requests only, and it detects rather than masks. [api-security.md](api-security.md#data-leaving-that-should-not).
 - `exposed_credentials` (alias `leaked_credentials`): detects a known-leaked basic-auth password and tags or blocks. [exposed-credentials.md](exposed-credentials.md).
 
 **AI-specific.** Policies with no equivalent in an ordinary API gateway.
@@ -163,7 +163,7 @@ The fail-closed contract is deliberate: a misconfigured or unreachable judge can
 
 ## NL-to-Cedar decision
 
-SBproxy does not offer natural-language-to-Cedar compilation: nothing turns a prose rule into Cedar policy text, and the inactive NL components that once attempted it had no runtime consumer and were removed. That is a different thing from the Cedar engine itself, which does ship: an `mcp` action's `cedar_policies` block hands Cedar source to `sbproxy-extension`'s compiler, which turns it into a schema-validated policy set, and its evaluator maps verdicts onto allow, deny, and confirm on the built-in MCP `tools/call` hook. Write Cedar under `cedar_policies`; the gateway compiles and enforces it at config load. The engine's embedded policy store (redb, stateless by default) is in the tree but is not yet wired to that hook; policies come from the config block, and the store's console and CLI surfaces are tracked as separate work.
+SBproxy does not offer natural-language-to-Cedar compilation: nothing turns a prose rule into Cedar policy text, and the inactive NL components that once attempted it had no runtime consumer and were removed. That is a different thing from the Cedar engine itself, which does ship: an `mcp` action's `cedar_policies` block hands Cedar source to `sbproxy-extension`'s compiler, which turns it into a schema-validated policy set, and its evaluator maps verdicts onto allow, deny, and confirm on the built-in MCP `tools/call` hook. Write Cedar under `cedar_policies`; the gateway compiles and enforces it at config load. The engine's embedded policy store (redb, stateless by default) is in the tree but is not yet wired to that hook; policies come from the config block, and the store's console and CLI surfaces are tracked as separate work. Dedicated page: [cedar-policy.md](cedar-policy.md). Runnable: [`examples/cedar-mcp-full/`](../examples/cedar-mcp-full/).
 
 ## request_validator
 

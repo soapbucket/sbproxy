@@ -1,15 +1,20 @@
-//! Operator-facing status surface for this crate.
+//! Operator-facing status surface for a standalone marketplace host.
 //!
-//! This crate ships as an independent set of axum handlers rather
-//! than a module inside the main `sbproxy` binary, so it does not
-//! have a page in `ui/`, the admin console for that binary's own
-//! request pipeline. `GET /admin/status` (mounted by
-//! [`crate::router`]) is this crate's own equivalent: a small JSON
-//! surface an operator (or a script, or a future `ui/` integration)
-//! can poll to see what a running marketplace bridge currently
-//! publishes and how healthy its signing key rotation looks, without
-//! needing a Prometheus query client or decoding a quote signature by
-//! hand.
+//! `GET /admin/status`, mounted by [`crate::router`]: a small JSON
+//! surface an operator or a script can poll to see what a running
+//! marketplace bridge currently publishes and how healthy its signing
+//! key rotation looks, without a Prometheus query client or decoding a
+//! quote signature by hand.
+//!
+//! This is the route for a process that mounts this crate's axum
+//! router. `sbproxy` is not that process: it serves the CoMP endpoints
+//! off its own request path, so this router is never mounted there and
+//! this route never answers. The equivalent under the proxy's own
+//! authenticated admin API is `GET /admin/licensing`
+//! (`crates/sbproxy-core/src/admin_licensing.rs`), which reports the
+//! same fields per origin. A console page for it is separate scope
+//! under the admin console epic; `docs/admin-api-reference.md` says so
+//! beside the route.
 //!
 //! The route is unauthenticated by design, matching
 //! `GET /.well-known/iab-comp/manifest.json` itself: everything it
@@ -42,17 +47,25 @@ pub struct StatusResponse {
     pub trusted_kid_count: usize,
 }
 
+impl StatusResponse {
+    /// Project one marketplace's operator-visible state.
+    ///
+    /// Shared with `sbproxy`'s own `GET /admin/licensing` so the two
+    /// surfaces cannot report different field sets for the same bridge.
+    pub fn of(marketplace: &CompMarketplace) -> Self {
+        let manifest = marketplace.manifest();
+        Self {
+            publisher_domain: manifest.publisher.domain.clone(),
+            tier_count: manifest.tiers.len(),
+            active_signing_kid: marketplace.active_signing_kid(),
+            trusted_kid_count: marketplace.trusted_kid_count(),
+        }
+    }
+}
+
 /// `GET /admin/status` handler.
-pub async fn status(
-    State((mp, keys)): State<(Arc<CompMarketplace>, Arc<crate::keys::KeyManager>)>,
-) -> Json<StatusResponse> {
-    let manifest = mp.manifest();
-    Json(StatusResponse {
-        publisher_domain: manifest.publisher.domain.clone(),
-        tier_count: manifest.tiers.len(),
-        active_signing_kid: keys.active_kid(),
-        trusted_kid_count: keys.jwks().len(),
-    })
+pub async fn status(State(mp): State<Arc<CompMarketplace>>) -> Json<StatusResponse> {
+    Json(StatusResponse::of(&mp))
 }
 
 #[cfg(test)]
@@ -70,7 +83,7 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    fn build_marketplace() -> (Arc<CompMarketplace>, Arc<KeyManager>) {
+    fn build_marketplace() -> Arc<CompMarketplace> {
         let keys = KeyManager::new(MasterKey::new(vec![0x11u8; 32]).unwrap());
         keys.set_active("2026-q2-001").unwrap();
         let manifest = Arc::new(CompManifest {
@@ -102,22 +115,17 @@ mod tests {
             3600,
         ));
         let buyer_keys = Arc::new(InMemoryBuyerKeyRegistry::new());
-        let mp = Arc::new(CompMarketplace::new(
-            keys.clone(),
-            manifest,
-            revocation,
-            bridge,
-            buyer_keys,
-        ));
-        (mp, keys)
+        Arc::new(CompMarketplace::new(
+            keys, manifest, revocation, bridge, buyer_keys,
+        ))
     }
 
     #[tokio::test]
     async fn status_reports_configured_marketplace() {
-        let (mp, keys) = build_marketplace();
+        let mp = build_marketplace();
         let app = Router::new()
             .route("/admin/status", get(status))
-            .with_state((mp, keys));
+            .with_state(mp);
         let req = Request::builder()
             .uri("/admin/status")
             .body(Body::empty())

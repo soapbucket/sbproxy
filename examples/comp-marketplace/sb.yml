@@ -1,0 +1,161 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# IAB CoMP marketplace bridge: sell a standing license, not a crawl.
+#
+# The pay-per-crawl challenge in examples/ai-crawl-control re-negotiates
+# on every request. This is the other shape: a buyer reads your catalog
+# once, gets a signed price for the volume it wants, pays, and redeems
+# that acceptance for a license token good for a day. The token is an
+# OLP token signed with this origin's own `olp.signing_key`, so the same
+# origin's /.well-known/olp/introspect verifies it with no extra trust
+# configuration.
+#
+# Three endpoints, all on this origin:
+#
+#   GET  /.well-known/iab-comp/manifest.json   the catalog
+#   POST /.well-known/iab-comp/quote           a signed price
+#   POST /.well-known/iab-comp/redeem          acceptance -> license token
+#
+# Run:
+#   export COMP_MASTER_KEY="$(head -c 32 /dev/urandom | base64)"
+#   export OLP_SIGNING_KEY="$(head -c 32 /dev/urandom | xxd -p -c 64)"
+#   make run CONFIG=examples/comp-marketplace/sb.yml
+#
+# Test:
+#   # 1. The catalog. Two tiers, one of them redeemable.
+#   curl -s -H 'Host: licensing.local' \
+#     http://127.0.0.1:8080/.well-known/iab-comp/manifest.json | jq
+#
+#   # 2. A signed price for 10,000 inference requests over 30 days.
+#   #    Note `signature.kid`: quotes sign under a comp-* kid, never the
+#   #    OLP one, so a quote signature can never be replayed as a token.
+#   curl -s -H 'Host: licensing.local' -H 'content-type: application/json' \
+#     -d '{"comp_version":"1.0",
+#          "buyer":{"agent_id":"agent_acme_001","organization":"Acme AI Inc."},
+#          "tier_id":"tier_ai_inference",
+#          "requested_volume":{"model":"per_request","expected_count":10000,"duration_days":30},
+#          "audience":"licensing.local"}' \
+#     http://127.0.0.1:8080/.well-known/iab-comp/quote | jq
+#
+#   # 3. Redeeming needs a buyer signature over the request body. The
+#   #    key below is a demo keypair whose public half is in the config;
+#   #    see README.md for the signing script.
+#
+#   # 4. Refusals, without any signing at all. Both fail closed:
+#   curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: licensing.local' \
+#     -H 'content-type: application/json' -d '{not json' \
+#     http://127.0.0.1:8080/.well-known/iab-comp/quote            # 400
+#   curl -s -H 'Host: licensing.local' -H 'content-type: application/json' \
+#     -d '{"comp_version":"1.0","buyer":{"agent_id":"a","organization":"b"},
+#          "tier_id":"tier_that_does_not_exist",
+#          "requested_volume":{"model":"per_request","expected_count":1,"duration_days":1},
+#          "audience":"licensing.local"}' \
+#     http://127.0.0.1:8080/.well-known/iab-comp/quote | jq   # unknown_tier, 404
+#
+#   # 5. What the operator sees, behind admin auth:
+#   curl -s -u admin:"${SB_ADMIN_PASSWORD:-demo-change-me}" \
+#     http://127.0.0.1:9090/admin/licensing | jq
+
+# sbproxy-docs:begin
+proxy:
+  http_bind_port: 8080
+
+  # Step 5 of the walkthrough reads GET /admin/licensing, which lives on
+  # the admin listener. Without this block the listener never starts and
+  # that curl gets connection refused, which reads like a broken route
+  # rather than a missing block.
+  admin:
+    enabled: true
+    bind: 127.0.0.1
+    port: 9090
+    username: admin
+    # Demo password for a loopback bind. Change before any other bind.
+    password: ${SB_ADMIN_PASSWORD:-demo-change-me}
+
+  # Only because the demo upstream runs on this machine: the SSRF guard
+  # refuses private upstream addresses unless allowlisted. A production
+  # config pointing at a real origin does not need this block.
+  extensions:
+    upstream:
+      allow_private_cidrs:
+        - '127.0.0.1/32'
+
+origins:
+  "licensing.local":
+    action:
+      type: static
+      status_code: 200
+      content_type: application/json
+      body: '{"inference":"the licensed content lives behind this route"}'
+
+    # The bridge has no issuer of its own. It mints with this key, under
+    # this kid, so the token a buyer redeems for verifies against this
+    # same origin's OLP surface.
+    olp:
+      enabled: true
+      # 32 bytes hex. `head -c 32 /dev/urandom | xxd -p -c 64`
+      signing_key: "${OLP_SIGNING_KEY}"
+      key_id: 2026-q3
+      issuer: https://licensing.local
+      default_scope: ai-input
+      default_ttl_secs: 86400
+
+    comp:
+      enabled: true
+
+      # HKDF input for the quote-signing key. Takes the same reference
+      # forms as every other secret in the config: file:, vault://,
+      # secret://, and a whole-value ${VAR}. At least 32 bytes once
+      # resolved, and an unset ${VAR} is refused rather than becoming
+      # the key.
+      master_key: "${COMP_MASTER_KEY}"
+      # Rotate by bumping this label: a new comp-<rotation_id> kid is
+      # derived and starts signing, and the previous one keeps verifying
+      # until the process restarts.
+      rotation_id: 2026-q3-001
+
+      publisher:
+        name: Example Publishing Co.
+        contact: licensing@example.com
+
+      tiers:
+        # Advertised, not redeemable. `redeem` mints only for `olp`
+        # tiers, which is why /admin/licensing reports olp_tier_count
+        # separately from tier_count.
+        - id: tier_free_search
+          name: Free search indexing
+          description: Indexing for traditional search engines.
+          license: urn:rsl:search-index:default
+          shape: html
+          authorization: cap
+          route_glob: "/**"
+          pricing:
+            model: free
+            currency: USD
+            amount: 0
+          rate_caps:
+            max_rps: 1.0
+            max_bytes_per_day: 1073741824
+
+        - id: tier_ai_inference
+          name: AI inference
+          description: Per-request inference access.
+          license: urn:rsl:pay-per-inference:default
+          shape: json-envelope
+          authorization: olp
+          route_glob: "/api/v1/inference/**"
+          pricing:
+            model: per_request
+            currency: USD
+            # Millionths of a dollar: $0.0025 per request.
+            amount_micros: 2500
+
+      # The onboarding boundary. A redeem is refused unless its signing
+      # kid resolves here, so an empty list refuses every redeem and a
+      # buyer you have not onboarded cannot buy at any price.
+      #
+      # This is the public half of the demo keypair in README.md. Never
+      # ship a demo key in a real catalog: anyone who has read this file
+      # holds the private half.
+      buyer_keys:
+        - kid: buyer-demo-001
+          public_key: "DXVQdU4IAKXSN-71gmA1dmubPloVhoqUCrKJlYeI47A"

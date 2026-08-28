@@ -1,5 +1,7 @@
 # HTTP Digest authentication
 
+*Last modified: 2026-08-28*
+
 Digest auth (RFC 7616) keeps the password off the wire: the client proves it knows the secret by hashing it into a response, and the server checks that hash against a stored HA1 without ever seeing the plaintext. This example serves a static page behind one digest user and answers the SHA-256 challenge.
 
 ## The credential

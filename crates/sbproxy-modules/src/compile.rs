@@ -461,7 +461,7 @@ fn compile_policy_with_optional_registry(
         // configured `JudgeClient` and routes each request through
         // the configured prompt template. See
         // `policy/semantic_constraint.rs` and
-        // `docs/adr-policy-compilation.md`.
+        // `docs/policy.md`.
         "semantic_constraint" => Ok(Policy::SemanticConstraint(
             SemanticConstraintPolicy::from_config(config.clone())?,
         )),

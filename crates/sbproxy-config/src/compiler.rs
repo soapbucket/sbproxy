@@ -1210,6 +1210,195 @@ pub(crate) fn validate_decision_script(
 /// supported engine. WASM is rejected with a pointer to the reason:
 /// inline `source` is text, and a WASM log field would need a compiled
 /// module path instead.
+/// Validate one origin's `comp:` block (WOR-2673).
+///
+/// Every refusal here is a catalog an operator would otherwise publish
+/// and then watch fail one buyer at a time: a tier nobody can redeem, a
+/// price that does not apply to its own pricing model, a buyer key that
+/// is not a key. The bridge itself is built at pipeline construction
+/// and needs secrets to do it; this runs on a machine that has none.
+fn validate_comp_marketplace(
+    comp: &crate::types::CompMarketplaceConfig,
+    olp: Option<&crate::types::OlpConfig>,
+) -> Result<()> {
+    // The bridge has no issuer of its own. It signs the license token it
+    // returns with the origin's OLP key so that the origin's own
+    // `/.well-known/olp/introspect` verifies it; without that block
+    // there is nothing to sign with and nothing to verify against.
+    if !olp.is_some_and(|olp| olp.enabled) {
+        anyhow::bail!(
+            "config compile: comp.enabled needs olp.enabled on the same origin. The bridge \
+             mints its license tokens with olp.signing_key so this origin's own \
+             /.well-known/olp/introspect verifies them"
+        );
+    }
+    if comp.master_key.trim().is_empty() {
+        anyhow::bail!("config compile: comp.master_key must not be empty");
+    }
+    if comp.rotation_id.trim().is_empty() {
+        anyhow::bail!("config compile: comp.rotation_id must not be empty");
+    }
+    if comp.publisher.name.trim().is_empty() || comp.publisher.contact.trim().is_empty() {
+        anyhow::bail!(
+            "config compile: comp.publisher.name and comp.publisher.contact are required"
+        );
+    }
+    if comp.tiers.is_empty() {
+        anyhow::bail!(
+            "config compile: comp.tiers must not be empty; a manifest with no tiers publishes \
+             nothing a buyer can quote"
+        );
+    }
+    let mut seen: Vec<&str> = Vec::with_capacity(comp.tiers.len());
+    for tier in &comp.tiers {
+        if tier.id.trim().is_empty() {
+            anyhow::bail!("config compile: comp.tiers[].id must not be empty");
+        }
+        if seen.contains(&tier.id.as_str()) {
+            anyhow::bail!(
+                "config compile: comp.tiers[].id '{}' appears twice; a quote request names a \
+                 tier by id and would resolve to whichever came first",
+                tier.id
+            );
+        }
+        seen.push(tier.id.as_str());
+        if tier.license.trim().is_empty() {
+            anyhow::bail!(
+                "config compile: comp.tiers[{}].license must name the license URN the minted \
+                 token grants",
+                tier.id
+            );
+        }
+        match tier.authorization.as_str() {
+            "public" | "cap" | "olp" => {}
+            other => anyhow::bail!(
+                "config compile: comp.tiers[{}].authorization '{other}' is not one of public, \
+                 cap, olp",
+                tier.id
+            ),
+        }
+        match tier.shape.as_str() {
+            "html" | "json-envelope" | "bulk-archive" => {}
+            other => anyhow::bail!(
+                "config compile: comp.tiers[{}].shape '{other}' is not one of html, \
+                 json-envelope, bulk-archive",
+                tier.id
+            ),
+        }
+        match tier.pricing.model.as_str() {
+            "free" => {}
+            "per_request" => {
+                if tier.pricing.amount_micros.is_none() {
+                    anyhow::bail!(
+                        "config compile: comp.tiers[{}].pricing.model is per_request, which \
+                         prices from amount_micros; set it or the tier quotes at zero",
+                        tier.id
+                    );
+                }
+            }
+            "flat_rate" => {
+                if tier.pricing.amount.is_none() {
+                    anyhow::bail!(
+                        "config compile: comp.tiers[{}].pricing.model is flat_rate, which \
+                         prices from amount; set it or the tier quotes at zero",
+                        tier.id
+                    );
+                }
+            }
+            other => anyhow::bail!(
+                "config compile: comp.tiers[{}].pricing.model '{other}' is not one of free, \
+                 per_request, flat_rate",
+                tier.id
+            ),
+        }
+        if tier.pricing.currency.trim().len() != 3 {
+            anyhow::bail!(
+                "config compile: comp.tiers[{}].pricing.currency must be a three-letter ISO 4217 \
+                 code",
+                tier.id
+            );
+        }
+    }
+    // `redeem` only mints for OLP-authorized tiers, and it mints for
+    // exactly one. Nothing in a redeem request names a tier: the buyer
+    // sends a `quote_id`, and this bridge keeps no durable
+    // quote-to-tier mapping. So zero redeemable tiers is an endpoint
+    // that refuses everything, and two is an endpoint that hands a
+    // buyer whichever one the manifest lists first.
+    //
+    // The second half is the same hazard as the duplicate-tier-id
+    // refusal above, and it is refused here for the same reason: a
+    // documented limit an operator can configure their way into is an
+    // invariant held by prose (WOR-2673 review B2).
+    let olp_tiers: Vec<&str> = comp
+        .tiers
+        .iter()
+        .filter(|tier| tier.authorization == "olp")
+        .map(|tier| tier.id.as_str())
+        .collect();
+    match olp_tiers.as_slice() {
+        [] => anyhow::bail!(
+            "config compile: comp.tiers has no tier with authorization: olp, and redeem can \
+             only mint a license token for an OLP tier"
+        ),
+        [_one] => {}
+        [first, second, ..] => anyhow::bail!(
+            "config compile: comp.tiers carries more than one tier with authorization: olp \
+             ('{first}' and '{second}'). A redeem request names a quote_id and no tier, and \
+             this bridge keeps no quote-to-tier store, so it would mint '{first}' for a buyer \
+             who quoted '{second}'. Advertise the others as authorization: cap or public, or \
+             split them across origins"
+        ),
+    }
+    if comp.buyer_keys.is_empty() {
+        anyhow::bail!(
+            "config compile: comp.buyer_keys must not be empty; a redeem request is refused \
+             unless its signing kid resolves here, so an empty list refuses every redeem"
+        );
+    }
+    let mut seen_kids: Vec<&str> = Vec::with_capacity(comp.buyer_keys.len());
+    for key in &comp.buyer_keys {
+        if key.kid.trim().is_empty() {
+            anyhow::bail!("config compile: comp.buyer_keys[].kid must not be empty");
+        }
+        if seen_kids.contains(&key.kid.as_str()) {
+            anyhow::bail!(
+                "config compile: comp.buyer_keys[].kid '{}' appears twice",
+                key.kid
+            );
+        }
+        seen_kids.push(key.kid.as_str());
+        let decoded = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            key.public_key.trim(),
+        )
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "config compile: comp.buyer_keys[{}].public_key is not base64url without \
+                 padding: {error}",
+                key.kid
+            )
+        })?;
+        if decoded.len() != 32 {
+            anyhow::bail!(
+                "config compile: comp.buyer_keys[{}].public_key decoded to {} bytes; an Ed25519 \
+                 public key is 32",
+                key.kid,
+                decoded.len()
+            );
+        }
+    }
+    if let Some(hash) = comp.manifest_hash.as_deref() {
+        if !hash.starts_with("sha256:") {
+            anyhow::bail!(
+                "config compile: comp.manifest_hash must be `sha256:<hex>`; leave it unset to \
+                 have the proxy compute it over the manifest it publishes"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn validate_custom_log_fields(fields: &[crate::CustomLogFieldConfig]) -> Result<()> {
     let mut seen = std::collections::HashSet::new();
     for field in fields {
@@ -1994,6 +2183,36 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         }
     }
 
+    // WOR-2673: the OLP token endpoint's per-source budget. Zero is a
+    // refusal rather than "unlimited": that endpoint is unauthenticated,
+    // mints an Ed25519 bearer license token per call, and answers ahead
+    // of authentication and the policy chain where an origin's own rate
+    // limits live, so this value is the only bound on it. A bound one
+    // typo away from being off is not a bound.
+    for (host, origin) in &config_file.origins {
+        if let Some(olp) = origin.olp.as_ref().filter(|olp| olp.enabled) {
+            if olp.token_rate_limit_per_minute == 0 {
+                anyhow::bail!(
+                    "config compile: origin `{host}` olp.token_rate_limit_per_minute is 0, which \
+                     is not a way to say unlimited. POST /.well-known/olp/token is \
+                     unauthenticated and mints a bearer license token per call, so it always \
+                     carries a budget. Remove the key for the default of 60 per minute, or set \
+                     the number you want"
+                );
+            }
+        }
+    }
+
+    // WOR-2673: the CoMP marketplace bridge. Validated here rather than
+    // at pipeline build so `sbproxy validate` catches a catalog nobody
+    // can buy from, on a machine that holds none of the secrets.
+    for (host, origin) in &config_file.origins {
+        if let Some(comp) = origin.comp.as_ref().filter(|comp| comp.enabled) {
+            validate_comp_marketplace(comp, origin.olp.as_ref())
+                .with_context(|| format!("origin `{host}` comp"))?;
+        }
+    }
+
     // Config-authority participation. Validated here rather than at first
     // fetch so `sbproxy validate` catches an unusable authority URL, an
     // inline credential, or a `replace` subscriber that has told itself it
@@ -2333,6 +2552,56 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
                 ),
                 Some(_) => {}
             }
+        }
+    }
+
+    // WOR-2673: the AWS-SDK cache-reserve backend was retired in favor
+    // of the object-storage one, which reaches the same buckets plus
+    // GCS, Azure, a local directory, and every S3-compatible store.
+    // A refusal rather than a silent migration: `type: s3` carried
+    // `kms_key_id`, and an alias would have moved an operator from
+    // KMS-wrapped per-object data keys to local sealing without saying
+    // so. `CacheReserveBackendConfig` also carries `#[serde(other)]`,
+    // so with no refusal here the old block parses as an out-of-tree
+    // backend and the reserve silently disappears.
+    if let Some(reserve) = config_file.proxy.cache_reserve.as_ref() {
+        if let Some(crate::types::CacheReserveBackendConfig::S3 {
+            bucket,
+            region,
+            kms_key_id,
+            prefix,
+            ..
+        }) = reserve.backend.as_ref()
+        {
+            let bucket = bucket
+                .as_deref()
+                .map(str::trim)
+                .filter(|bucket| !bucket.is_empty())
+                .unwrap_or("your-bucket");
+            let region_line = region
+                .as_deref()
+                .map(|region| format!("\n        region: {region}"))
+                .unwrap_or_default();
+            let prefix_line = prefix
+                .as_deref()
+                .map(|prefix| format!("\n        prefix: {prefix}"))
+                .unwrap_or_default();
+            let kms_note = if kms_key_id.is_some() {
+                "Your kms_key_id has no equivalent: the replacement seals entries \
+                 locally with AES-256-GCM under cache_reserve.backend.encryption, or \
+                 leaves encryption to the bucket's own SSE-KMS setting, which is \
+                 configured on the bucket and composes with either choice."
+            } else {
+                "kms_key_id has no equivalent: the replacement seals entries locally \
+                 with AES-256-GCM under cache_reserve.backend.encryption, or leaves \
+                 encryption to the bucket's own SSE-KMS setting."
+            };
+            anyhow::bail!(
+                "config compile: proxy.cache_reserve.backend type: s3 was retired. \
+                 Write this instead:\n      backend:\n        type: object_store\n        \
+                 backend: s3\n        bucket: {bucket}{region_line}{prefix_line}\n\
+                 {kms_note} See docs/cache-reserve.md for the full migration."
+            );
         }
     }
 
@@ -4691,6 +4960,7 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         deprecation,
         message_signatures: config.message_signatures,
         olp: config.olp,
+        comp: config.comp,
         web_bot_auth_publish: config.web_bot_auth_publish,
         idempotency: config.idempotency,
         // Resolved upstream transport deadlines; see
