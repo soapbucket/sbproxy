@@ -758,6 +758,7 @@ mod tests {
             path: "sb.yml".to_string(),
             credential: None,
             verify_signature: false,
+            confine: false,
             timeout_secs: 60,
             refresh_interval_secs: refresh_secs,
         }
