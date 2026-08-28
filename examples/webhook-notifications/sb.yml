@@ -32,9 +32,24 @@
 #     -d '{"url":"https://customer.example.com/hooks/sbproxy",
 #          "event_types":["key_minted","key_revoked","key_rotated"]}' | jq
 #
-# A filter is `*`, a family prefix like `key.*`, or an exact event name.
+# A filter is an exact event name, a family prefix like `key_*`, or `*`.
 # A name that matches nothing selects nothing rather than everything, so a
 # typo is a receiver that goes quiet rather than one that gets everything.
+# The family form keeps the separator, so `key_*` is the key family and
+# does not pick up a future `keyless_auth_denied`.
+#
+# `*` and `request_*` reach the per-request lifecycle events, which fire
+# once per proxied request. That is one webhook delivery per request, so
+# both are refused unless the same call says so:
+#   curl -s -u admin:admin -X POST \
+#     http://127.0.0.1:9090/admin/notifications/subscriptions \
+#     -H 'Content-Type: application/json' \
+#     -d '{"url":"https://customer.example.com/hooks/sbproxy",
+#          "event_types":["*"]}' | jq
+#   {
+#     "error": "invalid event_types: \"*\" selects the per-request lifecycle events too, which is one webhook delivery per request; name the events you want, or set allow_firehose: true to say you meant it",
+#     "code": "invalid"
+#   }
 #
 # List them. No secret comes back from any read path:
 #   curl -s -u admin:admin \
@@ -53,21 +68,42 @@
 #     -H 'Content-Type: application/json' -d '{"name":"demo"}' | jq
 #
 # When the receiver is down, three attempts are made a second or so apart
-# and the delivery lands in the deadletter queue rather than being lost:
+# and the delivery lands in the deadletter queue rather than being lost.
+# The listing is paged and carries no event bodies; `attempts` is what was
+# actually tried, so a receiver that refused outright reads 1 and one that
+# timed out three times reads 3:
 #   curl -s -u admin:admin \
-#     http://127.0.0.1:9090/admin/notifications/deadletters | jq
+#     'http://127.0.0.1:9090/admin/notifications/deadletters?limit=50' | jq
+#
+# Read one with its body, or drop one without replaying it:
+#   curl -s -u admin:admin \
+#     http://127.0.0.1:9090/admin/notifications/deadletters/$DELIVERY | jq
+#   curl -s -u admin:admin -X DELETE \
+#     http://127.0.0.1:9090/admin/notifications/deadletters/$DELIVERY | jq
 #
 # Replay it once the receiver is healthy. The replay re-sends under the
-# original event id, so a receiver that stores seen ids recognizes it:
+# original event id, so a receiver that stores seen ids recognizes it. The
+# record is removed only once the worker has taken the delivery:
 #   curl -s -u admin:admin -X POST \
 #     http://127.0.0.1:9090/admin/notifications/deadletters/$DELIVERY/replay | jq
 #
-# A nightly drain is four lines of shell, which is the point of stopping the
-# retry budget at three attempts rather than at three days:
-#   curl -s -u admin:admin http://127.0.0.1:9090/admin/notifications/deadletters \
-#     | jq -r '.items[].delivery_id' \
-#     | xargs -I{} curl -s -u admin:admin -X POST \
-#         http://127.0.0.1:9090/admin/notifications/deadletters/{}/replay
+# A nightly drain is a handful of lines of shell, which is the point of
+# stopping the retry budget at three attempts rather than at three days.
+# Check `replayed`: a full delivery queue answers 429 with `false` and keeps
+# the record, and a loop that ignores that runs far ahead of the worker and
+# gets nothing but refusals.
+#   while :; do
+#     ids=$(curl -s -u admin:admin \
+#       'http://127.0.0.1:9090/admin/notifications/deadletters?limit=20' \
+#       | jq -r '.items[].delivery_id')
+#     [ -n "$ids" ] || break
+#     for id in $ids; do
+#       ok=$(curl -s -u admin:admin -X POST \
+#         "http://127.0.0.1:9090/admin/notifications/deadletters/$id/replay" \
+#         | jq -r '.replayed')
+#       [ "$ok" = "true" ] || { sleep 30; break; }
+#     done
+#   done
 
 proxy:
   http_bind_port: 8080

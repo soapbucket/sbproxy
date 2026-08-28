@@ -28,17 +28,32 @@ import ClickToCopy from "../components/ClickToCopy.vue";
 
 const summary = useAsync(() => api.notifySummary());
 const subscriptions = useAsync(() => api.notifySubscriptions());
-const deadletters = useAsync(() => api.notifyDeadletters());
+const deadletters = useAsync(() =>
+  api.notifyDeadletters(deadletterCursor.value ?? undefined),
+);
 
 const newUrl = ref("");
-const newFilters = ref("*");
+/*
+ * Empty, not "*". This shipped pre-filled with the wildcard, so the
+ * shortest path through the page was paste a URL, click subscribe, and
+ * receive one webhook delivery per proxied request from a worker that
+ * cannot serve them. The server refuses a wildcard without the box below
+ * now; the default here is what stops an operator meeting that refusal by
+ * accident in the first place.
+ */
+const newFilters = ref("");
+const allowFirehose = ref(false);
 const mintedSecret = ref<string | null>(null);
+const deadletterCursor = ref<string | null>(null);
 const busy = ref<string | null>(null);
 const notice = ref<string | null>(null);
 
 function refreshAll() {
   summary.run();
   subscriptions.run();
+  // Back to the first page: an action that changed the queue makes a
+  // cursor into the middle of the old one meaningless.
+  deadletterCursor.value = null;
   deadletters.run();
 }
 onMounted(refreshAll);
@@ -60,6 +75,7 @@ const notConfigured = computed(
 const stats = computed<NotifierSummary | null>(() => summary.data.value ?? null);
 const rows = computed<NotifySubscription[]>(() => subscriptions.data.value?.items ?? []);
 const dead = computed<NotifyDeadLetter[]>(() => deadletters.data.value?.items ?? []);
+const moreDeadletters = computed<string | null>(() => deadletters.data.value?.next ?? null);
 
 function parseFilters(raw: string): string[] {
   return raw
@@ -85,13 +101,32 @@ async function create() {
   const url = newUrl.value.trim();
   const filters = parseFilters(newFilters.value);
   await run("__create", async () => {
-    const result = await api.notifyCreateSubscription(url, filters);
+    const result = await api.notifyCreateSubscription(
+      url,
+      filters,
+      allowFirehose.value,
+    );
     // Shown once, here. There is no route that returns it again.
     mintedSecret.value = result.signing_secret;
     newUrl.value = "";
+    newFilters.value = "";
+    allowFirehose.value = false;
     return `Created ${result.subscription.subscription_id}.`;
   });
 }
+
+/* Whether the typed filters would need the firehose acknowledgement, so
+ * the checkbox appears when it is relevant rather than always. */
+const needsFirehose = computed(() =>
+  parseFilters(newFilters.value).some(
+    (filter) =>
+      filter === "*" ||
+      (filter.endsWith("*") &&
+        ["request_started", "request_completed", "request_error"].some((event) =>
+          event.startsWith(filter.slice(0, -1)),
+        )),
+  ),
+);
 
 async function setActive(row: NotifySubscription, active: boolean) {
   await run(row.subscription_id, async () => {
@@ -101,6 +136,17 @@ async function setActive(row: NotifySubscription, active: boolean) {
 }
 
 async function rotate(row: NotifySubscription) {
+  // Confirmed, like every other irreversible operation in this console.
+  // Rotating invalidates the receiver's signing secret immediately and no
+  // read path returns the old one, so a misclick means re-onboarding the
+  // customer.
+  if (
+    !confirm(
+      `Rotate the signing key for ${row.subscription_id}? The receiver's current secret stops working immediately.`,
+    )
+  ) {
+    return;
+  }
   await run(row.subscription_id, async () => {
     const result = await api.notifyRotate(row.subscription_id);
     mintedSecret.value = result.signing_secret;
@@ -109,6 +155,13 @@ async function rotate(row: NotifySubscription) {
 }
 
 async function remove(row: NotifySubscription) {
+  if (
+    !confirm(
+      `Delete ${row.subscription_id}? Its filters and signing key go with it and cannot be restored.`,
+    )
+  ) {
+    return;
+  }
   await run(row.subscription_id, async () => {
     await api.notifyDeleteSubscription(row.subscription_id);
     return `Deleted ${row.subscription_id}. Its deadletters were kept.`;
@@ -120,6 +173,27 @@ async function replay(record: NotifyDeadLetter) {
     const result = await api.notifyReplay(record.delivery_id);
     return `Replayed ${result.event_id}.`;
   });
+}
+
+async function discard(record: NotifyDeadLetter) {
+  if (
+    !confirm(
+      `Discard ${record.delivery_id} without replaying it? The receiver never gets this event.`,
+    )
+  ) {
+    return;
+  }
+  await run(record.delivery_id, async () => {
+    await api.notifyDiscardDeadletter(record.delivery_id);
+    return `Discarded ${record.delivery_id}.`;
+  });
+}
+
+function loadMoreDeadletters() {
+  const cursor = moreDeadletters.value;
+  if (!cursor) return;
+  deadletterCursor.value = cursor;
+  deadletters.run();
 }
 </script>
 
@@ -176,7 +250,7 @@ async function replay(record: NotifyDeadLetter) {
         v-model="newFilters"
         class="sb-input filters"
         type="text"
-        placeholder="*, key.*, or key_minted, key_revoked"
+        placeholder="key_minted, key_revoked, or key_* (required)"
       />
       <button
         class="sb-btn sb-btn--sm sb-btn--primary"
@@ -187,9 +261,18 @@ async function replay(record: NotifyDeadLetter) {
       </button>
     </div>
 
+    <label v-if="needsFirehose" class="firehose">
+      <input v-model="allowFirehose" type="checkbox" />
+      <span>
+        This filter reaches the per-request lifecycle events, which fire once
+        per proxied request. That is one webhook delivery per request, and the
+        queue starts dropping under any real traffic. Tick to confirm.
+      </span>
+    </label>
+
     <EmptyState
       v-if="!rows.length && !subscriptions.loading.value"
-      message="No subscriptions. Every typed proxy event is available; see the events documentation for the list."
+      message="No subscriptions. Name the events you want, or a family like key_*; the per-request lifecycle events need an explicit acknowledgement because they fire once per request. See the events documentation for the list."
     />
 
     <div v-else class="sb-card table-wrap">
@@ -252,7 +335,7 @@ async function replay(record: NotifyDeadLetter) {
 
     <EmptyState
       v-if="!dead.length && !deadletters.loading.value"
-      message="Nothing has run out of attempts. A delivery lands here after three failed attempts and stays until it is replayed."
+      message="Nothing has run out of attempts. A delivery lands here once it has used its budget, or immediately on a refusal that will not change, and stays until it is replayed or discarded."
     />
 
     <div v-else class="sb-card table-wrap">
@@ -262,6 +345,7 @@ async function replay(record: NotifyDeadLetter) {
             <th>Delivery</th>
             <th>Event</th>
             <th>Type</th>
+            <th>Attempts</th>
             <th>Last status</th>
             <th>Reason</th>
             <th>Moved</th>
@@ -273,22 +357,40 @@ async function replay(record: NotifyDeadLetter) {
             <td class="sb-mono">{{ record.delivery_id }}</td>
             <td class="sb-mono">{{ record.event_id }}</td>
             <td class="sb-mono">{{ record.event_type }}</td>
+            <td class="sb-mono">{{ record.attempts }}</td>
             <td class="sb-mono">{{ record.last_status ?? "-" }}</td>
             <td class="sb-mono">{{ record.last_reason }}</td>
             <td class="sb-mono">{{ record.moved_at }}</td>
             <td>
-              <button
-                class="sb-btn sb-btn--sm"
-                :disabled="busy === record.delivery_id"
-                title="Re-send under the original event id. The record leaves the queue."
-                @click="replay(record)"
-              >
-                replay
-              </button>
+              <div class="actions">
+                <button
+                  class="sb-btn sb-btn--sm"
+                  :disabled="busy === record.delivery_id"
+                  title="Re-send under the original event id. The record leaves the queue once the worker takes it."
+                  @click="replay(record)"
+                >
+                  replay
+                </button>
+                <button
+                  class="sb-btn sb-btn--sm"
+                  :disabled="busy === record.delivery_id"
+                  title="Drop the record without replaying it. The receiver never gets this event."
+                  @click="discard(record)"
+                >
+                  discard
+                </button>
+              </div>
             </td>
           </tr>
         </tbody>
       </table>
+      <button
+        v-if="moreDeadletters"
+        class="sb-btn sb-btn--sm more"
+        @click="loadMoreDeadletters"
+      >
+        load more
+      </button>
     </div>
   </template>
 </template>
@@ -344,5 +446,16 @@ async function replay(record: NotifyDeadLetter) {
 .notice {
   margin: 0 0 16px;
   font-size: 13px;
+}
+.firehose {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin: 0 0 12px;
+  font-size: 13px;
+  max-width: 70ch;
+}
+.more {
+  margin: 12px;
 }
 </style>

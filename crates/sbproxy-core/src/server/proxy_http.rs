@@ -9026,9 +9026,9 @@ impl ProxyHttp for SbProxy {
         // Build the terminal RequestEvent and hand it to the
         // registered RequestEventSink. The OSS default is a no-op
         // sink, so this pays one OnceLock load + an early return when
-        // no sink has been wired. Enterprise startup registers a NATS
-        // producer adapter (separate slice) that ships the event to
-        // the broker.
+        // no sink has been wired. `request_events.sink: nats` and
+        // `: clickhouse` register the two network sinks in
+        // `sbproxy_observe::event_ingest` (WOR-2674).
         let latency_ms_envelope: Option<u32> = ctx.request_start.map(|s| {
             let ms = s.elapsed().as_millis();
             // Saturate at u32::MAX rather than overflow on the

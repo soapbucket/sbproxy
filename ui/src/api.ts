@@ -2579,6 +2579,9 @@ export interface NotifySubscription {
   event_types: string[];
   signing_key_id: string;
   active: boolean;
+  /** Whether this subscription was allowed to name a wildcard that reaches
+   *  the per-request lifecycle events. */
+  allow_firehose: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -3139,11 +3142,15 @@ export const api = {
     getJson<{ items: NotifySubscription[] }>("/admin/notifications/subscriptions"),
   // The signing secret is in this response and in no other. The view shows
   // it once and does not store it.
-  notifyCreateSubscription: (url: string, eventTypes: string[]) =>
+  notifyCreateSubscription: (
+    url: string,
+    eventTypes: string[],
+    allowFirehose = false,
+  ) =>
     sendJson<{ subscription: NotifySubscription; signing_secret: string }>(
       "POST",
       "/admin/notifications/subscriptions",
-      { url, event_types: eventTypes },
+      { url, event_types: eventTypes, allow_firehose: allowFirehose },
     ),
   notifySetActive: (subscriptionId: string, active: boolean) =>
     sendJson<NotifySubscription>(
@@ -3161,12 +3168,26 @@ export const api = {
       "DELETE",
       `/admin/notifications/subscriptions/${encodeURIComponent(subscriptionId)}`,
     ),
-  notifyDeadletters: () =>
-    getJson<{ items: NotifyDeadLetter[] }>("/admin/notifications/deadletters"),
+  // Paged, oldest first. The records carry no event body: the queue holds
+  // up to 10,000 of them and this is re-fetched after every action.
+  notifyDeadletters: (after?: string, limit = 50) => {
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (after) params.set("after", after);
+    return getJson<{ items: NotifyDeadLetter[]; next: string | null }>(
+      `/admin/notifications/deadletters?${params.toString()}`,
+    );
+  },
   notifyReplay: (deliveryId: string) =>
     sendJson<{ event_id: string; replayed: boolean }>(
       "POST",
       `/admin/notifications/deadletters/${encodeURIComponent(deliveryId)}/replay`,
+    ),
+  // How a record whose stored event no longer deserializes leaves the
+  // queue: a replay of one refuses before it would have been removed.
+  notifyDiscardDeadletter: (deliveryId: string) =>
+    sendJson<{ deleted: boolean }>(
+      "DELETE",
+      `/admin/notifications/deadletters/${encodeURIComponent(deliveryId)}`,
     ),
 
   // Attested metering (WOR-2131). All three are tenant-scoped server-side

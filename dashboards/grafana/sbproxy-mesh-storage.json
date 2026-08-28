@@ -1150,7 +1150,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (outcome) (rate(sbproxy_notify_deliveries_total{outcome=~\"delivered|retried|deadlettered|dropped\"}[5m]))",
+          "expr": "sum by (outcome) (rate(sbproxy_notify_deliveries_total{outcome=~\"delivered|retried|deadlettered|dropped|deadletter_evicted|deadletter_failed|worker_stopped\"}[5m]))",
           "legendFormat": "{{outcome}}",
           "datasource": {
             "type": "prometheus",
@@ -1158,7 +1158,7 @@
           }
         }
       ],
-      "description": "What the outbound notifier did with each delivery. delivered is a receiver that answered 2xx. retried is an attempt that failed and will be tried again, so a low steady rate is a flaky receiver rather than a broken one. deadlettered is a delivery that used its whole attempt budget and is now waiting for a replay: alert on this, because it is the only outcome that needs a human. dropped is the hand-off queue at capacity, which means the request path outran the delivery worker and events were discarded rather than made to wait."
+      "description": "What the outbound notifier did with each delivery. delivered is a receiver that answered 2xx. retried is an attempt that failed and will be tried again, so a low steady rate is a flaky receiver rather than a broken one. deadlettered is a delivery that used its whole attempt budget and is now waiting for a replay: alert on this, because it is the only outcome that needs a human. dropped is the hand-off queue at capacity, which means the request path outran the delivery worker and events were discarded rather than made to wait. deadletter_evicted, deadletter_failed, and worker_stopped are the other three loss outcomes: records pushed out of a full deadletter queue, a deadletter that could not be written at all, and a delivery offered after the worker was gone. Any of the four non-zero means events nobody will ever receive."
     },
     {
       "id": 16,

@@ -80,11 +80,49 @@ curl -s -u admin:admin -X POST \
 `signing_secret` appears there and nowhere else. A receiver that loses it
 rotates rather than reading it back.
 
-A filter is one of three things: `*` for everything, a family prefix like
-`key.*`, or an exact event name. Anything else is refused at creation rather
+A filter is one of three things: an exact event name, a family prefix like
+`key_*`, or `*` for everything. Anything else is refused at creation rather
 than silently selecting nothing, and an exact filter that does not match any
 event name selects nothing rather than everything, which is the safe
 direction for a rule that decides what leaves your network.
+
+The family form keeps the separator in the prefix, so `key_*` selects
+`key_minted`, `key_revoked`, `key_rotated`, and `key_blocked` and does not
+select a future `keyless_auth_denied`. A prefix that matched mid-word would
+hand a customer subscribed to the key family an event neither of you asked
+for, with no config change on either side.
+
+### The wildcard is a firehose, and it has to be said out loud
+
+`request_started`, `request_completed`, and `request_error` fire once per
+proxied request. A subscription that selects one of them is asking for one
+HTTP POST per request, with three attempts and a five-second timeout each,
+from a worker that runs at most 64 deliveries at a time. At 500 rps that is
+not a rate this feature can serve, and the queue starts dropping within
+seconds.
+
+So a wildcard that reaches any of the three is refused unless the same call
+says `allow_firehose: true`:
+
+```bash
+curl -s -u admin:admin -X POST http://127.0.0.1:9090/admin/notifications/subscriptions \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://customer.example.com/hooks/sbproxy","event_types":["*"]}'
+```
+
+```json
+{"error":"invalid event_types: \"*\" selects the per-request lifecycle events too, which is one webhook delivery per request; name the events you want, or set allow_firehose: true to say you meant it","code":"invalid"}
+```
+
+That covers `["*"]` and `["request_*"]` alike. Naming one of the three
+exactly is not refused: that is you picking it, and the set is bounded by
+what you typed.
+
+What you get when you do set the flag: the queue is `queue_capacity` deep
+(4,096 by default), a full queue **drops the event** and counts it under
+`sbproxy_notify_deliveries_total{outcome="dropped"}`, and nothing on the
+request path waits for your receiver. A proxy that blocked on a customer's
+webhook endpoint is a proxy that customer can stall.
 
 ## Managing them
 
@@ -112,6 +150,11 @@ curl -s -u admin:admin -X POST \
 curl -s -u admin:admin -X DELETE \
   http://127.0.0.1:9090/admin/notifications/subscriptions/$SUB
 ```
+
+The console asks before the last two. Rotating invalidates the receiver's
+signing secret immediately and no read path returns the old one, and
+deleting takes the filters and the key with it, so both need the customer
+re-onboarded to undo.
 
 ## What a receiver gets
 
@@ -166,14 +209,15 @@ flowchart LR
     Q -- yes --> D1[dropped, counted]
     Q -- no --> A1[attempt 1]
     A1 -- 2xx --> OK([delivered])
-    A1 -- "4xx, or egress refused" --> DL[deadletter queue]
+    A1 -- "4xx, or egress refused" --> DL["deadletter queue<br/>attempts: 1"]
     A1 -- "5xx, 408, 429, timeout" --> W1[wait ~1s, jittered]
     W1 --> A2[attempt 2]
     A2 -- 2xx --> OK
     A2 -- retryable --> W2[wait ~4s, jittered]
     W2 --> A3[attempt 3]
     A3 -- 2xx --> OK
-    A3 -- anything else --> DL
+    A3 -- anything else --> DL2["deadletter queue<br/>attempts: 3"]
+    DL2 -->|operator replays| A1
     DL -->|operator replays| A1
 ```
 
@@ -192,12 +236,16 @@ outbound spool with a scheduler, backpressure, and an operational surface of
 its own, and a proxy is not a queue service. The deadletter queue plus the
 replay endpoint is the recoverable version of the same guarantee, with the
 holding made explicit rather than implicit: a nightly job that lists the
-queue and replays it is four lines of shell and you can see it.
+queue and replays it is a handful of lines of shell and you can see it.
 
 ## The deadletter queue
 
+The listing is paged, oldest first, and carries no event bodies: the queue
+holds up to 10,000 records each carrying a whole event, and the console
+re-fetches it after every action.
+
 ```bash
-curl -s -u admin:admin http://127.0.0.1:9090/admin/notifications/deadletters
+curl -s -u admin:admin 'http://127.0.0.1:9090/admin/notifications/deadletters?limit=50'
 ```
 
 ```json
@@ -209,10 +257,30 @@ curl -s -u admin:admin http://127.0.0.1:9090/admin/notifications/deadletters
   "attempts": 3,
   "last_status": 503,
   "last_reason": "http_error",
-  "moved_at": "2026-08-27T10:14:18Z",
-  "event": {"event_type": "key_minted", "tenant_id": "acme", "data": {}}
-}]}
+  "moved_at": "2026-08-27T10:14:18Z"
+}], "next": "dlv_01J8ZK..."}
 ```
+
+`next` is the cursor for the following page and is `null` on the last one:
+pass it back as `?after=`. `limit` defaults to 50 and is capped at 100.
+
+`attempts` is what was actually tried, not the budget. A receiver answering
+`400` deadletters after one attempt and says `1`; a receiver timing out
+three times says `3`. That is the first thing to look at in a queue of mixed
+records.
+
+Read one with its event body, or drop one without replaying it:
+
+```bash
+curl -s -u admin:admin \
+  http://127.0.0.1:9090/admin/notifications/deadletters/$DELIVERY
+
+curl -s -u admin:admin -X DELETE \
+  http://127.0.0.1:9090/admin/notifications/deadletters/$DELIVERY
+```
+
+`DELETE` is how a record whose stored event no longer deserializes leaves
+the queue, since a replay of one refuses before it would have been removed.
 
 ```bash
 curl -s -u admin:admin -X POST \
@@ -223,11 +291,25 @@ curl -s -u admin:admin -X POST \
 {"event_id": "evt_01J8ZK...", "replayed": true}
 ```
 
-A replay re-sends under the original `event_id` and removes the record
-first. Removing it first is deliberate: keeping it until the replay
-succeeded means a replay that fails again writes a second record for the
-same event, and an operator draining the queue would watch it refuse to
-shrink.
+A replay re-sends under the original `event_id`, and the record is removed
+only once the worker has taken the delivery. If the delivery queue is full
+the answer is `429` and the record stays:
+
+```json
+{"error":"the delivery queue is full; this deadletter was kept, retry once it drains","code":"queue_full","replayed":false}
+```
+
+**Check `replayed` in a drain script.** The queue is `queue_capacity` deep
+and the worker spends up to twenty seconds per delivery against a receiver
+that may still be flaky, while a shell loop issues admin calls in
+milliseconds. A loop that ignores the refusal will run far ahead of the
+worker and get nothing but `429`s; one that backs off drains the queue.
+
+The cost of removing the record last rather than first is that a replay
+which is taken and then fails again writes a fresh record, so draining
+against a receiver that is still down leaves the queue non-empty. That is
+one record per pass, and it is recoverable. Removing it first was not: a
+full queue destroyed the record and reported success.
 
 The queue holds at most 10,000 records. Past that the oldest is dropped, a
 `warn` line says so, and
@@ -242,7 +324,7 @@ deadletter queue, and a replay button.
 
 | Family | Labels | Reading it |
 |---|---|---|
-| `sbproxy_notify_deliveries_total` | `outcome` | `delivered`, `retried`, `deadlettered`, `dropped`, plus `deadletter_evicted` and the admin mutations. Alert on `deadlettered`: it is the only outcome that needs a human. |
+| `sbproxy_notify_deliveries_total` | `outcome` | `delivered`, `retried`, `deadlettered`, `dropped`, plus `deadletter_evicted`, `deadletter_failed`, `serialize_error`, `worker_stopped`, and the admin mutations (`create`, `update`, `rotate`, `delete`, `replay`, `discard`). Alert on `deadlettered`: it is the only outcome that needs a human. The four loss outcomes, `dropped`, `deadletter_evicted`, `deadletter_failed`, and `worker_stopped`, all mean events nobody will ever receive. |
 | `sbproxy_notify_queue` | `collection` | `subscriptions` and `deadletters`. A configured notifier publishes both at zero on boot, so no data means it is not configured. |
 
 Neither family is labeled by subscription id or destination. Both are
@@ -262,6 +344,12 @@ needs a sequence reads the event's own `timestamp`.
 
 It does not deliver to a subscription created after the event was published.
 The subscription set is snapshotted when the event reaches the worker.
+
+It does not queue without bound. The hand-off queue is `queue_capacity`
+deep, at most 64 deliveries are in flight at once, and an event that arrives
+with no room is dropped and counted rather than making a request wait. A
+receiver that is down slows its own subscription and not the others: each
+delivery holds one of the 64 slots.
 
 It does not flush on shutdown. The notifier is installed process-wide and is
 never dropped, so `SIGTERM` ends the process with whatever is queued still

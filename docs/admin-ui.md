@@ -253,17 +253,28 @@ its whole attempt budget is the one outcome that needs a human.
 
 - **Shows:** `GET /admin/notifications` for the four counts,
   `GET /admin/notifications/subscriptions`, and
-  `GET /admin/notifications/deadletters`.
+  `GET /admin/notifications/deadletters?limit=50`, which is paged and
+  carries no event bodies. **load more** walks the pages.
 - **Mutations:** `POST /admin/notifications/subscriptions` (create, which is
   the only response that ever carries the signing secret; the page shows it
   in a dismissible banner and does not store it),
   `PATCH .../subscriptions/{id}` (pause, resume, repoint),
-  `POST .../subscriptions/{id}/rotate`, `DELETE .../subscriptions/{id}`, and
-  `POST /admin/notifications/deadletters/{delivery_id}/replay`.
+  `POST .../subscriptions/{id}/rotate`, `DELETE .../subscriptions/{id}`,
+  `POST /admin/notifications/deadletters/{delivery_id}/replay`, and
+  `DELETE /admin/notifications/deadletters/{delivery_id}`. Rotate, delete,
+  and discard each ask first, matching the rest of the console: rotating
+  invalidates the receiver's secret immediately and no read path returns the
+  old one, deleting takes the filters and key with it, and discarding means
+  the receiver never gets that event.
+- **The filter box starts empty**, and the subscribe button stays disabled
+  until something is typed. A filter that reaches the per-request lifecycle
+  events shows a checkbox that has to be ticked, because those fire once per
+  proxied request and the server refuses them without it.
 - **Empty/error notes:** every route answers `404` when
   `proxy.notifications` is absent or disabled, and the page renders that as
-  "not configured" rather than as an error. An empty deadletter queue is the
-  healthy state, not a missing feature.
+  "not configured" rather than as an error. That is read off the response
+  status, not off the error text. An empty deadletter queue is the healthy
+  state, not a missing feature.
 
 See [notifications.md](notifications.md) for the delivery contract, the
 signature construction, and why the retry budget stops at three attempts.

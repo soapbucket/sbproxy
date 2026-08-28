@@ -391,17 +391,18 @@ const EXEMPT: &[Exemption] = &[
                  ClickHouse insert carries events from many unrelated requests. A \
                  traceparent there would name whichever request happened to be first in \
                  the batch, which is worse than none: it renders as a real edge. The \
-                 per-event trace id is already a field of the payload, which is where a \
-                 warehouse join belongs. WOR-2318.",
+                 event's own `request_id` is already a field of the payload, which is \
+                 where a warehouse join belongs. WOR-2318.",
     },
     Exemption {
         file: "crates/sbproxy-observe/src/notify/mod.rs",
         reason: "The span is lost at a spawn boundary. The notifier's delivery worker \
                  owns its own runtime and drains a queue, so nothing is current when it \
-                 sends, and a retry lands minutes after the request that produced the \
-                 event has finished. The delivery carries the event's own id in a \
-                 header instead, which is the correlation a receiver can actually act \
-                 on. WOR-2318.",
+                 sends, and the last of three attempts lands about five seconds after \
+                 the request that produced the event has finished, or far later still \
+                 when an operator replays it out of the deadletter queue. The delivery \
+                 carries the event's own id in a header instead, which is the \
+                 correlation a receiver can actually act on. WOR-2318.",
     },
     Exemption {
         file: "crates/sbproxy-observe/src/event_sink.rs",

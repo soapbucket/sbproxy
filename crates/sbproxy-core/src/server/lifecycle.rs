@@ -782,20 +782,22 @@ fn build_request_event_sink(
         // deployment that asked for its events to go somewhere should
         // still see them locally rather than discover the typo as
         // silence in a warehouse.
-        RequestEventSinkKind::Nats => match build_ingest_sink(cfg, "nats") {
+        RequestEventSinkKind::Nats => match build_ingest_sink(cfg, RequestEventSinkKind::Nats) {
             Some(sink) => Some((sink, "nats")),
             None => Some((
                 Arc::new(LoggingSink) as Arc<dyn RequestEventSink>,
                 "logging",
             )),
         },
-        RequestEventSinkKind::ClickHouse => match build_ingest_sink(cfg, "clickhouse") {
-            Some(sink) => Some((sink, "clickhouse")),
-            None => Some((
-                Arc::new(LoggingSink) as Arc<dyn RequestEventSink>,
-                "logging",
-            )),
-        },
+        RequestEventSinkKind::ClickHouse => {
+            match build_ingest_sink(cfg, RequestEventSinkKind::ClickHouse) {
+                Some(sink) => Some((sink, "clickhouse")),
+                None => Some((
+                    Arc::new(LoggingSink) as Arc<dyn RequestEventSink>,
+                    "logging",
+                )),
+            }
+        }
     }
 }
 
@@ -872,14 +874,20 @@ fn resolve_ingest_secret(field: &'static str, reference: Option<&str>) -> Option
 
 /// Build one of the two optional ingest sinks, or `None` when its block is
 /// missing, malformed, or its credential will not resolve.
+///
+/// Takes the sink kind rather than a string, and matches it exhaustively.
+/// The string form had a catch-all arm that built ClickHouse for any value
+/// that was not `"nats"`, so a third destination added later would have
+/// been silently built as the second one.
 fn build_ingest_sink(
     cfg: &sbproxy_config::types::RequestEventsConfig,
-    kind: &'static str,
+    kind: sbproxy_config::types::RequestEventSinkKind,
 ) -> Option<std::sync::Arc<dyn sbproxy_observe::RequestEventSink>> {
+    use sbproxy_config::types::RequestEventSinkKind;
     use sbproxy_observe::event_ingest::EventIngest;
 
     let target = match kind {
-        "nats" => match cfg.nats.as_ref() {
+        RequestEventSinkKind::Nats => match cfg.nats.as_ref() {
             Some(nats) => build_nats_target(nats)?,
             None => {
                 tracing::warn!(
@@ -888,7 +896,7 @@ fn build_ingest_sink(
                 return None;
             }
         },
-        _ => match cfg.clickhouse.as_ref() {
+        RequestEventSinkKind::ClickHouse => match cfg.clickhouse.as_ref() {
             Some(clickhouse) => build_clickhouse_target(clickhouse)?,
             None => {
                 tracing::warn!(
@@ -898,6 +906,12 @@ fn build_ingest_sink(
                 return None;
             }
         },
+        // Not reachable from `build_request_event_sink`, which only calls
+        // this for the two network destinations. Named rather than caught
+        // so adding a third kind is a compile error here.
+        RequestEventSinkKind::None | RequestEventSinkKind::Logging | RequestEventSinkKind::File => {
+            return None
+        }
     };
 
     let watermark = cfg.watermark_store_path.as_ref().and_then(|path| {
@@ -917,11 +931,12 @@ fn build_ingest_sink(
         }
     });
 
+    let target_label = target.label();
     match EventIngest::start(target, cfg.queue_capacity, watermark) {
         Ok(sink) => Some(std::sync::Arc::new(sink)),
         Err(error) => {
             tracing::warn!(
-                sink = kind,
+                sink = target_label,
                 error = %error,
                 "request event ingest sink could not start; using the logging sink"
             );
