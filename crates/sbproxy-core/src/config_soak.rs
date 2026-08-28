@@ -267,11 +267,11 @@ pub fn degraded_signal(degraded: &[String], require_none: bool) -> SignalOutcome
 /// measured nothing.
 #[must_use]
 pub fn upstream_health_signal(
+    config: &ConfigSoakConfig,
     open_breakers: &[String],
     observed: usize,
-    require: bool,
 ) -> SignalOutcome {
-    if !require {
+    if !config.require_upstream_health {
         return SignalOutcome::Abstain("require_upstream_health is off for this node".to_string());
     }
     if observed == 0 {
@@ -298,12 +298,12 @@ pub fn upstream_health_signal(
 /// wrong before us.
 #[must_use]
 pub fn request_outcome_signal(
+    config: &ConfigSoakConfig,
     baseline: RequestCounts,
     current: RequestCounts,
-    min_requests: u64,
-    max_error_rate_delta: f64,
     baseline_error_rate: Option<f64>,
 ) -> SignalOutcome {
+    let min_requests = config.min_requests;
     let window = current.since(baseline);
     if window.requests < min_requests {
         return SignalOutcome::Abstain(format!(
@@ -318,14 +318,14 @@ pub fn request_outcome_signal(
     // against zero: a node whose steady state is 2% 404s from a scanner
     // has not got worse because the new config kept doing that.
     let previous = baseline_error_rate.unwrap_or(0.0);
-    if rate - previous > max_error_rate_delta {
+    if rate - previous > config.max_error_rate_delta {
         return SignalOutcome::Fail(format!(
             "the error rate rose from {:.1}% to {:.1}% over {} request(s), past the \
              max_error_rate_delta of {:.1}%",
             previous * 100.0,
             rate * 100.0,
             window.requests,
-            max_error_rate_delta * 100.0
+            config.max_error_rate_delta * 100.0
         ));
     }
     SignalOutcome::Pass
@@ -558,31 +558,23 @@ pub fn judge(
     open_breakers: &[String],
     observed_breakers: usize,
 ) -> (SoakVerdict, Vec<(SoakSignal, SignalOutcome)>) {
+    // Bound once, and by type: every read below is a read of a
+    // `ConfigSoakConfig` field, which is what `check-config-readers.sh`
+    // and its `key_registry` test look for when they prove that every
+    // key the schema accepts is one production code actually consults.
+    let config = &window.config;
     let reports = vec![
         (
             SoakSignal::DegradedSubsystems,
-            degraded_signal(
-                &window.degraded,
-                window.config.require_no_degraded_subsystems,
-            ),
+            degraded_signal(&window.degraded, config.require_no_degraded_subsystems),
         ),
         (
             SoakSignal::UpstreamHealth,
-            upstream_health_signal(
-                open_breakers,
-                observed_breakers,
-                window.config.require_upstream_health,
-            ),
+            upstream_health_signal(config, open_breakers, observed_breakers),
         ),
         (
             SoakSignal::RequestOutcome,
-            request_outcome_signal(
-                window.baseline,
-                current,
-                window.config.min_requests,
-                window.config.max_error_rate_delta,
-                window.baseline_error_rate,
-            ),
+            request_outcome_signal(config, window.baseline, current, window.baseline_error_rate),
         ),
         (
             SoakSignal::OperatorProbe,
@@ -940,13 +932,12 @@ mod tests {
     #[test]
     fn the_request_outcome_signal_abstains_below_min_requests() {
         let outcome = request_outcome_signal(
+            &soak(50),
             RequestCounts::default(),
             RequestCounts {
                 requests: 4,
                 errors: 1,
             },
-            50,
-            0.05,
             None,
         );
         assert!(
@@ -1154,26 +1145,24 @@ mod tests {
     fn the_error_rate_is_a_delta_not_an_absolute() {
         // Steady state 10% errors, unchanged by the new config.
         let outcome = request_outcome_signal(
+            &soak(50),
             RequestCounts::default(),
             RequestCounts {
                 requests: 100,
                 errors: 10,
             },
-            50,
-            0.05,
             Some(0.10),
         );
         assert_eq!(outcome, SignalOutcome::Pass);
 
         // The same node, now failing a third of its requests.
         let outcome = request_outcome_signal(
+            &soak(50),
             RequestCounts::default(),
             RequestCounts {
                 requests: 100,
                 errors: 33,
             },
-            50,
-            0.05,
             Some(0.10),
         );
         assert!(matches!(outcome, SignalOutcome::Fail(_)), "{outcome:?}");

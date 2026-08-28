@@ -1235,6 +1235,20 @@ proxy:
     dir: /var/lib/sbproxy/config-history
     keep: 20
     keep_rejected: 10
+    soak:
+      window_secs: 120
+      min_requests: 50
+      max_error_rate_delta: 0.05
+      require_no_degraded_subsystems: true
+      require_upstream_health: true
+      probe:
+        url: http://127.0.0.1:8080/healthz
+        expect_status: 200
+        interval_secs: 10
+    boot:
+      fallback: off
+      max_attempts: 3
+      success_secs: 30
 ```
 
 | Field | Type | Default | Description |
@@ -1242,13 +1256,131 @@ proxy:
 | `enabled` | bool | `false` | Master switch. |
 | `dir` | string | `/var/lib/sbproxy/config-history` | Directory the ring lives in. |
 | `keep` | int | `20` | Applied entries the ring retains, beyond whichever entry the last-known-good pointer names (that entry is never evicted). Must be at least 1. |
-| `keep_rejected` | int | `10` | Reserved for rejected-candidate retention. Accepted and stored for forward compatibility, but nothing writes to the ring's `rejected/` directory yet in this release, so this field has no observable effect today; a config that fails to apply is not recorded anywhere. Wiring the writer is a later change. |
+| `keep_rejected` | int | `10` | Refused candidates the ring retains under `rejected/`. Eviction is oldest first, keyed on the most recent refusal, so a candidate an authority is still serving every poll interval is not the one that gets dropped. |
+| `soak` | object | see below | The window a newly applied revision must survive before it is promoted to last known good. |
+| `boot` | object | see below | What this node does when the config it was told to boot on does not work. |
+
+#### soak
+
+Compiling is not evidence that a config works. A dead upstream URL, a rate
+limit of 10 that should have been 10000, an auth block that rejects the
+caller carrying most of your traffic, and a WAF rule that matches every
+request all compile cleanly. So a committed reload arms a window, four
+signals report into it, and only a window that closes on a passing verdict
+moves the last-known-good pointer.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | `true` | On by default inside a block that is off by default. A node that recorded revisions but never promoted one would leave the boot fallback with nothing to boot from. |
+| `window_secs` | int | `120` | How long a revision must survive before the window closes. Must be at least 1 when the soak is enabled; `POST /admin/config/confirm` short-circuits it. |
+| `min_requests` | int | `50` | Fewest requests the window must observe before the request-outcome signal reports anything but `abstain`. |
+| `max_error_rate_delta` | float | `0.05` | How far the error rate may rise, against the rate measured when the window armed, before the request-outcome signal fails. Between 0 and 1. |
+| `require_no_degraded_subsystems` | bool | `true` | Whether a reload that published while a subsystem stayed on prior state fails its soak. |
+| `require_upstream_health` | bool | `true` | Whether an open upstream circuit breaker fails the soak. |
+| `probe.url` | string | unset | An HTTP `GET` the soak issues on its own cadence. Absent by default. |
+| `probe.expect_status` | int | `200` | Status that response must carry. |
+| `probe.interval_secs` | int | `10` | Seconds between probe ticks. Must be at least 1. |
+| `probe.timeout_ms` | int | `2000` | Per-request timeout. A probe that times out fails the soak; it does not abstain. |
+
+The four signals, and what each of them catches:
+
+| Signal | Source | Catches |
+|---|---|---|
+| Degraded subsystems | The reload's own outcome | A pipeline that published while the key plane, a sink, or the model runtime stayed on prior state. Reports immediately, so a degraded reload fails without waiting the window out. |
+| Upstream health | The running config's circuit breakers | A config that repointed an origin at a dead address, on a node with almost no traffic. |
+| Request outcome | `sbproxy_requests_total` by status class, plus the upstream retry and timeout counters | A policy that denies everything, an auth block that rejects every caller, a transform that corrupts bodies. |
+| Operator probe | `probe:` above, and `proxy.synthetic_probe` when it is running | Whatever you know and the proxy does not. |
+
+The verdict has three states, not two. Argo Rollouts has the one people
+forget: an analysis run completes successful, failed, or **inconclusive**,
+and inconclusive pauses a rollout rather than promoting or aborting it. A
+node that took four requests overnight and 500'd one of them has a 25%
+error rate and no information, so below `min_requests` the request-outcome
+signal abstains.
+
+| Signals | Verdict | The `lkg` pointer |
+|---|---|---|
+| Any non-abstaining failure | failed | does not move |
+| At least one non-abstaining pass, no failures | passed | advances |
+| Every signal abstained | inconclusive | does not move; the entry stays `applied` |
+
+One abstaining signal never blocks a promotion. Every signal abstaining is
+different, and promoting on it would be promote-on-apply with two extra
+minutes attached. That case gets its own `inconclusive` label on
+`sbproxy_config_soak_verdict_total`, because a soak that is not measuring
+anything is worth surfacing rather than hiding behind a green promotion.
+
+A clean reload does not promote on its own. `require_no_degraded_subsystems`
+is a veto: it can fail a soak and it cannot pass one, for the same reason
+this block exists at all. Something that actually observed traffic, an
+upstream, or a probe has to be what promotes a revision.
+
+On a node with little organic traffic, turn on
+[`synthetic_probe`](#synthetic_probe). Flagger's field experience is the
+warning worth copying: a canary that receives no traffic fails its metric
+check with "no values found for metric request-success-rate" and eventually
+rolls back, and insufficient traffic is documented as the most common cause
+of a spurious Flagger rollback. The synthetic driver this proxy already
+ships fires an in-process request through the compiled handler chain on a
+fixed cadence, and the soak reads its outcome. Be precise about what that
+proves: the synthetic origin is a non-network action, so a passing run
+proves the chain executes and proves nothing about whether any upstream is
+reachable. That is why it sits alongside the upstream-health signal rather
+than replacing it, and why an operator who wants a real upstream exercised
+still declares `probe.url`.
+
+#### boot
+
+`run` used to read the file, resolve `source:`, compile, bind, and exit 1
+on any failure. That is right on a first boot, because a node with no
+working config has nothing to serve. It is wrong on the thousandth, when
+the node served fine for six months, someone pushed a typo, and there is a
+perfectly good config sitting in the ring.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `fallback` | `off` \| `last_known_good` | `off` | What to do when the configured document does not boot. Off by default, so a broken config still exits 1 with the same message unless you ask. |
+| `max_attempts` | int | `3` | How many times one ring entry may be tried before it is retired as unbootable. Must be at least 1. |
+| `success_secs` | int | `30` | How long a booted process must serve before its entry's boot counter is cleared. |
+
+`--config-fallback <off|last-known-good>` and `SB_CONFIG_FALLBACK` override
+this field, in that order of precedence. The flag wins deliberately: a
+rescue boot must not depend on the file being right, and the file is what
+is broken.
+
+A node that boots on the fallback says so. It warns at startup, reports
+`sbproxy_config_fallback_active` as 1, and answers `GET /admin/config/fallback`
+with the revision it is pinned to. A node quietly serving a config nobody
+wrote is worse than one that is down, because nobody goes looking for it.
+
+While the pin is in place the file watcher, SIGHUP, and the `source:`
+refresh poller are inert. They have to be: the watcher watches the config's
+*directory* and re-reads the config path on any event in it, so leaving it
+live would re-apply the broken file on the next save in that directory and
+loop straight back into the state the fallback just rescued the node from.
+Config-authority polling stays live on purpose, because a fleet-wide fix
+pushed from the control plane is how this should end.
+`DELETE /admin/config/fallback` clears the pin and resumes all three
+without a restart.
+
+An entry that was good in October need not construct after an upgrade that
+tightened validation, so the walk counts. Borrowing systemd-boot's boot
+counting, `boot_attempts` on the entry being tried is incremented on disk
+*before* the attempt and cleared once the process has served for
+`success_secs`. `max_attempts` failures retire that entry and the walk
+moves to the next candidate. The ring is finite and each exhausted
+candidate leaves it permanently, so the walk terminates; when it runs out,
+the process exits `78` (`EX_CONFIG`) with a message naming every revision
+it tried and why each one failed. A first boot with an empty ring exits the
+way `off` does, and says the ring was empty rather than pretending a
+fallback was attempted.
 
 Every applied revision, whatever triggered it, lands in the ring the same
 way: hash the pre-resolution bytes, write the blob, append an entry, then
 persist the index (eviction, when `keep` is exceeded, always spares
-whichever entry the `lkg` pointer names). `mark_good` is the one thing
-that would move that pointer, and nothing in this release calls it:
+whichever entry the `lkg` pointer names). Appending never promotes. The
+soak window is the only thing that moves the `lkg` pointer, and only on a
+passing verdict:
 
 ```mermaid
 flowchart TD
@@ -1260,8 +1392,22 @@ flowchart TD
     E -->|yes| G["Evict the oldest entries\n(never the one lkg names)"]
     G --> F
     F --> H["GET /admin/config/history\nGET /admin/config/history/{digest}"]
-    D -.->|"mark_good() exists but has\nno caller in this release"| I["state: good, lkg pointer moves\n(not wired yet)"]
+    F --> S["Arm the soak window\n(soak.window_secs)"]
+    S --> T{"Verdict at window close,\nor at POST /admin/config/confirm"}
+    T -->|"passed"| U["state: good,\nlkg pointer advances"]
+    T -->|"failed"| V["state: failed,\nlkg pointer does not move"]
+    T -->|"inconclusive\n(every signal abstained)"| W["state stays applied,\nlkg pointer does not move"]
 ```
+
+A candidate that never applies is kept too, under `rejected/<digest>.json`,
+with the reason it was refused, the stage that refused it, the provenance,
+and the document as written. The node already knows exactly why it refused
+a candidate; before this it became a counter and a log line and then it was
+gone. `GET /admin/config/rejected` reads them back, and a repeat refusal of
+byte-identical content updates one entry's count rather than filling the
+directory with copies. A `reload_busy` skip is not recorded: nothing was
+examined, the candidate is retried at the next interval, and a row that
+repeats every poll cycle on a healthy node would bury the real refusals.
 
 Each entry stores the pre-resolution config bytes: exactly what was read off
 disk, git, or the config authority, before `${VAR}` and

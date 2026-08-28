@@ -1634,6 +1634,16 @@ mod config_history_tests {
         assert_eq!(BootFallbackMode::LastKnownGood.as_str(), "last-known-good");
     }
 
+    /// `fallback: off` is what the documentation shows, so it has to
+    /// parse as the enum rather than as a YAML 1.1 boolean.
+    #[test]
+    fn boot_fallback_off_parses_from_bare_yaml_off() {
+        let cfg: ConfigHistoryConfig =
+            serde_yaml::from_str("enabled: true\nboot:\n  fallback: off\n")
+                .expect("bare off parses");
+        assert_eq!(cfg.boot.fallback, BootFallbackMode::Off);
+    }
+
     /// The blocks parse from YAML with the keys the documentation names.
     #[test]
     fn config_history_parses_the_soak_and_boot_sub_blocks() {

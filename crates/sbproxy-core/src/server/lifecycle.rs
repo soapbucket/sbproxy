@@ -9043,15 +9043,38 @@ egress:
         let entries = recorder.entries();
         assert_eq!(entries.len(), 1);
         assert_eq!(
+            entries[0].degraded,
+            vec!["key plane".to_string(), "sink dispatcher".to_string()],
+            "the degradation is recorded as its own field rather than by refusing to record \
+             the revision at all: the pipeline did publish"
+        );
+        // WOR-2458 changed what happens next. Recording still stores the
+        // revision the same way, but arming the soak now reaches a
+        // verdict immediately for a degraded reload rather than waiting
+        // out the window, and that verdict is what moves the entry out
+        // of `Applied`. Before the soak existed, this entry stayed
+        // `Applied` forever and the last-known-good pointer never moved
+        // for anything, which is the defect the epic exists to fix.
+        assert_eq!(
             entries[0].state,
-            sbproxy_config::RevisionState::Applied,
-            "a degraded reload still published its pipeline, so the entry stays Applied; \
-             the degradation is a separate field, not a distinct state"
+            sbproxy_config::RevisionState::Failed,
+            "a reload that published with subsystems on prior state fails its soak on the \
+             spot, without waiting the window out"
         );
         assert_eq!(
-            entries[0].degraded,
-            vec!["key plane".to_string(), "sink dispatcher".to_string()]
+            entries[0].soak_verdict,
+            Some(sbproxy_config::SoakVerdict::Failed),
         );
+        assert!(
+            recorder.lkg().is_none(),
+            "and a failed soak never advances the last-known-good pointer",
+        );
+        assert_eq!(
+            crate::config_soak::in_flight_revision(),
+            None,
+            "a window that already failed does not sit armed waiting to be closed",
+        );
+        crate::config_history::clear_config_history_recorder();
     }
 }
 

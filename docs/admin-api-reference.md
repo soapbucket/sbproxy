@@ -2705,6 +2705,7 @@ on and the retention it applies.
 | `entries[].actor` | string | Operator id, `"boot"`, or the config authority's identity, when known. May be empty. |
 | `entries[].blast_radius` | string or null | `hitless`, `reload`, `restart`, or `breaking`, against the previous entry. `null` for the ring's first entry. |
 | `entries[].degraded` | array of strings | Subsystems that did not apply cleanly when this revision applied. Empty for a fully applied revision. |
+| `timeline` | array | The same applied entries with this ring's refused candidates interleaved among them, newest first. Every row carries `kind` (`applied` or `rejected`) and `at` (RFC 3339). An applied row is an `entries[]` element; a rejected row is a `GET /admin/config/rejected` element. The console does not draw this yet; the data is here for the panel that will. |
 
 `provenance` is a four-value vocabulary going forward, but this release can
 only ever emit `local_file` or `git`. What is stored is where the *base*
@@ -2724,10 +2725,149 @@ Read-only operators may call this.
 | `404` | `proxy.config_history` is absent or `enabled: false`. Body: `{"error": "config history is not enabled"}`. |
 | `503` | The block is enabled but the ring failed to open at boot (an unwritable directory, or a shape it refuses to repair). Body: `{"error": "config history failed to open at boot: <reason>"}`. The proxy is otherwise running normally; only this ring is unavailable. Check the boot log for the same reason. |
 
-The ring is a local audit trail today. Nothing in this response promotes an
-entry, and nothing here moves the `lkg_revision` pointer; see
-[operator-runbook.md](operator-runbook.md#config-history-ring) for what the
-ring does and does not do yet.
+Reading the ring never promotes an entry. `lkg_revision` moves only when a
+soak window closes on a passing verdict, or when an operator confirms one
+early with [`POST /admin/config/confirm`](#post-adminconfigconfirm); see
+[configuration.md](configuration.md#soak) for the four signals and the
+three-way verdict.
+
+---
+
+### `GET /admin/config/rejected`
+
+Every candidate config this node refused, newest first, with the reason it
+was refused. The subscriber's failure table already knew each of these; this
+is where they survive the log rotation. Bounded by
+`proxy.config_history.keep_rejected`.
+
+```json
+{
+  "lineage": "b2b1b8b0-4b8e-4f7a-9b8b-1f0a2c3d4e5f",
+  "entries": [
+    {
+      "digest": "3f79bb7b435b05321651daefd374cdc681dc06faa65e374e38337b88ca046dea",
+      "reason": "denied_path",
+      "stage": "config_authority",
+      "detail": "claims paths this node owns: proxy.admin",
+      "provenance": "local_file",
+      "first_seen_at": "2026-08-26T09:02:11.004Z",
+      "last_seen_at": "2026-08-26T09:41:11.512Z",
+      "count": 14,
+      "document": "proxy:\n  admin:\n    port: 9999\n"
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `entries[].digest` | string | SHA-256 of the refused pre-resolution document. |
+| `entries[].reason` | string | `verify_failed`, `compile_failed`, `denied_path`, or `confinement_refused`. |
+| `entries[].stage` | string | Which path refused it: `config_authority` or `file_watcher` (SIGHUP shares the latter). |
+| `entries[].detail` | string | The refusing check's own message, bounded to 512 characters. |
+| `entries[].provenance` | string | Where the refused document came from. |
+| `entries[].first_seen_at` | string | RFC 3339. First refusal of this exact content. |
+| `entries[].last_seen_at` | string | RFC 3339. Most recent refusal. |
+| `entries[].count` | number | How many times this exact content has been refused. A repeat updates the row rather than adding one. |
+| `entries[].document` | string | The refused document, secret-redacted for display the same way `GET /admin/config/history/{digest}` redacts a stored revision. |
+
+A `reload_busy` cycle is not recorded here. Nothing was examined, the
+candidate is retried at the next interval, and a row that appeared every poll
+interval on a healthy node would bury the real refusals under it.
+
+Read-only operators may call this.
+
+| Status | When |
+|---|---|
+| `200` | Read successfully. |
+| `404` | `proxy.config_history` is absent or `enabled: false`. Same body as `GET /admin/config/history`. |
+| `503` | The block is enabled but the ring failed to open at boot. Same body as `GET /admin/config/history`. |
+
+---
+
+### `POST /admin/config/confirm`
+
+Close the soak window on the revision under judgement now, instead of
+waiting out `proxy.config_history.soak.window_secs`. This is what a
+deployment pipeline calls after its own smoke test.
+
+It short-circuits the *wait*, not the *judgement*. The same four signals run,
+and the response says what each of them found, so a revision already failing
+its upstream-health signal is not promoted just because somebody confirmed
+it, and the pipeline can fail its own step on the answer.
+
+```json
+{
+  "revision": 42,
+  "verdict": "passed",
+  "promoted": true,
+  "signals": [
+    {"signal": "degraded_subsystems", "outcome": "abstain", "detail": "no subsystem stayed on prior state, which is not by itself evidence that this config works"},
+    {"signal": "upstream_health", "outcome": "passed", "detail": ""},
+    {"signal": "request_outcome", "outcome": "abstain", "detail": "the window observed 12 request(s), under the min_requests of 50"},
+    {"signal": "operator_probe", "outcome": "passed", "detail": ""}
+  ]
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `revision` | number | The revision that was judged. |
+| `verdict` | string | `passed`, `failed`, or `inconclusive`. |
+| `promoted` | bool | Whether the last-known-good pointer moved. True only for `passed`. |
+| `signals[]` | array | One row per signal: its `outcome` (`passed`, `failed`, `abstain`) and the explanation it gave. |
+
+Mutating, so a read-only operator is refused.
+
+| Status | When |
+|---|---|
+| `200` | The window closed and reached a verdict. Read `promoted` rather than assuming the status means promotion. |
+| `404` | `proxy.config_history` is absent or `enabled: false`. |
+| `409` | No soak is in flight. Body: `{"error": "no config soak is in flight"}`. Either no reload has happened, or its window already closed. |
+| `503` | The block is enabled but the ring failed to open at boot. |
+
+---
+
+### `GET`, `DELETE` `/admin/config/fallback`
+
+Whether this node is serving a config its boot fallback restored from the
+revision ring, and the way to stop.
+
+`GET` answers on every node, including one that never enabled the ring: "am I
+running what I was told to run" has to be askable without first knowing
+whether a feature is on.
+
+```json
+{
+  "active": true,
+  "revision": 41,
+  "digest": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a5",
+  "suspended": ["file_watcher", "sighup", "config_refresh_poller"]
+}
+```
+
+`suspended` names the reload paths that are inert while the pin is in place.
+Config-authority polling is deliberately absent from that list: a fleet-wide
+fix pushed from the control plane is how a fallback boot should end.
+
+`DELETE` clears the pin, resumes all three paths without a restart, and
+returns `sbproxy_config_fallback_active` to 0.
+
+```json
+{
+  "cleared": true,
+  "revision": 41,
+  "digest": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a5",
+  "resumed": ["file_watcher", "sighup", "config_refresh_poller"]
+}
+```
+
+`DELETE` is mutating, so a read-only operator is refused.
+
+| Status | When |
+|---|---|
+| `200` | Read, or cleared. |
+| `409` | `DELETE` on a node that is not pinned. Body: `{"error": "this node is not pinned to a fallback configuration"}`. |
 
 ---
 

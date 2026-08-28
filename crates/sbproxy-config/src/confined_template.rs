@@ -3300,6 +3300,11 @@ mod tests {
             "the sink kind (`stderr` | `file`); the path is `access_log.output.path`",
         ),
         (
+            "proxy.config_history.boot.fallback",
+            "the boot fallback mode (`off` | `last_known_good`); the ring it reads from is \
+             `proxy.config_history.dir`",
+        ),
+        (
             "proxy.acme.storage_backend",
             "the store kind (`redb` | `sqlite` | `file` | `redis` | `s3` | `gcs` | `azure` \
              | `memory`); the location is `proxy.acme.storage_path`",
