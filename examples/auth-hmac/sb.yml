@@ -45,6 +45,13 @@ origins:
       # both directions. 300 is the default; spelled out here because
       # it is the replay defense.
       clock_skew_seconds: 300
+      # Refuse a header-only signature on a request that carries a
+      # body. GET is unaffected; POST must cover content-digest.
+      require_body_digest: true
+      # Optional in-process nonce ledger. Uncomment to require an RFC
+      # 9421 nonce and refuse a replay inside the window. The curl
+      # below omits nonce, so this stays off for the demo.
+      # nonce_store: memory
       keys:
         # `key_id` is what the signer advertises as `keyid`; the
         # secret stays in the environment. The metadata fields ride

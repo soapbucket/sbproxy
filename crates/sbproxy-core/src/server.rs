@@ -4856,6 +4856,53 @@ pub(crate) fn record_auth_decision(
     );
 }
 
+/// Record an auth allow, or stash it when a covered `content-digest`
+/// still has to be bound to the body (WOR-2644).
+///
+/// Call after `arm_deferred_body_digest_binding` so
+/// `bot_auth_digest_check_required` is already set. Denies are never
+/// deferred: a header-phase refusal is already the final decision.
+pub(crate) fn record_or_defer_auth_decision(
+    ctx: &mut RequestContext,
+    origin_label: &str,
+    auth_type: &str,
+    allowed: bool,
+    reason: &'static str,
+) {
+    if allowed && ctx.bot_auth_digest_check_required {
+        ctx.deferred_auth_decision = Some(crate::context::DeferredAuthPending {
+            origin_label: origin_label.to_string(),
+            auth_type: auth_type.to_string(),
+            allow_reason: reason,
+        });
+        return;
+    }
+    record_auth_decision(ctx, origin_label, auth_type, allowed, reason);
+}
+
+/// Emit the stashed auth decision once the deferred body proof resolves.
+///
+/// `verified` is the body-binding outcome. A missing stash is a no-op so
+/// callers that run on every request (logging, a second body-phase
+/// check) do not double-count.
+pub(crate) fn complete_deferred_body_digest_auth(ctx: &mut RequestContext, verified: bool) {
+    let Some(pending) = ctx.deferred_auth_decision.take() else {
+        return;
+    };
+    let reason = if verified {
+        pending.allow_reason
+    } else {
+        "content-digest body mismatch"
+    };
+    record_auth_decision(
+        ctx,
+        &pending.origin_label,
+        &pending.auth_type,
+        verified,
+        reason,
+    );
+}
+
 /// Publish one behavioral-anomaly verdict onto the decision feed
 /// (WOR-2666).
 ///

@@ -114,6 +114,7 @@ pub(crate) fn verify_and_finalize_body_proof(
     if verified {
         ctx.content_digest_verified = true;
     }
+    crate::server::complete_deferred_body_digest_auth(ctx, verified);
     finalize(ctx, !verified);
     verified
 }
@@ -130,8 +131,11 @@ pub(crate) fn finalize_pending_body_proof_at_request_end(ctx: &mut RequestContex
         || !ctx.bot_auth_digest_check_required
         || ctx.content_digest_verified
     {
+        crate::server::complete_deferred_body_digest_auth(ctx, ctx.content_digest_verified);
         return;
     }
+
+    crate::server::complete_deferred_body_digest_auth(ctx, false);
 
     let tier = derive_with_bot_auth(ctx, false, false);
     ctx.trust_tier = tier;

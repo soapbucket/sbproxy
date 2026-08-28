@@ -1621,6 +1621,209 @@ async fn hmac_auth_binds_a_body_covering_signature_to_the_body_that_arrives() {
     );
 }
 
+fn hmac_auth_metric(origin: &str, result: &str) -> f64 {
+    sbproxy_observe::metrics::metrics()
+        .auth_results
+        .with_label_values(&[origin, "hmac_auth", result])
+        .get()
+}
+
+/// WOR-2644: a deferred `content-digest` mismatch must not leave an
+/// `allow` on `sbproxy_auth_results_total` or the decision family.
+///
+/// This is the body-filter / idempotency sequence: both sites call
+/// `verify_and_finalize_body_proof` after the header phase stashed the
+/// would-be allow.
+#[tokio::test]
+async fn content_digest_mismatch_at_body_proof_records_auth_deny_not_allow() {
+    const SIGNED_BODY: &[u8] = br#"{"to":"acct-1091","amount":"25.00"}"#;
+    const SUBSTITUTED_BODY: &[u8] = br#"{"to":"acct-9999","amount":"250000.00"}"#;
+
+    let origin = "digest-mismatch-body-proof";
+    let pipeline = auth_test_pipeline(origin);
+    let secret_hex = "00112233445566778899aabbccddeeff";
+    let key_id = "svc-billing";
+    let auth = build_hmac_auth_provider(key_id, secret_hex);
+    let digest = sha256_digest(SIGNED_BODY);
+    let (sig_input, sig_value) = hmac_sign_post(
+        secret_hex,
+        key_id,
+        "/v1/transfer",
+        &["@method", "@target-uri", "content-digest"],
+        Some(&digest),
+    );
+    let headers = signed_headers(&sig_input, &sig_value, &digest);
+
+    let (result, _principal, _trust, decided) = check_auth_decided(
+        &auth,
+        &headers,
+        None,
+        "POST",
+        "/v1/transfer",
+        test_tenant(),
+        None,
+        None,
+    )
+    .await;
+    assert!(matches!(result, AuthResult::Allow { .. }));
+
+    let mut ctx = RequestContext::new();
+    ctx.pipeline = pipeline;
+    ctx.origin_idx = Some(0);
+    ctx.hostname = origin.into();
+    crate::server::request_phase::arm_deferred_body_digest_binding(&mut ctx, &decided, &headers);
+    crate::server::record_or_defer_auth_decision(
+        &mut ctx,
+        origin,
+        &decided,
+        true,
+        "credential accepted",
+    );
+
+    let allow_before = hmac_auth_metric(origin, "allow");
+    let deny_before = hmac_auth_metric(origin, "deny");
+    let family_allow_before =
+        decision_event_total(&[("event", "auth"), ("origin", origin), ("outcome", "allow")]);
+    let family_deny_before =
+        decision_event_total(&[("event", "auth"), ("origin", origin), ("outcome", "deny")]);
+
+    assert!(!crate::trust_tier::verify_and_finalize_body_proof(
+        &mut ctx,
+        &headers,
+        SUBSTITUTED_BODY
+    ));
+
+    assert_eq!(
+        hmac_auth_metric(origin, "allow"),
+        allow_before,
+        "a body-binding failure must not count as auth allow"
+    );
+    assert!(
+        hmac_auth_metric(origin, "deny") > deny_before,
+        "a body-binding failure must count as auth deny"
+    );
+    assert_eq!(
+        decision_event_total(&[("event", "auth"), ("origin", origin), ("outcome", "allow")]),
+        family_allow_before,
+        "the SIEM family must not carry an allow for a caught forgery"
+    );
+    assert!(
+        decision_event_total(&[("event", "auth"), ("origin", origin), ("outcome", "deny")])
+            > family_deny_before,
+        "the SIEM family must carry a deny a detection rule can match"
+    );
+}
+
+/// Same deferred record, resolved against the GraphQL inbound body
+/// (the third refusal site; it does not go through
+/// `verify_and_finalize_body_proof`).
+#[tokio::test]
+async fn content_digest_mismatch_on_graphql_inbound_body_records_auth_deny_not_allow() {
+    const SIGNED_BODY: &[u8] = br#"{"query":"{ ok }"}"#;
+    const SUBSTITUTED_BODY: &[u8] = br#"{"query":"{ secret }"}"#;
+
+    let origin = "digest-mismatch-graphql";
+    let pipeline = auth_test_pipeline(origin);
+    let secret_hex = "00112233445566778899aabbccddeeff";
+    let key_id = "svc-billing";
+    let auth = build_hmac_auth_provider(key_id, secret_hex);
+    let digest = sha256_digest(SIGNED_BODY);
+    let (sig_input, sig_value) = hmac_sign_post(
+        secret_hex,
+        key_id,
+        "/graphql",
+        &["@method", "@target-uri", "content-digest"],
+        Some(&digest),
+    );
+    let headers = signed_headers(&sig_input, &sig_value, &digest);
+
+    let (result, _principal, _trust, decided) = check_auth_decided(
+        &auth,
+        &headers,
+        None,
+        "POST",
+        "/graphql",
+        test_tenant(),
+        None,
+        None,
+    )
+    .await;
+    assert!(matches!(result, AuthResult::Allow { .. }));
+
+    let mut ctx = RequestContext::new();
+    ctx.pipeline = pipeline;
+    ctx.origin_idx = Some(0);
+    ctx.hostname = origin.into();
+    crate::server::request_phase::arm_deferred_body_digest_binding(&mut ctx, &decided, &headers);
+    crate::server::record_or_defer_auth_decision(
+        &mut ctx,
+        origin,
+        &decided,
+        true,
+        "credential accepted",
+    );
+
+    let allow_before = hmac_auth_metric(origin, "allow");
+    assert!(!super::proxy_http::verify_graphql_inbound_body_binding(
+        &headers,
+        SUBSTITUTED_BODY,
+        &mut ctx
+    ));
+    assert_eq!(hmac_auth_metric(origin, "allow"), allow_before);
+    assert!(hmac_auth_metric(origin, "deny") > 0.0);
+}
+
+/// Honest body-bound signature: exactly one allow, no deny.
+#[tokio::test]
+async fn content_digest_match_records_a_single_auth_allow() {
+    const BODY: &[u8] = br#"{"to":"acct-1091","amount":"25.00"}"#;
+    let origin = "digest-match-allow";
+    let pipeline = auth_test_pipeline(origin);
+    let secret_hex = "00112233445566778899aabbccddeeff";
+    let key_id = "svc-billing";
+    let auth = build_hmac_auth_provider(key_id, secret_hex);
+    let digest = sha256_digest(BODY);
+    let (sig_input, sig_value) = hmac_sign_post(
+        secret_hex,
+        key_id,
+        "/v1/transfer",
+        &["@method", "@target-uri", "content-digest"],
+        Some(&digest),
+    );
+    let headers = signed_headers(&sig_input, &sig_value, &digest);
+    let (result, _principal, _trust, decided) = check_auth_decided(
+        &auth,
+        &headers,
+        None,
+        "POST",
+        "/v1/transfer",
+        test_tenant(),
+        None,
+        None,
+    )
+    .await;
+    assert!(matches!(result, AuthResult::Allow { .. }));
+
+    let mut ctx = RequestContext::new();
+    ctx.pipeline = pipeline;
+    ctx.origin_idx = Some(0);
+    ctx.hostname = origin.into();
+    crate::server::request_phase::arm_deferred_body_digest_binding(&mut ctx, &decided, &headers);
+    crate::server::record_or_defer_auth_decision(
+        &mut ctx,
+        origin,
+        &decided,
+        true,
+        "credential accepted",
+    );
+    let deny_before = hmac_auth_metric(origin, "deny");
+    assert!(crate::trust_tier::verify_and_finalize_body_proof(
+        &mut ctx, &headers, BODY
+    ));
+    assert!(hmac_auth_metric(origin, "allow") > 0.0);
+    assert_eq!(hmac_auth_metric(origin, "deny"), deny_before);
+}
+
 /// `content-digest` in `required_components` must mean what the docs say.
 ///
 /// The honest client sends the true digest of a real body and is

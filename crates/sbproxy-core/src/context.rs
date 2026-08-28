@@ -325,6 +325,22 @@ pub struct SpecDeprecation {
     pub config: std::sync::Arc<sbproxy_config::CompiledDeprecation>,
 }
 
+/// Auth decision waiting on a deferred `content-digest` body proof (WOR-2644).
+///
+/// Header-phase signature verification can succeed while the covered
+/// digest has not yet been compared to the body. Stashing the would-be
+/// allow here, instead of emitting it, keeps a later mismatch from
+/// reading as a successful authentication in the SIEM feed.
+#[derive(Clone, Debug)]
+pub struct DeferredAuthPending {
+    /// Hostname label `sbproxy_auth_results_total` already uses.
+    pub origin_label: String,
+    /// Provider type (`hmac_auth`, `bot_auth`).
+    pub auth_type: String,
+    /// Reason recorded if the body proof succeeds.
+    pub allow_reason: &'static str,
+}
+
 /// Per-request state threaded through all Pingora phases as CTX.
 pub struct RequestContext {
     // --- Identity ---
@@ -816,6 +832,15 @@ pub struct RequestContext {
     /// that arms it is listed in
     /// `request_phase::DEFERRED_BODY_DIGEST_PROVIDERS`.
     pub bot_auth_digest_check_required: bool,
+
+    /// Header-phase auth succeeded, but a covered `content-digest` has
+    /// not been bound to the body yet (WOR-2644).
+    ///
+    /// The auth decision record is stashed here instead of emitted as
+    /// `allowed`, so a later body-binding refusal does not leave a
+    /// successful authentication in the SIEM feed. Taken by
+    /// `complete_deferred_body_digest_auth`.
+    pub deferred_auth_decision: Option<DeferredAuthPending>,
 
     // --- WOR-808 PR5 / PR6: RSL <link rel="license"> body injection ---
     /// Set in `response_filter` when the origin advertises an RSL
@@ -2017,6 +2042,7 @@ impl RequestContext {
             sri_scan_enabled: false,
             content_digest_verified: false,
             bot_auth_digest_check_required: false,
+            deferred_auth_decision: None,
             rsl_inject_link_pending: false,
             rsl_inject_link_feed: None,
             rsl_inject_link_buf: None,
