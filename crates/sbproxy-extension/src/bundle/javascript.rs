@@ -576,19 +576,11 @@ pub(super) fn prepare_program(
     let export = hook.hook().export.as_deref().ok_or_else(|| {
         BundleLoadError::new("javascript", "JavaScript hook needs a declared export")
     })?;
-    let mut config = config;
-    if let Some(schema) = hook.hook().config_schema.as_ref() {
-        envelope::apply_schema_defaults(&mut config, schema);
-    }
-    // WOR-2289: resolve secret references in the hook's declared
-    // `secret_vars` before it ever runs. Validation runs on the
-    // resolved value (not the reference) so a schema constraint on the
-    // value's shape (a `pattern`, for instance) checks the real secret
-    // rather than the pointer to it.
-    envelope::resolve_declared_secrets(&mut config, &hook.hook().secret_vars)
-        .map_err(|detail| BundleLoadError::new("config", detail))?;
-    hook.validate_config(&config)
-        .map_err(|error| BundleLoadError::new("config", error.to_string()))?;
+    // Defaults, secret resolution, and schema validation, in that
+    // order and in one place: `prepare_hook_config` is also where a
+    // value the bundle's own manifest authored is refused a host-backed
+    // secret (WOR-2433).
+    let config = envelope::prepare_hook_config(hook, config)?;
 
     let source = hook.prepared_javascript_source().ok_or_else(|| {
         BundleLoadError::new("javascript", "bundle has no prepared JavaScript artifact")

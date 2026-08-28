@@ -138,17 +138,10 @@ pub fn build_rego_policy(
             "hook kind does not match the requested Rego policy adapter",
         ));
     }
-    let mut config = config;
-    if let Some(schema) = hook.hook().config_schema.as_ref() {
-        envelope::apply_schema_defaults(&mut config, schema);
-    }
-    // WOR-2289: resolve secret references in the hook's declared
-    // `secret_vars` before any evaluation, matching every other bundle
-    // hook adapter.
-    envelope::resolve_declared_secrets(&mut config, &hook.hook().secret_vars)
-        .map_err(|detail| BundleLoadError::new("config", detail))?;
-    hook.validate_config(&config)
-        .map_err(|error| BundleLoadError::new("config", error.to_string()))?;
+    // One choke point for defaults, secret resolution, and schema
+    // validation, shared with every other bundle hook adapter
+    // (WOR-2289, WOR-2433).
+    let config = envelope::prepare_hook_config(hook, config)?;
     let compiled = hook.prepared_rego().ok_or_else(|| {
         BundleLoadError::new("rego", "bundle has no compiled Rego engine for this hook")
     })?;
@@ -266,17 +259,10 @@ pub fn build_rego_transform(
             "hook kind does not match the requested Rego transform adapter",
         ));
     }
-    let mut config = config;
-    if let Some(schema) = hook.hook().config_schema.as_ref() {
-        envelope::apply_schema_defaults(&mut config, schema);
-    }
-    // WOR-2289: resolve secret references in the hook's declared
-    // `secret_vars` before any evaluation, matching every other bundle
-    // hook adapter.
-    envelope::resolve_declared_secrets(&mut config, &hook.hook().secret_vars)
-        .map_err(|detail| BundleLoadError::new("config", detail))?;
-    hook.validate_config(&config)
-        .map_err(|error| BundleLoadError::new("config", error.to_string()))?;
+    // One choke point for defaults, secret resolution, and schema
+    // validation, shared with every other bundle hook adapter
+    // (WOR-2289, WOR-2433).
+    let config = envelope::prepare_hook_config(hook, config)?;
     let compiled = hook.prepared_rego().ok_or_else(|| {
         BundleLoadError::new("rego", "bundle has no compiled Rego engine for this hook")
     })?;
@@ -534,6 +520,73 @@ allow if {
             .await
             .expect("evaluates");
         assert!(matches!(denied, PolicyDecision::Deny { status: 403, .. }));
+    }
+
+    /// Hook YAML declaring `token` as a secret var and supplying the
+    /// manifest's own default for it.
+    fn authored_secret_var(default: &str) -> String {
+        format!(
+            "    secret_vars: [token]\n    config_schema:\n      type: object\n      properties:\n        token:\n          type: string\n          default: \"{default}\"\n"
+        )
+    }
+
+    #[test]
+    fn a_manifest_default_may_not_resolve_a_host_backed_secret_var() {
+        // WOR-2433 re-review. `env:PATH` stands in for a credential:
+        // the manifest declares the var, supplies the reference itself,
+        // and no line of the operator's attachment config names it.
+        let host_value = std::env::var("PATH").expect("PATH is set in the test environment");
+        let fixture = fixture(ALLOW_HEALTH_CHECKS, &authored_secret_var("env:PATH"));
+
+        let error = build_rego_policy(fixture.hook(), json!({}))
+            .expect_err("a manifest-authored host-backed reference must be refused");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("rego-fixture"), "{rendered}");
+        assert!(rendered.contains("token"), "{rendered}");
+        assert!(
+            !rendered.contains(&host_value),
+            "the refusal echoed the host's environment"
+        );
+    }
+
+    #[test]
+    fn a_manifest_default_may_not_read_a_host_file() {
+        let directory = TempDir::new().unwrap();
+        let secret = directory.path().join("host-owned");
+        std::fs::write(&secret, "DISTINCTIVE_REGO_HOST_FILE_2d9a").unwrap();
+        let fixture = fixture(
+            ALLOW_HEALTH_CHECKS,
+            &authored_secret_var(&format!("file:{}", secret.display())),
+        );
+
+        let error = build_rego_policy(fixture.hook(), json!({}))
+            .expect_err("a manifest-authored host path must be refused");
+
+        assert!(
+            !error
+                .to_string()
+                .contains("DISTINCTIVE_REGO_HOST_FILE_2d9a"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_operator_supplied_value_for_the_same_var_still_resolves() {
+        // The boundary is about who authored the value, not about the
+        // key. The operator writing the very reference the manifest
+        // wanted resolves, because the operator owns the host's
+        // secrets.
+        let expected = std::env::var("PATH").expect("PATH is set in the test environment");
+        let fixture = fixture(ALLOW_HEALTH_CHECKS, &authored_secret_var("env:PATH"));
+
+        let adapter = build_rego_policy(fixture.hook(), json!({ "token": "env:PATH" }))
+            .expect("an operator-authored reference still resolves");
+
+        assert_eq!(
+            adapter.config["token"], expected,
+            "the operator's reference must resolve into the hook's config"
+        );
     }
 
     #[tokio::test]

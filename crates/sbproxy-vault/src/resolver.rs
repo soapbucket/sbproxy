@@ -583,4 +583,62 @@ mod tests {
             .unwrap();
         assert_eq!(result, "hello");
     }
+
+    /// WOR-2433. `resolve_with_limit` tests four prefixes before it
+    /// reaches the backend manager, and three of them read this host
+    /// directly rather than a backend the operator declared. That set is
+    /// mirrored, not called, by
+    /// `sbproxy_config::types::host_backed_secret_reference`, which the
+    /// confined config pass uses to refuse an externally authored
+    /// document that reaches for one: `sbproxy-config` does not depend
+    /// on this crate and cannot, so the mirror cannot be a call.
+    ///
+    /// This test is the thing that makes the mirror hold. It pins the
+    /// prefix set here, at the enforcer, so adding a new host-backed
+    /// prefix to `resolve_with_limit` without adding it there turns this
+    /// red with a message saying where to go. Order matters too: the
+    /// legacy `vault://env/` alias is checked before the provider-URI
+    /// parse, which is why the mirror cannot simply skip every
+    /// `scheme://` value.
+    #[test]
+    fn every_host_backed_prefix_is_mirrored_by_the_confined_pass() {
+        // The prefixes `resolve_with_limit` resolves from this host,
+        // in the order it tests them.
+        const HOST_BACKED: &[&str] = &["vault://env/", "${", "env:", "file:"];
+        let source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/resolver.rs"))
+                .expect("this file is readable");
+        let body = source
+            .split_once("fn resolve_with_limit(")
+            .expect("resolve_with_limit is still the entry point")
+            .1;
+        let body = body
+            .split_once("\n    }\n")
+            .expect("the function has a closing brace")
+            .0;
+        for prefix in HOST_BACKED {
+            assert!(
+                body.contains(prefix),
+                "resolve_with_limit no longer handles `{prefix}`; \
+                 sbproxy_config::types::host_backed_secret_reference mirrors this set and \
+                 must be updated with it",
+            );
+        }
+        // Every branch that reads the environment or the filesystem in
+        // this function must correspond to one of the prefixes above. A
+        // new one shows up as an extra reader.
+        let env_reads = body.matches("std::env::var(").count();
+        let file_reads = body.matches("read_bounded_secret_file(").count()
+            + body.matches("fs::read_to_string(").count();
+        assert_eq!(
+            env_reads, 3,
+            "resolve_with_limit reads the environment from a branch this test does not know \
+             about; mirror it in sbproxy_config::types::host_backed_secret_reference",
+        );
+        assert_eq!(
+            file_reads, 2,
+            "resolve_with_limit reads the filesystem from a branch this test does not know \
+             about; mirror it in sbproxy_config::types::host_backed_secret_reference",
+        );
+    }
 }

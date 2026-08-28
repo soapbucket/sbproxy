@@ -149,6 +149,9 @@ impl From<ConfigSourceError> for BundleLoadError {
             ConfigSourceError::RevisionMismatch(_) => "Git revision verification failed",
             ConfigSourceError::Signature(_) => "Git signature verification failed",
             ConfigSourceError::Read(_) => "Git tree could not be read",
+            ConfigSourceError::Confinement(_) => {
+                "Git source document reaches for a host secret or a host file path"
+            }
             ConfigSourceError::Merge(_) | ConfigSourceError::RecursionLimit => {
                 "Git source materialization failed"
             }
