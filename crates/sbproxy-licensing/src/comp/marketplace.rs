@@ -627,14 +627,14 @@ fn derive_agent_id(buyer_kid: &str, acceptance: &CompAcceptance) -> String {
     format!("agent_{}", hex::encode(&digest[..8]))
 }
 
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
         .as_secs()
 }
 
-fn format_rfc3339(unix: u64) -> String {
+pub(crate) fn format_rfc3339(unix: u64) -> String {
     // Hand-rolled to avoid pulling chrono into this crate; the format
     // is a simplified RFC 3339 stamp suitable for the marketplace
     // wire surface.

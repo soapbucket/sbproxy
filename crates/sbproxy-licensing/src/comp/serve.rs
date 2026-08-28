@@ -304,6 +304,113 @@ mod tests {
         )
     }
 
+    /// A marketplace with one OLP tier and one onboarded buyer, plus a
+    /// redeem body signed by that buyer for a live quote it just got.
+    fn mintable_redeem() -> (CompMarketplace, Vec<u8>) {
+        use crate::comp::types::{
+            CompAcceptance, CompAuthorization, CompBuyer, CompPaymentProof, CompPricing,
+            CompPricingModel, CompQuoteRequest, CompRequestedVolume, CompSignature, CompTier,
+        };
+        use crate::comp::{quote_acceptance_hash, CompRedeemRequest};
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
+        use base64::Engine as _;
+        use ed25519_dalek::{Signer as _, SigningKey};
+
+        let keys = KeyManager::new(MasterKey::new(vec![0x41u8; 32]).expect("32-byte key"));
+        keys.set_active("2026-q3-001").expect("derive");
+        let manifest = Arc::new(CompManifest {
+            comp_version: COMP_VERSION.into(),
+            publisher: CompPublisher {
+                name: "Example".into(),
+                domain: "api.example.com".into(),
+                contact: "licensing@example.com".into(),
+                verified_at: None,
+            },
+            tiers: vec![CompTier {
+                id: "tier_ai_inference".into(),
+                name: "AI inference".into(),
+                description: "Per-request inference".into(),
+                license: "urn:rsl:pay-per-inference:default".into(),
+                shape: "json-envelope".into(),
+                pricing: CompPricing {
+                    model: CompPricingModel::PerRequest,
+                    currency: "USD".into(),
+                    amount: None,
+                    amount_micros: Some(2500),
+                },
+                authorization: CompAuthorization::Olp,
+                rate_caps: None,
+                route_glob: "/api/v1/inference/**".into(),
+            }],
+            endpoints: CompEndpoints {
+                manifest: "https://api.example.com/.well-known/iab-comp/manifest.json".into(),
+                quote: "https://api.example.com/.well-known/iab-comp/quote".into(),
+                redeem: "https://api.example.com/.well-known/iab-comp/redeem".into(),
+            },
+            robots_url: "https://api.example.com/robots.txt".into(),
+            llms_url: "https://api.example.com/llms.txt".into(),
+            rsl_url: "https://api.example.com/licenses.xml".into(),
+            generated_at: "2026-08-28T00:00:00Z".into(),
+            manifest_hash: "sha256:placeholder".into(),
+        });
+        let revocation: Arc<dyn Revocation> = Arc::new(InMemoryRevocation::new());
+        let bridge = Arc::new(OlpBridgeSigner::new(
+            [0x42u8; 32],
+            "olp-2026-q3-001",
+            "https://api.example.com",
+            "ai-input",
+            3600,
+        ));
+        let buyer_keys = Arc::new(InMemoryBuyerKeyRegistry::new());
+        let buyer = SigningKey::from_bytes(&[0x43u8; 32]);
+        buyer_keys.insert("buyer-1", buyer.verifying_key());
+        let marketplace = CompMarketplace::new(keys, manifest, revocation, bridge, buyer_keys);
+
+        let quote = marketplace
+            .quote(CompQuoteRequest {
+                comp_version: COMP_VERSION.into(),
+                buyer: CompBuyer {
+                    agent_id: "agent_acme_001".into(),
+                    organization: "Acme AI".into(),
+                },
+                tier_id: "tier_ai_inference".into(),
+                requested_volume: CompRequestedVolume {
+                    model: CompPricingModel::PerRequest,
+                    expected_count: 100,
+                    duration_days: 30,
+                },
+                audience: "api.example.com".into(),
+            })
+            .expect("the fixture tier quotes");
+
+        let mut request = CompRedeemRequest {
+            comp_version: COMP_VERSION.into(),
+            quote_id: quote.quote_id.clone(),
+            buyer_signature: CompSignature {
+                alg: "ed25519".into(),
+                kid: "buyer-1".into(),
+                value: String::new(),
+            },
+            buyer_acceptance: CompAcceptance {
+                accepted_quote_hash: quote_acceptance_hash(&quote).expect("hash"),
+                accepted_at: crate::comp::marketplace::format_rfc3339(
+                    crate::comp::marketplace::unix_now(),
+                ),
+                buyer_legal_entity: "Acme AI Inc.".into(),
+            },
+            payment_proof: CompPaymentProof {
+                rail: "x402".into(),
+                txhash: Some("0xabc".into()),
+                chain: Some("base".into()),
+                receipt_id: None,
+            },
+        };
+        let signing_input = serde_json::to_vec(&request).expect("serialize for signing");
+        request.buyer_signature.value = B64URL.encode(buyer.sign(&signing_input).to_bytes());
+        let body = serde_json::to_vec(&request).expect("serialize redeem");
+        (marketplace, body)
+    }
+
     /// The manifest response carries the headers a buyer's cache and
     /// version negotiation need, from the one body that writes them.
     #[test]
@@ -346,6 +453,122 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_slice(&response.body).expect("the refusal body is JSON");
         assert_eq!(parsed["error"], "unknown_tier");
+    }
+
+    /// Reading one family's current value for a label, or 0 when the
+    /// family did not register.
+    fn counter(
+        family: &std::sync::LazyLock<Option<prometheus::IntCounterVec>>,
+        outcome: &str,
+    ) -> u64 {
+        family
+            .as_ref()
+            .map(|family| family.with_label_values(&[outcome]).get())
+            .unwrap_or(0)
+    }
+
+    /// WOR-2673: the metric writers are inside these bodies, and these
+    /// bodies are what both transports call.
+    ///
+    /// The families register into the process-wide Prometheus registry,
+    /// so this reads the counter before and after rather than asserting
+    /// an absolute value: another test in the same process may have
+    /// moved it. What it pins is that serving through this path moves
+    /// the family at all, which is the thing that was not true while
+    /// the crate was unlinked from every binary.
+    #[test]
+    fn serving_moves_the_metric_family_the_dashboard_reads() {
+        let marketplace = marketplace();
+
+        let before = counter(&metrics::MANIFEST_SERVES_TOTAL, "ok");
+        serve_manifest(&marketplace);
+        assert_eq!(
+            counter(&metrics::MANIFEST_SERVES_TOTAL, "ok"),
+            before + 1,
+            "a manifest serve must move sbproxy_comp_marketplace_manifest_serves_total"
+        );
+
+        let before = counter(&metrics::QUOTE_REQUESTS_TOTAL, "rejected");
+        serve_quote(&marketplace, b"{not json");
+        assert_eq!(
+            counter(&metrics::QUOTE_REQUESTS_TOTAL, "rejected"),
+            before + 1,
+            "a refused quote must move the quote family under `rejected`"
+        );
+    }
+
+    /// The decision events an operator greps for, and the credential
+    /// that must never be in one.
+    #[tokio::test]
+    async fn a_minted_redeem_logs_its_decision_without_the_token() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        /// Collects every rendered event into one buffer.
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl tracing_subscriber::fmt::MakeWriter<'_> for Capture {
+            type Writer = Self;
+            fn make_writer(&self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(capture.clone())
+                .with_ansi(false),
+        );
+
+        // A marketplace with a real tier and a real onboarded buyer, so
+        // the redeem actually mints rather than being refused.
+        let (marketplace, body) = mintable_redeem();
+        let rendered = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let response = serve_redeem(&marketplace, &body).await;
+            assert_eq!(response.status, 200, "the fixture must mint");
+            let minted: crate::comp::CompRedeemResponse =
+                serde_json::from_slice(&response.body).expect("the response is JSON");
+            let log = String::from_utf8(
+                capture
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            )
+            .expect("captured log is UTF-8");
+            (log, minted)
+        };
+        let (log, minted) = rendered;
+
+        assert!(
+            log.contains("comp_redeem_decision"),
+            "the decision event must fire: {log}"
+        );
+        assert!(log.contains("minted"), "{log}");
+        assert!(
+            log.contains(&minted.agent_id),
+            "the derived agent id is what an operator reconciles against: {log}"
+        );
+        assert!(
+            !log.contains(&minted.license_token),
+            "the minted bearer token must never reach a log line: {log}"
+        );
     }
 
     /// Log-forging defense, on the field that reaches `tracing` from an
