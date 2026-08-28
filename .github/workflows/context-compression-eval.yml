@@ -167,3 +167,5 @@ jobs:
           cargo test -p sbproxy-e2e --locked --test ai_native_inbound
           anthropic_native_upstream_receives_the_compressed_message_list
           -- --exact --test-threads=1
+
+# Bisect: comment only, to make the path filter match at edf8b937.
