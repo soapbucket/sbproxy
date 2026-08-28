@@ -56,3 +56,65 @@ export function isConfigHistoryDisabled(error: ApiError | null): boolean {
   if (!error || error.status !== 404) return false;
   return `${error.message} ${error.body}`.includes("not enabled");
 }
+
+/**
+ * Whether a Roll back button may submit, and what it has to say first
+ * (WOR-2460).
+ *
+ * The node computes the blast radius from the two stored documents and
+ * refuses a `restart` or `breaking` rollback whose `confirm_revision`
+ * does not name the target. This is the same rule on the client side, so
+ * the button can be disabled and explained rather than the operator
+ * finding out from a 409. The server refusal is the enforcer; this is
+ * the affordance.
+ *
+ * `null` (the lineage's first entry, with nothing to compare against)
+ * requires the typed confirmation too. An unknown radius is not a safe
+ * radius, and the one action here that cannot be undone in process is
+ * the wrong place to assume the best case.
+ */
+export interface RollbackGate {
+  /** Whether the operator has to type the revision number back. */
+  requiresTypedConfirmation: boolean;
+  /** Whether the form may be submitted as it stands. */
+  canSubmit: boolean;
+  /** Why not, when `canSubmit` is false. */
+  reason: string | null;
+}
+
+const TYPED_CONFIRMATION_RADII: ReadonlySet<string> = new Set([
+  "restart",
+  "breaking",
+]);
+
+/**
+ * Gate one rollback submission.
+ *
+ * @param radius blast radius of rolling back to this revision, as
+ *   `GET /admin/config/history` reports it.
+ * @param targetRevision the revision the operator is rolling back to.
+ * @param typed what they typed into the confirmation field, verbatim.
+ */
+export function rollbackGate(
+  radius: ConfigHistoryBlastRadius | null,
+  targetRevision: number,
+  typed: string,
+): RollbackGate {
+  const requiresTypedConfirmation =
+    radius === null || TYPED_CONFIRMATION_RADII.has(radius);
+  if (!requiresTypedConfirmation) {
+    return { requiresTypedConfirmation: false, canSubmit: true, reason: null };
+  }
+  const what = radius === null ? "unknown-radius" : radius;
+  if (typed.trim() === String(targetRevision)) {
+    return { requiresTypedConfirmation: true, canSubmit: true, reason: null };
+  }
+  return {
+    requiresTypedConfirmation: true,
+    canSubmit: false,
+    reason:
+      `rolling back to revision ${targetRevision} is a ${what} change, which an ` +
+      `in-process swap cannot fully apply. type ${targetRevision} to confirm, and ` +
+      `plan to restart this node`,
+  };
+}

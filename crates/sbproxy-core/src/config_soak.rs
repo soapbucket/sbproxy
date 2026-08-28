@@ -73,10 +73,16 @@
 //! is what a deployment pipeline calls after its own smoke test instead
 //! of sleeping for two minutes.
 //!
-//! # Nothing here reverts
+//! # Reverting is off by default
 //!
-//! A failed soak records its verdict and leaves the pointer alone. It
-//! does not roll the node back; auto-revert is its own change.
+//! A failed soak records its verdict and leaves the last-known-good
+//! pointer alone. Whether it also puts the node back on that pointer is
+//! `proxy.config_history.soak.auto_revert`, which ships **off**
+//! (WOR-2461): with it off the soak still runs, still promotes, and
+//! still alerts, and nothing about what is serving changes without an
+//! operator. With it on, [`crate::config_rollback::auto_revert_after_failed_soak`]
+//! carries the four gates a revert has to pass, including the
+//! blast-radius arming rule and the no-loop rule.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -586,10 +592,22 @@ pub(crate) const fn verdict_label(verdict: SoakVerdict) -> &'static str {
 pub(crate) struct SoakOutcome {
     /// Ring revision this window judged.
     pub(crate) revision: u64,
+    /// That revision's content digest, carried so the auto-revert's
+    /// no-loop rule can compare content rather than revision numbers
+    /// without a second ring read (WOR-2461).
+    pub(crate) digest: String,
     /// The verdict it reached.
     pub(crate) verdict: SoakVerdict,
     /// One entry per signal, in the order they are evaluated.
     pub(crate) reports: Vec<(SoakSignal, SignalOutcome)>,
+    /// Whether `soak.auto_revert` was armed for the window that reached
+    /// this verdict.
+    ///
+    /// Carried on the outcome rather than re-read from the running
+    /// config by whoever handles it: by the time a caller acts on a
+    /// failed verdict the pipeline may already have moved, and the
+    /// question is what the operator armed for *this* revision.
+    pub(crate) auto_revert: bool,
 }
 
 /// One soak window in flight.
@@ -895,8 +913,10 @@ fn finish(window: &SoakWindow) -> SoakOutcome {
     }
     SoakOutcome {
         revision: window.revision,
+        digest: window.digest.clone(),
         verdict,
         reports,
+        auto_revert: window.config.auto_revert,
     }
 }
 
@@ -1156,7 +1176,7 @@ pub(crate) fn synthetic_probe_observation(
 ///
 /// A no-op when no window is ever armed, which is every node that has
 /// not enabled `proxy.config_history`.
-pub(crate) fn spawn() {
+pub(crate) fn spawn(config_path: String) {
     let client = match reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -1205,9 +1225,46 @@ pub(crate) fn spawn() {
                     run_operator_probe(&probe, &client).await;
                 }
             }
-            let _ = close_due();
+            if let Some(outcome) = close_due() {
+                react_to_verdict(&config_path, outcome).await;
+            }
         }
     });
+}
+
+/// Hand a closed window's verdict to the auto-revert decision
+/// (WOR-2461).
+///
+/// Only a `Failed` verdict can revert. `Inconclusive` deliberately
+/// cannot: a window where every signal abstained measured nothing, and
+/// reverting on "no information" is the 3am false positive that gets
+/// this feature switched off. That is Argo Rollouts' own position on an
+/// inconclusive analysis run, which pauses rather than aborting.
+///
+/// `spawn_blocking` because the revert drives the reload transaction,
+/// which compiles a configuration and constructs a pipeline while
+/// holding a `std::sync::Mutex`. Running that on the supervisor's
+/// current-thread runtime would stall the probe ticker and the admin
+/// server that shares it.
+async fn react_to_verdict(config_path: &str, outcome: SoakOutcome) {
+    if outcome.verdict != SoakVerdict::Failed {
+        return;
+    }
+    let config_path = config_path.to_string();
+    let handle = tokio::task::spawn_blocking(move || {
+        crate::config_rollback::auto_revert_after_failed_soak(
+            Some(&config_path),
+            outcome.revision,
+            &outcome.digest,
+            outcome.auto_revert,
+        );
+    });
+    if let Err(error) = handle.await {
+        tracing::error!(
+            error = %error,
+            "the automatic config revert task did not complete; the running configuration is              whatever the failed soak left serving",
+        );
+    }
 }
 
 #[cfg(test)]

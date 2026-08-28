@@ -383,6 +383,14 @@ enum ConfigSub {
     /// Print one recorded revision's stored document, selected by the
     /// revision number `config history` lists.
     Show(ConfigShowArgs),
+    /// Roll the running proxy back to a config revision it already
+    /// stored. Names the blast radius before it acts, refuses a stale
+    /// `--expected-current`, and the restored document soaks like any
+    /// other candidate.
+    Rollback(ConfigRollbackArgs),
+    /// Diff two stored config revisions, or one stored revision against
+    /// what the proxy is running. Applies nothing.
+    Diff(ConfigDiffArgs),
 }
 
 impl ConfigCmd {
@@ -394,7 +402,15 @@ impl ConfigCmd {
     /// indistinguishable from a broken invocation, so their CLI-error code
     /// is 1 like `plan`'s.
     fn uses_plan_exit_codes(&self) -> bool {
-        matches!(self.sub, ConfigSub::Authority(_) | ConfigSub::Pull(_))
+        // `config diff` joins the two that already report this way: it
+        // prints a plan, and a plan whose exit code doubled as a CLI
+        // error code would make "these two revisions differ"
+        // indistinguishable from "you typed the command wrong"
+        // (WOR-2460).
+        matches!(
+            self.sub,
+            ConfigSub::Authority(_) | ConfigSub::Pull(_) | ConfigSub::Diff(_)
+        )
     }
 }
 
@@ -580,6 +596,70 @@ struct ConfigHistoryArgs {
     admin: ModelsAdminArgs,
     /// Output format. `text` (default) prints a table; `json` prints
     /// the admin API's response verbatim.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+/// `sbproxy config rollback`: re-apply a stored config revision.
+#[derive(clap::Args, Debug)]
+struct ConfigRollbackArgs {
+    /// Which revision to restore: a revision number from
+    /// `sbproxy config history`, a content digest, or the default
+    /// `last-known-good`.
+    #[arg(long = "to", default_value = "last-known-good")]
+    to: String,
+    /// Refuse unless this is the revision the node is running right
+    /// now. Two operators reaching for rollback during one incident is
+    /// not hypothetical, and without this the second silently undoes
+    /// the first. Read it from `sbproxy config history`.
+    #[arg(long = "expected-current")]
+    expected_current: Option<u64>,
+    /// Confirm a restart-class or breaking rollback by naming the
+    /// target revision again. Required for those two classes and
+    /// ignored for the other two, the way a destructive action should
+    /// be.
+    #[arg(long = "confirm")]
+    confirm: Option<u64>,
+    /// Refuse unless the node's ring carries this lineage. A `source:`
+    /// repoint preserves lineage; a node-identity change re-mints it,
+    /// and a revision number from before that names a different
+    /// history.
+    #[arg(long = "lineage")]
+    lineage: Option<String>,
+    /// Roll back across a lineage break anyway.
+    #[arg(long = "force", action = ArgAction::SetTrue)]
+    force: bool,
+    /// Admin endpoint and Basic Auth credentials of the running proxy.
+    #[command(flatten)]
+    admin: ModelsAdminArgs,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+/// `sbproxy config diff`: plan between two stored revisions.
+#[derive(clap::Args, Debug)]
+struct ConfigDiffArgs {
+    /// The revision to diff **to**: a revision number or
+    /// `last-known-good`. Positional, so `sbproxy config diff 7` is the
+    /// short form.
+    to: Option<String>,
+    /// Baseline revision. Defaults to what the proxy is running, which
+    /// makes the one-argument form the question people actually ask
+    /// mid-incident. Junos spells the two forms
+    /// `show | compare rollback n` and
+    /// `show system rollback 3 compare 1`; this is both.
+    #[arg(long = "from")]
+    from: Option<String>,
+    /// Target revision, as a flag rather than the positional. Naming
+    /// both is a usage error rather than a precedence rule.
+    #[arg(long = "to")]
+    to_flag: Option<String>,
+    /// Admin endpoint and Basic Auth credentials of the running proxy.
+    #[command(flatten)]
+    admin: ModelsAdminArgs,
+    /// Output format. `text` prints the plan; `json` prints the admin
+    /// API's response verbatim.
     #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
 }
@@ -8831,6 +8911,8 @@ fn handle_config_subcommand(
         ConfigSub::Pull(args) => handle_config_pull(args, global_config),
         ConfigSub::History(args) => handle_config_history(args),
         ConfigSub::Show(args) => handle_config_show(args),
+        ConfigSub::Rollback(args) => handle_config_rollback(args),
+        ConfigSub::Diff(args) => handle_config_diff(args),
     }
 }
 
@@ -10481,6 +10563,249 @@ fn print_config_history_table(body: &serde_json::Value) {
             "{revision}\t{state}\t{blast_radius}\t{provenance}\t{applied_at}\t{actor}\t{digest}"
         );
     }
+}
+
+/// `sbproxy config rollback --to <rev|digest|last-known-good>`: ask the
+/// running proxy to re-apply a config revision it already stored
+/// (WOR-2460).
+///
+/// Speaks to the admin API the way `config history` and `apply` do.
+/// Exit codes follow the `config` family's convention: `0` on a
+/// rollback that applied, `4` when the node refused it (an unknown
+/// revision, a stale `--expected-current`, an unconfirmed restart-class
+/// change), and `2` on a CLI-level error, which `run_subcommand` maps.
+///
+/// The `--confirm` flag is the typed confirmation a restart-class or
+/// breaking rollback needs. The node computes the blast radius from the
+/// two stored documents, so the CLI does not have to guess: run without
+/// `--confirm` first, read the refusal, and re-run naming the revision
+/// back if the radius is one you accept.
+fn handle_config_rollback(args: &ConfigRollbackArgs) -> anyhow::Result<i32> {
+    let mut body = serde_json::Map::new();
+    // A digest is 64 lowercase hex characters; a revision is a number.
+    // Deciding here rather than making the operator pick a flag is the
+    // one place this CLI guesses, and it guesses from a shape that
+    // cannot be both.
+    if args.to == "last-known-good" {
+        body.insert(
+            "target".to_string(),
+            serde_json::Value::String("last-known-good".to_string()),
+        );
+    } else if let Ok(revision) = args.to.parse::<u64>() {
+        body.insert("revision".to_string(), serde_json::json!(revision));
+    } else {
+        body.insert(
+            "digest".to_string(),
+            serde_json::Value::String(args.to.clone()),
+        );
+    }
+    if let Some(expected) = args.expected_current {
+        body.insert("expected_current".to_string(), serde_json::json!(expected));
+    }
+    if let Some(confirm) = args.confirm {
+        body.insert("confirm_revision".to_string(), serde_json::json!(confirm));
+    }
+    if let Some(lineage) = args.lineage.as_deref() {
+        body.insert(
+            "lineage".to_string(),
+            serde_json::Value::String(lineage.to_string()),
+        );
+    }
+    if args.force {
+        body.insert("force".to_string(), serde_json::json!(true));
+    }
+    let payload = AdminRequestBody::Json(serde_json::Value::Object(body));
+
+    let answer = match admin_request_parts(
+        &args.admin,
+        reqwest::Method::POST,
+        "/admin/config/rollback",
+        Some(payload),
+    )? {
+        AdminOutcome::Unreachable(reason) => {
+            return Ok(report_admin_unreachable(
+                "config rollback",
+                &args.admin,
+                &reason,
+            ));
+        }
+        AdminOutcome::Answered { status, body } if !status.is_success() => {
+            // Printed rather than swallowed: the refusal body is where
+            // the available revisions and both sides of a stale
+            // `expected_current` live, and it is the whole reason this
+            // route names them.
+            report_admin_refusal("config rollback", status, &body);
+            if matches!(args.format, OutputFormat::Json) {
+                println!("{}", serde_json::to_string_pretty(&body)?);
+            }
+            return Ok(4);
+        }
+        AdminOutcome::Answered { body, .. } => body,
+    };
+
+    match args.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&answer)?),
+        OutputFormat::Text => print_config_rollback_text(&answer),
+    }
+    Ok(0)
+}
+
+/// Render a successful rollback for `--format text`.
+///
+/// Every warning the node returned is printed, and the config-file line
+/// is printed whether or not the node listed it, because that is the
+/// half of the recovery the rollback did not do.
+fn print_config_rollback_text(body: &serde_json::Value) {
+    let restored = json_u64(body, "restored_revision");
+    let digest = body
+        .get("restored_digest")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("-");
+    let radius = body
+        .get("blast_radius")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    println!("config rollback: restored revision {restored} ({digest}), blast radius {radius}");
+    if let Some(previous) = body
+        .get("previous_revision")
+        .and_then(serde_json::Value::as_u64)
+    {
+        println!("config rollback: revision {previous} is marked reverted");
+    }
+    if let Some(appended) = body
+        .get("appended_revision")
+        .and_then(serde_json::Value::as_u64)
+    {
+        println!(
+            "config rollback: appended as revision {appended}; history is append-only, so this \
+             rollback is itself in the history"
+        );
+    }
+    if body
+        .get("soaking")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        println!(
+            "config rollback: the restored revision is soaking like any other candidate. \
+             POST /admin/config/confirm promotes it early; a failed soak leaves the \
+             last-known-good pointer where it is"
+        );
+    }
+    for warning in body
+        .get("warnings")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or(&Vec::new())
+    {
+        if let Some(warning) = warning.as_str() {
+            println!("config rollback: warning: {warning}");
+        }
+    }
+}
+
+/// `sbproxy config diff [<rev>] [--from <a> --to <b>]`: a plan between
+/// two stored config revisions, or between what is running and one
+/// stored revision (WOR-2460).
+///
+/// Junos has both forms and the second is the one people want
+/// mid-incident: `show | compare rollback n` diffs against one stored
+/// revision, and `show system rollback 3 compare 1` diffs two stored
+/// revisions that need not be adjacent. Cisco's
+/// `show archive config differences` is the same idea.
+///
+/// Reads only. Nothing is applied, no pointer moves, and the running
+/// config is untouched whichever form is used. Exit codes follow
+/// `plan`'s convention through [`ConfigCmd::uses_plan_exit_codes`]: `0`
+/// when the two revisions are identical, `2` when they differ.
+fn handle_config_diff(args: &ConfigDiffArgs) -> anyhow::Result<i32> {
+    let to = match (args.to.as_deref(), args.to_flag.as_deref()) {
+        (Some(_), Some(_)) => {
+            eprintln!(
+                "config diff: name the target revision once, either as the positional argument \
+                 or as --to, not both"
+            );
+            return Ok(1);
+        }
+        (Some(positional), None) => positional,
+        (None, Some(flag)) => flag,
+        (None, None) => {
+            eprintln!(
+                "config diff: name a target revision, for example `sbproxy config diff 7` or \
+                 `sbproxy config diff --from 5 --to 7`. `sbproxy config history` lists what is \
+                 in the ring"
+            );
+            return Ok(1);
+        }
+    };
+    let mut path = format!("/admin/config/diff?to={}", urlencoding_lite(to));
+    if let Some(from) = args.from.as_deref() {
+        path.push_str(&format!("&from={}", urlencoding_lite(from)));
+    }
+    let body = match admin_request_parts(&args.admin, reqwest::Method::GET, &path, None)? {
+        AdminOutcome::Unreachable(reason) => {
+            return Ok(report_admin_unreachable(
+                "config diff",
+                &args.admin,
+                &reason,
+            ));
+        }
+        AdminOutcome::Answered { status, body } if !status.is_success() => {
+            return Ok(report_admin_refusal("config diff", status, &body));
+        }
+        AdminOutcome::Answered { body, .. } => body,
+    };
+    match args.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&body)?),
+        OutputFormat::Text => {
+            let from = describe_diff_side(body.get("from"), "the running configuration");
+            let to = describe_diff_side(body.get("to"), "unknown");
+            let radius = body
+                .get("max_blast_radius")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            println!("config diff: {from} -> {to}, largest blast radius {radius}");
+            print!(
+                "{}",
+                body.get("plan_text")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+            );
+        }
+    }
+    // `plan`'s convention: 2 means "changes present" and is not an
+    // error, so a script can branch on "is this rollback a no-op".
+    let changes = json_u64(&body, "changes");
+    Ok(if changes == 0 { 0 } else { 2 })
+}
+
+/// Name one side of a diff for the text header.
+fn describe_diff_side(side: Option<&serde_json::Value>, when_absent: &str) -> String {
+    side.and_then(|side| side.get("revision"))
+        .and_then(serde_json::Value::as_u64)
+        .map_or_else(
+            || when_absent.to_string(),
+            |revision| format!("revision {revision}"),
+        )
+}
+
+/// Percent-encode the handful of characters a revision selector could
+/// carry that would otherwise break the query string.
+///
+/// Deliberately tiny rather than a dependency: the accepted values are a
+/// decimal number and the literal `last-known-good`, and anything else
+/// is refused by the route with a message naming both forms. This exists
+/// so a typo cannot smuggle an `&` into the next parameter.
+fn urlencoding_lite(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '~') {
+                character.to_string()
+            } else {
+                format!("%{:02X}", character as u32 & 0xFF)
+            }
+        })
+        .collect()
 }
 
 /// `sbproxy config show <rev>`: resolve a revision number to its

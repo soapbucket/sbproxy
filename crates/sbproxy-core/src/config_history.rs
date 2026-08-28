@@ -360,6 +360,31 @@ impl ConfigHistoryRecorder {
         }
     }
 
+    /// Mark `revision` as the one this node rolled away from
+    /// (WOR-2460, WOR-2461).
+    ///
+    /// The rule, including why the last-known-good pointer deliberately
+    /// does not move, lives in
+    /// [`sbproxy_config::RevisionStore::mark_reverted`]. This forwards
+    /// to it and swallows a write failure the way every other write on
+    /// this type does: a rollback that applied and could not be
+    /// annotated is still a rollback that applied, and failing the
+    /// operator's recovery over a bookkeeping write would be the wrong
+    /// trade at three in the morning.
+    pub fn mark_reverted(&self, revision: u64) {
+        let mut store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(error) = store.mark_reverted(revision) {
+            tracing::error!(
+                error = %error,
+                revision,
+                "config history: failed to mark a revision as rolled away from"
+            );
+        }
+    }
+
     /// Clear one entry's boot counter: it booted and served long enough
     /// to count as working (WOR-2459).
     ///
