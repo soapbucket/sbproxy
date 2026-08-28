@@ -109,7 +109,7 @@ fn catalog_entries(
         // WOR-2647: one resolution, shared with the `/v1/models`
         // listing. Two derivations of the same fact is how a policy and
         // a client end up reading different windows for one model.
-        let facts = crate::context_window::model_facts(model);
+        let facts = crate::context_window::model_facts_from_table(model, price_table);
         if let Some(window) = facts.context_window {
             entry.insert(
                 "context_window".to_string(),
@@ -220,6 +220,32 @@ mod tests {
             dear_entry["input_per_million"],
             CelValue::Float(v) if (v - 9.0).abs() < 1e-12
         ));
+    }
+
+    #[test]
+    fn two_operator_tables_keep_distinct_catalog_windows() {
+        let providers = [provider_with_models(&["split-window-model"])];
+        let dir = tempfile::tempdir().expect("temp dir");
+        let card = dir.path().join("card.json");
+        std::fs::write(&card, r#"{"split-window-model":{"max_output_tokens":64}}"#)
+            .expect("write rate card");
+        let windowed = crate::budget::build_price_table(
+            &HashMap::<String, crate::budget::ModelPriceConfig>::new(),
+            Some(card.to_str().expect("utf8 path")),
+        );
+        let windowed_entries = catalog_entries(&providers, &windowed);
+        let empty_entries = catalog_entries(&providers, &PriceTable::new());
+        let CelValue::Map(windowed_entry) = &windowed_entries["split-window-model"] else {
+            panic!("windowed entry must be a map");
+        };
+        assert!(matches!(
+            windowed_entry["max_output_tokens"],
+            CelValue::Int(64)
+        ));
+        assert!(
+            !empty_entries.contains_key("split-window-model"),
+            "an origin with no rate card must not inherit another origin's window"
+        );
     }
 
     #[test]

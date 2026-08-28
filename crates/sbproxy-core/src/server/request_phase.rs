@@ -3622,7 +3622,7 @@ pub(super) async fn request_filter(
                 {
                     Ok(version) => version,
                     Err(error) => {
-                        let body = format!(r#"{{"error":"{error}"}}"#);
+                        let body = serde_json::json!({"error": error.to_string()}).to_string();
                         send_response(session, 400, "application/json", body.as_bytes()).await?;
                         return Ok(true);
                     }

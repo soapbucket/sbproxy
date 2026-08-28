@@ -1331,6 +1331,11 @@ impl PromptCatalogSnapshot {
     }
 }
 
+/// Bound on remembered tool-call auth challenges. A 401 is a finished
+/// call; this map is a recent-challenge log for `GET /admin/mcp-runtime`,
+/// not an unbounded in-flight table.
+const TOOL_CALL_AUTH_CAP: usize = 64;
+
 /// Aggregates tools from multiple upstream MCP servers into one registry.
 pub struct McpFederation {
     servers: Vec<McpServerConfig>,
@@ -1384,7 +1389,9 @@ pub struct McpFederation {
     server_runtime: ArcSwap<HashMap<String, super::auth_state::ServerRuntimeState>>,
     /// In-flight tool-call auth posture, keyed by the caller's
     /// correlation id. A step-up on one call does not move the server
-    /// out of [`super::auth_state::ServerRuntimeState::Ready`].
+    /// out of [`super::auth_state::ServerRuntimeState::Ready`]. Capped
+    /// at [`TOOL_CALL_AUTH_CAP`]: a 401 is a finished call, and this
+    /// map is the recent-challenge log `GET /admin/mcp-runtime` reads.
     tool_call_auth: std::sync::Mutex<HashMap<String, super::auth_state::ToolCallAuthStatus>>,
     /// WOR-818: mcpApps capability values mirrored from any
     /// upstream that advertised one. Empty when no upstream
@@ -2251,13 +2258,27 @@ impl McpFederation {
     }
 
     fn begin_tool_call(&self, correlation_id: &str) {
-        self.tool_call_auth
+        self.store_tool_call_auth(
+            correlation_id,
+            super::auth_state::ToolCallAuthStatus::Running,
+        );
+    }
+
+    fn store_tool_call_auth(
+        &self,
+        correlation_id: &str,
+        status: super::auth_state::ToolCallAuthStatus,
+    ) {
+        let mut map = self
+            .tool_call_auth
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(
-                correlation_id.to_string(),
-                super::auth_state::ToolCallAuthStatus::Running,
-            );
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if map.len() >= TOOL_CALL_AUTH_CAP && !map.contains_key(correlation_id) {
+            if let Some(evict) = map.keys().next().cloned() {
+                map.remove(&evict);
+            }
+        }
+        map.insert(correlation_id.to_string(), status);
     }
 
     fn note_tool_call_failure(
@@ -2277,17 +2298,14 @@ impl McpFederation {
         }
         let challenge =
             super::auth_state::parse_bearer_challenge(status.www_authenticate.as_deref());
-        self.tool_call_auth
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(
-                correlation_id.to_string(),
-                super::auth_state::ToolCallAuthStatus::AuthRequired {
-                    server: server_name.to_string(),
-                    tool: tool_name.to_string(),
-                    challenge,
-                },
-            );
+        self.store_tool_call_auth(
+            correlation_id,
+            super::auth_state::ToolCallAuthStatus::AuthRequired {
+                server: server_name.to_string(),
+                tool: tool_name.to_string(),
+                challenge,
+            },
+        );
         sbproxy_observe::metrics::record_mcp_tool_dispatch(tool_name, "call_auth_required", 0.0);
         tracing::info!(
             event = "mcp_tool_call_auth_required",
@@ -6717,6 +6735,33 @@ mod tests {
         assert!(!fed.complete_tool_call_success("corr-1"));
         fed.begin_tool_call("corr-2");
         assert!(fed.complete_tool_call_success("corr-2"));
+    }
+
+    #[test]
+    fn tool_call_auth_challenges_are_capped() {
+        let fed = McpFederation::new(vec![mock_server("gh", "http://gh.test")]);
+        let err: anyhow::Error = crate::mcp::streamable::McpUpstreamHttpStatus {
+            status: 401,
+            www_authenticate_present: true,
+            www_authenticate: Some(
+                r#"Bearer error="insufficient_scope", scope="repo""#.to_string(),
+            ),
+        }
+        .into();
+        for i in 0..=super::TOOL_CALL_AUTH_CAP {
+            let id = format!("corr-{i}");
+            fed.begin_tool_call(&id);
+            fed.note_tool_call_failure(&id, "gh", "search", &err);
+        }
+        let calls = fed
+            .tool_call_auth
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            calls.len(),
+            super::TOOL_CALL_AUTH_CAP,
+            "a flood of 401s must not grow the recent-challenge map without bound"
+        );
     }
 
     #[test]

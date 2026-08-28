@@ -64,7 +64,7 @@ impl std::fmt::Display for InvalidOpenApiVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "unsupported OpenAPI version {:?}; accepted values are 3.0, 3.0.3, 3.1, 3.1.0",
+            "unsupported OpenAPI version {}; accepted values are 3.0, 3.0.3, 3.1, 3.1.0",
             self.0
         )
     }
@@ -236,6 +236,22 @@ mod tests {
     fn unknown_version_is_an_error() {
         let err = OpenApiVersion::from_query(Some("version=2.0")).unwrap_err();
         assert!(err.to_string().contains("2.0"));
+    }
+
+    #[test]
+    fn unknown_version_error_encodes_as_json() {
+        let err = OpenApiVersion::from_query(Some("version=2.0")).unwrap_err();
+        let body = json!({"error": err.to_string()});
+        let encoded = body.to_string();
+        let parsed: Value = serde_json::from_str(&encoded).expect("the 400 body must be JSON");
+        assert_eq!(
+            parsed["error"].as_str().expect("error is a string"),
+            err.to_string()
+        );
+        assert!(
+            !err.to_string().contains('"'),
+            "Display must not quote the token; a quoted token makes a hand-built JSON body invalid"
+        );
     }
 
     #[test]

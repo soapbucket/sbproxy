@@ -2055,15 +2055,15 @@ mod tests {
     // scope so the existing test bodies keep compiling unchanged.
     use super::dissemination::{apply_update, apply_updates, decide_transition, TransitionOutcome};
     use super::ping_req::pick_indirect_witnesses;
-    use super::probe::{sweep_dead_for_gc, sweep_suspects_to_dead};
+    use super::probe::{sweep_dead_for_gc, sweep_suspects_to_dead, transition_to_alive};
     // Per-phase metrics constants the tests assert on; these used to live
     // inline in the parent module's `use crate::metrics::{...}` block but
     // now belong to the phase modules. Re-import here so `super::*` still
     // covers everything tests reference.
     use crate::metrics::{
         DISSEM_IGNORE_STALE_INCARNATION, DISSEM_IGNORE_TERMINAL_DEAD, DISSEM_IGNORE_UNKNOWN_PEER,
-        DISSEM_TRANS_ALIVE_LEFT, DISSEM_TRANS_DEAD_ALIVE, MESH_DISSEMINATION_UPDATES_IGNORED,
-        MESH_PROBE_DIRECT_SUCCESS,
+        DISSEM_TRANS_ALIVE_LEFT, DISSEM_TRANS_DEAD_ALIVE, DISSEM_TRANS_LEFT_ALIVE,
+        MESH_DISSEMINATION_UPDATES_IGNORED, MESH_PROBE_DIRECT_SUCCESS,
     };
 
     /// Serializes tests that read+assert on the global `MESH_ADDR_MAP_UPDATES`
@@ -2231,6 +2231,33 @@ mod tests {
         let guard = peers.read().unwrap();
         let entry = guard.get_by_node_id("peer-a").expect("peer-a present");
         assert!(matches!(entry.state, PeerState::Alive));
+    }
+
+    #[test]
+    fn an_ack_does_not_revive_a_peer_that_has_left() {
+        let now = Instant::now();
+        let left_entry = PeerEntry {
+            node_id: "peer-a".to_string(),
+            addr: "127.0.0.1:1".to_string(),
+            state: PeerState::Left,
+            last_ack: now - Duration::from_secs(1),
+            last_heartbeat: now - Duration::from_secs(1),
+            incarnation: 3,
+            last_transition: now - Duration::from_millis(100),
+        };
+        let peers = Arc::new(RwLock::new(PeerTable::from_entries(vec![left_entry])));
+        let disseminator = Arc::new(Disseminator::new());
+        transition_to_alive(&peers, "peer-a", "127.0.0.1:1", Some(&disseminator));
+        let guard = peers.read().unwrap();
+        let entry = guard.get_by_node_id("peer-a").expect("peer-a present");
+        assert!(
+            matches!(entry.state, PeerState::Left),
+            "an in-flight ACK must not resurrect a graceful leave"
+        );
+        assert!(
+            disseminator.drain_for_send(16).is_empty(),
+            "an ignored leave ACK must not rebroadcast Alive"
+        );
     }
 
     #[test]
@@ -3219,6 +3246,40 @@ mod tests {
         assert!(matches!(
             from_dead,
             TransitionOutcome::Ignore(DISSEM_IGNORE_TERMINAL_DEAD)
+        ));
+    }
+
+    #[test]
+    fn a_left_peer_rejoins_on_higher_incarnation_alive() {
+        let same = decide_transition(
+            PeerState::Left,
+            3,
+            &PeerUpdate {
+                node_id: "b".into(),
+                state: PeerStateWire::Alive,
+                incarnation: 3,
+            },
+        );
+        assert!(matches!(
+            same,
+            TransitionOutcome::Ignore(DISSEM_IGNORE_TERMINAL_DEAD)
+        ));
+        let rejoin = decide_transition(
+            PeerState::Left,
+            3,
+            &PeerUpdate {
+                node_id: "b".into(),
+                state: PeerStateWire::Alive,
+                incarnation: 4,
+            },
+        );
+        assert!(matches!(
+            rejoin,
+            TransitionOutcome::Accept {
+                new_state: PeerState::Alive,
+                transition_label: DISSEM_TRANS_LEFT_ALIVE,
+                ..
+            }
         ));
     }
 

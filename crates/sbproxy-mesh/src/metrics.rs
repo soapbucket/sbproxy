@@ -270,6 +270,8 @@ pub const DISSEM_TRANS_SUSPECT_DEAD: &str = "suspect_to_dead";
 pub const DISSEM_TRANS_SUSPECT_LEFT: &str = "suspect_to_left";
 /// `transition` label: Dead -> Alive (rejoin).
 pub const DISSEM_TRANS_DEAD_ALIVE: &str = "dead_to_alive";
+/// `transition` label: Left -> Alive (rejoin after a graceful leave).
+pub const DISSEM_TRANS_LEFT_ALIVE: &str = "left_to_alive";
 /// `transition` label: local self-refutation (we learned we were Suspect
 /// about ourselves, bumped incarnation, and queued a fresh Alive).
 pub const DISSEM_TRANS_SELF_REFUTATION: &str = "self_refutation";

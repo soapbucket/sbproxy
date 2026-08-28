@@ -49,12 +49,26 @@ pub struct ModelFacts {
 /// caller omits the fields rather than guessing.
 #[must_use]
 pub fn model_facts(model: &str) -> ModelFacts {
+    model_facts_from_limits(model, crate::budget::catalog_token_limits(model))
+}
+
+/// Resolve one model's token limits against a specific operator table.
+///
+/// `ai.catalog` builds from the origin's `PriceTable` so a window from
+/// another origin's rate card cannot leak into this catalog (WOR-2431).
+pub(crate) fn model_facts_from_table(model: &str, table: &crate::budget::PriceTable) -> ModelFacts {
+    model_facts_from_limits(model, crate::budget::catalog_token_limits_in(table, model))
+}
+
+fn model_facts_from_limits(
+    model: &str,
+    limits: Option<crate::budget::ModelTokenLimits>,
+) -> ModelFacts {
     // The price layers match case-insensitively but the static table is
     // exact; fall back to the lowercase form so a mixed-case declared
     // model does not end up priced-but-windowless.
     let window =
         model_context_window(model).or_else(|| model_context_window(&model.to_ascii_lowercase()));
-    let limits = crate::budget::catalog_token_limits(model);
     ModelFacts {
         context_window: window.or_else(|| limits.and_then(|limits| limits.max_input_tokens)),
         max_output_tokens: limits.and_then(|limits| limits.max_output_tokens),
