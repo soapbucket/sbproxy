@@ -613,6 +613,31 @@ fn a_deny_listed_path_is_rejected_at_publish() {
     );
 }
 
+/// WOR-2436: `origin_defaults` is authority-writable and its sibling
+/// `origin_sources` is not, so the distinction is deliberate rather than
+/// an accident of what happens to be on the deny list.
+///
+/// The negative half is covered by `a_deny_listed_path_is_rejected_at_publish`
+/// above, which walks the whole list. This is the positive half: the
+/// platform raising a security floor across the fleet is exactly what
+/// this channel exists for, and a refusal here would mean the block
+/// could never be distributed.
+#[test]
+fn an_authority_bundle_setting_origin_defaults_is_accepted() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let authority = authority(temp.path());
+
+    let yaml = format!(
+        "{}\norigin_defaults:\n  policies:\n    - name: waf\n      type: waf\n      \
+         mode: block\n      locked: true\n",
+        payload("api.test", "ok")
+    );
+    let outcome = authority
+        .publish(&yaml, BundleMode::Overlay)
+        .expect("the platform floor must publish through the authority");
+    assert_eq!(outcome.revision, 1);
+}
+
 /// The published example payload really publishes.
 ///
 /// `validate_examples` only runs the example files through
