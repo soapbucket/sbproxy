@@ -11,12 +11,17 @@ name: checkout
 # What this service needs from whoever deploys it. An unbound input with
 # no default is a resolve error naming both the input and the entry, not
 # a warning and not literal passthrough.
+#
+# An input binds as text. Anything credential-bearing belongs in the
+# entry's `overrides:` block instead: a profile is a confined document,
+# so `${VAR}`, `env:NAME` and `file:/path` are all refused inside it,
+# and so is a secret written out in full.
 inputs:
-  - name: upstream_key
-    description: credential the proxy presents to the checkout upstream
-  - name: region
-    description: which regional upstream to send to
-    default: us-east-1
+  - name: upstream_host
+    description: the regional upstream this deployment sends to
+  - name: shop_origin
+    description: browser origin allowed to call this service
+    default: https://shop.example.com
 
 spec:
   api:
@@ -24,21 +29,21 @@ spec:
     base:
       action:
         type: proxy
-        upstream: "https://checkout-{{vars.region}}.internal.example.com"
-      authentication:
-        type: api_key
-        # The shape is the project's. The reference is the entry's.
-        # A literal here is refused, and so is `env:NAME`.
-        api_key: "{{vars.upstream_key}}"
+        url: "https://{{vars.upstream_host}}"
+        preserve_query: true
       policies:
         # Merged by name against origin_defaults. The fields this entry
-        # does not mention survive from the floor.
+        # does not mention survive from the floor, so `burst` and
+        # `type` both come through unchanged.
         - name: rate_limit
           requests_per_minute: 1200
-        # A name the floor does not carry is appended after it.
-        - name: checkout_quota
-          type: quota
-          per_key_per_day: 50000
+        # A name the floor does not carry is appended after it. Adding a
+        # second entry of a *locked* floor entry's type would be refused
+        # instead: a lock binds the effect, not the name.
+        - name: checkout_request_limit
+          type: request_limit
+          max_body_size: 1048576
+          max_url_length: 2048
       request_modifiers:
         - name: service_headers
           headers:
@@ -46,24 +51,25 @@ spec:
               X-Service: checkout
       cors:
         allowed_origins:
-          - https://shop.example.com
+          - "{{vars.shop_origin}}"
         allowed_methods: [GET, POST]
     environments:
       # Structural differences only. Selected by the entry's
       # `environment:` field.
       prod:
         action:
-          timeout_ms: 1500
+          host_override: checkout.internal.example.com
       staging:
         action:
-          upstream: https://checkout-staging.internal.example.com
+          url: https://checkout-staging.internal.example.com
+          preserve_query: false
   webhooks:
     base:
       action:
         type: proxy
-        upstream: https://checkout-hooks.internal.example.com
+        url: https://checkout-hooks.internal.example.com
       policies:
         # An unnamed entry in a project profile is always an addition.
         - type: ip_filter
-          allow:
+          whitelist:
             - 203.0.113.0/24

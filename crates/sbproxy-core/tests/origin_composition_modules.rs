@@ -46,7 +46,7 @@ spec:
     base:
       action:
         type: proxy
-        upstream: https://checkout.internal
+        url: https://checkout.internal
       policies:
         - name: budget
           headers:
@@ -102,6 +102,83 @@ fn the_same_policy_with_its_bookkeeping_left_in_is_refused_by_the_module() {
         assert!(
             RateLimitBudgetPolicy::from_config(value).is_err(),
             "`{key}` must be refused by the module, or the strip proves nothing"
+        );
+    }
+}
+
+/// The gauge is written for every tier on every load, including the load
+/// where the block is gone.
+///
+/// The reading the dashboard panel and `docs/configuration.md` both tell
+/// an operator to alert on is "the total dropped to zero", and the one
+/// after it is "a non-zero `pinned=false` under `tier=production`". Both
+/// are transitions *out* of a state, so a gauge only written on the path
+/// that reads the block could never produce either: deleting the block
+/// left the last value standing, and promoting a document from
+/// development to production left the development series behind.
+///
+/// Reads the real Prometheus default registry rather than a helper,
+/// because `register_int_gauge_vec!` is where the series actually lands
+/// and a test against anything else would be testing the test.
+#[test]
+fn the_entry_gauge_covers_every_tier_and_clears_when_the_block_goes() {
+    fn series() -> std::collections::BTreeMap<(String, String), i64> {
+        let mut out = std::collections::BTreeMap::new();
+        for family in prometheus::gather() {
+            if family.name() != "sbproxy_origin_source_entries" {
+                continue;
+            }
+            for metric in family.get_metric() {
+                let mut tier = String::new();
+                let mut pinned = String::new();
+                for label in metric.get_label() {
+                    match label.name() {
+                        "tier" => tier = label.value().to_string(),
+                        "pinned" => pinned = label.value().to_string(),
+                        _ => {}
+                    }
+                }
+                out.insert(
+                    (tier, pinned),
+                    metric.get_gauge().value.unwrap_or_default() as i64,
+                );
+            }
+        }
+        out
+    }
+
+    let with_block = "origins: {}\norigin_sources:\n  tier: production\n  entries:\n    \
+                      - name: checkout\n      repo: https://git.test/acme/checkout\n      \
+                      revision: refs/tags/v1.4.2\n      path: sbproxy/origin.yaml\n";
+    sbproxy_config::compile_config(with_block).expect("the pinned production config compiles");
+    let after_declaration = series();
+    assert_eq!(
+        after_declaration.get(&("production".to_string(), "true".to_string())),
+        Some(&1),
+        "{after_declaration:?}"
+    );
+    // Every other series exists and reads zero, so an alert on
+    // `pinned="false"` has something to be false about.
+    for key in [
+        ("production", "false"),
+        ("development", "true"),
+        ("development", "false"),
+    ] {
+        assert_eq!(
+            after_declaration.get(&(key.0.to_string(), key.1.to_string())),
+            Some(&0),
+            "{key:?} missing from {after_declaration:?}"
+        );
+    }
+
+    // The block is deleted. Every series has to fall to zero: this is
+    // the transition the panel description names.
+    sbproxy_config::compile_config("origins: {}\n").expect("a config with no block compiles");
+    let after_removal = series();
+    for (key, value) in &after_removal {
+        assert_eq!(
+            *value, 0,
+            "`{key:?}` kept a stale reading after the block was removed: {after_removal:?}"
         );
     }
 }

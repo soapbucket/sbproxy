@@ -148,6 +148,37 @@ const PROFILE_SECRET_KEYS: &[&str] = &[
     "webhook_secret",
 ];
 
+/// The origin fields a project profile may set, as strings.
+///
+/// The same set as [`OriginProfileSpec`]'s fields, spelled here because
+/// the runtime needs it as data: `validate_origin_body` asks whether a
+/// key in `origin_defaults` is a real origin field, and building a
+/// schema per config load to answer that would be absurd.
+/// `every_raw_origin_field_is_classified` asserts this list is exactly
+/// [`OriginProfileSpec`]'s schema properties, so the duplication cannot
+/// drift.
+pub const PROFILE_WRITABLE_ORIGIN_FIELDS: &[&str] = &[
+    "action",
+    "agent_skills",
+    "agents_json",
+    "agents_md",
+    "ai_txt",
+    "authentication",
+    "compression",
+    "content_signal",
+    "cors",
+    "default_content_shape",
+    "deprecation",
+    "error_pages",
+    "expose_openapi",
+    "policies",
+    "problem_details",
+    "request_modifiers",
+    "response_modifiers",
+    "token_bytes_ratio",
+    "transforms",
+];
+
 /// The fields of `RawOriginConfig` a project profile may not set, each
 /// with the reason it belongs to whoever runs the proxy.
 ///
@@ -228,11 +259,16 @@ pub const PLATFORM_OWNED_ORIGIN_FIELDS: &[(&str, &str)] = &[
     ),
     (
         "on_request",
-        "extension hooks: arbitrary code on the request path",
+        "names an installed extension bundle to run on the request path. The distinction \
+         from the allowed `request_modifiers[].lua_script` is capability, not code: a script \
+         body runs in an interpreter with no network, no filesystem, no clock and no crypto, \
+         while a bundle is host code the operator installed and granted, so naming one is \
+         spending a grant the project never made",
     ),
     (
         "on_response",
-        "extension hooks: arbitrary code on the response path",
+        "the same grant on the response path, where the bundle additionally sees the \
+         upstream's body",
     ),
     (
         "bot_detection",
@@ -485,20 +521,77 @@ impl OriginProfileSpec {
 /// operator reading one line knows which repository to go and fix.
 ///
 /// No variant carries a config value: an entry credential and a bound
-/// input are both secret-shaped, and a refusal that echoed one would
-/// put it in every log that saw the refusal.
+/// input are both secret-shaped, and a refusal that echoed one would put
+/// it in every log that saw the refusal.
+///
+/// The twenty hand-written variants hold that by construction. The three
+/// that report a deserialization failure ([`Self::Parse`],
+/// [`Self::ProfileParse`], [`Self::Compose`]) would not: serde renders
+/// the offending value into its own message, so `invalid type: string
+/// "sk-live-...", expected f32` is a secret in a refusal. They carry a
+/// [`redact_serde_message`] rendering instead of the error itself, which
+/// keeps the backtick-quoted field names serde uses for identifiers and
+/// replaces every double-quoted value with `[redacted]`. The cost is the
+/// `#[source]` chain on those three, which is the right trade: a chain
+/// only a `{:#}` formatter prints is worth less than a value that cannot
+/// leak.
 #[derive(Debug, thiserror::Error)]
 pub enum OriginResolveError {
-    /// `origin_defaults` has a list entry with no `name:`.
+    /// A runtime-authored origin block has a list entry with no `name:`.
     #[error(
-        "origin_defaults: `{list}` entry {index} has no `name:`. A default has to be \
-         addressable to be overridable, so give it one"
+        "{block}: `{list}` entry {index} has no `name:`. A default has to be addressable to \
+         be overridable, so give it one"
     )]
     UnnamedDefault {
+        /// Which block: `origin_defaults`, or one entry's `overrides:`.
+        block: String,
         /// Which of [`PROFILE_LIST_MERGE_KEYS`] the entry is in.
         list: &'static str,
         /// Zero-based position of the offending entry.
         index: usize,
+    },
+    /// A runtime-authored origin block names a key that is not an origin
+    /// field.
+    #[error(
+        "{block}: `{key}` is not a field of an origin, so nothing would ever read it. \
+         Neither block carries `deny_unknown_fields`, because the merge runs before the \
+         typed parse, so this check is what stops a typo reaching the aggregator"
+    )]
+    UnknownOriginKey {
+        /// Which block: `origin_defaults`, or one entry's `overrides:`.
+        block: String,
+        /// The key as authored.
+        key: String,
+    },
+    /// A runtime-authored origin block names a policy or transform type
+    /// the dispatcher does not know.
+    #[error(
+        "{block}: `{list}` entry `{name}` has `type: {kind}`, which no module answers to. \
+         Every composed origin inherits this entry, so the whole fleet would refuse to boot"
+    )]
+    UnknownEntryType {
+        /// Which block: `origin_defaults`, or one entry's `overrides:`.
+        block: String,
+        /// `policies` or `transforms`.
+        list: &'static str,
+        /// The entry's `name:`.
+        name: String,
+        /// The unrecognized `type:`.
+        kind: String,
+    },
+    /// A runtime-authored `policies:` or `transforms:` entry has no
+    /// `type:`.
+    #[error(
+        "{block}: `{list}` entry `{name}` has no `type:`. Without one nothing dispatches it, \
+         and a project overriding it by name would be overriding nothing"
+    )]
+    MissingEntryType {
+        /// Which block: `origin_defaults`, or one entry's `overrides:`.
+        block: String,
+        /// `policies` or `transforms`.
+        list: &'static str,
+        /// The entry's `name:`.
+        name: String,
     },
     /// `origin_defaults` is present but is not a mapping of origin keys.
     #[error("origin_defaults: `{list}` is not a list")]
@@ -592,13 +685,12 @@ pub enum OriginResolveError {
         repo: String,
     },
     /// The profile document is not YAML, or is not a profile.
-    #[error("origin_sources entry `{entry}`: the profile document does not parse: {source}")]
+    #[error("origin_sources entry `{entry}`: the profile document does not parse: {reason}")]
     Parse {
         /// The entry name.
         entry: String,
-        /// The parse failure.
-        #[source]
-        source: serde_yaml::Error,
+        /// The parse failure, with every quoted value redacted.
+        reason: String,
     },
     /// The profile document parses as YAML but is not a valid profile.
     ///
@@ -607,16 +699,17 @@ pub enum OriginResolveError {
     /// else arrives here as an unknown key naming itself.
     #[error(
         "origin_sources entry `{entry}`: profile `{profile}` is not a valid origin profile: \
-         {source}"
+         {reason}"
     )]
     ProfileParse {
         /// The entry name.
         entry: String,
         /// The profile name.
         profile: String,
-        /// The parse failure, which names the offending key.
-        #[source]
-        source: serde_yaml::Error,
+        /// The parse failure. Names the offending key, which serde
+        /// quotes with backticks, and never the value, which it quotes
+        /// with `"`.
+        reason: String,
     },
     /// The profile carries a secret inline rather than by reference.
     #[error(
@@ -729,6 +822,14 @@ pub enum OriginResolveError {
         /// The entry's name, or `?` when it has none.
         name: String,
     },
+    /// A project layer added an entry that would shadow a locked one.
+    ///
+    /// Boxed: six names is more than any other variant carries, and
+    /// unboxed it would push every `Result` in this module over
+    /// `clippy::result_large_err`'s threshold, so every refusal would
+    /// pay for this one on the stack.
+    #[error("{0}")]
+    LockedEffectShadowed(Box<LockedEffectShadow>),
     /// A merge-key list is not a list in one of the layers.
     #[error(
         "origin_sources entry `{entry}`: profile `{profile}` sets `{list}` to something that \
@@ -743,21 +844,54 @@ pub enum OriginResolveError {
         list: String,
     },
     /// The composed origin is not a valid origin.
-    #[error("origin_sources entry `{entry}`: composed origin `{host}` is not valid: {source}")]
+    #[error("origin_sources entry `{entry}`: composed origin `{host}` is not valid: {reason}")]
     Compose {
         /// The entry name.
         entry: String,
         /// The map key the composed origin would have taken.
         host: String,
-        /// The deserialization failure.
-        #[source]
-        source: serde_yaml::Error,
+        /// The deserialization failure, with every quoted value redacted.
+        reason: String,
     },
     /// A layer serialized to something that is not a mapping. Not
     /// reachable from any document; present so the resolver has no
     /// `unwrap`.
     #[error("internal: an origin layer is not a mapping")]
     LayerNotAMapping,
+}
+
+/// Why a project addition was refused for shadowing a locked entry.
+///
+/// A struct rather than enum fields so the variant can be boxed; see
+/// [`OriginResolveError::LockedEffectShadowed`].
+#[derive(Debug)]
+pub struct LockedEffectShadow {
+    /// The `origin_sources` entry being composed.
+    pub entry: String,
+    /// The profile that carried the addition.
+    pub profile: String,
+    /// Which of [`PROFILE_LIST_MERGE_KEYS`] the addition is in.
+    pub list: String,
+    /// The locked entry it would shadow.
+    pub locked: String,
+    /// The addition's own `name:`, or `(unnamed)`.
+    pub addition: String,
+    /// The effect the two share: `type=<value>`, or the dotted leaf path
+    /// both write.
+    pub shadowed: String,
+}
+
+impl std::fmt::Display for LockedEffectShadow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "origin_sources entry `{}`: profile `{}` adds `{}` entry `{}`, which shadows the \
+             locked entry `{}` through `{}`. A lock binds what the entry does, not what it is \
+             called, so the addition is refused rather than layered after it. Ask whoever owns \
+             `origin_defaults` to carry it",
+            self.entry, self.profile, self.list, self.addition, self.locked, self.shadowed
+        )
+    }
 }
 
 // --- Resolver inputs and report --------------------------------------
@@ -822,37 +956,144 @@ pub struct OriginResolution {
 
 /// Check `origin_defaults` at config load.
 ///
-/// The one rule the block has of its own: every entry in a
-/// [`PROFILE_LIST_MERGE_KEYS`] list carries a `name:`. A default with no
-/// name is a default no project can address, so it can be neither
-/// overridden nor locked, and the operator who wrote it would find that
-/// out at the first compose rather than here.
+/// See [`validate_origin_body`] for the three rules and why they run
+/// here rather than at the aggregator.
 ///
 /// # Errors
 ///
-/// Returns [`OriginResolveError::UnnamedDefault`] naming the list and
-/// the position, or [`OriginResolveError::DefaultsListShape`] when one
-/// of those keys is not a list at all.
+/// Returns [`OriginResolveError::UnnamedDefault`],
+/// [`OriginResolveError::UnknownOriginKey`],
+/// [`OriginResolveError::UnknownEntryType`],
+/// [`OriginResolveError::MissingEntryType`], or
+/// [`OriginResolveError::DefaultsListShape`], each naming the block and
+/// the offending key or position.
 pub fn validate_origin_defaults(defaults: &Mapping) -> Result<(), OriginResolveError> {
+    validate_origin_body("origin_defaults", defaults, TypeRule::Required)
+}
+
+/// Whether a `policies:` or `transforms:` entry in a runtime-authored
+/// block has to name a `type:`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TypeRule {
+    /// `origin_defaults`, the bottom layer. Nothing beneath it supplies
+    /// a `type:`, so an entry without one dispatches to nothing.
+    Required,
+    /// An entry's `overrides:`, the top layer. A named entry there is
+    /// usually a partial override of a floor entry that already carries
+    /// the type, so demanding one would refuse the block's main use.
+    /// A `type:` that *is* written still has to be a real one.
+    OptionalButKnown,
+}
+
+/// The shared checks for a runtime-authored, origin-shaped block:
+/// `origin_defaults` and each entry's `overrides:`.
+///
+/// Neither block is a `RawOriginConfig`, because the merge runs before
+/// the typed parse and the typed modifier structs reject the `name:` key
+/// the merge is keyed on. That is the right call and it costs the two
+/// blocks their `deny_unknown_fields`, so a misspelled key in either one
+/// used to pass `sbproxy validate` clean and then fail every compose at
+/// the aggregator, which is the far end of a GitOps loop. These three
+/// checks put the refusal back where the operator is.
+///
+/// * Every top-level key is a real origin field, asked through the same
+///   classification the write-boundary ratchet keeps honest, so this can
+///   never be narrower than the origin.
+/// * Every entry in a merged list carries a `name:`, because a default
+///   has to be addressable to be overridable.
+/// * Every `policies[]` and `transforms[]` entry names a `type:` the
+///   dispatcher knows. `request_modifiers[]` and `response_modifiers[]`
+///   have no type discriminator, so they are not checked here.
+///
+/// # What this cannot see
+///
+/// A `type:` is required in `origin_defaults` and optional in an entry's
+/// `overrides:`, because an override is usually a partial edit of a
+/// floor entry that already carries the type. So a named `overrides:`
+/// entry that matches nothing in the floor and carries no `type:` is an
+/// addition that will fail at compose, and only the two documents
+/// together can say that. Neither block is validated against a module's
+/// own field set either: this checks the type string, not the
+/// configuration under it, which is `compile_config`'s job on the
+/// composed origin.
+fn validate_origin_body(
+    block: &str,
+    body: &Mapping,
+    type_rule: TypeRule,
+) -> Result<(), OriginResolveError> {
+    for key in body.keys() {
+        let Some(key) = key.as_str() else {
+            continue;
+        };
+        if !origin_field_exists(key) {
+            return Err(OriginResolveError::UnknownOriginKey {
+                block: block.to_string(),
+                key: key.to_string(),
+            });
+        }
+    }
     for list in PROFILE_LIST_MERGE_KEYS {
-        let Some(value) = defaults.get(*list) else {
+        let Some(value) = body.get(*list) else {
             continue;
         };
         let Some(items) = value.as_sequence() else {
             return Err(OriginResolveError::DefaultsListShape { list });
         };
         for (index, item) in items.iter().enumerate() {
-            let named = item
+            let named = entry_name(item);
+            if named.is_none() {
+                return Err(OriginResolveError::UnnamedDefault {
+                    block: block.to_string(),
+                    list,
+                    index,
+                });
+            }
+            let known: &[&str] = match *list {
+                "policies" => crate::validate::KNOWN_POLICY_TYPES,
+                "transforms" => crate::validate::KNOWN_TRANSFORM_TYPES,
+                _ => continue,
+            };
+            let kind = item
                 .as_mapping()
-                .and_then(|entry| entry.get("name"))
-                .and_then(Value::as_str)
-                .is_some_and(|name| !name.trim().is_empty());
-            if !named {
-                return Err(OriginResolveError::UnnamedDefault { list, index });
+                .and_then(|entry| entry.get("type"))
+                .and_then(Value::as_str);
+            match kind {
+                Some(kind) if known.contains(&kind) => {}
+                Some(kind) => {
+                    return Err(OriginResolveError::UnknownEntryType {
+                        block: block.to_string(),
+                        list,
+                        name: named.unwrap_or("?").to_string(),
+                        kind: kind.to_string(),
+                    })
+                }
+                None if type_rule == TypeRule::Required => {
+                    return Err(OriginResolveError::MissingEntryType {
+                        block: block.to_string(),
+                        list,
+                        name: named.unwrap_or("?").to_string(),
+                    })
+                }
+                None => {}
             }
         }
     }
     Ok(())
+}
+
+/// Whether `key` is a field of `RawOriginConfig`.
+///
+/// Asked through the two halves of the write boundary rather than
+/// through a third list. `every_raw_origin_field_is_classified` asserts
+/// that [`PROFILE_WRITABLE_ORIGIN_FIELDS`] plus
+/// [`PLATFORM_OWNED_ORIGIN_FIELDS`] is exactly the origin's field set,
+/// so this cannot drift narrower than the struct without that test going
+/// red first.
+fn origin_field_exists(key: &str) -> bool {
+    PROFILE_WRITABLE_ORIGIN_FIELDS.contains(&key)
+        || PLATFORM_OWNED_ORIGIN_FIELDS
+            .iter()
+            .any(|(field, _)| *field == key)
 }
 
 /// Check `origin_sources` at config load, with no repository fetched.
@@ -938,6 +1179,17 @@ pub fn validate_origin_sources(sources: &OriginSourcesConfig) -> Result<(), Orig
         // rather than only a schema entry, and so an operator sees the
         // posture of every entry at boot rather than at the first
         // fetch.
+        if let Some(overrides) = entry.overrides.as_ref() {
+            // The same shape as `origin_defaults`, written by the same
+            // people, and open to the same misspelling for the same
+            // reason: it is a `Mapping` because the merge predates the
+            // typed parse.
+            validate_origin_body(
+                &format!("origin_sources entry `{}` overrides", entry.name),
+                overrides,
+                TypeRule::OptionalButKnown,
+            )?;
+        }
         let timeout_secs = entry.timeout_secs;
         tracing::debug!(
             entry = %entry.name,
@@ -950,6 +1202,43 @@ pub fn validate_origin_sources(sources: &OriginSourcesConfig) -> Result<(), Orig
         );
     }
     Ok(())
+}
+
+/// The per-tier entry counts a config load should publish, for **every**
+/// tier, whether or not the block is present.
+///
+/// A pure function rather than two `set` calls inside the `if let` that
+/// reads the block, because the readings an operator is told to alert on
+/// are the ones the block's *absence* produces. A gauge only written on
+/// the present path keeps its last value when the block is deleted, and
+/// keeps the old tier's series when a document is promoted from
+/// `development` to `production`, so the two transitions the metric
+/// exists to show were the two it could not express.
+///
+/// Returns `(tier, pinned, unpinned)` for each tier in
+/// [`EnvironmentTier::ALL`]. Every tier that is not in force reads zero.
+#[must_use]
+pub fn origin_source_entry_counts(
+    sources: Option<&OriginSourcesConfig>,
+) -> [(EnvironmentTier, usize, usize); 2] {
+    let declared = sources.map(|sources| {
+        let pinned = sources
+            .entries
+            .iter()
+            .filter(|entry| entry.revision.as_deref().is_some_and(revision_is_immutable))
+            .count();
+        (
+            sources.tier,
+            pinned,
+            sources.entries.len().saturating_sub(pinned),
+        )
+    });
+    EnvironmentTier::ALL.map(|tier| match declared {
+        Some((declared_tier, pinned, unpinned)) if declared_tier == tier => {
+            (tier, pinned, unpinned)
+        }
+        _ => (tier, 0, 0),
+    })
 }
 
 /// Whether a revision names something git cannot move underneath the
@@ -1088,7 +1377,7 @@ pub fn resolve_origins(
                         OriginResolveError::Compose {
                             entry: entry.name.clone(),
                             host: host.clone(),
-                            source,
+                            reason: redact_serde_message(&source.to_string()),
                         }
                     })?;
                 tracing::info!(
@@ -1128,7 +1417,7 @@ fn parse_profile(
     let declared: DeclaredInputs =
         serde_yaml::from_str(document).map_err(|source| OriginResolveError::Parse {
             entry: entry.name.clone(),
-            source,
+            reason: redact_serde_message(&source.to_string()),
         })?;
     let profile_name = declared.name.clone();
     let declared_names: BTreeSet<&str> = declared
@@ -1179,7 +1468,7 @@ fn parse_profile(
     let resolved_value: Value =
         serde_yaml::from_str(&resolved).map_err(|source| OriginResolveError::Parse {
             entry: entry.name.clone(),
-            source,
+            reason: redact_serde_message(&source.to_string()),
         })?;
     refuse_inline_secrets(&resolved_value, "", &entry.name, &profile_name)?;
     // The typed parse is the allowlist. Everything a project may set is
@@ -1188,9 +1477,70 @@ fn parse_profile(
     serde_yaml::from_value(resolved_value).map_err(|source| OriginResolveError::ProfileParse {
         entry: entry.name.clone(),
         profile: profile_name,
-        source,
+        reason: redact_serde_message(&source.to_string()),
     })
 }
+
+/// A serde failure message with every value it quoted taken out, bounded.
+///
+/// Serde spells an identifier with backticks (``unknown field `force_ssl`
+/// ``, ``missing field `url` ``) and a *value* with double quotes
+/// (`invalid type: string "sk-live-...", expected f32`). That split is
+/// what makes this a one-rule scrub rather than a parser: every
+/// double-quoted run becomes `"[redacted]"`, and everything else,
+/// including the field name the write-boundary refusal has to name,
+/// survives.
+///
+/// # What this cannot see
+///
+/// A value serde renders **without** quoting it. `invalid value: integer
+/// 7, expected ...` keeps the `7`, and an unquoted enum variant keeps its
+/// text. Both are bounded, non-string shapes that a secret cannot be, so
+/// the residue is a number or an identifier rather than a credential. The
+/// length cap is the backstop for anything this reasoning misses: a
+/// message longer than [`MAX_SERDE_MESSAGE_BYTES`] is cut on a character
+/// boundary and marked, so a pathological rendering cannot put a document
+/// in a log line.
+fn redact_serde_message(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut in_quotes = false;
+    for character in message.chars() {
+        if character == '"' {
+            if in_quotes {
+                out.push_str("[redacted]\"");
+            } else {
+                out.push('"');
+            }
+            in_quotes = !in_quotes;
+            continue;
+        }
+        if !in_quotes {
+            out.push(character);
+        }
+    }
+    if in_quotes {
+        // An unterminated quote means the rest of the message was inside
+        // it, so nothing more is emitted and the run is closed here.
+        out.push_str("[redacted]\"");
+    }
+    if out.len() > MAX_SERDE_MESSAGE_BYTES {
+        let cut = (0..=MAX_SERDE_MESSAGE_BYTES)
+            .rev()
+            .find(|index| out.is_char_boundary(*index))
+            .unwrap_or(0);
+        out.truncate(cut);
+        out.push_str(" (truncated)");
+    }
+    out
+}
+
+/// Cap on a redacted serde message, in bytes.
+///
+/// Long enough for the longest real one, which is the write boundary's
+/// ``unknown field `x`, expected one of `action`, `authentication`, ...``
+/// listing all nineteen allowed fields. Short enough that no rendering
+/// puts a document into a log line.
+const MAX_SERDE_MESSAGE_BYTES: usize = 512;
 
 /// Walk a resolved profile and refuse a secret written out in full.
 fn refuse_inline_secrets(
@@ -1369,6 +1719,9 @@ fn merge_plain(base: &mut Mapping, over: &Mapping) {
 ///   `over` order.
 /// * A locked existing entry that a project layer touches is a refusal
 ///   naming the entry, the profile and the source entry.
+/// * A project addition that would shadow a locked entry's effect is the
+///   same refusal, because a lock that bound only the name would be one
+///   rename away from useless. See [`effect_keys`].
 /// * `disabled: true` from `over` drops the entry and records the drop.
 /// * An unnamed `over` entry is always an addition.
 fn merge_named_list(
@@ -1445,6 +1798,25 @@ fn merge_named_list(
                     });
                     continue;
                 }
+                // A lock has to bind the entry's effect, not its name.
+                // Refusing only a same-name override left the project one
+                // rename away from the thing the lock existed to stop:
+                // append an entry of the same shape, land after the floor,
+                // and win whatever is last-write-wins.
+                if context.author == LayerAuthor::Project {
+                    if let Some((locked, shadowed)) = shadowed_lock(result.iter().flatten(), item) {
+                        return Err(OriginResolveError::LockedEffectShadowed(Box::new(
+                            LockedEffectShadow {
+                                entry: context.entry.name.clone(),
+                                profile: context.profile.to_string(),
+                                list: list.to_string(),
+                                locked,
+                                addition: incoming_name.unwrap_or("(unnamed)").to_string(),
+                                shadowed,
+                            },
+                        )));
+                    }
+                }
                 appended.push(item.clone());
             }
         }
@@ -1470,6 +1842,99 @@ fn flag(value: &Value, key: &str) -> bool {
         .and_then(|map| map.get(key))
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+/// The first locked entry in `existing` whose effect `addition` would
+/// shadow, with the effect they share.
+///
+/// Returns `(locked entry name, shared effect key)`.
+fn shadowed_lock<'a, I>(existing: I, addition: &Value) -> Option<(String, String)>
+where
+    I: IntoIterator<Item = &'a Value>,
+{
+    let incoming = effect_keys(addition);
+    if incoming.is_empty() {
+        return None;
+    }
+    for candidate in existing {
+        if !flag(candidate, "locked") {
+            continue;
+        }
+        let locked = effect_keys(candidate);
+        if let Some(shared) = incoming.intersection(&locked).next() {
+            return Some((
+                entry_name(candidate).unwrap_or("(unnamed)").to_string(),
+                shared.clone(),
+            ));
+        }
+    }
+    None
+}
+
+/// What an entry in one of the four merged lists actually does, reduced
+/// to a comparable set.
+///
+/// Two shapes, because the four lists have two shapes.
+///
+/// A `policies:` or `transforms:` entry is discriminated by `type:`, and
+/// two entries of the same type are two configurations of one mechanism.
+/// For a last-write-wins mechanism the later one wins outright; for an
+/// additive one (a second WAF runs as well as the first) it does not.
+/// This does not try to tell those apart, and refuses on the type alone.
+/// That is deliberately wider than the hazard: a project that needs a
+/// second policy of a locked type asks the platform to carry it, which
+/// is what a lock is for, and the alternative is a per-module table of
+/// which mechanisms compose, which nothing else in the tree maintains
+/// and which would be wrong the first time a module changed.
+///
+/// A `request_modifiers:` or `response_modifiers:` entry has no `type:`.
+/// What it does is the set of leaf paths it writes, so
+/// `headers.set.content-security-policy` is the effect, and a second
+/// entry writing the same path shadows the first whatever it is called.
+/// Paths are lowercased because a header name is case-insensitive and a
+/// comparison that was not would be a boundary its own header could walk
+/// through.
+fn effect_keys(entry: &Value) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    let Some(map) = entry.as_mapping() else {
+        return keys;
+    };
+    if let Some(kind) = map.get("type").and_then(Value::as_str) {
+        keys.insert(format!("type={}", kind.trim().to_ascii_lowercase()));
+        return keys;
+    }
+    collect_leaf_paths(entry, "", &mut keys);
+    keys
+}
+
+/// Every dotted leaf path in `value`, lowercased, skipping bookkeeping.
+fn collect_leaf_paths(value: &Value, path: &str, out: &mut BTreeSet<String>) {
+    match value {
+        Value::Mapping(map) => {
+            for (key, child) in map {
+                let name = key.as_str().unwrap_or("?");
+                if path.is_empty() && BOOKKEEPING_KEYS.contains(&name) {
+                    continue;
+                }
+                let child_path = if path.is_empty() {
+                    name.to_ascii_lowercase()
+                } else {
+                    format!("{path}.{}", name.to_ascii_lowercase())
+                };
+                collect_leaf_paths(child, &child_path, out);
+            }
+        }
+        // A sequence is a leaf for this purpose. Two entries writing the
+        // same list-valued key overwrite each other whatever is in the
+        // list, and comparing element by element would let a one-element
+        // difference slip a shadow past.
+        Value::Sequence(_) | Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
+            if !path.is_empty() {
+                out.insert(path.to_string());
+            }
+        }
+        Value::Tagged(_) => {}
+    }
 }
 
 /// Remove `name`, `locked` and `disabled` from the four merged lists.
@@ -1569,6 +2034,20 @@ mod tests {
                  `RawOriginConfig`; a composed origin carrying it would fail to deserialize"
             );
         }
+
+        // `validate_origin_body` needs the writable set as data rather
+        // than as a type, so it is spelled twice. This is what stops the
+        // two spellings drifting: a field added to `OriginProfileSpec`
+        // and not to the const would make `origin_defaults` refuse a key
+        // a project may set.
+        let spelled: BTreeSet<String> = PROFILE_WRITABLE_ORIGIN_FIELDS
+            .iter()
+            .map(|field| (*field).to_string())
+            .collect();
+        assert_eq!(
+            spelled, profile_fields,
+            "`PROFILE_WRITABLE_ORIGIN_FIELDS` must be exactly `OriginProfileSpec`'s fields"
+        );
         for (field, reason) in PLATFORM_OWNED_ORIGIN_FIELDS {
             assert!(
                 origin_fields.contains(*field),

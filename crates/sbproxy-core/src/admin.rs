@@ -3193,19 +3193,61 @@ fn config_write_redirect(layers: &crate::config_effective::ConfigLayers) -> Stri
     }
 }
 
-/// `GET /admin/config/effective`: the configuration this node is actually
-/// running, plus which layer owns each leaf of it.
+/// Read this node's own config file and assemble the document it is
+/// actually running, or the response that says why not.
 ///
-/// On a node that owns its own configuration this is the local file merged
-/// with nothing, and every leaf reports `local`. The endpoint is still
-/// worth calling there, because the answer "every key is yours" is what
-/// tells an editor it may offer a write at all.
-///
-/// The `yaml` field passes through
-/// [`sbproxy_observe::redact::redact_secrets`] like `GET /admin/config`
-/// does: the merged document carries any plaintext credential the local
-/// file or an authority layer inlined, so the sibling endpoint must not
-/// return what the primary one redacts.
+/// Shared by `GET /admin/config/effective` and
+/// `GET /admin/origin-composition`, which need the same three steps and
+/// the same three failures. They were written out twice, which meant two
+/// copies of the hand-rolled JSON error bodies and two places for the
+/// "config path not wired" contract to drift.
+fn effective_document(state: &AdminState) -> Result<EffectiveDocument, AdminResponse> {
+    let Some(path) = state.config_path.as_ref() else {
+        return Err((
+            503,
+            "application/json",
+            r#"{"error":"config path not wired"}"#.to_string(),
+        ));
+    };
+    let local = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) => {
+            let message = sanitise_path_in_error(&error.to_string(), path);
+            return Err((
+                500,
+                "application/json",
+                serde_json::json!({"error": format!("read config: {message}")}).to_string(),
+            ));
+        }
+    };
+    let layers = crate::config_effective::current_layers(&local);
+    match crate::config_effective::effective_config(&layers) {
+        Ok(effective) => Ok(EffectiveDocument { layers, effective }),
+        Err(error) => {
+            // A merge that fails here failed for the running node too, so
+            // the node is serving whatever it last applied. Say so rather
+            // than reporting a document that was never assembled.
+            tracing::warn!(%error, "admin: effective config merge failed");
+            Err((
+                500,
+                "application/json",
+                serde_json::json!({
+                    "error": format!("could not assemble the effective config: {error}"),
+                    "code": "effective_config_unavailable",
+                    "layers": config_layers_json(&layers),
+                })
+                .to_string(),
+            ))
+        }
+    }
+}
+
+/// The layers in play and the document they merged to.
+struct EffectiveDocument {
+    layers: crate::config_effective::ConfigLayers,
+    effective: crate::config_effective::EffectiveConfig,
+}
+
 /// `GET /admin/origin-composition`: which project repositories this
 /// node's configuration pulls, what hosts each one claims, and the
 /// platform floor every composed origin starts from (WOR-2436).
@@ -3394,47 +3436,23 @@ fn origin_defaults_json(config: &sbproxy_config::ConfigFile) -> serde_json::Valu
     })
 }
 
+/// `GET /admin/config/effective`: the configuration this node is actually
+/// running, plus which layer owns each leaf of it.
+///
+/// On a node that owns its own configuration this is the local file merged
+/// with nothing, and every leaf reports `local`. The endpoint is still
+/// worth calling there, because the answer "every key is yours" is what
+/// tells an editor it may offer a write at all.
+///
+/// The `yaml` field passes through
+/// [`sbproxy_observe::redact::redact_secrets`] like `GET /admin/config`
+/// does: the merged document carries any plaintext credential the local
+/// file or an authority layer inlined, so the sibling endpoint must not
+/// return what the primary one redacts.
 fn handle_config_effective(state: &AdminState) -> (u16, &'static str, String) {
-    let path = match state.config_path.as_ref() {
-        Some(p) => p,
-        None => {
-            return (
-                503,
-                "application/json",
-                r#"{"error":"config path not wired"}"#.to_string(),
-            );
-        }
-    };
-    let local = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => {
-            let msg = sanitise_path_in_error(&e.to_string(), path);
-            return (
-                500,
-                "application/json",
-                format!(r#"{{"error":"read config: {}"}}"#, msg.replace('"', "'")),
-            );
-        }
-    };
-    let layers = crate::config_effective::current_layers(&local);
-    let effective = match crate::config_effective::effective_config(&layers) {
-        Ok(effective) => effective,
-        Err(error) => {
-            // A merge that fails here failed for the running node too, so
-            // the node is serving whatever it last applied. Say so rather
-            // than reporting a document that was never assembled.
-            tracing::warn!(%error, "admin effective config: merge failed");
-            return (
-                500,
-                "application/json",
-                serde_json::json!({
-                    "error": format!("could not assemble the effective config: {error}"),
-                    "code": "effective_config_unavailable",
-                    "layers": config_layers_json(&layers),
-                })
-                .to_string(),
-            );
-        }
+    let EffectiveDocument { layers, effective } = match effective_document(state) {
+        Ok(document) => document,
+        Err(response) => return response,
     };
     let locally_owned = effective
         .provenance
@@ -11544,6 +11562,20 @@ origin_sources:
         let body = origin_composition_json(&config);
         assert_eq!(body["declared"], false);
         assert_eq!(body["origin_defaults"]["present"], false);
+    }
+
+    /// The route's authentication is the gate every route past a certain
+    /// point in the dispatcher sits behind, which is a property of where
+    /// 400 lines of `if` put it rather than of anything the route itself
+    /// says. Assert it, the way its neighbours do: the surface reports
+    /// which project repositories a fleet pulls and what hosts they
+    /// claim, and an unauthenticated read of that is reconnaissance.
+    #[test]
+    fn origin_composition_requires_auth() {
+        let state = make_state();
+        let (status, _, _) =
+            handle_admin_request("GET", "/admin/origin-composition", &state, None, None);
+        assert_eq!(status, 401);
     }
 
     #[test]

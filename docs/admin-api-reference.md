@@ -2423,7 +2423,7 @@ returns is the declaration and its posture.
       "timeout_secs": 30,
       "credential": "reference",
       "hosts": {"api": ["checkout.example.com"], "webhooks": ["hooks.example.com"]},
-      "inputs": ["region", "upstream_key"],
+      "inputs": ["shop_origin", "upstream_host"],
       "has_overrides": true
     }
   ],

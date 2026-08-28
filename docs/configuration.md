@@ -7802,11 +7802,15 @@ origin_defaults:
   policies:
     - name: platform_waf
       type: waf
-      mode: block
+      owasp_crs:
+        enabled: true
+        managed_bundle: true
+      action_on_match: block
       locked: true
     - name: rate_limit
-      type: rate_limit
+      type: rate_limiting
       requests_per_minute: 600
+      burst: 100
   request_modifiers:
     - name: platform_headers
       headers:
@@ -7814,7 +7818,11 @@ origin_defaults:
           X-Served-By: sbproxy
 ```
 
-Every entry under `policies`, `transforms`, `request_modifiers` and `response_modifiers` must carry a `name:`. A default has to be addressable to be overridable, and an unnamed one fails at config load rather than at the first composition. `locked: true` on an entry refuses a project override outright.
+Every entry under `policies`, `transforms`, `request_modifiers` and `response_modifiers` must carry a `name:`. A default has to be addressable to be overridable, and an unnamed one fails at config load rather than at the first composition.
+
+`locked: true` on an entry refuses a project override, and also refuses a project addition that would shadow that entry's effect. A lock binds what an entry does, not what it is called; see [List merge by name](#list-merge-by-name).
+
+Three things about this block are checked at config load rather than at the aggregator, because neither this block nor an entry's `overrides:` carries `deny_unknown_fields` (the merge runs before the typed parse, and the typed modifier structs reject the `name:` key the merge is keyed on). Every top-level key must be a real origin field, every list entry must carry a `name:`, and every `policies:` and `transforms:` entry must name a `type:` some module answers to. A misspelling in any of the three used to pass `sbproxy validate` clean and then fail every compose at the far end of a GitOps loop.
 
 This block is authority-writable. The platform raising a security floor across the fleet is exactly what that channel exists for.
 
@@ -7872,33 +7880,34 @@ The git fields are the `source:` block's field set rather than a narrower struct
 name: checkout
 
 inputs:
-  - name: upstream_key
-    description: credential the proxy presents to the checkout upstream
-  - name: region
-    description: which regional upstream to send to
-    default: us-east-1
+  - name: upstream_host
+    description: the regional upstream this deployment sends to
+  - name: shop_origin
+    description: browser origin allowed to call this service
+    default: https://shop.example.com
 
 spec:
   api:
     base:
       action:
         type: proxy
-        upstream: "https://checkout-{{vars.region}}.internal.example.com"
-      authentication:
-        type: api_key
-        api_key: "{{vars.upstream_key}}"
+        url: "https://{{vars.upstream_host}}"
+        preserve_query: true
       policies:
         - name: rate_limit
           requests_per_minute: 1200
+      cors:
+        allowed_origins:
+          - "{{vars.shop_origin}}"
     environments:
       prod:
         action:
-          timeout_ms: 1500
+          host_override: checkout.internal.example.com
   webhooks:
     base:
       action:
         type: proxy
-        upstream: https://checkout-hooks.internal.example.com
+        url: https://checkout-hooks.internal.example.com
 ```
 
 `spec` is a map of profile origin name to that origin's layers, so one profile can declare an API host and a webhook host at once. The entry's `hosts:` binds each name to real hostnames.
@@ -7926,6 +7935,7 @@ Later layers win, and the runtime bookends the stack:
 | name in both | field-level merge; the project wins per field |
 | name only in the project | appended after the floor, in project order |
 | name in the floor with `locked: true`, project touches it | refused, naming the policy, the profile and the entry |
+| project adds an entry that would shadow a locked one | refused, naming the lock, the addition and the effect they share |
 | project sets `disabled: true` on an unlocked floor entry | dropped, and the drop is recorded |
 | unnamed entry in `origin_defaults` | refused at config load |
 | unnamed entry in a project profile | always an addition, appended |
@@ -7935,6 +7945,10 @@ There is no delete verb. `disabled: true` leaves a record; an absence does not. 
 `name`, `locked` and `disabled` are stripped before the composed origin is emitted, because the modules those lists feed reject unknown keys.
 
 `locked:` protects the floor from the project, not from the platform that wrote it. The entry's `overrides:` block passes straight through a lock. A project that sets `locked:` itself is refused: locking is the runtime config's verb.
+
+A lock binds what an entry does, not what it is called. Refusing only a same-name override would leave the project one rename away from the thing the lock exists to stop: every project addition lands after the floor, and for anything last-write-wins the later entry simply wins. So a project addition is refused when it shares an effect with a locked entry, where "effect" is the `type:` for a `policies:` or `transforms:` entry and the set of leaf paths written for a modifier. A floor that locks `response_modifiers[].headers.set.Content-Security-Policy` therefore refuses a project entry writing that header under any name and in any case.
+
+That is deliberately wider than the hazard: two policies of the same type do not always shadow each other, and a project that needs a second one of a locked type asks whoever owns `origin_defaults` to carry it. The alternative is a per-module table of which mechanisms compose, which nothing else in the tree maintains and which would be wrong the first time a module changed.
 
 ### What a project may set
 
@@ -7950,9 +7964,25 @@ A deny list written today would already have missed `filters[].failure_posture` 
 
 A profile is a confined document; see [Confined fragments](#confined-fragments). It cannot reach the composing host at all. `${VAR}` and `{{env.X}}` are refused, and so are `env:NAME`, `file:/path` and `vault://env/NAME`, along with every config key that names a host path the proxy opens.
 
-The one secret spelling that survives is a provider URI such as `secret://prod/checkout-upstream-key`, which resolves only against a backend declared under `proxy.secrets`, a block no project can write.
+The one secret spelling that survives is a provider URI such as `secret://prod/checkout-key`, which resolves only against a backend declared under `proxy.secrets`, a block no project can write.
 
 A profile carrying a secret written out in full is refused, and the refusal names the field and the profile but never the value. The check runs after inputs are substituted, so an entry that binds a raw token is refused exactly as a profile that wrote one would be.
+
+In practice the simplest answer is to keep credentials out of the profile entirely and put them in the entry's `overrides:` block. That block is ordinary runtime YAML, so `${VAR}` resolves there and every secret reference form works, and it is layered last, so nothing the project wrote can reach around it:
+
+```yaml
+origin_sources:
+  entries:
+    - name: checkout
+      overrides:
+        authentication:
+          type: api_key
+          header_name: X-Api-Key
+          api_keys:
+            - "${CHECKOUT_INBOUND_KEY}"
+```
+
+Note the direction of travel. An origin's `authentication:` block validates the callers of this service; it is not the credential the proxy presents to the upstream. The outbound credential is `credentials:` or `outbound_credential:`, both platform-owned and both unrepresentable in a profile.
 
 ### Pinning and the environment tier
 
@@ -7987,7 +8017,7 @@ curl -su admin:"$ADMIN_PASSWORD" http://127.0.0.1:9090/admin/origin-composition
       "verify_signature": true,
       "credential": "reference",
       "hosts": { "api": ["checkout.example.com"] },
-      "inputs": ["region", "upstream_key"]
+      "inputs": ["shop_origin", "upstream_host"]
     }
   ],
   "claimed_hosts": [

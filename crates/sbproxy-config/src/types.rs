@@ -1113,6 +1113,10 @@ pub enum EnvironmentTier {
 }
 
 impl EnvironmentTier {
+    /// Every tier, so a per-tier metric series can be written for all of
+    /// them on every load rather than only for the one in force.
+    pub const ALL: [Self; 2] = [Self::Development, Self::Production];
+
     /// The tier as the metric label and admin field an operator reads.
     #[must_use]
     pub fn as_str(self) -> &'static str {

@@ -58,11 +58,14 @@ Later layers win, and the runtime bookends the stack, so a project can be given 
 | name in both | field-level merge; the project wins per field |
 | name only in the project | appended after the floor, in project order |
 | name in the floor with `locked: true`, project touches it | refused, naming the policy, the profile and the entry |
+| project adds an entry that would shadow a locked one | refused, naming the lock, the addition and the effect they share |
 | project sets `disabled: true` on an unlocked floor entry | dropped, and the drop is recorded |
 | unnamed entry in `origin_defaults` | refused at config load: a default has to be addressable to be overridable |
 | unnamed entry in a project profile | always an addition, appended |
 
 There is no delete verb, matching the rest of the merge contract. `disabled: true` leaves a record; an absence does not. `policies: []` in a project profile therefore leaves the floor intact, which is the scenario the whole floor concept exists to prevent.
+
+A lock binds what an entry does, not what it is called. Refusing only a same-name override would leave the project one rename away from the thing the lock exists to stop, because every project addition lands after the floor and for anything last-write-wins the later entry simply wins. So a project addition is refused when it shares an effect with a locked entry: the `type:` for a policy or transform, and the set of leaf paths written for a modifier.
 
 `name`, `locked` and `disabled` are stripped before the composed origin is emitted, because the modules those lists feed reject unknown keys.
 
@@ -79,32 +82,42 @@ A deny list written today would already have missed `filters[].failure_posture` 
 A project declares that it needs one; the entry supplies the reference:
 
 ```yaml
-# origin.yaml, in the project repository
+# origin.yaml, in the project repository. The service declares what it
+# needs and never a credential.
 inputs:
-  - name: upstream_key
-    description: credential the proxy presents to the checkout upstream
+  - name: upstream_host
+    description: the regional upstream this deployment sends to
 spec:
   api:
     base:
-      authentication:
-        type: api_key
-        api_key: "{{vars.upstream_key}}"
+      action:
+        type: proxy
+        url: "https://{{vars.upstream_host}}"
 ```
 
 ```yaml
-# sb.yml, in the runtime config repository
+# sb.yml, in the runtime config repository. The credential lives here,
+# in the layer that is applied last and that the project cannot reach.
 origin_sources:
   entries:
     - name: checkout
       inputs:
-        upstream_key: secret://prod/checkout-upstream-key
+        upstream_host: checkout-us-east-1.internal.example.com
+      overrides:
+        authentication:
+          type: api_key
+          header_name: X-Api-Key
+          api_keys:
+            - "${CHECKOUT_INBOUND_KEY}"
 ```
 
-A profile is a confined document, so it cannot reach the composing host at all. `${VAR}` and `{{env.X}}` are refused, and so are `env:NAME`, `file:/path` and `vault://env/NAME`, along with every config key that names a host path the proxy opens. The one secret spelling that survives is a provider URI such as `secret://prod/checkout-upstream-key`, which resolves against a backend declared under `proxy.secrets`, a block no project can write.
+A profile is a confined document, so it cannot reach the composing host at all. `${VAR}` and `{{env.X}}` are refused, and so are `env:NAME`, `file:/path` and `vault://env/NAME`, along with every config key that names a host path the proxy opens. The one secret spelling that survives inside a profile is a provider URI such as `secret://prod/checkout-key`, which resolves against a backend declared under `proxy.secrets`, a block no project can write. Everything else belongs in `overrides:`, which is ordinary runtime YAML.
 
-The check runs after the input is substituted, so an entry that binds a raw token is refused exactly as a profile that wrote one would be. Neither refusal echoes the value.
+A profile carrying a secret written out in full is refused, and so is an entry that binds a raw token into a declared input, because the check runs after the input is substituted. Neither refusal echoes the value.
 
-An input binds as text. A typed knob belongs in the entry's `overrides:` block, which is runtime YAML and is never substituted.
+An input binds as text. A typed knob belongs in the entry's `overrides:` block too.
+
+Note the direction of travel. An origin's `authentication:` block validates the callers of this service; it is not the credential the proxy presents to the upstream. The outbound credential is `credentials:` or `outbound_credential:`, both platform-owned and both unrepresentable in a profile.
 
 ## Pinning
 
@@ -146,7 +159,7 @@ curl -su admin:"$ADMIN_PASSWORD" http://127.0.0.1:9090/admin/origin-composition
       "verify_signature": true,
       "credential": "reference",
       "hosts": { "api": ["checkout.example.com"], "webhooks": ["hooks.example.com"] },
-      "inputs": ["region", "upstream_key"]
+      "inputs": ["shop_origin", "upstream_host"]
     }
   ],
   "claimed_hosts": [
@@ -169,7 +182,7 @@ The metric `sbproxy_origin_source_entries{tier,pinned}` carries the same two fac
 ## Try it
 
 ```bash
-sbproxy validate -c examples/origin-profiles/sb.yml
+sbproxy validate examples/origin-profiles/sb.yml
 ```
 
 The validation is offline and answers from the document alone: entry names are unique, credentials are references rather than literals, every entry is pinned for the declared tier, every `origin_defaults` list entry is addressable, and no two entries claim the same hostname. Change `revision: refs/tags/v1.4.2` to `revision: main` and it refuses, naming the entry.

@@ -90,10 +90,11 @@ pub use listing::{
 };
 pub use model_host::*;
 pub use origin_profile::{
-    claimed_hosts, resolve_origins, revision_is_immutable, validate_origin_defaults,
-    validate_origin_sources, DroppedDefault, HostClaim, OriginProfile, OriginProfileInput,
-    OriginProfileOrigin, OriginProfileSpec, OriginResolution, OriginResolveError, ProfileBinding,
-    PLATFORM_OWNED_ORIGIN_FIELDS, PROFILE_LIST_MERGE_KEYS,
+    claimed_hosts, origin_source_entry_counts, resolve_origins, revision_is_immutable,
+    validate_origin_defaults, validate_origin_sources, DroppedDefault, HostClaim,
+    LockedEffectShadow, OriginProfile, OriginProfileInput, OriginProfileOrigin, OriginProfileSpec,
+    OriginResolution, OriginResolveError, ProfileBinding, PLATFORM_OWNED_ORIGIN_FIELDS,
+    PROFILE_LIST_MERGE_KEYS, PROFILE_WRITABLE_ORIGIN_FIELDS,
 };
 pub use payments::{
     iso_4217_decimals, settlement_amount, AdvertisedRailName, AmountConversionError, BreakerConfig,

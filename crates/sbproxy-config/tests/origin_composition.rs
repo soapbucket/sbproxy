@@ -51,7 +51,7 @@ spec:
     base:
       action:
         type: proxy
-        upstream: https://checkout.internal
+        url: https://checkout.internal
 "#;
 
 /// A platform floor with one WAF policy and one modifier, both named.
@@ -59,9 +59,11 @@ const FLOOR: &str = r#"
 policies:
   - name: waf
     type: waf
-    mode: block
+    owasp_crs:
+      enabled: true
+    action_on_match: block
   - name: rate_limit
-    type: rate_limit
+    type: rate_limiting
     requests_per_minute: 100
 request_modifiers:
   - name: platform_headers
@@ -160,13 +162,13 @@ fn a_hostless_profile_plus_an_entry_produces_an_origin() {
     let resolution = compose(CHECKOUT_PROFILE, CHECKOUT_ENTRY, Some(FLOOR));
     let origin = as_yaml(&resolution, "checkout.acme.test");
     assert_eq!(
-        origin.get("action").and_then(|a| a.get("upstream")),
+        origin.get("action").and_then(|a| a.get("url")),
         Some(&serde_yaml::Value::String(
             "https://checkout.internal".to_string()
         ))
     );
     // The floor came through untouched.
-    assert_eq!(names(&origin, "policies"), vec!["waf", "rate_limit"]);
+    assert_eq!(names(&origin, "policies"), vec!["waf", "rate_limiting"]);
 }
 
 /// One profile, two named origins, each against its own host list.
@@ -179,12 +181,12 @@ spec:
     base:
       action:
         type: proxy
-        upstream: https://checkout.internal
+        url: https://checkout.internal
   webhooks:
     base:
       action:
         type: proxy
-        upstream: https://hooks.internal
+        url: https://hooks.internal
 "#;
     let entry_yaml = r#"
 name: checkout
@@ -207,7 +209,7 @@ hosts:
     for host in ["checkout.acme.test", "pay.acme.test"] {
         let origin = as_yaml(&resolution, host);
         assert_eq!(
-            origin.get("action").and_then(|a| a.get("upstream")),
+            origin.get("action").and_then(|a| a.get("url")),
             Some(&serde_yaml::Value::String(
                 "https://checkout.internal".to_string()
             )),
@@ -216,7 +218,7 @@ hosts:
     }
     let hooks = as_yaml(&resolution, "hooks.acme.test");
     assert_eq!(
-        hooks.get("action").and_then(|a| a.get("upstream")),
+        hooks.get("action").and_then(|a| a.get("url")),
         Some(&serde_yaml::Value::String(
             "https://hooks.internal".to_string()
         ))
@@ -233,10 +235,10 @@ name: checkout
 spec:
   api:
     base:
-      action: {type: proxy, upstream: https://checkout.internal}
+      action: {type: proxy, url: https://checkout.internal}
   webhooks:
     base:
-      action: {type: proxy, upstream: https://hooks.internal}
+      action: {type: proxy, url: https://hooks.internal}
 "#;
     let resolution = compose(profile, CHECKOUT_ENTRY, None);
     assert_eq!(resolution.origins.len(), 1);
@@ -274,7 +276,9 @@ fn a_default_the_project_never_mentions_survives_unchanged() {
     let policies = list(&origin, "policies");
     assert_eq!(policies.len(), 2);
     assert_eq!(
-        policies[0].get("mode").and_then(serde_yaml::Value::as_str),
+        policies[0]
+            .get("action_on_match")
+            .and_then(serde_yaml::Value::as_str),
         Some("block")
     );
 }
@@ -287,7 +291,7 @@ name: checkout
 spec:
   api:
     base:
-      action: {type: proxy, upstream: https://checkout.internal}
+      action: {type: proxy, url: https://checkout.internal}
       policies:
         - name: rate_limit
           requests_per_minute: 5000
@@ -304,7 +308,7 @@ spec:
     );
     assert_eq!(
         rate_limit.get("type").and_then(serde_yaml::Value::as_str),
-        Some("rate_limit"),
+        Some("rate_limiting"),
         "the field the project did not mention survived"
     );
 }
@@ -318,18 +322,23 @@ name: checkout
 spec:
   api:
     base:
-      action: {type: proxy, upstream: https://checkout.internal}
+      action: {type: proxy, url: https://checkout.internal}
       policies:
         - name: idempotency_guard
-          type: request_validation
+          type: request_validator
         - name: quota
-          type: quota
+          type: concurrent_limit
 "#;
     let resolution = compose(profile, CHECKOUT_ENTRY, Some(FLOOR));
     let origin = as_yaml(&resolution, "checkout.acme.test");
     assert_eq!(
         names(&origin, "policies"),
-        vec!["waf", "rate_limit", "request_validation", "quota"]
+        vec![
+            "waf",
+            "rate_limiting",
+            "request_validator",
+            "concurrent_limit"
+        ]
     );
 }
 
@@ -341,7 +350,9 @@ fn touching_a_locked_default_names_the_policy_the_profile_and_the_entry() {
 policies:
   - name: waf
     type: waf
-    mode: block
+    owasp_crs:
+      enabled: true
+    action_on_match: block
     locked: true
 "#;
     let profile = r#"
@@ -349,10 +360,10 @@ name: checkout
 spec:
   api:
     base:
-      action: {type: proxy, upstream: https://checkout.internal}
+      action: {type: proxy, url: https://checkout.internal}
       policies:
         - name: waf
-          mode: monitor
+          action_on_match: log
 "#;
     let error = compose_err(profile, CHECKOUT_ENTRY, Some(floor));
     let text = error.to_string();
@@ -374,7 +385,9 @@ fn the_entry_override_layer_passes_through_a_lock() {
 policies:
   - name: waf
     type: waf
-    mode: block
+    owasp_crs:
+      enabled: true
+    action_on_match: block
     locked: true
 "#;
     let entry_yaml = r#"
@@ -386,15 +399,15 @@ hosts:
 overrides:
   policies:
     - name: waf
-      mode: monitor
+      action_on_match: log
 "#;
     let resolution = compose(CHECKOUT_PROFILE, entry_yaml, Some(floor));
     let origin = as_yaml(&resolution, "checkout.acme.test");
     assert_eq!(
         list(&origin, "policies")[0]
-            .get("mode")
+            .get("action_on_match")
             .and_then(serde_yaml::Value::as_str),
-        Some("monitor")
+        Some("log")
     );
 }
 
@@ -407,7 +420,7 @@ name: checkout
 spec:
   api:
     base:
-      action: {type: proxy, upstream: https://checkout.internal}
+      action: {type: proxy, url: https://checkout.internal}
       policies:
         - name: rate_limit
           disabled: true
@@ -430,6 +443,8 @@ fn a_locked_default_cannot_be_disabled() {
 policies:
   - name: waf
     type: waf
+    owasp_crs:
+      enabled: true
     locked: true
 "#;
     let profile = r#"
@@ -437,7 +452,7 @@ name: checkout
 spec:
   api:
     base:
-      action: {type: proxy, upstream: https://checkout.internal}
+      action: {type: proxy, url: https://checkout.internal}
       policies:
         - name: waf
           disabled: true
@@ -457,7 +472,7 @@ fn an_unnamed_origin_defaults_entry_is_refused() {
 policies:
   - name: waf
     type: waf
-  - type: rate_limit
+  - type: rate_limiting
 "#,
     );
     let error = validate_origin_defaults(&floor).expect_err("an unnamed default must be refused");
@@ -465,7 +480,8 @@ policies:
         error,
         OriginResolveError::UnnamedDefault {
             list: "policies",
-            index: 1
+            index: 1,
+            ..
         }
     ));
     assert!(
@@ -482,7 +498,7 @@ name: checkout
 spec:
   api:
     base:
-      action: {type: proxy, upstream: https://checkout.internal}
+      action: {type: proxy, url: https://checkout.internal}
       request_modifiers:
         - headers:
             set:
@@ -502,14 +518,14 @@ name: checkout
 spec:
   api:
     base:
-      action: {type: proxy, upstream: https://checkout.internal}
+      action: {type: proxy, url: https://checkout.internal}
       policies: []
 "#;
     let resolution = compose(profile, CHECKOUT_ENTRY, Some(FLOOR));
     let origin = as_yaml(&resolution, "checkout.acme.test");
     assert_eq!(
         names(&origin, "policies"),
-        vec!["waf", "rate_limit"],
+        vec!["waf", "rate_limiting"],
         "an empty list is not a delete verb"
     );
 }
@@ -523,6 +539,8 @@ fn name_locked_and_disabled_are_stripped_before_emit() {
 policies:
   - name: waf
     type: waf
+    owasp_crs:
+      enabled: true
     locked: true
 request_modifiers:
   - name: platform_headers
@@ -535,7 +553,7 @@ name: checkout
 spec:
   api:
     base:
-      action: {type: proxy, upstream: https://checkout.internal}
+      action: {type: proxy, url: https://checkout.internal}
       request_modifiers:
         - name: platform_headers
           headers:
@@ -580,7 +598,7 @@ name: checkout
 spec:
   api:
     base:
-      action: {type: proxy, upstream: https://checkout.internal}
+      action: {type: proxy, url: https://checkout.internal}
       error_pages:
         - status: 404
           content_type: text/plain
@@ -610,7 +628,7 @@ fn the_layer_order_is_defaults_then_base_then_environment_then_entry_overrides()
     let floor = r#"
 action:
   type: proxy
-  upstream: https://floor.internal
+  url: https://floor.internal
   timeout_ms: 1000
 "#;
     let profile = r#"
@@ -620,14 +638,14 @@ spec:
     base:
       action:
         type: proxy
-        upstream: https://base.internal
+        url: https://base.internal
     environments:
       prod:
         action:
-          upstream: https://prod.internal
+          url: https://prod.internal
       staging:
         action:
-          upstream: https://staging.internal
+          url: https://staging.internal
 "#;
     let entry_yaml = r#"
 name: checkout
@@ -646,7 +664,7 @@ overrides:
         .cloned()
         .expect("action composed");
     assert_eq!(
-        action.get("upstream").and_then(serde_yaml::Value::as_str),
+        action.get("url").and_then(serde_yaml::Value::as_str),
         Some("https://prod.internal"),
         "the selected environment layer beat the base layer"
     );
@@ -665,16 +683,16 @@ name: checkout
 spec:
   api:
     base:
-      action: {type: proxy, upstream: https://base.internal}
+      action: {type: proxy, url: https://base.internal}
     environments:
       prod:
-        action: {upstream: https://prod.internal}
+        action: {url: https://prod.internal}
 "#;
     let resolution = compose(profile, CHECKOUT_ENTRY, None);
     assert_eq!(
         as_yaml(&resolution, "checkout.acme.test")
             .get("action")
-            .and_then(|a| a.get("upstream"))
+            .and_then(|a| a.get("url"))
             .and_then(serde_yaml::Value::as_str),
         Some("https://base.internal")
     );
@@ -694,10 +712,11 @@ inputs:
 spec:
   api:
     base:
-      action: {type: proxy, upstream: https://checkout.internal}
-      authentication:
-        type: api_key
-        api_key: "{{vars.upstream_key}}"
+      action:
+        type: ai_proxy
+        providers:
+          - name: openai
+            api_key: "{{vars.upstream_key}}"
 "#;
     let error = compose_err(profile, CHECKOUT_ENTRY, None);
     let text = error.to_string();
@@ -722,10 +741,11 @@ inputs:
 spec:
   api:
     base:
-      action: {type: proxy, upstream: https://checkout.internal}
-      authentication:
-        type: api_key
-        api_key: "{{vars.upstream_key}}"
+      action:
+        type: ai_proxy
+        providers:
+          - name: openai
+            api_key: "{{vars.upstream_key}}"
 "#;
     let entry_yaml = r#"
 name: checkout
@@ -739,8 +759,10 @@ inputs:
     let resolution = compose(profile, entry_yaml, None);
     assert_eq!(
         as_yaml(&resolution, "checkout.acme.test")
-            .get("authentication")
-            .and_then(|a| a.get("api_key"))
+            .get("action")
+            .and_then(|a| a.get("providers"))
+            .and_then(|providers| providers.get(0))
+            .and_then(|provider| provider.get("api_key"))
             .and_then(serde_yaml::Value::as_str),
         Some("secret://prod/checkout-key")
     );
@@ -759,14 +781,14 @@ spec:
     base:
       action:
         type: proxy
-        upstream: "https://checkout.{{vars.region}}.internal"
+        url: "https://checkout.{{vars.region}}.internal"
 "#;
     let resolution = compose(profile, CHECKOUT_ENTRY, None);
     let origin = as_yaml(&resolution, "checkout.acme.test");
     assert_eq!(
         origin
             .get("action")
-            .and_then(|a| a.get("upstream"))
+            .and_then(|a| a.get("url"))
             .and_then(serde_yaml::Value::as_str),
         Some("https://checkout.us-east-1.internal")
     );
@@ -785,10 +807,10 @@ inputs:
 spec:
   api:
     base:
-      action: {type: proxy, upstream: https://checkout.internal}
+      action: {type: proxy, url: https://checkout.internal}
       policies:
         - name: rate_limit
-          type: rate_limit
+          type: rate_limiting
           requests_per_minute: "{{vars.rpm}}"
 "#;
     let resolution = compose(profile, CHECKOUT_ENTRY, None);
@@ -815,7 +837,7 @@ inputs:
 spec:
   api:
     base:
-      action: {type: proxy, upstream: https://checkout.internal}
+      action: {type: proxy, url: https://checkout.internal}
 "#;
     let entry_yaml = r#"
 name: checkout
@@ -1011,10 +1033,11 @@ name: checkout
 spec:
   api:
     base:
-      action: {type: proxy, upstream: https://checkout.internal}
-      authentication:
-        type: api_key
-        api_key: "sk-live-NOTAREFERENCE"
+      action:
+        type: ai_proxy
+        providers:
+          - name: openai
+            api_key: "sk-live-NOTAREFERENCE"
 "#;
     let error = compose_err(profile, CHECKOUT_ENTRY, None);
     let text = error.to_string();
@@ -1041,10 +1064,11 @@ inputs:
 spec:
   api:
     base:
-      action: {type: proxy, upstream: https://checkout.internal}
-      authentication:
-        type: api_key
-        api_key: "{{vars.upstream_key}}"
+      action:
+        type: ai_proxy
+        providers:
+          - name: openai
+            api_key: "{{vars.upstream_key}}"
 "#;
     let entry_yaml = r#"
 name: checkout
@@ -1071,7 +1095,7 @@ name: checkout
 spec:
   api:
     base:
-      action: {type: proxy, upstream: https://checkout.internal}
+      action: {type: proxy, url: https://checkout.internal}
       policies:
         - name: my_rule
           type: waf
@@ -1082,6 +1106,385 @@ spec:
     assert!(error.to_string().contains("my_rule"), "{error}");
 }
 
+/// A lock has to bind what an entry does, not what it is called.
+///
+/// The failure this closes: the platform locks a security header in the
+/// floor, the project appends its own `response_modifiers` entry under a
+/// different name writing the same header, the addition lands after the
+/// floor because every addition does, and the last writer wins. Nothing
+/// was refused, no drop was recorded, and `/admin/origin-composition`
+/// still reported the floor entry as locked.
+#[test]
+fn a_project_addition_that_shadows_a_locked_header_is_refused() {
+    let floor = r#"
+response_modifiers:
+  - name: platform_security
+    locked: true
+    headers:
+      set:
+        Content-Security-Policy: "default-src 'self'"
+"#;
+    let profile = r#"
+name: checkout
+spec:
+  api:
+    base:
+      action: {type: proxy, url: https://checkout.internal}
+      response_modifiers:
+        - name: my_headers
+          headers:
+            set:
+              Content-Security-Policy: "default-src *"
+"#;
+    let error = compose_err(profile, CHECKOUT_ENTRY, Some(floor));
+    let text = error.to_string();
+    assert!(
+        matches!(error, OriginResolveError::LockedEffectShadowed { .. }),
+        "expected a shadow refusal, got: {text}"
+    );
+    assert!(text.contains("platform_security"), "names the lock: {text}");
+    assert!(text.contains("my_headers"), "names the addition: {text}");
+    assert!(
+        text.contains("profile `checkout`"),
+        "names the profile: {text}"
+    );
+    assert!(text.contains("entry `checkout`"), "names the entry: {text}");
+    assert!(
+        text.contains("headers.set.content-security-policy"),
+        "names the shared effect: {text}"
+    );
+}
+
+/// A header name is case-insensitive, so the comparison is too. A
+/// boundary its own header could walk through by changing case would be
+/// no boundary.
+#[test]
+fn a_shadow_is_caught_across_header_case() {
+    let floor = r#"
+response_modifiers:
+  - name: platform_security
+    locked: true
+    headers:
+      set:
+        Content-Security-Policy: "default-src 'self'"
+"#;
+    let profile = r#"
+name: checkout
+spec:
+  api:
+    base:
+      action: {type: proxy, url: https://checkout.internal}
+      response_modifiers:
+        - name: my_headers
+          headers:
+            set:
+              content-security-policy: "default-src *"
+"#;
+    assert!(matches!(
+        compose_err(profile, CHECKOUT_ENTRY, Some(floor)),
+        OriginResolveError::LockedEffectShadowed { .. }
+    ));
+}
+
+/// The same rule on the typed lists, where the discriminator is `type:`
+/// rather than the leaf path.
+#[test]
+fn a_project_policy_of_a_locked_type_is_refused() {
+    let floor = r#"
+policies:
+  - name: platform_waf
+    type: waf
+    owasp_crs:
+      enabled: true
+    locked: true
+"#;
+    let profile = r#"
+name: checkout
+spec:
+  api:
+    base:
+      action: {type: proxy, url: https://checkout.internal}
+      policies:
+        - name: my_waf
+          type: waf
+          owasp_crs:
+            enabled: false
+"#;
+    let error = compose_err(profile, CHECKOUT_ENTRY, Some(floor));
+    assert!(matches!(
+        error,
+        OriginResolveError::LockedEffectShadowed { .. }
+    ));
+    assert!(error.to_string().contains("type=waf"), "{error}");
+}
+
+/// The rule is narrow enough to be usable: an addition that touches
+/// nothing the lock touches still lands.
+#[test]
+fn a_project_addition_that_shadows_nothing_locked_still_lands() {
+    let floor = r#"
+policies:
+  - name: platform_waf
+    type: waf
+    owasp_crs:
+      enabled: true
+    locked: true
+response_modifiers:
+  - name: platform_security
+    locked: true
+    headers:
+      set:
+        Content-Security-Policy: "default-src 'self'"
+"#;
+    let profile = r#"
+name: checkout
+spec:
+  api:
+    base:
+      action: {type: proxy, url: https://checkout.internal}
+      policies:
+        - name: my_limit
+          type: request_limit
+          max_body_size: 1024
+      response_modifiers:
+        - name: my_headers
+          headers:
+            set:
+              X-Service: checkout
+"#;
+    let resolution = compose(profile, CHECKOUT_ENTRY, Some(floor));
+    let origin = as_yaml(&resolution, "checkout.acme.test");
+    assert_eq!(names(&origin, "policies"), vec!["waf", "request_limit"]);
+    assert_eq!(list(&origin, "response_modifiers").len(), 2);
+}
+
+/// A lock binds the project, not the platform. The entry `overrides:`
+/// block may add whatever it likes, because both sides of that argument
+/// are the runtime config.
+#[test]
+fn the_entry_override_layer_may_shadow_a_lock() {
+    let floor = r#"
+response_modifiers:
+  - name: platform_security
+    locked: true
+    headers:
+      set:
+        Content-Security-Policy: "default-src 'self'"
+"#;
+    let entry_yaml = r#"
+name: checkout
+repo: https://git.test/acme/checkout
+path: sbproxy/origin.yaml
+hosts:
+  api: ["checkout.acme.test"]
+overrides:
+  response_modifiers:
+    - name: incident_override
+      headers:
+        set:
+          Content-Security-Policy: "default-src *"
+"#;
+    let resolution = compose(CHECKOUT_PROFILE, entry_yaml, Some(floor));
+    assert_eq!(
+        list(
+            &as_yaml(&resolution, "checkout.acme.test"),
+            "response_modifiers"
+        )
+        .len(),
+        2
+    );
+}
+
+// --- WOR-2436: what a runtime-authored origin block may say ------------
+
+/// A misspelled key in `origin_defaults` used to pass `sbproxy validate`
+/// clean and fail every compose at the aggregator, which is the far end
+/// of a GitOps loop. Neither block carries `deny_unknown_fields`, because
+/// the merge runs before the typed parse, so this check is what puts the
+/// refusal back where the operator is.
+#[test]
+fn a_misspelled_key_in_origin_defaults_is_refused_at_load() {
+    let floor = defaults("forced_ssl: true\n");
+    let error = validate_origin_defaults(&floor).expect_err("a typo must be refused");
+    assert!(matches!(error, OriginResolveError::UnknownOriginKey { .. }));
+    assert!(error.to_string().contains("forced_ssl"), "{error}");
+}
+
+/// The key check is asked through the same classification the write
+/// boundary uses, so it covers every origin field including the ones no
+/// project may write.
+#[test]
+fn a_platform_owned_key_in_origin_defaults_is_accepted() {
+    for key in [
+        "force_ssl: true\n",
+        "filters: []\n",
+        "stream_safety: [pii]\n",
+    ] {
+        validate_origin_defaults(&defaults(key))
+            .unwrap_or_else(|error| panic!("`{key}` is a real origin field: {error}"));
+    }
+}
+
+/// A policy type no module answers to is refused where it is written.
+/// Every composed origin inherits the floor, so the whole fleet would
+/// have refused to boot on this one entry.
+#[test]
+fn an_unknown_policy_type_in_origin_defaults_is_refused_at_load() {
+    let floor = defaults("policies:\n  - name: rl\n    type: rate_limit\n");
+    let error = validate_origin_defaults(&floor).expect_err("an unknown type must be refused");
+    assert!(matches!(error, OriginResolveError::UnknownEntryType { .. }));
+    assert!(error.to_string().contains("rate_limit"), "{error}");
+    // The real spelling loads.
+    validate_origin_defaults(&defaults(
+        "policies:\n  - name: rl\n    type: rate_limiting\n",
+    ))
+    .expect("`rate_limiting` is the spelling the dispatcher answers to");
+}
+
+/// A floor entry with no `type:` dispatches to nothing, and a project
+/// overriding it by name would be overriding nothing.
+#[test]
+fn a_typeless_policy_in_origin_defaults_is_refused_at_load() {
+    let floor = defaults("policies:\n  - name: rl\n    requests_per_minute: 10\n");
+    assert!(matches!(
+        validate_origin_defaults(&floor).expect_err("a typeless floor policy must be refused"),
+        OriginResolveError::MissingEntryType { .. }
+    ));
+}
+
+/// The same three checks run over an entry's `overrides:`, which is the
+/// same shape written by the same people, with one difference: a `type:`
+/// is optional there, because a named override is usually a partial edit
+/// of a floor entry that already carries one.
+#[test]
+fn an_entry_override_block_is_checked_the_same_way_with_optional_types() {
+    let bad: OriginSourcesConfig = serde_yaml::from_str(
+        "entries:\n  - name: checkout\n    repo: https://git.test/a/b\n    path: p.yaml\n    \
+         overrides:\n      forced_ssl: true\n",
+    )
+    .expect("parses");
+    let error = validate_origin_sources(&bad).expect_err("a typo must be refused");
+    assert!(matches!(error, OriginResolveError::UnknownOriginKey { .. }));
+    assert!(error.to_string().contains("checkout"), "{error}");
+
+    let partial: OriginSourcesConfig = serde_yaml::from_str(
+        "entries:\n  - name: checkout\n    repo: https://git.test/a/b\n    path: p.yaml\n    \
+         overrides:\n      policies:\n        - name: rate_limit\n          \
+         requests_per_minute: 5000\n",
+    )
+    .expect("parses");
+    validate_origin_sources(&partial)
+        .expect("a named partial override needs no `type:` of its own");
+}
+
+// --- WOR-2436: the metric, on every load -------------------------------
+
+/// Every series on every load, including the loads where the block is
+/// absent. A gauge only written on the present path keeps its last value
+/// when the block is deleted and keeps the old tier's series when a
+/// document is promoted, which are the two readings the dashboard panel
+/// and the docs tell an operator to alert on.
+#[test]
+fn the_entry_counts_cover_every_tier_on_every_load() {
+    // No block at all: both tiers read zero, so a deleted block shows up
+    // as the drop to zero the panel describes.
+    for (tier, pinned, unpinned) in sbproxy_config::origin_source_entry_counts(None) {
+        assert_eq!((pinned, unpinned), (0, 0), "{tier:?}");
+    }
+
+    let production: OriginSourcesConfig = serde_yaml::from_str(
+        "tier: production\nentries:\n  - name: a\n    repo: https://git.test/a/b\n    \
+         path: p.yaml\n    revision: refs/tags/v1\n  - name: b\n    \
+         repo: https://git.test/c/d\n    path: p.yaml\n    \
+         revision: 0123456789abcdef0123456789abcdef01234567\n",
+    )
+    .expect("parses");
+    let counts = sbproxy_config::origin_source_entry_counts(Some(&production));
+    for (tier, pinned, unpinned) in counts {
+        match tier {
+            EnvironmentTier::Production => assert_eq!((pinned, unpinned), (2, 0)),
+            // The tier that is not in force must be written as zero, or a
+            // promotion from development to production leaves the old
+            // series standing at its last reading forever.
+            EnvironmentTier::Development => assert_eq!((pinned, unpinned), (0, 0)),
+        }
+    }
+
+    let development: OriginSourcesConfig = serde_yaml::from_str(
+        "entries:\n  - name: a\n    repo: https://git.test/a/b\n    path: p.yaml\n    \
+         revision: main\n",
+    )
+    .expect("parses");
+    let counts = sbproxy_config::origin_source_entry_counts(Some(&development));
+    for (tier, pinned, unpinned) in counts {
+        match tier {
+            EnvironmentTier::Development => assert_eq!((pinned, unpinned), (0, 1)),
+            EnvironmentTier::Production => assert_eq!((pinned, unpinned), (0, 0)),
+        }
+    }
+}
+
+// --- WOR-2434: a refusal never carries a value -------------------------
+
+/// The three variants that report a deserialization failure would echo
+/// the offending value if they carried serde's error, because serde
+/// renders it: `invalid type: string "sk-live-...", expected f32`.
+///
+/// The path is real rather than theoretical. `refuse_inline_secrets` runs
+/// before the typed parse, but it matches on key names, and
+/// `token_bytes_ratio` is not a secret-shaped key. A fat-fingered binding
+/// reaches the typed parse and comes back out inside the refusal, which
+/// the aggregator logs.
+#[test]
+fn a_type_mismatch_refusal_does_not_echo_the_value() {
+    const SENTINEL: &str = "sk-live-SENTINELVALUE";
+    let profile = r#"
+name: checkout
+inputs:
+  - name: ratio
+spec:
+  api:
+    base:
+      action: {type: proxy, url: https://checkout.internal}
+      token_bytes_ratio: "{{vars.ratio}}"
+"#;
+    let entry_yaml = format!(
+        "name: checkout\nrepo: https://git.test/acme/checkout\npath: sbproxy/origin.yaml\n\
+         hosts:\n  api: [\"checkout.acme.test\"]\ninputs:\n  ratio: \"{SENTINEL}\"\n"
+    );
+    let error = compose_err(profile, &entry_yaml, None);
+    let text = error.to_string();
+    assert!(
+        matches!(error, OriginResolveError::ProfileParse { .. }),
+        "expected the typed parse to refuse it, got: {text}"
+    );
+    assert!(
+        !text.contains(SENTINEL),
+        "the refusal echoed the bound value: {text}"
+    );
+    assert!(
+        text.contains("[redacted]"),
+        "the value should be visibly removed rather than silently dropped: {text}"
+    );
+    assert!(
+        text.contains("token_bytes_ratio") || text.contains("f32"),
+        "the refusal still has to say what was wrong: {text}"
+    );
+}
+
+/// Redaction must not take the field name with it. The write boundary's
+/// whole job is naming the key a project may not set, and serde spells an
+/// identifier with backticks and a value with double quotes, which is
+/// what makes the scrub a one-rule pass rather than a parser.
+#[test]
+fn redaction_keeps_the_field_name_the_write_boundary_has_to_name() {
+    let profile = "name: checkout\nspec:\n  api:\n    base:\n      action: {type: proxy}\n      \
+                   force_ssl: false\n";
+    let error = compose_err(profile, CHECKOUT_ENTRY, None).to_string();
+    assert!(error.contains("force_ssl"), "{error}");
+    assert!(error.contains("unknown field"), "{error}");
+}
+
 // --- WOR-2435: the read boundary --------------------------------------
 
 /// A project-owned profile is a confined document. Each of these is the
@@ -1089,8 +1492,8 @@ spec:
 #[test]
 fn a_profile_cannot_read_the_composing_process_environment() {
     for reach in [
-        r#"upstream: "https://collect.example/${AWS_SECRET_ACCESS_KEY}""#,
-        r#"upstream: "{{env.AWS_SECRET_ACCESS_KEY}}""#,
+        r#"url: "https://collect.example/${AWS_SECRET_ACCESS_KEY}""#,
+        r#"url: "{{env.AWS_SECRET_ACCESS_KEY}}""#,
     ] {
         let profile = format!(
             "name: checkout\nspec:\n  api:\n    base:\n      action:\n        type: proxy\n        \
@@ -1114,7 +1517,8 @@ fn a_profile_cannot_carry_a_host_backed_secret_reference() {
     ] {
         let profile = format!(
             "name: checkout\nspec:\n  api:\n    base:\n      action: {{type: proxy}}\n      \
-             authentication:\n        type: api_key\n        api_key: \"{reference}\"\n"
+             action:\n        type: ai_proxy\n        providers:\n          - name: openai\n            \
+             api_key: \"{reference}\"\n"
         );
         let error = compose_err(&profile, CHECKOUT_ENTRY, None);
         assert!(
@@ -1134,10 +1538,10 @@ spec:
     base:
       action:
         type: proxy
-        upstream: https://checkout.internal
+        url: https://checkout.internal
       policies:
         - name: opa
-          type: opa
+          type: rego
           rego_module_path: /etc/sbproxy/policy.rego
 "#;
     let error = compose_err(profile, CHECKOUT_ENTRY, None);
@@ -1266,7 +1670,13 @@ fn two_entries_sharing_a_name_are_refused() {
     ));
 }
 
-/// Both blocks round-trip through YAML unchanged.
+/// Both blocks round-trip through YAML unchanged, on one `ConfigFile`.
+///
+/// `origin_defaults` is the half that could actually lose something: it
+/// is held as an untyped `Mapping` rather than a typed struct, so a
+/// round-trip is the only thing that says the mapping survives a
+/// serialize and a re-parse with its nesting and its bookkeeping keys
+/// intact.
 #[test]
 fn both_blocks_round_trip() {
     let yaml = r#"
@@ -1295,6 +1705,28 @@ entries:
         serde_yaml::from_str(&serde_yaml::to_string(&parsed).expect("serializes"))
             .expect("re-parses");
     assert_eq!(parsed, round_tripped);
+
+    // And both blocks together, on the container the node actually
+    // parses, because `origin_defaults` only exists there.
+    let document = format!(
+        "origins: {{}}\norigin_defaults:\n  policies:\n    - name: waf\n      type: waf\n      \
+         locked: true\n      owasp_crs:\n        enabled: true\norigin_sources:{yaml}"
+    );
+    let config: sbproxy_config::ConfigFile =
+        serde_yaml::from_str(&document).expect("the whole document parses");
+    let text = serde_yaml::to_string(&config).expect("the whole document serializes");
+    let again: sbproxy_config::ConfigFile = serde_yaml::from_str(&text).expect("re-parses");
+    assert_eq!(
+        config.origin_sources.as_ref(),
+        again.origin_sources.as_ref()
+    );
+    assert_eq!(
+        config.origin_defaults.as_ref(),
+        again.origin_defaults.as_ref(),
+        "the untyped floor is the half a round-trip could lose"
+    );
+    let floor = again.origin_defaults.expect("the floor survived");
+    validate_origin_defaults(&floor).expect("and it is still a valid floor");
 }
 
 /// Unknown keys in either block are refused rather than dropped, which
@@ -1328,7 +1760,7 @@ name: billing
 spec:
   api:
     base:
-      action: {type: proxy, upstream: https://billing.internal}
+      action: {type: proxy, url: https://billing.internal}
 "#;
     let floor = defaults(FLOOR);
     let resolution = resolve_origins(
@@ -1379,6 +1811,20 @@ fn the_resolver_composes_from_text_alone() {
 /// The one exception is deliberate and narrow: the tests at the bottom of
 /// the module read the shipped schemas to run the field-classification
 /// ratchet, so the scan stops at the `#[cfg(test)]` boundary.
+///
+/// # What this cannot see
+///
+/// It is a textual scan of one file, so it says nothing about what the
+/// module *calls*. The resolver reaches outside itself three times, and
+/// each one is named here rather than left to the reader:
+/// `crate::source::redact_repo` (a string rewrite),
+/// `crate::source::is_full_commit_sha` (a length and hex-digit check),
+/// and `crate::validate::KNOWN_POLICY_TYPES` / `KNOWN_TRANSFORM_TYPES`
+/// (two `&[&str]` constants). None of the four opens anything, and they
+/// are listed because the next call added is the one this scan would
+/// wave through. The scan is still the wider half of the claim: the
+/// module cannot open a file or a socket itself, and its four callees
+/// are small enough to have been read.
 #[test]
 fn nothing_in_the_resolver_opens_a_file_or_a_socket() {
     let source = std::fs::read_to_string(
@@ -1492,27 +1938,41 @@ fn the_shipped_example_pair_composes() {
     // The input the entry bound reached the action.
     assert_eq!(
         api.get("action")
-            .and_then(|action| action.get("upstream"))
+            .and_then(|action| action.get("url"))
             .and_then(serde_yaml::Value::as_str),
         Some("https://checkout-us-east-1.internal.example.com")
     );
     // The environment layer the entry selected won.
     assert_eq!(
         api.get("action")
-            .and_then(|action| action.get("timeout_ms")),
-        Some(&serde_yaml::Value::Number(1500.into()))
+            .and_then(|action| action.get("host_override"))
+            .and_then(serde_yaml::Value::as_str),
+        Some("checkout.internal.example.com")
     );
     // The locked floor policy survived, the project's addition landed
     // after it, and the runtime override had the last word.
     assert_eq!(
         names(&api, "policies"),
-        vec!["waf", "rate_limit", "quota"],
+        vec!["waf", "rate_limiting", "request_limit"],
         "floor first, then the project's addition"
     );
     assert_eq!(
         list(&api, "policies")[1].get("requests_per_minute"),
         Some(&serde_yaml::Value::Number(5000.into())),
         "the entry `overrides:` block bookends the stack"
+    );
+    assert_eq!(
+        list(&api, "policies")[1].get("burst"),
+        Some(&serde_yaml::Value::Number(100.into())),
+        "and the floor field neither the project nor the entry mentioned survived"
+    );
+    // The runtime supplied the inbound credential, which is why the
+    // profile does not carry an `authentication:` block at all.
+    assert!(
+        api.get("authentication")
+            .and_then(|auth| auth.get("api_keys"))
+            .is_some(),
+        "the entry `overrides:` block owns the inbound credential: {api:?}"
     );
     // And the hand-written origin is untouched by any of it.
     assert!(hand_written.contains("status.example.com"));

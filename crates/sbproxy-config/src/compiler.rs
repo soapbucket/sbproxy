@@ -1794,7 +1794,6 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
             config_file.origins.keys().cloned().collect();
         let claims = crate::origin_profile::claimed_hosts(&sources.entries, &hand_written)
             .map_err(|error| anyhow::anyhow!("config compile: {error}"))?;
-        let tier = sources.tier.as_str();
         let pinned = sources
             .entries
             .iter()
@@ -1805,17 +1804,22 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
                     .is_some_and(crate::origin_profile::revision_is_immutable)
             })
             .count();
-        let unpinned = sources.entries.len().saturating_sub(pinned);
-        sbproxy_observe::metrics::set_origin_source_entries(tier, true, pinned as i64);
-        sbproxy_observe::metrics::set_origin_source_entries(tier, false, unpinned as i64);
         tracing::info!(
-            tier,
+            tier = sources.tier.as_str(),
             entries = sources.entries.len(),
             pinned,
-            unpinned,
+            unpinned = sources.entries.len().saturating_sub(pinned),
             claimed_hosts = claims.len(),
             "origin_sources declared; composition runs in the aggregator, not on this node"
         );
+    }
+    // Every series, every load, whether or not the block is present. See
+    // `origin_source_entry_counts` for why this is outside the `if let`.
+    for (tier, pinned, unpinned) in
+        crate::origin_profile::origin_source_entry_counts(config_file.origin_sources.as_ref())
+    {
+        sbproxy_observe::metrics::set_origin_source_entries(tier.as_str(), true, pinned as i64);
+        sbproxy_observe::metrics::set_origin_source_entries(tier.as_str(), false, unpinned as i64);
     }
 
     if config_file
