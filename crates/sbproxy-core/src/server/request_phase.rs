@@ -8323,17 +8323,130 @@ mod fail_open_reason_tests {
     }
 }
 
+/// WOR-2666: where the reputation gate sits in `request_filter`.
+///
+/// **A text search, and narrower than the thing it guards.** It sees
+/// the order of three strings in this file's source. It cannot see that
+/// the gate runs, that a refusal reaches the wire, or that moving the
+/// gate would actually change a verdict; `reputation_gate_wire_tests`
+/// covers that half, and covers the tenant dimension for real because
+/// its fixture origin stamps one.
+///
+/// It exists because the wire fixture is blind to the *other* dimension
+/// of the same move. The fixture has no agent-class catalog and no
+/// verifying auth provider, so the class resolves to `unknown` on
+/// either side of the auth arms and a gate hoisted above them passes
+/// every test in the workspace. The failure would be silent and it is
+/// the exact one the round-two move was made to fix: `bot_auth`
+/// restamps the class only after it has verified a signature and `kya`
+/// stamps its identity later still, so a gate above the auth arms can
+/// never see a verified source, while `analyze_on` in the response
+/// phase keys on the restamped class. Gate and histogram would key on
+/// different classes for the same caller.
+///
+/// The round-one version of this guard asserted the opposite ordering
+/// and was deleted when the gate moved. Deleting it rather than
+/// inverting it is what left the placement unpinned, and the
+/// replacement's rustdoc claimed to be a superset of it, which it was
+/// not. Both live here now, each saying what it does not cover.
+#[cfg(test)]
+mod reputation_gate_placement_tests {
+    /// This file's own source, read at compile time so the guard cannot
+    /// drift from what shipped.
+    const SOURCE: &str = include_str!("request_phase.rs");
+
+    #[test]
+    fn the_gate_runs_after_the_tenant_stamp_and_after_authentication() {
+        // Built rather than written out, so the needle does not match
+        // this test's own text.
+        let needle = format!("if {}(session, ctx).await? {{", "reputation_admission");
+        let calls: Vec<usize> = SOURCE.match_indices(&needle).map(|(at, _)| at).collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "the reputation gate must have exactly one call site in the request path: a second \
+             one would mean two refusal paths and a double `analyze_on` to reason about"
+        );
+        let call = calls[0];
+
+        let filter_at = SOURCE
+            .find("pub(super) async fn request_filter(")
+            .expect("request_filter is in this file");
+        let definition_at = SOURCE
+            .find("async fn reputation_admission(")
+            .expect("the gate is in this file");
+        assert!(
+            call > filter_at && call < definition_at,
+            "the call has to be inside request_filter, not in the gate's own body"
+        );
+
+        // After the tenant stamp. `ctx.tenant_id` starts at
+        // `__default__` and is overwritten from the matched origin, and
+        // the histogram is keyed by tenant, so a gate above this reads
+        // a key the detector has never seen and admits everyone.
+        let tenant_stamp_at = SOURCE
+            .find("ctx.tenant_id = pipeline_guard.config.origins[origin_idx].tenant_id.clone();")
+            .expect("the tenant stamp is in this file");
+        assert!(
+            call > tenant_stamp_at,
+            "the gate must run after the origin's tenant is stamped"
+        );
+
+        // After authentication. The class is what the resolver
+        // produced, and the verifying providers restamp it only once
+        // they have verified something.
+        let auth_at = SOURCE
+            .find("crate::server::record_auth_decision(")
+            .expect("the auth decision seam is in this file");
+        assert!(
+            call > auth_at,
+            "the gate must run after authentication, or it can never see a verified agent class \
+             and will key on a different one than the detector does"
+        );
+    }
+}
+
 /// WOR-2666: the reputation gate, driven through `request_filter` over
 /// a real socket.
 ///
-/// This replaces a source-text guard that asserted the call site
-/// existed. The guard's own rustdoc justified itself with "there is no
-/// `Session` fake in this workspace", which was false: the harness
-/// below is a copy of `empty_body_buffered_policy_tests`, in this file,
-/// and it binds a listener, builds a `Session`, and reads the bytes the
-/// gateway wrote. Everything the guard could not see (that
-/// `send_error_with_pages` is reached, that the caller gets the status,
-/// that the rest of the filter is short-circuited) is what this asserts.
+/// The round-one version of this was a source-text guard whose rustdoc
+/// justified itself with "there is no `Session` fake in this
+/// workspace", which was false: the harness below is a copy of
+/// `empty_body_buffered_policy_tests`, in this file, and it binds a
+/// listener, builds a `Session`, and reads the bytes the gateway wrote.
+///
+/// **What this covers and what it does not.** It covers the behavior
+/// the guard could not see: that `send_error_with_pages` is reached,
+/// that the caller gets the status on the wire, that the origin did not
+/// serve it, that the body carries no class or band, and that a class
+/// whose weight has rolled out of the window is admitted again. It also
+/// covers one dimension of the gate's *placement*, because the fixture
+/// origin declares a real `tenant_id`: a gate above the stamp at
+/// `ctx.tenant_id = ...` reads `__default__`, finds no score, and
+/// admits, so the refusal leg goes red.
+///
+/// It does not cover ordering against the auth stage. The fixture has
+/// no agent-class catalog and no verifying auth provider, so the class
+/// resolves to `unknown` on either side of the auth arms and a gate
+/// moved above them behaves identically here.
+/// `reputation_gate_placement_tests` is the guard for that half, and it
+/// is a text search, which is why both exist rather than one claiming
+/// to be a superset of the other. That claim is what the first
+/// replacement got wrong.
+///
+/// **Process-global state.** This is the third test in the crate that
+/// writes `anomaly::DETECTOR`, alongside the two in `anomaly.rs` whose
+/// note asks that any further one carry this paragraph. It lives here
+/// rather than beside them because it needs this file's `Session`
+/// harness, and it is the one with a blast radius: it installs a
+/// detector with `deny_below: 0.5` and a floored class, so under
+/// `cargo test`, which does not fork per test, a neighboring test
+/// driving `request_filter` could start getting refusals from a
+/// detector it never installed. Nextest runs a process per test, which
+/// is what makes it safe. It narrows the exposure anyway by flooring
+/// under [`FIXTURE_TENANT`] rather than `__default__`, which is the
+/// tenant every other `request_filter` test in this file resolves to,
+/// including `empty_body_buffered_policy_tests`.
 #[cfg(test)]
 mod reputation_gate_wire_tests {
     use std::time::Duration;
@@ -8345,12 +8458,24 @@ mod reputation_gate_wire_tests {
     use super::*;
     use crate::anomaly::{AnomalyDetector, AnomalySettings};
 
+    /// The tenant the fixture origin stamps.
+    ///
+    /// Deliberately not `__default__`. `ctx.tenant_id` starts at the
+    /// default and is overwritten from the matched origin partway
+    /// through `request_filter`, so a gate placed before that stamp
+    /// looks up a key the detector has never seen, gets `None`, and
+    /// admits. Flooring the detector under this name is what makes the
+    /// refusal leg fail if the gate moves back above the stamp.
+    const FIXTURE_TENANT: &str = "reputation-fixture-tenant";
+
     /// A pipeline whose only origin answers 200, so anything other than
     /// 200 on the wire came from the gate.
     fn pipeline_with_reputation_floor() -> crate::pipeline::CompiledPipeline {
         let config = sbproxy_config::compile_config(
             r#"
 proxy:
+  tenants:
+    - id: reputation-fixture-tenant
   anomaly:
     enabled: true
     min_observations: 5
@@ -8358,6 +8483,9 @@ proxy:
       deny_below: 0.5
 origins:
   "reputation.test":
+    tenant_id: reputation-fixture-tenant
+    authentication:
+      type: noop
     action:
       type: static
       status: 200
@@ -8382,7 +8510,7 @@ origins:
 
     fn view<'a>(ja4: &'a str) -> sbproxy_plugin::RequestContextView<'a> {
         sbproxy_plugin::RequestContextView {
-            tenant_id: "__default__",
+            tenant_id: FIXTURE_TENANT,
             hostname: "reputation.test",
             method: "GET",
             path: "/",
@@ -8412,9 +8540,15 @@ origins:
             detector.analyze_on(&view(&ja4), day);
         }
         assert_eq!(
-            detector.reputation("__default__", "unknown"),
+            detector.reputation(FIXTURE_TENANT, "unknown"),
             Some(0.0),
             "the fixture has to actually floor the class"
+        );
+        assert_eq!(
+            detector.reputation("__default__", "unknown"),
+            None,
+            "and it must floor it under the origin's tenant only, so a gate reading the \
+             pre-stamp default finds nothing and admits"
         );
         detector
     }

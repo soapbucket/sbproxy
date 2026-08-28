@@ -36,13 +36,15 @@ Two arms have a shape worth knowing before you read their output.
 
 ## Where it runs, and what that leaves out
 
-The detector is dispatched from the response phase. A request that never reaches a response filter is never judged and never learned from:
+There are two dispatch sites. The main one is the response phase, which every admitted request passes through. The second is the reputation gate itself: a request the gate refuses is analyzed on the way out, so a class being refused keeps learning and keeps decaying rather than freezing at the score that got it refused. That is the mechanism [a refusal is not permanent](#acting-on-it) depends on, and it is the reason a refused request does not appear in the list below.
+
+What is left out is everything that terminates before the response phase and is not a reputation refusal:
 
 - a `static` or `mock` origin, which writes its response in the request phase;
 - a request served from the hot cache or the cache reserve;
 - anything authentication, a policy, or a rate limiter already refused.
 
-So the population the detector calls "normal" is the population that reached an origin, and an attacker whose requests are all being refused contributes nothing to the histogram and nothing to its class's reputation. That is worth holding in mind before reading a quiet detector as a quiet network.
+So the population the detector calls "normal" is close to the population that reached an origin, and an attacker whose requests are all being refused *by something other than the reputation gate* contributes nothing to the histogram and nothing to its class's reputation. That is worth holding in mind before reading a quiet detector as a quiet network.
 
 ## Configuration
 

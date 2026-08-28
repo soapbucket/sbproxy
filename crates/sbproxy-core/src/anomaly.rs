@@ -1236,28 +1236,72 @@ mod tests {
         assert_eq!(entry.kind, KIND_REQUEST_RATE_SPIKE);
     }
 
-    /// WOR-2666 re-review N8, red first. `examples/anomaly-detection/`
-    /// ships a walkthrough with exact numbers in it, and nothing
-    /// checked them: the settings it uses are not the ones any other
-    /// test exercises, and the first version's "nothing is flagged
-    /// yet" step actually fired twice, because `mean_before` is read
-    /// before the observation, so with one address the count is always
-    /// one past the mean.
+    /// One numeric setting out of the shipped example's YAML.
+    ///
+    /// A three-line scan rather than a YAML parse, and that is a choice
+    /// with a reason: pulling `serde_yaml` and the whole config tree
+    /// into this test to read two floats would make the test depend on
+    /// the compiler agreeing about the file, when what it needs is the
+    /// bytes an operator reads. It matches the key at the start of a
+    /// trimmed line, so a mention inside a comment does not satisfy it,
+    /// and it panics rather than defaulting: a key that moved is the
+    /// drift this exists to catch, and a silent fallback would hide it.
+    fn example_setting(yaml: &str, key: &str) -> f64 {
+        let prefix = format!("{key}:");
+        let found = yaml
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with('#'))
+            .find_map(|line| line.strip_prefix(&prefix))
+            .unwrap_or_else(|| panic!("examples/anomaly-detection/sb.yml no longer sets `{key}`"));
+        found
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| {
+                panic!("`{key}` in examples/anomaly-detection/sb.yml is not a number: {found}")
+            })
+    }
+
+    /// WOR-2666 re-review N8, red first, and re-review R4. The example
+    /// ships a walkthrough with exact numbers in it and nothing checked
+    /// them: the settings it uses are not the ones any other test
+    /// exercises, and the first version's "nothing is flagged yet" step
+    /// actually fired twice, because `mean_before` is read before the
+    /// observation, so with one address the count is always one past
+    /// the mean.
+    ///
+    /// The settings come out of the shipped `sb.yml` rather than being
+    /// copied into this file. Copying them would close the defect
+    /// against a duplicate and let the artifact drift again, which is
+    /// the same failure one layer along: a test that cannot see the
+    /// thing it is about.
     ///
     /// This is the example's config and the example's walkthrough. If
     /// it goes red, the README is wrong.
     #[test]
     fn the_shipped_example_walkthrough_produces_the_numbers_it_prints() {
-        const EXAMPLE_MIN_MEAN: f64 = 6.0;
-        const EXAMPLE_MULTIPLIER: f64 = 1.0;
+        // Read out of the shipped file rather than copied from it. The
+        // defect this test closes was an example whose printed numbers
+        // did not match the detector; hardcoding the settings here
+        // would close it against a copy and let the artifact drift
+        // again, which is the same failure one layer along.
+        let example = include_str!("../../../examples/anomaly-detection/sb.yml");
+        let example_min_mean = example_setting(example, "rate_spike_min_mean");
+        let example_multiplier = example_setting(example, "rate_spike_multiplier");
+        let example_min_observations = example_setting(example, "min_observations");
+
+        // The two loop lengths the README's walkthrough runs.
         const QUIET_REQUESTS: usize = 5;
         const NOISY_REQUESTS: usize = 8;
 
         let detector = AnomalyDetector::new(AnomalySettings {
-            min_observations: 5,
+            min_observations: example_min_observations as u64,
             outlier_frequency: 0.01,
-            rate_spike_multiplier: EXAMPLE_MULTIPLIER,
-            rate_spike_min_mean: EXAMPLE_MIN_MEAN,
+            rate_spike_multiplier: example_multiplier,
+            rate_spike_min_mean: example_min_mean,
             deny_below: None,
             challenge_below: None,
         });
@@ -1688,16 +1732,28 @@ mod tests {
     /// reaches that loop.
     ///
     /// **Process-global state, and the constraint that makes it safe.**
-    /// This test and `a_reload_that_changes_nothing_keeps_the_window`
-    /// both write `DETECTOR`, which `CompiledPipeline::from_config`
-    /// also writes. Nextest runs each test in its own process, which is
+    /// Three tests in this crate write `DETECTOR`, which
+    /// `CompiledPipeline::from_config` also writes: this one,
+    /// `a_reload_that_changes_nothing_keeps_the_window` below, and
+    /// `server::request_phase::reputation_gate_wire_tests`, which lives
+    /// in the file it drives because it needs that file's `Session`
+    /// harness. Nextest runs each test in its own process, which is
     /// what keeps them from racing; `cargo test` does not, and neither
     /// does any future test in this crate that compiles a config with
     /// `proxy.anomaly` enabled. A `parking_lot` guard held across the
     /// awaits below would trip `clippy::await_holding_lock`, so the
     /// constraint is written down rather than enforced: run this crate
-    /// under nextest, and put any third detector-mutating test here
-    /// beside these two.
+    /// under nextest, and if you add a fourth, put the same note on it
+    /// and add it to this list.
+    ///
+    /// The wire test is the one to know about, because it is the one
+    /// with a blast radius. It installs a detector with
+    /// `deny_below: 0.5` and a floored class, and under `cargo test` a
+    /// neighboring test driving `request_filter` would start getting
+    /// refusals from a detector it never installed. It scopes that
+    /// where it can, by flooring under its own fixture tenant rather
+    /// than under `__default__`, which is what every other
+    /// `request_filter` test in that file resolves to.
     #[tokio::test]
     async fn an_installed_detector_is_reachable_through_the_plugin_registry() {
         let detector = Arc::new(AnomalyDetector::new(settings()));
