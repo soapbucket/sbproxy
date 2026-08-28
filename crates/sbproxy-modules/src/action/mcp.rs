@@ -10631,8 +10631,27 @@ allow := false if {
     /// proxy's private or VIP address, and every MCP request 401s.
     /// These tests are the thing that goes red.
     mod colocated_jwks_binding {
-        // `super::*` is deliberately not imported: these tests read the
-        // shipped YAML and the derivation, not the module state.
+        use super::super::colocated_broker_jwks_url;
+
+        /// A broker config carrying just the two fields the derivation
+        /// reads.
+        ///
+        /// The tests call the shipped function rather than repeating
+        /// its `format!`. Repeating it meant all four stayed green if
+        /// the production derivation changed, which is the whole
+        /// failure this binding has: it is a string equality between
+        /// two operator-supplied values, and nothing went red when the
+        /// two sides drifted.
+        fn broker_config(
+            external_base_url: &str,
+            base_path: &str,
+        ) -> sbproxy_mcp_gateway::McpGatewayConfig {
+            sbproxy_mcp_gateway::McpGatewayConfig {
+                external_base_url: external_base_url.to_string(),
+                base_path: base_path.to_string(),
+                ..sbproxy_mcp_gateway::McpGatewayConfig::default()
+            }
+        }
 
         /// The shipped example's `jwks_url` must be exactly what the
         /// wiring derives, or the example is the broken shape.
@@ -10681,11 +10700,7 @@ allow := false if {
                 .and_then(serde_yaml::Value::as_str)
                 .expect("resource_server.jwks_url");
 
-            let derived = format!(
-                "{}{}/.well-known/jwks.json",
-                base_url.trim_end_matches('/'),
-                base_path.trim_end_matches('/')
-            );
+            let derived = colocated_broker_jwks_url(&broker_config(base_url, base_path));
             assert_eq!(
                 configured, derived,
                 "examples/mcp-oauth-broker/sb.yml sets a jwks_url the colocated shortcut will not \
@@ -10706,11 +10721,7 @@ allow := false if {
                 ("https://mcp.example.com", "/mcp/oauth/"),
                 ("https://mcp.example.com/", "/mcp/oauth/"),
             ] {
-                let derived = format!(
-                    "{}{}/.well-known/jwks.json",
-                    base.trim_end_matches('/'),
-                    path.trim_end_matches('/')
-                );
+                let derived = colocated_broker_jwks_url(&broker_config(base, path));
                 assert_eq!(derived, expected, "base={base} path={path}");
             }
         }
@@ -10721,11 +10732,8 @@ allow := false if {
         /// tokens it never minted.
         #[test]
         fn a_different_host_does_not_match_the_colocated_url() {
-            let derived = format!(
-                "{}{}/.well-known/jwks.json",
-                "https://mcp.example.com".trim_end_matches('/'),
-                "/mcp/oauth".trim_end_matches('/')
-            );
+            let derived =
+                colocated_broker_jwks_url(&broker_config("https://mcp.example.com", "/mcp/oauth"));
             assert_ne!(
                 derived, "https://idp.example.com/mcp/oauth/.well-known/jwks.json",
                 "a jwks_url on another host must not satisfy the colocated binding"
@@ -10741,7 +10749,9 @@ allow := false if {
         /// it false while every other assertion still passes.
         #[test]
         fn the_colocated_shape_yields_a_provider_that_verifies_in_process() {
-            let jwks_url = "https://mcp.example.com/mcp/oauth/.well-known/jwks.json";
+            let jwks_url =
+                colocated_broker_jwks_url(&broker_config("https://mcp.example.com", "/mcp/oauth"));
+            let jwks_url = jwks_url.as_str();
             let cfg: sbproxy_mcp_gateway::McpResourceServerConfig =
                 serde_json::from_value(serde_json::json!({
                     "resource_uri": "https://mcp.example.com/",

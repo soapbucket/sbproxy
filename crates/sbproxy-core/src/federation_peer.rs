@@ -293,16 +293,37 @@ impl FederationPeerVerifier {
             self.max_chain_duration_ms,
             self.max_authority_hints,
         );
-        let chain = match sbproxy_federation::compose_trust_chain_budgeted(
+        // The budget checks its deadline before each fetch, which
+        // bounds a walk that keeps making progress. It cannot bound one
+        // that stops: a peer that accepts the connection and then
+        // stalls holds this future for the whole per-fetch timeout on
+        // top of the walk budget, 30s + 5s at the defaults, inside an
+        // unauthenticated `request_filter`. This wrapper is what makes
+        // `max_chain_duration_ms` the wall-clock number
+        // `docs/federation.md` says it is, whatever the peer does.
+        let walk = sbproxy_federation::compose_trust_chain_budgeted(
             self.fetcher.clone(),
             &self.resolver,
             entity_id,
             self.max_depth,
             &mut budget,
-        )
-        .await
-        {
-            Ok(chain) => chain,
+        );
+        let deadline = Duration::from_millis(self.max_chain_duration_ms);
+        let chain = match tokio::time::timeout(deadline, walk).await {
+            Err(_elapsed) => {
+                tracing::warn!(
+                    target: "sbproxy_federation::decision",
+                    event = "federation_peer_decision_detail",
+                    outcome = "refused",
+                    reason = "chain_unresolved",
+                    cause = "walk_deadline",
+                    max_chain_duration_ms = self.max_chain_duration_ms,
+                    "peer chain walk hit its wall-clock budget"
+                );
+                return PeerVerdict::Refused("chain_unresolved");
+            }
+            Ok(inner) => match inner {
+                Ok(chain) => chain,
             // The error names the peer URL, the resolved address, or
             // the transport failure, all of which are answers to a
             // probe the caller chose the question for. The crate
@@ -312,18 +333,19 @@ impl FederationPeerVerifier {
             // spent: an operator watching refusals needs to tell a peer
             // that is simply unreachable from one that is exhausting
             // the budget, because the second is someone probing.
-            Err(_) => {
-                tracing::warn!(
-                    target: "sbproxy_federation::decision",
-                    event = "federation_peer_decision_detail",
-                    outcome = "refused",
-                    reason = "chain_unresolved",
-                    fetches_spent = budget.fetches_spent(),
-                    bytes_spent = budget.bytes_spent(),
-                    "peer chain did not resolve"
-                );
-                return PeerVerdict::Refused("chain_unresolved");
-            }
+                Err(_) => {
+                    tracing::warn!(
+                        target: "sbproxy_federation::decision",
+                        event = "federation_peer_decision_detail",
+                        outcome = "refused",
+                        reason = "chain_unresolved",
+                        fetches_spent = budget.fetches_spent(),
+                        bytes_spent = budget.bytes_spent(),
+                        "peer chain did not resolve"
+                    );
+                    return PeerVerdict::Refused("chain_unresolved");
+                }
+            },
         };
         let Some(leaf) = chain.leaf() else {
             return PeerVerdict::Refused("chain_unresolved");

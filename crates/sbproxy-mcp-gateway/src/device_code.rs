@@ -1859,4 +1859,66 @@ mod tests {
             })
             .collect()
     }
+
+    /// The broker's own external origin is accepted even when a
+    /// branded verification URI names a different host.
+    ///
+    /// This is the half of the origin fix that keeps the *shipped*
+    /// consent page working. `enabled_config` leaves
+    /// `external_base_url` empty and points
+    /// `device_code_verification_uri` at `broker.example`, which is
+    /// also `CONSENT_ORIGIN`, so every other test in this module
+    /// matches through the second branch and deleting
+    /// `expected.push(base.origin())` leaves them all green. Here the
+    /// two origins are deliberately distinct.
+    #[tokio::test]
+    async fn the_brokers_own_origin_is_accepted_when_a_branded_page_is_configured() {
+        let mut config = enabled_config();
+        // The operator points users at a branded page on their own
+        // host, and the broker still serves its built-in page from
+        // its own origin.
+        config.external_base_url = "https://broker.example".to_string();
+        config.device_code_verification_uri = "https://id.acme.example/consent".to_string();
+
+        let app = build_app(config);
+        let token = consent_form_token(app.clone()).await;
+        let body = format!("user_code=ZZZZ-ZZZZ&action=approve&form_token={token}");
+        // `CONSENT_ORIGIN` is the broker's own origin, not the
+        // configured verification URI's.
+        let (status, text) =
+            post_form_from(app, "/mcp/oauth/verify", &body, Some(CONSENT_ORIGIN)).await;
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "the broker's own origin must be accepted alongside a configured branded one, or \
+             naming a branded page breaks the page the broker itself serves; body: {text}"
+        );
+    }
+
+    /// And a third-party origin is still refused, so the fix widened
+    /// the allowed set by exactly one entry rather than disabling the
+    /// check.
+    #[tokio::test]
+    async fn a_third_origin_is_still_refused_when_both_are_configured() {
+        let mut config = enabled_config();
+        config.external_base_url = "https://broker.example".to_string();
+        config.device_code_verification_uri = "https://id.acme.example/consent".to_string();
+
+        let app = build_app(config);
+        let token = consent_form_token(app.clone()).await;
+        let body = format!("user_code=ZZZZ-ZZZZ&action=approve&form_token={token}");
+        let (status, _text) = post_form_from(
+            app,
+            "/mcp/oauth/verify",
+            &body,
+            Some("https://evil.example"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "an origin that is neither the broker's nor the configured page's must be refused"
+        );
+    }
+
 }

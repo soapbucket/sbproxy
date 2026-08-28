@@ -346,7 +346,7 @@ admission decision on top of them is a fourth event at the same target:
 - `federation_peer_decision`, field `outcome` (`trusted` or `refused`).
   On `trusted` it also carries `entity_id`, the value the chain proved,
   and `trust_anchor_id`, the pinned anchor it reached. On `refused` it
-  carries `reason`, which is one of exactly five fixed words:
+  carries `reason`, which is one of exactly six fixed words:
 
   | `reason` | what happened |
   |---|---|
@@ -355,6 +355,7 @@ admission decision on top of them is a fourth event at the same target:
   | `chain_unresolved` | the walk did not reach a pinned anchor. Covers a failed fetch, a signature that did not verify, and a spent fetch, byte, or time budget. |
   | `metadata_policy` | the peer's published metadata violates what its superiors imposed. |
   | `trust_mark` | a `required_trust_marks` entry is missing or not signed by the anchor. |
+  | `walk_rate_limited` | this source address has already started `walks_per_minute` chain walks in the current window. A cache miss is what reaches the walk, so this counts walks rather than requests, and a caller that rotates the entity id it claims is what normally trips it. |
 
   This is the event that corresponds to the 403, and it fires **once
   per request**, including on a cache hit where none of the three above
