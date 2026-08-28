@@ -2222,7 +2222,7 @@ mod tests {
                             $name, $active
                         )
                     });
-                before.assert_exact_terminal_delta($expected, $name);
+                before.assert_exact_terminal_delta($expected, $name).await;
             }};
             ($name:literal, $expected:expr, $future:expr, $check:expr) => {{
                 assert_http_case!($name, $expected, 0usize, $future, $check);
@@ -2453,15 +2453,17 @@ mod tests {
         .await
         .expect("slow HTTP connection reaches its server deadline");
         assert!(slow_response.is_empty());
-        before.assert_exact_terminal_delta(
-            OutcomeExpectation::failure(
-                Transport::Http,
-                MetricCommand::Healthz,
-                Stage::Read,
-                Reason::Deadline,
-            ),
-            "whole-connection deadline after route",
-        );
+        before
+            .assert_exact_terminal_delta(
+                OutcomeExpectation::failure(
+                    Transport::Http,
+                    MetricCommand::Healthz,
+                    Stage::Read,
+                    Reason::Deadline,
+                ),
+                "whole-connection deadline after route",
+            )
+            .await;
 
         let encode_fault = controls.arm_next(HttpFault::Encode);
         assert_http_case!(
@@ -2518,15 +2520,17 @@ mod tests {
                 assert!(response.is_empty(), "{name}");
             }
             armed.assert_consumed_exactly_once();
-            before.assert_exact_terminal_delta(
-                OutcomeExpectation::failure(
-                    Transport::Http,
-                    MetricCommand::Healthz,
-                    Stage::Write,
-                    Reason::Io,
-                ),
-                name,
-            );
+            before
+                .assert_exact_terminal_delta(
+                    OutcomeExpectation::failure(
+                        Transport::Http,
+                        MetricCommand::Healthz,
+                        Stage::Write,
+                        Reason::Io,
+                    ),
+                    name,
+                )
+                .await;
         }
 
         let mut occupying = tokio::time::timeout(
