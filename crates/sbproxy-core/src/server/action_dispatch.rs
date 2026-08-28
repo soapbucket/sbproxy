@@ -491,9 +491,16 @@ pub(super) async fn handle_action(
                 return Ok(false);
             }
 
+            // Box the dispatch future before the task-local price-table
+            // wrapper takes it. `with_price_table_async` would otherwise
+            // embed `handle_ai_proxy`'s state machine in the Pingora
+            // worker frame, and a debug child overflows that 2 MiB stack
+            // (WOR-2431).
             sbproxy_ai::budget::with_price_table_async(
                 ai.config.price_table(),
-                handle_ai_proxy(session, &ai.config, pipeline, &hostname, ctx, origin_idx),
+                Box::pin(handle_ai_proxy(
+                    session, &ai.config, pipeline, &hostname, ctx, origin_idx,
+                )),
             )
             .await?;
             Ok(true)
