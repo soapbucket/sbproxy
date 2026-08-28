@@ -1024,3 +1024,10 @@ unreferenced number is two below this branch's 1522 and forty-seven above
 main's 1473, because main's anomaly and auth-provider work gave out-of-file
 consumers to two items this branch had left file-local; neither parent's
 figure describes the merged tree, so neither was taken.
+
+2026-08-28 (WOR-2673, cache-reserve consolidation): tests-only 324 -> 323.
+`S3ReserveConfig` and the `S3Reserve` surface around it went with the
+AWS-SDK cache-reserve backend, which the object-storage backend replaces.
+The item was reachable only from its own tests and the mock-SDK integration
+file, both of which were removed with it. Unreferenced 1520 -> 1519, the
+same removal.

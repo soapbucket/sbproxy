@@ -32,7 +32,7 @@ use compact_str::CompactString;
 use sbproxy_cache::{
     CacheReserveBackend, CacheStore, EncryptedCacheStore, FileCacheConfig, FileCacheStore,
     FsReserve, MemcachedConfig, MemcachedStore, MemoryCacheStore, MemoryReserve, RedisCacheStore,
-    RedisReserve, S3Reserve, S3ReserveConfig,
+    RedisReserve,
 };
 use sbproxy_config::{CompiledConfig, Parameter, RequestModifierConfig};
 use sbproxy_extension::bundle::{BundleRegistry, DynamicBundleRegistry};
@@ -1165,12 +1165,27 @@ fn build_cache_reserve(
         sbproxy_config::CacheReserveBackendConfig::Memory => "memory",
         sbproxy_config::CacheReserveBackendConfig::Filesystem { .. } => "filesystem",
         sbproxy_config::CacheReserveBackendConfig::Redis { .. } => "redis",
-        sbproxy_config::CacheReserveBackendConfig::S3 { .. } => "s3",
-        // One label for the whole variant. The `s3` arm above is the
-        // dedicated AWS-SDK backend, so splitting this one by its
-        // `backend:` field would put two different code paths under the
-        // same `backend="s3"` series.
-        sbproxy_config::CacheReserveBackendConfig::ObjectStore { .. } => "object_store",
+        sbproxy_config::CacheReserveBackendConfig::S3 { .. } => "retired_s3",
+        // WOR-2673: the provider, not the abstraction. While two
+        // object-storage backends shipped, one label per variant was
+        // the only honest option: `backend="s3"` would have covered two
+        // different code paths. With one path left, S3, GCS, Azure, and
+        // a local directory fail for entirely different reasons, and an
+        // operator alerting on
+        // `sbproxy_cache_reserve_degraded{backend="object_store"}`
+        // cannot tell which one broke. The vocabulary stays closed: a
+        // provider string this build does not know falls back to
+        // `object_store` rather than reaching a label as an operator
+        // typed it.
+        sbproxy_config::CacheReserveBackendConfig::ObjectStore { backend, .. } => {
+            match backend.as_str() {
+                "s3" => "s3",
+                "gcs" => "gcs",
+                "azure" => "azure",
+                "local" => "local",
+                _ => "object_store",
+            }
+        }
         sbproxy_config::CacheReserveBackendConfig::Other => "other",
     };
     let mut init_failure = None;
@@ -1198,32 +1213,22 @@ fn build_cache_reserve(
                 None
             }
         },
-        sbproxy_config::CacheReserveBackendConfig::S3 {
-            bucket,
-            region,
-            kms_key_id,
-            prefix,
-            replication_target_bucket,
-            sse_kms_bucket_default,
-        } => match S3Reserve::new(S3ReserveConfig {
-            bucket: bucket.clone(),
-            region: region.clone(),
-            kms_key_id: kms_key_id.clone(),
-            prefix: prefix.clone(),
-            replication_target_bucket: replication_target_bucket.clone(),
-            sse_kms_bucket_default: *sse_kms_bucket_default,
-            max_size_bytes: cfg.max_size_bytes,
-        }) {
-            Ok(r) => Some(Arc::new(r)),
-            Err(e) => {
-                tracing::warn!(error = %e, "cache_reserve s3 backend init failed; reserve disabled");
-                init_failure = Some((
-                    "invalid_configuration",
-                    "cache reserve initialization failed",
-                ));
-                None
-            }
-        },
+        // WOR-2673: retired. `compile_config` refuses this variant by
+        // name before a pipeline is ever built, so reaching here means
+        // a caller constructed the config in memory rather than loading
+        // it. Degrade the way an unknown backend does rather than
+        // pretending a reserve exists.
+        sbproxy_config::CacheReserveBackendConfig::S3 { .. } => {
+            tracing::warn!(
+                "cache_reserve backend type: s3 was retired; use type: object_store with \
+                 backend: s3 (see docs/cache-reserve.md)"
+            );
+            init_failure = Some((
+                "unsupported_backend",
+                "cache reserve backend is not available",
+            ));
+            None
+        }
         // WOR-2673: object storage. `sbproxy validate` stops at the
         // shape: building the provider client reads credentials from the
         // environment and resolving a sealing key reads files and dials
@@ -1325,6 +1330,17 @@ fn build_object_store_reserve(
             "cache_reserve.backend.path is only for the local backend; remove it or set \
              backend: local"
         );
+    }
+    // WOR-2673. The retired AWS-SDK backend refused an empty bucket,
+    // region, and key id in its own constructor; the provider builders
+    // below take what they are given, so an empty string would reach
+    // the wire on every request with a message naming neither the
+    // config key nor the empty value.
+    if bucket.as_deref().is_some_and(str::is_empty) {
+        anyhow::bail!("cache_reserve.backend.bucket must not be empty");
+    }
+    if path.as_deref().is_some_and(str::is_empty) {
+        anyhow::bail!("cache_reserve.backend.path must not be empty");
     }
     let store: Arc<dyn object_store::ObjectStore> = match backend {
         "local" => {
@@ -5722,6 +5738,112 @@ mod object_store_reserve_tests {
             "a type: object_store block must produce a reserve backend"
         );
         assert!(admission.is_some());
+    }
+
+    /// WOR-2673: the `backend` label names the provider, not the
+    /// abstraction in front of it.
+    ///
+    /// Two backends briefly shipped for object storage, so the label
+    /// had to say which code path was running and `object_store` was
+    /// the honest value. With one path left, an operator reading
+    /// `sbproxy_cache_reserve_degraded{backend="object_store"}` cannot
+    /// tell an S3 reserve from an Azure one, and the four providers
+    /// fail for entirely different reasons.
+    /// WOR-2673: carried over from the retired AWS-SDK backend, whose
+    /// `S3Reserve::new` refused an empty bucket, region, or key id.
+    ///
+    /// The object-store path builds its client from a provider builder
+    /// that takes the bucket name as given, so an empty string reaches
+    /// the provider and every request fails at the wire with a message
+    /// that names neither the config key nor the empty value. Refusing
+    /// it here keeps the property the retired backend proved.
+    #[test]
+    fn an_empty_bucket_is_refused_rather_than_dialed() {
+        for backend in ["s3", "gcs", "azure"] {
+            let error = build_object_store_reserve(
+                backend,
+                &Some(String::new()),
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+            )
+            .expect_err("an empty bucket must be refused");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("bucket"),
+                "the refusal must name the field: {message}"
+            );
+        }
+    }
+
+    /// The same property on the `local` backend, whose bucket
+    /// equivalent is `path`. An empty path canonicalizes to the process
+    /// working directory, so the reserve would write cache objects into
+    /// whatever directory the proxy happened to start in.
+    #[test]
+    fn an_empty_local_path_is_refused_rather_than_writing_beside_the_process() {
+        let error = build_object_store_reserve(
+            "local",
+            &None,
+            &Some(String::new()),
+            &None,
+            &None,
+            &None,
+            &None,
+        )
+        .expect_err("an empty path must be refused");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("path"),
+            "the refusal must name the field: {message}"
+        );
+    }
+
+    #[test]
+    fn the_backend_label_names_the_provider_not_the_abstraction() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (_reserve, _admission, health) =
+            build_cache_reserve(&reserve_config(local_backend(dir.path(), None)), false);
+        assert_eq!(
+            health.snapshot().backend,
+            "local",
+            "the label must name the object-store provider an operator configured"
+        );
+    }
+
+    /// Every provider the object-store backend accepts gets its own
+    /// series, and an unrecognized one still lands on a bounded label
+    /// rather than the operator's own string.
+    #[test]
+    fn every_provider_has_its_own_bounded_label() {
+        for (configured, expected) in [
+            ("s3", "s3"),
+            ("gcs", "gcs"),
+            ("azure", "azure"),
+            ("local", "local"),
+            ("wasabi", "object_store"),
+        ] {
+            let backend = sbproxy_config::CacheReserveBackendConfig::ObjectStore {
+                backend: configured.to_string(),
+                bucket: Some("reserve".to_string()),
+                path: None,
+                region: None,
+                endpoint: None,
+                prefix: None,
+                encryption: None,
+            };
+            // `validating: true` stops before any provider client is
+            // built, so this reads the label without dialing anything.
+            let (_reserve, _admission, health) =
+                build_cache_reserve(&reserve_config(backend), true);
+            assert_eq!(
+                health.snapshot().backend,
+                expected,
+                "backend '{configured}' must be labeled '{expected}'"
+            );
+        }
     }
 
     #[test]

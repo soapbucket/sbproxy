@@ -2290,6 +2290,52 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         }
     }
 
+    // WOR-2673: the AWS-SDK cache-reserve backend was retired in favor
+    // of the object-storage one, which reaches the same buckets plus
+    // GCS, Azure, a local directory, and every S3-compatible store.
+    // A refusal rather than a silent migration: `type: s3` carried
+    // `kms_key_id`, and an alias would have moved an operator from
+    // KMS-wrapped per-object data keys to local sealing without saying
+    // so. `CacheReserveBackendConfig` also carries `#[serde(other)]`,
+    // so with no refusal here the old block parses as an out-of-tree
+    // backend and the reserve silently disappears.
+    if let Some(reserve) = config_file.proxy.cache_reserve.as_ref() {
+        if let Some(crate::types::CacheReserveBackendConfig::S3 {
+            bucket,
+            region,
+            kms_key_id,
+            prefix,
+            ..
+        }) = reserve.backend.as_ref()
+        {
+            let bucket = bucket.as_deref().unwrap_or("your-bucket");
+            let region_line = region
+                .as_deref()
+                .map(|region| format!("\n        region: {region}"))
+                .unwrap_or_default();
+            let prefix_line = prefix
+                .as_deref()
+                .map(|prefix| format!("\n        prefix: {prefix}"))
+                .unwrap_or_default();
+            let kms_note = if kms_key_id.is_some() {
+                "Your kms_key_id has no equivalent: the replacement seals entries \
+                 locally with AES-256-GCM under cache_reserve.backend.encryption, or \
+                 leaves encryption to the bucket's own SSE-KMS setting, which is \
+                 configured on the bucket and composes with either choice."
+            } else {
+                "kms_key_id has no equivalent: the replacement seals entries locally \
+                 with AES-256-GCM under cache_reserve.backend.encryption, or leaves \
+                 encryption to the bucket's own SSE-KMS setting."
+            };
+            anyhow::bail!(
+                "config compile: proxy.cache_reserve.backend type: s3 was retired. \
+                 Write this instead:\n      backend:\n        type: object_store\n        \
+                 backend: s3\n        bucket: {bucket}{region_line}{prefix_line}\n\
+                 {kms_note} See docs/cache-reserve.md for the full migration."
+            );
+        }
+    }
+
     // WOR-2199: a bind address the operator cannot express is a bind
     // address they cannot restrict, and one they misspell must not fall
     // back to every interface.

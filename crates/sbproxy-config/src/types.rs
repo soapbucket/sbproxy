@@ -6553,8 +6553,8 @@ fn default_anomaly_rate_spike_min_mean() -> f64 {
 /// promotes the entry back into the hot tier on hit.
 ///
 /// Backend selection is open-ended via [`CacheReserveBackendConfig`]
-/// so the in-tree memory / filesystem / redis / s3 backends can be
-/// extended without touching this schema.
+/// so the in-tree memory / filesystem / redis / object-storage
+/// backends can be extended without touching this schema.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CacheReserveConfig {
@@ -6624,35 +6624,47 @@ pub enum CacheReserveBackendConfig {
         #[serde(default)]
         key_prefix: Option<String>,
     },
-    /// S3-backed reserve with AWS KMS envelope encryption. A cold,
-    /// cross-region-replicable tier; cross-region replication itself
-    /// is configured at the bucket level, outside this schema.
-    /// Credentials resolve through the standard AWS chain (env,
-    /// profile, IMDS, container credentials), never through this
-    /// config block.
+    /// Retired (WOR-2673): the AWS-SDK S3 backend with KMS envelope
+    /// encryption. [`Self::ObjectStore`] with `backend: s3` replaces
+    /// it and reaches the same buckets.
+    ///
+    /// This variant still deserializes, and the config compiler still
+    /// refuses it by name, on purpose. This enum carries
+    /// `#[serde(other)]`, so deleting the variant outright would have
+    /// made an existing `type: s3` block parse as "a backend
+    /// registered out of tree": the config would load, the proxy would
+    /// serve, the startup log would carry one `warn!`, and the cold
+    /// tier would be gone. Every field is optional here because none
+    /// of them is read for behavior; they exist so a real operator
+    /// config parses far enough to reach a refusal that names its
+    /// replacement.
+    ///
+    /// See `docs/cache-reserve.md` for the field-by-field migration,
+    /// including the one behavior that does not carry over: KMS-wrapped
+    /// per-object data keys. The replacement seals locally with
+    /// AES-256-GCM, or leaves sealing to the bucket's own SSE-KMS.
     S3 {
-        /// Source S3 bucket.
-        bucket: String,
-        /// AWS region the bucket lives in.
-        region: String,
-        /// KMS key ID, ARN, or alias used to wrap/unwrap the
-        /// per-object data key (or, in `sse_kms_bucket_default` mode,
-        /// passed as `ssekms_key_id`).
-        kms_key_id: String,
-        /// Optional key prefix prepended to every object (e.g.
-        /// `"reserve/"`).
+        /// Ignored. Was the source S3 bucket.
+        #[serde(default)]
+        bucket: Option<String>,
+        /// Ignored. Was the AWS region the bucket lives in.
+        #[serde(default)]
+        region: Option<String>,
+        /// Ignored, and the field whose behavior does not carry over.
+        /// Was the KMS key that wrapped each object's data key.
+        #[serde(default)]
+        kms_key_id: Option<String>,
+        /// Ignored. Was the key prefix prepended to every object.
         #[serde(default)]
         prefix: Option<String>,
-        /// Optional replication target bucket name, surfaced for
-        /// diagnostics only. Cross-region replication is configured
-        /// at the bucket level and this backend never acts on it.
+        /// Ignored. Was a diagnostics-only hint; cross-region
+        /// replication was always configured at the bucket level.
         #[serde(default)]
         replication_target_bucket: Option<String>,
-        /// When `true`, upload plaintext and rely on S3 SSE-KMS
-        /// bucket-default encryption instead of local envelope
-        /// encryption. Defaults to `false`.
+        /// Ignored. Was the switch between local envelope encryption
+        /// and S3 bucket-default SSE-KMS.
         #[serde(default)]
-        sse_kms_bucket_default: bool,
+        sse_kms_bucket_default: Option<bool>,
     },
     /// WOR-2673: object storage. One variant covers S3, Google Cloud
     /// Storage, Azure Blob Storage, and a local directory, because they

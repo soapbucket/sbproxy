@@ -49,8 +49,12 @@ ignore = [
   # Cargo.lock; CI will then enforce automatically.
 
   # --- AWS SDK: transitive rustls 0.21 -> rustls-webpki 0.101.7 ---
-  # The three advisories below flag the unpatched `rustls-webpki 0.101.7`, which
-  # the `aws-smithy-http-client 1.1.13` HTTP client pins through `rustls 0.21`.
+  # Historical. `rustls-webpki 0.101.7` is no longer in the lockfile at all
+  # (one copy remains, the patched 0.103.13), so nothing below matches any
+  # more. Kept as the record of why the entries existed and when they went.
+  # The three advisories below flagged the unpatched `rustls-webpki 0.101.7`,
+  # which the `aws-smithy-http-client 1.1.13` HTTP client pinned through
+  # `rustls 0.21`.
   # The upstream AWS SDK has not yet bumped the smithy http client to the
   # rustls 0.23 line. None of the three advisories applies to the
   # `aws-sdk-secretsmanager` / `aws-sdk-sts` use case: we connect to
@@ -174,25 +178,12 @@ ignore = [
   # `NsReader` (memory-exhaustion DoS).
   "RUSTSEC-2026-0195",
 
-  # --- RUSTSEC-2026-0258: h2 0.3.27 unbounded empty DATA frames (WOR-2673) --
-  # `vulnerability`-class, ignored with a tighter rationale like the
-  # quick-xml pair above. Path: h2 0.3.27 -> hyper 0.14.32 ->
-  # aws-smithy-http-client 1.1.13's legacy client feature, pulled in only
-  # because `aws-smithy-mocks` (a dev-dependency of sbproxy-cache's S3 + KMS
-  # cache-reserve tests) depends on `aws-smithy-http-client` without
-  # `default-features = false`. The production AWS clients (aws-config,
-  # aws-sdk-s3, aws-sdk-kms, and sbproxy-vault's aws-sdk-secretsmanager /
-  # aws-sdk-sts) all select `default-https-client`, which resolves through
-  # the separate, patched `h2 0.4.16` / hyper-rustls 0.27 stack instead; the
-  # vulnerable h2 0.3.27 copy is reachable only from `#[cfg(test)]` code that
-  # never opens a real socket (aws-smithy-mocks intercepts requests at the
-  # SDK's operation layer, in-process). Low severity even if it were live: an
-  # unbounded queue of empty DATA frames from a peer the test process never
-  # dials. Revisit when `aws-smithy-mocks` depends on a version of
-  # `aws-smithy-http-client` built with `default-features = false`, or drops
-  # the legacy client entirely; both v0.2.6 and the current v0.3.0 still pull
-  # it as of this writing.
-  "RUSTSEC-2026-0258",
+  # RUSTSEC-2026-0258 (h2 0.3.27, unbounded empty DATA frames) was ignored
+  # here for the `aws-smithy-mocks` dev-dependency of the AWS-SDK
+  # cache-reserve backend's tests, which pulled the legacy hyper 0.14 / h2
+  # 0.3 client. WOR-2673 retired that backend in favor of the object-storage
+  # one, and with it the whole legacy stack: the lockfile now holds one h2
+  # (0.4.16) and one hyper (1.9.0). Entry removed 2026-08-27.
 ]
 
 # --- Advisories this file structurally CANNOT gate -----------------------

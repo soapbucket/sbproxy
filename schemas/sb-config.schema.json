@@ -6435,7 +6435,7 @@
       "additionalProperties": false
     },
     "CacheReserveConfig": {
-      "description": "Top-level Cache Reserve configuration.\n\nCache Reserve is a long-tail cold tier sitting under the per-origin response cache. Items evicted from the hot cache are admitted into the reserve subject to a sample rate and size threshold; on a hot miss the proxy consults the reserve before going to origin and promotes the entry back into the hot tier on hit.\n\nBackend selection is open-ended via [`CacheReserveBackendConfig`] so the in-tree memory / filesystem / redis / s3 backends can be extended without touching this schema.",
+      "description": "Top-level Cache Reserve configuration.\n\nCache Reserve is a long-tail cold tier sitting under the per-origin response cache. Items evicted from the hot cache are admitted into the reserve subject to a sample rate and size threshold; on a hot miss the proxy consults the reserve before going to origin and promotes the entry back into the hot tier on hit.\n\nBackend selection is open-ended via [`CacheReserveBackendConfig`] so the in-tree memory / filesystem / redis / object-storage backends can be extended without touching this schema.",
       "type": "object",
       "properties": {
         "enabled": {
@@ -6548,12 +6548,9 @@
           "additionalProperties": false
         },
         {
-          "description": "S3-backed reserve with AWS KMS envelope encryption. A cold, cross-region-replicable tier; cross-region replication itself is configured at the bucket level, outside this schema. Credentials resolve through the standard AWS chain (env, profile, IMDS, container credentials), never through this config block.",
+          "description": "Retired (WOR-2673): the AWS-SDK S3 backend with KMS envelope encryption. [`Self::ObjectStore`] with `backend: s3` replaces it and reaches the same buckets.\n\nThis variant still deserializes, and the config compiler still refuses it by name, on purpose. This enum carries `#[serde(other)]`, so deleting the variant outright would have made an existing `type: s3` block parse as \"a backend registered out of tree\": the config would load, the proxy would serve, the startup log would carry one `warn!`, and the cold tier would be gone. Every field is optional here because none of them is read for behavior; they exist so a real operator config parses far enough to reach a refusal that names its replacement.\n\nSee `docs/cache-reserve.md` for the field-by-field migration, including the one behavior that does not carry over: KMS-wrapped per-object data keys. The replacement seals locally with AES-256-GCM, or leaves sealing to the bucket's own SSE-KMS.",
           "type": "object",
           "required": [
-            "bucket",
-            "kms_key_id",
-            "region",
             "type"
           ],
           "properties": {
@@ -6564,19 +6561,31 @@
               ]
             },
             "bucket": {
-              "description": "Source S3 bucket.",
-              "type": "string"
+              "description": "Ignored. Was the source S3 bucket.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "region": {
-              "description": "AWS region the bucket lives in.",
-              "type": "string"
+              "description": "Ignored. Was the AWS region the bucket lives in.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "kms_key_id": {
-              "description": "KMS key ID, ARN, or alias used to wrap/unwrap the per-object data key (or, in `sse_kms_bucket_default` mode, passed as `ssekms_key_id`).",
-              "type": "string"
+              "description": "Ignored, and the field whose behavior does not carry over. Was the KMS key that wrapped each object's data key.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "prefix": {
-              "description": "Optional key prefix prepended to every object (e.g. `\"reserve/\"`).",
+              "description": "Ignored. Was the key prefix prepended to every object.",
               "default": null,
               "type": [
                 "string",
@@ -6584,7 +6593,7 @@
               ]
             },
             "replication_target_bucket": {
-              "description": "Optional replication target bucket name, surfaced for diagnostics only. Cross-region replication is configured at the bucket level and this backend never acts on it.",
+              "description": "Ignored. Was a diagnostics-only hint; cross-region replication was always configured at the bucket level.",
               "default": null,
               "type": [
                 "string",
@@ -6592,9 +6601,12 @@
               ]
             },
             "sse_kms_bucket_default": {
-              "description": "When `true`, upload plaintext and rely on S3 SSE-KMS bucket-default encryption instead of local envelope encryption. Defaults to `false`.",
-              "default": false,
-              "type": "boolean"
+              "description": "Ignored. Was the switch between local envelope encryption and S3 bucket-default SSE-KMS.",
+              "default": null,
+              "type": [
+                "boolean",
+                "null"
+              ]
             }
           },
           "additionalProperties": false

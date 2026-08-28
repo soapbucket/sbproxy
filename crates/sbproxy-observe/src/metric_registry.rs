@@ -2056,7 +2056,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Proxy,
         labels: &["backend"],
-        description: "Whether the configured Cache Reserve backend is degraded.",
+        description: "Whether the configured Cache Reserve backend is degraded. `backend` is the provider (`memory`, `filesystem`, `redis`, `s3`, `gcs`, `azure`, `local`, or `object_store` for a provider this build does not name), not the client library in front of it.",
         dead_reason: None,
     },
     MetricCapability {
@@ -2089,7 +2089,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Proxy,
         labels: &["backend", "state", "reason"],
-        description: "Cache Reserve backend health transitions by bounded reason.",
+        description: "Cache Reserve backend health transitions by bounded reason. `backend` carries the same closed provider vocabulary as `sbproxy_cache_reserve_degraded`.",
         dead_reason: None,
     },
     MetricCapability {

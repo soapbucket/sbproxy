@@ -3,7 +3,7 @@
 
 Cache Reserve is a long-tail cold tier sitting under the per-origin response cache. Items evicted from the hot cache are admitted into the reserve subject to a sample rate and size threshold; on a hot miss the proxy consults the reserve before falling through to origin and promotes the entry back into the hot tier on hit.
 
-SBproxy ships five reserve backends out of the box: memory, filesystem, redis, object storage (S3, Google Cloud Storage, Azure Blob, or a local directory), and a dedicated S3 backend with AWS KMS envelope encryption.
+SBproxy ships four reserve backends out of the box: memory, filesystem, redis, and object storage (S3, Google Cloud Storage, Azure Blob, a local directory, or any S3-compatible store).
 
 ## Configuration
 
@@ -38,7 +38,7 @@ origins:
 | `filesystem` | `path` | One body file plus a sidecar metadata JSON per key, fanned out by SHA-256 hash. Survives restarts. |
 | `redis` | `redis_url`, optional `key_prefix` | Connection pooling via `ConnectionManager`. Entries self-evict on the server side via `PEXPIREAT`. |
 | `object_store` | `backend`, plus `bucket` (or `path` for `local`) | S3, GCS, Azure Blob, or a local directory, through one backend. Optional at-rest sealing. See below. |
-| `s3` | `bucket`, `region`, `kms_key_id`, optional `prefix`, `replication_target_bucket`, `sse_kms_bucket_default` | A cold, cross-region-replicable tier. AWS KMS envelope encryption by default; see [s3](#s3) below. |
+| `s3` | retired | Refused at config load with the block to write instead. See [Migrating from `type: s3`](#migrating-from-type-s3). |
 
 The pipeline ignores unknown backend types with a warning.
 
@@ -89,27 +89,40 @@ Three behaviors are worth knowing before you point this at a bucket:
 - **The expiry sweep runs on a timer, and it is not the recommended answer at scale.** The proxy calls `evict_expired` every fifteen minutes from its background tasks, so a small reserve does expire without any bucket configuration. Expiry lives inside the object, so the sweep reads each candidate rather than judging it from the listing, and it examines at most 1,000 objects per call. It keeps a cursor: a pass that hits the cap records where it stopped and the next one resumes after it, wrapping to the start when a pass reaches the end. So a large reserve is walked forward across ticks rather than re-examined from the top, and the arithmetic is worth doing before you rely on it: a million objects is about ten days of ticks per full pass, and an entry that expires just behind the cursor waits for the next lap. **Configure a bucket lifecycle rule** (S3 lifecycle expiration, GCS object lifecycle management, Azure blob lifecycle) on the reserve prefix for any deployment large enough for that to matter. The sweep is the answer for small reserves and for correctness after a TTL change.
 - **Objects are named by digest, not by key.** An entry is written at `{prefix}{ab}/{cd}/{hex(sha256(cache key))}`. A cache key runs to a couple of hundred bytes, and encoding one inline puts the object name past `NAME_MAX` on the `local` backend and eventually past S3's 1,024-byte key limit; the two levels of fan-out keep the directory entry count per prefix bounded. The digest is also the associated data an entry is sealed under, so an object copied to another entry's path fails to authenticate.
 
-#### s3
+#### Migrating from `type: s3`
 
-The AWS-SDK backend, for a deployment that wants KMS-wrapped envelope encryption rather than the local sealing `object_store` offers.
+A separate `type: s3` backend, written against the AWS SDK with KMS-wrapped envelope encryption, briefly shipped beside `object_store`. It is retired. `object_store` with `backend: s3` reaches the same buckets, plus GCS, Azure Blob, a local directory, and every S3-compatible store an `endpoint` points at, through one code path instead of two.
 
-```yaml
-proxy:
-  cache_reserve:
-    enabled: true
-    backend:
-      type: s3
-      bucket: sbproxy-cache-reserve-prod
-      region: us-west-2
-      kms_key_id: alias/sbproxy-cache-reserve
-      prefix: "reserve/"
+The old block is refused at config load rather than translated, and the refusal prints the replacement:
+
+```
+config compile: proxy.cache_reserve.backend type: s3 was retired. Write this instead:
+      backend:
+        type: object_store
+        backend: s3
+        bucket: sbproxy-cache-reserve-prod
+        region: us-west-2
 ```
 
-Every `put` calls `KMS:GenerateDataKey` to mint a fresh 256-bit data key, seals the body locally with AES-256-GCM, and stores the KMS-wrapped data key alongside the ciphertext as S3 object metadata. `get` sends the wrapped key back through `KMS:Decrypt` and decrypts in-process. This envelope-encryption pattern keeps KMS request volume bounded to one call per object rather than one per byte, and lets the master key rotate without rewriting object bodies. Deployments that prefer S3's bucket-default SSE-KMS encryption instead can set `sse_kms_bucket_default: true`; in that mode the body uploads in plaintext and S3 encrypts at rest, and neither `put` nor `get` calls KMS.
+Field by field:
 
-AWS credentials resolve through the standard chain (environment, shared profile, EC2/ECS instance role, container credentials); nothing under `backend:` carries a secret. Cross-region replication is configured at the bucket level with an S3 replication rule and IAM role; `replication_target_bucket` is a diagnostics-only hint this backend does not act on.
+| Retired field | Replacement |
+|---|---|
+| `bucket` | `bucket`, unchanged |
+| `region` | `region`, unchanged. Still falls back to `AWS_REGION` when omitted |
+| `prefix` | `prefix`, unchanged, though the default moved from none to `sbproxy/reserve/` |
+| `kms_key_id` | No equivalent. See below |
+| `sse_kms_bucket_default` | No equivalent, and none is needed: SSE-KMS is a bucket setting, so it applies to what this backend writes without the proxy knowing about it |
+| `replication_target_bucket` | Gone. It was a diagnostics-only hint that nothing acted on; cross-region replication was always configured with an S3 replication rule and an IAM role at the bucket level, and still is |
 
-`evict_expired` lists the bucket and issues one `HeadObject` per listed key to read its expiry. That does not scale to a large bucket: past 100,000 objects a log line suggests configuring an S3 lifecycle rule instead of relying on this sweep.
+**What happens to KMS.** The retired backend called `KMS:GenerateDataKey` on every write and `KMS:Decrypt` on every read, wrapping a per-object data key with a cloud master key. The replacement does not call KMS at all. Two ways to cover it, and they compose:
+
+- **Bucket-level SSE-KMS**, configured on the bucket with the same key. S3 encrypts at rest with your CMK, CloudTrail records the key use, and revoking the key policy locks the objects, exactly as before. Nothing in the proxy config changes.
+- **`encryption.enabled: true`** on this block, which seals each entry with AES-256-GCM inside the proxy before the object leaves the process, under a key you name with the same reference syntax as every other secret in the config, including `vault://` and `secret://` references your own KMS-backed secret store answers.
+
+What is genuinely gone is a per-object data key that a cloud KMS unwraps on the read path. That was the cost as well as the feature: a reachable KMS became a hard requirement for reading the cache at all, and a KMS round trip sat on the read path of a tier whose entire argument is being cheaper than the origin.
+
+**Why one backend rather than two.** The other reverse proxies in this space do not ship a per-vendor object-storage cache backend at all. Kong's proxy cache stores in a shared memory dictionary, with Redis in the Enterprise `proxy-cache-advanced` plugin. APISIX's `proxy-cache` offers memory and disk. Envoy's HTTP cache filter is the closest to this design and the most instructive: storage is delegated to a pluggable backend selected by `typed_config`, and the two that ship are `SimpleHttpCache` (in-process) and `FileSystemHttpCache`. No S3 backend ships in-tree there either, and Dropbox's Envoy migration writeup names an S3-backed cache as future work behind that same plugin interface rather than as a second in-tree implementation. One storage interface with the provider behind it is the shape the ecosystem converged on; two provider-specific backends for overlapping stores is not.
 
 ### Admission filter
 
@@ -316,7 +329,7 @@ Two more report the tier's health rather than its traffic:
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `sbproxy_cache_reserve_degraded` | gauge | `backend` | `1` while the reserve is degraded, `0` while it is healthy. This is the alerting signal: a reserve that is failing every operation still serves every request, so nothing else goes red. |
+| `sbproxy_cache_reserve_degraded` | gauge | `backend` | `1` while the reserve is degraded, `0` while it is healthy. This is the alerting signal: a reserve that is failing every operation still serves every request, so nothing else goes red. `backend` names the provider (`memory`, `filesystem`, `redis`, `s3`, `gcs`, `azure`, `local`), not the client library in front of it, so an S3 reserve and an Azure one are separate series. |
 | `sbproxy_cache_reserve_health_transitions_total` | counter | `backend`, `to` | One tick per healthy-to-degraded or degraded-to-healthy edge, not one per operation. A high rate with the gauge near zero is a reserve flapping. |
 
 Each transition also publishes a `cache.reserve.health` decision-audit record (see [events.md](events.md)), so the change reaches a SIEM without a Prometheus scrape.

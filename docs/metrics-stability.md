@@ -217,10 +217,10 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_budget_share_fail_open_total` | Counter | `stable` | `beta` | `op` | Shared budget store operations that failed and fell open to per-instance enforcement, by operation: `read`, `write`, or `mirror_dropped` (a streamed settlement handed its mirror write to a detached task that never ran, which a shutting-down runtime does). |
 | `sbproxy_budget_share_unavailable` | Gauge | `stable` | `beta` | none | 1 while shared budget enforcement is degraded to per-instance tracking, 0 when the shared store answered. |
 | `sbproxy_bytes_total` | Counter | `stable` | `stable` | `origin`, `direction` | Bytes transferred. |
-| `sbproxy_cache_reserve_degraded` | Gauge | `stable` | `beta` | `backend` | Whether the configured Cache Reserve backend is degraded. |
+| `sbproxy_cache_reserve_degraded` | Gauge | `stable` | `beta` | `backend` | Whether the configured Cache Reserve backend is degraded. `backend` is the provider (`memory`, `filesystem`, `redis`, `s3`, `gcs`, `azure`, `local`, or `object_store` for a provider this build does not name), not the client library in front of it. |
 | `sbproxy_cache_reserve_errors_total` | Counter | `stable` | `beta` | `origin`, `operation` | Cache Reserve operations the backend refused, by operation (`put`, `get`, `delete`, `sweep`, `init`); the reserve is best-effort, so this is the only signal a failing cold tier gives. `init` under origin `__init__` means the backend never built, which every other reserve family reports as flat zero. |
 | `sbproxy_cache_reserve_evictions_total` | Counter | `stable` | `stable` | `origin` | Cache Reserve explicit deletions. |
-| `sbproxy_cache_reserve_health_transitions_total` | Counter | `stable` | `beta` | `backend`, `state`, `reason` | Cache Reserve backend health transitions by bounded reason. |
+| `sbproxy_cache_reserve_health_transitions_total` | Counter | `stable` | `beta` | `backend`, `state`, `reason` | Cache Reserve backend health transitions by bounded reason. `backend` carries the same closed provider vocabulary as `sbproxy_cache_reserve_degraded`. |
 | `sbproxy_cache_reserve_hits_total` | Counter | `stable` | `stable` | `origin` | Cache Reserve hits served after a hot-cache miss. |
 | `sbproxy_cache_reserve_misses_total` | Counter | `stable` | `stable` | `origin` | Cache Reserve misses (hot + reserve both empty). |
 | `sbproxy_cache_reserve_writes_total` | Counter | `stable` | `stable` | `origin` | Cache Reserve writes (admitted entries). |
