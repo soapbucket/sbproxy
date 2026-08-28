@@ -951,6 +951,11 @@ proxy:
 Each of the three duration keys is refused at startup, by name, if it is
 larger than a duration the proxy can represent.
 
+The pending queue is bounded at 5,000 and there is no key for it. Past that
+the submission route answers `429` with a named reason; terminal records are
+the durable replay refusal and the audit trail and are not counted against
+the cap. See [agent-registry.md](agent-registry.md).
+
 ### Notification fields
 
 `proxy.notifications` is the customer-facing webhook side of the event feed:

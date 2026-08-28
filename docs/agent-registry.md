@@ -145,6 +145,21 @@ its submitter permanently, so it expires after `duplicate_window_secs` and a
 resubmission then takes a fresh slot. A submission a reviewer *has* decided
 is the index's answer, and the window is not consulted for it.
 
+#### The queue is bounded
+
+At 5,000 pending registrations the route answers `429`:
+
+```json
+{"error":"the pending registration queue is at its limit of 5000; try again once a reviewer has worked it down","code":"queue_full"}
+```
+
+A queue with no bound is a disk-exhaustion primitive, and the deployment
+below, where the submission route is fronted for public self-service, is the
+one where whoever fills it need not be somebody you know. Terminal records
+are not counted against the cap: they are the durable replay refusal and the
+audit trail, and evicting them would be evicting the refusal itself. A
+reviewer working the queue down makes room.
+
 ### Deciding
 
 ```bash
