@@ -74,7 +74,7 @@ The per-request cost is bounded for the same reason and in the same place. Readi
 
 ## A reload does not cost the window
 
-A config reload keeps the running detector when the resolved `proxy.anomaly` block is unchanged, which is the common case: a reload triggered by a neighbouring file, or by an edit somewhere else in the config, leaves the baseline alone. A reload that genuinely changes `proxy.anomaly` starts over, and so does a restart.
+A config reload keeps the running detector when the resolved `proxy.anomaly` block is unchanged, which is the common case: a reload triggered by a neighboring file, or by an edit somewhere else in the config, leaves the baseline alone. A reload that genuinely changes `proxy.anomaly` starts over, and so does a restart.
 
 A reload that fails to compile changes nothing. The detector is installed after every fallible step of the config compile, so a rejected config cannot leave a security control switched off or a warmed window discarded.
 

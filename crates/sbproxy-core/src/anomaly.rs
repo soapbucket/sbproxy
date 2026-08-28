@@ -103,7 +103,7 @@
 //!
 //! A config **reload** does not cost the window. `install` keeps the
 //! running detector when the resolved settings are unchanged, which is
-//! the common case: a reload triggered by a neighbouring file, or by an
+//! the common case: a reload triggered by a neighboring file, or by an
 //! edit somewhere else in the config, leaves the baseline alone. A
 //! reload that genuinely changes `proxy.anomaly` does start over, and
 //! that is stated where an operator reads it.
@@ -856,7 +856,7 @@ static HOOK_REGISTERED: OnceLock<()> = OnceLock::new();
 ///
 /// A reload whose resolved settings match the running detector's keeps
 /// the running detector, window and all. Rebuilding unconditionally
-/// meant any reload at all, including one triggered by a neighbouring
+/// meant any reload at all, including one triggered by a neighboring
 /// file, threw away up to 28 days of baseline; a deployment reloading
 /// daily could never accumulate one.
 pub fn install(settings: Option<AnomalySettings>) {
