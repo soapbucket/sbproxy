@@ -3562,6 +3562,24 @@ mod tests {
              file the proxy opened",
         ),
         (
+            "origin_sources.entries[].path",
+            "a path inside the project repository, relative to its root, not a path on this \
+             host. It names the profile document the aggregator reads out of a clone it made \
+             itself, and nothing on this node opens it. The block is on \
+             `crate::AUTHORITY_DENIED_PATHS`, so no externally authored document sets it, and \
+             a project profile has no field that could hold it either",
+        ),
+        (
+            "origin_sources.entries[].credential",
+            "matches `file` and `path` inside the `file:/path` spelling the description lists \
+             as one accepted reference form. The value is a secret reference resolved by the \
+             process secret resolver, not a path this key opens, and the same reference \
+             vocabulary is screened by `host_backed_secret_reference` wherever an externally \
+             authored document could carry it. Here it cannot: `origin_sources` is on \
+             `crate::AUTHORITY_DENIED_PATHS` and is written only in the runtime config the \
+             operator owns, exactly like `source.credential`",
+        ),
+        (
             "source.path",
             "a path inside the repository, relative to its root, not a path on this \
              host. A fetched document's own `source:` is never handed back to git \

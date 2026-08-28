@@ -391,6 +391,66 @@
         }
       ],
       "description": "Rate of fallback_origin responses served, by origin and by which trigger fired: `status` when the primary answered with a status listed under on_status, `error` when it failed outright. Every series here is a degraded response the client received instead of the primary's. Runbook: docs/operator-runbook.md#origins. When this rises, the primary behind that origin is failing; check the Per-Origin Error Rate panel above for the status it is answering with."
+    },
+    {
+      "id": 6,
+      "title": "Project Repositories Declared under origin_sources",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 50
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": true,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "noValue": "No origin_sources block is configured on any node reporting here. Origins are hand written under origins:."
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "lastNotNull",
+            "min",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (tier, pinned) (sbproxy_origin_source_entries)",
+          "legendFormat": "{{tier}} - pinned={{pinned}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Project repositories this fleet's configuration pulls, split by runtime tier and by whether the entry is pinned to an immutable revision (a full commit sha, or a tag spelled refs/tags/<name>). Set at config load, so a step change means a config was applied rather than that a fetch happened. Two readings to act on: the total dropping to zero means a fleet that should be composing project profiles has quietly stopped, and any non-zero pinned=false series under tier=production means a node is running a document that predates the pinning rule, because config load refuses that combination outright. Runbook: docs/operator-runbook.md#origins."
     }
   ],
   "templating": {

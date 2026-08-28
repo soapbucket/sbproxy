@@ -101,6 +101,31 @@ pub struct ConfigFile {
     /// as the defaults (stable channel, no background check).
     #[serde(default)]
     pub update: UpdateConfig,
+    /// WOR-2436: what an origin is before any project has an opinion
+    /// about it.
+    ///
+    /// The same shape as one entry under `origins:`, held untyped
+    /// because the composition resolver merges `policies:`,
+    /// `transforms:`, `request_modifiers:` and `response_modifiers:`
+    /// by a `name:` key that the typed modifier structs reject
+    /// (`RequestModifierConfig` is `deny_unknown_fields` and has no
+    /// `name` field). Every entry in those four lists must carry a
+    /// `name:`, because a default has to be addressable to be
+    /// overridable, and each may carry `locked: true` to refuse a
+    /// project override. See [`crate::origin_profile`].
+    ///
+    /// Authority-writable on purpose: this block is the platform
+    /// setting a security floor, which is the whole reason it exists.
+    /// Its sibling `origin_sources` is not, and is on
+    /// [`crate::AUTHORITY_DENIED_PATHS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<serde_json::Map<String, serde_json::Value>>")]
+    pub origin_defaults: Option<serde_yaml::Mapping>,
+    /// WOR-2436: which project repositories the aggregator pulls, what
+    /// hosts each one answers on, and the environment tier the pinning
+    /// rule is judged against. See [`OriginSourcesConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_sources: Option<OriginSourcesConfig>,
 }
 
 /// One process-wide feature flag exposed to CEL.
@@ -1016,6 +1041,158 @@ fn default_source_timeout_secs() -> u64 {
 /// to resolve once at boot instead.
 fn default_source_refresh_secs() -> u64 {
     60
+}
+
+// --- Project-owned origin profiles: the runtime half (WOR-2436) ---
+
+/// Top-level `origin_sources:` block: which project repositories the
+/// aggregator pulls, and the tier its pinning rule is judged against.
+///
+/// A project repository commits a hostless origin profile
+/// ([`crate::origin_profile::OriginProfile`]). It never names a
+/// hostname, because a hostname is an environment fact. This block is
+/// where the runtime config supplies the facts the project does not
+/// have: the hosts each declared profile origin answers on, the values
+/// for the inputs the profile declares, and the last word through
+/// `overrides:`.
+///
+/// The whole block is on [`crate::AUTHORITY_DENIED_PATHS`]. `source` is
+/// denied because a fragment that can set it redirects the fleet at one
+/// repository; this block names N repositories whose Lua, WASM and JS
+/// bodies the `{{ }}` interpolator deliberately never reads, so an
+/// authority able to write it turns into arbitrary code fetch on every
+/// node that trusts it.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OriginSourcesConfig {
+    /// Which tier this runtime config document is. See
+    /// [`EnvironmentTier`].
+    #[serde(default)]
+    pub tier: EnvironmentTier,
+    /// The project repositories composed into `origins:`.
+    #[serde(default)]
+    pub entries: Vec<OriginSourceEntry>,
+}
+
+/// The tier of the runtime config document, which is what the
+/// production pinning rule keys off.
+///
+/// Deliberately a property of the runtime document rather than of an
+/// entry. A rule that read the entry own `environment:` field would be
+/// no rule at all: an entry that wants to track a branch would simply
+/// write `environment: dev` and be granted what it asked for. A
+/// self-declared constraint is not a constraint. The entry
+/// `environment:` selects which `environments:` layer of the profile
+/// applies, and nothing more.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvironmentTier {
+    /// The default. An entry may follow a branch, or pin nothing at all
+    /// and follow the default branch.
+    #[default]
+    Development,
+    /// Every entry must pin an immutable revision: a full commit sha,
+    /// or a tag spelled `refs/tags/<name>`. A bare name is refused
+    /// because git does not tell a tag from a branch by spelling, and a
+    /// rule that guessed would be a rule a branch could walk through.
+    Production,
+}
+
+impl EnvironmentTier {
+    /// The tier as the metric label and admin field an operator reads.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Development => "development",
+            Self::Production => "production",
+        }
+    }
+}
+
+/// One project repository, and the runtime facts that deploy it.
+///
+/// The git fields are the [`ConfigSource::Git`] set rather than a
+/// narrower struct of their own. Omitting `credential` would mean no
+/// private project repositories, omitting `verify_signature` would take
+/// away the check the whole pinning trust story leans on, and omitting
+/// `timeout_secs` would mean one unreachable project repository can
+/// hold a compose open.
+///
+/// Two `ConfigSource::Git` fields are deliberately absent.
+/// `refresh_interval_secs` is the aggregator poll cadence and belongs
+/// to the aggregator rather than to one entry. `confine` is absent
+/// because a project profile is **always** confined: the flag exists so
+/// an operator can opt a repository they own into the boundary, and
+/// there is no repository here the operator authored.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OriginSourceEntry {
+    /// Stable name for this entry, unique within `origin_sources`. Every
+    /// refusal the composition raises names it, so make it the name an
+    /// operator would recognize.
+    pub name: String,
+    /// Repository URL, in any form `git clone` accepts.
+    pub repo: String,
+    /// Branch, tag, or full commit sha this entry is pinned to. Absent
+    /// follows the default branch, which
+    /// [`EnvironmentTier::Production`] refuses.
+    #[serde(default)]
+    pub revision: Option<String>,
+    /// Path inside the repository to the profile document, relative to
+    /// the repository root. Conventionally `sbproxy/origin.yaml`.
+    pub path: String,
+    /// Optional credential reference for a private repository, as
+    /// `env:NAME`, `${NAME}`, `file:/path`, or `secret://backend/name`.
+    /// An inline literal is refused, exactly as `source.credential`
+    /// refuses one: a token in a config file is a token in every copy
+    /// of that file.
+    #[serde(default)]
+    pub credential: Option<String>,
+    /// Require a valid signature on the resolved tag or commit. Off by
+    /// default, because most repositories are not signed.
+    #[serde(default)]
+    pub verify_signature: bool,
+    /// Hard timeout for one fetch of this repository, in seconds.
+    #[serde(default = "default_source_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Which `environments:` layer of the profile applies. Absent means
+    /// the profile `base:` layer alone. This selects a layer and grants
+    /// nothing; see [`EnvironmentTier`].
+    #[serde(default)]
+    pub environment: Option<String>,
+    /// Hosts each declared profile origin answers on, keyed by the
+    /// profile origin name.
+    ///
+    /// A map rather than a bare list because a profile may declare more
+    /// than one origin from day one: an API host plus a webhook host is
+    /// the common case, and changing this from a list to a map later
+    /// would break every committed entry.
+    #[serde(default)]
+    pub hosts: std::collections::BTreeMap<String, Vec<String>>,
+    /// Values for the inputs the profile declares.
+    ///
+    /// A value lands in the profile document through `{{vars.NAME}}`
+    /// and is then checked as document text, so a host-backed secret
+    /// reference (`env:NAME`, `file:/path`, `vault://env/NAME`) is
+    /// refused here just as it is refused anywhere else in an
+    /// externally authored document. Supply a provider URI
+    /// (`secret://backend/name`) instead: it resolves only against a
+    /// backend the operator declared under `proxy.secrets`, which is a
+    /// path no project can write.
+    #[serde(default)]
+    #[schemars(with = "std::collections::BTreeMap<String, serde_json::Value>")]
+    pub inputs: std::collections::BTreeMap<String, serde_yaml::Value>,
+    /// The runtime last word for this entry, layered after everything
+    /// the project wrote.
+    ///
+    /// Same untyped origin shape as `origin_defaults`, and merged the
+    /// same way. The runtime bookends the stack, so a project can be
+    /// given room without being given the last word.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<serde_json::Map<String, serde_json::Value>>")]
+    pub overrides: Option<serde_yaml::Mapping>,
 }
 
 // --- Agent-class top-level config ---

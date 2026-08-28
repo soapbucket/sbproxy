@@ -1,0 +1,69 @@
+# Project-owned origin profiles: the project half.
+#
+# This is what the checkout team commits at sbproxy/origin.yaml in its
+# own repository. It is not a config file the proxy loads; the
+# aggregator reads it and composes it against the runtime config.
+#
+# It never names a hostname. There is no field that could hold one.
+
+name: checkout
+
+# What this service needs from whoever deploys it. An unbound input with
+# no default is a resolve error naming both the input and the entry, not
+# a warning and not literal passthrough.
+inputs:
+  - name: upstream_key
+    description: credential the proxy presents to the checkout upstream
+  - name: region
+    description: which regional upstream to send to
+    default: us-east-1
+
+spec:
+  api:
+    # The layer that applies in every environment.
+    base:
+      action:
+        type: proxy
+        upstream: "https://checkout-{{vars.region}}.internal.example.com"
+      authentication:
+        type: api_key
+        # The shape is the project's. The reference is the entry's.
+        # A literal here is refused, and so is `env:NAME`.
+        api_key: "{{vars.upstream_key}}"
+      policies:
+        # Merged by name against origin_defaults. The fields this entry
+        # does not mention survive from the floor.
+        - name: rate_limit
+          requests_per_minute: 1200
+        # A name the floor does not carry is appended after it.
+        - name: checkout_quota
+          type: quota
+          per_key_per_day: 50000
+      request_modifiers:
+        - name: service_headers
+          headers:
+            set:
+              X-Service: checkout
+      cors:
+        allowed_origins:
+          - https://shop.example.com
+        allowed_methods: [GET, POST]
+    environments:
+      # Structural differences only. Selected by the entry's
+      # `environment:` field.
+      prod:
+        action:
+          timeout_ms: 1500
+      staging:
+        action:
+          upstream: https://checkout-staging.internal.example.com
+  webhooks:
+    base:
+      action:
+        type: proxy
+        upstream: https://checkout-hooks.internal.example.com
+      policies:
+        # An unnamed entry in a project profile is always an addition.
+        - type: ip_filter
+          allow:
+            - 203.0.113.0/24

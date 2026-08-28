@@ -3626,6 +3626,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_origin_source_entries",
+        kind: MetricKind::Gauge,
+        writer: Writer::Recorder("set_origin_source_entries"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["tier", "pinned"],
+        description: "Project repositories declared under origin_sources, by runtime tier and whether the entry is pinned to an immutable revision.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_outbound_request_duration_seconds",
         kind: MetricKind::Histogram,
         writer: Writer::Recorder("record_outbound_request_duration"),

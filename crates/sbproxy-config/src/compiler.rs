@@ -1778,6 +1778,46 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         }
     }
 
+    // WOR-2436: both composition blocks are checked here rather than in
+    // the aggregator, so `sbproxy validate`, `sbproxy plan` and boot all
+    // inherit the same refusals. An operator learns that a production
+    // entry follows a branch, or that two project repositories claim the
+    // same hostname, before anything has been fetched.
+    if let Some(defaults) = config_file.origin_defaults.as_ref() {
+        crate::origin_profile::validate_origin_defaults(defaults)
+            .map_err(|error| anyhow::anyhow!("config compile: {error}"))?;
+    }
+    if let Some(sources) = config_file.origin_sources.as_ref() {
+        crate::origin_profile::validate_origin_sources(sources)
+            .map_err(|error| anyhow::anyhow!("config compile: {error}"))?;
+        let hand_written: std::collections::BTreeSet<String> =
+            config_file.origins.keys().cloned().collect();
+        let claims = crate::origin_profile::claimed_hosts(&sources.entries, &hand_written)
+            .map_err(|error| anyhow::anyhow!("config compile: {error}"))?;
+        let tier = sources.tier.as_str();
+        let pinned = sources
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .revision
+                    .as_deref()
+                    .is_some_and(crate::origin_profile::revision_is_immutable)
+            })
+            .count();
+        let unpinned = sources.entries.len().saturating_sub(pinned);
+        sbproxy_observe::metrics::set_origin_source_entries(tier, true, pinned as i64);
+        sbproxy_observe::metrics::set_origin_source_entries(tier, false, unpinned as i64);
+        tracing::info!(
+            tier,
+            entries = sources.entries.len(),
+            pinned,
+            unpinned,
+            claimed_hosts = claims.len(),
+            "origin_sources declared; composition runs in the aggregator, not on this node"
+        );
+    }
+
     if config_file
         .proxy
         .http3

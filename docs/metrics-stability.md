@@ -354,6 +354,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_origin_active_connections` | Gauge | `stable` | `beta` | `origin` | In-flight requests per origin. |
 | `sbproxy_origin_request_duration_seconds` | Histogram | `stable` | `beta` | `origin`, `method`, `status` | Request latency per origin. |
 | `sbproxy_origin_requests_total` | Counter | `stable` | `beta` | `origin`, `method`, `status` | Total HTTP requests per origin. |
+| `sbproxy_origin_source_entries` | Gauge | `stable` | `beta` | `tier`, `pinned` | Project repositories declared under origin_sources, by runtime tier and whether the entry is pinned to an immutable revision. |
 | `sbproxy_outbound_request_duration_seconds` | Histogram | `stable` | `beta` | `host`, `method`, `status` | Wall-clock latency of one outbound upstream request. |
 | `sbproxy_payment_provider_calls_total` | Counter | `stable` | `beta` | `rail`, `operation`, `provider_class` | Payment provider calls that left the process, by rail, operation, and provider class. |
 | `sbproxy_payment_rail_enabled` | Gauge | `stable` | `beta` | `rail` | 1 for each settlement rail this build compiled and this configuration registered, 0 otherwise. |
