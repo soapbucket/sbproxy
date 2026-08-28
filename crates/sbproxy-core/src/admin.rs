@@ -3480,6 +3480,62 @@ fn handle_config_history_list() -> (u16, &'static str, String) {
     (200, "application/json", body.to_string())
 }
 
+/// `GET /admin/config/fallback`: whether this node is serving a config
+/// its boot fallback restored from the revision ring, and which one
+/// (WOR-2459).
+///
+/// Always answers, on every node, including one that never enabled the
+/// ring: "am I running what I was told to run" is a question an operator
+/// must be able to ask without first knowing whether a feature is
+/// switched on, and answering `404` there would read as "I do not know".
+fn handle_config_fallback_status() -> (u16, &'static str, String) {
+    let pinned = crate::config_boot::pinned_revision();
+    let body = serde_json::json!({
+        "active": crate::config_boot::on_fallback(),
+        "revision": pinned.as_ref().map(|pin| pin.revision),
+        "digest": pinned.as_ref().map(|pin| pin.digest.clone()),
+        // Named rather than implied: an operator reading this is
+        // deciding whether their edit to the config file will do
+        // anything, and the answer is no until they clear the pin.
+        "suspended": if crate::config_boot::on_fallback() {
+            serde_json::json!(["file_watcher", "sighup", "config_refresh_poller"])
+        } else {
+            serde_json::json!([])
+        },
+    });
+    (200, "application/json", body.to_string())
+}
+
+/// `DELETE /admin/config/fallback`: clear the pin and resume the
+/// suspended reload paths (WOR-2459).
+///
+/// The file watcher, SIGHUP, and the `source:` refresh poller check the
+/// pin on every cycle rather than being torn down at boot, precisely so
+/// this can bring them back without a restart. `sbproxy_config_fallback_active`
+/// returns to 0 in the same call.
+///
+/// `409` when nothing is pinned: clearing a pin that does not exist is a
+/// caller bug, and answering `200` would tell an operator their node is
+/// back on its config file when it was never off it.
+fn handle_config_fallback_clear() -> (u16, &'static str, String) {
+    match crate::config_boot::clear_fallback() {
+        Some(pin) => {
+            let body = serde_json::json!({
+                "cleared": true,
+                "revision": pin.revision,
+                "digest": pin.digest,
+                "resumed": ["file_watcher", "sighup", "config_refresh_poller"],
+            });
+            (200, "application/json", body.to_string())
+        }
+        None => (
+            409,
+            "application/json",
+            r#"{"error":"this node is not pinned to a fallback configuration"}"#.to_string(),
+        ),
+    }
+}
+
 /// `POST /admin/config/confirm`: promote the revision under soak
 /// immediately, without waiting out its window (WOR-2458).
 ///
@@ -6085,6 +6141,21 @@ pub fn handle_admin_request(
     if path_only == "/admin/config/history" {
         if method.eq_ignore_ascii_case("GET") {
             return handle_config_history_list();
+        }
+        return (
+            405,
+            "application/json",
+            r#"{"error":"method not allowed"}"#.to_string(),
+        );
+    }
+    // WOR-2459: the boot fallback pin. GET reads it, DELETE clears it
+    // and resumes the suspended reload paths.
+    if path_only == "/admin/config/fallback" {
+        if method.eq_ignore_ascii_case("GET") {
+            return handle_config_fallback_status();
+        }
+        if method.eq_ignore_ascii_case("DELETE") {
+            return handle_config_fallback_clear();
         }
         return (
             405,
@@ -11954,6 +12025,72 @@ mod tests {
             provenance: BaseOrigin::Local,
             rejected_at: at,
         }
+    }
+
+    /// WOR-2459. The fallback pin is readable on every node, and
+    /// clearing it is refused when nothing is pinned.
+    #[test]
+    fn config_fallback_route_reports_and_clears_the_pin() {
+        crate::config_boot::reset_for_test();
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+
+        let (status, _, _) =
+            handle_admin_request("GET", "/admin/config/fallback", &state, None, None);
+        assert_eq!(
+            status, 401,
+            "the pin is behind the admin auth like everything else"
+        );
+        let (status, _, _) =
+            handle_admin_request("POST", "/admin/config/fallback", &state, Some(&auth), None);
+        assert_eq!(status, 405);
+
+        // Nothing pinned: answers, rather than 404ing, because "am I
+        // running what I was told to run" must be askable on any node.
+        let (status, _, body) =
+            handle_admin_request("GET", "/admin/config/fallback", &state, Some(&auth), None);
+        assert_eq!(status, 200);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(parsed["active"], false);
+        assert_eq!(parsed["suspended"].as_array().expect("array").len(), 0);
+
+        let (status, _, body) = handle_config_fallback_clear();
+        assert_eq!(
+            status, 409,
+            "clearing a pin that does not exist is a caller bug"
+        );
+        assert!(body.contains("not pinned"), "{body}");
+
+        crate::config_boot::mark_on_fallback(crate::config_boot::PinnedRevision {
+            revision: 12,
+            digest: "cafe".to_string(),
+        });
+        let (status, _, body) =
+            handle_admin_request("GET", "/admin/config/fallback", &state, Some(&auth), None);
+        assert_eq!(status, 200);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(parsed["active"], true);
+        assert_eq!(parsed["revision"], 12);
+        assert_eq!(parsed["digest"], "cafe");
+        let suspended: Vec<&str> = parsed["suspended"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|value| value.as_str().expect("string"))
+            .collect();
+        assert_eq!(
+            suspended,
+            vec!["file_watcher", "sighup", "config_refresh_poller"],
+            "config_authority is deliberately absent: a fleet-wide fix is how this ends",
+        );
+
+        let (status, _, body) = handle_config_fallback_clear();
+        assert_eq!(status, 200);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(parsed["cleared"], true);
+        assert_eq!(parsed["revision"], 12);
+        assert!(!crate::config_boot::on_fallback());
+        crate::config_boot::reset_for_test();
     }
 
     /// WOR-2458. Confirming is a mutation, so it is POST only and

@@ -546,6 +546,19 @@ impl SourcePoller {
             }
         };
 
+        // WOR-2459: suspended while the node is pinned to a
+        // configuration its boot fallback restored. The poller reloads
+        // from the same `source:` pointer the broken local file names,
+        // so leaving it live would undo the rescue on its next tick.
+        // Checked per cycle rather than by not starting the poller, so
+        // clearing the pin resumes it without a restart.
+        if crate::config_boot::reload_suspended("config_refresh_poller") {
+            tracing::debug!(
+                kind = self.kind,
+                "the config source refresh poller is suspended while this node is pinned to a                  fallback configuration",
+            );
+            return SourceCycle::NotModified;
+        }
         let outcome = crate::server::try_reload_from_config_yaml(
             &self.config_path,
             &effective,

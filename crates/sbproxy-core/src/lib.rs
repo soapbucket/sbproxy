@@ -112,6 +112,10 @@ pub mod compression_value;
 /// does, sign it, store it under a monotonic revision, and serve it to
 /// subscribers on a listener of its own.
 pub mod config_authority;
+/// Config-authority subscriber: pull signed configuration from an
+/// upstream authority, verify it, merge it over the base document, and
+/// apply it through the shared reload transaction.
+pub mod config_boot;
 /// What configuration is actually running on this node, which layer owns
 /// each part of it, and whether a proposed write to the local file would
 /// survive the next poll or be silently swallowed.
@@ -125,9 +129,6 @@ pub mod config_gossip;
 /// every config this process applies, recorded once by the shared
 /// reload transaction, and read back by the admin history surface.
 pub mod config_history;
-/// Config-authority subscriber: pull signed configuration from an
-/// upstream authority, verify it, merge it over the base document, and
-/// apply it through the shared reload transaction.
 pub mod config_soak;
 /// Honouring `source:`: resolve the config document from a git
 /// repository (or an overlay chain over one), keep it fresh on a timer,
