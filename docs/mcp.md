@@ -1,6 +1,6 @@
 # MCP gateway
 
-*Last modified: 2026-08-27*
+*Last modified: 2026-08-28*
 
 SBproxy ships an MCP (Model Context Protocol) gateway that speaks
 JSON-RPC 2.0 over HTTP POST. Configure the `mcp` action on an origin
@@ -1271,6 +1271,9 @@ walks through that same fixture end to end, including a real
   flip.
 - [`agent-skills.md`](agent-skills.md): Agent Skills manifest
   advertised via `experimental.agentSkillsUrl`.
+- [`cedar-policy.md`](cedar-policy.md): Cedar ABAC on federated
+  `tools/call`. Compile at load, empty entity store, Confirm as a
+  labelled refusal. Runnable: [`examples/cedar-mcp-full/`](../examples/cedar-mcp-full/).
 - [`features.md`](features.md): feature overview that covers the
   MCP gateway in context.
 - [`scripting.md`](scripting.md): CEL, Lua, JavaScript, and WASM

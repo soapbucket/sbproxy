@@ -30,19 +30,6 @@ tokio = { workspace = true, features = ["fs", "sync", "macros", "rt"] }
 redis = { workspace = true, features = ["connection-manager"] }
 base64.workspace = true
 
-# S3 + KMS cache-reserve backend (WOR-2673): envelope-encrypted cold
-# tier for the response cache. `default-features = false` plus
-# `default-https-client` keeps the TLS stack on the hyper-rustls 0.27 /
-# rustls-webpki 0.103 path `sbproxy-vault` already pinned for its
-# Secrets Manager client (see that crate's Cargo.toml); the legacy
-# `rustls` feature would instead lock the vulnerable rustls-webpki
-# 0.101.7 already tracked in this workspace's deny.toml. Verify with
-# `cargo tree -e features -i hyper-rustls`, which shows the 0.27 copy
-# reached through aws-smithy-http-client's `default-https-client`.
-aws-config = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
-aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
-aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
-
 # WOR-2673: the object-storage reserve backend. Already a workspace
 # dependency driving the storage action, the ACME cert store, and the AI
 # usage sink, so this adds no new external crate; it buys S3, GCS, Azure
@@ -54,13 +41,3 @@ futures = { workspace = true }
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
-
-# Mocks the AWS SDK's HTTP layer for the S3 + KMS reserve backend's
-# tests, so they exercise the real request-building and
-# response-parsing code paths without a live S3 or KMS endpoint.
-aws-smithy-mocks = "0.2"
-# `test-util` enables the SDK's `with_test_defaults_v2` plumbing that
-# `aws_smithy_mocks::mock_client!` relies on.
-aws-smithy-runtime = { version = "1", features = ["test-util"] }
-aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client", "behavior-version-latest", "test-util"] }
-aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client", "behavior-version-latest", "test-util"] }

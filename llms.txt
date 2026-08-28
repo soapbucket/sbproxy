@@ -24,7 +24,8 @@ Most teams run nginx or Traefik for HTTP traffic, a separate thing for MCP, and 
 - Getting Started: https://github.com/soapbucket/sbproxy/blob/main/docs/getting-started.md
 - Manual: https://github.com/soapbucket/sbproxy/blob/main/docs/manual.md
 - Configuration: https://github.com/soapbucket/sbproxy/blob/main/docs/configuration.md
-- Features: https://github.com/soapbucket/sbproxy/blob/main/docs/features.md
+- All-traffic gateway: https://github.com/soapbucket/sbproxy/blob/main/docs/all-traffic-gateway.md
+- Features (catalog stub): https://github.com/soapbucket/sbproxy/blob/main/docs/features.md
 - AI Gateway: https://github.com/soapbucket/sbproxy/blob/main/docs/ai-gateway.md
 - AI Context Compression: https://github.com/soapbucket/sbproxy/blob/main/docs/ai-context-compression.md
 - AI Crawl Control + Pay Per Crawl: https://github.com/soapbucket/sbproxy/blob/main/docs/ai-crawl-control.md
@@ -35,7 +36,9 @@ Most teams run nginx or Traefik for HTTP traffic, a separate thing for MCP, and 
 - Architecture: https://github.com/soapbucket/sbproxy/blob/main/docs/architecture.md
 - Performance: https://github.com/soapbucket/sbproxy/blob/main/docs/performance.md
 - Scripting: https://github.com/soapbucket/sbproxy/blob/main/docs/scripting.md
-- Comparison: https://github.com/soapbucket/sbproxy/blob/main/docs/comparison.md
+- gRPC: https://github.com/soapbucket/sbproxy/blob/main/docs/grpc.md
+- Cedar policy: https://github.com/soapbucket/sbproxy/blob/main/docs/cedar-policy.md
+- Comparison (pinned rows): https://github.com/soapbucket/sbproxy/blob/main/docs/comparison.md
 - Troubleshooting: https://github.com/soapbucket/sbproxy/blob/main/docs/troubleshooting.md
 - Upgrade Guide: https://github.com/soapbucket/sbproxy/blob/main/docs/upgrade.md
 - Observability: https://github.com/soapbucket/sbproxy/blob/main/docs/observability.md

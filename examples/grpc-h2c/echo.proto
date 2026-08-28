@@ -1,0 +1,21 @@
+// Minimal echo service for the grpc-h2c example fixture.
+//
+// Same package and unary method as e2e/proto/echo.proto so a
+// FileDescriptorSet compiled from this file binds the same
+// transcode route the e2e suite uses: sbproxy_e2e.echo.Echo.Hello.
+
+syntax = "proto3";
+
+package sbproxy_e2e.echo;
+
+service Echo {
+  rpc Hello(EchoRequest) returns (EchoResponse);
+}
+
+message EchoRequest {
+  string message = 1;
+}
+
+message EchoResponse {
+  string message = 1;
+}

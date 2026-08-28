@@ -456,7 +456,7 @@ proxy:
 | `notifications` | object | unset | Outbound webhook subscriptions with per-destination filters, signing keys, retries, and a durable deadletter queue. Boot-only. See [Notification fields](#notification-fields). |
 | `l2_cache_settings` | object | | Optional shared-state backend. Alias: `l2_cache`. |
 | `anomaly` | object | unset | Behavioral anomaly detection over the TLS fingerprint, resolver source, headless-library signal, and per-address rate, plus the per-agent-class reputation score it feeds and the optional admission thresholds that read it. Disabled by default. See [anomaly-detection.md](anomaly-detection.md). |
-| `cache_reserve` | object | unset | Optional cold-tier response cache backed by memory, filesystem, Redis, object storage (S3, GCS, Azure Blob, or a local directory) with optional at-rest sealing, or S3 with AWS KMS envelope encryption. See [cache-reserve.md](cache-reserve.md). |
+| `cache_reserve` | object | unset | Optional cold-tier response cache backed by memory, filesystem, Redis, or object storage (S3, GCS, Azure Blob, a local directory, or any S3-compatible store) with optional at-rest sealing. The separate `type: s3` backend is retired and refused at config load; see [cache-reserve.md](cache-reserve.md). |
 | `compression_state` | object | unset | Process-owned Local AI summary-state path. See [compression_state](#compression_state). |
 | `config_history` | object | unset | Durable local ring of every applied config revision, kept for inspection and future rollback. Disabled by default. See [config_history](#config_history). |
 | `response_cache_store` | object | unset | Picks the backing store for the shared response cache and optionally encrypts entries at rest. See [Choosing the backing store](#choosing-the-backing-store). When unset, the store is Redis if `l2_cache_settings` is configured and an in-process map otherwise. |
@@ -1822,7 +1822,8 @@ origins:
 | `deprecation` | object | | RFC 9745 `Deprecation` + RFC 8594 `Sunset` announcement for every route this origin serves. Also accepted per forward rule, where it overrides this block. See [API deprecation](#api-deprecation-rfc-9745--rfc-8594). |
 | `traffic_capture` | object | | Not supported. Setting it fails config load. Use `mirror` for live request mirroring. |
 | `message_signatures` | object | | RFC 9421 HTTP message signatures. |
-| `olp` | object | | RSL Open License Protocol token issuer and public-key endpoints. |
+| `olp` | object | | RSL Open License Protocol token issuer and public-key endpoints. `token_rate_limit_per_minute` (default 60, `0` refused) budgets `POST /.well-known/olp/token` per source IP: that endpoint is unauthenticated and mints a bearer license token per call. See [comp-marketplace.md](comp-marketplace.md#the-olp-token-endpoints-budget). |
+| `comp` | object | | IAB CoMP marketplace bridge: `/.well-known/iab-comp/{manifest.json,quote,redeem}` on this origin, minting license tokens with the `olp` block's key. Requires `olp.enabled`. See [comp-marketplace.md](comp-marketplace.md). |
 | `web_bot_auth_publish` | object | | Publish a Web Bot Auth key directory and Signature Agent Card on this origin. |
 | `idempotency` | object | | `Idempotency-Key` middleware. See [Idempotency](#idempotency). |
 | `connection_pool` | object | | Only `idle_timeout_secs` is read, as the legacy spelling of `timeouts.idle_ms`. `max_connections` and `max_lifetime_secs` fail config load. See [Connection pool](#connection-pool). |
@@ -2276,7 +2277,7 @@ origins:
 | `grpc_web` | bool | false | Allow browser gRPC-Web clients (HTTP/1.1 with base64 or binary framing) to reach the native gRPC upstream. |
 | `transcode` | object | unset | REST-to-gRPC transcoding: `descriptor_set` (path to a compiled protobuf `FileDescriptorSet`) and `routes[]`, each a `{method, path, grpc_method, body}` binding an HTTP route to a unary gRPC call. `path` uses `google.api.http`-style templates; `body` names the field the HTTP body decodes into, or is omitted (or `"*"`) to decode the whole body as the request message. |
 
-`grpc_web` and `transcode` both read the gRPC message frames, so both send `grpc-accept-encoding: identity` upstream and neither supports gRPC message compression. There is no field to change that. Plain passthrough (neither field set) forwards frames untouched and is unaffected. See [gRPC limits](routing.md#grpc-limits).
+`grpc_web` and `transcode` both read the gRPC message frames, so both send `grpc-accept-encoding: identity` upstream and neither supports gRPC message compression. There is no field to change that. Plain passthrough (neither field set) forwards frames untouched and is unaffected. Dedicated page: [grpc.md](grpc.md). Limits: [gRPC limits](routing.md#grpc-limits). Runnable at [`examples/grpc-h2c/`](../examples/grpc-h2c/).
 
 ### ai_proxy
 
@@ -3071,6 +3072,7 @@ origins:
 | `dual_llm_quarantine` | object | unset | Optional LLM review gate for suspicious tool output. |
 | `tool_pricing` | map | `{}` | USD price per advertised tool name for cost attribution. |
 | `usage_sinks` | list | `[]` | JSONL, webhook, ledger, Langfuse, or Datadog tool-usage destinations. |
+| `cedar_policies` | object | unset | Optional Cedar ABAC set compiled at config load and installed as a built-in MCP `tools/call` hook. `policies` is the Cedar source (required). `schema_override` appends workspace schema that must not collide with the default MCP schema. Match `principal == Agent::"<id>"` (or `Agent::"anonymous"`); `principal in AgentClass::"..."` never matches because the hook evaluates against an empty entity store. Confirm-annotated forbids currently refuse with `confirmation required: …`; there is no parked-approval flow. Does not run on `type: local` tools. See [cedar-policy.md](cedar-policy.md). |
 
 See [mcp.md](mcp.md) for federation, RBAC, OpenAPI-backed tools, sessions,
 versioning, and cost attribution, and [mcp-compose.md](mcp-compose.md) for
@@ -3461,6 +3463,8 @@ authentication:
 ```
 
 The algorithm is negotiated, not merely declared. The challenge carries `algorithm=`, and a response that names a different algorithm, or omits the parameter on a SHA-256 realm, is rejected. A client cannot talk a SHA-256 realm down to MD5 by dropping the parameter. Only `SHA-256` and `MD5` are implemented; the `-sess` variants and `SHA-512-256` are refused at config compile rather than silently downgraded.
+
+A runnable SHA-256 challenge, a successful `curl --digest` retry, and a wrong-password 401 are in [`examples/auth-digest/`](../examples/auth-digest/).
 
 ### hmac_auth
 
@@ -4213,7 +4217,7 @@ The intake accepts up to 64 KiB per report via `POST /__sbproxy/csp-report` and 
 
 ### dlp
 
-Data Loss Prevention scan over the request URI and headers. Matches against the configured detector catalog (or every default when `detectors: []`) and either tags the upstream request with `dlp-detection: <names>` (`action: tag`, default) or rejects with `403` (`action: block`).
+Data Loss Prevention scan over the request URI and headers. Matches against the configured detector catalog (or every default when `detectors: []`) and either tags the upstream request with `dlp-detection: <names>` (`action: tag`, default) or rejects with `403` (`action: block`). The scan does not mask or rewrite anything it finds; `action: tag` stamps a header, `action: block` refuses. `replacement` on a custom `rules:` entry is accepted because the rule type is shared with the `pii:` redactor, and DLP does not apply it. Response bodies are out of scope. Runnable at [`examples/dlp-catalog/`](../examples/dlp-catalog/).
 
 ```yaml
 policies:
@@ -4235,13 +4239,13 @@ policies:
 | `action` | string | `tag` | `tag` stamps `<header>: <detector_csv>` on the upstream. `block` returns `403`. |
 | `direction` | string | `request` | `request` is the only path enforced today; `response` and `both` are accepted for forward compatibility. |
 | `header` | string | `dlp-detection` | Header name when `action: tag`. |
-| `scan_body` | bool | `true` | Include the buffered request body in the scan, in addition to the URI and headers. |
-| `body_max_bytes` | int | `16384` | Maximum bytes of the request body scanned when `scan_body` is true. |
+| `scan_body` | bool | `true` | When the snapshot carries a body, include it in the scan. The live request-filter chain currently always snapshots an empty body, so this knob does not change what an operator sees on the wire today. |
+| `body_max_bytes` | int | `16384` | Maximum bytes of that body scanned when `scan_body` is true and a body is present in the snapshot. |
 | `rules` | list | `[]` | Custom regex rules layered on top of the catalog. Same shape as the `pii.rules` block on `ai_proxy` origins. |
 
-The scan covers the request URI (path + query), request headers, and, unless `scan_body: false`, the buffered request body. Auth-class headers (`Authorization`, `Cookie`, `Set-Cookie`) are excluded so tokens carried by design don't self-flag. The body is capped at `body_max_bytes` and decoded lossily, so a non-text payload with a regulated shape near the head is still caught.
+The scan covers the request URI (path + query) and request headers. Auth-class headers (`Authorization`, `Cookie`, `Set-Cookie`) are excluded so tokens carried by design don't self-flag. `scan_body` defaults true and `body_max_bytes` defaults 16384; those knobs are what the enforcer uses when a body is present in the snapshot it receives. The request-filter policy chain currently snapshots with an empty body and DLP does not opt into body buffering, so a secret that appears only in the POST body is not seen. URI and header matches still fire.
 
-Every hit also carries bounded detection spans: an entity type plus a byte offset and length for each match, never the matched value itself. Offsets are relative to the segment that produced the span: the URI text (path + query), the individual header value that matched, or the capped, lossily decoded body text. A span does not name its segment, so treat offsets as evidence within one of those three coordinate spaces rather than positions in the raw request. The merged list is capped at 32 spans across the whole scan, filled round-robin across the URI, header, and body matches so no one segment can crowd the others out of the cap; everything past the cap is counted, not carried. `action: block` folds a compact summary of the count (and how many were dropped past the cap) into the `403` message, which is also what lands in the admin console's per-request `deny_reason` column.
+Every hit also carries bounded detection spans: an entity type plus a byte offset and length for each match, never the matched value itself. Offsets are relative to the segment that produced the span: the URI text (path + query), the individual header value that matched, or the capped, lossily decoded body text when a body is in the snapshot. A span does not name its segment, so treat offsets as evidence within one of those three coordinate spaces rather than positions in the raw request. The merged list is capped at 32 spans across the whole scan, filled round-robin across the URI, header, and body matches so no one segment can crowd the others out of the cap; everything past the cap is counted, not carried. `action: block` folds a compact summary of the count (and how many were dropped past the cap) into the `403` message, which is also what lands in the admin console's per-request `deny_reason` column.
 
 ### prompt_injection_v2
 

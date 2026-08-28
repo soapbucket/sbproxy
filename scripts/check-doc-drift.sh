@@ -390,9 +390,6 @@ breakdown_claims = 0
 # below so an exception that stops matching anything is reported rather
 # than quietly covering nothing.
 NOT_OUR_CATALOG: dict[tuple[str, str], str] = {
-    ("docs/comparison.md", "100+ providers"): "LiteLLM's catalog, in the comparison table",
-    ("docs/comparison.md", "100+ native providers"): "LiteLLM's catalog, in the prose above the table",
-    ("docs/comparison.md", "100+ LLM providers"): "LiteLLM's catalog, in the LiteLLM section",
     ("docs/admin-api-reference.md", "10 provider"): (
         "a sample-size floor for a latency estimate, not a catalog size: "
         "'inactive until at least 10 provider attempts contribute'"

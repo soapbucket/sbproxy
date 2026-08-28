@@ -5337,7 +5337,7 @@ fn emit_policy_verdict_with_outcome(
             );
             if let Err(_dropped) = crate::policy_bus::try_publish(event) {
                 // Bus full or not yet installed; the dropped-events metric is
-                // the paging signal per `docs/adr-policy-audit-binding.md`. The
+                // the paging signal per `docs/events.md`. The
                 // drop counter is per tenant on purpose: one noisy tenant
                 // filling the queue must not silently degrade another tenant's
                 // audit trail, which it would if this were keyed on the always
@@ -7058,7 +7058,7 @@ pub(crate) mod a2a_body_phase;
 // The ProxyHttp trait impl lives in the `proxy_http` submodule
 //. A trait impl needs no re-import to take effect.
 mod proxy_http;
-mod request_phase;
+pub(crate) mod request_phase;
 
 // --- Access log emission helpers ---
 //

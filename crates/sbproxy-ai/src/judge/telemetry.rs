@@ -1,7 +1,7 @@
 //! Prometheus metrics for the judge backend.
 //!
 //! Four metrics are registered, matching the OSS-scoped subset of the
-//! telemetry surface from `adr-judge-trait.md`:
+//! telemetry surface from `docs/policy.md`:
 //!
 //! | Metric | Type | Labels |
 //! |---|---|---|
