@@ -24,9 +24,13 @@
 #
 # The generator half needs the workspace binaries in target/debug. It
 # reuses them rather than re-entering cargo with a `-p` selection, which
-# would resolve a different feature union and recompile the graph. Without
-# a build it names what it could not re-derive and exits non-zero, rather
-# than reporting those files as current.
+# would resolve a different feature union and recompile the graph. It also
+# refuses a binary older than anything it is built from, which after a
+# merge from main is the normal case: a stale generator reproduces
+# pre-merge output, and copying that over a freshly merged file while
+# printing MOVED is worse than doing nothing. Either way it names what it
+# could not re-derive and exits non-zero, rather than reporting those files
+# as current.
 
 set -uo pipefail
 
@@ -73,6 +77,30 @@ rederive_generated() {
   if [ ! -x "$prebuilt" ]; then
     printf '  \033[1;33mskip\033[0m    %s (no %s in %s/debug)\n' \
       "$label" "$bin" "$target_dir"
+    NEEDS_BUILD+=("$label")
+    return 0
+  fi
+
+  # Existence is not freshness, and this script runs at the one moment
+  # freshness is least likely: right after a merge from main, when
+  # target/debug holds binaries built from the pre-merge tree.
+  #
+  # Both failure modes are silent without this. In write mode, main lands a
+  # new metric family and its regenerated table, the stale binary
+  # reproduces the pre-merge output, and the script copies a revert of
+  # main's regeneration over the freshly merged file and prints MOVED. In
+  # --check mode the stale binary reproduces the old content, which matches
+  # the old committed file, and the line printed is `ok`, which is the
+  # exact false green this script exists to prevent.
+  #
+  # So: if anything the generator is built from is newer than the
+  # generator, the binary is not authoritative. `find -newer` is a per-inode
+  # mtime comparison, so this costs milliseconds.
+  local newer
+  newer="$(find crates Cargo.toml Cargo.lock -newer "$prebuilt" -print 2>/dev/null | head -1)"
+  if [ -n "$newer" ]; then
+    printf '  \033[1;33mskip\033[0m    %s (%s is older than %s)\n' \
+      "$label" "$bin" "$newer"
     NEEDS_BUILD+=("$label")
     return 0
   fi
@@ -286,7 +314,9 @@ if [ "${#NEEDS_BUILD[@]}" -gt 0 ]; then
   for item in "${NEEDS_BUILD[@]}"; do
     printf '  * %s\n' "$item"
   done
-  printf '\nBuild the workspace once in this worktree and re-run:\n\n'
+  printf '\nThese were NOT checked and are NOT known to be current. Build the\n'
+  printf 'workspace in this worktree, which is what makes the generators match\n'
+  printf 'the merged tree, and re-run:\n\n'
   printf '  cargo build --workspace --exclude sbproxy-e2e --locked\n'
 fi
 printf -- '------------------------------------------------------------------------\n'
