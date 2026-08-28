@@ -16329,7 +16329,7 @@ pub(super) async fn relay_ai_response_with_cache(
         // gone. The error itself is attributed downstream by the writer;
         // this is the half that needs the request context, which the
         // shared writer does not have.
-        if let Some(context) = ctx.as_deref_mut() {
+        if let Some(context) = ctx {
             context.ai_upstream_cancelled_on_client_disconnect = true;
         }
     }
