@@ -565,6 +565,17 @@ mod runtime {
                 let (Some(provider), Some(model)) = (&ctx.ai_provider, &ctx.ai_model) else {
                     return Vec::new();
                 };
+                // WOR-2622: a streamed response whose provider sent no
+                // usage frame carries this gateway's own tokenizer count
+                // on `ai_tokens_*`, marked `estimated`. Those counts move
+                // the operator's caps; they must never become an invoiced
+                // quantity, because the customer's bill has to be a
+                // number the provider stands behind. An estimate reports
+                // no row at all rather than a row nobody can defend in a
+                // dispute.
+                if ctx.ai_usage_source == Some("estimated") {
+                    return Vec::new();
+                }
                 map_ai(
                     &binding.unit,
                     provider,
@@ -734,6 +745,59 @@ mod runtime {
             .map(String::as_str)
             .filter(|value| !value.trim().is_empty())
             .map(str::to_string)
+    }
+
+    #[cfg(test)]
+    mod estimated_usage_tests {
+        use super::*;
+
+        fn ai_binding() -> UsageBinding {
+            UsageBinding {
+                reporter: "stripe_meter".to_string(),
+                event_name: "ai_tokens".to_string(),
+                customer_field: "stripe_customer_id".to_string(),
+                customer_attribute: "stripe_customer_id",
+                source: UsageSource::Ai,
+                unit: sbproxy_config::payments::USAGE_UNIT_TOTAL_TOKENS.to_string(),
+            }
+        }
+
+        fn ai_context(usage_source: Option<&'static str>) -> RequestContext {
+            let mut ctx = RequestContext::new();
+            ctx.ai_provider = Some("openai".to_string());
+            ctx.ai_model = Some("gpt-4o-mini".to_string());
+            ctx.ai_tokens_in = Some(11);
+            ctx.ai_tokens_out = Some(7);
+            ctx.ai_usage_source = usage_source;
+            ctx
+        }
+
+        /// WOR-2622: an estimate never becomes an invoiced quantity.
+        ///
+        /// A streamed response whose provider sent no usage frame
+        /// carries this gateway's own tokenizer count on the same
+        /// context fields a measured one does, because the operator's
+        /// caps and the access log want them. A customer's bill is a
+        /// different question: it has to be a number the provider stands
+        /// behind, and a row nobody can defend in a dispute is worse
+        /// than no row.
+        #[test]
+        fn an_estimated_stream_bills_no_units() {
+            let units = resolve_units(&ai_context(Some("estimated")), &ai_binding(), None);
+            assert!(
+                units.is_empty(),
+                "an estimate reached the payment bridge: {units:?}"
+            );
+        }
+
+        #[test]
+        fn a_measured_stream_still_bills_its_tokens() {
+            let units = resolve_units(&ai_context(Some("measured")), &ai_binding(), None);
+            assert!(
+                !units.is_empty(),
+                "a measured stream has to keep billing its tokens"
+            );
+        }
     }
 }
 

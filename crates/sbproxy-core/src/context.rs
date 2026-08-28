@@ -1329,8 +1329,29 @@ pub struct RequestContext {
     /// dispatch. Never carries the credential itself, only which one
     /// paid.
     pub ai_credential_source: Option<&'static str>,
-    /// Prompt / input tokens reported by the provider response.
+    /// Prompt / input tokens reported by the provider response, or,
+    /// when [`Self::ai_usage_source`] says `estimated`, counted by this
+    /// gateway from the text the response delivered.
     pub ai_tokens_in: Option<u64>,
+    /// WOR-2622: where [`Self::ai_tokens_in`] / [`Self::ai_tokens_out`]
+    /// came from. A closed set of three static strings:
+    ///
+    /// * `measured` - the provider reported these counts itself.
+    /// * `estimated` - the provider reported none, so the counts are
+    ///   this gateway's own tokenizer count of the delivered text and
+    ///   the request-path prompt estimate. Internal budgets and the
+    ///   access log take them; invoicing, the usage sinks, the ledger
+    ///   and the payment bridge skip a request marked this way, because
+    ///   an invoiced quantity has to be one the provider stands behind.
+    /// * `absent` - a 2xx AI response whose usage could be neither read
+    ///   nor estimated. The counts stay `None` and nothing is billed.
+    ///
+    /// `None` whenever the two count fields beside it are `None`, which
+    /// includes an AI origin with no `budget:` block, since the buffered
+    /// relay stamps all three together. This is the per-request answer
+    /// to "was this line measured or estimated?", which no counter can
+    /// give.
+    pub ai_usage_source: Option<&'static str>,
     /// WOR-1499: estimated prompt tokens computed on the request path
     /// from the inbound body (before any upstream usage is known). Used
     /// for request-path prompt accounting and as the fallback token
@@ -2084,6 +2105,7 @@ impl RequestContext {
             ai_serve_model: None,
             ai_credential_source: None,
             ai_tokens_in: None,
+            ai_usage_source: None,
             ai_prompt_tokens_est: None,
             ai_prompt_fingerprint: None,
             ai_tokens_out: None,

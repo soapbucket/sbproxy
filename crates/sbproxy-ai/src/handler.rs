@@ -271,11 +271,42 @@ pub struct AiHandlerConfig {
     /// Recognized values: `auto` (default; chooses by upstream URL,
     /// `Content-Type`, or response `X-Provider` header), `openai`,
     /// `anthropic`, `vertex`, `bedrock`, `cohere`, `ollama`,
-    /// `generic`, or `none` (disable parsing). Unknown values warn
-    /// and fall back to `generic` so a typo never silently disables
-    /// budget recording.
+    /// `generic`, or `none`. Unknown values warn and fall back to
+    /// `generic` so a typo never silently disables budget recording.
+    ///
+    /// WOR-2622: `none` disables reading the provider's own usage
+    /// frame; it no longer means the stream is billed nothing. A stream
+    /// with no parsed usage is priced from this gateway's tokenizer
+    /// count of the text it delivered, marked `estimated`, so an origin
+    /// that set `none` to skip parsing now sees its caps move. See
+    /// `docs/ai-gateway.md#what-a-stream-is-billed`.
     #[serde(default = "default_usage_parser")]
     pub usage_parser: String,
+    /// WOR-2622: ask an OpenAI-compatible provider to end a stream with
+    /// a usage frame, by injecting `stream_options.include_usage: true`
+    /// into the outbound body.
+    ///
+    /// Off by default, and opt-in for a reason the operator has to
+    /// decide rather than have decided for them: with it on the provider
+    /// appends one extra terminal chunk whose `choices` is `[]` and
+    /// whose `usage` is populated, and the caller sees that chunk. A
+    /// client that indexes `choices[0]` unconditionally throws on it.
+    /// LiteLLM makes the same switch opt-in for the same reason.
+    ///
+    /// Injected only for providers whose wire format is OpenAI's, only
+    /// on streaming requests, and only when the caller did not send
+    /// `stream_options` itself. Anthropic, Vertex / Gemini, Bedrock,
+    /// Cohere and Ollama have no such field, and several
+    /// OpenAI-compatible servers (older Azure API versions, some
+    /// self-hosted runtimes) answer 400 to an unknown top-level body
+    /// key, so a blanket injection would turn working streams into hard
+    /// failures.
+    ///
+    /// With it off, a stream that carries no usage frame is priced from
+    /// the tokenizer estimate instead; see
+    /// `docs/ai-gateway.md#what-a-stream-is-billed`.
+    #[serde(default)]
+    pub stream_include_usage: bool,
     /// Usage sinks: forward a record of every completed LLM call to external
     /// systems (a JSONL file, an HTTP collector). The open-source seam that
     /// LiteLLM's `success_callback` / `callbacks` map onto. Empty by default.
@@ -3345,6 +3376,7 @@ mod tests {
             semantic_cache: None,
             prompts: None,
             usage_parser: "auto".to_string(),
+            stream_include_usage: false,
             pii_redactor: OnceLock::new(),
             router: OnceLock::new(),
             usage_sinks: vec![],
@@ -3403,6 +3435,7 @@ mod tests {
             semantic_cache: None,
             prompts: None,
             usage_parser: "auto".to_string(),
+            stream_include_usage: false,
             pii_redactor: OnceLock::new(),
             router: OnceLock::new(),
             usage_sinks: vec![],
@@ -3461,6 +3494,7 @@ mod tests {
             semantic_cache: None,
             prompts: None,
             usage_parser: "auto".to_string(),
+            stream_include_usage: false,
             pii_redactor: OnceLock::new(),
             router: OnceLock::new(),
             usage_sinks: vec![],
@@ -3520,6 +3554,7 @@ mod tests {
             semantic_cache: None,
             prompts: None,
             usage_parser: "auto".to_string(),
+            stream_include_usage: false,
             pii_redactor: OnceLock::new(),
             router: OnceLock::new(),
             usage_sinks: vec![],

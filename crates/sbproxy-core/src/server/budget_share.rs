@@ -203,23 +203,68 @@ pub(crate) async fn record_shared_budget_usage(
     prompt_tokens: u64,
     completion_tokens: u64,
 ) {
+    if let Some(write) = shared_spend_write(cfg, keys, model, prompt_tokens, completion_tokens) {
+        write.run().await;
+    }
+}
+
+/// One request's cluster-shared spend write, as owned data.
+///
+/// WOR-2622: [`record_shared_budget_usage`] borrows the budget config and
+/// the scope keys, which a settlement running from a `Drop` cannot do -
+/// it has nothing to await on and nothing borrowed outlives the frame.
+/// Resolving the keys and the price up front makes the write something a
+/// detached task can take by value.
+pub(crate) struct SharedSpendWrite {
+    /// Period-bucketed scope key and the TTL its limit's window implies.
+    keys: Vec<(String, u64)>,
+    /// Tokens to add to every key's counter.
+    total: u64,
+    /// Dollars to add to every key's counter.
+    cost: f64,
+}
+
+impl SharedSpendWrite {
+    /// Apply the write to every scope key.
+    pub(crate) async fn run(self) {
+        for (key, ttl) in &self.keys {
+            record_shared_spend(key, self.total, self.cost, *ttl).await;
+        }
+    }
+}
+
+/// Resolve the shared-budget write for one request, or `None` when there
+/// is no shared store configured or nothing to record.
+pub(crate) fn shared_spend_write(
+    cfg: &sbproxy_ai::BudgetConfig,
+    keys: &[(usize, String)],
+    model: &str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+) -> Option<SharedSpendWrite> {
     if shared_budget().is_none() || (prompt_tokens == 0 && completion_tokens == 0) {
-        return;
+        return None;
     }
-    let total = prompt_tokens + completion_tokens;
-    let cost = sbproxy_ai::estimate_cost(model, prompt_tokens, completion_tokens);
-    for (limit_idx, key) in keys {
-        // TTL = the limit's window in seconds; "total" (no window) uses 0
-        // (no expiry). The key is already period-bucketed, so the TTL only
-        // governs cleanup of stale buckets, not correctness.
-        let ttl = cfg
-            .limits
-            .get(*limit_idx)
-            .and_then(|l| l.window())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        record_shared_spend(key, total, cost, ttl).await;
-    }
+    Some(SharedSpendWrite {
+        keys: keys
+            .iter()
+            .map(|(limit_idx, key)| {
+                // TTL = the limit's window in seconds; "total" (no window)
+                // uses 0 (no expiry). The key is already period-bucketed,
+                // so the TTL only governs cleanup of stale buckets, not
+                // correctness.
+                let ttl = cfg
+                    .limits
+                    .get(*limit_idx)
+                    .and_then(|l| l.window())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                (key.clone(), ttl)
+            })
+            .collect(),
+        total: prompt_tokens.saturating_add(completion_tokens),
+        cost: sbproxy_ai::estimate_cost(model, prompt_tokens, completion_tokens),
+    })
 }
 
 /// Read an integer counter. `Some(0)` on a miss, `None` on a store or

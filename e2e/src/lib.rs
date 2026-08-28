@@ -752,6 +752,41 @@ impl ProxyHarness {
     /// Build (or return) the lazy-initialised blocking HTTP client.
     /// Construction is deferred so harness creation does not trigger
     /// reqwest's internal runtime drop in async contexts.
+    /// Send a built request, and when the transport fails, attach the tail
+    /// of the proxy's own stderr to the error.
+    ///
+    /// A request that gets no response is usually the proxy dying, and the
+    /// client-side error says nothing about why: reqwest reports
+    /// "connection closed before message completed" whether the server
+    /// panicked, aborted on a debug overflow check, or simply closed an
+    /// idle keep-alive connection. The panic line is already on disk in
+    /// the harness's own stderr capture, so not showing it turns a
+    /// one-line diagnosis into CI archaeology. Bounded to the last 60
+    /// lines because a proxy log can be long and only the tail carries
+    /// the death.
+    fn send(&self, request: reqwest::blocking::RequestBuilder) -> anyhow::Result<Response> {
+        match request.send() {
+            Ok(response) => decode(response),
+            Err(error) => {
+                let tail = self.stderr_tail(60);
+                if tail.trim().is_empty() {
+                    Err(anyhow::Error::new(error))
+                } else {
+                    Err(anyhow::Error::new(error)
+                        .context(format!("proxy stderr (last 60 lines):\n{tail}")))
+                }
+            }
+        }
+    }
+
+    /// The last `lines` lines of the proxy's captured stderr.
+    fn stderr_tail(&self, lines: usize) -> String {
+        let stderr = std::fs::read_to_string(self._stderr.path())
+            .unwrap_or_else(|read_error| format!("<read child stderr: {read_error}>"));
+        let all: Vec<&str> = stderr.lines().collect();
+        all[all.len().saturating_sub(lines)..].join("\n")
+    }
+
     fn http_client(&self) -> &reqwest::blocking::Client {
         self.client.get_or_init(|| {
             reqwest::blocking::Client::builder()
@@ -917,7 +952,7 @@ impl ProxyHarness {
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
-        decode(req.send()?)
+        self.send(req)
     }
 
     /// Path of the temp config file the harness wrote on startup.
@@ -984,7 +1019,7 @@ impl ProxyHarness {
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
-        decode(req.send()?)
+        self.send(req)
     }
 
     /// POST a raw body with an explicit `content-type` (used by the
@@ -1006,7 +1041,7 @@ impl ProxyHarness {
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
-        decode(req.send()?)
+        self.send(req)
     }
 
     /// PUT a raw body with an explicit `content-type`.
@@ -1027,7 +1062,7 @@ impl ProxyHarness {
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
-        decode(req.send()?)
+        self.send(req)
     }
 }
 
