@@ -298,14 +298,18 @@
 //!
 //! Noticing a key nobody added is the job of
 //! `every_path_shaped_schema_key_is_covered_or_explained`, which walks
-//! the shipped `schemas/sb-config.schema.json` for every path-shaped
-//! property and requires each one to be on `HOST_FILE_KEYS` or on a
-//! written allowlist. A prose instruction to "run the sweep again" was
-//! the previous answer and it was not one: re-running it turned up about
-//! twenty-five uncovered keys, four of them the audit chain's own sinks
-//! (WOR-2433 re-review round 3). The schema still cannot see the untyped
-//! module and AI blocks, and those keys are swept out of the crates that
-//! deserialize them; that residue is named on the list's own doc.
+//! **every schema this repository generates** - the six files under
+//! `schemas/`, all of them gated by `scripts/check-config-schema.sh` -
+//! for every path-shaped property and requires each one to be on
+//! `HOST_FILE_KEYS` or on a written allowlist. A prose instruction to
+//! "run the sweep again" was the previous answer and it was not one:
+//! re-running it turned up about twenty-five uncovered keys, four of
+//! them the audit chain's own sinks (WOR-2433 re-review round 3).
+//! Sweeping only `sb-config.schema.json` was the answer after that, and
+//! it was not one either: the AI blocks are untyped *there* and fully
+//! typed in `schemas/ai-proxy-provider.schema.json`, which is where
+//! `origins.*.ai.providers[].serve` lives, and that block names an
+//! engine binary this node executes (WOR-2433 re-review round 4).
 //!
 //! **Naming an environment variable is not always reading a secret out
 //! of it.** `WafFeedConfig::signature_key_env` and `auth_token_env`
@@ -442,8 +446,28 @@ struct HostFileKey {
     /// (`crates/sbproxy-modules/src/projections/agent_skills.rs:341-347`),
     /// so a name-only entry would either miss the read or refuse the
     /// documented remote form.
-    host_path_value: Option<fn(&str) -> bool>,
+    host_path_value: Option<HostPathTest>,
 }
+
+/// A test on one value, plus the sibling `type:` of the mapping it sits
+/// in when that mapping has one.
+///
+/// The sibling is the serde tag and nothing else. Half this config
+/// vocabulary is `#[serde(tag = "type")]`, so one key can be a host path
+/// under one variant and a remote reference under another:
+/// `extensions.sources[].path` is a host directory under
+/// `type: directory` and a directory *inside the fetched repository*
+/// under `type: git` (`crates/sbproxy-config/src/extensions.rs:167-183`),
+/// and an entry that could not tell them apart refused the one spelling
+/// its own remedy pointed at (WOR-2433 re-review round 4).
+///
+/// Deliberately the tag alone rather than the whole mapping. A test that
+/// can read any sibling is a test that can quietly depend on one, and
+/// the mapping is being walked mutably at the call site; the tag is read
+/// once before that walk begins. A discriminator with another name
+/// (`proxy.acme.storage_backend`) is out of reach, and the entries that
+/// would want it say so and refuse every spelling instead.
+type HostPathTest = fn(value: &str, sibling_type: Option<&str>) -> bool;
 
 impl HostFileKey {
     /// Whether `key`, sitting at `ancestry` and carrying `value`, is
@@ -453,7 +477,13 @@ impl HostFileKey {
     /// rather than waved through: the module that reads it would reject
     /// it anyway, and fail-closed is the direction this boundary picks
     /// everywhere else.
-    fn refuses(&self, ancestry: Ancestry<'_>, key: &str, value: &serde_yaml::Value) -> bool {
+    fn refuses(
+        &self,
+        ancestry: Ancestry<'_>,
+        key: &str,
+        value: &serde_yaml::Value,
+        sibling_type: Option<&str>,
+    ) -> bool {
         if self.key != key || !self.scope.covers(ancestry) {
             return false;
         }
@@ -468,7 +498,7 @@ impl HostFileKey {
         }
         match self.host_path_value {
             None => true,
-            Some(is_host_path) => is_host_path(text),
+            Some(is_host_path) => is_host_path(text, sibling_type),
         }
     }
 }
@@ -523,8 +553,77 @@ fn document_chose_the_path(value: &str) -> bool {
 /// detector-narrower-than-the-enforcer shape at the one key this module
 /// made value-aware (WOR-2433 re-review round 3). A future entry that
 /// normalizes a value before testing it has the same bug waiting.
-fn agent_skill_url_is_a_host_path(value: &str) -> bool {
+fn agent_skill_url_is_a_host_path(value: &str, _sibling_type: Option<&str>) -> bool {
     !(value.starts_with("https://") || value.starts_with("http://"))
+}
+
+/// Whether an `extensions.sources[]` entry's `path` is read off this
+/// host.
+///
+/// `BundleSourceConfig` is `#[serde(tag = "type")]` with two variants
+/// that both carry a `path`
+/// (`crates/sbproxy-config/src/extensions.rs:167-183`).
+/// `type: directory` names a directory on this filesystem, which is
+/// extension *code* and is refused. `type: git` names a bundle
+/// directory **inside the fetched repository**, which is the document's
+/// own tree rather than this host, and it is the spelling both
+/// extension-code remedies on this list point at, so refusing it left a
+/// refusal whose only remedy the same entry refused
+/// (WOR-2433 re-review round 4).
+///
+/// A `type: git` path still has to stay inside the checkout. The
+/// extension loader validates the path is non-empty and nothing more
+/// (`extensions.rs:126-131`), so an absolute or `..`-bearing value
+/// under a git source reaches back out onto this host, and that is
+/// refused here with everything else. A missing or unknown `type:` is
+/// refused too: `deny_unknown_fields` will reject it later, and
+/// fail-closed is the direction this boundary picks everywhere.
+fn bundle_source_path_is_a_host_path(value: &str, sibling_type: Option<&str>) -> bool {
+    if sibling_type != Some("git") {
+        return true;
+    }
+    !path_stays_inside_a_checkout(value)
+}
+
+/// Whether a path names something inside a fetched repository and
+/// cannot leave it: non-empty, relative, no `..`, no `~`, and no colon
+/// (a scheme or a Windows drive).
+///
+/// `Path::components` is what decides, rather than a substring scan, so
+/// `a/../../etc` is a `ParentDir` component rather than a `..` needle
+/// somebody can spell around.
+fn path_stays_inside_a_checkout(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('~')
+        && !value.contains(':')
+        && std::path::Path::new(value).components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+}
+
+/// Whether a served model's LoRA adapter `source` is read off this
+/// host.
+///
+/// `LoraAdapter::source` is "an `hf:Org/Repo` reference or a local path"
+/// (`crates/sbproxy-model-host/src/config.rs:562`), so the remote form
+/// stays legal and everything else is a directory this node loads
+/// adapter weights out of.
+fn lora_adapter_source_is_a_host_path(value: &str, _sibling_type: Option<&str>) -> bool {
+    !value.starts_with("hf:")
+}
+
+/// Whether a compression lever's `endpoint` is a host socket.
+///
+/// The value is "a classifier gRPC URI or absolute `unix://` socket
+/// path" (`crates/sbproxy-ai/src/compression/config.rs:233`), and the
+/// `unix://` form is stripped to a filesystem path and connected to
+/// (`:669`). The network form is an egress destination, which is a
+/// different boundary and not this list's business.
+fn compression_lever_endpoint_is_a_host_path(value: &str, _sibling_type: Option<&str>) -> bool {
+    value.starts_with("unix://")
 }
 
 /// Config keys whose value is a path the proxy opens on the host
@@ -542,32 +641,58 @@ fn agent_skill_url_is_a_host_path(value: &str) -> bool {
 ///
 /// # How this list is kept honest
 ///
-/// The method is a sweep of **`schemas/sb-config.schema.json`**, not of
-/// the Rust field declarations, and
+/// The method is a sweep of **every schema this repository generates**,
+/// not of the Rust field declarations, and
 /// `every_path_shaped_schema_key_is_covered_or_explained` runs that
 /// sweep as a test rather than leaving it to whoever remembers. The
-/// schema is generated from the same types, is the operator-facing
-/// surface, and gives a dotted path per key, so a parent scope is read
-/// off rather than guessed. Every schema property whose name carries a
-/// path marker (`path`, `file`, `dir`, `_dir`, `ca_file`, `key_file`,
-/// `cert`, `socket`, `log`, `sink`) must be either on this list or on
-/// that test's `SCHEMA_KEYS_THAT_ARE_NOT_HOST_PATHS` allowlist with a
-/// written reason. The earlier method - sweep `pub <name>(path|file|
-/// dir):` in `sbproxy-config` and `sbproxy-modules` - was re-run by the
-/// reviewer and still returned about twenty-five uncovered keys,
-/// including all four audit-chain sinks and the access-log path, which
-/// is what a method nobody can run against a fixture buys you
-/// (WOR-2433 re-review round 3).
+/// schemas are generated from the same types, are the operator-facing
+/// surface, and give a dotted path per key, so a parent scope is read
+/// off rather than guessed.
 ///
-/// What the schema **cannot** see is the module and AI blocks, which
-/// are untyped `serde_yaml::Value` there: `origins.*.policies[]`,
-/// `origins.*.action`, `origins.*.ai` and `proxy.extensions[]`. Those
-/// keys are swept out of the crates that deserialize them, which is
-/// wider than the two the doc used to name - `sbproxy-ai` and
-/// `sbproxy-core` deserialize config too, and
-/// `semantic_cache.inprocess.model_path`,
-/// `agent_detect.rule_pack_path` and the guardrail classifier's
-/// `backend.model_path` all live there.
+/// All six files under `schemas/` are swept, because
+/// `sb-config.schema.json` alone is not the config surface. It leaves
+/// the module and AI blocks untyped (`origins.*.policies[]`,
+/// `origins.*.action`, `origins.*.ai`, `proxy.extensions.*`), and five
+/// of those blocks have a generated schema of their own:
+/// `ai-proxy-provider`, `ai-semantic-cache`, `ai-rag`,
+/// `ai-compression`, `ai-external-guardrail`. All six are regenerated
+/// and diffed by `scripts/check-config-schema.sh` on every PR, so a
+/// type change that adds a path cannot land without moving one of them,
+/// and the sweep runs over whatever moved. `ai-proxy-provider` is where
+/// `origins.*.ai.providers[].serve` lives, which is
+/// `sbproxy_model_host::ModelHostConfig`
+/// (`crates/sbproxy-ai/src/provider.rs:161`): a fifth crate that
+/// deserializes `sb.yml`, carrying a weight-cache directory, a catalog
+/// file and an engine binary this node **executes**
+/// (`engines.<kind>.acquire.path` becomes
+/// `BinaryAcquirePlan::Explicit` at
+/// `crates/sbproxy-model-host/src/acquire.rs:100-103`). Sweeping the
+/// top-level schema alone missed all three, and the doc claimed the
+/// untyped blocks had been swept out of `sbproxy-ai` and
+/// `sbproxy-core` when `sbproxy-model-host` was never looked at
+/// (WOR-2433 re-review round 4).
+///
+/// A property is path-shaped when its **name** carries a marker
+/// (`path`, `file`, `dir`, `_dir`, `ca_file`, `key_file`, `cert`,
+/// `socket`, `log`, `sink`) **or** its **description** does
+/// (`file`, `path`, `director...`, `socket`). Two signals rather than
+/// one because a name-only detector is exactly as wide as its marker
+/// list: `proxy.acme.ca_root` is a PEM this process reads with
+/// `std::fs::read` (`crates/sbproxy-tls/src/lib.rs:986-988`) and its
+/// name carries no marker, and `proxy.admin.tls.key` had to be added to
+/// this list by hand for the same reason. Each hit must be on this list
+/// or on that test's `SCHEMA_KEYS_THAT_ARE_NOT_HOST_PATHS` allowlist
+/// with a written reason. The description signal is noisy on purpose:
+/// it is cheaper to write a line saying why `path.prefix` is not a
+/// filesystem path than to discover the next `ca_root` in a re-review.
+///
+/// The earlier methods, in order: sweep `pub <name>(path|file|dir):` in
+/// `sbproxy-config` and `sbproxy-modules` by hand (missed about
+/// twenty-five keys including all four audit-chain sinks); sweep the
+/// top-level schema by name (missed `ca_root` and the whole `serve:`
+/// block). What is left uncovered now is stated rather than implied:
+/// nothing in the six schemas, and, outside them, any config block that
+/// is untyped in all six.
 ///
 /// Where two config keys reach the same read, the entry names the
 /// function that *chooses* between them rather than the read site,
@@ -623,6 +748,24 @@ fn agent_skill_url_is_a_host_path(value: &str) -> bool {
 /// over, and parent-scoping them is what left two of the three
 /// spellings uncovered.
 ///
+/// **A binary this node executes.** `engines.<kind>.acquire.path` under
+/// a `serve:` block is an explicit engine-binary override that "wins
+/// over everything" (`crates/sbproxy-model-host/src/acquire.rs:100-103`)
+/// and is spawned. It reaches the pipeline through
+/// `origins.*.ai.providers[].serve`
+/// (`crates/sbproxy-ai/src/provider.rs:161`), a path `origins` leaves
+/// open to a config-authority bundle with no opt-out. Two more host
+/// paths sit beside it in the same block: `serve.cache_dir`
+/// (`crates/sbproxy-model-host/src/config.rs:752`), which the node
+/// `create_dir_all`s and fills with engines, weights and a redb ledger
+/// (`crates/sbproxy-ai/src/handler.rs:616-620`), and `catalog_file`
+/// (`:744`), read from disk. `catalog_file` is scoped `Anywhere`
+/// because the same name is `proxy.model_host.catalog_file` one block
+/// over and parent-scoping it covered one of the two.
+/// `lora_adapters[].source` (`:562`) joins them value-aware: an
+/// `hf:Org/Repo` reference is a fetch, anything else is a directory
+/// this node loads adapter weights out of.
+///
 /// **Extension code.** `extensions.bundles_dir` and
 /// `extensions.sources[].path` both hand the extension loader a host
 /// directory to load *code* out of
@@ -631,7 +774,12 @@ fn agent_skill_url_is_a_host_path(value: &str) -> bool {
 /// `ExtensionBundlesConfig` carries `#[serde(deny_unknown_fields)]`, so
 /// the `extensions.bundles.bundles_dir` this entry used to name was a
 /// shape `serde` rejects and the entry could not fire on any valid
-/// config (WOR-2433 re-review round 3).
+/// config (WOR-2433 re-review round 3). The second is value-aware for
+/// the reason [`bundle_source_path_is_a_host_path`] gives: under
+/// `type: git` the path is inside the fetched repository, and that is
+/// the spelling both of these remedies point at, so refusing it made
+/// the remedies name a key this same entry refused (WOR-2433 re-review
+/// round 4).
 ///
 /// **Node identity and node state.** `tls_cert_file`, `tls_key_file`,
 /// `cert_file`, `key_file`, `ca_file`, `client_ca_file`, `tls.cert`,
@@ -670,6 +818,16 @@ fn agent_skill_url_is_a_host_path(value: &str) -> bool {
 /// `local_path`, `prompt_persistence_path` and `backend.path` (the
 /// filesystem cache reserve). Each of these creates and writes the path
 /// it is given.
+///
+/// **Trust anchors and sockets the process opens.** `acme.ca_root` is a
+/// PEM read with `std::fs::read` at issuance, and refusing to fall back
+/// to the system roots is the point of it
+/// (`crates/sbproxy-tls/src/lib.rs:986-988`); it is the key that showed
+/// a name-only sweep is exactly as wide as its marker list.
+/// `levers[].endpoint` is value-aware: `unix://` is stripped to a
+/// filesystem path and connected to
+/// (`crates/sbproxy-ai/src/compression/config.rs:669`), while the
+/// network form is an egress destination and a different boundary.
 ///
 /// * `proxy.ai_providers_file` - `crates/sbproxy-config/src/types.rs:1905`,
 ///   read at boot by `crates/sbproxy-core/src/server/lifecycle.rs:1663`
@@ -826,16 +984,18 @@ const HOST_FILE_KEYS: &[HostFileKey] = &[
     HostFileKey {
         scope: KeyScope::Under("extensions"),
         key: "bundles_dir",
-        remedy: "declare the bundle as a `sources:` entry with its own digest, or leave \
+        remedy: "declare the bundle as a `sources:` entry of `type: git`, pinned by \
+                 `revision`, whose `path` is relative to the repository root, or leave \
                  the directory to the layer this node owns",
         host_path_value: None,
     },
     HostFileKey {
         scope: KeyScope::Under("sources"),
         key: "path",
-        remedy: "use a `type: git` bundle source with a pinned revision, or leave the \
-                 directory to the layer this node owns",
-        host_path_value: None,
+        remedy: "declare the source as `type: git` with a pinned `revision` and a `path` \
+                 relative to the repository root, or leave the directory to the layer this \
+                 node owns",
+        host_path_value: Some(bundle_source_path_is_a_host_path),
     },
     // --- node identity and node state ---------------------------------
     HostFileKey {
@@ -941,11 +1101,31 @@ const HOST_FILE_KEYS: &[HostFileKey] = &[
         host_path_value: None,
     },
     HostFileKey {
-        scope: KeyScope::Under("model_host"),
+        scope: KeyScope::Anywhere,
         key: "catalog_file",
         remedy: "take the model catalog compiled into the binary, or leave the file to \
                  the layer this node owns",
         host_path_value: None,
+    },
+    HostFileKey {
+        scope: KeyScope::Under("serve"),
+        key: "cache_dir",
+        remedy: "leave the weight cache directory to the layer this node owns",
+        host_path_value: None,
+    },
+    HostFileKey {
+        scope: KeyScope::Under("acquire"),
+        key: "path",
+        remedy: "take `acquire.source: release` with a pinned `version` and `sha256`, or \
+                 leave the engine binary to the layer this node owns",
+        host_path_value: None,
+    },
+    HostFileKey {
+        scope: KeyScope::Under("lora_adapters"),
+        key: "source",
+        remedy: "name the adapter as an `hf:Org/Repo` reference, or leave the adapter \
+                 directory to the layer this node owns",
+        host_path_value: Some(lora_adapter_source_is_a_host_path),
     },
     HostFileKey {
         scope: KeyScope::Under("cache"),
@@ -1103,11 +1283,35 @@ const HOST_FILE_KEYS: &[HostFileKey] = &[
         remedy: "leave the bundle cache to the layer this node owns",
         host_path_value: None,
     },
+    // `proxy.acme.storage_path` is a filesystem directory under the
+    // `redb`, `sqlite` and `file` backends and a bucket or key prefix
+    // under `s3`, `gcs`, `azure` and `redis`. The discriminator is a
+    // sibling named `storage_backend`, not the serde `type` tag, so
+    // `HostPathTest` cannot reach it and this entry refuses every
+    // backend's spelling. That is the fail-closed side, and it is
+    // over-refusal on the cloud backends, which is why the remedy names
+    // the operator's own layer rather than a different backend
+    // (WOR-2433 re-review round 4).
     HostFileKey {
         scope: KeyScope::Anywhere,
         key: "storage_path",
-        remedy: "leave the certificate store to the layer this node owns",
+        remedy: "leave the certificate store's location to the layer this node owns, \
+                 whichever `storage_backend` it uses",
         host_path_value: None,
+    },
+    HostFileKey {
+        scope: KeyScope::Under("acme"),
+        key: "ca_root",
+        remedy: "take the system trust roots by leaving this unset, or leave the PEM to \
+                 the layer this node owns",
+        host_path_value: None,
+    },
+    HostFileKey {
+        scope: KeyScope::Under("levers"),
+        key: "endpoint",
+        remedy: "address the classifier over the network with a `grpc://` or `http://` \
+                 endpoint, or leave the socket to the layer this node owns",
+        host_path_value: Some(compression_lever_endpoint_is_a_host_path),
     },
     HostFileKey {
         scope: KeyScope::Under("compression_state"),
@@ -1434,9 +1638,9 @@ pub enum ConfinedTemplateError {
          whose default is {form}. A default is text this document wrote, not a value this \
          node supplies: the pre-parse pass makes it the value whenever the variable is \
          unset, so it is a literal in placeholder clothing and is refused as one. Write the \
-         value the node should use as `${{VAR}}` with no default and export it on the node, \
-         or move the key into the layer this node owns. See the `Confined fragments` \
-         section of docs/configuration.md."
+         literal if the document owns this value, write `${{VAR}}` with no default and export \
+         it on the node if the node owns it, or move the key into the layer this node owns. \
+         See the `Confined fragments` section of docs/configuration.md."
     )]
     HostReachingDefault {
         /// Caller-supplied label for the document, for the operator.
@@ -1767,13 +1971,21 @@ impl Resolver<'_> {
                     let child = join_path(path, &key_name);
                     self.check_key(&child, key)?;
                 }
+                // The serde tag of this mapping, read once before the
+                // mutable walk borrows it, for the entries whose key is
+                // a host path under one variant and not under another
+                // (`HostPathTest`). One hash lookup per mapping, and an
+                // allocation only where a `type:` string is present.
+                let sibling_type = map
+                    .get(serde_yaml::Value::String("type".to_string()))
+                    .and_then(serde_yaml::Value::as_str)
+                    .map(str::to_owned);
                 for (key, val) in map.iter_mut() {
                     let key_name = key.as_str().map_or_else(|| "?".to_string(), str::to_owned);
                     let child = join_path(path, &key_name);
-                    if let Some(entry) = HOST_FILE_KEYS
-                        .iter()
-                        .find(|entry| entry.refuses(ancestry, key_name.as_str(), val))
-                    {
+                    if let Some(entry) = HOST_FILE_KEYS.iter().find(|entry| {
+                        entry.refuses(ancestry, key_name.as_str(), val, sibling_type.as_deref())
+                    }) {
                         if !self.policy.host_file_inlining {
                             return Err(ConfinedTemplateError::HostFileInlining {
                                 fragment: self.fragment.to_string(),
@@ -2709,8 +2921,20 @@ mod tests {
             "proxy:\n  model_host:\n    store_path: /var/lib/sbproxy/models\n",
         ),
         (
-            "model_host.catalog_file",
+            "catalog_file",
             "proxy:\n  model_host:\n    catalog_file: /etc/sbproxy/catalog.yaml\n",
+        ),
+        (
+            "serve.cache_dir",
+            "origins:\n  api:\n    ai:\n      providers:\n        - name: local\n          serve:\n            cache_dir: /var/lib/sbproxy/weights\n",
+        ),
+        (
+            "acquire.path",
+            "origins:\n  api:\n    ai:\n      providers:\n        - name: local\n          serve:\n            engines:\n              llama_cpp:\n                acquire:\n                  source: path\n                  path: /usr/local/bin/llama-server\n",
+        ),
+        (
+            "lora_adapters.source",
+            "origins:\n  api:\n    ai:\n      providers:\n        - name: local\n          serve:\n            models:\n              - name: m\n                lora_adapters:\n                  - name: a\n                    source: /etc/sbproxy/adapter\n",
         ),
         (
             "cache.directory",
@@ -2817,6 +3041,14 @@ mod tests {
             "proxy:\n  acme:\n    storage_path: /var/lib/sbproxy/acme\n",
         ),
         (
+            "acme.ca_root",
+            "proxy:\n  acme:\n    ca_root: /etc/sbproxy/acme-root.pem\n",
+        ),
+        (
+            "levers.endpoint",
+            "origins:\n  api:\n    action:\n      type: ai_proxy\n      compression:\n        levers:\n          - type: token_prune\n            endpoint: unix:///run/sbproxy/classifier.sock\n",
+        ),
+        (
             "compression_state.local_path",
             "proxy:\n  compression_state:\n    local_path: /var/lib/sbproxy/compression.redb\n",
         ),
@@ -2864,26 +3096,247 @@ mod tests {
         }
     }
 
-    /// The path markers the schema sweep looks for in a property name,
-    /// exactly as the `HOST_FILE_KEYS` doc states them.
+    /// The path markers the schema sweep looks for in a property
+    /// **name**, exactly as the `HOST_FILE_KEYS` doc states them.
+    /// Matched as substrings, which is why `compression_profile` is
+    /// path-shaped by this rule.
     const SCHEMA_PATH_MARKERS: &[&str] = &[
         "path", "file", "dir", "_dir", "ca_file", "key_file", "cert", "socket", "log", "sink",
     ];
 
-    /// Schema properties whose **name** carries a path marker and whose
-    /// **value** is not a path on this host, each with the reason it is
-    /// not on `HOST_FILE_KEYS`.
+    /// The stems that make a property **description** path-shaped.
     ///
-    /// The markers are substrings, so most of this list is the price of
-    /// that: `compression_profile` and `profile` match `file`,
+    /// The second signal, and the reason it exists: a name-only
+    /// detector is exactly as wide as its marker list, and
+    /// `proxy.acme.ca_root` is a PEM this process reads off the disk
+    /// whose name carries no marker at all (WOR-2433 re-review round 4).
+    /// Matched at a word boundary and as a prefix, so `file`, `files`,
+    /// `filesystem`, `path`, `paths`, `directory`, `directories`,
+    /// `socket` all count and `profile` does not.
+    const SCHEMA_PATH_DESCRIPTION_STEMS: &[&str] = &["file", "path", "director", "socket"];
+
+    /// Every schema this repository generates, with the config path its
+    /// root sits at.
+    ///
+    /// All six are regenerated and diffed by
+    /// `scripts/check-config-schema.sh` on every PR, so a type change
+    /// that adds a host path has to move one of these files and the
+    /// sweep runs over whatever moved. Sweeping only the first one is
+    /// how `origins.*.ai.providers[].serve` - an engine binary this node
+    /// executes - stayed uncovered for three rounds: the AI blocks are
+    /// untyped in `sb-config.schema.json` and fully typed here
+    /// (WOR-2433 re-review round 4).
+    const GENERATED_SCHEMAS: &[(&str, &str)] = &[
+        ("sb-config.schema.json", ""),
+        ("ai-proxy-provider.schema.json", "origins.*.ai.providers[]"),
+        ("ai-compression.schema.json", "origins.*.action.compression"),
+        (
+            "ai-external-guardrail.schema.json",
+            "origins.*.ai.guardrails.external[]",
+        ),
+        ("ai-rag.schema.json", "origins.*.action.rag"),
+        (
+            "ai-semantic-cache.schema.json",
+            "origins.*.action.semantic_cache",
+        ),
+    ];
+
+    /// Schema properties the sweep calls path-shaped and whose **value**
+    /// is not a path on this host, each with the reason it is not on
+    /// `HOST_FILE_KEYS`.
+    ///
+    /// Two signals means two sources of noise. The name markers are
+    /// substrings, so `compression_profile` and `profile` match `file`,
     /// `directory_url` matches `dir`, and `catalog` matches `log`. The
-    /// rest are real path-shaped names that name something other than a
-    /// path on the compiling host.
+    /// description stems catch every key whose prose mentions a file or
+    /// a path for any reason, which is most of the HTTP routing
+    /// vocabulary and every secret reference whose doc lists the `file:`
+    /// scheme. That noise is the price of catching a `ca_root`, and it
+    /// is paid here, once, in writing.
     ///
     /// An entry here that the sweep no longer finds fails the test too,
     /// so a key that is renamed or deleted cannot leave a stale excuse
     /// behind.
     const SCHEMA_KEYS_THAT_ARE_NOT_HOST_PATHS: &[(&str, &str)] = &[
+        // --- the sink kind, next to the sink path -------------------
+        (
+            "access_log.output.type",
+            "the sink kind (`stderr` | `file`); the path is `access_log.output.path`",
+        ),
+        (
+            "proxy.acme.storage_backend",
+            "the store kind (`redb` | `sqlite` | `file` | `redis` | `s3` | `gcs` | `azure` \
+             | `memory`); the location is `proxy.acme.storage_path`",
+        ),
+        (
+            "proxy.secrets.backends[].format",
+            "`File format.`, meaning `yaml` or `json`; the file is `backends[].path`",
+        ),
+        // --- HTTP routing vocabulary ---------------------------------
+        (
+            "origins.*.forward_rules[].rules[].match",
+            "an HTTP prefix match, the shorthand for `path: { prefix: ... }`",
+        ),
+        (
+            "origins.*.forward_rules[].rules[].path.exact",
+            "an exact HTTP request path this rule matches",
+        ),
+        (
+            "origins.*.forward_rules[].rules[].path.prefix",
+            "an HTTP request-path prefix this rule matches",
+        ),
+        (
+            "origins.*.forward_rules[].rules[].path.regex",
+            "a regex over the HTTP request path",
+        ),
+        (
+            "origins.*.forward_rules[].rules[].path.template",
+            "an OpenAPI-style HTTP path template with named segments",
+        ),
+        (
+            "origins.*.forward_rules[].parameters[].in",
+            "where a parameter appears (`path` | `query` | `header`), not a path",
+        ),
+        (
+            "origins.*.forward_rules[].parameters[].name",
+            "the parameter name; its description mentions path params",
+        ),
+        // --- URLs and network endpoints ------------------------------
+        (
+            "origins.*.action.semantic_cache.openai.base_url",
+            "an `https://` base URL for the embedding API",
+        ),
+        (
+            "proxy.config_authority.upstream.url",
+            "the authority's absolute base URL; the subscriber appends its own path",
+        ),
+        (
+            "origins.*.observability.log.sinks[].output.endpoint",
+            "an OTLP collector URL",
+        ),
+        (
+            "proxy.observability.log.sinks[].output.endpoint",
+            "an OTLP collector URL",
+        ),
+        (
+            "proxy.tenants[].observability.log.sinks[].output.endpoint",
+            "an OTLP collector URL",
+        ),
+        // --- names inside somebody else's namespace ------------------
+        (
+            "origins.*.action.rag.vector_store.database",
+            "a Chroma database name that appears in its collection path, not a path here",
+        ),
+        (
+            "origins.*.action.rag.vector_store.database_tenant",
+            "a Chroma tenant name that appears in its collection path",
+        ),
+        (
+            "proxy.secrets.backends[].mount",
+            "a KV mount inside the secret provider, never opened on this filesystem",
+        ),
+        (
+            "proxy.secrets.backends[].mount_prefix",
+            "a KV prefix inside the secret provider that every read must stay inside",
+        ),
+        ("proxy.secrets.hashicorp.mount", "a Vault KV engine mount"),
+        (
+            "proxy.key_management.store.secrets_manager.mount",
+            "a KV mount (`hashicorp`) or key prefix (`aws`) inside the provider",
+        ),
+        (
+            "origins.*.ai.providers[].serve.models[].gguf_file",
+            "the exact GGUF filename inside a multi-file Hugging Face repo, resolved \
+             remotely; the local cache it lands in is `serve.cache_dir`, which is on the \
+             list",
+        ),
+        (
+            "origins.*.ai.providers[].aws_sigv4.credentials.profile",
+            "a named profile in the shared AWS config; the SDK, not this value, decides \
+             which file that is",
+        ),
+        (
+            "proxy.attestation.sign_with",
+            "a *config* path naming an existing signing identity, not a filesystem path",
+        ),
+        (
+            "proxy.attestation.route_weights[].name",
+            "the unit name on the invoice line; its description mentions the route path",
+        ),
+        // --- inline bodies, which are the remedies this list offers ---
+        (
+            "origins.*.agent_skills[].body",
+            "the inline artifact body, which is exactly what `agent_skills[].path` and \
+             `agent_skills[].url` are told to use instead",
+        ),
+        (
+            "origins.*.error_pages[].body",
+            "the inline response body; its description mentions `request.path`",
+        ),
+        // --- secret material, screened by the secret rules -----------
+        (
+            "origins.*.credentials[].key",
+            "secret material or a provider reference; the `file:` spelling its doc lists \
+             is refused by the host-backed secret rule, not by this list",
+        ),
+        (
+            "proxy.credentials[].key",
+            "secret material or a provider reference; screened by the host-backed secret \
+             rule",
+        ),
+        (
+            "proxy.tenants[].credentials[].key",
+            "secret material or a provider reference; screened by the host-backed secret \
+             rule",
+        ),
+        (
+            "origins.*.outbound_credential.dpop.key",
+            "a provider URI or `file:` secret reference; screened by the host-backed \
+             secret rule",
+        ),
+        (
+            "origins.*.ai.providers[].aws_sigv4.credentials.secret_access_key",
+            "an AWS secret access key, resolved through the secret rules",
+        ),
+        (
+            "origins.*.ai.providers[].aws_sigv4.credentials.external_id",
+            "an STS external id held as a credential",
+        ),
+        (
+            "origins.*.web_bot_auth_publish.signing_key_hex",
+            "a hex-encoded Ed25519 seed carried inline, not a file",
+        ),
+        (
+            "source.credential",
+            "a credential reference for the repository; its `file:` spelling is refused \
+             by the host-backed secret rule",
+        ),
+        // --- log field values and enums ------------------------------
+        (
+            "origins.*.observability.log.custom_fields[].value",
+            "a log field value with `${...}` interpolation, screened by the environment \
+             rules",
+        ),
+        (
+            "proxy.observability.log.custom_fields[].value",
+            "a log field value with `${...}` interpolation",
+        ),
+        (
+            "proxy.tenants[].observability.log.custom_fields[].value",
+            "a log field value with `${...}` interpolation",
+        ),
+        (
+            "proxy.payments.usage_reporters.stripe_meter.failure_posture",
+            "an enum for what the request path does when the enqueue fails",
+        ),
+        (
+            "proxy.payments.usage_reporters.stripe_meter.source",
+            "which request-path record is authoritative for the meter event",
+        ),
+        (
+            "proxy.acme.email",
+            "the ACME account contact email; its description mentions the directory",
+        ),
         (
             "agent_classes.catalog",
             "matches `log` inside `catalog`; the value is a source selector \
@@ -3015,6 +3468,65 @@ mod tests {
             .any(|marker| lowered.contains(marker))
     }
 
+    /// Whether a property description carries one of the path stems at
+    /// a word boundary.
+    ///
+    /// Word-boundary prefix matching, which is what keeps `profile`
+    /// from counting as `file` while `filesystem` does count. Only the
+    /// first sentence-bearing line is read: a schema description's
+    /// summary line is what states what the value *is*, and the
+    /// paragraphs under it discuss everything around it.
+    fn a_schema_description_is_path_shaped(description: &str) -> bool {
+        let first_line = description.lines().next().unwrap_or_default();
+        first_line
+            .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+            .any(|word| {
+                let lowered = word.to_ascii_lowercase();
+                SCHEMA_PATH_DESCRIPTION_STEMS
+                    .iter()
+                    .any(|stem| lowered.starts_with(stem))
+            })
+    }
+
+    /// The first description this node or anything it composes carries.
+    ///
+    /// `schemars` puts the doc comment on the `$ref` target for a named
+    /// type and on the property for an inline one, so a sweep that read
+    /// only the property would miss half of them.
+    fn first_schema_description(
+        node: &serde_json::Value,
+        definitions: &serde_json::Map<String, serde_json::Value>,
+        visiting: &mut Vec<String>,
+    ) -> Option<String> {
+        let object = node.as_object()?;
+        if let Some(description) = object
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+        {
+            return Some(description.to_string());
+        }
+        if let Some(reference) = object.get("$ref").and_then(serde_json::Value::as_str) {
+            let name = reference.strip_prefix("#/definitions/")?;
+            if visiting.iter().any(|seen| seen == name) {
+                return None;
+            }
+            visiting.push(name.to_string());
+            let found = definitions
+                .get(name)
+                .and_then(|target| first_schema_description(target, definitions, visiting));
+            visiting.pop();
+            return found;
+        }
+        ["allOf", "anyOf", "oneOf"].iter().find_map(|branch| {
+            object
+                .get(*branch)
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .find_map(|schema| first_schema_description(schema, definitions, visiting))
+        })
+    }
+
     /// Whether this schema node accepts a string, following `$ref` and
     /// the three composition keywords.
     fn a_schema_node_accepts_a_string(
@@ -3066,6 +3578,7 @@ mod tests {
         definitions: &'a serde_json::Map<String, serde_json::Value>,
         visiting: &mut Vec<&'a str>,
         found: &mut std::collections::BTreeSet<String>,
+        reached: &mut std::collections::BTreeSet<&'a str>,
     ) {
         let Some(object) = node.as_object() else {
             return;
@@ -3084,8 +3597,9 @@ mod tests {
             let Some((key, target)) = definitions.get_key_value(name) else {
                 return;
             };
+            reached.insert(key.as_str());
             visiting.push(key.as_str());
-            walk_schema_for_path_shaped_keys(target, path, definitions, visiting, found);
+            walk_schema_for_path_shaped_keys(target, path, definitions, visiting, found, reached);
             visiting.pop();
             return;
         }
@@ -3096,7 +3610,14 @@ mod tests {
                 .into_iter()
                 .flatten()
             {
-                walk_schema_for_path_shaped_keys(schema, path, definitions, visiting, found);
+                walk_schema_for_path_shaped_keys(
+                    schema,
+                    path,
+                    definitions,
+                    visiting,
+                    found,
+                    reached,
+                );
             }
         }
         if let Some(properties) = object
@@ -3109,12 +3630,21 @@ mod tests {
                 } else {
                     format!("{path}.{name}")
                 };
-                if a_schema_key_name_is_path_shaped(name)
-                    && a_schema_node_accepts_a_string(sub, definitions, &mut Vec::new())
+                if a_schema_node_accepts_a_string(sub, definitions, &mut Vec::new())
+                    && (a_schema_key_name_is_path_shaped(name)
+                        || first_schema_description(sub, definitions, &mut Vec::new())
+                            .is_some_and(|text| a_schema_description_is_path_shaped(&text)))
                 {
                     found.insert(child.clone());
                 }
-                walk_schema_for_path_shaped_keys(sub, &child, definitions, visiting, found);
+                walk_schema_for_path_shaped_keys(
+                    sub,
+                    &child,
+                    definitions,
+                    visiting,
+                    found,
+                    reached,
+                );
             }
         }
         if let Some(additional) = object.get("additionalProperties") {
@@ -3124,7 +3654,14 @@ mod tests {
                 } else {
                     format!("{path}.*")
                 };
-                walk_schema_for_path_shaped_keys(additional, &child, definitions, visiting, found);
+                walk_schema_for_path_shaped_keys(
+                    additional,
+                    &child,
+                    definitions,
+                    visiting,
+                    found,
+                    reached,
+                );
             }
         }
         if let Some(items) = object.get("items") {
@@ -3135,49 +3672,85 @@ mod tests {
                     definitions,
                     visiting,
                     found,
+                    reached,
                 );
             }
         }
     }
 
-    /// WOR-2433 re-review round 3, the method that replaces "run the
-    /// sweep again".
+    /// WOR-2433 re-review rounds 3 and 4: the method that replaces
+    /// "run the sweep again", widened until it covers every schema this
+    /// repository generates.
     ///
     /// `HOST_FILE_KEYS` is a hand-written list, so the only question
     /// that matters about it is what it is missing, and no test that
     /// reads the list can answer that. This one reads the shipped
-    /// schema instead: every string property whose name carries a path
-    /// marker has to be on the list or on
-    /// `SCHEMA_KEYS_THAT_ARE_NOT_HOST_PATHS` with a written reason.
+    /// schemas instead. Every string property whose **name** carries a
+    /// path marker **or** whose **description** carries a path stem has
+    /// to be on the list or on `SCHEMA_KEYS_THAT_ARE_NOT_HOST_PATHS`
+    /// with a written reason.
     ///
-    /// The previous method was a prose instruction in the list's own
-    /// doc. Re-running it by hand turned up about twenty-five uncovered
-    /// keys, including all four audit-chain sinks and the access-log
-    /// path, which is what an instruction nobody executes is worth.
+    /// Three things this asserts, each one a way a previous round of
+    /// this test was green while a host path went unguarded:
+    ///
+    /// * **All six schemas**, not just `sb-config`. Round 4 swept only
+    ///   the top-level file, where `origins.*.ai` is untyped, and left
+    ///   `serve.engines.<kind>.acquire.path` - a binary this node
+    ///   executes - completely uncovered.
+    /// * **Two signals**, not just the key name. Round 4 matched
+    ///   markers in names only, so `proxy.acme.ca_root` was invisible
+    ///   and `proxy.admin.tls.key` had to be added by hand.
+    /// * **Every definition is reached.** A schema definition the walk
+    ///   never enters is a whole struct's worth of keys nobody swept,
+    ///   and the walk would stay green about it. This asserts the walk
+    ///   touches all of them, so a `$ref` shape the traversal does not
+    ///   understand fails here rather than silently narrowing the
+    ///   sweep.
     #[test]
     fn every_path_shaped_schema_key_is_covered_or_explained() {
-        let text = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../schemas/sb-config.schema.json"
-        ))
-        .expect("the shipped config schema is readable");
-        let schema: serde_json::Value =
-            serde_json::from_str(&text).expect("the shipped config schema parses");
-        let definitions = schema
-            .get("definitions")
-            .and_then(serde_json::Value::as_object)
-            .expect("the shipped config schema has definitions")
-            .clone();
         let mut found = std::collections::BTreeSet::new();
-        walk_schema_for_path_shaped_keys(&schema, "", &definitions, &mut Vec::new(), &mut found);
+        for (file, prefix) in GENERATED_SCHEMAS {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../schemas")
+                .join(file);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("`{file}` is readable: {error}"));
+            let schema: serde_json::Value = serde_json::from_str(&text)
+                .unwrap_or_else(|error| panic!("`{file}` parses: {error}"));
+            let definitions = schema
+                .get("definitions")
+                .and_then(serde_json::Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let mut reached = std::collections::BTreeSet::new();
+            walk_schema_for_path_shaped_keys(
+                &schema,
+                prefix,
+                &definitions,
+                &mut Vec::new(),
+                &mut found,
+                &mut reached,
+            );
+            let unreached: Vec<&String> = definitions
+                .keys()
+                .filter(|name| !reached.contains(name.as_str()))
+                .collect();
+            assert!(
+                unreached.is_empty(),
+                "the walk never entered these `{file}` definitions, so every key inside them \
+                 went unswept: {unreached:#?}",
+            );
+        }
 
         // A sweep that finds nothing would pass vacuously; the surface
-        // has been in the dozens since this list existed.
+        // has been in the dozens since this list existed and is over a
+        // hundred across the six schemas.
         assert!(
-            found.len() >= 80,
-            "the schema sweep found only {} path-shaped keys, which means the walk broke \
-             rather than that the surface shrank",
+            found.len() >= 120,
+            "the sweep found only {} path-shaped keys across {} schemas, which means the \
+             walk broke rather than that the surface shrank",
             found.len(),
+            GENERATED_SCHEMAS.len(),
         );
 
         let uncovered: Vec<&String> = found
@@ -3191,15 +3764,15 @@ mod tests {
             .collect();
         assert!(
             uncovered.is_empty(),
-            "these config keys open or write a host path and are on neither HOST_FILE_KEYS \
-             nor the allowlist: {uncovered:#?}",
+            "these config keys look like a host path and are on neither HOST_FILE_KEYS nor \
+             the allowlist: {uncovered:#?}",
         );
 
         for (allowed, reason) in SCHEMA_KEYS_THAT_ARE_NOT_HOST_PATHS {
             assert!(
                 found.contains(*allowed),
-                "`{allowed}` is allowlisted but the schema sweep no longer finds it; delete \
-                 the entry rather than leaving a stale excuse",
+                "`{allowed}` is allowlisted but the sweep no longer finds it; delete the \
+                 entry rather than leaving a stale excuse",
             );
             assert!(
                 !a_host_file_key_covers(allowed),
@@ -3255,6 +3828,82 @@ mod tests {
             &ConfinementPolicy::remote_document(),
         )
         .expect("an absolute https url is fetched, not read off this host");
+    }
+
+    /// WOR-2433 re-review round 4, New 3. Both extension-code remedies
+    /// on `HOST_FILE_KEYS` point at a `type: git` bundle source, and
+    /// the `sources.path` entry refused exactly that, so the refusal's
+    /// only remedy was refused by the same entry. A `type: git` path is
+    /// a directory inside the fetched repository, not a path on this
+    /// host.
+    #[test]
+    fn a_git_bundle_source_may_name_a_path_inside_its_own_repository() {
+        let policy = ConfinementPolicy::remote_document();
+        check_confined_document(
+            "acme/runtime-config",
+            concat!(
+                "extensions:\n",
+                "  sources:\n",
+                "    - type: git\n",
+                "      repo: https://example.test/bundles.git\n",
+                "      revision: 1111111111111111111111111111111111111111\n",
+                "      path: bundles/edge\n",
+            ),
+            &policy,
+        )
+        .expect("an in-repository bundle directory is the document's own tree");
+
+        // And it still has to stay inside the checkout: the extension
+        // loader only checks that the path is non-empty.
+        for escape in ["/etc/sbproxy/bundles", "../../etc", "~/bundles"] {
+            let document = format!(
+                "extensions:\n  sources:\n    - type: git\n      repo: https://example.test/b.git\n      revision: 1111111111111111111111111111111111111111\n      path: {escape}\n"
+            );
+            let error = check_confined_document("acme/runtime-config", &document, &policy)
+                .expect_err("a git source path that leaves the checkout is a host read");
+            assert!(
+                matches!(error, ConfinedTemplateError::HostFileInlining { .. }),
+                "{error:?}",
+            );
+        }
+
+        // A source with no `type:` at all is refused rather than waved
+        // through, which is the direction every other ambiguity takes.
+        check_confined_document(
+            "acme/runtime-config",
+            "extensions:\n  sources:\n    - path: bundles/edge\n",
+            &policy,
+        )
+        .expect_err("a source whose variant cannot be read is refused");
+    }
+
+    /// The remote spellings of the other two value-aware entries this
+    /// round added stay legal, which is what keeps the guard from being
+    /// a refusal with no remedy.
+    #[test]
+    fn the_remote_form_of_a_lora_adapter_and_a_classifier_endpoint_is_allowed() {
+        let policy = ConfinementPolicy::remote_document();
+        check_confined_document(
+            "acme/runtime-config",
+            concat!(
+                "origins:\n  api:\n    ai:\n      providers:\n        - name: local\n",
+                "          serve:\n            models:\n              - name: m\n",
+                "                lora_adapters:\n                  - name: a\n",
+                "                    source: hf:Org/Adapter\n",
+            ),
+            &policy,
+        )
+        .expect("an `hf:` adapter reference is a fetch, not a host read");
+        check_confined_document(
+            "acme/runtime-config",
+            concat!(
+                "origins:\n  api:\n    action:\n      type: ai_proxy\n",
+                "      compression:\n        levers:\n          - type: token_prune\n",
+                "            endpoint: http://classifier.internal:9000\n",
+            ),
+            &policy,
+        )
+        .expect("a network classifier endpoint is an egress destination, not a host socket");
     }
 
     #[test]
