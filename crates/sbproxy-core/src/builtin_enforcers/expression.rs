@@ -126,6 +126,7 @@ pub(crate) fn decision_views(ctx: &RequestContext) -> sbproxy_modules::Expressio
         vendor: ctx.kya_vendor.as_deref(),
         kya_version: ctx.kya_version.as_deref(),
         kyab_balance: ctx.kya_kyab_balance,
+        kyab_currency: ctx.kya_kyab_currency.as_deref(),
     });
     #[cfg(not(feature = "agent-class"))]
     let kya_view: Option<sbproxy_extension::cel::context::KyaVerdictView<'_>> = None;

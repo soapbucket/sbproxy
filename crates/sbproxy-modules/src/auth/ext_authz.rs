@@ -26,9 +26,18 @@
 //! refusal the client sees (defaulting to `403 Forbidden by
 //! ext_authz`), and `headers` are attached to that refusal, which is
 //! how a service returns a `WWW-Authenticate` challenge or a
-//! `Retry-After`. This is the JSON shape Envoy's `ext_authz` HTTP
-//! service filter and the OpenPolicyAgent Envoy plugin both speak, so
-//! a service written for either answers this provider unchanged.
+//! `Retry-After`.
+//!
+//! This is the field vocabulary of Envoy's gRPC `CheckResponse`,
+//! carried as JSON, which is what the OpenPolicyAgent Envoy plugin
+//! also speaks. It is deliberately **not** Envoy's HTTP authorization
+//! filter, which has no body contract at all and signals its verdict
+//! with the response status alone. That difference is load-bearing
+//! here: because the decision lives in the body, this provider reads
+//! the body first and honors an explicit `"allowed": false` whatever
+//! status carried it. Only an answer that carries no decision, one
+//! that did not parse or was too large to read, falls to
+//! `failure_mode_allow`.
 //!
 //! # How it differs from `forward_auth`
 //!
@@ -360,20 +369,10 @@ impl ExtAuthzProvider {
             }
         };
 
-        // Envoy treats a non-2xx from the authorization service as a
-        // failure of the check rather than as a decision, and so does
-        // `oauth_introspection` a file over. A 500 whose body happens
-        // to parse as `{"allowed": true}` is not an authorization.
+        // The status is read but not acted on yet: what the body says
+        // decides, and only an answer that carries no decision falls to
+        // the failure mode. See the `interpret_answer` doc.
         let status = response.status();
-        if !status.is_success() {
-            warn!(
-                url = %sbproxy_security::url_redact::redacted_url(&self.url),
-                status = status.as_u16(),
-                failure_mode_allow = self.failure_mode_allow,
-                "ext_authz service answered a non-success status"
-            );
-            return self.on_failure();
-        }
 
         if let Some(length) = response.content_length() {
             if length > MAX_CHECK_RESPONSE_BYTES as u64 {
@@ -408,22 +407,66 @@ impl ExtAuthzProvider {
             );
             return self.on_failure();
         }
-        let parsed: CheckResponse = match serde_json::from_slice(&body) {
-            Ok(parsed) => parsed,
+        self.interpret_answer(status, &body)
+    }
+
+    /// Decide from what the service actually answered.
+    ///
+    /// # Why the body is read before the status is judged
+    ///
+    /// The first version of this refused on a non-2xx before parsing,
+    /// on the reasoning that Envoy treats a non-2xx as a failed check.
+    /// That reasoning does not carry to this provider. Envoy's *HTTP*
+    /// authorization filter signals its verdict **with** the status and
+    /// has no body contract at all; the JSON `allowed` field this
+    /// provider speaks is the gRPC `CheckResponse` shape. So a service
+    /// written against this provider's documented contract can, and
+    /// reasonably does, answer `403` with `{"allowed": false,
+    /// "status": 402}`: the status is the verdict it is asking the
+    /// gateway to send onward, and the body is the decision.
+    ///
+    /// Refusing before parsing turned that deliberate deny into a
+    /// failed check, and under `failure_mode_allow: true` a failed
+    /// check is an admission. A service saying "no" produced a "yes".
+    ///
+    /// So: an answer that parses as a check document is a decision at
+    /// any status. Only an answer that carries no decision, because it
+    /// did not parse or because it was too large to read, falls to
+    /// `on_failure`, and a non-2xx is what makes that fall loud rather
+    /// than quiet.
+    fn interpret_answer(&self, status: http::StatusCode, body: &[u8]) -> ExtAuthzOutcome {
+        match serde_json::from_slice::<CheckResponse>(body) {
+            Ok(parsed) => {
+                if !status.is_success() {
+                    // Worth a line either way: a service answering a
+                    // decision under a non-2xx is unusual enough that an
+                    // operator debugging one wants to see it, and the
+                    // line says the decision was honored so nobody
+                    // reads it as a swallowed failure.
+                    warn!(
+                        url = %sbproxy_security::url_redact::redacted_url(&self.url),
+                        status = status.as_u16(),
+                        allowed = parsed.allowed,
+                        "ext_authz service answered a check document under a non-success status; \
+                         honoring the decision the document carries"
+                    );
+                }
+                Self::interpret(parsed)
+            }
             Err(error) => {
                 // The parse error names a position, never the payload,
                 // so an authorization service that answers with a
                 // credential-bearing page does not log one.
                 warn!(
                     url = %sbproxy_security::url_redact::redacted_url(&self.url),
+                    status = status.as_u16(),
                     error = %error,
+                    failure_mode_allow = self.failure_mode_allow,
                     "ext_authz check response is not a check document"
                 );
-                return self.on_failure();
+                self.on_failure()
             }
-        };
-
-        Self::interpret(parsed)
+        }
     }
 
     /// Turn a parsed check document into an outcome. Split out so the
@@ -503,6 +546,73 @@ mod tests {
 
     fn check_response(json: serde_json::Value) -> CheckResponse {
         serde_json::from_value(json).expect("check document parses")
+    }
+
+    /// WOR-2667 re-review N2, red first. The status check used to run
+    /// before the body was parsed, so a service answering an explicit
+    /// `{"allowed": false}` under a non-2xx took the failure path.
+    /// Under `failure_mode_allow: true` that turned a deliberate deny
+    /// into an admission: the one direction a security control must
+    /// never fail in.
+    #[test]
+    fn an_explicit_deny_under_a_non_success_status_is_still_a_deny() {
+        for failure_mode_allow in [false, true] {
+            let outcome = provider(failure_mode_allow).interpret_answer(
+                http::StatusCode::FORBIDDEN,
+                br#"{"allowed": false, "status": 402, "body": "quota exhausted"}"#,
+            );
+            match outcome {
+                ExtAuthzOutcome::Denied {
+                    status, message, ..
+                } => {
+                    assert_eq!(status, 402);
+                    assert_eq!(message, "quota exhausted");
+                }
+                other => panic!(
+                    "a service that said no must be honored with failure_mode_allow = \
+                     {failure_mode_allow}: {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// The other half of the same rule: an answer that carries no
+    /// decision is a failed check, and the failure mode decides.
+    #[test]
+    fn an_unparseable_answer_falls_to_the_failure_mode() {
+        assert!(matches!(
+            provider(false).interpret_answer(
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                b"<html>gateway timeout</html>",
+            ),
+            ExtAuthzOutcome::Unavailable
+        ));
+        assert!(matches!(
+            provider(true).interpret_answer(
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                b"<html>gateway timeout</html>",
+            ),
+            ExtAuthzOutcome::FailedOpen
+        ));
+        // And an empty body is the same thing: nothing was decided.
+        assert!(matches!(
+            provider(false).interpret_answer(http::StatusCode::OK, b""),
+            ExtAuthzOutcome::Unavailable
+        ));
+    }
+
+    /// An allow under a non-2xx is honored for the same reason a deny
+    /// is: the document is the decision. The odd shape gets a log line
+    /// rather than a different verdict.
+    #[test]
+    fn an_allow_under_a_non_success_status_is_still_an_allow() {
+        assert!(matches!(
+            provider(false).interpret_answer(
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                br#"{"allowed": true, "subject": "svc-a"}"#,
+            ),
+            ExtAuthzOutcome::Allowed { .. }
+        ));
     }
 
     #[test]

@@ -407,11 +407,13 @@ async fn check_auth(
         Auth::Kya(verifier) => {
             use sbproxy_modules::auth::KyaVerdict;
             // The same resolution the dispatch used to route the
-            // request. Reading `Host` alone yields `""` on H3, which
-            // Pingora surfaces as `:authority`, and an empty audience
-            // fails every token minted for this gateway with
-            // `audience_mismatch`: the operator sees a rising `invalid`
-            // count and goes looking at the issuer.
+            // request. Reading `Host` alone yields `""` when the request
+            // carries its authority on the URI rather than in a header,
+            // which is the H2/H3 shape, and an empty audience fails
+            // every token minted for this gateway with
+            // `audience_mismatch`: the same token succeeds over
+            // HTTP/1.1, and the operator sees a rising `invalid` count
+            // and goes looking at the issuer.
             let hostname = extract_hostname(headers, uri);
             match verifier.verify(headers, &hostname).await {
                 KyaVerdict::Verified(_) => true,
@@ -1028,6 +1030,49 @@ mod tests {
     use sbproxy_plugin::{ActionHandler, ActionOutcome, PluginResult};
 
     use super::*;
+
+    /// WOR-2667 re-review N4. The M4 fix is a one-line call swap with
+    /// no test, and the arm it fixed cannot be driven from here: it
+    /// needs a live issuer, `check_auth` is private, and this build
+    /// refuses `http3.enabled: true`. What is testable is the
+    /// resolution the arm now uses, which is the whole content of the
+    /// fix. On the H2/H3 shape there is no `Host` header and the
+    /// authority arrives on the URI, so `headers.get(HOST)` yielded
+    /// `""`, and an empty audience fails every token minted for this
+    /// gateway with `audience_mismatch`.
+    #[test]
+    fn the_kya_audience_hostname_survives_an_absent_host_header() {
+        let authority_only = http::HeaderMap::new();
+        let absolute: http::Uri = "https://gateway.example.com:8443/v1/chat"
+            .parse()
+            .expect("absolute uri");
+        assert!(
+            authority_only.get(http::header::HOST).is_none(),
+            "this is the shape the old code read, and it is absent"
+        );
+        assert_eq!(
+            extract_hostname(&authority_only, &absolute),
+            "gateway.example.com",
+            "the audience check has to see the routed name, not the empty string"
+        );
+
+        // The H1 shape still resolves the way it always did.
+        let mut h1 = http::HeaderMap::new();
+        h1.insert(
+            http::header::HOST,
+            http::HeaderValue::from_static("gateway.example.com:8443"),
+        );
+        let path_only: http::Uri = "/v1/chat".parse().expect("path-only uri");
+        assert_eq!(extract_hostname(&h1, &path_only), "gateway.example.com");
+
+        // And both resolve to the same name, which is the point: the
+        // kya arm reads what the dispatch routed on, so one protocol
+        // cannot refuse a token the other accepts.
+        assert_eq!(
+            extract_hostname(&authority_only, &absolute),
+            extract_hostname(&h1, &path_only)
+        );
+    }
 
     struct OutcomeAction(ActionOutcome);
 

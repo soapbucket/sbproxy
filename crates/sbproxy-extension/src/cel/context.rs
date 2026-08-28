@@ -336,10 +336,15 @@ pub fn populate_aipref_namespace(ctx: &mut CelContext, aipref: Option<&AiprefVie
 /// presence.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct KyaVerdictView<'a> {
-    /// Verdict label as defined by `KyaVerdict::metric_label` on the
-    /// enterprise verifier. One of: `"verified"`, `"missing"`,
-    /// `"expired"`, `"revoked"`, `"invalid"`,
-    /// `"directory_unavailable"`. `None` when no KYA hook ran.
+    /// Verdict label the built-in `kya` provider stamped.
+    ///
+    /// Two values reach a policy, and only two, because only two
+    /// continue into the policy chain: `"verified"`, and
+    /// `"directory_unavailable"` when `fail_open: true` admitted the
+    /// request anyway. Every other verdict the provider can return
+    /// (`missing`, `expired`, `revoked`, `invalid`,
+    /// `insufficient_balance`) refuses, so no policy runs to read it.
+    /// `None` when no KYA hook ran.
     pub verdict: Option<&'a str>,
     /// Agent identifier the verified token carried. Empty when the
     /// verdict is not `"verified"`.
@@ -356,8 +361,18 @@ pub struct KyaVerdictView<'a> {
     pub vendor: Option<&'a str>,
     /// KYA spec version (e.g. `"v1"`).
     pub kya_version: Option<&'a str>,
-    /// KYAB advisory balance (smallest currency unit).
+    /// KYAB advisory balance, in the smallest unit of
+    /// [`Self::kyab_currency`].
     pub kyab_balance: Option<u64>,
+    /// Currency the balance is denominated in, as the token declared it
+    /// (`"USD"`, `"JPY"`).
+    ///
+    /// Carried because the amount alone is not comparable: 5000 JPY and
+    /// 5000 COP are about 32 dollars and about a dollar twenty. The
+    /// provider's own `min_kyab_balance` floor is denominated by
+    /// `min_kyab_currency` for that reason, and a policy writing its
+    /// own comparison needs the same thing to work with.
+    pub kyab_currency: Option<&'a str>,
 }
 
 /// Populate the `request.kya` namespace with the verdict produced by
@@ -400,7 +415,7 @@ pub fn populate_kya_namespace(ctx: &mut CelContext, view: &KyaVerdictView<'_>) {
         "kya_version".to_string(),
         CelValue::String(view.kya_version.unwrap_or("").to_string()),
     );
-    let mut balance_map = HashMap::with_capacity(1);
+    let mut balance_map = HashMap::with_capacity(2);
     // KYAB balance is advisory; the proxy never settles against it.
     // Render `amount` as `Int(0)` when absent so a CEL expression like
     // `request.kya.kyab_balance.amount > 100` short-circuits cleanly
@@ -408,6 +423,15 @@ pub fn populate_kya_namespace(ctx: &mut CelContext, view: &KyaVerdictView<'_>) {
     balance_map.insert(
         "amount".to_string(),
         CelValue::Int(view.kyab_balance.unwrap_or(0) as i64),
+    );
+    // WOR-2667 re-review N3. The provider's floor became denominated
+    // and this surface did not, so a policy author writing their own
+    // comparison had the amount and no way to learn what it was
+    // denominated in. `""` for an unsigned token, matching every other
+    // absent string here.
+    balance_map.insert(
+        "currency".to_string(),
+        CelValue::String(view.kyab_currency.unwrap_or("").to_string()),
     );
     kya_map.insert("kyab_balance".to_string(), CelValue::Map(balance_map));
 
@@ -1964,6 +1988,7 @@ mod tests {
             vendor: Some("skyfire"),
             kya_version: Some("v1"),
             kyab_balance: Some(1000),
+            kyab_currency: Some("JPY"),
         };
         populate_kya_namespace(&mut ctx, &view);
 
@@ -1985,6 +2010,11 @@ mod tests {
             .unwrap());
         assert!(engine
             .eval_bool_source(r#"request.kya.kyab_balance.amount == 1000"#, &ctx)
+            .unwrap());
+        // WOR-2667 re-review N3: the amount alone is not comparable, so
+        // a policy has to be able to see what it is denominated in.
+        assert!(engine
+            .eval_bool_source(r#"request.kya.kyab_balance.currency == "JPY""#, &ctx)
             .unwrap());
     }
 

@@ -120,13 +120,24 @@ identity half. Everything the verified token carried is addressable:
 | `request.kya.agent_class` | The agent class the token claimed |
 | `request.kya.vendor` | The vendor from the token |
 | `request.kya.kya_version` | The KYA spec version the token was minted under |
-| `request.kya.kyab_balance.amount` | The balance, in the smallest currency unit, or `0` |
+| `request.kya.kyab_balance.amount` | The balance, in the smallest unit of the token's own currency, or `0` |
+| `request.kya.kyab_balance.currency` | That currency, as the token declared it (`USD`, `JPY`), or `""` |
 
 The same fields are readable from Lua, JavaScript, and WASM. A balance
 whose `expires_at` has passed reads as `0`, and so does one whose
 `expires_at` does not parse: an allowance the issuer has already
 withdrawn is not one to spend, and an unparseable expiry is not a
 reason to treat it as unlimited.
+
+Compare the currency before you compare the amount. That is the same
+rule `min_kyab_balance` follows against `min_kyab_currency`, and it is
+there because 5000 JPY and 5000 COP are about thirty-two dollars and
+about a dollar twenty:
+
+```
+request.kya.kyab_balance.currency == "USD" &&
+  request.kya.kyab_balance.amount >= 5000
+```
 
 The verdict also feeds the [trust tier](../../docs/trust-tiers.md). A
 verified token earns `strong`, a presented-and-rejected one drops the

@@ -3317,7 +3317,7 @@ What the caller sees: a verified token is admitted, and its `sub` becomes the pr
 
 Three ways a balance is worth nothing against the floor, and each is a refusal rather than a guess: it names a currency other than `min_kyab_currency`, its `expires_at` has passed, or its `expires_at` does not parse. The currency rule matters more than it looks: 5000 JPY is about 32 dollars and 5000 COP is about a dollar twenty, so a floor of `1000` meaning ten dollars is cleared by both if the comparison is numeric. The proxy holds no exchange rate and will not invent one.
 
-Leave `min_kyab_balance` unset and the balance gates nothing; it is still carried to policy as `request.kya.kyab_balance.amount`.
+Leave `min_kyab_balance` unset and the balance gates nothing; it is still carried to policy as `request.kya.kyab_balance.amount`, alongside `request.kya.kyab_balance.currency`. Both, because the amount alone is not comparable for the same reason the floor is denominated: a policy writing its own comparison needs to know what the number is in.
 
 Verdicts are not cached. The JWKS and the denylist are, per issuer, but a token is verified on every request, because a cached verdict is a revocation the proxy has decided not to see.
 
