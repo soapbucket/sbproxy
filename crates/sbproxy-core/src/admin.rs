@@ -5096,6 +5096,13 @@ pub fn handle_admin_request(
     if let Some(response) = crate::admin_federation::dispatch(method, path) {
         return response;
     }
+    // MCP OAuth brokers. The crate's own /admin/status is deliberately
+    // not mounted in process, because the broker's route tree sits on
+    // the public MCP origin ahead of the resource-server check. This is
+    // the same JSON behind operator auth.
+    if let Some(response) = crate::admin_mcp_oauth::dispatch(method, path) {
+        return response;
+    }
 
     // Classifier cache and bounded unavailable-stage health. This is kept
     // behind the operator-auth gate because configured origin identifiers and

@@ -8131,6 +8131,41 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0.0
+        },
+        "max_chain_fetches": {
+          "description": "Total outbound fetches one chain walk may spend.\n\nThis is the bound that matters, and it is not `max_chain_depth`. `authority_hints` is an array: one entity naming five thousand superiors costs five thousand fetches at depth 1, and a depth cap never fires. A well-formed chain spends about two fetches per level, so the default covers a four-level federation that has to try a second superior at one level.",
+          "default": 16,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "max_chain_bytes": {
+          "description": "Total bytes one chain walk may read across every fetch.\n\nEach fetch is separately capped at 1 MiB by the fetcher; this bounds the sum, so a peer serving a maximum-size document at every hop cannot make one request hold the product of the two.",
+          "default": 2097152,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "max_chain_duration_ms": {
+          "description": "Wall-clock budget for one chain walk, in milliseconds.\n\nEvery fetch has its own connect and read timeout. Without an aggregate deadline, a peer that answers just inside the per-fetch timeout at every hop holds the request open for the product of the two. The walk stops here whatever it has found.",
+          "default": 5000,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "max_authority_hints": {
+          "description": "Most `authority_hints` a single entity configuration may publish before the walk refuses the document.\n\nRefused rather than truncated: silently ignoring an operator's superiors turns a configuration error into an unexplained refusal further down.",
+          "default": 8,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "walks_per_minute": {
+          "description": "Chain walks one source address may start per minute.\n\nThe decision cache is keyed on the peer address and the claimed entity id, so a caller that rotates the entity id it claims misses the cache every time. This is what stops that from becoming one walk per request.",
+          "default": 30,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
         }
       },
       "additionalProperties": false

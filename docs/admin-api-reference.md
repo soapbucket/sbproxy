@@ -3209,6 +3209,7 @@ model-host artifact cache above:
 | POST | `/admin/cache/key-policy/evict` | Drop one (or all) cached key policies so the next request re-reads the keystore. |
 | GET | `/admin/cache/semantic` | Recent semantic (embedding) cache lookup decisions per AI origin. |
 | GET | `/admin/federation` | OpenID Federation identity this proxy publishes, and what it requires of a peer. |
+| GET | `/admin/mcp-oauth` | Every colocated MCP OAuth broker this proxy runs, and what each has wired in. |
 
 ### `GET /admin/cache`
 
@@ -3306,6 +3307,56 @@ the well-known route from the request path and never mounts that crate's
 router. An admin console page for it is separate scope, under the admin
 console epic; the JSON here is the operator surface today. See
 [federation.md](federation.md).
+
+### `GET /admin/mcp-oauth`
+
+Colocated MCP OAuth brokers. Returns `{"enabled": false}` when no `mcp`
+action configures `oauth.broker`, so a poll can tell "off" from a typo
+in the path. Both `admin` and `read_only` operators may call it.
+
+```json
+{
+  "enabled": true,
+  "brokers": [
+    {
+      "base_path": "/mcp/oauth",
+      "resource_server_configured": true,
+      "features": {
+        "as_metadata_cache": true,
+        "cimd": true,
+        "cimd_to_dcr_translation": false,
+        "dpop_replay_cache": true,
+        "dpop_nonce_issuer": true,
+        "device_code_grant": true,
+        "pushed_authorization_requests": false,
+        "revocation": false,
+        "introspection": false,
+        "token_exchange": false,
+        "broker_signing_key": true
+      }
+    }
+  ]
+}
+```
+
+One entry per `mcp` action carrying an `oauth.broker` block.
+`resource_server_configured` is the question worth polling: a broker
+with no verifier mints tokens nothing on this proxy checks.
+`pushed_authorization_requests` is always `false` on a colocated broker
+because the in-process constructor does not build a PAR store; the
+standalone embedding is where that route is available.
+
+This route exists because the broker's own
+`GET {base_path}/admin/status` is deliberately **not** mounted in
+process. The broker's whole route tree is dispatched on the public MCP
+origin ahead of the resource-server check, and the OAuth routes have to
+stay unauthenticated for the flow to work, so a route answering "which
+security controls are off" would be world-readable there. Same JSON,
+behind operator auth, like
+[`GET /admin/federation`](#get-adminfederation). An admin console page
+for it is separate scope, under the admin console epic; the JSON here
+is the operator surface today. See [mcp.md](mcp.md) and
+[mcp-oauth-gateway.md](mcp-oauth-gateway.md).
 
 ### `POST /admin/cache/purge`
 

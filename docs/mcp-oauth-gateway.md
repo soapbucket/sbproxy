@@ -277,10 +277,10 @@ mount it, and
 [`action_dispatch.rs`](../crates/sbproxy-core/src/server/action_dispatch.rs)
 carries a test pinning that a real broker route answers while this one
 returns 404. The proxy's own authenticated admin API is where an
-operator-facing status surface belongs; the federation half of this
-branch does exactly that with
-[`GET /admin/federation`](admin-api-reference.md#get-adminfederation),
-and the equivalent for the broker is not shipped.
+operator-facing status surface belongs, and that is where a colocated
+deployment reads these fields:
+[`GET /admin/mcp-oauth`](admin-api-reference.md#get-adminmcp-oauth)
+serves the same JSON, one entry per `mcp` action, behind operator auth.
 
 ## The device-consent page
 

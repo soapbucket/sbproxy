@@ -625,6 +625,13 @@ embed the broker standalone against `sbproxy_storage::RedisStore` per
 [mcp-oauth-gateway.md](mcp-oauth-gateway.md#storage-in-process-by-default-redis-for-multiple-replicas).
 A multi-replica store selector under `oauth.broker` is not shipped.
 
+[`GET /admin/mcp-oauth`](admin-api-reference.md#get-adminmcp-oauth) on
+the proxy's admin listener reports every colocated broker and what each
+has wired in, including whether a resource server is configured to
+check the tokens it mints. The broker's own
+`GET {base_path}/admin/status` is not mounted in process, because these
+routes sit on the public MCP origin ahead of the verifier.
+
 Every refusal this surface makes is visible: the resource server's 401,
 the per-operation scope refusal, and each broker endpoint's 4xx write
 `sbproxy_mcp_gateway_decisions_total{surface,decision}`, one

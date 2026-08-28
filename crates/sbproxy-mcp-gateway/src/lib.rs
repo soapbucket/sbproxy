@@ -252,9 +252,34 @@ pub struct GatewayHttpResponse {
 pub struct McpGatewayRuntime {
     base_path: String,
     router: Router,
+    /// The feature snapshot, captured at construction because that is
+    /// where the collaborators are known. Serving it from the proxy's
+    /// admin API means reading it without the axum state the
+    /// standalone handler has.
+    status: serde_json::Value,
 }
 
 impl McpGatewayRuntime {
+    /// What this broker has wired in, as the JSON the standalone
+    /// `GET {base_path}/admin/status` route serves.
+    ///
+    /// The route itself is standalone-only: in process the broker's
+    /// tree is dispatched on the public MCP origin ahead of the
+    /// resource-server check, so mounting it there would answer "which
+    /// security controls are off" to anyone who asked. A colocated
+    /// deployment reads the same fields through the proxy's own
+    /// authenticated admin API instead, which is what this method is
+    /// for. It reveals no secret and no key material, only which
+    /// optional collaborators are configured.
+    pub fn status_json(&self) -> serde_json::Value {
+        self.status.clone()
+    }
+
+    /// The base path this broker is mounted under.
+    pub fn base_path(&self) -> &str {
+        &self.base_path
+    }
+
     /// Build the broker and every enabled collaborator from one config.
     pub fn new(config: McpGatewayConfig) -> anyhow::Result<Self> {
         Self::new_with_security_context(config, McpSecurityContext::new())
@@ -307,9 +332,36 @@ impl McpGatewayRuntime {
         // this no longer clamps it on the way past.
         let sessions =
             InMemorySessionStore::arc(std::time::Duration::from_secs(config.session_ttl_secs));
+        // Capture the feature snapshot from the config before it moves
+        // into the router. The standalone handler reads the same facts
+        // off `AppState`; a colocated deployment has no `AppState` to
+        // reach, so the proxy's admin API reads this instead.
+        let status = serde_json::json!({
+            "base_path": base_path,
+            "features": {
+                "as_metadata_cache": config.upstream_metadata_url.is_some(),
+                "cimd": config.cimd_enabled,
+                "cimd_to_dcr_translation": config.dcr_translate_cimd_clients,
+                // `router_with_security_context`, the constructor this
+                // path uses, always builds both DPoP collaborators and
+                // never a PAR store. Reporting the config flags instead
+                // would tell an operator a route is mounted when it is
+                // not, which is the failure the whole surface exists to
+                // avoid.
+                "dpop_replay_cache": true,
+                "dpop_nonce_issuer": true,
+                "device_code_grant": config.device_code_enabled,
+                "pushed_authorization_requests": false,
+                "revocation": config.upstream_revocation_endpoint_url.is_some(),
+                "introspection": config.upstream_introspection_endpoint_url.is_some(),
+                "token_exchange": config.token_exchange_enabled,
+                "broker_signing_key": config.broker_signing_key.is_some(),
+            }
+        });
         Ok(Self {
             base_path,
             router: router_with_security_context(Arc::new(config), sessions, security),
+            status,
         })
     }
 

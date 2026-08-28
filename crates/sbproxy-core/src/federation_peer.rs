@@ -457,6 +457,11 @@ mod tests {
             trust_anchors: vec![anchor_config("https://anchor.example")],
             required_trust_marks: Vec::new(),
             max_chain_depth: 3,
+            max_chain_fetches: 16,
+            max_chain_bytes: 2 * 1024 * 1024,
+            max_chain_duration_ms: 5_000,
+            max_authority_hints: 8,
+            walks_per_minute: 30,
             cache_ttl_secs: 600,
         }
     }
@@ -470,7 +475,7 @@ mod tests {
             "",
             "https://peer.example/../../etc",
         ] {
-            let verdict = verifier.verify(bad).await;
+            let verdict = verifier.verify("198.51.100.7", bad).await;
             if bad == "https://peer.example/../../etc" {
                 // A syntactically valid https URL still goes to the
                 // fetcher; the refusal there is what covers it.
@@ -490,7 +495,7 @@ mod tests {
         let verifier = FederationPeerVerifier::new(&peer_config()).expect("verifier");
         let long = format!("https://{}.example", "a".repeat(MAX_ENTITY_ID_LEN));
         assert_eq!(
-            verifier.verify(&long).await,
+            verifier.verify("198.51.100.7", &long).await,
             PeerVerdict::Refused("malformed_entity_id")
         );
         assert_eq!(verifier.cached_peers(), 0);
@@ -501,10 +506,14 @@ mod tests {
         let verifier = FederationPeerVerifier::new(&peer_config()).expect("verifier");
         // `anchor.invalid` does not resolve, so the chain walk fails
         // and the refusal is what gets cached.
-        let first = verifier.verify("https://peer.invalid").await;
+        let first = verifier
+            .verify("198.51.100.7", "https://peer.invalid")
+            .await;
         assert!(matches!(first, PeerVerdict::Refused(_)));
         assert_eq!(verifier.cached_peers(), 1);
-        let second = verifier.verify("https://peer.invalid").await;
+        let second = verifier
+            .verify("198.51.100.7", "https://peer.invalid")
+            .await;
         assert_eq!(first, second);
         assert_eq!(verifier.cached_peers(), 1);
     }
@@ -515,5 +524,78 @@ mod tests {
         assert_eq!(verifier.header(), "x-federation-entity-id");
         assert!(verifier.required());
         assert_eq!(verifier.anchor_count(), 1);
+    }
+
+    /// The decision cache is keyed on the source **and** the entity id.
+    ///
+    /// Keying on the entity id alone was the whole of what
+    /// `docs/federation.md` claimed stopped an unverified caller
+    /// driving outbound traffic per request. The caller picks that
+    /// string, so rotating it missed the cache every time.
+    #[tokio::test]
+    async fn security_boundary_the_decision_cache_is_keyed_on_the_source_too() {
+        let verifier = FederationPeerVerifier::new(&peer_config()).expect("verifier");
+        let entity = "https://peer.invalid";
+        assert!(matches!(
+            verifier.verify("198.51.100.7", entity).await,
+            PeerVerdict::Refused(_)
+        ));
+        assert_eq!(verifier.cached_peers(), 1);
+        // A different source asking about the same entity is a
+        // different cache entry, so one source cannot evict another's
+        // verdict by churning.
+        assert!(matches!(
+            verifier.verify("203.0.113.9", entity).await,
+            PeerVerdict::Refused(_)
+        ));
+        assert_eq!(verifier.cached_peers(), 2);
+    }
+
+    /// One source rotating the entity id it claims hits the walk rate
+    /// limit rather than starting a walk per request.
+    ///
+    /// This is the amplifier the cache was supposed to stop and could
+    /// not: every rotation is a cache miss by construction.
+    #[tokio::test]
+    async fn security_boundary_a_rotating_caller_hits_the_per_source_walk_limit() {
+        let mut config = peer_config();
+        config.walks_per_minute = 3;
+        let verifier = FederationPeerVerifier::new(&config).expect("verifier");
+        let mut refused_for_rate = 0;
+        for i in 0..20 {
+            // A fresh entity id every time: never a cache hit.
+            let entity = format!("https://peer{i}.invalid");
+            if verifier.verify("198.51.100.7", &entity).await
+                == PeerVerdict::Refused("walk_rate_limited")
+            {
+                refused_for_rate += 1;
+            }
+        }
+        assert_eq!(
+            refused_for_rate, 17,
+            "three walks are allowed per window and the other seventeen must be rate limited"
+        );
+    }
+
+    /// And the limit is per source, so one caller cannot spend
+    /// another's allowance.
+    #[tokio::test]
+    async fn the_walk_limit_is_per_source() {
+        let mut config = peer_config();
+        config.walks_per_minute = 1;
+        let verifier = FederationPeerVerifier::new(&config).expect("verifier");
+        assert!(matches!(
+            verifier.verify("198.51.100.7", "https://a.invalid").await,
+            PeerVerdict::Refused("chain_unresolved")
+        ));
+        assert_eq!(
+            verifier.verify("198.51.100.7", "https://b.invalid").await,
+            PeerVerdict::Refused("walk_rate_limited"),
+            "the first source has spent its allowance"
+        );
+        assert!(matches!(
+            verifier.verify("203.0.113.9", "https://c.invalid").await,
+            PeerVerdict::Refused("chain_unresolved")
+        ));
     }
 }
