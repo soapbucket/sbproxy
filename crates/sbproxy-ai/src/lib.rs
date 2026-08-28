@@ -71,6 +71,8 @@ pub mod routing_state;
 pub mod semantic_cache;
 pub mod service_tier;
 pub mod session;
+pub mod shadow_eval;
+pub mod shadow_judge;
 pub mod token_estimate;
 /// Bounded production facade for governed agents, offline evaluation, and rollouts.
 pub mod toolkit;

@@ -1,10 +1,12 @@
 # AI shadow / side-by-side evaluation
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-27*
 
 ![AI shadow / side-by-side evaluation](../../docs/assets/ai-shadow.gif)
 
-Each request is forwarded to the primary provider as usual; a copy is also sent to every configured shadow target concurrently. This config runs two, Anthropic and Gemini. The shadow response is drained and never reaches the client; metadata is logged at `target=sbproxy_ai_shadow` so it can be filtered into a dedicated stream with provider, status, latency_ms, prompt_tokens, completion_tokens, and finish_reason. Useful for validating a model swap before flipping primary traffic, comparing finish_reason or token counts across providers, and spot-checking guardrail or routing changes without exposing experimental output to users.
+Each request is forwarded to the primary provider as usual; a copy is also sent to every configured shadow target concurrently. This config runs two, Anthropic and Gemini. The shadow response never reaches the client. Metadata is logged at `target=sbproxy_ai_shadow` so it can be filtered into a dedicated stream with provider, status, latency_ms, prompt_tokens, completion_tokens, and finish_reason. Useful for validating a model swap before flipping primary traffic, comparing finish_reason or token counts across providers, and spot-checking guardrail or routing changes without exposing experimental output to users.
+
+Whether the response *text* is kept is a separate decision from whether it reaches the client, and this config makes it: `capture_content: true` is half of the content-recording gate, and the calling key's own `allow_content_capture` is the other half. With both on, the candidate's answer is retained beside the primary's on `GET /api/requests/{id}/content` under `shadow_responses[]`, through the same redaction stack and payload cap as the primary's own. With either off no sink is installed and the body is drained exactly as before, never held and then discarded. Numbers say a candidate cost less and answered faster; they never say it answered worse, and reading that needs the two answers side by side.
 
 `sample_rate: 0.1` mirrors 10% of traffic; set to 1.0 to mirror every request (doubles spend on that leg). One draw is taken per request and every target is compared against it, so the 0.1 Anthropic target only ever fires on requests the 0.5 Gemini target also fired on. That nesting is what makes two targets comparable: their measurements come from the same requests, not from two independent samples.
 
@@ -71,6 +73,9 @@ sbproxy_ai_shadow_calls_total{target="gemini",status_class="2xx",finish_reason="
 - Structured shadow events emitted under `sbproxy_ai_shadow` for offline analysis, one per target
 - Per-target usage rows tagged `shadow`, joined to the primary by `shadow_of` and carrying `finish_reason`
 - `sbproxy_ai_shadow_calls_total` and `sbproxy_ai_shadow_latency_seconds`, both labeled by target
+- `ai_proxy.capture_content` - the origin's half of the content-recording gate; with the calling key's `allow_content_capture` it retains the primary's answer and every target's beside it on `GET /api/requests/{id}/content` under `shadow_responses[]`
+- `GET /api/ai/shadow/report?window=1h` - one row per target over a window, leading with provenance (requests seen, sample rate applied, pairs retained, pairs dropped by reason) so the cost and latency deltas under it are falsifiable
+- `ai_proxy.shadow.judge` - the batch judge's spend cap, one ceiling shared by every target in the block. The prompt and the scoring loop are not implemented, so this configures the budget and nothing else runs behind it yet
 
 ## See also
 

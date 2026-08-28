@@ -1774,6 +1774,32 @@ impl Router {
         strategy_name(&self.strategy)
     }
 
+    /// WOR-2651: whether this strategy produces a candidate order the
+    /// operator authored, which a prompt-cache lease must not jump.
+    ///
+    /// `fallback_chain` sorts by declared priority, `cascade` walks
+    /// tiers in cost order, and `cost_quality` splits cheap against
+    /// frontier per request. Each is an order somebody wrote down on
+    /// purpose, so moving a lease holder to the front of it would
+    /// defeat the strategy rather than compose with it. (A
+    /// `routing_policy` plan is the fourth of that set, but it is not a
+    /// `RoutingStrategy` variant: the dispatcher checks for it
+    /// separately.)
+    ///
+    /// The `fallback_chain` arm is the one that was missing. The
+    /// dispatch site named all four in a comment and checked three, so
+    /// a priority-sorted chain silently had its first candidate
+    /// replaced by whichever provider held the caller's lease, and
+    /// recorded a lease of its own on every success.
+    pub fn owns_candidate_order(&self) -> bool {
+        matches!(
+            self.strategy,
+            RoutingStrategy::FallbackChain
+                | RoutingStrategy::Cascade(_)
+                | RoutingStrategy::CostQuality(_)
+        )
+    }
+
     /// Returns true when the configured strategy is `Cascade`. The
     /// AI client uses this to decide whether to engage the
     /// tier-by-tier cascade dispatch path.
@@ -2092,6 +2118,57 @@ mod tests {
             counts[0],
             counts[1]
         );
+    }
+
+    /// WOR-2651: every strategy whose order a cache-affinity lease must
+    /// not jump, and a sample of the ones it may.
+    ///
+    /// All three arms of the predicate are exercised, because a
+    /// predicate wider than its test is how the `fallback_chain` gap
+    /// this test was written to close survived in the first place:
+    /// deleting an untested arm leaves the suite green.
+    ///
+    /// Red before the fix on the `fallback_chain` arm: the dispatch
+    /// site excluded `cascade` and `cost_quality` and never excluded
+    /// the chain, while both the doc and the comment above the check
+    /// said all of them were excluded.
+    #[test]
+    fn the_authored_orderings_own_their_candidate_order() {
+        let cascade: CascadeConfig = serde_json::from_value(serde_json::json!({
+            "tiers": [
+                {"provider_id": "cheap", "model": "cheap-model", "quality_threshold": 0.5},
+                {"provider_id": "frontier", "model": "frontier-model", "quality_threshold": 0.9}
+            ]
+        }))
+        .expect("cascade fixture");
+        let cost_quality: crate::cost_quality::CostQualityConfig =
+            serde_json::from_value(serde_json::json!({
+                "cheap_provider": "cheap",
+                "frontier_provider": "frontier"
+            }))
+            .expect("cost_quality fixture");
+        for strategy in [
+            RoutingStrategy::FallbackChain,
+            RoutingStrategy::Cascade(cascade),
+            RoutingStrategy::CostQuality(cost_quality),
+        ] {
+            let name = strategy_name(&strategy);
+            assert!(
+                Router::new(strategy, 2).owns_candidate_order(),
+                "{name} orders its own candidates and a lease must not jump it"
+            );
+        }
+        for strategy in [
+            RoutingStrategy::RoundRobin,
+            RoutingStrategy::Random,
+            RoutingStrategy::LowestLatency,
+        ] {
+            let name = strategy_name(&strategy);
+            assert!(
+                !Router::new(strategy, 2).owns_candidate_order(),
+                "{name} produces an order a lease is allowed to re-front"
+            );
+        }
     }
 
     // --- FallbackChain Tests ---
