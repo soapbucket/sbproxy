@@ -1767,28 +1767,36 @@ fn the_loop_re_reads_the_runtime_document_between_rounds() {
 
     let mut aggregator =
         Aggregator::from_path(&path, context(&git)).expect("the aggregator reads the file");
-    let first = aggregator.compose().expect("composes");
-    assert_eq!(first.origins, 1);
+    let publisher = RecordingPublisher::default();
+    // Through the loop rather than through a refresh helper, because the
+    // loop is the seam that was broken: `spawn` read the file once and
+    // nothing re-read it for the process lifetime.
+    aggregation_loop(&mut aggregator, &publisher, Some(1));
+    {
+        let published = publisher.published.lock().expect("published");
+        assert_eq!(published.len(), 1, "the first cycle publishes");
+        assert!(!published[0].contains("billing.acme.test"));
+    }
 
-    // The platform engineer adds a service and reloads.
+    // The platform engineer adds a service and reloads. Nothing restarts
+    // the aggregator.
     let with_two = runtime(&format!(
         "{ONE_ENTRY}    - name: billing\n      repo: https://example.test/billing.git\n      \
          path: sbproxy/origin.yaml\n      hosts:\n        api: [billing.acme.test]\n"
     ));
     std::fs::write(&path, &with_two).expect("rewrite the runtime document");
 
-    assert!(
-        aggregator.refresh_document(),
-        "a changed document on disk has to be picked up"
-    );
-    let second = aggregator.compose().expect("composes again");
+    aggregation_loop(&mut aggregator, &publisher, Some(1));
+    let published = publisher.published.lock().expect("published");
     assert_eq!(
-        second.origins, 2,
-        "the new entry's origins reach the fleet without a restart"
+        published.len(),
+        2,
+        "the changed document is a new composition, so it publishes"
     );
     assert!(
-        !aggregator.refresh_document(),
-        "and an unchanged document is not re-parsed on every round"
+        published[1].contains("billing.acme.test"),
+        "and the new entry's origins reach the fleet without a restart: {}",
+        published[1]
     );
 }
 

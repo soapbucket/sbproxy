@@ -427,7 +427,12 @@ impl Aggregator {
     /// stop. The aggregator keeps publishing from the last good document
     /// while the operator fixes the file, which is the same posture the
     /// node's own reload takes.
-    pub fn refresh_document(&mut self) -> bool {
+    ///
+    /// Private: [`aggregation_loop`] is the only thing that should
+    /// decide when a round starts, and a caller that refreshed out of
+    /// band would compose from a document no poll had been taken
+    /// against.
+    fn refresh_document(&mut self) -> bool {
         let Some(path) = self.config_path.clone() else {
             return false;
         };
@@ -1948,10 +1953,10 @@ pub fn aggregation_loop(
     let mut coalescer = Coalescer::new(aggregator.timings());
     let mut next_poll = Instant::now();
     let mut polled = 0_u32;
-    let mut compose = |aggregator: &mut Aggregator,
-                       coalescer: &mut Coalescer,
-                       entries: usize,
-                       deferral_ceiling: bool| {
+    let compose = |aggregator: &mut Aggregator,
+                   coalescer: &mut Coalescer,
+                   entries: usize,
+                   deferral_ceiling: bool| {
         coalescer.reset();
         tracing::info!(
             entries,
