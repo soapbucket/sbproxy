@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-08-27*
+*Last modified: 2026-08-28*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -55,10 +55,11 @@ For AI-specific features in depth, see [ai-gateway.md](ai-gateway.md). For CEL, 
 45. [Redis integration](#redis-integration)
 46. [Config source (GitOps)](#config-source-gitops)
 47. [Config authority](#config-authority-fleet-configuration-distribution)
-48. [Validation](#validation)
-49. [CORS](#cors)
-50. [Quick reference: config field locations](#quick-reference-config-field-locations)
-51. [Environment variable templating in header modifiers](#environment-variable-templating-in-header-modifiers)
+48. [Project-owned origin profiles](#project-owned-origin-profiles)
+49. [Validation](#validation)
+50. [CORS](#cors)
+51. [Quick reference: config field locations](#quick-reference-config-field-locations)
+52. [Environment variable templating in header modifiers](#environment-variable-templating-in-header-modifiers)
 
 ---
 
@@ -238,6 +239,11 @@ request_events: { ... }
 events: { ... }
 flags: [ ... ]
 update: { ... }
+
+# Project-owned origin profiles: the floor every composed origin starts
+# from, and which project repositories to pull
+origin_defaults: { ... }
+origin_sources: { ... }
 
 # Per-hostname origin configurations
 origins:
@@ -7646,13 +7652,15 @@ Runnable configs for both halves are in [`examples/config-authority/`](../exampl
 
 No authority can set these paths, in either merge mode:
 
-`proxy.listeners`, `proxy.tls`, `proxy.admin`, `proxy.secrets`, `proxy.cluster`, `proxy.model_host`, `proxy.config_authority`, `proxy.compression_state`, `proxy.config_history`, `source`
+`proxy.listeners`, `proxy.tls`, `proxy.admin`, `proxy.secrets`, `proxy.cluster`, `proxy.model_host`, `proxy.config_authority`, `proxy.compression_state`, `proxy.config_history`, `source`, `origin_sources`
 
 Presence of one of them anywhere in a payload rejects the whole payload, at publish time on the authority and again at merge time on the subscriber. Not the changed keys, the whole thing: a partial apply of a configuration is a configuration nobody wrote.
 
 The reason is recovery. If a fleet-wide push could rewrite `proxy.admin`, the first bad push would take away the port you would use to undo it. If it could rewrite `proxy.config_authority`, it could point every node at a different authority, permanently. And `proxy.tls` and `proxy.secrets` are per-node material that a central document has no business knowing.
 
-The last three before `source` are about local storage and the audit trail. `proxy.compression_state` and `proxy.config_history` both name directories on the node's own disk, which only the process owner can choose. `proxy.config_history` is also the durable record of every configuration this subscriber has applied: an authority that could redirect or disable that ring could cover its own tracks.
+`origin_sources` is the same argument as `source`, one level up. `source` names one repository this node reads its own document from; `origin_sources` names N repositories whose Lua, WASM and JavaScript bodies the `{{ }}` interpolator deliberately never reads, so an authority able to write it would be arbitrary code fetch on every node that trusts it. Its sibling `origin_defaults` is deliberately **not** on this list: that block is the platform raising a security floor across the fleet, which is the one thing this channel exists to distribute. See [Project-owned origin profiles](#project-owned-origin-profiles).
+
+The three before `source` are about local storage and the audit trail. `proxy.compression_state` and `proxy.config_history` both name directories on the node's own disk, which only the process owner can choose. `proxy.config_history` is also the durable record of every configuration this subscriber has applied: an authority that could redirect or disable that ring could cover its own tracks.
 
 ### Authority: `proxy.config_authority.publish`
 
@@ -7952,6 +7960,271 @@ An authority that is configured but has not yet been reached counts as not local
 The refusal is enforced on the server, not in the browser. The admin console greys the editor out and says why, but the same write from `curl` gets the same `409`, and refusals are recorded in the audit log alongside the writes that land.
 
 Two notes on `mode: replace`. The response is a re-serialization, so comments and key order in the local file are not preserved in the effective document (they were already lost in any config with a `features:` block, which is migrated through a full YAML round-trip). And a setting the authority's document simply omits is reported with owner `suppressed` rather than a layer name: under replace it is discarded rather than overwritten, which is the same outcome for whoever was trying to set it.
+
+---
+
+## Project-owned origin profiles
+
+Let a project repository commit the part of the proxy config it actually knows about, and let the platform keep the part it knows about, without either side being able to author a whole origin alone.
+
+`origins:` is a map keyed by hostname. A project repository that wants to ship its own action and its own policies has to author the map key, and the map key is the one thing it does not know: a hostname is an environment fact, and the same service answers on a different one in staging. So a project commits a hostless **origin profile**, and the runtime config supplies the hostname.
+
+Two blocks in the runtime config drive it:
+
+| Block | Owner | What it holds |
+|---|---|---|
+| `origin_defaults` | platform team | what an origin is before any project has an opinion about it |
+| `origin_sources` | platform team | which project repositories to pull, and what hosts each answers on |
+
+Composition runs in one aggregator, not on every node. The aggregator resolves each entry, composes, and publishes the result through the [config authority](#config-authority-fleet-configuration-distribution). A node keeps the subscriber it already has: it receives an ordinary signed bundle and never clones a project repository.
+
+A runnable pair is in [examples/origin-profiles](https://github.com/soapbucket/sbproxy/tree/main/examples/origin-profiles).
+
+### `origin_defaults`
+
+The same shape as one entry under `origins:`, minus the hostname.
+
+```yaml
+origin_defaults:
+  policies:
+    - name: platform_waf
+      type: waf
+      owasp_crs:
+        enabled: true
+        managed_bundle: true
+      action_on_match: block
+      locked: true
+    - name: rate_limit
+      type: rate_limiting
+      requests_per_minute: 600
+      burst: 100
+  request_modifiers:
+    - name: platform_headers
+      headers:
+        set:
+          X-Served-By: sbproxy
+```
+
+Every entry under `policies`, `transforms`, `request_modifiers` and `response_modifiers` must carry a `name:`. A default has to be addressable to be overridable, and an unnamed one fails at config load rather than at the first composition.
+
+`locked: true` on an entry refuses a project override, and also refuses a project addition that would shadow that entry's effect. A lock binds what an entry does, not what it is called; see [List merge by name](#list-merge-by-name).
+
+Three things about this block are checked at config load rather than at the aggregator, because neither this block nor an entry's `overrides:` carries `deny_unknown_fields` (the merge runs before the typed parse, and the typed modifier structs reject the `name:` key the merge is keyed on). Every top-level key must be a real origin field, every list entry must carry a `name:`, and every `policies:` and `transforms:` entry must name a `type:` some module answers to. A misspelling in any of the three used to pass `sbproxy validate` clean and then fail every compose at the far end of a GitOps loop.
+
+A `type:` is required in `origin_defaults` and optional in an entry's `overrides:`, because a named override is usually a partial edit of a floor entry that already carries one. And "some module answers to" is read off the built-in list, which is not the whole vocabulary: an installed extension bundle provides types that are by construction absent from it. Config load cannot resolve the installed set, because bundle sources are paths and URLs it deliberately does not fetch, so the question it asks instead is whether this document declares any bundle source at all. A document with none is refused for an unrecognized type, since it has no way to acquire one; a document with one warns and lets the composed origin meet the real dispatcher at boot.
+
+This block is authority-writable. The platform raising a security floor across the fleet is exactly what that channel exists for.
+
+### `origin_sources`
+
+```yaml
+origin_sources:
+  tier: production
+  entries:
+    - name: checkout
+      repo: https://git.example.com/acme/checkout
+      revision: refs/tags/v1.4.2
+      path: sbproxy/origin.yaml
+      credential: secret://ci/github-token
+      verify_signature: true
+      timeout_secs: 30
+      environment: prod
+      hosts:
+        api:
+          - checkout.example.com
+        webhooks:
+          - hooks.example.com
+      inputs:
+        upstream_key: secret://prod/checkout-upstream-key
+        region: us-east-1
+      overrides:
+        policies:
+          - name: rate_limit
+            requests_per_minute: 5000
+```
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `tier` | enum | `development` | `development` or `production`. In `production` every entry must pin an immutable revision. A property of this document, never of an entry. |
+| `entries[].name` | string | required | Stable name, unique within the block. Every refusal names it. |
+| `entries[].repo` | string | required | Repository URL, in any form `git clone` accepts. |
+| `entries[].revision` | string | none | Branch, tag, or full commit sha. Absent follows the default branch, which the `production` tier refuses. |
+| `entries[].path` | string | required | Path to the profile inside the repository, relative to its root. Conventionally `sbproxy/origin.yaml`. |
+| `entries[].credential` | string | none | Reference for a private repository: `env:NAME`, `${NAME}`, `file:/path`, or `secret://backend/name`. An inline literal is refused. |
+| `entries[].verify_signature` | bool | `false` | Require a valid signature on the resolved tag or commit. |
+| `entries[].timeout_secs` | int | `60` | Hard timeout for one fetch. `0` is refused. |
+| `entries[].environment` | string | none | Which `environments:` layer of the profile applies. Selects a layer and grants nothing. |
+| `entries[].hosts` | map | `{}` | Hosts each declared profile origin answers on, keyed by profile origin name. |
+| `entries[].inputs` | map | `{}` | Values for the inputs the profile declares. |
+| `entries[].overrides` | map | none | The runtime's last word, layered after everything the project wrote. |
+
+The git fields are the `source:` block's field set rather than a narrower struct of their own. Omitting `credential` would mean no private project repositories, omitting `verify_signature` would take away the check the pinning trust story leans on, and omitting `timeout_secs` would mean one unreachable project repository can hold a compose open. Two `source:` fields are deliberately absent: `refresh_interval_secs` belongs to the aggregator rather than to one entry, and `confine` is absent because a project profile is always confined.
+
+`origin_sources` is **not** authority-writable. It is on the subscriber's denied-path list alongside `source`, and for the same reason one level up: `source` names one repository, while this block names N of them, and the documents it pulls carry Lua, WASM and JavaScript bodies the `{{ }}` interpolator deliberately never reads. An authority able to write it would be arbitrary code fetch on every node that trusts it.
+
+### The profile a project commits
+
+```yaml
+# sbproxy/origin.yaml in the project's own repository
+name: checkout
+
+inputs:
+  - name: upstream_host
+    description: the regional upstream this deployment sends to
+  - name: shop_origin
+    description: browser origin allowed to call this service
+    default: https://shop.example.com
+
+spec:
+  api:
+    base:
+      action:
+        type: proxy
+        url: "https://{{vars.upstream_host}}"
+        preserve_query: true
+      policies:
+        - name: rate_limit
+          requests_per_minute: 1200
+      cors:
+        allowed_origins:
+          - "{{vars.shop_origin}}"
+    environments:
+      prod:
+        action:
+          host_override: checkout.internal.example.com
+  webhooks:
+    base:
+      action:
+        type: proxy
+        url: https://checkout-hooks.internal.example.com
+```
+
+`spec` is a map of profile origin name to that origin's layers, so one profile can declare an API host and a webhook host at once. The entry's `hosts:` binds each name to real hostnames.
+
+A declared input with neither a bound value nor a default is a resolve error naming both the input and the entry. It is never a warning and never a literal passthrough. An entry that binds a name the profile does not declare is refused too, with the message listing what the profile does declare.
+
+An input binds as text. A typed knob belongs in the entry's `overrides:` block, which is runtime YAML and is never substituted.
+
+### Layering
+
+Later layers win, and the runtime bookends the stack:
+
+1. `origin_defaults`
+2. `spec.<origin>.base`
+3. `spec.<origin>.environments.<env>`, selected by the entry's `environment:`
+4. `overrides:` on the source entry
+
+### List merge by name
+
+`policies`, `transforms`, `request_modifiers` and `response_modifiers` merge entry by entry against a `name:` key. Every other sequence replaces wholesale, matching the rest of the config merge, because element identity in a generic YAML list is not knowable.
+
+| Situation | Result |
+|---|---|
+| name in the floor, absent from the project | the floor entry survives unchanged |
+| name in both | field-level merge; the project wins per field |
+| name only in the project | appended after the floor, in project order |
+| name in the floor with `locked: true`, project touches it | refused, naming the policy, the profile and the entry |
+| project adds an entry that would shadow a locked one | refused, naming the lock, the addition and the effect they share |
+| project sets `disabled: true` on an unlocked floor entry | dropped, and the drop is recorded |
+| unnamed entry in `origin_defaults` | refused at config load |
+| unnamed entry in a project profile | always an addition, appended |
+
+There is no delete verb. `disabled: true` leaves a record; an absence does not. `policies: []` in a project profile therefore leaves the floor intact, which is the scenario the whole floor concept exists to prevent.
+
+`name`, `locked` and `disabled` are stripped before the composed origin is emitted, because the modules those lists feed reject unknown keys.
+
+`locked:` protects the floor from the project, not from the platform that wrote it. The entry's `overrides:` block passes straight through a lock. A project that sets `locked:` itself is refused: locking is the runtime config's verb.
+
+A lock binds what an entry does, not what it is called. Refusing only a same-name override would leave the project one rename away from the thing the lock exists to stop: every project addition lands after the floor, and for anything last-write-wins the later entry simply wins. So a project layer is refused in three places:
+
+- **An addition that shares an effect with a locked entry.** "Effect" is the `type:` for a `policies:` or `transforms:` entry, and the set of leaf paths written for a modifier, compared case-insensitively. A floor that locks `response_modifiers[].headers.set.Content-Security-Policy` refuses a project entry that *declares* that header under any name and in any case.
+- **A script body brought into a modifier list that holds a lock, by an addition or by an override.** `lua_script`, `js_script`, `rego_module` and `rego_module_path` all return `set_headers`, and what they set is inside a string, so the effect comparison cannot read it. Rather than promise a boundary it cannot hold, the composition refuses the project layer outright while any entry in that list is locked. Both arms, because an override reaches the same place an addition does with a rename saved: merging a `lua_script` onto an unlocked entry that already sits after the lock would otherwise land, since the comparison sees the key and not what it writes. The check reads the incoming layer's entry rather than the merged result, so a floor entry that already carries a script of its own is not retroactively refused by a project layer editing some other field of it. This is why the bullet above says "declares": a locked header is safe from a declarative project entry by comparison, and safe from a project script by refusal.
+- **An override of an unlocked entry that introduces an effect a lock above it already holds.** Merging replaces scalars, `type:` included, so a project matching an unlocked floor entry by name can rewrite it into a locked entry's mechanism, or make it write a locked header, without renaming or adding anything. Only the effects the merge introduced are compared, and only against locks the entry already sits after: the floor's own arrangement of two entries touching one thing is the platform's business, and an entry does not shadow a lock that comes later.
+
+All three rules bind the project and only the project. The entry's `overrides:` block is the runtime config speaking to itself, so it passes through a lock and may bring a script into a locked list; it is layered last in any case.
+
+The first rule is deliberately wider than the hazard: two policies of the same type do not always shadow each other, and a project that needs a second one of a locked type asks whoever owns `origin_defaults` to carry it. The alternative is a per-module table of which mechanisms compose, which nothing else in the tree maintains and which would be wrong the first time a module changed.
+
+### What a project may set
+
+A project may set exactly these origin fields:
+
+`action`, `authentication`, `policies`, `transforms`, `request_modifiers`, `response_modifiers`, `cors`, `compression`, `error_pages`, `problem_details`, `deprecation`, `expose_openapi`, `agents_md`, `ai_txt`, `agents_json`, `agent_skills`, `default_content_shape`, `content_signal`, `token_bytes_ratio`.
+
+Everything else on an origin is unrepresentable in a profile rather than merely rejected: there is no field that could hold it, so the parse fails and names the key. That is an allowlist on purpose. An origin has 52 fields and gains more regularly, so a deny list would make every future field a silent privilege grant to every project repository. A test enumerates the origin's fields and fails when one appears on neither side, and the failure says to classify it.
+
+A deny list written today would already have missed `filters[].failure_posture` (a project flipping a platform security filter to fail-open while the config still advertises protection), `force_ssl: false`, `response_cache` (an authenticated response cached and served to somebody else), the `on_request` and `on_response` extension hooks, and `allowed_methods` (an empty list allows every method).
+
+### Secrets in a profile
+
+A profile is a confined document; see [Confined fragments](#confined-fragments). It cannot reach the composing host at all. `${VAR}` and `{{env.X}}` are refused, and so are `env:NAME`, `file:/path` and `vault://env/NAME`, along with every config key that names a host path the proxy opens.
+
+The one secret spelling that survives is a provider URI such as `secret://prod/checkout-key`, which resolves only against a backend declared under `proxy.secrets`, a block no project can write.
+
+A profile carrying a secret written out in full is refused, and the refusal names the field and the profile but never the value. The check runs after inputs are substituted, so an entry that binds a raw token is refused exactly as a profile that wrote one would be.
+
+In practice the simplest answer is to keep credentials out of the profile entirely and put them in the entry's `overrides:` block. That block is ordinary runtime YAML, so `${VAR}` resolves there and every secret reference form works, and it is layered last, so nothing the project wrote can reach around it:
+
+```yaml
+origin_sources:
+  entries:
+    - name: checkout
+      overrides:
+        authentication:
+          type: api_key
+          header_name: X-Api-Key
+          api_keys:
+            - "${CHECKOUT_INBOUND_KEY}"
+```
+
+Note the direction of travel. An origin's `authentication:` block validates the callers of this service; it is not the credential the proxy presents to the upstream. The outbound credential is `credentials:` or `outbound_credential:`, both platform-owned and both unrepresentable in a profile.
+
+### Pinning and the environment tier
+
+In the `production` tier every entry must pin a full commit sha, or a tag spelled `refs/tags/v1.4.2`. A bare `v1.4.2` is refused, because git does not tell a tag from a branch by spelling and a rule that guessed would be a rule a branch could walk straight through.
+
+The tier cannot come from the entry. An entry that wanted to track a branch would simply write `environment: dev`, and a self-declared constraint is not a constraint. The entry's `environment:` selects which profile layer applies, and nothing more.
+
+### Two writers, one hostname
+
+Two entries claiming the same map key is a named error, and so is an entry claiming a host that a hand-written `origins:` key already declares. Silent last-wins is the failure that check exists to prevent, and it is answered from the runtime document alone, so `sbproxy validate` catches it with nothing fetched.
+
+Wildcard overlap is not a collision. An exact key beats a wildcard and the longest matching suffix wins between wildcards, all of which routing already settles, so the only question asked here is whether two writers claim the same map key.
+
+### Operating it
+
+`GET /admin/origin-composition` reports the declaration and its posture, read off the effective config:
+
+```bash
+curl -su admin:"$ADMIN_PASSWORD" http://127.0.0.1:9090/admin/origin-composition
+```
+
+```json
+{
+  "declared": true,
+  "tier": "production",
+  "entries": [
+    {
+      "name": "checkout",
+      "repo": "https://git.example.com/acme/checkout",
+      "revision": "refs/tags/v1.4.2",
+      "pinned": true,
+      "verify_signature": true,
+      "credential": "reference",
+      "hosts": { "api": ["checkout.example.com"] },
+      "inputs": ["shop_origin", "upstream_host"]
+    }
+  ],
+  "claimed_hosts": [
+    { "host": "checkout.example.com", "entry": "checkout", "profile_origin": "api" }
+  ],
+  "collision": null
+}
+```
+
+A repository URL is credential-stripped, an entry credential is reported as present or absent and never by value, and an input is reported by name only.
+
+`sbproxy_origin_source_entries{tier,pinned}` carries the same two facts for alerting. The total dropping to zero means a fleet that should be composing project profiles has quietly stopped. A non-zero `pinned="false"` series under `tier="production"` means a node is running a document that predates the pinning rule, since config load refuses that combination outright.
 
 ---
 

@@ -232,6 +232,25 @@
           "$ref": "#/definitions/UpdateConfig"
         }
       ]
+    },
+    "origin_defaults": {
+      "description": "WOR-2436: what an origin is before any project has an opinion about it.\n\nThe same shape as one entry under `origins:`, held untyped because the composition resolver merges `policies:`, `transforms:`, `request_modifiers:` and `response_modifiers:` by a `name:` key that the typed modifier structs reject (`RequestModifierConfig` is `deny_unknown_fields` and has no `name` field). Every entry in those four lists must carry a `name:`, because a default has to be addressable to be overridable, and each may carry `locked: true` to refuse a project override. See [`crate::origin_profile`].\n\nAuthority-writable on purpose: this block is the platform setting a security floor, which is the whole reason it exists. Its sibling `origin_sources` is not, and is on [`crate::AUTHORITY_DENIED_PATHS`].",
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": true
+    },
+    "origin_sources": {
+      "description": "WOR-2436: which project repositories the aggregator pulls, what hosts each one answers on, and the environment tier the pinning rule is judged against. See [`OriginSourcesConfig`].",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/OriginSourcesConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
     }
   },
   "definitions": {
@@ -13275,6 +13294,134 @@
           ]
         }
       ]
+    },
+    "OriginSourcesConfig": {
+      "description": "Top-level `origin_sources:` block: which project repositories the aggregator pulls, and the tier its pinning rule is judged against.\n\nA project repository commits a hostless origin profile ([`crate::origin_profile::OriginProfile`]). It never names a hostname, because a hostname is an environment fact. This block is where the runtime config supplies the facts the project does not have: the hosts each declared profile origin answers on, the values for the inputs the profile declares, and the last word through `overrides:`.\n\nThe whole block is on [`crate::AUTHORITY_DENIED_PATHS`]. `source` is denied because a fragment that can set it redirects the fleet at one repository; this block names N repositories whose Lua, WASM and JS bodies the `{{ }}` interpolator deliberately never reads, so an authority able to write it turns into arbitrary code fetch on every node that trusts it.",
+      "type": "object",
+      "properties": {
+        "tier": {
+          "description": "Which tier this runtime config document is. See [`EnvironmentTier`].",
+          "default": "development",
+          "allOf": [
+            {
+              "$ref": "#/definitions/EnvironmentTier"
+            }
+          ]
+        },
+        "entries": {
+          "description": "The project repositories composed into `origins:`.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/OriginSourceEntry"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "EnvironmentTier": {
+      "description": "The tier of the runtime config document, which is what the production pinning rule keys off.\n\nDeliberately a property of the runtime document rather than of an entry. A rule that read the entry own `environment:` field would be no rule at all: an entry that wants to track a branch would simply write `environment: dev` and be granted what it asked for. A self-declared constraint is not a constraint. The entry `environment:` selects which `environments:` layer of the profile applies, and nothing more.",
+      "oneOf": [
+        {
+          "description": "The default. An entry may follow a branch, or pin nothing at all and follow the default branch.",
+          "type": "string",
+          "enum": [
+            "development"
+          ]
+        },
+        {
+          "description": "Every entry must pin an immutable revision: a full commit sha, or a tag spelled `refs/tags/<name>`. A bare name is refused because git does not tell a tag from a branch by spelling, and a rule that guessed would be a rule a branch could walk through.",
+          "type": "string",
+          "enum": [
+            "production"
+          ]
+        }
+      ]
+    },
+    "OriginSourceEntry": {
+      "description": "One project repository, and the runtime facts that deploy it.\n\nThe git fields are the [`ConfigSource::Git`] set rather than a narrower struct of their own. Omitting `credential` would mean no private project repositories, omitting `verify_signature` would take away the check the whole pinning trust story leans on, and omitting `timeout_secs` would mean one unreachable project repository can hold a compose open.\n\nTwo `ConfigSource::Git` fields are deliberately absent. `refresh_interval_secs` is the aggregator poll cadence and belongs to the aggregator rather than to one entry. `confine` is absent because a project profile is **always** confined: the flag exists so an operator can opt a repository they own into the boundary, and there is no repository here the operator authored.",
+      "type": "object",
+      "required": [
+        "name",
+        "path",
+        "repo"
+      ],
+      "properties": {
+        "name": {
+          "description": "Stable name for this entry, unique within `origin_sources`. Every refusal the composition raises names it, so make it the name an operator would recognize.",
+          "type": "string"
+        },
+        "repo": {
+          "description": "Repository URL, in any form `git clone` accepts.",
+          "type": "string"
+        },
+        "revision": {
+          "description": "Branch, tag, or full commit sha this entry is pinned to. Absent follows the default branch, which [`EnvironmentTier::Production`] refuses.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "Path inside the repository to the profile document, relative to the repository root. Conventionally `sbproxy/origin.yaml`.",
+          "type": "string"
+        },
+        "credential": {
+          "description": "Optional credential reference for a private repository, as `env:NAME`, `${NAME}`, `file:/path`, or `secret://backend/name`. An inline literal is refused, exactly as `source.credential` refuses one: a token in a config file is a token in every copy of that file.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "verify_signature": {
+          "description": "Require a valid signature on the resolved tag or commit. Off by default, because most repositories are not signed.",
+          "default": false,
+          "type": "boolean"
+        },
+        "timeout_secs": {
+          "description": "Hard timeout for one fetch of this repository, in seconds.",
+          "default": 60,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "environment": {
+          "description": "Which `environments:` layer of the profile applies. Absent means the profile `base:` layer alone. This selects a layer and grants nothing; see [`EnvironmentTier`].",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hosts": {
+          "description": "Hosts each declared profile origin answers on, keyed by the profile origin name.\n\nA map rather than a bare list because a profile may declare more than one origin from day one: an API host plus a webhook host is the common case, and changing this from a list to a map later would break every committed entry.",
+          "default": {},
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "inputs": {
+          "description": "Values for the inputs the profile declares.\n\nA value lands in the profile document through `{{vars.NAME}}` and is then checked as document text, so a host-backed secret reference (`env:NAME`, `file:/path`, `vault://env/NAME`) is refused here just as it is refused anywhere else in an externally authored document. Supply a provider URI (`secret://backend/name`) instead: it resolves only against a backend the operator declared under `proxy.secrets`, which is a path no project can write.",
+          "default": {},
+          "type": "object",
+          "additionalProperties": true
+        },
+        "overrides": {
+          "description": "The runtime last word for this entry, layered after everything the project wrote.\n\nSame untyped origin shape as `origin_defaults`, and merged the same way. The runtime bookends the stack, so a project can be given room without being given the last word.",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

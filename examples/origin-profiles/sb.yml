@@ -1,0 +1,122 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Project-owned origin profiles: the runtime half.
+#
+# This is the file the platform team owns. It sets the floor every origin
+# starts from, names the project repositories to pull, and supplies the
+# two things a project repository cannot know: the hostname, and the
+# credentials.
+#
+# The project half lives in each service's own repository. See
+# origin.yaml in this directory for what a service commits.
+#
+# Composition itself runs in one aggregator, not on this node. This file
+# is what the aggregator reads.
+#
+# Try it:
+#
+#   sbproxy validate examples/origin-profiles/sb.yml
+
+proxy:
+  http_bind_port: 8080
+
+  # The backend the entry below references. A project profile can never
+  # declare one of these, because `proxy.secrets` is on
+  # AUTHORITY_DENIED_PATHS and no profile has a field that could hold it.
+  # That is what makes `secret://` the one secret spelling a project
+  # keeps.
+  secrets:
+    backends:
+      - type: local
+        name: ci
+        entries:
+          github-token: "${CI_GITHUB_TOKEN:-local-dev-token}"
+
+# What an origin is before any project has an opinion about it.
+#
+# Every entry in policies, transforms, request_modifiers and
+# response_modifiers carries a `name:`, because a default has to be
+# addressable to be overridable. `locked: true` refuses a project
+# override, and also refuses a project addition that would shadow this
+# entry's effect: a lock binds what an entry does, not what it is called.
+origin_defaults:
+  policies:
+    - name: platform_waf
+      type: waf
+      owasp_crs:
+        enabled: true
+        managed_bundle: true
+      action_on_match: block
+      locked: true
+    - name: rate_limit
+      type: rate_limiting
+      requests_per_minute: 600
+      burst: 100
+  request_modifiers:
+    - name: platform_headers
+      headers:
+        set:
+          X-Served-By: sbproxy
+
+# Which project repositories to pull, and what hosts each answers on.
+#
+# The whole block is on AUTHORITY_DENIED_PATHS: a config authority that
+# could write it would be naming N repositories whose Lua, WASM and JS
+# bodies nothing on the node ever reads.
+origin_sources:
+  # The tier is a property of this document, not of an entry. An entry
+  # that could declare its own tier could declare its way out of the
+  # pinning rule.
+  tier: production
+  entries:
+    - name: checkout
+      repo: https://git.example.com/acme/checkout
+      # production tier: a full commit sha, or a tag spelled the long
+      # way. A bare `v1.4.2` is refused, because git does not tell a tag
+      # from a branch by spelling.
+      revision: refs/tags/v1.4.2
+      path: sbproxy/origin.yaml
+      credential: secret://ci/github-token
+      verify_signature: true
+      timeout_secs: 30
+      # Selects which `environments:` layer of the profile applies.
+      # It grants nothing.
+      environment: prod
+      # The hostname the project could not know. A map, because one
+      # profile may declare more than one origin.
+      hosts:
+        api:
+          - checkout.example.com
+        webhooks:
+          - hooks.example.com
+      # The values the profile declared that it needs. These are text,
+      # substituted into the project document through `{{vars.NAME}}`,
+      # and checked afterwards, so a host-backed reference (`env:NAME`,
+      # `file:/path`) is refused here exactly as it would be inside the
+      # profile.
+      inputs:
+        upstream_host: checkout-us-east-1.internal.example.com
+        shop_origin: https://shop.example.com
+      # The runtime's last word, layered after everything the project
+      # wrote. This is where anything credential-bearing belongs: it is
+      # ordinary runtime YAML, so `${VAR}` resolves here and does not in
+      # a profile.
+      overrides:
+        authentication:
+          type: api_key
+          header_name: X-Api-Key
+          api_keys:
+            - "${CHECKOUT_INBOUND_KEY:-local-dev-key}"
+        policies:
+          - name: rate_limit
+            requests_per_minute: 5000
+
+# A hand-written origin still works, and still wins the argument: an
+# entry above that claimed `status.example.com` would be refused at
+# config load rather than silently taking it.
+origins:
+  "status.example.com":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: ok

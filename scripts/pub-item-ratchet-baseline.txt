@@ -1025,6 +1025,15 @@ main's 1473, because main's anomaly and auth-provider work gave out-of-file
 consumers to two items this branch had left file-local; neither parent's
 figure describes the merged tree, so neither was taken.
 
+2026-08-28 (WOR-2432 aggregation foundations): tests-only 324 -> 323,
+unreferenced 1520 -> 1518. Two items gained production callers in the same
+round. `origin_source_entry_counts` moved off `compile_config` and onto
+`CompiledConfig`, where `reload::load_pipeline` reads it, because compile
+also runs on candidate documents and publishing a gauge there zeroed the
+live series on every authority publish. And the read-and-merge prologue the
+two config admin routes had duplicated became one `effective_document`
+helper, which took a symbol out of the wider count.
+
 2026-08-28 (WOR-2455 config rollback core, merged with main at 304d6d53):
 tests-only unchanged at 324, unreferenced 1520 to 1523. Three additions,
 all of the kind this list already carries in bulk.
@@ -1051,3 +1060,18 @@ the admin surface are its only consumers and both are in-crate;
 `config_subscriber::rejection_reason_for` is `pub(crate)` for the same
 reason. `config_soak::clear` is `#[cfg(test)]`: no production path drops a
 soak window without a verdict.
+
+2026-08-28 (WOR-2455 config rollback core merged with main at 454e0abf,
+WOR-2432's aggregation foundations): recounted against the merged tree
+rather than carried from either parent. Tests-only 323, unreferenced 1521.
+
+Both parents' numbers are wrong for this tree and neither was taken. This
+branch recorded 324 and 1523; main recorded 323 and 1518. The tests-only
+figure lands on main's 323 because the two synthetic helpers this branch
+narrowed to `#[cfg(test)] pub(crate)` never entered that count, so main's
+`origin_source_entry_counts` and `effective_document` reductions are the
+only movement. The unreferenced figure is three above main's 1518 and two
+below this branch's 1523: this branch adds `ConfigBootConfig`,
+`FailedCandidate`, and `FallbackDocument` for the reasons recorded above,
+while main's `effective_document` and `origin_source_entry_counts` work
+removed two the branch had counted.
