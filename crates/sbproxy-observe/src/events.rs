@@ -599,6 +599,13 @@ pub enum EventType {
     /// and the acting operator when an admin session resolved one; never a
     /// minted secret, a registration access token, or a credential hash.
     AgentRegistrationDecided,
+    /// Event name `config_soak_verdict`. A config revision's soak window
+    /// closed with a verdict: promoted to last known good, failed, or
+    /// inconclusive because every signal abstained (WOR-2458). Its
+    /// payload is the revision, the digest, the verdict, and one row per
+    /// signal with its outcome and explanation; never a config value and
+    /// never a secret.
+    ConfigSoakVerdict,
 }
 
 impl ProxyEvent {
@@ -641,7 +648,7 @@ impl ProxyEvent {
 /// mode this prevents is a twenty-third event type that no `events:` sink
 /// can ever be told to deliver, which looks exactly like a working sink
 /// to everyone except the operator waiting for the event.
-pub const ALL_EVENT_TYPES: [EventType; 23] = [
+pub const ALL_EVENT_TYPES: [EventType; 24] = [
     EventType::RequestStarted,
     EventType::RequestCompleted,
     EventType::RequestError,
@@ -665,6 +672,7 @@ pub const ALL_EVENT_TYPES: [EventType; 23] = [
     EventType::AiEvaluationOperation,
     EventType::AiPromptRolloutSelected,
     EventType::AgentRegistrationDecided,
+    EventType::ConfigSoakVerdict,
 ];
 
 impl EventType {
@@ -700,6 +708,7 @@ impl EventType {
             Self::AiEvaluationOperation => "ai_evaluation_operation",
             Self::AiPromptRolloutSelected => "ai_prompt_rollout_selected",
             Self::AgentRegistrationDecided => "agent_registration_decided",
+            Self::ConfigSoakVerdict => "config_soak_verdict",
         }
     }
 
@@ -739,6 +748,7 @@ impl EventType {
             Self::AiEvaluationOperation => 20,
             Self::AiPromptRolloutSelected => 21,
             Self::AgentRegistrationDecided => 22,
+            Self::ConfigSoakVerdict => 23,
         }
     }
 
@@ -793,6 +803,9 @@ impl EventType {
                 // The agent registry publishes one per queue decision:
                 // submission, approval, rejection, revocation.
                 | Self::AgentRegistrationDecided
+                // The config soak window publishes one per closed
+                // window, from `sbproxy_core::config_soak` (WOR-2458).
+                | Self::ConfigSoakVerdict
         )
         // `CacheHit` and `CacheMiss` are deliberately absent: wiring
         // them per-request would put an NDJSON line on every configured

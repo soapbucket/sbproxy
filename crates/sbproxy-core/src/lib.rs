@@ -125,6 +125,11 @@ pub mod config_aggregator;
 /// does, sign it, store it under a monotonic revision, and serve it to
 /// subscribers on a listener of its own.
 pub mod config_authority;
+/// Booting on the last known good config when the document this node was
+/// told to boot on does not work: the ring walk, the durable boot
+/// counter, and the pin that suspends the local reload triggers while
+/// the node is serving a rescued configuration.
+pub mod config_boot;
 /// What configuration is actually running on this node, which layer owns
 /// each part of it, and whether a proposed write to the local file would
 /// survive the next poll or be silently swallowed.
@@ -138,7 +143,15 @@ pub mod config_gossip;
 /// every config this process applies, recorded once by the shared
 /// reload transaction, and read back by the admin history surface.
 pub mod config_history;
-/// Honouring `source:`: resolve the config document from a git
+/// The soak window that decides whether an applied config revision
+/// becomes this node's last known good (WOR-2458).
+///
+/// Crate-visible rather than public: every consumer is inside this
+/// crate (the reload transaction arms a window, the admin surface
+/// closes one), and nothing outside it has a reason to reach a soak
+/// verdict on this process's behalf.
+pub(crate) mod config_soak;
+/// Honoring `source:`: resolve the config document from a git
 /// repository (or an overlay chain over one), keep it fresh on a timer,
 /// and hand the result to the shared reload transaction.
 pub mod config_source;

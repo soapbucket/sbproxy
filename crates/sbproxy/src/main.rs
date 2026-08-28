@@ -165,6 +165,27 @@ struct GlobalArgs {
         global = true
     )]
     disable_sb_flags: bool,
+
+    /// What to do when the config this node was told to boot on does not
+    /// work: `off` (exit, the default and today's behavior) or
+    /// `last-known-good` (walk the config revision ring for a revision
+    /// that boots). Beats `SB_CONFIG_FALLBACK` and
+    /// `proxy.config_history.boot.fallback`, deliberately: a rescue boot
+    /// must not depend on the file being right, and the file is what is
+    /// broken. A node that boots on the fallback warns loudly, reports
+    /// `sbproxy_config_fallback_active` as 1, and suspends its file
+    /// watcher, SIGHUP, and `source:` poller until an operator clears
+    /// the pin with `DELETE /admin/config/fallback`.
+    ///
+    /// `SB_CONFIG_FALLBACK` is deliberately **not** declared here.
+    /// Letting clap consume it into this slot made the environment
+    /// indistinguishable from the flag, which turned an unparseable
+    /// value into `exit(2)` instead of the documented warn-and-fall-
+    /// through, and left the environment branch in
+    /// `sbproxy_core::config_boot::mode_from_flag_or_env` unreachable in
+    /// production. That function reads the variable instead.
+    #[arg(long = "config-fallback", global = true)]
+    config_fallback: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -2128,7 +2149,25 @@ fn main() {
             if cli.locked {
                 enforce_locked_serve_or_exit(path.as_deref());
             }
-            run_proxy(path.as_deref(), grace);
+            // WOR-2459: refused here, before anything binds, rather
+            // than ignored: a rescue boot typed under pressure with the
+            // mode misspelled must not silently come up with the
+            // fallback off, which is the one outcome the operator was
+            // trying to avoid.
+            let fallback = match cli.globals.config_fallback.as_deref() {
+                None => None,
+                Some(raw) => match sbproxy_config::BootFallbackMode::parse(raw) {
+                    Some(mode) => Some(mode),
+                    None => {
+                        eprintln!(
+                            "Fatal: --config-fallback must be 'off' or 'last-known-good', \
+                             got '{raw}'"
+                        );
+                        std::process::exit(2);
+                    }
+                },
+            };
+            run_proxy(path.as_deref(), grace, fallback);
         }
     }
 }
@@ -2201,7 +2240,11 @@ fn raise_fd_limit() {
     let _ = rlimit::increase_nofile_limit(1_048_576);
 }
 
-fn run_proxy(config_path: Option<&std::path::Path>, grace: sbproxy_core::GraceConfig) {
+fn run_proxy(
+    config_path: Option<&std::path::Path>,
+    grace: sbproxy_core::GraceConfig,
+    fallback: Option<sbproxy_config::BootFallbackMode>,
+) {
     raise_fd_limit();
     warn_low_fd_limit();
     match config_path {
@@ -2212,9 +2255,22 @@ fn run_proxy(config_path: Option<&std::path::Path>, grace: sbproxy_core::GraceCo
             // (or fail loud) instead of reaching the wire verbatim.
             install_secret_resolver(path);
             let path_str = path.to_string_lossy();
-            if let Err(e) = sbproxy_core::run(&path_str, grace) {
+            if let Err(e) = sbproxy_core::server::run_with_fallback(&path_str, grace, fallback) {
                 eprintln!("Fatal: {e:#}");
-                std::process::exit(1);
+                // WOR-2459: an exhausted ring gets its own exit code, so
+                // an init system or a deployment pipeline can tell "this
+                // node's config is broken and its own history could not
+                // rescue it" apart from every other fatal boot failure
+                // without parsing a log line. Every other failure keeps
+                // the exit code it has always had.
+                let code = if format!("{e:#}")
+                    .contains(sbproxy_core::config_boot::RING_EXHAUSTED_MARKER)
+                {
+                    sbproxy_core::config_boot::EXIT_CONFIG_RING_EXHAUSTED
+                } else {
+                    1
+                };
+                std::process::exit(code);
             }
         }
         None => {
@@ -10682,13 +10738,14 @@ fn handle_config_pull(
         .unwrap_or(0);
     let candidate = match subscriber.evaluate(&signed, &local_yaml, now_unix_ms) {
         Ok(candidate) => candidate,
-        Err(result) => {
+        Err(refusal) => {
             eprintln!(
                 "config pull: revision {} was refused ({}): {}",
                 signed.bundle.revision,
-                result.as_str(),
-                pull_refusal_hint(result),
+                refusal.result.as_str(),
+                pull_refusal_hint(refusal.result),
             );
+            eprintln!("config pull: {}", refusal.detail);
             eprintln!(
                 "config pull: nothing was applied. The bundle cache, the replay cursor, and the \
                  running configuration are all untouched."

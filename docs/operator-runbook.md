@@ -928,10 +928,99 @@ flowchart TD
     Ring -->|a subsystem came up degraded| Degraded["applied, degraded: subsystems named"]
 ```
 
-What it does not do yet: nothing here promotes an entry to last-known-good,
-nothing reads the `lkg` pointer to decide anything, and nothing reapplies a
-prior entry. The ring is a durable audit trail an operator can inspect by
-hand today, not an automatic rollback path. Soak-window promotion and a
-rollback that actually reapplies a ring entry are follow-on work; until they
-land, use the Helm or `kubectl apply` steps above, or `sbproxy apply`, to
-move the running config back.
+Recording a revision never promotes it. The `lkg` pointer moves only when a
+soak window closes on a passing verdict, and that is the whole point of the
+block: a config that compiles is not a config that works.
+
+#### The soak window
+
+Every committed reload arms a window (`soak.window_secs`, 120 seconds by
+default). Four signals report into it, and the verdict has three states:
+
+| Verdict | What it means | The `lkg` pointer |
+|---|---|---|
+| passed | At least one signal measured something and it was fine, and nothing failed | advances |
+| failed | A signal measured something and it was not fine | does not move |
+| inconclusive | Every signal abstained, so nothing was measured | does not move |
+
+`inconclusive` is the one to watch on a quiet node. It carries its own label
+on `sbproxy_config_soak_verdict_total{verdict,signal}`, and a node that keeps
+producing it is telling you the soak has no evidence to work with. Read the
+per-signal labels to find out which kind of nothing it is:
+
+* `signal="request_outcome",verdict="abstain"` means too little traffic.
+  Lower `soak.min_requests`, or accept that another signal has to carry it.
+* `signal="upstream_health",verdict="abstain"` means a forwarding origin
+  exposes no health signal at all. A `type: proxy` origin with no
+  `health_check:`, `circuit_breaker:`, or `outlier_detection:` block is
+  invisible to this soak, and it will not report health it never looked
+  for. While that is true, `proxy.synthetic_probe` alone cannot promote
+  either, because the synthetic origin is a non-network action and its pass
+  says nothing about your upstreams. Three ways out, all named in the
+  warning: declare `soak.probe.url` against a real upstream, give the origin
+  one of the three health blocks, or set `require_upstream_health: false`.
+  An origin that answers from the proxy itself (`static`, `mock`, `echo`)
+  is not counted here at all, so the synthetic driver's own origin never
+  causes this.
+* `signal="operator_probe",verdict="abstain"` means neither probe is
+  running, or the synthetic driver has not produced an outcome yet.
+
+Until one of those changes, the node has no rollback target, which
+`sbproxy_config_lkg_revision` reports as `-1`.
+
+A deployment pipeline that has run its own smoke test does not have to wait
+out the window. `POST /admin/config/confirm` closes it now and answers with
+the verdict and every signal's reasoning, so the pipeline can fail its own
+step when the answer is not `passed`.
+
+#### Booting on the last known good config
+
+When the config a node is told to boot on does not work, the node exits 1,
+which is right on a first boot and wrong on the thousandth. Start it with
+`--config-fallback=last-known-good` (or `SB_CONFIG_FALLBACK`, or
+`proxy.config_history.boot.fallback`) and it walks the ring instead,
+last-known-good entry first.
+
+A node that comes up that way is not quiet about it. It warns at startup,
+reports `sbproxy_config_fallback_active` as 1, and answers
+[`GET /admin/config/fallback`](admin-api-reference.md#get-delete-adminconfigfallback)
+with the revision it is pinned to. While it is pinned, the file watcher,
+SIGHUP, and the `source:` refresh poller do nothing: the watcher watches the
+config's directory, so leaving it live would re-apply the broken file on the
+next save in there. Config-authority polling stays live, because a fleet-wide
+fix is how this should end.
+
+Recovering, in order:
+
+1. `GET /admin/config/fallback` to confirm which revision the node is on.
+2. `GET /admin/config/rejected` to see why the config you pushed was refused.
+   The reason and the refusing stage are both there, with the document as
+   written.
+3. Fix the file, or push a corrected bundle from the config authority.
+4. `DELETE /admin/config/fallback`. That clears the pin, brings the three
+   suspended paths back without a restart, and applies the file in the same
+   call. Read `reloaded` in the response: `false` means the pin is gone but
+   your file still does not compile, and `reload_error` says why.
+
+Step 4 does the apply itself on purpose. The watcher only fires on a
+filesystem event, so a node whose file you fixed in step 3 would otherwise
+keep serving the rescued revision with `sbproxy_config_fallback_active`
+reading 0, which is the one reading that says everything is fine.
+
+While a node is pinned, its suspended reload paths count under their own
+label rather than as failures: `sbproxy_config_reload_total{result="suspended"}`
+for a local reload and `sbproxy_config_source_fetch_total{result="suspended"}`
+for a skipped source poll. A flatlined source counter or a climbing reload
+failure rate on a pinned node would be indistinguishable from a fault, and
+a pinned node is not a fault, it is the fallback working.
+
+If the walk runs out of candidates, the process exits `78` (`EX_CONFIG`)
+rather than `1`, and the message names every revision it tried and why each
+one failed. An entry that fails `boot.max_attempts` times is retired and the
+walk moves on, so a ring full of documents that no longer construct after an
+upgrade terminates rather than looping.
+
+What is still missing: nothing reverts automatically. A failed soak records
+its verdict and leaves the running config alone. To move a running config
+back by hand, use the Helm or `kubectl apply` steps above, or `sbproxy apply`
+with the document `GET /admin/config/history/{digest}` returns.

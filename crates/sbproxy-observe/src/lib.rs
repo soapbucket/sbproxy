@@ -145,6 +145,7 @@ pub use sink_dispatcher::{
 pub use synthetic::{
     SyntheticProbeRegistration, SyntheticProbeState, DEFAULT_SYNTHETIC_HOSTNAME,
     DEFAULT_SYNTHETIC_INTERVAL_SECS, DEFAULT_SYNTHETIC_PATH, DEFAULT_SYNTHETIC_TIMEOUT_MS,
+    SYNTHETIC_NO_OUTCOME_DETAIL, SYNTHETIC_STALE_DETAIL_PREFIX,
 };
 pub use telemetry::{
     extract_from_headers, init_otlp_metrics_pipeline, init_propagator, inject_into_headers,

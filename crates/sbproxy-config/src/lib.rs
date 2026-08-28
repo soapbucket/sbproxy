@@ -114,7 +114,9 @@ pub use plan::{
 };
 pub use raw::*;
 pub use revision_store::{
-    AppendMetadata, RevisionEntry, RevisionState, RevisionStore, RevisionStoreError, SoakVerdict,
+    AppendMetadata, RejectedCandidate, RejectionMetadata, RejectionReason, RevisionEntry,
+    RevisionState, RevisionStore, RevisionStoreError, SoakVerdict, DEFAULT_KEEP_REJECTED,
+    MAX_REJECTION_DETAIL_CHARS,
 };
 pub use schema::{config_json_schema, CONFIG_SCHEMA_FILE};
 pub use snapshot::*;

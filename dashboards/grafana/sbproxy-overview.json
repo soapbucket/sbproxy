@@ -610,6 +610,222 @@
         }
       ],
       "description": "Reserve operations the backend refused, by trait method. The reserve is best-effort: every one of these was swallowed and the request served anyway, so this is the only place a failing cold tier shows up. A sustained non-zero `put` rate with a healthy `get` rate usually means expired write credentials or a bucket policy change; a non-zero rate on all three means the store is unreachable. Reads flat zero on a healthy reserve."
+    },
+    {
+      "id": 9,
+      "title": "Config Rollback Readiness",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 32
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sbproxy_config_lkg_revision",
+          "legendFormat": "lkg revision",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Which config revision this node would roll back to. -1 means it has none: every soak window so far ended failed or inconclusive, so nothing has ever been promoted to last known good. A node sitting at -1 for hours is a node with no rollback target, and the soak verdict panel beside this says why."
+    },
+    {
+      "id": 10,
+      "title": "Serving a Fallback Config",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 32
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sbproxy_config_fallback_active",
+          "legendFormat": "fallback active",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "1 while this node is serving a config its boot fallback restored from the revision ring rather than the config file it was pointed at. Its file watcher, SIGHUP, and source: refresh poller are suspended while this is 1. Clear it with DELETE /admin/config/fallback once the real config is fixed. This should never be 1 for long."
+    },
+    {
+      "id": 11,
+      "title": "Config Soak Verdicts",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 40
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (verdict, signal) (increase(sbproxy_config_soak_verdict_total[1h]))",
+          "legendFormat": "{{signal}} {{verdict}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "How each soak signal is voting, and what the windows are deciding. A steady stream of verdict=\"inconclusive\" on signal=\"window\" means the soak is measuring nothing: the node is too quiet for min_requests and has no probe, so no revision can ever be promoted. Turn on proxy.synthetic_probe or declare soak.probe.url. verdict=\"failed\" on signal=\"degraded_subsystems\" means a reload published while a subsystem stayed on prior state."
+    },
+    {
+      "id": 12,
+      "title": "Config Candidates Refused",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 40
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (reason) (increase(sbproxy_config_rejected_total[1h]))",
+          "legendFormat": "{{reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Config candidates this node refused before applying, by reason. denied_path and confinement_refused mean an authority bundle reached for something this node owns; compile_failed on a quiet fleet usually means a local file edit that never took. GET /admin/config/rejected has the document and the refusing check's own message for each one."
     }
   ],
   "templating": {

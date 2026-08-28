@@ -439,6 +439,80 @@ pub enum CycleResult {
     ReloadBusy,
 }
 
+/// One refusal from [`ConfigSubscriber::evaluate`]: the cycle result to
+/// record, plus the detail the refusing check produced.
+///
+/// The detail exists so the refusal reaches
+/// `proxy.config_history`'s `rejected/` directory carrying what the log
+/// line carries (WOR-2462). Building it here rather than recording at
+/// the point of refusal is what keeps `evaluate` pure: it decides and
+/// describes, and the caller writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CycleRefusal {
+    /// The cycle result the caller should record.
+    pub result: CycleResult,
+    /// Human-readable detail, bounded when stored.
+    pub detail: String,
+}
+
+impl CycleRefusal {
+    /// Build a refusal.
+    #[must_use]
+    pub fn new(result: CycleResult, detail: impl Into<String>) -> Self {
+        Self {
+            result,
+            detail: detail.into(),
+        }
+    }
+}
+
+/// Which stored [`sbproxy_config::RejectionReason`] one cycle result
+/// maps to, or `None` when the result is not a refusal at all.
+///
+/// Exhaustive by construction, so a new [`CycleResult`] variant fails to
+/// compile until somebody decides which side of this line it falls on.
+///
+/// The two deliberate `None`s are worth reading twice.
+/// [`CycleResult::ReloadBusy`] is a **deferral**, not a refusal: nothing
+/// was examined, the candidate will be retried at the next interval, and
+/// recording it would bury the real refusals under a row that repeats
+/// every poll cycle on a perfectly healthy node. The three
+/// non-refusals ([`CycleResult::Applied`], [`CycleResult::NotModified`],
+/// [`CycleResult::Unreachable`]) never had a candidate to refuse.
+#[must_use]
+pub(crate) fn rejection_reason_for(result: CycleResult) -> Option<sbproxy_config::RejectionReason> {
+    use sbproxy_config::RejectionReason;
+    match result {
+        CycleResult::VerifyFailed => Some(RejectionReason::VerifyFailed),
+        CycleResult::CompileFailed => Some(RejectionReason::CompileFailed),
+        CycleResult::DeniedPath => Some(RejectionReason::DeniedPath),
+        CycleResult::ConfinementRefused => Some(RejectionReason::ConfinementRefused),
+        CycleResult::Applied
+        | CycleResult::NotModified
+        | CycleResult::Unreachable
+        | CycleResult::ReloadBusy => None,
+    }
+}
+
+/// Record one refused candidate into the config revision ring's
+/// `rejected/` directory (WOR-2462).
+///
+/// A no-op when the result is not a refusal (`rejection_reason_for`, in
+/// this module, decides which results are) or when no ring is open.
+/// `content` is the
+/// candidate's pre-resolution bytes: the authority's own document for a
+/// bundle refusal, the merged document for one the reload transaction
+/// refused.
+pub fn record_refusal(content: &str, refusal: &CycleRefusal, stage: &str, provenance: BaseOrigin) {
+    let Some(reason) = rejection_reason_for(refusal.result) else {
+        return;
+    };
+    crate::config_history::record_rejected_candidate(
+        content.as_bytes(),
+        crate::config_history::rejection_metadata(reason, stage, &refusal.detail, provenance),
+    );
+}
+
 impl CycleResult {
     /// Stable metric label. Never changes for a given variant.
     #[must_use]
@@ -798,12 +872,15 @@ impl ConfigSubscriber {
         signed: &SignedConfigBundle,
         base_yaml: &str,
         now_unix_ms: u64,
-    ) -> Result<MergedCandidate, CycleResult> {
+    ) -> Result<MergedCandidate, CycleRefusal> {
         // No trusted keys means nothing can be verified, so nothing can be
         // applied. `load_keys` already logged why, once per attempt, and
         // every cycle retries the load.
         let Some(keys) = self.keys.as_ref() else {
-            return Err(CycleResult::VerifyFailed);
+            return Err(CycleRefusal::new(
+                CycleResult::VerifyFailed,
+                "no trusted verifying keys are loaded",
+            ));
         };
         let bundle = match signed.verify_at(keys, now_unix_ms) {
             Ok(bundle) => bundle,
@@ -814,7 +891,10 @@ impl ConfigSubscriber {
                     "config bundle failed verification; keeping the configuration already \
                      serving",
                 );
-                return Err(CycleResult::VerifyFailed);
+                return Err(CycleRefusal::new(
+                    CycleResult::VerifyFailed,
+                    format!("envelope verification failed: {error}"),
+                ));
             }
         };
         // The envelope declares how it expects to be applied. A
@@ -830,7 +910,14 @@ impl ConfigSubscriber {
                 "config bundle declares a different apply mode than this subscriber is \
                  configured for; refusing it",
             );
-            return Err(CycleResult::VerifyFailed);
+            return Err(CycleRefusal::new(
+                CycleResult::VerifyFailed,
+                format!(
+                    "bundle declares mode {} but this subscriber runs {}",
+                    format_mode(bundle.mode),
+                    format_mode(self.mode)
+                ),
+            ));
         }
         // Anti-replay, on a probe copy so a later failure cannot leave
         // the real cursor advanced past a bundle that never applied.
@@ -842,7 +929,10 @@ impl ConfigSubscriber {
                 candidate_revision = bundle.revision,
                 "config bundle refused by the anti-replay cursor",
             );
-            return Err(CycleResult::VerifyFailed);
+            return Err(CycleRefusal::new(
+                CycleResult::VerifyFailed,
+                format!("refused by the anti-replay cursor: {error}"),
+            ));
         }
 
         // Computed once, from the base this candidate is actually merged
@@ -875,7 +965,10 @@ impl ConfigSubscriber {
                 revision = bundle.revision,
                 "config bundle reaches for a host resource this node owns; refusing it",
             );
-            return Err(CycleResult::ConfinementRefused);
+            return Err(CycleRefusal::new(
+                CycleResult::ConfinementRefused,
+                format!("reaches for a host resource this node owns: {error}"),
+            ));
         }
         let merged = match merge_config(
             base_yaml,
@@ -890,7 +983,10 @@ impl ConfigSubscriber {
                     revision = bundle.revision,
                     "config bundle claims paths this node owns; refusing the whole bundle",
                 );
-                return Err(CycleResult::DeniedPath);
+                return Err(CycleRefusal::new(
+                    CycleResult::DeniedPath,
+                    format!("claims paths this node owns: {}", paths.join(", ")),
+                ));
             }
             Err(error) => {
                 tracing::error!(
@@ -898,7 +994,10 @@ impl ConfigSubscriber {
                     revision = bundle.revision,
                     "config bundle could not be merged over the local document",
                 );
-                return Err(CycleResult::CompileFailed);
+                return Err(CycleRefusal::new(
+                    CycleResult::CompileFailed,
+                    format!("could not be merged over the local document: {error}"),
+                ));
             }
         };
         // An unresolved `${VAR}` in a hand-edited config is a warning
@@ -914,7 +1013,13 @@ impl ConfigSubscriber {
                 "config bundle leaves unresolved ${{VAR}} reference(s) after merging; refusing \
                  it rather than applying the literal text as a value",
             );
-            return Err(CycleResult::CompileFailed);
+            return Err(CycleRefusal::new(
+                CycleResult::CompileFailed,
+                format!(
+                    "leaves unresolved ${{VAR}} reference(s) after merging: {}",
+                    unresolved.join(", ")
+                ),
+            ));
         }
 
         Ok(MergedCandidate {
@@ -955,6 +1060,19 @@ impl ConfigSubscriber {
                     revision = candidate.revision,
                     "config bundle was rejected by the reload transaction; the previously \
                      applied configuration keeps serving",
+                );
+                // The merged document, not the bundle's half: this is
+                // the document the reload transaction actually refused,
+                // and the half that compiled fine on its own tells an
+                // operator nothing about why the whole did not.
+                record_refusal(
+                    &candidate.merged_yaml,
+                    &CycleRefusal::new(
+                        CycleResult::CompileFailed,
+                        format!("rejected by the reload transaction: {error:#}"),
+                    ),
+                    "config_authority",
+                    candidate.base_origin.clone(),
                 );
                 return CycleResult::CompileFailed;
             }
@@ -1244,7 +1362,20 @@ impl ConfigSubscriber {
                     let evaluated = self.evaluate(&signed, &base_yaml, now_unix_ms());
                     match evaluated {
                         Ok(candidate) => self.apply(candidate),
-                        Err(result) => result,
+                        Err(refusal) => {
+                            // The authority's own document, which is the
+                            // half that was refused. Recorded here, at
+                            // the one place every refusal from `evaluate`
+                            // converges, rather than at each of the eight
+                            // sites that produce one.
+                            record_refusal(
+                                &signed.bundle.config_yaml,
+                                &refusal,
+                                "config_authority",
+                                base_origin_for(&base_yaml),
+                            );
+                            refusal.result
+                        }
                     }
                 } else {
                     CycleResult::CompileFailed
@@ -1364,10 +1495,16 @@ impl ConfigSubscriber {
 
         let candidate = match self.evaluate(&cached.bundle, local_yaml, now) {
             Ok(candidate) => candidate,
-            Err(result) => {
+            // Not recorded into the ring's `rejected/` directory, unlike
+            // every other refusal: this runs inside `fold_boot_bundle`,
+            // before the boot path has opened the ring at all, so there
+            // is nothing to record into. The reason still reaches the
+            // operator, through the boot warning this builds.
+            Err(refusal) => {
                 return self.boot_without_bundle(&format!(
-                    "the cached config bundle was refused ({})",
-                    result.as_str()
+                    "the cached config bundle was refused ({}: {})",
+                    refusal.result.as_str(),
+                    refusal.detail
                 ))
             }
         };
@@ -1592,6 +1729,51 @@ mod tests {
             cursor_path_for(Path::new("/var/lib/sbproxy/config-bundle.json")),
             PathBuf::from("/var/lib/sbproxy/config-bundle.json.cursor"),
         );
+    }
+
+    /// WOR-2462. A `reload_busy` skip is a deferral, not a refusal, and
+    /// recording it would put a row in `rejected/` on every poll
+    /// interval of a healthy node whose reload happened to be busy.
+    #[test]
+    fn a_reload_busy_cycle_maps_to_no_rejection_reason() {
+        assert_eq!(rejection_reason_for(CycleResult::ReloadBusy), None);
+    }
+
+    /// WOR-2462. Every refusal in the failure table maps to a stored
+    /// reason, and every non-refusal maps to none. The match is
+    /// exhaustive, so a new [`CycleResult`] variant cannot be added
+    /// without deciding which side of this line it falls on; this test
+    /// pins the decision for the variants that exist.
+    #[test]
+    fn every_cycle_result_maps_to_the_documented_rejection_reason() {
+        use sbproxy_config::RejectionReason;
+        let expected = [
+            (CycleResult::Applied, None),
+            (CycleResult::NotModified, None),
+            (CycleResult::Unreachable, None),
+            (CycleResult::ReloadBusy, None),
+            (
+                CycleResult::VerifyFailed,
+                Some(RejectionReason::VerifyFailed),
+            ),
+            (
+                CycleResult::CompileFailed,
+                Some(RejectionReason::CompileFailed),
+            ),
+            (CycleResult::DeniedPath, Some(RejectionReason::DeniedPath)),
+            (
+                CycleResult::ConfinementRefused,
+                Some(RejectionReason::ConfinementRefused),
+            ),
+        ];
+        for (result, reason) in expected {
+            assert_eq!(
+                rejection_reason_for(result),
+                reason,
+                "{} maps to the wrong stored reason",
+                result.as_str(),
+            );
+        }
     }
 
     #[test]

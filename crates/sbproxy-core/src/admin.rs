@@ -3724,9 +3724,291 @@ fn handle_config_history_list() -> (u16, &'static str, String) {
     let body = serde_json::json!({
         "lineage": recorder.lineage(),
         "lkg_revision": recorder.lkg().map(|entry| entry.revision),
+        // Which revision is under judgment right now, if any. An
+        // operator looking at a ring whose `lkg_revision` has not moved
+        // needs to know whether that is because a window is still open
+        // or because the last one did not promote (WOR-2458).
+        "soak_revision": crate::config_soak::in_flight_revision(),
+        "entries": entries,
+        // Additive: `entries` keeps its existing shape and meaning, and
+        // `timeline` interleaves the refused candidates among them for a
+        // panel that wants the whole story in one list (WOR-2462).
+        "timeline": config_history_timeline(&recorder),
+    });
+    (200, "application/json", body.to_string())
+}
+
+/// `GET /admin/config/fallback`: whether this node is serving a config
+/// its boot fallback restored from the revision ring, and which one
+/// (WOR-2459).
+///
+/// Always answers, on every node, including one that never enabled the
+/// ring: "am I running what I was told to run" is a question an operator
+/// must be able to ask without first knowing whether a feature is
+/// switched on, and answering `404` there would read as "I do not know".
+fn handle_config_fallback_status() -> (u16, &'static str, String) {
+    let pinned = crate::config_boot::pinned_revision();
+    let body = serde_json::json!({
+        "active": crate::config_boot::on_fallback(),
+        "revision": pinned.as_ref().map(|pin| pin.revision),
+        "digest": pinned.as_ref().map(|pin| pin.digest.clone()),
+        // Named rather than implied: an operator reading this is
+        // deciding whether their edit to the config file will do
+        // anything, and the answer is no until they clear the pin.
+        "suspended": if crate::config_boot::on_fallback() {
+            serde_json::json!(["file_watcher", "sighup", "config_refresh_poller"])
+        } else {
+            serde_json::json!([])
+        },
+    });
+    (200, "application/json", body.to_string())
+}
+
+/// `DELETE /admin/config/fallback`: clear the pin and resume the
+/// suspended reload paths (WOR-2459).
+///
+/// The file watcher, SIGHUP, and the `source:` refresh poller check the
+/// pin on every cycle rather than being torn down at boot, precisely so
+/// this can bring them back without a restart. `sbproxy_config_fallback_active`
+/// returns to 0 in the same call.
+///
+/// `409` when nothing is pinned: clearing a pin that does not exist is a
+/// caller bug, and answering `200` would tell an operator their node is
+/// back on its config file when it was never off it.
+fn handle_config_fallback_clear(state: &AdminState) -> (u16, &'static str, String) {
+    let Some(pin) = crate::config_boot::clear_fallback() else {
+        return (
+            409,
+            "application/json",
+            r#"{"error":"this node is not pinned to a fallback configuration"}"#.to_string(),
+        );
+    };
+    // Clearing the pin is only half of recovery, and leaving the other
+    // half to the operator was a trap: the watcher only fires on a
+    // *future* filesystem event, so a node whose file had already been
+    // fixed sat on the October config with
+    // `sbproxy_config_fallback_active` reading 0, which is the one
+    // reading that says everything is fine. So the clear applies the
+    // file itself, through the same path `POST /admin/reload` uses
+    // (WOR-2459 fix round, Major 9).
+    let reload = state.config_path.as_ref().map(|path| {
+        // The unaudited variant: this handler writes the record, with
+        // the actor the HTTP layer has. Letting the shared path write
+        // its own too produced two entries for one apply, one of them
+        // naming `file_watcher` for a deliberate operator action
+        // (verification residual R3).
+        let outcome = crate::server::reload_from_config_path_unaudited(&path.to_string_lossy());
+        // Audited here, at the admin call site, with the actor the HTTP
+        // layer has. `reload_from_config_path` stamps its own entry under
+        // `source: "file_watcher"`, which is right for a filesystem event
+        // and wrong for the single most consequential operator action in
+        // this feature: clearing the pin is a deliberate recovery, and
+        // the audit trail has to name who did it rather than blame the
+        // watcher (re-review, new Minor 7).
+        let mut entry =
+            sbproxy_observe::ConfigAuditEntry::new("api", Vec::new(), Vec::new(), Vec::new());
+        if let Some(actor) = current_admin_actor() {
+            entry = entry.with_actor(actor);
+        }
+        if let Err(error) = &outcome {
+            entry = entry.with_rejection_reason(crate::path_redact::sanitise_path_in_error(
+                &format!("{error:#}"),
+                path,
+            ));
+        }
+        entry.emit();
+        outcome
+    });
+    let (reloaded, reload_error) = match reload {
+        Some(Ok(_)) => (true, None),
+        Some(Err(error)) => (
+            false,
+            Some(crate::path_redact::sanitise_path_in_error(
+                &format!("{error:#}"),
+                state
+                    .config_path
+                    .as_deref()
+                    .unwrap_or(std::path::Path::new("")),
+            )),
+        ),
+        // No config path is wired into this admin state, which is the
+        // unit-test shape rather than a served one.
+        None => (
+            false,
+            Some("no config path is wired on this node".to_string()),
+        ),
+    };
+    let body = serde_json::json!({
+        "cleared": true,
+        "revision": pin.revision,
+        "digest": pin.digest,
+        "resumed": ["file_watcher", "sighup", "config_refresh_poller"],
+        "reloaded": reloaded,
+        "reload_error": reload_error,
+    });
+    // 200 either way: the pin *is* cleared, which is what was asked for
+    // and what the gauge now reports. A file that still does not compile
+    // is the operator's next problem, not a failure of this call, and
+    // `reloaded: false` plus the error is how they see it.
+    (200, "application/json", body.to_string())
+}
+
+/// `POST /admin/config/confirm`: promote the revision under soak
+/// immediately, without waiting out its window (WOR-2458).
+///
+/// The Junos `commit confirmed` ergonomic, inverted. A deployment
+/// pipeline that has just run its own smoke test knows more than a timer
+/// does, and this is what it calls instead of sleeping for two minutes.
+///
+/// `409` when no soak is in flight, rather than a cheerful `200`:
+/// confirming nothing is a caller bug (the reload never happened, or the
+/// window already closed), and answering it as success would tell a
+/// pipeline its config is now the rollback target when it is not.
+///
+/// The confirmation runs the same signals a timed close runs, so it
+/// short-circuits the *wait*, not the *judgment*: a revision that is
+/// already failing its upstream-health signal is not promoted just
+/// because somebody confirmed it. Reporting the verdict back is what
+/// lets the pipeline fail its own step on it.
+fn handle_config_confirm() -> (u16, &'static str, String) {
+    // Answered before the soak state is consulted, so a node that never
+    // opted into the ring gets the same "not enabled" body as its
+    // sibling routes rather than a confusing 409.
+    if let Err(response) = config_history_open_recorder() {
+        return response;
+    }
+    let Some(closed) = crate::config_soak::confirm_now() else {
+        return (
+            409,
+            "application/json",
+            r#"{"error":"no config soak is in flight"}"#.to_string(),
+        );
+    };
+    let signals: Vec<serde_json::Value> = closed
+        .reports
+        .iter()
+        .map(|(signal, outcome)| {
+            serde_json::json!({
+                "signal": signal.as_str(),
+                "outcome": outcome.as_str(),
+                // Redacted for display, the same pass
+                // `config_rejected_entry_json` applies to a stored
+                // refusal. A signal detail is built from bounded,
+                // secret-free parts by construction (the probe's URL
+                // reaches it only through `redacted_url`), and this is
+                // the belt to that brace: an operator can put a literal
+                // credential into a config value the same way they can
+                // anywhere else, and a soak failure quoting one back to
+                // an admin-authenticated reader would be the leak this
+                // pass exists to stop (WOR-2458 fix round, Blocker 1).
+                "detail": sbproxy_observe::redact::redact_secrets(
+                    outcome.detail().unwrap_or_default(),
+                ),
+            })
+        })
+        .collect();
+    let body = serde_json::json!({
+        "revision": closed.revision,
+        "verdict": crate::config_soak::verdict_label(closed.verdict),
+        "promoted": closed.verdict == sbproxy_config::SoakVerdict::Successful,
+        "signals": signals,
+    });
+    (200, "application/json", body.to_string())
+}
+
+/// `GET /admin/config/rejected`: every candidate config this node
+/// refused, newest first, with the reason it was refused (WOR-2462).
+///
+/// The node already knows exactly why it refused a candidate: the
+/// subscriber's failure table enumerates the cases, and every one of
+/// them produced a counter and a log line that were gone by the time
+/// anybody went looking. This is where they survive. Envoy's config dump
+/// retains the last rejected config alongside the accepted one with the
+/// rejection reason attached, and it is one of the more useful things it
+/// does.
+///
+/// `404`/`503` per [`config_history_open_recorder`] when the slot is not
+/// open, the same as its applied-history siblings: refused candidates
+/// live in the same ring directory and are bounded by the same block's
+/// `keep_rejected`.
+///
+/// `document` is redacted for display exactly the way
+/// [`handle_config_history_detail`] redacts a stored revision, and for
+/// the same reason: pre-resolution storage guarantees a `${VAR}` /
+/// `vault://` / `secret://` reference is never resolved into the ring,
+/// and says nothing about a literal secret an operator typed straight
+/// into the YAML. The file on disk keeps the original bytes; only this
+/// response is redacted.
+fn handle_config_rejected_list() -> (u16, &'static str, String) {
+    let recorder = match config_history_open_recorder() {
+        Ok(recorder) => recorder,
+        Err(response) => return response,
+    };
+    let mut stored = recorder.rejections();
+    // The ring stores oldest refusal first; the response contract is
+    // newest first, matching what an operator asking "why is my config
+    // not updating" wants at the top.
+    stored.reverse();
+    let entries: Vec<serde_json::Value> = stored.iter().map(config_rejected_entry_json).collect();
+    let body = serde_json::json!({
+        "lineage": recorder.lineage(),
         "entries": entries,
     });
     (200, "application/json", body.to_string())
+}
+
+/// One refused candidate, in the shape `docs/admin-api-reference.md`
+/// documents.
+fn config_rejected_entry_json(entry: &sbproxy_config::RejectedCandidate) -> serde_json::Value {
+    serde_json::json!({
+        "digest": entry.digest,
+        "reason": entry.reason.as_str(),
+        "stage": entry.stage,
+        "detail": sbproxy_observe::redact::redact_secrets(&entry.detail),
+        "provenance": config_history_provenance_label(&entry.provenance),
+        "first_seen_at": config_history_rfc3339(entry.first_seen_at),
+        "last_seen_at": config_history_rfc3339(entry.last_seen_at),
+        "count": entry.count,
+        "document": sbproxy_observe::redact::redact_secrets(&entry.document),
+    })
+}
+
+/// The applied entries and the refused candidates in one list, newest
+/// first (WOR-2462).
+///
+/// A rejection has to appear in the timeline in its correct place rather
+/// than being invisible: "the config stopped updating three hours ago"
+/// and "a candidate has been refused every poll cycle for three hours"
+/// are the same incident, and a timeline that shows only the first half
+/// of it sends an operator to the wrong place.
+///
+/// Sorted by the instant each row happened: `applied_at` for an applied
+/// revision, `last_seen_at` for a refusal, which is the refusal an
+/// operator is currently living with rather than the first one.
+///
+/// **The Vue History panel does not render this yet.** The data is here
+/// and tested; drawing it belongs with the rest of the console work in
+/// WOR-2574, which owns `ui/src/views/ConfigView.vue`.
+fn config_history_timeline(
+    recorder: &crate::config_history::ConfigHistoryRecorder,
+) -> Vec<serde_json::Value> {
+    let mut rows: Vec<(u64, serde_json::Value)> = Vec::new();
+    for entry in recorder.entries() {
+        let mut row = config_history_entry_json(&entry);
+        row["kind"] = serde_json::Value::String("applied".to_string());
+        row["at"] = serde_json::Value::String(config_history_rfc3339(entry.applied_at));
+        rows.push((entry.applied_at, row));
+    }
+    for entry in recorder.rejections() {
+        let mut row = config_rejected_entry_json(&entry);
+        row["kind"] = serde_json::Value::String("rejected".to_string());
+        row["at"] = serde_json::Value::String(config_history_rfc3339(entry.last_seen_at));
+        rows.push((entry.last_seen_at, row));
+    }
+    // Newest first, so `sort_by_key` on the timestamp then reverse
+    // rather than a descending comparator.
+    rows.sort_by_key(|(at, _)| *at);
+    rows.into_iter().rev().map(|(_, row)| row).collect()
 }
 
 /// `GET /admin/config/history/{digest}`: the stored pre-resolution
@@ -6218,6 +6500,45 @@ pub fn handle_admin_request(
     if path_only == "/admin/config/history" {
         if method.eq_ignore_ascii_case("GET") {
             return handle_config_history_list();
+        }
+        return (
+            405,
+            "application/json",
+            r#"{"error":"method not allowed"}"#.to_string(),
+        );
+    }
+    // WOR-2459: the boot fallback pin. GET reads it, DELETE clears it
+    // and resumes the suspended reload paths.
+    if path_only == "/admin/config/fallback" {
+        if method.eq_ignore_ascii_case("GET") {
+            return handle_config_fallback_status();
+        }
+        if method.eq_ignore_ascii_case("DELETE") {
+            return handle_config_fallback_clear(state);
+        }
+        return (
+            405,
+            "application/json",
+            r#"{"error":"method not allowed"}"#.to_string(),
+        );
+    }
+    // WOR-2458: short-circuit the soak window for the revision under
+    // judgment. POST only: it is a state change.
+    if path_only == "/admin/config/confirm" {
+        if method.eq_ignore_ascii_case("POST") {
+            return handle_config_confirm();
+        }
+        return (
+            405,
+            "application/json",
+            r#"{"error":"method not allowed"}"#.to_string(),
+        );
+    }
+    // WOR-2462: the refused candidates, in the same ring and behind the
+    // same opt-in as the applied ones.
+    if path_only == "/admin/config/rejected" {
+        if method.eq_ignore_ascii_case("GET") {
+            return handle_config_rejected_list();
         }
         return (
             405,
@@ -12189,6 +12510,355 @@ origin_sources:
         }
     }
 
+    fn history_rejection(
+        reason: sbproxy_config::RejectionReason,
+        at: u64,
+    ) -> sbproxy_config::RejectionMetadata {
+        sbproxy_config::RejectionMetadata {
+            reason,
+            stage: "config_authority".to_string(),
+            detail: "refused for the test".to_string(),
+            provenance: BaseOrigin::Local,
+            rejected_at: at,
+        }
+    }
+
+    /// WOR-2459. The fallback pin is readable on every node, and
+    /// clearing it is refused when nothing is pinned.
+    #[test]
+    fn config_fallback_route_reports_and_clears_the_pin() {
+        crate::config_boot::reset_for_test();
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+
+        let (status, _, _) =
+            handle_admin_request("GET", "/admin/config/fallback", &state, None, None);
+        assert_eq!(
+            status, 401,
+            "the pin is behind the admin auth like everything else"
+        );
+        let (status, _, _) =
+            handle_admin_request("POST", "/admin/config/fallback", &state, Some(&auth), None);
+        assert_eq!(status, 405);
+
+        // Nothing pinned: answers, rather than 404ing, because "am I
+        // running what I was told to run" must be askable on any node.
+        let (status, _, body) =
+            handle_admin_request("GET", "/admin/config/fallback", &state, Some(&auth), None);
+        assert_eq!(status, 200);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(parsed["active"], false);
+        assert_eq!(parsed["suspended"].as_array().expect("array").len(), 0);
+
+        let (status, _, body) = handle_config_fallback_clear(&state);
+        assert_eq!(
+            status, 409,
+            "clearing a pin that does not exist is a caller bug"
+        );
+        assert!(body.contains("not pinned"), "{body}");
+
+        crate::config_boot::mark_on_fallback(crate::config_boot::PinnedRevision {
+            revision: 12,
+            digest: "cafe".to_string(),
+        });
+        let (status, _, body) =
+            handle_admin_request("GET", "/admin/config/fallback", &state, Some(&auth), None);
+        assert_eq!(status, 200);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(parsed["active"], true);
+        assert_eq!(parsed["revision"], 12);
+        assert_eq!(parsed["digest"], "cafe");
+        let suspended: Vec<&str> = parsed["suspended"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|value| value.as_str().expect("string"))
+            .collect();
+        assert_eq!(
+            suspended,
+            vec!["file_watcher", "sighup", "config_refresh_poller"],
+            "config_authority is deliberately absent: a fleet-wide fix is how this ends",
+        );
+
+        let (status, _, body) = handle_config_fallback_clear(&state);
+        assert_eq!(status, 200);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(parsed["cleared"], true);
+        assert_eq!(parsed["revision"], 12);
+        assert!(!crate::config_boot::on_fallback());
+        crate::config_boot::reset_for_test();
+    }
+
+    /// WOR-2459 fix round, Major 9. Recovery has to finish in one call.
+    /// The watcher only fires on a *future* filesystem event, so a node
+    /// whose file had already been fixed before the pin was cleared sat
+    /// on the rescued config with `sbproxy_config_fallback_active`
+    /// reading 0, which is the reading that says everything is fine.
+    #[test]
+    fn clearing_the_pin_applies_the_config_file_rather_than_waiting_for_a_touch() {
+        crate::config_boot::reset_for_test();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config_path = dir.path().join("sb.yml");
+        std::fs::write(&config_path, "proxy: {}\n# the operator's fix\n").expect("write");
+        let state = make_state().with_config_path(&config_path);
+
+        crate::config_boot::mark_on_fallback(crate::config_boot::PinnedRevision {
+            revision: 7,
+            digest: "rescued".to_string(),
+        });
+        let before = crate::reload::current_pipeline_full();
+
+        let (status, _, body) = handle_config_fallback_clear(&state);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        let after = crate::reload::current_pipeline_full();
+        crate::config_boot::reset_for_test();
+
+        assert_eq!(status, 200);
+        assert_eq!(parsed["cleared"], true);
+        assert_eq!(
+            parsed["reloaded"], true,
+            "clearing the pin applies the file in the same call: {body}",
+        );
+        assert_eq!(parsed["reload_error"], serde_json::Value::Null);
+        assert!(
+            !std::sync::Arc::ptr_eq(&before, &after),
+            "and the running pipeline is the operator's fix, not the rescued revision",
+        );
+    }
+
+    /// A file that still does not compile is the operator's next
+    /// problem, not a failure of the clear: the pin is genuinely gone
+    /// and the gauge says so, and `reloaded: false` carries the reason.
+    #[test]
+    fn clearing_the_pin_still_succeeds_when_the_file_is_still_broken() {
+        crate::config_boot::reset_for_test();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config_path = dir.path().join("sb.yml");
+        std::fs::write(&config_path, "proxy:\n  http2_cleartextt: true\n").expect("write");
+        let state = make_state().with_config_path(&config_path);
+        crate::config_boot::mark_on_fallback(crate::config_boot::PinnedRevision {
+            revision: 7,
+            digest: "rescued".to_string(),
+        });
+
+        let (status, _, body) = handle_config_fallback_clear(&state);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        let pinned = crate::config_boot::on_fallback();
+        crate::config_boot::reset_for_test();
+
+        assert_eq!(status, 200);
+        assert_eq!(parsed["cleared"], true);
+        assert_eq!(parsed["reloaded"], false);
+        assert!(
+            parsed["reload_error"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("http2_cleartextt")),
+            "the operator is told why their file still does not apply: {body}",
+        );
+        assert!(!pinned, "the pin is gone either way");
+    }
+
+    /// WOR-2458. Confirming is a mutation, so it is POST only and
+    /// behind the same auth as everything else here.
+    #[test]
+    fn config_confirm_requires_auth_and_only_answers_post() {
+        crate::config_history::clear_config_history_recorder();
+        crate::config_soak::clear();
+        let state = make_state();
+        let (status, _, _) =
+            handle_admin_request("POST", "/admin/config/confirm", &state, None, None);
+        assert_eq!(status, 401);
+
+        let auth = basic_auth("admin", "secret");
+        for method in ["GET", "PUT", "DELETE"] {
+            let (status, _, _) =
+                handle_admin_request(method, "/admin/config/confirm", &state, Some(&auth), None);
+            assert_eq!(status, 405, "{method} should not be accepted");
+        }
+        // Opt-in, like its siblings: a node with no ring has nothing to
+        // confirm and says so the same way.
+        let (status, _, body) =
+            handle_admin_request("POST", "/admin/config/confirm", &state, Some(&auth), None);
+        assert_eq!(status, 404);
+        assert_eq!(body, r#"{"error":"config history is not enabled"}"#);
+    }
+
+    /// WOR-2458. Confirming with nothing in flight is refused rather
+    /// than answered as a cheerful success: a pipeline told its config
+    /// is the rollback target when it is not would carry on deploying.
+    #[test]
+    fn config_confirm_is_refused_when_no_soak_is_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let _recorder = install_test_history_recorder(dir.path());
+        crate::config_soak::clear();
+
+        let (status, _, body) = handle_config_confirm();
+        crate::config_history::clear_config_history_recorder();
+        assert_eq!(status, 409);
+        assert_eq!(body, r#"{"error":"no config soak is in flight"}"#);
+    }
+
+    /// WOR-2458. Confirming short-circuits the wait, not the judgment:
+    /// the same signals run, and the answer says whether the revision
+    /// was actually promoted.
+    #[test]
+    fn config_confirm_closes_the_window_and_reports_the_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = install_test_history_recorder(dir.path());
+        crate::config_soak::clear();
+        let entry = recorder
+            .record(b"origins: {}\n# confirmed\n", history_metadata("operator"))
+            .expect("one recorded revision");
+        crate::config_soak::arm(
+            entry.revision,
+            &entry.digest,
+            &[],
+            &sbproxy_config::ConfigSoakConfig::default(),
+        );
+        // The operator's own probe, which dials a real URL and so
+        // promotes on its own. A synthetic pass cannot stand in: this
+        // fixture declares no upstream, the health signal abstains, and
+        // a synthetic pass is discarded with it (verification residual
+        // R1).
+        crate::config_soak::record_probe(
+            crate::config_soak::ProbeKind::Operator,
+            crate::config_soak::ProbeObservation::Ok,
+        );
+
+        let (status, _, body) = handle_config_confirm();
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        let promoted = recorder.lkg().map(|lkg| lkg.revision);
+        crate::config_history::clear_config_history_recorder();
+        crate::config_soak::clear();
+
+        assert_eq!(status, 200);
+        assert_eq!(parsed["revision"], entry.revision);
+        assert_eq!(parsed["verdict"], "passed");
+        assert_eq!(parsed["promoted"], true);
+        assert_eq!(
+            parsed["signals"].as_array().expect("signals").len(),
+            4,
+            "the caller sees what each signal said, not just the verdict",
+        );
+        assert_eq!(
+            promoted,
+            Some(entry.revision),
+            "a confirmed, passing window advances the pointer",
+        );
+    }
+
+    /// WOR-2462. The refused candidates are behind the same auth as
+    /// everything else on the admin surface.
+    #[test]
+    fn config_rejected_route_requires_auth_and_only_answers_get() {
+        crate::config_history::clear_config_history_recorder();
+        let state = make_state();
+        let (status, _, _) =
+            handle_admin_request("GET", "/admin/config/rejected", &state, None, None);
+        assert_eq!(status, 401);
+
+        let auth = basic_auth("admin", "secret");
+        for method in ["PUT", "POST", "DELETE"] {
+            let (status, _, _) =
+                handle_admin_request(method, "/admin/config/rejected", &state, Some(&auth), None);
+            assert_eq!(status, 405, "{method} should not be accepted");
+        }
+        // Opt-in, same as its applied-history siblings.
+        let (status, _, body) =
+            handle_admin_request("GET", "/admin/config/rejected", &state, Some(&auth), None);
+        assert_eq!(status, 404);
+        assert_eq!(body, r#"{"error":"config history is not enabled"}"#);
+    }
+
+    /// WOR-2462. Newest first, one row per refused candidate, with the
+    /// reason and the count an operator reads first.
+    #[test]
+    fn config_rejected_list_is_newest_first_with_reason_and_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = install_test_history_recorder(dir.path());
+        recorder.record_rejection(
+            b"a: 1\n",
+            history_rejection(
+                sbproxy_config::RejectionReason::VerifyFailed,
+                1_700_000_001_000,
+            ),
+        );
+        recorder.record_rejection(
+            b"a: 2\n",
+            history_rejection(
+                sbproxy_config::RejectionReason::DeniedPath,
+                1_700_000_002_000,
+            ),
+        );
+        recorder.record_rejection(
+            b"a: 2\n",
+            history_rejection(
+                sbproxy_config::RejectionReason::DeniedPath,
+                1_700_000_003_000,
+            ),
+        );
+
+        let (status, _, body) = handle_config_rejected_list();
+        crate::config_history::clear_config_history_recorder();
+        assert_eq!(status, 200);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        let entries = parsed["entries"].as_array().expect("entries array");
+        assert_eq!(entries.len(), 2, "the repeat updated a row, not added one");
+        assert_eq!(entries[0]["reason"], "denied_path");
+        assert_eq!(entries[0]["count"], 2);
+        assert_eq!(entries[1]["reason"], "verify_failed");
+        assert_eq!(entries[1]["count"], 1);
+        assert_eq!(entries[0]["stage"], "config_authority");
+        assert!(entries[0]["last_seen_at"]
+            .as_str()
+            .is_some_and(|when| when.starts_with("2023-")));
+    }
+
+    /// WOR-2462. A rejection appears in the timeline in its correct
+    /// place rather than being invisible: the incident an operator is
+    /// investigating is one sequence, not two lists.
+    #[test]
+    fn config_history_timeline_interleaves_rejections_with_applied_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = install_test_history_recorder(dir.path());
+        recorder.record(
+            b"origins: {}\n# one\n",
+            sbproxy_config::AppendMetadata {
+                applied_at: 1_000,
+                ..history_metadata("first")
+            },
+        );
+        recorder.record_rejection(
+            b"broken: yes\n",
+            history_rejection(sbproxy_config::RejectionReason::CompileFailed, 2_000),
+        );
+        recorder.record(
+            b"origins: {}\n# two\n",
+            sbproxy_config::AppendMetadata {
+                applied_at: 3_000,
+                ..history_metadata("second")
+            },
+        );
+
+        let (status, _, body) = handle_config_history_list();
+        crate::config_history::clear_config_history_recorder();
+        assert_eq!(status, 200);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        let timeline = parsed["timeline"].as_array().expect("timeline array");
+        let shape: Vec<&str> = timeline
+            .iter()
+            .map(|row| row["kind"].as_str().expect("kind"))
+            .collect();
+        assert_eq!(
+            shape,
+            vec!["applied", "rejected", "applied"],
+            "newest first, with the refusal in its own place: {timeline:?}",
+        );
+        assert_eq!(timeline[0]["revision"], 2);
+        assert_eq!(timeline[1]["reason"], "compile_failed");
+        assert_eq!(timeline[2]["revision"], 1);
+    }
+
     #[test]
     fn config_history_routes_require_auth() {
         let state = make_state();
@@ -12266,7 +12936,15 @@ origin_sources:
             .collect();
         assert_eq!(
             top,
-            ["lineage", "lkg_revision", "entries"].into_iter().collect(),
+            [
+                "lineage",
+                "lkg_revision",
+                "soak_revision",
+                "entries",
+                "timeline"
+            ]
+            .into_iter()
+            .collect(),
         );
         assert_eq!(parsed["lkg_revision"], serde_json::Value::Null);
         assert!(parsed["lineage"].as_str().is_some_and(|s| !s.is_empty()));
