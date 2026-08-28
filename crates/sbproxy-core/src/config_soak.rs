@@ -642,6 +642,39 @@ fn in_flight() -> &'static Mutex<Option<SoakWindow>> {
     IN_FLIGHT.get_or_init(|| Mutex::new(None))
 }
 
+/// A verdict reached before a window could be stored, waiting for the
+/// supervisor to act on it (WOR-2461).
+///
+/// [`arm`] runs inside the reload transaction, which holds
+/// `CONFIG_RELOAD_LOCK`, and an automatic revert re-enters that
+/// transaction to publish the restored document. So a verdict reached
+/// at arm time cannot act where it is discovered: it would deadlock
+/// against the lock its own caller is holding. It is left here instead,
+/// and [`drive_verdicts`] picks it up on the supervisor's next tick,
+/// outside the lock.
+///
+/// One slot, last writer wins, because a newer revision supersedes an
+/// unhandled failure for the same reason [`arm`] supersedes a window in
+/// flight: reverting on account of a revision that is no longer serving
+/// would undo a change nothing has judged.
+static PENDING_VERDICT: OnceLock<Mutex<Option<SoakOutcome>>> = OnceLock::new();
+
+fn pending_verdict() -> &'static Mutex<Option<SoakOutcome>> {
+    PENDING_VERDICT.get_or_init(|| Mutex::new(None))
+}
+
+/// Take the verdict [`arm`] left behind, if it left one.
+///
+/// Taking rather than reading: a verdict is acted on once. A second
+/// supervisor tick a second later must not revert again on the strength
+/// of the same failure.
+pub(crate) fn take_pending_verdict() -> Option<SoakOutcome> {
+    pending_verdict()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+}
+
 /// Host wall clock in unix milliseconds.
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -661,13 +694,33 @@ fn now_ms() -> u64 {
 /// A window already in flight is **superseded**: it is dropped without a
 /// verdict, so it can never later promote a revision that is no longer
 /// running. The superseded revision's entry stays `applied`, which is
-/// the honest record of what happened to it.
+/// the honest record of what happened to it. A failure this function
+/// left in [`PENDING_VERDICT`] and the supervisor has not reached yet is
+/// superseded on the same grounds and for the same reason.
+///
+/// The caller records the returned verdict on the ring entry. A `Failed`
+/// verdict is additionally left in [`PENDING_VERDICT`] for the
+/// supervisor, because this runs under the reload lock and an automatic
+/// revert cannot be taken from here; see that slot's documentation.
 pub(crate) fn arm(
     revision: u64,
     digest: &str,
     degraded: &[String],
     config: &ConfigSoakConfig,
 ) -> Option<SoakVerdict> {
+    // Before the disabled-soak early return below, not after: a node
+    // whose next revision switches the soak off is still a node whose
+    // previous revision is no longer serving.
+    if let Some(superseded) = take_pending_verdict() {
+        tracing::info!(
+            superseded_revision = superseded.revision,
+            revision,
+            "a newer config revision applied before the supervisor acted on an immediate soak \
+             failure; the failure is dropped rather than reverting a revision that is no \
+             longer running",
+        );
+    }
+
     if !config.enabled {
         // Promote on apply, because the operator turned the soak off.
         // Loudly enough that it is not a surprise, once per reload.
@@ -703,6 +756,18 @@ pub(crate) fn arm(
             "the applied config revision failed its soak immediately; the last-known-good \
              pointer does not move",
         );
+        // Handed to the supervisor rather than acted on here: this runs
+        // under the reload lock and a revert re-enters the reload
+        // transaction (WOR-2461).
+        *pending_verdict()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(SoakOutcome {
+            revision,
+            digest: digest.to_string(),
+            verdict: SoakVerdict::Failed,
+            reports: vec![(SoakSignal::DegradedSubsystems, degraded_outcome.clone())],
+            auto_revert: config.auto_revert,
+        });
         return Some(SoakVerdict::Failed);
     }
 
@@ -731,18 +796,22 @@ pub(crate) fn in_flight_revision() -> Option<u64> {
         .map(|window| window.revision)
 }
 
-/// Drop the window in flight without reaching a verdict.
+/// Drop the window in flight, and any verdict waiting for the
+/// supervisor, without reaching or acting on either.
 ///
-/// Tests only. The soak slot is process-global, so one test's armed
-/// window would otherwise be judged by the next test's `confirm_now`.
-/// No production path drops a window without a verdict: the two ways
-/// one ends are the timer and an operator's confirmation, and a third
-/// reload supersedes it through [`arm`] rather than through this.
+/// Tests only. Both slots are process-global, so one test's armed
+/// window would otherwise be judged by the next test's `confirm_now`
+/// and one test's immediate failure would revert during the next
+/// test's reload. No production path drops a window without a verdict:
+/// the two ways one ends are the timer and an operator's confirmation,
+/// and a third reload supersedes it through [`arm`] rather than through
+/// this.
 #[cfg(test)]
 pub(crate) fn clear() {
     *in_flight()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    let _ = take_pending_verdict();
 }
 
 /// Record the most recent observation from one probe against the window
@@ -1197,39 +1266,69 @@ pub(crate) fn spawn(config_path: String) {
         let mut last_probe_ms: u64 = 0;
         loop {
             ticker.tick().await;
-            // Cloned out under the lock and dropped before any await:
-            // the slot is a `std::sync::Mutex`, and holding one across
-            // the probe's `await` is what `clippy::await_holding_lock`
-            // exists to stop.
-            let armed = {
-                let slot = in_flight()
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                slot.as_ref().map(|window| window.config.probe.clone())
-            };
-            let Some(probe) = armed else {
-                continue;
-            };
-            // The synthetic driver's outcome first: it needs no I/O of
-            // our own, and it is what keeps a quiet node's window out of
-            // `Inconclusive`. Recorded into its own slot, so an operator
-            // probe that failed a moment ago is not erased by it.
-            if let Some(observation) = synthetic_observation() {
-                record_probe(ProbeKind::Synthetic, observation);
-            }
-            if let Some(probe) = probe {
-                let due = now_ms().saturating_sub(last_probe_ms)
-                    >= probe.interval_secs.saturating_mul(1_000);
-                if due {
-                    last_probe_ms = now_ms();
-                    run_operator_probe(&probe, &client).await;
-                }
-            }
-            if let Some(outcome) = close_due() {
-                react_to_verdict(&config_path, outcome).await;
-            }
+            last_probe_ms = supervisor_tick(&config_path, &client, last_probe_ms).await;
         }
     });
+}
+
+/// One tick of the supervisor: read the probes, then act on whatever
+/// verdict is waiting. Returns the updated operator-probe cursor.
+///
+/// Split out of the loop above so a test can drive a whole tick rather
+/// than the halves of it, which is what caught both of the bugs the
+/// shape below exists to avoid.
+///
+/// # Verdict handling is outside the armed-window gate
+///
+/// The probes only mean anything while a window is in flight, so their
+/// work is gated on one. Verdict handling is not, and that is
+/// deliberate (WOR-2461): [`arm`] reaches a `Failed` verdict for a
+/// degraded reload **without storing a window at all**, so gating this
+/// on an armed window would drop exactly the failure that needs it, and
+/// leave `auto_revert` looking like a feature that works until the most
+/// common failure it has arrives.
+///
+/// The pending slot is drained before [`close_due`] so a failure and a
+/// later window close are handled in the order they happened.
+pub(crate) async fn supervisor_tick(
+    config_path: &str,
+    client: &reqwest::Client,
+    last_probe_ms: u64,
+) -> u64 {
+    let mut last_probe_ms = last_probe_ms;
+    // Cloned out under the lock and dropped before any await: the slot
+    // is a `std::sync::Mutex`, and holding one across the probe's
+    // `await` is what `clippy::await_holding_lock` exists to stop.
+    let armed = {
+        let slot = in_flight()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slot.as_ref().map(|window| window.config.probe.clone())
+    };
+    if let Some(probe) = armed {
+        // The synthetic driver's outcome first: it needs no I/O of our
+        // own, and it is what keeps a quiet node's window out of
+        // `Inconclusive`. Recorded into its own slot, so an operator
+        // probe that failed a moment ago is not erased by it.
+        if let Some(observation) = synthetic_observation() {
+            record_probe(ProbeKind::Synthetic, observation);
+        }
+        if let Some(probe) = probe {
+            let due =
+                now_ms().saturating_sub(last_probe_ms) >= probe.interval_secs.saturating_mul(1_000);
+            if due {
+                last_probe_ms = now_ms();
+                run_operator_probe(&probe, client).await;
+            }
+        }
+    }
+    if let Some(outcome) = take_pending_verdict() {
+        react_to_verdict(config_path, outcome).await;
+    }
+    if let Some(outcome) = close_due() {
+        react_to_verdict(config_path, outcome).await;
+    }
+    last_probe_ms
 }
 
 /// Hand a closed window's verdict to the auto-revert decision
@@ -1245,7 +1344,8 @@ pub(crate) fn spawn(config_path: String) {
 /// which compiles a configuration and constructs a pipeline while
 /// holding a `std::sync::Mutex`. Running that on the supervisor's
 /// current-thread runtime would stall the probe ticker and the admin
-/// server that shares it.
+/// server that shares it. Awaited rather than detached, so two reverts
+/// cannot overlap and one tick cannot outrun the apply it asked for.
 async fn react_to_verdict(config_path: &str, outcome: SoakOutcome) {
     if outcome.verdict != SoakVerdict::Failed {
         return;
@@ -1262,7 +1362,8 @@ async fn react_to_verdict(config_path: &str, outcome: SoakOutcome) {
     if let Err(error) = handle.await {
         tracing::error!(
             error = %error,
-            "the automatic config revert task did not complete; the running configuration is              whatever the failed soak left serving",
+            "the automatic config revert task did not complete; the running configuration is \
+             whatever the failed soak left serving",
         );
     }
 }
@@ -2018,5 +2119,92 @@ mod tests {
         });
         assert_eq!(window, RequestCounts::default());
         assert_eq!(window.error_rate(), None);
+    }
+
+    /// WOR-2461. An immediate failure is reached inside the reload
+    /// transaction, which holds the reload lock, and a revert re-enters
+    /// that transaction. So the failure cannot act where it is
+    /// discovered; it is left here for the supervisor, which runs
+    /// outside the lock. Dropping it instead is what
+    /// `auto_revert` silently missing the one failure the soak reaches
+    /// with no traffic at all looks like.
+    #[test]
+    fn an_immediate_failure_is_left_for_the_supervisor_rather_than_dropped() {
+        clear();
+        let armed = ConfigSoakConfig {
+            auto_revert: true,
+            ..soak(50)
+        };
+        assert_eq!(
+            arm(11, "digest-11", &["key_plane".to_string()], &armed),
+            Some(SoakVerdict::Failed),
+        );
+        let pending = take_pending_verdict().expect("the failure is handed on, not dropped");
+        assert_eq!(pending.revision, 11);
+        assert_eq!(pending.digest, "digest-11");
+        assert_eq!(pending.verdict, SoakVerdict::Failed);
+        assert!(
+            pending.auto_revert,
+            "and it carries what the operator armed for this revision, not what the pipeline \
+             declares by the time the supervisor gets to it",
+        );
+        assert!(
+            take_pending_verdict().is_none(),
+            "handed on once, acted on once: a second tick must not revert twice",
+        );
+        clear();
+    }
+
+    /// WOR-2461. A newer revision supersedes a pending immediate
+    /// failure for exactly the reason it supersedes a window in flight:
+    /// reverting because of a revision that is no longer serving would
+    /// undo a change nothing has judged.
+    #[test]
+    fn a_newer_revision_supersedes_a_pending_immediate_failure() {
+        clear();
+        let armed = ConfigSoakConfig {
+            auto_revert: true,
+            ..soak(50)
+        };
+        assert_eq!(
+            arm(11, "digest-11", &["key_plane".to_string()], &armed),
+            Some(SoakVerdict::Failed),
+        );
+        assert_eq!(
+            arm(12, "digest-12", &[], &armed),
+            None,
+            "a clean reload arms a window rather than reaching a verdict",
+        );
+        assert!(
+            take_pending_verdict().is_none(),
+            "revision 11 is not what this node is serving any more",
+        );
+        clear();
+    }
+
+    /// A node whose operator switched the soak off promotes on apply
+    /// and reaches no failure, so it can never queue one, whatever a
+    /// previous revision left behind.
+    #[test]
+    fn a_disabled_soak_leaves_nothing_pending() {
+        clear();
+        let armed = ConfigSoakConfig {
+            auto_revert: true,
+            ..soak(50)
+        };
+        assert_eq!(
+            arm(11, "digest-11", &["key_plane".to_string()], &armed),
+            Some(SoakVerdict::Failed),
+        );
+        let off = ConfigSoakConfig {
+            enabled: false,
+            ..armed
+        };
+        assert_eq!(
+            arm(12, "digest-12", &[], &off),
+            Some(SoakVerdict::Successful)
+        );
+        assert!(take_pending_verdict().is_none());
+        clear();
     }
 }

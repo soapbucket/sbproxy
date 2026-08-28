@@ -1391,6 +1391,14 @@ is a larger promise, so it is off until somebody makes it. The per-change
 half of the Junos ergonomic is `POST /admin/config/confirm`, which is
 already on.
 
+A failed soak arrives one of two ways and both of them revert. A window
+that ran its time and failed reverts when the supervisor closes it. A
+reload that published with a subsystem left on prior state fails
+immediately, without waiting the window out, and reverts on the
+supervisor's next tick about a second later. The second is the common
+one: the evidence is already in hand and no traffic is needed to confirm
+it.
+
 **Arming is gated by blast radius.** An in-process revert is an arc-swap.
 A `Restart` or `Breaking` change (listener ports, the `proxy.admin` block,
 cluster identity, an origin's action or auth type) is not something

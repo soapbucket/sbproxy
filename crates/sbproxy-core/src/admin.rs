@@ -3982,6 +3982,22 @@ fn config_auto_revert_json(
 /// rather than in a doc because it is the half of the recovery this
 /// route cannot do. See [`crate::config_rollback`]'s module
 /// documentation.
+///
+/// # The console's Roll back button is deferred to WOR-2574
+///
+/// **There is no button in the Vue console that calls this yet.** Until
+/// there is, this route and `sbproxy config rollback` are the operator
+/// surface, and the console will call this same route when it lands.
+/// WOR-2574 owns `ui/src/views/ConfigView.vue`, so drawing the button
+/// belongs with the rest of the console work rather than here.
+///
+/// The client half of the typed-confirmation rule is written and tested
+/// ahead of it, as `rollbackGate` in `ui/src/lib/config-history.ts`: a
+/// `restart` or `breaking` rollback, and one whose radius is unknown,
+/// may not submit until the operator types the target revision back.
+/// That function is the affordance and nothing calls it yet; this
+/// route's `confirm_revision` check is the enforcer and is what
+/// actually refuses.
 fn handle_config_rollback(state: &AdminState, body: Option<&str>) -> (u16, &'static str, String) {
     // Answered before the ring is consulted, so a node that never opted
     // into `proxy.config_history` gets the same "not enabled" body as

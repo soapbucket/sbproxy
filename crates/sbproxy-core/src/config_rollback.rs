@@ -1474,6 +1474,91 @@ mod tests {
         crate::config_history::clear_config_history_recorder();
     }
 
+    /// WOR-2461, the wiring rather than the decision.
+    ///
+    /// A degraded reload fails its soak at arm time and never stores a
+    /// window, so that verdict never reaches `close_due` and the
+    /// supervisor's window-close path cannot see it. This drives a whole
+    /// supervisor tick, so an auto-revert that only ever worked for
+    /// window-close failures fails here rather than shipping as a
+    /// feature that misses the most common failure it has.
+    ///
+    /// The tick runs on a hand-built current-thread runtime rather than
+    /// under `#[tokio::test]`, which is what the admin runtime the
+    /// supervisor lives on actually is. The fixture's own applies stay
+    /// outside it: the reload transaction calls `block_in_place` when it
+    /// finds an ambient runtime, which is legal on the blocking thread
+    /// the revert reaches it from and a panic on a current-thread
+    /// worker, and the file watcher and every other synchronous caller
+    /// of that path already stands outside a runtime.
+    #[test]
+    fn a_degraded_reload_reverts_through_the_supervisors_own_tick() {
+        crate::config_soak::clear();
+        clear_auto_revert_memory();
+        let temp = tempfile::tempdir().expect("temp");
+        let ring_dir = temp.path().join("ring");
+        let config_path = temp.path().join("sb.yml");
+        let recorder = install_ring(&ring_dir);
+        apply(&config_path, "proxy: {}\n# the good one\n");
+        apply(&config_path, "proxy: {}\n# the degraded one\n");
+        let entries = recorder.entries();
+        recorder.record_soak_verdict(entries[0].revision, SoakVerdict::Successful);
+        crate::config_soak::clear();
+        let serving = crate::reload::current_pipeline_full();
+
+        // What the reload transaction does when a subsystem stayed on
+        // prior state: `arm` reaches `Failed` on the spot and stores no
+        // window at all.
+        let armed = sbproxy_config::ConfigSoakConfig {
+            auto_revert: true,
+            ..sbproxy_config::ConfigSoakConfig::default()
+        };
+        assert_eq!(
+            crate::config_soak::arm(
+                entries[1].revision,
+                &entries[1].digest,
+                &["key_plane".to_string()],
+                &armed,
+            ),
+            Some(sbproxy_config::SoakVerdict::Failed),
+        );
+        assert_eq!(
+            crate::config_soak::in_flight_revision(),
+            None,
+            "the premise: there is no window for the supervisor to close",
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("the admin runtime's flavour");
+        runtime.block_on(async {
+            let client = reqwest::Client::builder()
+                .build()
+                .expect("the supervisor's probe client");
+            crate::config_soak::supervisor_tick(config_path.to_str().expect("utf-8"), &client, 0)
+                .await;
+        });
+
+        assert!(
+            !std::sync::Arc::ptr_eq(&serving, &crate::reload::current_pipeline_full()),
+            "one supervisor tick put this node back on its last known good",
+        );
+        let after = recorder.entries();
+        assert_eq!(after.len(), 3, "the revert appends rather than rewinding");
+        assert_eq!(
+            after[2].digest, entries[0].digest,
+            "and what it appended is the last known good document",
+        );
+        assert_eq!(after[1].state, RevisionState::Reverted);
+        assert_eq!(
+            counter("sbproxy_config_apply_total", "outcome", "reverted"),
+            1.0,
+        );
+        crate::config_soak::clear();
+        crate::config_history::clear_config_history_recorder();
+    }
+
     /// WOR-2461. A `Restart`-class diff is not one an arc-swap can undo,
     /// so the node does not revert and says so with the radius named.
     #[test]

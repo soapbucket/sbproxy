@@ -68,6 +68,14 @@ export function isConfigHistoryDisabled(error: ApiError | null): boolean {
  * finding out from a 409. The server refusal is the enforcer; this is
  * the affordance.
  *
+ * **Nothing calls this yet.** The Roll back button belongs to the admin
+ * console work that owns `ConfigView.vue`, and until it lands the
+ * operator surface is `POST /admin/config/rollback` and
+ * `sbproxy config rollback`. The rule is written and tested here ahead
+ * of the button so the two cannot disagree about which radii need
+ * typing, and so a reader of this file is not left guessing whether the
+ * gate exists.
+ *
  * `null` (the lineage's first entry, with nothing to compare against)
  * requires the typed confirmation too. An unknown radius is not a safe
  * radius, and the one action here that cannot be undone in process is
