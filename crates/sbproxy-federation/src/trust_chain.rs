@@ -844,13 +844,19 @@ mod tests {
         let resolver = TrustChainResolver::new(store_with_anchor(anchor_jwk), 5);
         let resolved = resolver.resolve(&chain).unwrap();
         // The fixture chain has none. Empty iterator.
-        assert_eq!(resolved.metadata_policies().count(), 0);
+        assert_eq!(resolved.metadata_policies_from_superiors().count(), 0);
     }
 
     /// The policy iterator's public contract is anchor-to-leaf even
-    /// though statements are stored leaf-to-anchor.
+    /// though statements are stored leaf-to-anchor, and it stops
+    /// before the leaf.
+    ///
+    /// The exclusion is the security property: `compose_policies`
+    /// inserts an operator the superior did not name, so composing the
+    /// leaf's own policy into the one it is judged against lets it
+    /// satisfy a constraint its published metadata does not meet.
     #[test]
-    fn security_boundary_metadata_policies_iterate_anchor_to_leaf() {
+    fn security_boundary_metadata_policies_iterate_anchor_to_leaf_and_exclude_the_leaf() {
         fn statement(entity_id: &str, marker: &str) -> EntityStatement {
             let now = chrono::Utc::now().timestamp();
             EntityStatement {
@@ -880,10 +886,15 @@ mod tests {
             trust_anchor_id: "https://anchor.example".to_string(),
         };
         let markers: Vec<&str> = resolved
-            .metadata_policies()
+            .metadata_policies_from_superiors()
             .map(|policy| policy.0["marker"].as_str().unwrap())
             .collect();
 
-        assert_eq!(markers, vec!["anchor", "intermediate", "leaf"]);
+        assert_eq!(
+            markers,
+            vec!["anchor", "intermediate"],
+            "anchor-to-leaf order, and the leaf's own policy is not one of the policies \
+             it is judged against"
+        );
     }
 }
