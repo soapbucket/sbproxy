@@ -269,7 +269,7 @@
     {
       "id": 4,
       "title": "Web Bot Auth Verification Mix",
-      "description": "Splits agent-classified traffic into three buckets: `verified` (a catalog-resolved agent \u2014 Web Bot Auth signature carried a known keyid), `anonymous` (signed but no resolved keyid, draft-rescorla-anonymous-webbotauth-00), and `unknown` (looks automated but does not match the catalog). `human` is excluded.",
+      "description": "Splits agent-classified traffic into three buckets: `verified` (a catalog-resolved agent — Web Bot Auth signature carried a known keyid), `anonymous` (signed but no resolved keyid, draft-rescorla-anonymous-webbotauth-00), and `unknown` (looks automated but does not match the catalog). `human` is excluded.",
       "type": "timeseries",
       "gridPos": {
         "h": 9,
@@ -535,6 +535,118 @@
           }
         }
       ]
+    },
+    {
+      "id": 9,
+      "title": "Agent Registry Queue and Catalog",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 33
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "min": 0,
+          "noValue": "agent_registry is not configured on any scraped process."
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (collection) (sbproxy_agent_registry_entries)",
+          "legendFormat": "{{collection}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "How many agents the verified catalog names, and how many registrations sit in each state of the owner-approval queue. Pending is the one worth an alert: a registration nobody has decided is an operator being asked a question they have not seen. A configured registry publishes all five series at zero the moment it boots, so No data means agent_registry is absent or disabled on every scraped process rather than that the queue is empty."
+    },
+    {
+      "id": 10,
+      "title": "Agent Registry Refusals",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 33
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "min": 0,
+          "noValue": "No refusals recorded."
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (op, outcome) (rate(sbproxy_agent_registry_operations_total{outcome!=\"applied\"}[5m]))",
+          "legendFormat": "{{op}} {{outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Everything the registry turned away, by what was asked for and why. The outcomes divide into three groups an operator reads differently. bad_signature, unknown_key, expired, and unsupported_version on op=\"feed_refresh\" mean the catalog stopped updating and the proxy is serving the last verified copy: fix the publisher or the key directory. burned, duplicate, and invalid_transition on a queue op are the state machine working as designed and are healthy at a low rate. unauthorized on op=\"rotate\" or op=\"verify\" is an agent presenting a credential that does not authenticate, which is worth watching if it is sustained."
     }
   ]
 }

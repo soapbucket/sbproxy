@@ -273,7 +273,7 @@ origins:
 | `audit` | object | unset | Admin-action and security/config/key audit trail. `sink: memory` (default) keeps rows in an in-memory ring and on the `tracing` targets; `sink: chain` additionally hash-chains and Ed25519-signs `security_audit` (plus `config_audit`/`key_audit`/admin-action rows when `config_path`/`key_path`/`admin_path` are set) to a durable file `sbproxy audit verify` can check. See [audit-log.md](audit-log.md). |
 | `egress` | object | unset | Per-purpose outbound allowlists (AI providers, agent orchestration, classifier hooks, usage sinks, model artifacts, token exchange, telemetry). See [Egress allowlists](#egress-allowlists). |
 | `session_ledger` | object | unset | MCP tool-call session-ledger emission. |
-| `request_events` | object | unset | Where completed request events go: `none` (default), `logging`, or `file`. See [Request-event egress](observability.md#request-event-egress). |
+| `request_events` | object | unset | Where completed request events go: `none` (default), `logging`, `file`, `nats`, or `clickhouse`. See [request_events](#request_events) and [Request-event egress](observability.md#request-event-egress). |
 | `events` | object | unset | Where typed lifecycle events go: `none` (default), `file`, or `webhook`. Delivery is off the request path through a bounded queue. See [events.md](events.md). |
 | `flags` | list | `[]` | Process-wide feature flags exposed to CEL. |
 | `update` | object | stable channel, automatic checks off | Binary and managed-engine update policy: `channel`, `auto` (background freshness check, reports only, never replaces an artifact), `check_interval_secs` (default 1 day). See [manual.md](manual.md#update---keep-the-binary-engines-and-models-current) for the full field reference and the `sbproxy update` CLI. |
@@ -446,6 +446,8 @@ proxy:
 | `model_host` | object | unset | Canonical managed-model authority, cache, engines, deployments, placement, and rollout policy. |
 | `config_authority` | object | unset | Subscribe to or publish signed configuration bundles. |
 | `key_management` | object | unset | Mutable key store, policy cache, encryption, claim mapping, and declarative seed. |
+| `agent_registry` | object | unset | Signed agent-catalog subscriber plus the owner-approval queue for agent self-registration, over one embedded store. Boot-only. See [Agent registry fields](#agent-registry-fields). |
+| `notifications` | object | unset | Outbound webhook subscriptions with per-destination filters, signing keys, retries, and a durable deadletter queue. Boot-only. See [Notification fields](#notification-fields). |
 | `l2_cache_settings` | object | | Optional shared-state backend. Alias: `l2_cache`. |
 | `anomaly` | object | unset | Behavioral anomaly detection over the TLS fingerprint, resolver source, headless-library signal, and per-address rate, plus the per-agent-class reputation score it feeds and the optional admission thresholds that read it. Disabled by default. See [anomaly-detection.md](anomaly-detection.md). |
 | `cache_reserve` | object | unset | Optional cold-tier response cache backed by memory, filesystem, Redis, object storage (S3, GCS, Azure Blob, or a local directory) with optional at-rest sealing, or S3 with AWS KMS envelope encryption. See [cache-reserve.md](cache-reserve.md). |
@@ -919,6 +921,71 @@ canonical `catalog_file` takes precedence over compatibility provider
 assignments while target readiness converges. See [model-host.md](model-host.md)
 for the engine, cache, admission, placement, and rollout contracts.
 
+### Agent registry fields
+
+`proxy.agent_registry` runs two things over one embedded redb file: a
+subscriber for a signed agent catalog, and an owner-approval queue for agent
+self-registration. Disabled by default, and naming the block without
+`enabled: true` opens no store file. Every key here is applied at boot; a
+reload that changes any of them is refused by name. See
+[agent-registry.md](agent-registry.md) for the walkthrough.
+
+```yaml
+proxy:
+  agent_registry:
+    enabled: true
+    store_path: /var/lib/sbproxy/agent-registry.redb
+    feed_path: /var/lib/sbproxy/agents/feed.json
+    key_directory_path: /var/lib/sbproxy/agents/keys.json
+    bootstrap_keys:
+      publisher-2026: "8Fh0K0m5r0kQ1nQ0S8y1u3H3fQ4l9tGm2r7bQ0aXyZ0="
+    stale_grace_secs: 0
+    duplicate_window_secs: 3600
+    rotation_grace_secs: 2592000
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Master switch. False opens no store file and claims no admin routes. |
+| `store_path` | path | required | Embedded store holding the catalog cache and the registration queue. Created owner-only in the `open(2)` call. |
+| `feed_path` | path | unset | Signed catalog feed, a file you sync. SBproxy reads and verifies it and never dials for it. Absent means no refresh is possible and the refresh route says so. |
+| `key_directory_path` | path | unset | Signed key directory naming the feed signing keys. Required whenever `feed_path` is set. |
+| `bootstrap_keys` | map | `{}` | Public Ed25519 keys, keyed by key id, valued as base64 of the raw 32 bytes. Public material only, so it belongs in version control. An empty map trusts nothing and refuses every feed; there is no key compiled into the binary. |
+| `stale_grace_secs` | int | `0` | How far past its own `expires_at` a feed may still be applied. Zero honors the publisher's expiry exactly. Also sets the refresh interval, clamped to `[60s, 1h]`; zero falls back to 300 seconds. |
+| `duplicate_window_secs` | int | `3600` | How long an identical resubmission of an *undecided* registration is treated as a retry. A decided one is refused durably and forever, which is not this key's business. |
+| `rotation_grace_secs` | int | `2592000` | How long a rotated-away client secret keeps authenticating, so a fleet picks up a new secret without a synchronized restart. |
+
+Each of the three duration keys is refused at startup, by name, if it is
+larger than a duration the proxy can represent.
+
+The pending queue is bounded at 5,000 and there is no key for it. Past that
+the submission route answers `429` with a named reason; terminal records are
+the durable replay refusal and the audit trail and are not counted against
+the cap. The bound is deployment-wide rather than per tenant, so it is not a
+tenant isolation mechanism. See [agent-registry.md](agent-registry.md).
+
+### Notification fields
+
+`proxy.notifications` is the customer-facing webhook side of the event feed:
+several destinations, each with its own filter and its own signing key,
+managed at runtime through `/admin/notifications` rather than by editing this
+file. `events:` remains the one-collector SIEM feed. Boot-only, like the
+registry above. See [notifications.md](notifications.md).
+
+```yaml
+proxy:
+  notifications:
+    enabled: true
+    store_path: /var/lib/sbproxy/notifications.redb
+    queue_capacity: 4096
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Master switch. False opens no store file and answers `404` on `/admin/notifications`. |
+| `store_path` | path | required | Embedded store holding the subscriptions and the deadletter queue. It holds live HMAC signing secrets, which cannot be one-way hashed because a signature has to be re-derived on every delivery, so it is created owner-only and belongs on the volume you already trust with the rest of your configuration. |
+| `queue_capacity` | int | `4096` | Bound on the hand-off queue between the request path and the delivery worker. A full queue drops the event and counts the drop rather than making a request wait on a customer's endpoint. |
+
 ### Metrics fields
 
 | Field | Type | Default | Description |
@@ -957,6 +1024,58 @@ access_log:
 | `sample_rate` | float | `1.0` | Probability in `[0.0, 1.0]` that a matching request is logged. |
 | `status_codes` | list | `[]` | HTTP status codes to log. Empty matches every status. |
 | `methods` | list | `[]` | HTTP methods to log (case-insensitive). Empty matches every method. |
+
+### request_events
+
+Top-level block (sibling of `proxy:` and `origins:`) naming where completed
+request events go. `none` is the default and discards them. `logging` and
+`file` are local; `nats` and `clickhouse` are the two optional network
+destinations, and both are always compiled in, so a typo is a validation
+error rather than a differently built binary. See
+[event-ingest.md](event-ingest.md) for the NATS subject rules, the ClickHouse
+DDL, and the delivery guarantee.
+
+Boot-only: `request_events` installs a process-global sink through a
+set-once slot, so a reload that changes the block is refused by name rather
+than accepted and ignored.
+
+```yaml
+request_events:
+  sink: nats
+  queue_capacity: 8192
+  watermark_store_path: /var/lib/sbproxy/event-ingest.redb
+  nats:
+    address: broker.internal:4222
+    subject_prefix: sb.events
+    token: vault://kv/data/sbproxy#nats_token
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `sink` | enum | `none` | One of `none`, `logging`, `file`, `nats`, `clickhouse`. |
+| `path` | string | unset | NDJSON output path. Required for `sink: file`, ignored otherwise. |
+| `nats` | object | unset | Broker settings. Required for `sink: nats`, ignored otherwise. |
+| `clickhouse` | object | unset | Warehouse settings. Required for `sink: clickhouse`, ignored otherwise. |
+| `watermark_store_path` | path | unset | Embedded store holding the delivery checkpoint, so an operator reconciling a broker or a warehouse against the proxy has a position that survives a restart. Absent keeps no checkpoint. |
+| `queue_capacity` | int | `8192` | Bound on the hand-off queue between the request path and the delivery worker, for `nats` and `clickhouse`. A full queue drops the event and counts the drop. |
+
+`request_events.nats`:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `address` | string | required | `host:port` of the broker. Not a URL: this speaks the core NATS protocol over plain TCP, and a `nats://` string would suggest a URL parser that is not there. |
+| `subject_prefix` | string | `sb.events` | Prefix every subject starts with. The published subject is `<prefix>.<workspace_id>.<event_type>`, with the workspace id sanitized so it cannot add a level or name a wildcard. |
+| `token` | secret ref | unset | Authentication token, resolved through `proxy.secrets`. A literal is refused the same way every other credential reference is. The token crosses the network unencrypted; keep the broker on a trusted segment, and see the TLS note in [event-ingest.md](event-ingest.md). |
+
+`request_events.clickhouse`:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `url` | string | required | HTTP endpoint, for example `http://clickhouse.internal:8123`. |
+| `database` | string | `sbproxy` | Refused unless it matches `[A-Za-z0-9_]+`. |
+| `table` | string | `request_events` | Refused unless it matches `[A-Za-z0-9_]+`. The proxy never applies DDL; create the table first. |
+| `user` | string | unset | Optional user, sent as `X-ClickHouse-User`. |
+| `password` | secret ref | unset | Resolved through `proxy.secrets`, sent as `X-ClickHouse-Key`. |
 
 ### Alerting fields
 

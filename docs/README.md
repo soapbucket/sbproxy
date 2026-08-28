@@ -116,6 +116,7 @@ Route AI, govern the AI that calls you, and run AI models yourself.
 - [a2a-gateway.md](a2a-gateway.md) - the `a2a` action and policy: envelope trust, per-hop chain limits, push-notification target validation, typed AgentCard, and modality negotiation helpers.
 - [agent-orchestration.md](agent-orchestration.md) - governed agent discovery and bounded finite-state workflows through the live authenticated toolkit runtime; not the same A2A as the entry above.
 - [agent-skills.md](agent-skills.md) - Agent Skills v0.2.0 well-known projection: schema, integrity, archive safety, no-script-execution contract.
+- [agent-registry.md](agent-registry.md) - agent identity: a signed catalog of known agents plus an owner-approval queue for agents that register themselves, both on one embedded store with no database behind it.
 - [cloudflare-code-mode.md](cloudflare-code-mode.md) - typed TypeScript module emission for Cloudflare Code Mode agents over the MCP federation registry.
 - [content-for-agents.md](content-for-agents.md) - operator guide to agent-aware content delivery: shape negotiation, body transforms, well-known license posture.
 - [rsl.md](rsl.md) - RSL 1.0 licensing cookbook: expressing license stance via YAML and the resulting `/licenses.xml` projection.
@@ -189,7 +190,9 @@ Point a framework you already run at the gateway: chat completions through the O
 - [audit-log.md](audit-log.md) - tamper-evident audit log of admin actions.
 - [observability.md](observability.md) - metrics, logs, traces, and the bundled dashboards.
 - [clickhouse-attribution.md](clickhouse-attribution.md) - access-log schema, pre-aggregations, and sample attribution queries.
-- [events.md](events.md) - the twenty-two typed events, the `events:` file and webhook sinks, decision-audit, and how the pieces fit into a SIEM integration.
+- [events.md](events.md) - the twenty-three typed events, the `events:` file and webhook sinks, decision-audit, and how the pieces fit into a SIEM integration.
+- [notifications.md](notifications.md) - outbound webhook subscriptions for the customer-facing side of the same events: many destinations with their own filters and signing keys, bounded retries, and a deadletter queue with replay.
+- [event-ingest.md](event-ingest.md) - the two optional destinations for the request-event stream, a NATS subject tree and a ClickHouse table, plus the delivery watermark that replaces a reconciliation table.
 - [metrics-stability.md](metrics-stability.md) - Prometheus metric naming and stability.
 - [decision-records.md](decision-records.md) - what a SIEM consumer may rely on from the decision-audit feed.
 - [operator-runbook.md](operator-runbook.md) - the `runbook_id` index every paging alert resolves through, a response section per id, plus dashboard triage and rollback actions.

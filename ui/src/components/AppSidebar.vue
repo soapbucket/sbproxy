@@ -7,6 +7,8 @@ const nav = [
   { to: "/", label: "overview" },
   { to: "/get-started", label: "get started" },
   { to: "/keys", label: "keys" },
+  { to: "/agents", label: "agents" },
+  { to: "/notifications", label: "notifications" },
   { to: "/credentials", label: "credentials" },
   { to: "/config", label: "config" },
   { to: "/extensions", label: "extensions" },

@@ -33,6 +33,7 @@ members = [
     "crates/sbproxy-classifier",
     "crates/sbproxy-classifier-client",
     "crates/sbproxy-agent-detect",
+    "crates/sbproxy-agent-registry",
     "crates/sbproxy-model-host",
     "crates/sbproxy-capability",
     "crates/sbproxy-mcp-gateway",
@@ -76,6 +77,7 @@ default-members = [
     "crates/sbproxy-classifier",
     "crates/sbproxy-classifier-client",
     "crates/sbproxy-agent-detect",
+    "crates/sbproxy-agent-registry",
     "crates/sbproxy-mcp-gateway",
     "crates/sbproxy-federation",
     "crates/sbproxy-licensing",
@@ -131,6 +133,7 @@ sbproxy-httpkit = { path = "crates/sbproxy-httpkit" }
 sbproxy-security = { path = "crates/sbproxy-security" }
 sbproxy-observe = { path = "crates/sbproxy-observe" }
 sbproxy-platform = { path = "crates/sbproxy-platform" }
+sbproxy-agent-registry = { path = "crates/sbproxy-agent-registry" }
 sbproxy-cache = { path = "crates/sbproxy-cache" }
 sbproxy-transport = { path = "crates/sbproxy-transport" }
 sbproxy-util = { path = "crates/sbproxy-util" }

@@ -191,6 +191,89 @@ fn reconcile_process_secrets(
     )
 }
 
+/// Fingerprints of the three blocks this process owns from boot.
+///
+/// `agent_registry` opens a redb file and starts a refresh loop,
+/// `notifications` opens a redb file and starts a delivery worker, and
+/// `request_events` installs a process-global sink through a set-once slot.
+/// None of the three has a rebuild path, so a reload that changed one would
+/// be accepted and then ignored, which is the failure
+/// `reconcile_process_secrets` already exists to prevent next door.
+static PROCESS_BOOT_ONLY_FINGERPRINTS: std::sync::OnceLock<[String; 3]> =
+    std::sync::OnceLock::new();
+
+/// The three blocks, fingerprinted, in a fixed order.
+fn boot_only_fingerprints(
+    server: &sbproxy_config::types::ProxyServerConfig,
+    request_events: Option<&sbproxy_config::types::RequestEventsConfig>,
+) -> [String; 3] {
+    let of = |value: serde_json::Value| {
+        let serialized = serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string());
+        crate::identity::config_revision(serialized.as_bytes())
+    };
+    [
+        of(serde_json::to_value(&server.agent_registry).unwrap_or(serde_json::Value::Null)),
+        of(serde_json::to_value(&server.notifications).unwrap_or(serde_json::Value::Null)),
+        of(serde_json::to_value(request_events).unwrap_or(serde_json::Value::Null)),
+    ]
+}
+
+/// Record the boot-time shape of the three boot-only blocks.
+fn record_boot_only_fingerprints(
+    server: &sbproxy_config::types::ProxyServerConfig,
+    request_events: Option<&sbproxy_config::types::RequestEventsConfig>,
+) {
+    let _ = PROCESS_BOOT_ONLY_FINGERPRINTS.set(boot_only_fingerprints(server, request_events));
+}
+
+/// Refuse a reload that changes a block this process can only apply at
+/// boot, naming the key that changed.
+///
+/// Refusing is the lesser failure. An accepted reload that silently does
+/// nothing is how an operator ends up reading `/admin/config` serving the
+/// new `bootstrap_keys` while every refresh keeps answering `unknown_key`,
+/// with nothing anywhere connecting the two.
+fn reconcile_boot_only_blocks(
+    server: &sbproxy_config::types::ProxyServerConfig,
+    request_events: Option<&sbproxy_config::types::RequestEventsConfig>,
+) -> anyhow::Result<()> {
+    let candidate = boot_only_fingerprints(server, request_events);
+    let installed = PROCESS_BOOT_ONLY_FINGERPRINTS.get_or_init(|| candidate.clone());
+    compare_boot_only_fingerprints(installed, &candidate)
+}
+
+/// The comparison and the message, without the process-global.
+///
+/// Split out so a test can drive the refusal itself rather than only the
+/// fingerprints feeding it: a `OnceLock` can be set once per process, so a
+/// test against `reconcile_boot_only_blocks` proves whichever case it
+/// happens to run first and nothing else.
+fn compare_boot_only_fingerprints(
+    installed: &[String; 3],
+    candidate: &[String; 3],
+) -> anyhow::Result<()> {
+    if installed == candidate {
+        return Ok(());
+    }
+    let keys = [
+        "proxy.agent_registry",
+        "proxy.notifications",
+        "request_events",
+    ];
+    let changed: Vec<&str> = keys
+        .iter()
+        .zip(installed.iter().zip(candidate.iter()))
+        .filter(|(_, (before, after))| before != after)
+        .map(|(key, _)| *key)
+        .collect();
+    anyhow::bail!(
+        "{} changed; restart sbproxy to apply it. That block opens its own store or installs a \
+         process-global sink at boot and has no rebuild path, so accepting the reload would \
+         leave the node running the old one",
+        changed.join(" and ")
+    )
+}
+
 /// Restores the previously live AI provider catalog when a reload that
 /// already installed a new one fails before it publishes.
 ///
@@ -707,6 +790,171 @@ fn build_request_event_sink(
                 ))
             }
         },
+        // WOR-2674. Both fall back to the logging sink the way `file`
+        // does when their own block is missing or malformed: a
+        // deployment that asked for its events to go somewhere should
+        // still see them locally rather than discover the typo as
+        // silence in a warehouse.
+        RequestEventSinkKind::Nats => match build_ingest_sink(cfg, RequestEventSinkKind::Nats) {
+            Some(sink) => Some((sink, "nats")),
+            None => Some((
+                Arc::new(LoggingSink) as Arc<dyn RequestEventSink>,
+                "logging",
+            )),
+        },
+        RequestEventSinkKind::ClickHouse => {
+            match build_ingest_sink(cfg, RequestEventSinkKind::ClickHouse) {
+                Some(sink) => Some((sink, "clickhouse")),
+                None => Some((
+                    Arc::new(LoggingSink) as Arc<dyn RequestEventSink>,
+                    "logging",
+                )),
+            }
+        }
+    }
+}
+
+/// Turn a `nats:` block into a target, or `None` when it will not work.
+///
+/// Takes the block rather than the whole config so the two destinations do
+/// not share one function with a `kind` string deciding which half of it
+/// runs, and so each names the type it reads.
+fn build_nats_target(
+    nats: &sbproxy_config::types::RequestEventsNatsConfig,
+) -> Option<sbproxy_observe::event_ingest::IngestTarget> {
+    let token = resolve_ingest_secret("request_events.nats.token", nats.token.as_deref())?;
+    Some(sbproxy_observe::event_ingest::IngestTarget::Nats {
+        address: nats.address.clone(),
+        subject_prefix: nats.subject_prefix.clone(),
+        token,
+    })
+}
+
+/// Turn a `clickhouse:` block into a target, or `None` when it will not
+/// work.
+fn build_clickhouse_target(
+    clickhouse: &sbproxy_config::types::RequestEventsClickHouseConfig,
+) -> Option<sbproxy_observe::event_ingest::IngestTarget> {
+    let password = resolve_ingest_secret(
+        "request_events.clickhouse.password",
+        clickhouse.password.as_deref(),
+    )?;
+    Some(sbproxy_observe::event_ingest::IngestTarget::ClickHouse {
+        url: clickhouse.url.clone(),
+        database: clickhouse.database.clone(),
+        table: clickhouse.table.clone(),
+        user: clickhouse.user.clone(),
+        password,
+    })
+}
+
+/// Resolve one ingest credential reference.
+///
+/// `Some(None)` is "no credential configured", `Some(Some(_))` is a
+/// resolved one, and `None` is a reference that would not resolve, which
+/// the caller turns into the logging-sink fallback.
+///
+/// Fail-soft here and fail-loud in the `events:` sink next door, and the
+/// difference is what a failure costs. An unresolvable
+/// `events.signing_secret` means a SIEM stops verifying signatures it
+/// thinks it is still verifying, which is a security property quietly
+/// turning off. An unresolvable broker token means the events go to the
+/// local log instead of the broker, which is visible in the log the
+/// operator is then reading.
+fn resolve_ingest_secret(field: &'static str, reference: Option<&str>) -> Option<Option<String>> {
+    let Some(reference) = reference else {
+        return Some(None);
+    };
+    let resolver = sbproxy_vault::process_resolver();
+    let resolved = match resolver.as_deref() {
+        Some(resolver) => resolver.resolve(reference),
+        None => sbproxy_vault::SecretResolver::new().resolve(reference),
+    };
+    match resolved {
+        Ok(value) => Some(Some(value)),
+        // The reference itself is not echoed: it can name a path or a vault
+        // key an operator would rather not have in a boot log.
+        Err(error) => {
+            tracing::warn!(
+                field,
+                error = %error,
+                "request_events credential would not resolve; using the logging sink"
+            );
+            None
+        }
+    }
+}
+
+/// Build one of the two optional ingest sinks, or `None` when its block is
+/// missing, malformed, or its credential will not resolve.
+///
+/// Takes the sink kind rather than a string, and matches it exhaustively.
+/// The string form had a catch-all arm that built ClickHouse for any value
+/// that was not `"nats"`, so a third destination added later would have
+/// been silently built as the second one.
+fn build_ingest_sink(
+    cfg: &sbproxy_config::types::RequestEventsConfig,
+    kind: sbproxy_config::types::RequestEventSinkKind,
+) -> Option<std::sync::Arc<dyn sbproxy_observe::RequestEventSink>> {
+    use sbproxy_config::types::RequestEventSinkKind;
+    use sbproxy_observe::event_ingest::EventIngest;
+
+    let target = match kind {
+        RequestEventSinkKind::Nats => match cfg.nats.as_ref() {
+            Some(nats) => build_nats_target(nats)?,
+            None => {
+                tracing::warn!(
+                    "request_events.sink is `nats` but no `nats` block is set; using the logging sink"
+                );
+                return None;
+            }
+        },
+        RequestEventSinkKind::ClickHouse => match cfg.clickhouse.as_ref() {
+            Some(clickhouse) => build_clickhouse_target(clickhouse)?,
+            None => {
+                tracing::warn!(
+                    "request_events.sink is `clickhouse` but no `clickhouse` block is set; \
+                     using the logging sink"
+                );
+                return None;
+            }
+        },
+        // Not reachable from `build_request_event_sink`, which only calls
+        // this for the two network destinations. Named rather than caught
+        // so adding a third kind is a compile error here.
+        RequestEventSinkKind::None | RequestEventSinkKind::Logging | RequestEventSinkKind::File => {
+            return None
+        }
+    };
+
+    let watermark = cfg.watermark_store_path.as_ref().and_then(|path| {
+        match sbproxy_platform::storage::EmbeddedKvStore::open_shared(path, "event_ingest") {
+            Ok(store) => Some(store as std::sync::Arc<dyn sbproxy_platform::storage::PersistentKv>),
+            Err(error) => {
+                // Fail-soft: the watermark is bookkeeping about delivery,
+                // not delivery. Losing it costs an operator a checkpoint,
+                // and refusing to deliver would cost them the events.
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "request_events watermark store could not be opened; delivering without a checkpoint"
+                );
+                None
+            }
+        }
+    });
+
+    let target_label = target.label();
+    match EventIngest::start(target, cfg.queue_capacity, watermark) {
+        Ok(sink) => Some(std::sync::Arc::new(sink)),
+        Err(error) => {
+            tracing::warn!(
+                sink = target_label,
+                error = %error,
+                "request event ingest sink could not start; using the logging sink"
+            );
+            None
+        }
     }
 }
 
@@ -1628,6 +1876,7 @@ fn reload_compiled_config_locked(
     // effect. Refuse it here rather than accept a config whose secret
     // backends are silently ignored.
     reconcile_process_secrets(compiled.server.secrets.as_ref())?;
+    reconcile_boot_only_blocks(&compiled.server, compiled.request_events.as_ref())?;
 
     // WOR-2481: the boot-only OTLP trace and metric exporters are never
     // rebuilt on reload (see `arm_egress_gates_from_config`'s doc
@@ -2535,6 +2784,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // calls `run`, so every later reload must present the same block;
     // `reconcile_process_secrets` rejects the ones that do not.
     record_process_secrets_fingerprint(server_config.secrets.as_ref());
+    record_boot_only_fingerprints(&server_config, compiled.request_events.as_ref());
 
     if let Some(metrics_cfg) = server_config.metrics.as_ref() {
         let _ = sbproxy_observe::metrics::init_cardinality_limiter(
@@ -3358,6 +3608,75 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
             admin_state_inner = admin_state_inner.with_prompt_persistence(p);
         }
 
+        let mut agent_registry_refresher: Option<(
+            std::sync::Arc<sbproxy_agent_registry::AgentRegistry>,
+            std::time::Duration,
+        )> = None;
+        // WOR-2664: the agent registry. Construction is fail-loud rather
+        // than fail-soft, unlike the prompt persistence above: a registry
+        // that could not open its store would answer every approval query
+        // with an empty queue, and an operator reading "no pending
+        // registrations" cannot tell that from a broken store. Prompt
+        // persistence degrades to ephemeral mutations, which is a smaller
+        // lie, so it warns and continues.
+        if let Some(registry_cfg) = server_config
+            .agent_registry
+            .as_ref()
+            .filter(|cfg| cfg.enabled)
+        {
+            registry_cfg
+                .validate()
+                .map_err(|message| anyhow::anyhow!("{message}"))?;
+            let registry = build_agent_registry(registry_cfg)?;
+            // WOR-2664 review: `agent_registry` on /readyz is WOR-1743's
+            // agent-class resolver and has nothing to do with this block, so
+            // the registry's own probe gets a distinct name rather than
+            // making one component answer for two subsystems.
+            {
+                let probe_registry = std::sync::Arc::clone(&registry);
+                admin_state_inner
+                    .health_registry
+                    .register(std::sync::Arc::new(sbproxy_observe::SyntheticProbe::new(
+                        AGENT_CATALOG_COMPONENT,
+                        move || {
+                            agent_catalog_component(
+                                probe_registry.catalog().health(chrono::Utc::now()),
+                            )
+                        },
+                    )));
+            }
+            // Only when there is something to refresh. The registry's
+            // approval queue is useful on its own and the branch's own
+            // example ships exactly that shape, so installing the loop
+            // unconditionally meant a queue-only deployment logged
+            // "refused a catalog feed" at warn and ticked
+            // `op="feed_refresh",outcome="invalid"` on boot and every
+            // interval forever. An operator alerting on refresh refusals,
+            // which the docs tell them to do, would page on a working
+            // config. This is the same condition `RegistrySummary`
+            // publishes as `feed_configured`.
+            agent_registry_refresher = agent_registry_refresher_for(registry_cfg, &registry);
+            admin_state_inner = admin_state_inner.with_agent_registry(registry);
+        }
+
+        // WOR-2669: the outbound notifier. Fail-loud for the same reason
+        // the agent registry is: a notifier that could not open its store
+        // would report an empty subscription list, and an operator reading
+        // "no subscriptions" cannot tell that from a broken store.
+        if let Some(notify_cfg) = server_config
+            .notifications
+            .as_ref()
+            .filter(|cfg| cfg.enabled)
+        {
+            let notifier = build_notifier(notify_cfg)?;
+            if !sbproxy_observe::notify::install(std::sync::Arc::clone(&notifier)) {
+                tracing::warn!(
+                    "a notifier was already installed in this process; the newly configured one will not receive events"
+                );
+            }
+            admin_state_inner = admin_state_inner.with_notifier(notifier);
+        }
+
         // WOR-27: register the synthetic-pipeline probe and spawn its
         // driver loop when the operator opted in. Registration runs
         // sync; the driver loop calls `tokio::spawn` and therefore
@@ -3537,6 +3856,22 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
             rt.block_on(async move {
                 if let Some((synth_cfg, state)) = synthetic_driver {
                     crate::synthetic::spawn_loop(synth_cfg, state);
+                }
+                // WOR-2664 review: without this the configured feed was read
+                // only when a human POSTed /admin/agent-registry/refresh, so
+                // every restart served whatever the store had cached and a
+                // republished feed never arrived. Refresh once at boot, then
+                // on the interval the operator's staleness tolerance implies.
+                if let Some((registry, interval)) = agent_registry_refresher {
+                    tokio::spawn(async move {
+                        loop {
+                            // A refusal is already counted and logged at warn
+                            // inside `refresh`, and the previous catalog keeps
+                            // serving, so the loop does not need to react.
+                            let _ = registry.refresh(chrono::Utc::now()).await;
+                            tokio::time::sleep(interval).await;
+                        }
+                    });
                 }
                 // The admin server's listener task lives forever;
                 // run it inline on this dedicated thread.
@@ -6793,6 +7128,186 @@ mod at_rest_posture_tests {
 /// in this crate. The builder is where every decision is made; the
 /// installer only hands its result to the setter.
 #[cfg(test)]
+mod boot_only_block_tests {
+    use super::*;
+
+    use sbproxy_config::types::{
+        AgentRegistryConfig, NotificationsConfig, ProxyServerConfig, RequestEventSinkKind,
+        RequestEventsConfig,
+    };
+
+    fn server(agent_registry: Option<AgentRegistryConfig>) -> ProxyServerConfig {
+        ProxyServerConfig {
+            agent_registry,
+            ..Default::default()
+        }
+    }
+
+    /// WOR-2664/2669/2674 review: all three blocks open a store or install
+    /// a process-global at boot and none has a rebuild path, so a reload
+    /// that changed one used to be accepted and then ignored. An operator
+    /// adding a rotated `bootstrap_keys` entry would see `/admin/config`
+    /// serve it back while every refresh kept answering `unknown_key`, with
+    /// nothing connecting the two.
+    #[test]
+    fn a_reload_that_changes_a_boot_only_block_is_refused_by_name() {
+        let before = server(Some(AgentRegistryConfig {
+            enabled: true,
+            store_path: "/tmp/a.redb".into(),
+            ..Default::default()
+        }));
+        let after = server(Some(AgentRegistryConfig {
+            enabled: true,
+            store_path: "/tmp/b.redb".into(),
+            ..Default::default()
+        }));
+
+        // Same shape reconciles clean whichever way round it is read.
+        let installed = boot_only_fingerprints(&before, None);
+        assert!(compare_boot_only_fingerprints(
+            &installed,
+            &boot_only_fingerprints(&server(before.agent_registry.clone()), None)
+        )
+        .is_ok());
+
+        // A changed block is refused, and the refusal names the key that
+        // moved rather than the set.
+        let refusal =
+            compare_boot_only_fingerprints(&installed, &boot_only_fingerprints(&after, None))
+                .expect_err("a changed boot-only block must be refused");
+        let refusal = refusal.to_string();
+        assert!(refusal.contains("proxy.agent_registry"), "{refusal}");
+        assert!(!refusal.contains("proxy.notifications"), "{refusal}");
+        assert!(refusal.contains("restart sbproxy"), "{refusal}");
+
+        // The other two blocks are refused the same way, so the guard is as
+        // wide as the claim in docs/configuration.md.
+        let notifications = compare_boot_only_fingerprints(
+            &boot_only_fingerprints(&ProxyServerConfig::default(), None),
+            &boot_only_fingerprints(
+                &ProxyServerConfig {
+                    notifications: Some(NotificationsConfig {
+                        enabled: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                None,
+            ),
+        )
+        .expect_err("proxy.notifications is boot-only too")
+        .to_string();
+        assert!(
+            notifications.contains("proxy.notifications"),
+            "{notifications}"
+        );
+
+        let events = compare_boot_only_fingerprints(
+            &boot_only_fingerprints(&ProxyServerConfig::default(), None),
+            &boot_only_fingerprints(
+                &ProxyServerConfig::default(),
+                Some(&RequestEventsConfig {
+                    sink: RequestEventSinkKind::Logging,
+                    ..Default::default()
+                }),
+            ),
+        )
+        .expect_err("request_events is boot-only too")
+        .to_string();
+        assert!(events.contains("request_events"), "{events}");
+    }
+
+    /// A config value must not reach `chrono::Duration::seconds`, which is
+    /// an `expect` past `i64::MAX / 1000`, and a bare `as i64` on a large
+    /// `u64` wraps negative and silently shortens the feed expiry the key
+    /// is documented to extend.
+    #[test]
+    fn an_out_of_range_duration_is_a_named_refusal_rather_than_a_panic_or_a_wrap() {
+        assert!(registry_duration("stale_grace_secs", 86_400).is_ok());
+        assert!(registry_duration("stale_grace_secs", 0).is_ok());
+
+        let refusal = registry_duration("stale_grace_secs", u64::MAX)
+            .expect_err("u64::MAX is not a duration");
+        assert!(
+            refusal.to_string().contains("stale_grace_secs"),
+            "{refusal}"
+        );
+
+        assert!(
+            registry_duration("stale_grace_secs", 10_000_000_000_000_000).is_err(),
+            "past chrono's own bound, where Duration::seconds panics"
+        );
+    }
+
+    /// The registry's approval queue is useful on its own, and
+    /// `examples/agent-registry/sb.yml` ships exactly that shape with the
+    /// catalog half commented out. Installing the refresh loop on
+    /// `enabled` alone meant that config logged "agent registry refused a
+    /// catalog feed" at warn and ticked
+    /// `op="feed_refresh",outcome="invalid"` on boot and every 300 seconds
+    /// forever, so an operator alerting on refresh refusals, which
+    /// `docs/agent-registry.md` tells them to do, paged on a working proxy.
+    #[test]
+    fn a_registry_with_no_feed_runs_no_refresh_loop() {
+        // A real registry, so this drives the decision `run` makes rather
+        // than only the predicate underneath it: `agent_registry_refresher_for`
+        // is the whole install decision, so reverting it is reverting
+        // something this test reads.
+        let path = format!(
+            "{}/sbproxy_refresher_test_{}.redb",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let queue_only = AgentRegistryConfig {
+            enabled: true,
+            store_path: path.clone().into(),
+            ..Default::default()
+        };
+        let registry = build_agent_registry(&queue_only).expect("registry opens");
+
+        assert!(
+            agent_registry_refresher_for(&queue_only, &registry).is_none(),
+            "a queue-only registry must install no refresh loop"
+        );
+
+        // Half a feed is not a feed. `validate` refuses this shape at
+        // startup, and the loop must not run for it either.
+        let half = AgentRegistryConfig {
+            feed_path: Some("/tmp/feed.json".into()),
+            ..queue_only.clone()
+        };
+        assert!(agent_registry_refresher_for(&half, &registry).is_none());
+
+        let full = AgentRegistryConfig {
+            key_directory_path: Some("/tmp/keys.json".into()),
+            ..half
+        };
+        let installed = agent_registry_refresher_for(&full, &registry)
+            .expect("a configured feed installs the loop");
+        assert_eq!(installed.1, AGENT_REGISTRY_REFRESH_DEFAULT);
+
+        drop(registry);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The refresh loop's interval is derived rather than configured, so
+    /// the derivation is what an operator plans against.
+    #[test]
+    fn the_refresh_interval_is_clamped_around_the_staleness_tolerance() {
+        let with = |stale_grace_secs| {
+            agent_registry_refresh_interval(&AgentRegistryConfig {
+                stale_grace_secs,
+                ..Default::default()
+            })
+        };
+        assert_eq!(with(0), AGENT_REGISTRY_REFRESH_DEFAULT);
+        assert_eq!(with(1), AGENT_REGISTRY_REFRESH_FLOOR);
+        assert_eq!(with(600), std::time::Duration::from_secs(600));
+        assert_eq!(with(u64::MAX), AGENT_REGISTRY_REFRESH_CEILING);
+    }
+}
+
+#[cfg(test)]
 mod request_event_sink_tests {
     use super::*;
 
@@ -6857,6 +7372,7 @@ mod request_event_sink_tests {
         let cfg = RequestEventsConfig {
             sink: RequestEventSinkKind::Logging,
             path: None,
+            ..Default::default()
         };
         let (sink, kind) = build_request_event_sink(&cfg).expect("logging sink is built");
         assert_eq!(kind, "logging");
@@ -6873,6 +7389,7 @@ mod request_event_sink_tests {
         let cfg = RequestEventsConfig {
             sink: RequestEventSinkKind::File,
             path: Some(path.display().to_string()),
+            ..Default::default()
         };
 
         let (sink, kind) = build_request_event_sink(&cfg).expect("file sink is built");
@@ -6891,11 +7408,82 @@ mod request_event_sink_tests {
         assert!(written.contains("api.example.com"), "{written:?}");
     }
 
+    /// WOR-2674: the two optional ingest sinks fall back the way the file
+    /// sink does. A deployment that asked for its events to go somewhere
+    /// and typed the block name wrong should read them locally rather than
+    /// discover the typo as silence in a warehouse.
+    #[test]
+    fn an_ingest_sink_without_its_block_falls_back_to_logging() {
+        for sink in [RequestEventSinkKind::Nats, RequestEventSinkKind::ClickHouse] {
+            let cfg = RequestEventsConfig {
+                sink,
+                ..Default::default()
+            };
+            let (_, kind) = build_request_event_sink(&cfg).expect("a fallback sink is still built");
+            assert_eq!(kind, "logging", "{sink:?}");
+        }
+    }
+
+    /// A malformed target is refused at build time rather than at the
+    /// first request. `nats://` is the shape an operator reaches for and
+    /// the shape this sink does not take.
+    #[test]
+    fn a_malformed_ingest_target_falls_back_to_logging() {
+        let cfg = RequestEventsConfig {
+            sink: RequestEventSinkKind::Nats,
+            nats: Some(sbproxy_config::types::RequestEventsNatsConfig {
+                address: "nats://broker:4222".into(),
+                subject_prefix: "sb.events".into(),
+                token: None,
+            }),
+            ..Default::default()
+        };
+        let (_, kind) = build_request_event_sink(&cfg).expect("a fallback sink is still built");
+        assert_eq!(kind, "logging");
+    }
+
+    /// A credential reference that will not resolve must not become a
+    /// verbatim token on the wire, and must not silently become an
+    /// unauthenticated connection either.
+    #[test]
+    fn an_unresolvable_broker_token_falls_back_to_logging() {
+        let cfg = RequestEventsConfig {
+            sink: RequestEventSinkKind::Nats,
+            nats: Some(sbproxy_config::types::RequestEventsNatsConfig {
+                address: "127.0.0.1:4222".into(),
+                subject_prefix: "sb.events".into(),
+                token: Some("file:/nonexistent/sbproxy-nats-token".into()),
+            }),
+            ..Default::default()
+        };
+        let (_, kind) = build_request_event_sink(&cfg).expect("a fallback sink is still built");
+        assert_eq!(kind, "logging");
+    }
+
+    /// The sink starts without dialing: a broker that is down at boot must
+    /// not stop the proxy from booting.
+    #[test]
+    fn an_ingest_sink_starts_without_reaching_the_broker() {
+        let cfg = RequestEventsConfig {
+            sink: RequestEventSinkKind::Nats,
+            nats: Some(sbproxy_config::types::RequestEventsNatsConfig {
+                // Nothing listens here. Construction still succeeds.
+                address: "127.0.0.1:1".into(),
+                subject_prefix: "sb.events".into(),
+                token: None,
+            }),
+            ..Default::default()
+        };
+        let (_, kind) = build_request_event_sink(&cfg).expect("the sink is built");
+        assert_eq!(kind, "nats");
+    }
+
     #[test]
     fn a_file_sink_without_a_path_falls_back_to_logging() {
         let cfg = RequestEventsConfig {
             sink: RequestEventSinkKind::File,
             path: None,
+            ..Default::default()
         };
         let (_, kind) = build_request_event_sink(&cfg).expect("a fallback sink is still built");
         assert_eq!(
@@ -6913,6 +7501,7 @@ mod request_event_sink_tests {
         let cfg = RequestEventsConfig {
             sink: RequestEventSinkKind::File,
             path: Some(path.display().to_string()),
+            ..Default::default()
         };
 
         let (_, kind) = build_request_event_sink(&cfg).expect("a fallback sink is still built");
@@ -7978,4 +8567,228 @@ origins:
         let logged = captured_warnings(CLEAN);
         assert!(logged.is_empty(), "got {logged}");
     }
+}
+
+/// The `/readyz` component name the agent catalog reports under.
+///
+/// Deliberately not `agent_registry`: that name is already taken by
+/// WOR-1743's agent-class resolver, which is a different subsystem, so an
+/// operator reading it would get either `not_configured` for a live
+/// registry or the health of something unrelated.
+const AGENT_CATALOG_COMPONENT: &str = "agent_catalog";
+
+/// Render the catalog's own health verdict as a `/readyz` component.
+///
+/// The three states are decided in `sbproxy-agent-registry`, next to the
+/// catalog and its tests; this is only the mapping onto the shared
+/// component vocabulary.
+fn agent_catalog_component(
+    health: sbproxy_agent_registry::CatalogHealth,
+) -> (sbproxy_observe::ComponentStatus, Option<String>) {
+    use sbproxy_agent_registry::CatalogHealth;
+    match health {
+        CatalogHealth::NoCatalog => (
+            sbproxy_observe::ComponentStatus::NotConfigured,
+            Some("no verified catalog has been applied".to_string()),
+        ),
+        CatalogHealth::Expired => (
+            sbproxy_observe::ComponentStatus::Degraded,
+            Some("the verified catalog is past its expiry".to_string()),
+        ),
+        CatalogHealth::Serving(count) => (
+            sbproxy_observe::ComponentStatus::Healthy,
+            Some(format!("{count} agents")),
+        ),
+        // `CatalogHealth` is `#[non_exhaustive]`, so a variant added later
+        // arrives here rather than as a compile error. Degraded rather than
+        // healthy: a state this build cannot name is not one it should
+        // report as fine on a readiness endpoint.
+        other => (
+            sbproxy_observe::ComponentStatus::Degraded,
+            Some(format!("unrecognized catalog state: {other:?}")),
+        ),
+    }
+}
+
+/// The refresh loop to install for this registry, or `None` when there is
+/// nothing to refresh from.
+///
+/// A function rather than an `if` at the call site, which is inside `run`
+/// and therefore unreachable from a test. The decision lives here in one
+/// piece, so reverting it is reverting something a test drives; a bare
+/// condition at the call site left the predicate covered and the decision
+/// not.
+fn agent_registry_refresher_for(
+    cfg: &sbproxy_config::AgentRegistryConfig,
+    registry: &std::sync::Arc<sbproxy_agent_registry::AgentRegistry>,
+) -> Option<(
+    std::sync::Arc<sbproxy_agent_registry::AgentRegistry>,
+    std::time::Duration,
+)> {
+    if !agent_registry_feed_configured(cfg) {
+        tracing::info!(
+            "the agent registry is enabled with no feed configured; the approval queue is \
+             live and no catalog refresh will run"
+        );
+        return None;
+    }
+    Some((
+        std::sync::Arc::clone(registry),
+        agent_registry_refresh_interval(cfg),
+    ))
+}
+
+/// Whether this registry has a catalog feed to refresh from.
+///
+/// The registry's approval queue is useful with no feed at all, and the
+/// example config ships that shape, so the refresh loop has to be
+/// conditional on this rather than on the block being enabled. Same
+/// condition `RegistrySummary::feed_configured` publishes, deliberately: an
+/// operator reading `feed_configured: false` in the summary and a refresh
+/// loop that is not running have to agree.
+fn agent_registry_feed_configured(cfg: &sbproxy_config::AgentRegistryConfig) -> bool {
+    cfg.feed_path.is_some() && cfg.key_directory_path.is_some()
+}
+
+/// Shortest and longest the catalog refresh loop may run at.
+///
+/// The floor keeps a small `stale_grace_secs` from turning into a hot loop
+/// over two files; the ceiling keeps a large one from meaning the feed is
+/// effectively never re-read.
+const AGENT_REGISTRY_REFRESH_FLOOR: std::time::Duration = std::time::Duration::from_secs(60);
+const AGENT_REGISTRY_REFRESH_CEILING: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+/// Interval used when `stale_grace_secs` is zero, which is the fail-closed
+/// default and says nothing about how often to poll.
+const AGENT_REGISTRY_REFRESH_DEFAULT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How often to re-read the configured feed.
+///
+/// Derived from `stale_grace_secs` rather than from a key of its own,
+/// because that value is already the operator's statement of how stale a
+/// catalog may be: polling at most that often is what makes the tolerance
+/// mean something. Zero means the operator wants the publisher's expiry
+/// honored exactly, which is a statement about acceptance and not about
+/// polling, so it falls back to the default rather than to no refresh.
+fn agent_registry_refresh_interval(
+    cfg: &sbproxy_config::AgentRegistryConfig,
+) -> std::time::Duration {
+    if cfg.stale_grace_secs == 0 {
+        return AGENT_REGISTRY_REFRESH_DEFAULT;
+    }
+    std::time::Duration::from_secs(cfg.stale_grace_secs)
+        .clamp(AGENT_REGISTRY_REFRESH_FLOOR, AGENT_REGISTRY_REFRESH_CEILING)
+}
+
+/// Turn one `agent_registry` duration key into a `chrono::Duration`.
+///
+/// `chrono::Duration::seconds` is `expect(try_seconds(..))` and panics past
+/// `i64::MAX / 1_000`, and a bare `as i64` on a large `u64` wraps negative,
+/// which would silently shorten a feed's expiry rather than extend it. Both
+/// are config values, so both get a named refusal instead. The workspace's
+/// unwrap ratchet cannot see the first of those, because the `expect` lives
+/// in chrono.
+fn registry_duration(field: &'static str, seconds: u64) -> anyhow::Result<chrono::Duration> {
+    i64::try_from(seconds)
+        .ok()
+        .and_then(chrono::Duration::try_seconds)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "agent_registry.{field} is {seconds}, which is not a duration sbproxy can \
+                 represent; use a value below {}",
+                i64::MAX / 1_000
+            )
+        })
+}
+
+/// Open the agent registry's embedded store and restore its cached catalog.
+///
+/// `open_shared` rather than `open`: a config reload builds a candidate
+/// generation while the live one still holds the file, and redb locks it
+/// exclusively, so an unconditional open would make every reload of a config
+/// with an agent registry fail.
+///
+/// The restore runs on a throwaway current-thread runtime because `run` has
+/// no ambient one and the store's operations now need a runtime to be in:
+/// each is a synchronous redb transaction handed to `spawn_blocking`, so
+/// there is a `JoinHandle` for a driver to poll. This is the reason it must
+/// stay a real runtime rather than becoming a bare `block_on` on a future
+/// nobody drives.
+fn build_agent_registry(
+    cfg: &sbproxy_config::AgentRegistryConfig,
+) -> anyhow::Result<std::sync::Arc<sbproxy_agent_registry::AgentRegistry>> {
+    use sbproxy_platform::storage::{EmbeddedKvStore, MemoryKv};
+
+    let store = EmbeddedKvStore::open_shared(&cfg.store_path, "agent_registry").map_err(|e| {
+        anyhow::anyhow!(
+            "agent_registry.store_path {}: {e}",
+            cfg.store_path.display()
+        )
+    })?;
+    let bootstrap = sbproxy_agent_registry::BootstrapKeys::from_pairs(
+        cfg.bootstrap_keys
+            .iter()
+            .map(|(kid, public_key)| (kid.clone(), public_key.clone())),
+    )
+    .map_err(|e| anyhow::anyhow!("agent_registry.bootstrap_keys: {e}"))?;
+
+    let options = sbproxy_agent_registry::AgentRegistryOptions {
+        feed_path: cfg.feed_path.clone(),
+        key_directory_path: cfg.key_directory_path.clone(),
+        bootstrap_keys: bootstrap,
+        stale_grace: registry_duration("stale_grace_secs", cfg.stale_grace_secs)?,
+        duplicate_window: registry_duration("duplicate_window_secs", cfg.duplicate_window_secs)?,
+        rotation_grace: registry_duration("rotation_grace_secs", cfg.rotation_grace_secs)?,
+    };
+    let registry = std::sync::Arc::new(
+        sbproxy_agent_registry::AgentRegistry::new(
+            store,
+            std::sync::Arc::new(MemoryKv::new("agent_registry")),
+            options,
+        )
+        .map_err(|e| anyhow::anyhow!("agent_registry: {e}"))?,
+    );
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .map_err(|e| anyhow::anyhow!("agent_registry boot runtime: {e}"))?;
+    let restored = runtime
+        .block_on(registry.boot())
+        .map_err(|e| anyhow::anyhow!("agent_registry could not read its store: {e}"))?;
+    tracing::info!(
+        path = %cfg.store_path.display(),
+        restored_entries = restored,
+        "agent registry opened"
+    );
+    Ok(registry)
+}
+
+/// Open the notifier's embedded store and start its delivery worker.
+///
+/// `open_shared` for the same reason the agent registry uses it: a config
+/// reload builds a candidate generation while the live one still holds the
+/// file, and redb locks it exclusively.
+fn build_notifier(
+    cfg: &sbproxy_config::NotificationsConfig,
+) -> anyhow::Result<std::sync::Arc<sbproxy_observe::notify::Notifier>> {
+    use sbproxy_platform::storage::EmbeddedKvStore;
+
+    let store = EmbeddedKvStore::open_shared(&cfg.store_path, "notifications").map_err(|e| {
+        anyhow::anyhow!("notifications.store_path {}: {e}", cfg.store_path.display())
+    })?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("notifier boot runtime: {e}"))?;
+    let notifier = runtime
+        .block_on(sbproxy_observe::notify::Notifier::start(
+            store,
+            cfg.queue_capacity,
+        ))
+        .map_err(|e| anyhow::anyhow!("notifications: {e}"))?;
+    tracing::info!(
+        path = %cfg.store_path.display(),
+        queue_capacity = cfg.queue_capacity,
+        "outbound notifier opened"
+    );
+    Ok(std::sync::Arc::new(notifier))
 }

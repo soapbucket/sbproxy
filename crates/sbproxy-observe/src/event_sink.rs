@@ -843,7 +843,7 @@ async fn deliver_batch(
 /// `sbproxy_core::server::lifecycle` is what has to write that key. It
 /// did not, for the whole life of the feature, and the answer here was
 /// `None` for every config anyone could write (WOR-2612).
-fn webhook_egress_gate() -> Option<sbproxy_security::egress::EgressAuthorizer> {
+pub(crate) fn webhook_egress_gate() -> Option<sbproxy_security::egress::EgressAuthorizer> {
     sbproxy_security::egress::configured_gate(sbproxy_security::egress::EgressPurpose::Webhook)
 }
 
@@ -988,17 +988,33 @@ pub fn wants_event(event_type: EventType) -> bool {
 /// block, and a `policy_denied` sink does not pay to serialize every
 /// completed request.
 pub fn publish_proxy_event(event_type: EventType, build: impl FnOnce() -> ProxyEvent) {
-    if !wants_event(event_type) {
-        return;
+    // Two independent consumers, and `build` runs at most once for both.
+    // The `events:` egress is one collector with no retries; the notifier
+    // (WOR-2669) is many customer-facing subscriptions with retries and a
+    // deadletter queue. A proxy with neither configured still pays only two
+    // relaxed loads and two bitmask tests here.
+    let egress_wants = wants_event(event_type);
+    let notifier_wants = crate::notify::wants(event_type.as_str());
+    match (egress_wants, notifier_wants) {
+        (false, false) => {}
+        (true, false) => {
+            // `wants_event` returning `true` already proved `EGRESS` is
+            // set, and it is a set-once `OnceLock` that never reverts to
+            // unset, so this second lookup cannot legitimately miss; the
+            // `else` exists only because the compiler cannot see that.
+            if let Some(egress) = EGRESS.get() {
+                egress.publish(build());
+            }
+        }
+        (false, true) => crate::notify::offer(build()),
+        (true, true) => {
+            let event = build();
+            if let Some(egress) = EGRESS.get() {
+                egress.publish(event.clone());
+            }
+            crate::notify::offer(event);
+        }
     }
-    // `wants_event` returning `true` already proved `EGRESS` is set,
-    // and it is a set-once `OnceLock` that never reverts to unset, so
-    // this second lookup cannot legitimately miss; the `else` exists
-    // only because the compiler cannot see that invariant.
-    let Some(egress) = EGRESS.get() else {
-        return;
-    };
-    egress.publish(build());
 }
 
 /// [`publish_proxy_event`]'s fail-closed sibling (WOR-2384): `build`
@@ -1016,7 +1032,22 @@ pub fn publish_proxy_event_checked(
     event_type: EventType,
     build: impl FnOnce() -> ProxyEvent,
 ) -> Result<(), EventPublishError> {
-    if !wants_event(event_type) {
+    let egress_wants = wants_event(event_type);
+    let notifier_wants = crate::notify::wants(event_type.as_str());
+    if !egress_wants && !notifier_wants {
+        return Err(EventPublishError::NoSinkConfigured);
+    }
+    let event = build();
+    if notifier_wants {
+        crate::notify::offer(event.clone());
+    }
+    if !egress_wants {
+        // The notifier took it, and the notifier is not what
+        // `events.fail_closed` is about: that setting names event types a
+        // caller would rather refuse a request than lose from the `events:`
+        // feed, and a customer-facing webhook subscription is not that
+        // feed. Reporting success here would tell a fail-closed caller its
+        // SIEM has a record when it does not.
         return Err(EventPublishError::NoSinkConfigured);
     }
     // See `publish_proxy_event`'s matching comment: this cannot
@@ -1024,7 +1055,7 @@ pub fn publish_proxy_event_checked(
     let Some(egress) = EGRESS.get() else {
         return Err(EventPublishError::NoSinkConfigured);
     };
-    egress.publish_checked(build())
+    egress.publish_checked(event)
 }
 
 #[cfg(test)]

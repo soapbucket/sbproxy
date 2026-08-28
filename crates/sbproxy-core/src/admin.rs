@@ -869,6 +869,15 @@ pub struct AdminState {
     pub log_events: tokio::sync::broadcast::Sender<String>,
     /// Fallible audit sink guarding compression summary-content inspection.
     compression_audit: Arc<dyn crate::admin_compression::CompressionAuditSink>,
+    /// WOR-2664: the agent registry, when the operator configured one.
+    /// `None` means `agent_registry:` is absent or disabled, and every
+    /// route under `/admin/agent-registry` answers 404 rather than
+    /// pretending an empty registry exists.
+    pub agent_registry: Option<Arc<sbproxy_agent_registry::AgentRegistry>>,
+    /// WOR-2669: the outbound notifier, when the operator configured one.
+    /// `None` means `notifications:` is absent or disabled, and every route
+    /// under `/admin/notifications` answers 404.
+    pub notifier: Option<Arc<sbproxy_observe::notify::Notifier>>,
     /// Pepper for hashing/verifying `AdminOperator.password_hash`.
     /// Defaults to [`crate::key_plane::default_admin_operator_pepper`] so
     /// operator login works with no `key_management:` block at all; the
@@ -894,6 +903,8 @@ impl AdminState {
             reload_in_progress: AtomicBool::new(false),
             health_registry: sbproxy_observe::default_registry_optional(None, None),
             prompt_persistence: None,
+            agent_registry: None,
+            notifier: None,
             session_signer: crate::admin_session::SessionSigner::random(),
             revoked_sessions: Mutex::new(std::collections::HashSet::new()),
             log_events: tokio::sync::broadcast::channel(256).0,
@@ -1048,6 +1059,31 @@ impl AdminState {
     /// via [`PromptPersistence::from_store`].
     pub fn with_prompt_persistence(mut self, persistence: Arc<PromptPersistence>) -> Self {
         self.prompt_persistence = Some(persistence);
+        self
+    }
+
+    /// Attach a configured agent registry.
+    ///
+    /// The binary opts in from `agent_registry:`; leaving it out is what
+    /// makes the routes 404 rather than answering for a registry with no
+    /// store behind it.
+    #[must_use]
+    pub fn with_agent_registry(
+        mut self,
+        registry: Arc<sbproxy_agent_registry::AgentRegistry>,
+    ) -> Self {
+        self.agent_registry = Some(registry);
+        self
+    }
+
+    /// Attach a configured outbound notifier.
+    ///
+    /// The binary opts in from `notifications:`; leaving it out is what
+    /// makes the routes 404 rather than answering for a notifier with no
+    /// store behind it.
+    #[must_use]
+    pub fn with_notifier(mut self, notifier: Arc<sbproxy_observe::notify::Notifier>) -> Self {
+        self.notifier = Some(notifier);
         self
     }
 
@@ -7009,6 +7045,128 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
         return;
     }
 
+    // WOR-2664: the agent registry is asynchronous (it reads an embedded
+    // store), so it is dispatched here rather than from the synchronous
+    // `handle_admin_request`. The CSRF and read-only-operator gates above
+    // have already run; what they do not do is refuse an unauthenticated
+    // request, because `handle_admin_request` owns that gate and this path
+    // never reaches it. So the authentication check is explicit here, and it
+    // comes first: an unauthenticated caller must not learn whether a
+    // registry is configured.
+    if path
+        .split('?')
+        .next()
+        .unwrap_or(path)
+        .starts_with(sbproxy_agent_registry::admin::ADMIN_PREFIX)
+    {
+        let Some(operator) = principal.as_ref() else {
+            let _ = write_admin_response_headed(
+                sock,
+                401,
+                "application/json",
+                br#"{"error":"unauthorized"}"#,
+                &cors,
+                challenge,
+            )
+            .await;
+            return;
+        };
+        let Some(registry) = state.agent_registry.as_ref() else {
+            let _ = write_admin_response_headed(
+                sock,
+                404,
+                "application/json",
+                br#"{"error":"agent_registry is not configured on this proxy"}"#,
+                &cors,
+                challenge,
+            )
+            .await;
+            return;
+        };
+        if let Some(response) = sbproxy_agent_registry::admin::dispatch(
+            registry.as_ref(),
+            method,
+            path,
+            body_owned.as_deref().map(str::as_bytes),
+            Some(operator.username.as_str()),
+            // WOR-2664 review: the resolved principal's tenant, so a scoped
+            // operator sees and acts only inside it. The dispatcher runs on
+            // the connection task, which is the only place the principal is
+            // available, which is why the meter and chargeback routes make
+            // this same decision here rather than deeper.
+            operator.tenant.as_deref(),
+            chrono::Utc::now(),
+        )
+        .await
+        {
+            let _ = write_admin_response_headed(
+                sock,
+                response.status,
+                response.content_type,
+                response.body.as_bytes(),
+                &cors,
+                challenge,
+            )
+            .await;
+            return;
+        }
+    }
+
+    // WOR-2669: the outbound notifier, dispatched here for the same reason
+    // the agent registry is. Same explicit authentication gate, and for the
+    // same reason: an unauthenticated caller must not learn whether a
+    // notifier is configured.
+    if path
+        .split('?')
+        .next()
+        .unwrap_or(path)
+        .starts_with(sbproxy_observe::notify::admin::ADMIN_PREFIX)
+    {
+        if principal.is_none() {
+            let _ = write_admin_response_headed(
+                sock,
+                401,
+                "application/json",
+                br#"{"error":"unauthorized"}"#,
+                &cors,
+                challenge,
+            )
+            .await;
+            return;
+        }
+        let Some(notifier) = state.notifier.as_ref() else {
+            let _ = write_admin_response_headed(
+                sock,
+                404,
+                "application/json",
+                br#"{"error":"notifications is not configured on this proxy"}"#,
+                &cors,
+                challenge,
+            )
+            .await;
+            return;
+        };
+        if let Some(response) = sbproxy_observe::notify::admin::dispatch(
+            notifier.as_ref(),
+            method,
+            path,
+            body_owned.as_deref().map(str::as_bytes),
+        )
+        .await
+        {
+            let _ = write_admin_response_headed(
+                sock,
+                response.status,
+                response.content_type,
+                response.body.as_bytes(),
+                &cors,
+                challenge,
+            )
+            .await;
+            return;
+        }
+    }
+
     // Compression session state is external and asynchronous. Dispatch it
     // here, after principal/CSRF resolution and before the generic GET path,
     // so content inspection can enforce Admin-only, opt-in, audit-first
@@ -7904,6 +8062,249 @@ mod tests {
         client.read_to_string(&mut response).await.unwrap();
         handler.await.unwrap();
         response
+    }
+
+    /// WOR-2664: the agent registry answers from its own dispatcher, which
+    /// runs before `handle_admin_request` and therefore before that
+    /// function's own authentication gate. Coverage of the dispatcher
+    /// proves nothing about the seam; these drive the real admin
+    /// connection.
+    #[tokio::test]
+    async fn the_agent_registry_route_refuses_an_unauthenticated_caller_before_saying_whether_it_exists(
+    ) {
+        // No `agent_registry:` configured. An unauthenticated caller still
+        // gets 401 rather than the 404 that would tell them the feature is
+        // off on this proxy.
+        let response = admin_connection_roundtrip(
+            std::sync::Arc::new(make_state()),
+            "10.0.0.41",
+            "GET /admin/agent-registry HTTP/1.1\r\n\r\n",
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 401"),
+            "unauthenticated callers must not learn the configuration: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_agent_registry_route_is_404_when_no_registry_is_configured() {
+        let auth = synthesize_basic("admin", "secret");
+        let response = admin_connection_roundtrip(
+            std::sync::Arc::new(make_state()),
+            "10.0.0.42",
+            &format!("GET /admin/agent-registry HTTP/1.1\r\nAuthorization: {auth}\r\n\r\n"),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+        assert!(
+            response.contains("agent_registry is not configured"),
+            "the 404 has to say why, or an operator reads it as a bad path: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_configured_agent_registry_answers_its_own_routes_and_records_the_operator() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let path = format!(
+            "{}/sbproxy_core_agent_registry_{}_{}.redb",
+            std::env::temp_dir().display(),
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let store = sbproxy_platform::storage::EmbeddedKvStore::open(&path, "agent_registry")
+            .expect("open store");
+        let registry = std::sync::Arc::new(
+            sbproxy_agent_registry::AgentRegistry::new(
+                std::sync::Arc::new(store),
+                std::sync::Arc::new(sbproxy_platform::storage::MemoryKv::new("agent_registry")),
+                sbproxy_agent_registry::AgentRegistryOptions::default(),
+            )
+            .expect("registry"),
+        );
+        let state = std::sync::Arc::new(make_state().with_agent_registry(registry));
+        let auth = synthesize_basic("admin", "secret");
+
+        let summary = admin_connection_roundtrip(
+            std::sync::Arc::clone(&state),
+            "10.0.0.43",
+            &format!("GET /admin/agent-registry HTTP/1.1\r\nAuthorization: {auth}\r\n\r\n"),
+        )
+        .await;
+        assert!(summary.starts_with("HTTP/1.1 200"), "{summary}");
+        assert!(summary.contains("\"catalog_entries\":0"), "{summary}");
+
+        // A submission over the wire, so the body plumbing is exercised too.
+        let body = serde_json::json!({
+            "agent_metadata": {
+                "vendor": "Acme",
+                "purpose": "search",
+                "contact_url": "https://acme.example.com/bots",
+                "expected_user_agents": ["AcmeBot/1.0"],
+                "requested_scopes": ["crawl:public"],
+            }
+        })
+        .to_string();
+        let created = admin_connection_roundtrip(
+            std::sync::Arc::clone(&state),
+            "10.0.0.43",
+            &format!(
+                "POST /admin/agent-registry/registrations HTTP/1.1\r\nAuthorization: {auth}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+        .await;
+        assert!(created.starts_with("HTTP/1.1 201"), "{created}");
+        let agent_id = created
+            .rsplit_once("\r\n\r\n")
+            .map(|(_, body)| body.to_string())
+            .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+            .and_then(|value| {
+                value["registration"]["agent_id"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .expect("agent id from the created registration");
+
+        let approved = admin_connection_roundtrip(
+            state,
+            "10.0.0.43",
+            &format!(
+                "POST /admin/agent-registry/registrations/{agent_id}/approve HTTP/1.1\r\nAuthorization: {auth}\r\nContent-Length: 0\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(approved.starts_with("HTTP/1.1 200"), "{approved}");
+        assert!(
+            approved.contains("\"decided_by\":\"admin\""),
+            "the authenticated operator has to reach the stored decision: {approved}"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// WOR-2664 review: the dispatcher read only the operator's username
+    /// off the resolved principal, so a `tenant: acme` operator had read
+    /// and write over every tenant's registrations. This drives the real
+    /// connection with a tenant-scoped operator and asserts the deployment
+    /// -wide catalog route refuses it, which is the same rule
+    /// `dispatch_ai_chargeback` states two thousand lines up.
+    #[tokio::test]
+    async fn a_tenant_scoped_operator_is_refused_the_deployment_wide_catalog_route() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let path = format!(
+            "{}/sbproxy_core_registry_tenant_{}_{}.redb",
+            std::env::temp_dir().display(),
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let store = sbproxy_platform::storage::EmbeddedKvStore::open(&path, "agent_registry")
+            .expect("open store");
+        let registry = std::sync::Arc::new(
+            sbproxy_agent_registry::AgentRegistry::new(
+                std::sync::Arc::new(store),
+                std::sync::Arc::new(sbproxy_platform::storage::MemoryKv::new("agent_registry")),
+                sbproxy_agent_registry::AgentRegistryOptions::default(),
+            )
+            .expect("registry"),
+        );
+
+        let config = AdminConfig {
+            username: "admin".to_string(),
+            password: "secret".to_string(),
+            operators: vec![AdminOperator {
+                username: "casey".to_string(),
+                password_hash: sbproxy_keystore::crypto::hash_secret(
+                    "hunter2",
+                    &crate::key_plane::default_admin_operator_pepper(),
+                ),
+                role: AdminRole::Admin,
+                tenant: Some("acme".to_string()),
+            }],
+            ..AdminConfig::default()
+        };
+        let state = std::sync::Arc::new(
+            AdminState::new(config).with_agent_registry(std::sync::Arc::clone(&registry)),
+        );
+        // An operator's tenant is resolved from `proxy.admin.operators` on
+        // every request, and only a session principal carries one: the
+        // top-level Basic credential is the deployment's own operator and
+        // is never narrowed.
+        let (token, _) = state
+            .session_signer
+            .mint("casey", AdminRole::Admin, 3600, unix_now());
+
+        let refused = admin_connection_roundtrip(
+            std::sync::Arc::clone(&state),
+            "10.0.0.46",
+            &format!(
+                "GET /admin/agent-registry/catalog HTTP/1.1\r\nCookie: sb_admin_session={token}\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(refused.starts_with("HTTP/1.1 403"), "{refused}");
+        assert!(refused.contains("deployment-wide"), "{refused}");
+
+        // The summary is allowed and reports the scope it covers, so the
+        // console can hide what the operator cannot reach.
+        let summary = admin_connection_roundtrip(
+            std::sync::Arc::clone(&state),
+            "10.0.0.46",
+            &format!(
+                "GET /admin/agent-registry HTTP/1.1\r\nCookie: sb_admin_session={token}\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(summary.starts_with("HTTP/1.1 200"), "{summary}");
+        assert!(summary.contains("\"scope\":\"acme\""), "{summary}");
+
+        // The deployment-wide credential is not refused.
+        let allowed = admin_connection_roundtrip(
+            state,
+            "10.0.0.46",
+            &format!(
+                "GET /admin/agent-registry/catalog HTTP/1.1\r\nAuthorization: {}\r\n\r\n",
+                synthesize_basic("admin", "secret")
+            ),
+        )
+        .await;
+        assert!(allowed.starts_with("HTTP/1.1 200"), "{allowed}");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// WOR-2669: the notifier's routes run before `handle_admin_request`
+    /// and therefore before that function's own authentication gate, so
+    /// the gate has to be here. Coverage of the notifier's dispatcher
+    /// proves nothing about that.
+    #[tokio::test]
+    async fn the_notifications_route_refuses_an_unauthenticated_caller_before_saying_whether_it_exists(
+    ) {
+        let response = admin_connection_roundtrip(
+            std::sync::Arc::new(make_state()),
+            "10.0.0.44",
+            "GET /admin/notifications HTTP/1.1\r\n\r\n",
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn the_notifications_route_is_404_when_no_notifier_is_configured() {
+        let auth = synthesize_basic("admin", "secret");
+        let response = admin_connection_roundtrip(
+            std::sync::Arc::new(make_state()),
+            "10.0.0.45",
+            &format!("GET /admin/notifications HTTP/1.1\r\nAuthorization: {auth}\r\n\r\n"),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+        assert!(
+            response.contains("notifications is not configured"),
+            "the 404 has to say why: {response}"
+        );
     }
 
     #[tokio::test]

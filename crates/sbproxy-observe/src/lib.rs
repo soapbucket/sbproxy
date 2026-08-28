@@ -25,6 +25,7 @@ pub mod decision_contract;
 /// Bridge from `sbproxy_security::egress::record_egress_refused` to the
 /// typed `EgressRefused` proxy event (WOR-2486).
 pub mod egress_bridge;
+pub mod event_ingest;
 /// Egress for the typed proxy events: the `events:` block's bounded
 /// queue, background worker, and file / webhook sinks. Delivery never
 /// runs on the publisher's thread, which is the difference between this
@@ -58,6 +59,7 @@ pub mod meter_metrics;
 pub mod metric_registry;
 /// Prometheus metrics registry, helpers, and per-origin recorders.
 pub mod metrics;
+pub mod notify;
 pub mod otel;
 /// WOR-1046 OTLP-logs sink output. Wraps `opentelemetry_otlp::LogExporter`
 /// behind the [`sink_dispatcher::SinkOutput`] trait so the dispatcher

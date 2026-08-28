@@ -69,6 +69,8 @@
         "ai_providers_file": null,
         "device_parser_file": null,
         "synthetic_probe": null,
+        "agent_registry": null,
+        "notifications": null,
         "scripting": {
           "lua": {
             "sandbox": {
@@ -821,6 +823,30 @@
           "anyOf": [
             {
               "$ref": "#/definitions/SyntheticProbeConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "agent_registry": {
+          "description": "Optional agent registry: a signed catalog of known agents plus an owner-approval queue for agents that ask to register themselves. Disabled by default. State lives in one embedded redb file named by `store_path`; nothing here needs a database or a sidecar.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AgentRegistryConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "notifications": {
+          "description": "Optional outbound webhook notifications: many subscriptions, each with its own filter and signing key, bounded retries, and a durable deadletter queue with replay. Disabled by default. State lives in one embedded redb file named by `store_path`.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/NotificationsConfig"
             },
             {
               "type": "null"
@@ -7031,6 +7057,96 @@
       },
       "additionalProperties": false
     },
+    "AgentRegistryConfig": {
+      "description": "Agent registry: the signed catalog subscriber plus the owner-approval queue for agent self-registration.\n\nBoth halves keep their state in one embedded redb file at `store_path`. The catalog is refreshed from `feed_path`, verified against `key_directory_path`, which is itself verified against `bootstrap_keys`. A registry with no feed configured still runs: the approval queue is useful on its own, and the catalog then serves whatever the store last cached.",
+      "type": "object",
+      "required": [
+        "store_path"
+      ],
+      "properties": {
+        "enabled": {
+          "description": "Master switch. Disabled by default, so a config that names the block without turning it on opens no store file.",
+          "default": false,
+          "type": "boolean"
+        },
+        "store_path": {
+          "description": "Path to the embedded store file holding the catalog cache and the registration queue. Created owner-only if absent.",
+          "type": "string"
+        },
+        "feed_path": {
+          "description": "Path to the signed catalog feed. Absent means no refresh is possible and `POST /admin/agent-registry/refresh` says so.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "key_directory_path": {
+          "description": "Path to the signed key directory that names the feed signing keys.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "bootstrap_keys": {
+          "description": "Bootstrap public keys, keyed by the key id the directory's signature names, valued as base64 of the raw 32-byte Ed25519 public key.\n\nBootstrap keys vouch for the feed publisher's key directory, which in turn vouches for the per-period keys that sign individual feeds. Only public material appears here, so this block belongs in version control with the rest of the config.\n\nAn empty map means no key directory can be trusted and therefore no feed can be applied. The registry refuses rather than falling back to a key shipped in the binary, because a build carrying a known public key is a build where whoever holds the private half signs directories.",
+          "default": {},
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "stale_grace_secs": {
+          "description": "How far past its own `expires_at` a feed may still be applied. Zero, the default, means the publisher's expiry is honored exactly.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "duplicate_window_secs": {
+          "description": "How long an identical resubmission is treated as a retry of the pending one rather than a new registration. One hour by default.",
+          "default": 3600,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "rotation_grace_secs": {
+          "description": "How long a rotated-away client secret keeps authenticating. Thirty days by default, so a fleet can pick up a new secret without a synchronized restart.",
+          "default": 2592000,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "NotificationsConfig": {
+      "description": "Outbound webhook notifications.\n\nDistinct from `events:`, which is one collector for the SIEM feed. This is the customer-facing side: several destinations, each with its own event-type filter and its own signing key, managed at runtime through the admin API rather than by editing this file.",
+      "type": "object",
+      "required": [
+        "store_path"
+      ],
+      "properties": {
+        "enabled": {
+          "description": "Master switch. Disabled by default, so a config that names the block without turning it on opens no store file.",
+          "default": false,
+          "type": "boolean"
+        },
+        "store_path": {
+          "description": "Path to the embedded store file holding the subscriptions and the deadletter queue. Created owner-only.\n\nThe file holds live HMAC signing secrets, which unlike an inbound API key cannot be stored as a one-way hash: the notifier has to re-derive a signature on every delivery. Put it on the volume you already trust with the rest of your configuration.",
+          "type": "string"
+        },
+        "queue_capacity": {
+          "description": "Bound on the hand-off queue between the request path and the delivery worker. A full queue drops the incoming event and counts the drop rather than making a request wait on a customer's endpoint.",
+          "default": 4096,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
     "ScriptingConfig": {
       "description": "Per-engine scripting sandbox limits, exposed under the `proxy.scripting:` block of sb.yml.\n\nBoth the Lua and the JavaScript sub-block are installed into their live engines at boot and refreshed on reload. CEL and WebAssembly manage their own budgets separately.",
       "type": "object",
@@ -12633,6 +12749,45 @@
             "string",
             "null"
           ]
+        },
+        "nats": {
+          "description": "Broker settings for `sink: nats`. Ignored otherwise.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RequestEventsNatsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "clickhouse": {
+          "description": "Warehouse settings for `sink: clickhouse`. Ignored otherwise.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RequestEventsClickHouseConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "watermark_store_path": {
+          "description": "Path to an embedded store holding the delivery watermark, so an operator reconciling a broker or a warehouse against the proxy has a checkpoint that survives a restart. Absent means no watermark is kept, which costs nothing and answers nothing.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "queue_capacity": {
+          "description": "Bound on the hand-off queue between the request path and the delivery worker, for the `nats` and `clickhouse` sinks. A full queue drops the incoming event and counts the drop rather than making a request wait on a broker.",
+          "default": 8192,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
         }
       },
       "additionalProperties": false
@@ -12660,8 +12815,89 @@
           "enum": [
             "file"
           ]
+        },
+        {
+          "description": "Publish one JSON message per event to a NATS subject tree. Requires `request_events.nats`.",
+          "type": "string",
+          "enum": [
+            "nats"
+          ]
+        },
+        {
+          "description": "Insert batches into a ClickHouse table over its HTTP interface. Requires `request_events.clickhouse`.",
+          "type": "string",
+          "enum": [
+            "click_house"
+          ]
         }
       ]
+    },
+    "RequestEventsNatsConfig": {
+      "description": "Broker settings for `request_events.sink: nats`.\n\nThe address is `host:port`, not a URL: the core NATS protocol this speaks is plain TCP, and a `nats://` string would suggest a URL parser that is not there.",
+      "type": "object",
+      "required": [
+        "address"
+      ],
+      "properties": {
+        "address": {
+          "description": "`host:port` of the broker.",
+          "type": "string"
+        },
+        "subject_prefix": {
+          "description": "Prefix every subject starts with. The published subject is `<prefix>.<workspace_id>.<event_type>`, with the workspace id sanitized so it cannot add a level or name a wildcard.",
+          "default": "sb.events",
+          "type": "string"
+        },
+        "token": {
+          "description": "Secret reference for the broker's authentication token, resolved through `proxy.secrets`. A literal here is refused the same way every other credential reference is.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "RequestEventsClickHouseConfig": {
+      "description": "Warehouse settings for `request_events.sink: clickhouse`.",
+      "type": "object",
+      "required": [
+        "url"
+      ],
+      "properties": {
+        "url": {
+          "description": "HTTP endpoint, for example `http://clickhouse.internal:8123`.",
+          "type": "string"
+        },
+        "database": {
+          "description": "Database name. Refused unless it matches `[A-Za-z0-9_]+`.",
+          "default": "sbproxy",
+          "type": "string"
+        },
+        "table": {
+          "description": "Table name. Refused unless it matches `[A-Za-z0-9_]+`. The proxy never applies DDL; create the table first.",
+          "default": "sbproxy_request_events",
+          "type": "string"
+        },
+        "user": {
+          "description": "Optional user.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "password": {
+          "description": "Secret reference for the password, resolved through `proxy.secrets`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
     },
     "EventsConfig": {
       "description": "Egress for the typed proxy events.\n\nDistinct from [`RequestEventsConfig`], and the difference is the stream rather than the transport. `request_events:` carries the capture envelope: one fully populated record per terminating request, for analytics and billing reconciliation. `events:` carries the lifecycle events an operator wants to react to (a policy denial, an auth failure, a config reload) and can filter down to just those, so a SIEM subscription does not cost one delivery per request served.\n\nDelivery never runs on the request path. The publish site puts the event on a bounded queue and returns; a background worker owns the file handle or the HTTP client. When the queue is full the event is dropped and counted on `sbproxy_events_dropped_total`, because the alternative is a slow SIEM adding latency to every denied request.\n\nShutdown does not flush; see `docs/events.md`.",

@@ -9001,6 +9001,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "sbproxy-agent-registry"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "argon2",
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "ed25519-dalek",
+ "hex",
+ "prometheus",
+ "rand 0.8.6",
+ "sbproxy-observe",
+ "sbproxy-platform",
+ "serde",
+ "serde_json",
+ "serde_json_canonicalizer",
+ "sha2 0.11.0",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "ulid",
+ "url",
+]
+
+[[package]]
 name = "sbproxy-ai"
 version = "0.1.0"
 dependencies = [
@@ -9327,6 +9354,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rustls",
  "sbproxy-agent-detect",
+ "sbproxy-agent-registry",
  "sbproxy-ai",
  "sbproxy-billing",
  "sbproxy-cache",
@@ -9868,6 +9896,8 @@ name = "sbproxy-observe"
 version = "1.13.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
+ "async-trait",
  "base64 0.22.1",
  "chrono",
  "ed25519-dalek",
@@ -9891,6 +9921,7 @@ dependencies = [
  "sbproxy-capability",
  "sbproxy-httpkit",
  "sbproxy-meter",
+ "sbproxy-platform",
  "sbproxy-plugin",
  "sbproxy-security",
  "sbproxy-util",
@@ -9946,6 +9977,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "sbproxy-plugin",
+ "sbproxy-util",
  "tempfile",
  "tokio",
  "tracing",

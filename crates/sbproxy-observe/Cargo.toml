@@ -57,6 +57,16 @@ chrono = { workspace = true, features = ["serde"] }
 hmac.workspace = true
 sha2.workspace = true
 hex.workspace = true
+# The notifier's delivery transport is a trait so the retry-and-deadletter
+# logic can be driven without a socket.
+async-trait.workspace = true
+# Lock-free swap of the notifier's live subscription snapshot, so the
+# publish path's filter test is one atomic load.
+arc-swap.workspace = true
+# The notifier keeps its subscriptions and its deadletter queue in the
+# shared embedded store. No cycle: sbproxy-platform depends only on
+# sbproxy-plugin and sbproxy-util, neither of which knows about this crate.
+sbproxy-platform.workspace = true
 base64.workspace = true
 # RFC 8785 (JCS) canonical form for the audit hash-chain's per-field
 # value fingerprint (WOR-2585 fix), so the HMAC is stable across

@@ -216,6 +216,69 @@ with the full lifecycle inline.
   `key_management` has no keystore backend configured at all, every
   call here returns `409`, surfaced as "Policy controls unavailable."
 
+## Agents (`/agents`)
+
+The owner-approval queue for agents that registered themselves, and the
+signed catalog of agents somebody else vouched for. A pending registration
+is a question an operator has to answer, and before this page the only way
+to see one was a curl against the admin API.
+
+- **Shows:** `GET /admin/agent-registry` for the five counts,
+  `GET /admin/agent-registry/registrations` for the queue, and
+  `GET /admin/agent-registry/catalog` for the verified catalog.
+- **Mutations:** `POST /admin/agent-registry/registrations/{agent_id}/approve`,
+  `.../reject`, `.../revoke`, and `POST /admin/agent-registry/refresh` to
+  reverify the feed on disk. The reject button stays disabled until a reason
+  is typed, because a rejection refuses that description for good.
+- **Tenancy:** the queue is scoped to the operator's own tenant when
+  `proxy.admin.operators[].tenant` names one; the catalog and the reverify
+  button are deployment-wide and the page hides both for a scoped operator,
+  matching the `403` the routes answer.
+- **Empty/error notes:** every route answers `404` when
+  `proxy.agent_registry` is absent or disabled, and the page renders that as
+  "not configured" rather than as an error. A configured registry with no
+  feed says so instead of showing an empty catalog that looks like a
+  publisher outage. Secret rotation is deliberately not on this page: it
+  authenticates with the agent's own registration access token, which an
+  operator does not hold.
+
+See [agent-registry.md](agent-registry.md) for the config block and the feed
+verification chain.
+
+## Notifications (`/notifications`)
+
+Outbound webhook subscriptions, and the deliveries that ran out of attempts.
+The deadletter queue is the reason this page exists: a delivery that used
+its whole attempt budget is the one outcome that needs a human.
+
+- **Shows:** `GET /admin/notifications` for the four counts,
+  `GET /admin/notifications/subscriptions`, and
+  `GET /admin/notifications/deadletters?limit=50`, which is paged and
+  carries no event bodies. **load more** walks the pages.
+- **Mutations:** `POST /admin/notifications/subscriptions` (create, which is
+  the only response that ever carries the signing secret; the page shows it
+  in a dismissible banner and does not store it),
+  `PATCH .../subscriptions/{id}` (pause, resume, repoint),
+  `POST .../subscriptions/{id}/rotate`, `DELETE .../subscriptions/{id}`,
+  `POST /admin/notifications/deadletters/{delivery_id}/replay`, and
+  `DELETE /admin/notifications/deadletters/{delivery_id}`. Rotate, delete,
+  and discard each ask first, matching the rest of the console: rotating
+  invalidates the receiver's secret immediately and no read path returns the
+  old one, deleting takes the filters and key with it, and discarding means
+  the receiver never gets that event.
+- **The filter box starts empty**, and the subscribe button stays disabled
+  until something is typed. A filter that reaches the per-request lifecycle
+  events shows a checkbox that has to be ticked, because those fire once per
+  proxied request and the server refuses them without it.
+- **Empty/error notes:** every route answers `404` when
+  `proxy.notifications` is absent or disabled, and the page renders that as
+  "not configured" rather than as an error. That is read off the response
+  status, not off the error text. An empty deadletter queue is the healthy
+  state, not a missing feature.
+
+See [notifications.md](notifications.md) for the delivery contract, the
+signature construction, and why the retry budget stops at three attempts.
+
 ## Credentials (`/credentials`)
 
 ![The Credentials page: provider secrets as metadata rows with lifecycle actions](assets/admin-credentials.png)

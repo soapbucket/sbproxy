@@ -820,6 +820,22 @@ fn compression_lever_endpoint_is_a_host_path(value: &str, _sibling_type: Option<
 /// filesystem cache reserve). Each of these creates and writes the path
 /// it is given.
 ///
+/// **The shared embedded store's three subsystems** (WOR-2661).
+/// `agent_registry.store_path`, `notifications.store_path` and
+/// `request_events.watermark_store_path` are redb files the process
+/// creates owner-only and writes; the notifier's holds live webhook
+/// signing secrets, so an externally authored document choosing its
+/// location chooses where those land.
+/// `agent_registry.feed_path` and `agent_registry.key_directory_path`
+/// are read rather than written, and they are the pair the whole
+/// signature chain hangs off: the directory vouches for the keys that
+/// sign the feed, so a document that names the directory names what the
+/// signatures are checked against. `store_path` is scoped per parent
+/// rather than `Anywhere` because `proxy.model_host` already uses that
+/// exact name for its revision store; `key_management`'s store is
+/// `proxy.key_management.store.path` and is covered by `Under("store")`,
+/// so it is not a second reason.
+///
 /// **Trust anchors and sockets the process opens.** `acme.ca_root` is a
 /// PEM read with `std::fs::read` at issuance, and refusing to fall back
 /// to the system roots is the point of it
@@ -1115,6 +1131,40 @@ const HOST_FILE_KEYS: &[HostFileKey] = &[
         scope: KeyScope::Under("model_host"),
         key: "store_path",
         remedy: "leave the revision store to the layer this node owns",
+        host_path_value: None,
+    },
+    // --- WOR-2661: the subsystems on the shared embedded store --------
+    HostFileKey {
+        scope: KeyScope::Under("agent_registry"),
+        key: "store_path",
+        remedy: "leave the registry's store to the layer this node owns",
+        host_path_value: None,
+    },
+    HostFileKey {
+        scope: KeyScope::Under("agent_registry"),
+        key: "feed_path",
+        remedy: "leave the catalog feed to the layer this node owns; the registry reads \
+                 it off the host filesystem and has no inline form",
+        host_path_value: None,
+    },
+    HostFileKey {
+        scope: KeyScope::Under("agent_registry"),
+        key: "key_directory_path",
+        remedy: "leave the key directory to the layer this node owns; naming it is naming \
+                 what the feed's signatures are checked against",
+        host_path_value: None,
+    },
+    HostFileKey {
+        scope: KeyScope::Under("notifications"),
+        key: "store_path",
+        remedy: "leave the notifier's store to the layer this node owns; the file holds \
+                 live webhook signing secrets",
+        host_path_value: None,
+    },
+    HostFileKey {
+        scope: KeyScope::Under("request_events"),
+        key: "watermark_store_path",
+        remedy: "leave the delivery checkpoint to the layer this node owns",
         host_path_value: None,
     },
     HostFileKey {
@@ -3136,6 +3186,26 @@ mod tests {
             "backend.path",
             "proxy:\n  cache_reserve:\n    backend:\n      type: filesystem\n      path: /etc/sbproxy/reserve\n",
         ),
+        (
+            "agent_registry.store_path",
+            "proxy:\n  agent_registry:\n    store_path: /var/lib/sbproxy/agent-registry.redb\n",
+        ),
+        (
+            "agent_registry.feed_path",
+            "proxy:\n  agent_registry:\n    feed_path: /var/lib/sbproxy/agents/feed.json\n",
+        ),
+        (
+            "agent_registry.key_directory_path",
+            "proxy:\n  agent_registry:\n    key_directory_path: /var/lib/sbproxy/agents/keys.json\n",
+        ),
+        (
+            "notifications.store_path",
+            "proxy:\n  notifications:\n    store_path: /var/lib/sbproxy/notifications.redb\n",
+        ),
+        (
+            "request_events.watermark_store_path",
+            "request_events:\n  watermark_store_path: /var/lib/sbproxy/event-ingest.redb\n",
+        ),
     ];
 
     #[test]
@@ -3162,6 +3232,17 @@ mod tests {
                         "`{name}` was refused at `{path}`, which is not the key it names",
                     );
                     assert!(!remedy.is_empty(), "`{name}` has no remedy");
+                    // A `remedy` is interpolated into the operator-facing
+                    // refusal, so a literal written across two source
+                    // lines without a `\`-continuation ships the source
+                    // indentation as a run of spaces. Three of these
+                    // entries did exactly that, and the emptiness check
+                    // above could not see it.
+                    assert!(
+                        !remedy.contains("  "),
+                        "`{name}`'s remedy carries a run of spaces where a line \
+                         continuation was meant: {remedy}",
+                    );
                 }
                 other => panic!("expected a HostFileInlining refusal for `{name}`, got {other:?}"),
             }
