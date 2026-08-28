@@ -9771,14 +9771,13 @@ mod request_filter_stack_tests {
 
     /// The measured size of `request_filter`'s state machine.
     fn request_filter_future_size() -> usize {
-        future_size(|| {
-            // Unreachable by construction: `future_size` takes the
-            // closure and drops it. These exist only so the call
-            // type-checks and names the future's type.
-            let session: &mut pingora_proxy::Session = unreachable!();
-            let ctx: &mut crate::context::RequestContext = unreachable!();
-            super::request_filter(session, ctx)
-        })
+        // Unreachable by construction: `future_size` takes the closure
+        // and drops it unpolled, so `never` is called only in the type
+        // system. One expression, so every statement stays reachable.
+        fn never<T>() -> T {
+            unreachable!("the size probe never runs its closure")
+        }
+        future_size(|| super::request_filter(never(), never()))
     }
 
     #[test]

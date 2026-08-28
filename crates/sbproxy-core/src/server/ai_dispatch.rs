@@ -24030,7 +24030,6 @@ mod external_guardrail_context_tests {
         /// What it still cannot see: the fixture provider is local
         /// plaintext, so no TLS frames sit on this stack, and the release
         /// binary's own path is not exercised here.
-        #[test]
         /// The dispatch future's own size, pinned so a regression
         /// fails here rather than in CI's request-path smoke lane.
         ///
@@ -24065,12 +24064,15 @@ mod external_guardrail_context_tests {
 
             // The closure is taken by value and dropped, never called,
             // so nothing is constructed and nothing is polled.
+            // `never` is called only in the type system: `future_size`
+            // takes the closure by value and drops it unpolled, so no
+            // argument is ever produced. Writing it as one expression
+            // keeps every statement reachable.
+            fn never<T>() -> T {
+                unreachable!("the size probe never runs its closure")
+            }
             let size = future_size(|| {
-                let session: &mut Session = unreachable!();
-                let config: &sbproxy_ai::AiHandlerConfig = unreachable!();
-                let pipeline: &crate::pipeline::CompiledPipeline = unreachable!();
-                let ctx: &mut crate::context::RequestContext = unreachable!();
-                super::super::handle_ai_proxy(session, config, pipeline, "ai.test", ctx, None)
+                super::super::handle_ai_proxy(never(), never(), never(), "ai.test", never(), None)
             });
             println!("handle_ai_proxy future: {size} bytes (budget {BUDGET})");
             assert!(
@@ -24083,6 +24085,7 @@ mod external_guardrail_context_tests {
             );
         }
 
+        #[test]
         fn a_non_streaming_dispatch_fits_a_pingora_worker_stack() {
             const PINGORA_WORKER_STACK: usize = 2 * 1024 * 1024;
 
