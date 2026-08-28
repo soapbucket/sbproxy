@@ -471,6 +471,16 @@ pub(super) fn mint_signing_key() -> (String, String) {
     (format!("k_{}", Ulid::new()), hex::encode(buffer))
 }
 
+/// Bound a caller-supplied filter and strip anything that could forge a
+/// line before it is quoted back in a refusal.
+fn sanitize_filter(filter: &str) -> String {
+    filter
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(64)
+        .collect()
+}
+
 /// Validate a destination and a filter list before anything is stored.
 ///
 /// `allow_firehose` is the switch on two refusals rather than one setting:
@@ -505,13 +515,37 @@ pub(super) fn validate_subscription(
             if !allow_firehose {
                 return Err(NotifyError::Invalid {
                     field: "event_types",
-                    detail: "\"*\" selects the per-request lifecycle events too, which is one                              webhook delivery per request; name the events you want, or set                              allow_firehose: true to say you meant it"
+                    detail: "\"*\" selects the per-request lifecycle events too, which is one \
+                             webhook delivery per request; name the events you want, or set \
+                             allow_firehose: true to say you meant it"
                         .into(),
                 });
             }
             continue;
         }
-        let candidate = filter.strip_suffix('*').unwrap_or(filter);
+        // A wildcard has to follow the vocabulary's own separator. `selects`
+        // keeps the `_` in the prefix so a family match is anchored, but
+        // accepting `key*` here stored a filter that then did an unanchored
+        // `starts_with("key")` and handed the subscriber a future
+        // `keyless_auth_denied`: verbatim the hazard the family form exists
+        // to prevent, spelled one character shorter. The refusal already
+        // advertised `key_*` as the form, so this makes the guard as wide
+        // as its own message.
+        let candidate = match filter.strip_suffix('*') {
+            Some(prefix) if prefix.ends_with('_') => prefix,
+            Some(_) => {
+                return Err(NotifyError::Invalid {
+                    field: "event_types",
+                    detail: format!(
+                        "{:?} is not a family: a wildcard has to follow the name separator, \
+                         as in key_*, or an unanchored prefix would select events the \
+                         family does not name",
+                        sanitize_filter(filter)
+                    ),
+                })
+            }
+            None => filter.as_str(),
+        };
         if candidate.is_empty()
             || !candidate
                 .bytes()
@@ -521,11 +555,7 @@ pub(super) fn validate_subscription(
                 field: "event_types",
                 detail: format!(
                     "{:?} is not an event name, a family prefix like key_*, or *",
-                    filter
-                        .chars()
-                        .filter(|c| !c.is_control())
-                        .take(64)
-                        .collect::<String>()
+                    sanitize_filter(filter)
                 ),
             });
         }
@@ -542,7 +572,9 @@ pub(super) fn validate_subscription(
             return Err(NotifyError::Invalid {
                 field: "event_types",
                 detail: format!(
-                    "{candidate:?}* selects a per-request lifecycle event, which is one                      webhook delivery per request; name the events you want, or set                      allow_firehose: true to say you meant it"
+                    "{candidate:?}* selects a per-request lifecycle event, which is one \
+                     webhook delivery per request; name the events you want, or set \
+                     allow_firehose: true to say you meant it"
                 ),
             });
         }
@@ -628,6 +660,31 @@ mod tests {
             !family.selects("keyless_auth_denied"),
             "an unanchored prefix would hand this to the key family"
         );
+
+        // And the spelling that would reintroduce it cannot be stored:
+        // `key*` passed validation and then matched unanchored, which is
+        // the same hazard one character shorter.
+        let refusal = validate_subscription("https://a.example/h", &["key*".into()], false)
+            .expect_err("a wildcard has to follow the separator");
+        assert!(refusal.to_string().contains("key_*"), "{refusal}");
+        assert!(validate_subscription("https://a.example/h", &["key_*".into()], false).is_ok());
+    }
+
+    /// The refusal text is the first thing an operator meets when the new
+    /// guard fires, and `docs/notifications.md` and the example both print
+    /// it. Line continuations in the literal, not runs of spaces.
+    #[test]
+    fn the_refusal_messages_read_as_sentences() {
+        for filters in [vec!["*".to_string()], vec!["request_*".to_string()]] {
+            let refusal = validate_subscription("https://a.example/h", &filters, false)
+                .expect_err("refused without the flag")
+                .to_string();
+            assert!(
+                !refusal.contains("  "),
+                "the message carries a run of spaces where a continuation was meant: {refusal}"
+            );
+            assert!(refusal.contains("allow_firehose"), "{refusal}");
+        }
     }
 
     #[test]

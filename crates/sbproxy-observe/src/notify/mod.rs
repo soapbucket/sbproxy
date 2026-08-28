@@ -244,6 +244,21 @@ struct DeliveryEnvelope<'a> {
     event: &'a ProxyEvent,
 }
 
+/// Whether a refused offer means the event is gone.
+///
+/// The publish path and the replay route both hand the worker a delivery
+/// and both can be refused by a full queue, but only one of them loses
+/// anything: the replay's durable record is still there and the caller was
+/// told to retry. Keeping them apart is what stops a drain script inflating
+/// a loss counter operators alert on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Loss {
+    /// A refusal here discards the only copy of the event.
+    EventLost,
+    /// A refusal here leaves the durable deadletter record in place.
+    RecordKept,
+}
+
 /// One event on its way out, carrying the id every attempt for it shares.
 #[derive(Debug, Clone)]
 struct QueuedDelivery {
@@ -376,10 +391,13 @@ impl Notifier {
     /// is counted under `outcome="dropped"` so a queue running at its bound
     /// is visible rather than silently lossy.
     pub fn offer(&self, event: ProxyEvent) {
-        let _ = self.offer_delivery(QueuedDelivery {
-            event_id: store::mint_event_id(),
-            event,
-        });
+        let _ = self.offer_delivery(
+            QueuedDelivery {
+                event_id: store::mint_event_id(),
+                event,
+            },
+            Loss::EventLost,
+        );
     }
 
     /// Offer a delivery, reporting whether it was taken.
@@ -387,19 +405,36 @@ impl Notifier {
     /// Fallible on purpose, unlike the publish path above. A replay has a
     /// durable record standing behind it, and a caller that deleted that
     /// record on the strength of an infallible offer would destroy it.
-    fn offer_delivery(&self, delivery: QueuedDelivery) -> Result<()> {
+    ///
+    /// `loss` says whether a refusal here means an event nobody will ever
+    /// receive. It does on the publish path, where the event exists only in
+    /// this call. It does not on a replay, where the durable record is kept
+    /// and the caller is told to try again: counting that under `dropped`
+    /// puts a documented "events nobody will ever receive" outcome on the
+    /// exact path `docs/notifications.md` tells operators to script, and
+    /// the same page warns that script will "get nothing but 429s".
+    fn offer_delivery(&self, delivery: QueuedDelivery, loss: Loss) -> Result<()> {
         let Some(tx) = self.tx.as_ref() else {
-            metrics::record_delivery("worker_stopped");
+            metrics::record_delivery(match loss {
+                Loss::EventLost => "worker_stopped",
+                Loss::RecordKept => "replay_refused",
+            });
             return Err(NotifyError::QueueFull);
         };
         match tx.try_send(delivery) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => {
-                metrics::record_delivery("dropped");
+                metrics::record_delivery(match loss {
+                    Loss::EventLost => "dropped",
+                    Loss::RecordKept => "replay_refused",
+                });
                 Err(NotifyError::QueueFull)
             }
             Err(TrySendError::Closed(_)) => {
-                metrics::record_delivery("worker_stopped");
+                metrics::record_delivery(match loss {
+                    Loss::EventLost => "worker_stopped",
+                    Loss::RecordKept => "replay_refused",
+                });
                 Err(NotifyError::QueueFull)
             }
         }
@@ -584,10 +619,13 @@ impl Notifier {
         let event: ProxyEvent = serde_json::from_value(record.event.clone())
             .map_err(|error| NotifyError::Backend(format!("deadletter is unreadable: {error}")))?;
         let event_id = record.event_id.clone();
-        self.offer_delivery(QueuedDelivery {
-            event_id: event_id.clone(),
-            event,
-        })?;
+        self.offer_delivery(
+            QueuedDelivery {
+                event_id: event_id.clone(),
+                event,
+            },
+            Loss::RecordKept,
+        )?;
         self.store.delete_deadletter(delivery_id).await?;
         metrics::set_deadletters(self.store.deadletter_count() as i64);
         metrics::record_admin("replay");
@@ -873,7 +911,11 @@ async fn deliver_with_retries(
                 tracing::warn!(
                     target: "notify",
                     evicted,
-                    capacity = MAX_DEADLETTERS,
+                    // The store's own cap, not the constant: the two are
+                    // the same in production and different under
+                    // `open_with_capacity`, and a log line that reports a
+                    // bound the code did not enforce is worse than none.
+                    capacity = store.deadletter_capacity(),
                     "deadletter queue is at capacity; the oldest records were dropped"
                 );
                 metrics::record_delivery_by("deadletter_evicted", evicted as u64);
@@ -1011,7 +1053,15 @@ pub(crate) mod metrics {
     //! `dropped`, `deadlettered`, `deadletter_evicted`, `deadletter_failed`,
     //! `serialize_error`, `worker_stopped`. Admin mutations, on the same
     //! family so one panel covers "what is this subsystem doing":
-    //! `create`, `update`, `rotate`, `delete`, `replay`, `discard`.
+    //! `create`, `update`, `rotate`, `delete`, `replay`, `discard`, and
+    //! `replay_refused`.
+    //!
+    //! `replay_refused` is kept apart from `dropped` deliberately. Four of
+    //! the delivery outcomes mean events nobody will ever receive, and
+    //! operators alert on them; a replay the queue refused kept its durable
+    //! record and lost nothing, so folding it into `dropped` would page
+    //! somebody for the documented behavior of the documented drain
+    //! script.
     //!
     //! Nothing is labeled by subscription id or destination: both are
     //! operator-supplied and unbounded, and a per-destination series set

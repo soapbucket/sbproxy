@@ -198,9 +198,16 @@ TTL timestamp + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192;
 ```
 
-Every optional field is serialized as `null` when it is absent, so the
-inserting user needs `input_format_null_as_default=1`, which is ClickHouse's
-default for `JSONEachRow`. If you drop a column you do not want, set
+Every optional field is **omitted** when it is absent rather than sent as
+`null`: `RequestEvent` carries `skip_serializing_if = "Option::is_none"` on
+all twenty of them, so a typical row carries about ten keys and the other
+twenty are simply not there. The setting that governs an omitted key in
+`JSONEachRow` is `input_format_defaults_for_omitted_fields`, which is
+ClickHouse's default of `1` and fills the column's `DEFAULT`. It is not
+`input_format_null_as_default`, which governs an explicit `null` and never
+fires here; an operator debugging a refused insert should check the first.
+
+If you drop a column you do not want, set
 `input_format_skip_unknown_fields=1` on the same user and know that the
 field is being discarded rather than stored.
 
@@ -274,7 +281,8 @@ Mesh Admission and Storage** dashboard.
 | `dropped` | The hand-off queue was full; the request path outran the sink. |
 | `error` | The destination did not take the batch, and it is gone. |
 | `oversize` | A message past the broker's advertised `max_payload`, skipped so its batch could land. |
-| `reconnected` | A broker redial, not counting the process's first dial. A steady rate here is a broker cycling. |
+| `connected` | The worker's first successful dial, once per process. |
+| `reconnected` | Every dial after the first. A steady rate here is a broker cycling; a redial between two batches, which is what a broker restart looks like from here, counts. |
 | `worker_stopped` | The worker thread is gone. Nothing will drain the queue. |
 
 `target` is `nats` or `clickhouse`. Nothing is labeled by workspace,

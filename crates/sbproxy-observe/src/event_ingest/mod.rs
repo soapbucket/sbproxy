@@ -76,6 +76,29 @@ const DRAIN_BATCH: usize = 256;
 /// Per-attempt network timeout, for the connect, the flush, and the POST.
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The flush timeout actually in force.
+///
+/// A cell rather than the constant so the no-resend test can wait past a
+/// lost acknowledgement in milliseconds instead of sleeping seven real
+/// seconds on every run of the lane. Production never writes it, so the
+/// load is one relaxed read per flush.
+static FLUSH_TIMEOUT_MILLIS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(5_000);
+
+/// How long to wait for the server's acknowledgement of a written batch.
+fn flush_timeout() -> Duration {
+    Duration::from_millis(FLUSH_TIMEOUT_MILLIS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Shorten the flush timeout for one test. Test-only by construction.
+#[cfg(test)]
+fn set_flush_timeout(value: Duration) {
+    FLUSH_TIMEOUT_MILLIS.store(
+        value.as_millis().min(u128::from(u64::MAX)) as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// Ceiling on the bytes read from a ClickHouse reply. Only the status
 /// decides whether the batch landed; the cap exists because something has
 /// to bound the read.
@@ -491,6 +514,10 @@ fn run_worker(
 
     let label = target.label();
     let mut nats: Option<NatsConnection> = None;
+    // Whether this worker has ever reached the broker. Lives here rather
+    // than inside `publish_to_nats` so a redial on a later batch is counted
+    // as the reconnect it is.
+    let mut nats_dialed = false;
     let http = match reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(NETWORK_TIMEOUT)
@@ -523,6 +550,7 @@ fn run_worker(
                 token,
             } => runtime.block_on(publish_to_nats(
                 &mut nats,
+                &mut nats_dialed,
                 address,
                 subject_prefix,
                 token.as_deref(),
@@ -746,8 +774,9 @@ impl NatsConnection {
         self.stream.flush().await?;
         // Past this point the server has the publishes. Anything that fails
         // now is a missing acknowledgement, and the caller must not resend.
-        self.expect_pong()
+        tokio::time::timeout(flush_timeout(), self.expect_pong())
             .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("nats acknowledgement timed out")))
             .map_err(|error| anyhow::Error::new(PublishPhase).context(error.to_string()))
     }
 }
@@ -763,6 +792,7 @@ fn nats_subject(prefix: &str, event: &RequestEvent) -> String {
 
 async fn publish_to_nats(
     connection: &mut Option<NatsConnection>,
+    dialed: &mut bool,
     address: &str,
     subject_prefix: &str,
     token: Option<&str>,
@@ -793,19 +823,23 @@ async fn publish_to_nats(
     // acknowledgement rather than a lost batch. Resending it is how 256
     // events become 512 rows in a warehouse, which is what
     // `docs/event-ingest.md` promises cannot happen.
-    let mut dialed = false;
     for attempt in 0..2 {
         if connection.is_none() {
             match NatsConnection::connect(address, token).await {
                 Ok(fresh) => {
-                    // The first dial of the process is not a reconnect. The
-                    // docs read a steady rate on this series as a broker
-                    // cycling, which every boot would otherwise start one
-                    // high.
-                    if dialed {
-                        metrics::record_ingest("nats", "reconnected");
-                    }
-                    dialed = true;
+                    // `dialed` belongs to the worker, not to this call. A
+                    // local would be false again on every batch, so a
+                    // broker that restarted between two batches (the
+                    // common case: enter with a stale connection, fail on
+                    // iteration 0, redial on iteration 1) would never be
+                    // counted, and `reconnected` would read zero for
+                    // exactly the event two documents sell it as the
+                    // signal for.
+                    metrics::record_ingest(
+                        "nats",
+                        if *dialed { "reconnected" } else { "connected" },
+                    );
+                    *dialed = true;
                     *connection = Some(fresh);
                 }
                 Err(error) => {
@@ -1003,16 +1037,19 @@ pub(crate) mod metrics {
     //! The one family the ingest sinks emit.
     //!
     //! `target` is `nats` or `clickhouse`; `outcome` is `published`,
-    //! `dropped`, `error`, `oversize`, `reconnected`, or `worker_stopped`.
-    //! Both closed sets fixed at compile time. Nothing is labeled by
-    //! workspace, subject, or table: the first is unbounded and the other
-    //! two are derived from it.
+    //! `dropped`, `error`, `oversize`, `connected`, `reconnected`, or
+    //! `worker_stopped`. Both closed sets fixed at compile time. Nothing is
+    //! labeled by workspace, subject, or table: the first is unbounded and
+    //! the other two are derived from it.
     //!
-    //! `reconnected` counts redials, not the process's first dial, so a
-    //! steady rate on it means a broker cycling and a boot does not read as
-    //! one. `oversize` counts events skipped for exceeding the broker's
-    //! advertised `max_payload`; they are not retried and not counted as
-    //! `published`.
+    //! `connected` is the worker's first successful dial, once per process.
+    //! `reconnected` is every dial after it, so a steady rate on it means a
+    //! broker cycling and a boot does not read as one. The two are separate
+    //! values rather than one counted conditionally, because a worker that
+    //! has never reached the broker and one that reconnects every minute
+    //! are different problems. `oversize` counts events skipped for
+    //! exceeding the broker's advertised `max_payload`; they are not
+    //! retried and not counted as `published`.
 
     use std::sync::LazyLock;
 
@@ -1057,6 +1094,7 @@ pub(crate) mod metrics {
 
         #[test]
         fn every_recorder_matches_the_declared_label_arity() {
+            record_ingest("nats", "connected");
             record_ingest("nats", "reconnected");
             record_ingest_by("nats", "oversize", 1);
             record_ingest_by("clickhouse", "published", 5);

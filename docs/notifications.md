@@ -90,7 +90,9 @@ The family form keeps the separator in the prefix, so `key_*` selects
 `key_minted`, `key_revoked`, `key_rotated`, and `key_blocked` and does not
 select a future `keyless_auth_denied`. A prefix that matched mid-word would
 hand a customer subscribed to the key family an event neither of you asked
-for, with no config change on either side.
+for, with no config change on either side. `key*`, without the separator,
+is refused at creation for that reason rather than stored and matched
+loosely.
 
 ### The wildcard is a firehose, and it has to be said out loud
 
@@ -305,6 +307,11 @@ that may still be flaky, while a shell loop issues admin calls in
 milliseconds. A loop that ignores the refusal will run far ahead of the
 worker and get nothing but `429`s; one that backs off drains the queue.
 
+Those refusals are counted under `outcome="replay_refused"` and not under
+`dropped`, so a drain that outruns the worker does not move a series
+operators alert on as lost events. Nothing was lost: the record is still
+there.
+
 The cost of removing the record last rather than first is that a replay
 which is taken and then fails again writes a fresh record, so draining
 against a receiver that is still down leaves the queue non-empty. That is
@@ -324,7 +331,7 @@ deadletter queue, and a replay button.
 
 | Family | Labels | Reading it |
 |---|---|---|
-| `sbproxy_notify_deliveries_total` | `outcome` | `delivered`, `retried`, `deadlettered`, `dropped`, plus `deadletter_evicted`, `deadletter_failed`, `serialize_error`, `worker_stopped`, and the admin mutations (`create`, `update`, `rotate`, `delete`, `replay`, `discard`). Alert on `deadlettered`: it is the only outcome that needs a human. The four loss outcomes, `dropped`, `deadletter_evicted`, `deadletter_failed`, and `worker_stopped`, all mean events nobody will ever receive. |
+| `sbproxy_notify_deliveries_total` | `outcome` | `delivered`, `retried`, `deadlettered`, `dropped`, plus `deadletter_evicted`, `deadletter_failed`, `serialize_error`, `worker_stopped`, and the admin mutations (`create`, `update`, `rotate`, `delete`, `replay`, `discard`, `replay_refused`). Alert on `deadlettered`: it is the only outcome that needs a human. The four loss outcomes, `dropped`, `deadletter_evicted`, `deadletter_failed`, and `worker_stopped`, all mean events nobody will ever receive. `replay_refused` is not one of them: the record was kept and the caller was told to retry, which is why it is counted apart. |
 | `sbproxy_notify_queue` | `collection` | `subscriptions` and `deadletters`. A configured notifier publishes both at zero on boot, so no data means it is not configured. |
 
 Neither family is labeled by subscription id or destination. Both are

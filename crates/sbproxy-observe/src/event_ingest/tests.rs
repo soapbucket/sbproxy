@@ -441,21 +441,100 @@ async fn a_batch_the_broker_took_is_not_resent_when_its_acknowledgement_is_lost(
         None,
     )
     .expect("sink");
+    // The flush timeout is what this test has to outwait, so shorten it
+    // rather than sleeping seven real seconds on every run of the lane.
+    set_flush_timeout(std::time::Duration::from_millis(150));
     sink.publish(event("acme"));
 
     assert!(
         eventually(|| !broker.observed().published.is_empty()).await,
         "the broker has to receive the batch once"
     );
-    // Past the 5 second flush timeout, which is when a resend would land.
-    tokio::time::sleep(std::time::Duration::from_secs(7)).await;
+    // Past the flush timeout, which is when a resend would land.
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    let published = broker.observed().published.len();
+    set_flush_timeout(NETWORK_TIMEOUT);
+    drop(sink);
     assert_eq!(
-        broker.observed().published.len(),
-        1,
+        published, 1,
         "a batch the broker already took must not be resent"
     );
+}
 
-    drop(sink);
+/// `docs/event-ingest.md` and `docs/metrics-stability.md` both sell
+/// `reconnected` as the broker-cycling signal. The version this replaces
+/// held "have we dialed" in a local of `publish_to_nats`, reset on every
+/// call, so the common case (enter with a stale connection, fail on
+/// iteration 0, redial on iteration 1) never counted and the series read
+/// zero for exactly the event it names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_redial_between_batches_counts_as_a_reconnect() {
+    let broker = FakeNats::start(false).await;
+    let mut connection: Option<NatsConnection> = None;
+    let mut dialed = false;
+
+    let connected = ingest_ops("nats", "connected");
+    let reconnected = ingest_ops("nats", "reconnected");
+
+    assert!(
+        publish_to_nats(
+            &mut connection,
+            &mut dialed,
+            &broker.address,
+            "sb.events",
+            None,
+            &[event("acme")],
+        )
+        .await
+    );
+    assert_eq!(
+        ingest_ops("nats", "connected"),
+        connected + 1,
+        "the first dial is a connect, not a reconnect"
+    );
+    assert_eq!(ingest_ops("nats", "reconnected"), reconnected);
+
+    // The broker went away between batches: the worker enters the next call
+    // holding a connection that is no longer usable.
+    drop(connection.take());
+    assert!(
+        publish_to_nats(
+            &mut connection,
+            &mut dialed,
+            &broker.address,
+            "sb.events",
+            None,
+            &[event("acme")],
+        )
+        .await
+    );
+    assert_eq!(
+        ingest_ops("nats", "reconnected"),
+        reconnected + 1,
+        "a dial on a later batch is the reconnect the docs point operators at"
+    );
+    assert_eq!(ingest_ops("nats", "connected"), connected + 1);
+}
+
+/// One `sbproxy_event_ingest_events_total` series off the default registry.
+fn ingest_ops(target: &str, outcome: &str) -> u64 {
+    for family in prometheus::gather() {
+        if family.name() != "sbproxy_event_ingest_events_total" {
+            continue;
+        }
+        for metric in family.get_metric() {
+            let labels = metric.get_label();
+            let has = |name: &str, want: &str| {
+                labels
+                    .iter()
+                    .any(|pair| pair.name() == name && pair.value() == want)
+            };
+            if has("target", target) && has("outcome", outcome) {
+                return metric.get_counter().value() as u64;
+            }
+        }
+    }
+    0
 }
 
 /// A broker that advertises `tls_required` expects a handshake next. This

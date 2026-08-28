@@ -450,10 +450,13 @@ async fn a_replay_a_full_queue_cannot_take_keeps_its_record() {
     let mut full = false;
     for _ in 0..2_000 {
         if notifier
-            .offer_delivery(QueuedDelivery {
-                event_id: store::mint_event_id(),
-                event: event(EventType::KeyMinted),
-            })
+            .offer_delivery(
+                QueuedDelivery {
+                    event_id: store::mint_event_id(),
+                    event: event(EventType::KeyMinted),
+                },
+                Loss::EventLost,
+            )
             .is_err()
         {
             full = true;
@@ -461,8 +464,11 @@ async fn a_replay_a_full_queue_cannot_take_keeps_its_record() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
+    let dropped_before = delivery_outcome("dropped");
     let refused = notifier.replay(&delivery_id).await;
     let record_survived = notifier.get_deadletter(&delivery_id).await.is_ok();
+    let dropped_after = delivery_outcome("dropped");
+    let replay_refused = delivery_outcome("replay_refused");
     // The refusal is a 429 carrying `replayed: false`, so a drain loop
     // reading the flag backs off instead of shredding the queue.
     let refusal = crate::notify::admin::dispatch(
@@ -500,6 +506,39 @@ async fn a_replay_a_full_queue_cannot_take_keeps_its_record() {
         "{}",
         refusal.body
     );
+
+    // The refusal kept the record, so it is not one of the loss outcomes
+    // the docs and the dashboard define as "events nobody will ever
+    // receive". Counting it there would page somebody for the documented
+    // behavior of the documented drain script.
+    assert_eq!(
+        dropped_after, dropped_before,
+        "a refused replay lost nothing and must not tick `dropped`"
+    );
+    assert!(
+        replay_refused > 0,
+        "and it has to be counted somewhere an operator can see"
+    );
+}
+
+/// One `sbproxy_notify_deliveries_total{outcome=..}` off the default
+/// registry. An absent series reads as zero.
+fn delivery_outcome(outcome: &str) -> u64 {
+    for family in prometheus::gather() {
+        if family.name() != "sbproxy_notify_deliveries_total" {
+            continue;
+        }
+        for metric in family.get_metric() {
+            if metric
+                .get_label()
+                .iter()
+                .any(|pair| pair.name() == "outcome" && pair.value() == outcome)
+            {
+                return metric.get_counter().value() as u64;
+            }
+        }
+    }
+    0
 }
 
 /// One customer's dead receiver used to throttle every other customer's

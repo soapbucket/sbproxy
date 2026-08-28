@@ -36,7 +36,8 @@
 # A name that matches nothing selects nothing rather than everything, so a
 # typo is a receiver that goes quiet rather than one that gets everything.
 # The family form keeps the separator, so `key_*` is the key family and
-# does not pick up a future `keyless_auth_denied`.
+# does not pick up a future `keyless_auth_denied`. `key*` is refused at
+# creation rather than stored and matched loosely.
 #
 # `*` and `request_*` reach the per-request lifecycle events, which fire
 # once per proxied request. That is one webhook delivery per request, so

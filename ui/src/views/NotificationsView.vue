@@ -54,6 +54,7 @@ function refreshAll() {
   // Back to the first page: an action that changed the queue makes a
   // cursor into the middle of the old one meaningless.
   deadletterCursor.value = null;
+  loadedPages.value = [];
   deadletters.run();
 }
 onMounted(refreshAll);
@@ -74,7 +75,15 @@ const notConfigured = computed(
 
 const stats = computed<NotifierSummary | null>(() => summary.data.value ?? null);
 const rows = computed<NotifySubscription[]>(() => subscriptions.data.value?.items ?? []);
-const dead = computed<NotifyDeadLetter[]>(() => deadletters.data.value?.items ?? []);
+/*
+ * Accumulated across pages rather than replaced. "load more" that swapped
+ * the table for the next page and offered no way back is a paginator
+ * wearing the wrong label.
+ */
+const loadedPages = ref<NotifyDeadLetter[]>([]);
+const dead = computed<NotifyDeadLetter[]>(() =>
+  loadedPages.value.length ? loadedPages.value : (deadletters.data.value?.items ?? []),
+);
 const moreDeadletters = computed<string | null>(() => deadletters.data.value?.next ?? null);
 
 function parseFilters(raw: string): string[] {
@@ -189,11 +198,15 @@ async function discard(record: NotifyDeadLetter) {
   });
 }
 
-function loadMoreDeadletters() {
+async function loadMoreDeadletters() {
   const cursor = moreDeadletters.value;
   if (!cursor) return;
+  // Keep what is on screen, then append the next page. `run()` replaces
+  // `deadletters.data`, so the accumulated list is held here.
+  const shown = dead.value;
   deadletterCursor.value = cursor;
-  deadletters.run();
+  await deadletters.run();
+  loadedPages.value = [...shown, ...(deadletters.data.value?.items ?? [])];
 }
 </script>
 
