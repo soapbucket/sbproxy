@@ -163,6 +163,9 @@ sbproxy-cache.workspace = true
 # action, so naming it here adds no new external crate.
 object_store = { workspace = true }
 sbproxy-platform.workspace = true
+# Agent identity: the signed catalog subscriber and the owner-approval
+# queue. The admin listener owns the routes; that crate owns what they mean.
+sbproxy-agent-registry.workspace = true
 sbproxy-openapi.workspace = true
 sbproxy-security.workspace = true
 # Process secret resolver, used to turn a response-cache encryption key

@@ -82,6 +82,8 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_a2a_denied_total` | Counter | `stable` | `beta` | `route`, `reason` | A2A hops denied by the a2a policy, labeled by route and reason. |
 | `sbproxy_a2a_hops_total` | Counter | `stable` | `beta` | `route`, `spec`, `decision` | A2A hops observed by the proxy, labeled by route, spec, and policy decision. |
 | `sbproxy_a2a_methods_total` | Counter | `stable` | `beta` | `route`, `method` | A2A 1.0 JSON-RPC methods observed by the proxy, labeled by route and method. |
+| `sbproxy_agent_registry_entries` | Gauge | `stable` | `beta` | `collection` | Agents the registry currently knows about, by collection: the verified catalog, or one of the registration queue's four states. |
+| `sbproxy_agent_registry_operations_total` | Counter | `stable` | `beta` | `op`, `outcome` | Agent registry and registration-queue operations by operation and outcome, including every refusal the queue's state machine and the feed verifier produce. |
 | `sbproxy_acme_renewal_duration_seconds` | Histogram | `stable` | `beta` | `result` | ACME renewal full-flow duration, by outcome. |
 | `sbproxy_acme_renewals_total` | Counter | `stable` | `beta` | `result` | ACME certificate renewal attempts, by outcome. |
 | `sbproxy_active_connections` | Gauge | `stable` | `stable` | none | Current active connections. |
@@ -244,6 +246,8 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_cors_refusals_total` | Counter | `stable` | `beta` | `reason` | Responses the CORS middleware refused to add headers to, by reason. |
 | `sbproxy_credential_resolution_duration_seconds` | Histogram | `stable` | `beta` | `cache`, `outcome` | Wall-clock latency of one bound-credential resolution, by which cache layer answered and the real outcome. |
 | `sbproxy_egress_refused_total` | Counter | `stable` | `beta` | `purpose`, `reason`, `tenant`, `origin` | Outbound dials refused by purpose-scoped egress authorization, by purpose, closed reason, tenant, and origin. |
+| `sbproxy_embedded_store_operations_total` | Counter | `stable` | `beta` | `store`, `op`, `outcome` | Embedded key-value store operations, by store, operation, and outcome (ok, error, or a bounded ephemeral store refusing a write at its cap). |
+| `sbproxy_event_ingest_events_total` | Counter | `stable` | `beta` | `target`, `outcome` | Request events handed to an optional ingest sink (NATS or ClickHouse), by target and outcome: published, dropped at a full queue, errored, or reconnected. |
 | `sbproxy_errors_total` | Counter | `stable` | `beta` | `hostname`, `error_type` | Total errors. |
 | `sbproxy_events_dropped_total` | Counter | `stable` | `beta` | `sink`, `reason` | Proxy events the events: egress did not deliver, by sink (file or webhook) and closed reason. |
 | `sbproxy_evidence_seq_tenant_cap_total` | Counter | `stable` | `beta` | none | Evidence sequence lookups for a tenant past the tracked-tenant cap, sharing the overflow counter. |
@@ -336,6 +340,8 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_model_plane_stream_cancellations_total` | Counter | `stable` | `beta` | `route_class` | Managed response streams dropped before completion by route class. |
 | `sbproxy_mtls_cert_cache_evictions_total` | Counter | `stable` | `beta` | none | Number of mTLS client cert metadata entries evicted by the LRU bound. |
 | `sbproxy_mtls_handshake_total` | Counter | `stable` | `beta` | `result` | mTLS client-certificate verification outcomes. |
+| `sbproxy_notify_deliveries_total` | Counter | `stable` | `beta` | `outcome` | Outbound webhook notification deliveries by outcome (delivered, retried, deadlettered, dropped), plus the admin mutations that manage the subscriptions. |
+| `sbproxy_notify_queue` | Gauge | `stable` | `beta` | `collection` | Notifier state by collection: configured webhook subscriptions, and deliveries sitting in the deadletter queue. |
 | `sbproxy_oauth_introspection_results_total` | Counter | `stable` | `beta` | `result` | RFC 7662 token-introspection results; `cached` is a verdict answered without reaching the authorization server and `no_token` is a request that presented none. |
 | `sbproxy_object_authz_enumeration_tracker_saturated_total` | Counter | `stable` | `beta` | none | Enumeration observations the object_authz policy could not track because the per-principal tracker was at capacity with live windows. |
 | `sbproxy_object_authz_violations_total` | Counter | `stable` | `beta` | `origin`, `kind`, `enforced` | Object/function-level authorization violations, by kind (bola, bfla, enumeration) and enforcement disposition (enforced=true refused the request; enforced=false was audited only). |

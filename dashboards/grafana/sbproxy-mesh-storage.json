@@ -973,6 +973,304 @@
         }
       ],
       "description": "Failed storage operations as a fraction of all of them. The latency histogram is observed on success and on failure alike, so the denominator contains the numerator and this really is bounded to 0 and 1. Anything sustained above one percent is worth a ticket. Anything near 1 means the store is effectively down and the mesh is running without shared state, which is the SBPROXY-STORAGE-BACKEND-ERRORS condition. Returns nothing rather than zero when there is no storage traffic to divide."
+    },
+    {
+      "id": 13,
+      "title": "Embedded Store Operations",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 37
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "min": 0,
+          "noValue": "No embedded store is configured on any scraped process. Configure agent_registry, notifications or event_ingest to populate this."
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (store, op) (rate(sbproxy_embedded_store_operations_total{outcome=\"ok\"}[5m]))",
+          "legendFormat": "{{store}} {{op}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Successful reads and writes against each embedded store, by store and operation. The agent registry, the outbound notifier and the event-ingest reconciler all share one redb-backed store type, so one panel answers the health question for every one of them. No data means no subsystem that uses an embedded store is configured on any scraped process, which is what a default deployment looks like rather than a stalled store."
+    },
+    {
+      "id": 14,
+      "title": "Embedded Store Errors and Refusals",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 37
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "min": 0,
+          "noValue": "No errors, refusals or evictions recorded."
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (store, op) (rate(sbproxy_embedded_store_operations_total{outcome=\"error\"}[5m]))",
+          "legendFormat": "error {{store}} {{op}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (store) (rate(sbproxy_embedded_store_operations_total{outcome=\"rejected\"}[5m]))",
+          "legendFormat": "refused {{store}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum by (store) (rate(sbproxy_embedded_store_operations_total{op=\"evict\"}[5m]))",
+          "legendFormat": "evicted {{store}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Two different problems on one axis, kept apart by the outcome label. An error is a fault: the redb transaction failed, or a record could not be decoded, and the subsystem above it did not get the write it asked for. A refusal is the bounded in-memory store working as designed, turning away a write because it is at its entry cap; a sustained refusal rate means a dedup window is too small for the traffic, not that the store is broken. Evictions are the TTL sweep reclaiming expired entries and are healthy at any rate."
+    },
+    {
+      "id": 15,
+      "title": "Outbound Notification Deliveries",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 45
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "min": 0,
+          "noValue": "No notifier is configured on any scraped process. Configure proxy.notifications to populate this."
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(sbproxy_notify_deliveries_total{outcome=~\"delivered|retried|deadlettered|dropped|deadletter_evicted|deadletter_failed|worker_stopped\"}[5m]))",
+          "legendFormat": "{{outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "What the outbound notifier did with each delivery. delivered is a receiver that answered 2xx. retried is an attempt that failed and will be tried again, so a low steady rate is a flaky receiver rather than a broken one. deadlettered is a delivery that used its whole attempt budget and is now waiting for a replay: alert on this, because it is the only outcome that needs a human. dropped is the hand-off queue at capacity, which means the request path outran the delivery worker and events were discarded rather than made to wait. deadletter_evicted, deadletter_failed, and worker_stopped are the other three loss outcomes: records pushed out of a full deadletter queue, a deadletter that could not be written at all, and a delivery offered after the worker was gone. Any of the four non-zero means events nobody will ever receive. replay_refused is deliberately not on this panel: a replay the queue turned away kept its durable record, so it is a drain script being asked to slow down rather than a loss."
+    },
+    {
+      "id": 16,
+      "title": "Notifier Subscriptions and Deadletter Depth",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 45
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "min": 0,
+          "noValue": "No notifier is configured on any scraped process."
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (collection) (sbproxy_notify_queue)",
+          "legendFormat": "{{collection}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "How many webhook subscriptions are configured, and how many deliveries are sitting in the deadletter queue waiting for a replay. The deadletter series is bounded: past its capacity the oldest record is dropped and the drop is counted under outcome=\"deadletter_evicted\" on the panel to the left, so a queue pinned at its ceiling is losing history rather than holding it. A configured notifier publishes both series at zero on boot, so No data means it is not configured rather than that there is nothing to send."
+    },
+    {
+      "id": 17,
+      "title": "Optional Event Ingest",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 53
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "min": 0,
+          "noValue": "No optional ingest sink is configured on any scraped process. Set request_events.sink to nats or clickhouse to populate this."
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (target, outcome) (rate(sbproxy_event_ingest_events_total[5m]))",
+          "legendFormat": "{{target}} {{outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "What the optional NATS and ClickHouse request-event sinks did with each event. published is a batch the destination confirmed: for NATS that is a PONG after the publishes, for ClickHouse a 2xx on the insert. dropped is the hand-off queue at capacity, which means the request path outran the sink and events were discarded rather than made to wait on a broker. error is a batch the destination did not take, and it is lost: this sink does not retry, because holding a request-event batch is a spool with its own operational surface. reconnected counts broker redials, and a steady rate there is a broker cycling rather than a healthy one."
     }
   ],
   "templating": {

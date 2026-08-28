@@ -1,0 +1,89 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Ship the request-event stream to a NATS subject tree.
+#
+# One fully populated record per terminating request: request id, workspace,
+# host, latency, status, and on an AI request the provider, model, token
+# counts, and cost. `request_events.sink` decides where it goes; `nats` and
+# `clickhouse` are the two destinations that put it somewhere other than
+# this machine.
+#
+# Neither runs, dials, or allocates a queue until it is configured, and
+# neither adds a dependency: the NATS core protocol is a handful of text
+# commands over TCP and ClickHouse's HTTP interface takes an INSERT as a
+# POST body. The default is still `none`.
+#
+# Setup, with a broker on the same host:
+#   docker run --rm -p 4222:4222 nats:2.10
+#   make run CONFIG=examples/event-ingest-nats/sb.yml
+#
+# Subscribe to everything the proxy publishes:
+#   nats sub 'sb.events.>'
+#
+# Make a request and watch one message arrive on
+# `sb.events.default.request_completed`:
+#   curl -s http://127.0.0.1:8080/ -H 'Host: test.sbproxy.dev'
+#
+# The subject is `<subject_prefix>.<workspace_id>.<event_type>`, and the
+# workspace id is sanitized before it gets there: anything outside
+# [A-Za-z0-9_-] collapses to `_`. A workspace named `acme.internal` publishes
+# to `sb.events.acme_internal.request_completed`, not one level deeper, so a
+# subscriber filtering `sb.events.acme.>` cannot be made to see somebody
+# else's traffic.
+#
+# Per-tenant subscriptions fall out of that:
+#   nats sub 'sb.events.default.>'
+#   nats sub 'sb.events.*.request_error'
+#
+# The watermark is the checkpoint an operator reconciles against. It is one
+# record in an embedded store, written after every batch the broker
+# confirms, and it survives a restart:
+#   ls -l /tmp/sbproxy-event-ingest.redb
+#
+# This is at-most-once delivery. A batch the broker refuses is counted under
+# sbproxy_event_ingest_events_total{outcome="error"} and is gone; a full
+# hand-off queue drops under outcome="dropped" rather than making a request
+# wait on a broker. If you need at-least-once into a warehouse, use
+# `sink: file` and ship the file with a tool built for that.
+#
+# For an authenticated broker, point `token` at a secret reference rather
+# than pasting one here; a reference that will not resolve falls back to the
+# logging sink rather than sending the reference itself as a token:
+#   token: env:SBPROXY_NATS_TOKEN
+#
+# ClickHouse instead of NATS is the same block with a different sink; see
+# docs/event-ingest.md for the table DDL, which the proxy never applies
+# itself.
+
+proxy:
+  http_bind_port: 8080
+
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    password: admin
+
+# `request_events:` is a top-level block, a sibling of `proxy:`, not a key
+# inside it.
+request_events:
+  sink: nats
+  # The bound between the request path and the delivery worker. A full
+  # queue drops rather than making a request wait on the broker.
+  queue_capacity: 8192
+  # One embedded record: the last delivered event and a running count.
+  # Replaces the Postgres reconciliation table this feature used
+  # elsewhere. Leaving it out costs nothing and answers nothing.
+  watermark_store_path: /tmp/sbproxy-event-ingest.redb
+  nats:
+    # host:port, not a URL. A `nats://` string is refused at startup.
+    address: "127.0.0.1:4222"
+    subject_prefix: sb.events
+
+origins:
+  "test.sbproxy.dev":
+    action:
+      type: static
+      status: 200
+      content_type: text/plain
+      body: |
+        ok

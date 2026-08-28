@@ -22,6 +22,18 @@ const routes = [
     meta: { title: "Keys", documentation: "key-management" },
   },
   {
+    path: "/agents",
+    name: "agents",
+    component: () => import("./views/AgentsView.vue"),
+    meta: { title: "Agents", documentation: "agent-registry" },
+  },
+  {
+    path: "/notifications",
+    name: "notifications",
+    component: () => import("./views/NotificationsView.vue"),
+    meta: { title: "Notifications", documentation: "notifications" },
+  },
+  {
     path: "/credentials",
     name: "credentials",
     component: () => import("./views/CredentialsView.vue"),

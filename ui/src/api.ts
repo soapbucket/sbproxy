@@ -2498,6 +2498,115 @@ export interface AdminUsersResponse {
   users: AdminUser[];
 }
 
+/** Where a registration sits in the owner-approval queue. */
+export type AgentRegistrationState =
+  | "pending"
+  | "approved"
+  | "rejected"
+  | "revoked";
+
+/** What a submitter said about their agent. Mirrors the server's
+ *  `AgentMetadata`; no credential material appears here, because the
+ *  server's read shape has nowhere to put any. */
+export interface AgentMetadata {
+  vendor: string;
+  purpose: string;
+  contact_url: string;
+  expected_user_agents: string[];
+  expected_reverse_dns_suffixes: string[];
+  expected_keyids: string[];
+  requested_scopes: string[];
+}
+
+/** One row of the approval queue. */
+export interface AgentRegistration {
+  agent_id: string;
+  tenant: string;
+  client_id: string;
+  metadata: AgentMetadata;
+  state: AgentRegistrationState;
+  reason: string | null;
+  decided_by: string | null;
+  created_at: string;
+  updated_at: string;
+  rotated_at: string | null;
+}
+
+/** One agent the verified catalog names. */
+export interface AgentCatalogEntry {
+  agent_id: string;
+  vendor: string;
+  purpose: string;
+  expected_user_agents: string[];
+  expected_reverse_dns_suffixes: string[];
+  expected_keyids: string[];
+  reputation_score: number;
+  flags: string[];
+}
+
+/** `GET /admin/agent-registry/catalog`. */
+export interface AgentCatalogResponse {
+  generated_at: string | null;
+  expires_at: string | null;
+  expired: boolean;
+  entries: AgentCatalogEntry[];
+}
+
+/** `GET /admin/agent-registry`. `feed_configured` and `bootstrap_keys` are
+ *  what separate "the publisher sent nothing" from "no feed is wired up". */
+export interface AgentRegistrySummary {
+  /** The tenant the queue counts cover: a tenant name, or `all`. */
+  scope: string;
+  /** Whether this operator may read the catalog and refresh the feed. */
+  catalog_writable: boolean;
+  catalog_entries: number;
+  catalog_generated_at: string | null;
+  catalog_expires_at: string | null;
+  catalog_expired: boolean;
+  pending: number;
+  approved: number;
+  rejected: number;
+  revoked: number;
+  feed_configured: boolean;
+  bootstrap_keys: number;
+}
+
+/** One webhook subscription. The signing secret is never here: the
+ *  server's read shape has nowhere to put one. */
+export interface NotifySubscription {
+  subscription_id: string;
+  url: string;
+  event_types: string[];
+  signing_key_id: string;
+  active: boolean;
+  /** Whether this subscription was allowed to name a wildcard that reaches
+   *  the per-request lifecycle events. */
+  allow_firehose: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+/** One delivery that ran out of attempts. */
+export interface NotifyDeadLetter {
+  delivery_id: string;
+  subscription_id: string;
+  event_id: string;
+  event_type: string;
+  attempts: number;
+  last_status: number | null;
+  last_reason: string;
+  moved_at: string;
+}
+
+/** `GET /admin/notifications`. */
+export interface NotifierSummary {
+  subscriptions: number;
+  active_subscriptions: number;
+  deadletters: number;
+  deadletter_capacity: number;
+  max_attempts: number;
+}
+
 /** A configured RBAC operator, as reported by `/api/operators`. Never
  *  carries a password_hash. Config-only: managed by editing
  *  `proxy.admin.operators` and reloading, not through this API. */
@@ -2996,6 +3105,90 @@ export const api = {
   // Configured RBAC operators only (excludes the top-level admin
   // credential). password_hash is never returned.
   operators: () => getJson<OperatorSummary[]>("/api/operators"),
+
+  // Agent registry (WOR-2664). Every one of these is 404 when
+  // `proxy.agent_registry` is absent or disabled, which is what the view
+  // renders as "not configured" rather than as an error.
+  agentRegistrySummary: () =>
+    getJson<AgentRegistrySummary>("/admin/agent-registry"),
+  agentRegistryCatalog: () =>
+    getJson<AgentCatalogResponse>("/admin/agent-registry/catalog"),
+  agentRegistryRefresh: () =>
+    sendJson<{ entries: number }>("POST", "/admin/agent-registry/refresh"),
+  agentRegistrations: (state?: AgentRegistrationState) =>
+    getJson<{ items: AgentRegistration[] }>(
+      state
+        ? `/admin/agent-registry/registrations?state=${encodeURIComponent(state)}`
+        : "/admin/agent-registry/registrations",
+    ),
+  // The reason is optional on approve and revoke and required on reject;
+  // the server enforces that, and the view disables the button rather than
+  // letting an operator discover it from a 400.
+  agentRegistrationDecide: (
+    agentId: string,
+    decision: "approve" | "reject" | "revoke",
+    reason?: string,
+  ) =>
+    sendJson<AgentRegistration>(
+      "POST",
+      `/admin/agent-registry/registrations/${encodeURIComponent(agentId)}/${decision}`,
+      reason ? { reason } : {},
+    ),
+
+  // Outbound webhook notifications (WOR-2669). 404 when
+  // `proxy.notifications` is absent or disabled.
+  notifySummary: () => getJson<NotifierSummary>("/admin/notifications"),
+  notifySubscriptions: () =>
+    getJson<{ items: NotifySubscription[] }>("/admin/notifications/subscriptions"),
+  // The signing secret is in this response and in no other. The view shows
+  // it once and does not store it.
+  notifyCreateSubscription: (
+    url: string,
+    eventTypes: string[],
+    allowFirehose = false,
+  ) =>
+    sendJson<{ subscription: NotifySubscription; signing_secret: string }>(
+      "POST",
+      "/admin/notifications/subscriptions",
+      { url, event_types: eventTypes, allow_firehose: allowFirehose },
+    ),
+  notifySetActive: (subscriptionId: string, active: boolean) =>
+    sendJson<NotifySubscription>(
+      "PATCH",
+      `/admin/notifications/subscriptions/${encodeURIComponent(subscriptionId)}`,
+      { active },
+    ),
+  notifyRotate: (subscriptionId: string) =>
+    sendJson<{ subscription: NotifySubscription; signing_secret: string }>(
+      "POST",
+      `/admin/notifications/subscriptions/${encodeURIComponent(subscriptionId)}/rotate`,
+    ),
+  notifyDeleteSubscription: (subscriptionId: string) =>
+    sendJson<{ deleted: boolean }>(
+      "DELETE",
+      `/admin/notifications/subscriptions/${encodeURIComponent(subscriptionId)}`,
+    ),
+  // Paged, oldest first. The records carry no event body: the queue holds
+  // up to 10,000 of them and this is re-fetched after every action.
+  notifyDeadletters: (after?: string, limit = 50) => {
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (after) params.set("after", after);
+    return getJson<{ items: NotifyDeadLetter[]; next: string | null }>(
+      `/admin/notifications/deadletters?${params.toString()}`,
+    );
+  },
+  notifyReplay: (deliveryId: string) =>
+    sendJson<{ event_id: string; replayed: boolean }>(
+      "POST",
+      `/admin/notifications/deadletters/${encodeURIComponent(deliveryId)}/replay`,
+    ),
+  // How a record whose stored event no longer deserializes leaves the
+  // queue: a replay of one refuses before it would have been removed.
+  notifyDiscardDeadletter: (deliveryId: string) =>
+    sendJson<{ deleted: boolean }>(
+      "DELETE",
+      `/admin/notifications/deadletters/${encodeURIComponent(deliveryId)}`,
+    ),
 
   // Attested metering (WOR-2131). All three are tenant-scoped server-side
   // from the authenticated operator; passing `tenant` narrows further and
