@@ -144,22 +144,6 @@ impl ResolvedTrustChain {
         self.statements.last()
     }
 
-    /// Convenience iterator over the metadata-policy claims along
-    /// the chain, in anchor-to-leaf order the policy applicator
-    /// consumes to compose the seven operators.
-    ///
-    /// This includes the leaf's **own** `metadata_policy`. A caller
-    /// deciding whether the leaf satisfies what its superiors demanded
-    /// wants [`Self::metadata_policies_from_superiors`] instead; see
-    /// there for why the difference is a security property and not a
-    /// preference.
-    pub fn metadata_policies(&self) -> impl Iterator<Item = &crate::MetadataPolicy> {
-        self.statements
-            .iter()
-            .rev()
-            .filter_map(|s| s.claims.metadata_policy.as_ref())
-    }
-
     /// The metadata policies the leaf's **superiors** imposed, in
     /// anchor-to-leaf order, excluding the leaf's own.
     ///
@@ -177,6 +161,11 @@ impl ResolvedTrustChain {
     /// `statements[0]` is the leaf by construction (the chain is
     /// leaf-to-anchor), so the exclusion is a `skip(1)` before the
     /// reverse.
+    ///
+    /// There is deliberately no sibling that includes the leaf. One
+    /// existed, every caller wanted this one, and the difference is a
+    /// security property rather than a preference, so leaving both on
+    /// the type invited picking the wrong one.
     pub fn metadata_policies_from_superiors(&self) -> impl Iterator<Item = &crate::MetadataPolicy> {
         self.statements
             .iter()

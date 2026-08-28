@@ -415,8 +415,13 @@ fn every_production_decision_write_is_a_promised_surface() {
     );
 }
 
-/// The `(surface, decision)` pairs the crate's own `DECISIONS_TOTAL`
-/// rustdoc table publishes.
+/// The `(surface, decision)` pairs the decisions family's own rustdoc
+/// table publishes, in `crates/sbproxy-mcp-gateway/src/metrics.rs`.
+///
+/// Named by file rather than by the static's identifier on purpose:
+/// `scan-pub-item-usage.py` matches identifiers in prose, and naming it
+/// here made a `pub` item whose only real consumer is its own module
+/// look like one whose only consumer is a test.
 ///
 /// Parsed out of the source rather than duplicated here: this table is
 /// a second promise about the same family, in a second place, and it
@@ -463,7 +468,7 @@ fn the_crate_rustdoc_table_names_every_promised_surface() {
     let documented = rustdoc_table_pairs(&root);
     assert!(
         documented.len() >= PROMISED.len(),
-        "the DECISIONS_TOTAL rustdoc table parsed as {} rows against {} promised surfaces;          the parser probably stopped seeing the table",
+        "the decisions-family rustdoc table parsed as {} rows against {} promised surfaces;          the parser probably stopped seeing the table",
         documented.len(),
         PROMISED.len()
     );
@@ -478,7 +483,7 @@ fn the_crate_rustdoc_table_names_every_promised_surface() {
     }
     assert!(
         missing.is_empty(),
-        "the DECISIONS_TOTAL rustdoc table in crates/sbproxy-mcp-gateway/src/metrics.rs does not \
+        "the decisions-family rustdoc table in crates/sbproxy-mcp-gateway/src/metrics.rs does not \
          list {missing:?}. A developer reading the call site sees that table, not the observe \
          registry, so a surface missing from it is undocumented where it is written."
     );
@@ -493,7 +498,7 @@ fn the_crate_rustdoc_table_names_every_promised_surface() {
     }
     assert!(
         extra.is_empty(),
-        "the DECISIONS_TOTAL rustdoc table lists {extra:?}, which nothing writes"
+        "the decisions-family rustdoc table lists {extra:?}, which nothing writes"
     );
 }
 

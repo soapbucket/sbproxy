@@ -307,7 +307,23 @@ impl FederationPeerVerifier {
             // the transport failure, all of which are answers to a
             // probe the caller chose the question for. The crate
             // already logged the detail on its own decision event.
-            Err(_) => return PeerVerdict::Refused("chain_unresolved"),
+            //
+            // What is safe to say, and worth saying, is what the walk
+            // spent: an operator watching refusals needs to tell a peer
+            // that is simply unreachable from one that is exhausting
+            // the budget, because the second is someone probing.
+            Err(_) => {
+                tracing::warn!(
+                    target: "sbproxy_federation::decision",
+                    event = "federation_peer_decision_detail",
+                    outcome = "refused",
+                    reason = "chain_unresolved",
+                    fetches_spent = budget.fetches_spent(),
+                    bytes_spent = budget.bytes_spent(),
+                    "peer chain did not resolve"
+                );
+                return PeerVerdict::Refused("chain_unresolved");
+            }
         };
         let Some(leaf) = chain.leaf() else {
             return PeerVerdict::Refused("chain_unresolved");

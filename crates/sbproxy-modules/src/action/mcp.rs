@@ -4565,6 +4565,25 @@ impl McpAction {
                     }
                     None => provider,
                 };
+                // Say at boot which mode the verifier is in. The
+                // colocated binding is a string equality between two
+                // operator-supplied values and its failure is silent
+                // and total: the verifier falls back to fetching this
+                // proxy's own JWKS URL, which inside a pod resolves to
+                // an address the OAuth egress policy refuses, and every
+                // MCP request 401s. An operator who sees `fetch` here
+                // when they configured the colocated shape has their
+                // answer before the first request.
+                tracing::info!(
+                    target: "mcp_gateway::decision",
+                    event = "mcp_resource_server_jwks_source",
+                    source = if provider.uses_local_jwks() {
+                        "in_process"
+                    } else {
+                        "fetch"
+                    },
+                    "MCP resource server key source resolved"
+                );
                 Ok(Arc::new(provider))
             })
             .transpose()?;
@@ -10710,6 +10729,53 @@ allow := false if {
             assert_ne!(
                 derived, "https://idp.example.com/mcp/oauth/.well-known/jwks.json",
                 "a jwks_url on another host must not satisfy the colocated binding"
+            );
+        }
+
+        /// The provider built from the shipped example's shape takes
+        /// its key set in process and makes no outbound client.
+        ///
+        /// The two tests above compare strings. This one asserts the
+        /// consequence: `uses_local_jwks` is what the request path
+        /// reads, and a binding that silently stopped matching leaves
+        /// it false while every other assertion still passes.
+        #[test]
+        fn the_colocated_shape_yields_a_provider_that_verifies_in_process() {
+            let jwks_url = "https://mcp.example.com/mcp/oauth/.well-known/jwks.json";
+            let cfg: sbproxy_mcp_gateway::McpResourceServerConfig =
+                serde_json::from_value(serde_json::json!({
+                    "resource_uri": "https://mcp.example.com/",
+                    "authorization_servers": ["https://mcp.example.com/mcp/oauth"],
+                    "jwks_url": jwks_url,
+                    "audience": "https://mcp.example.com/",
+                    "issuer": "https://mcp.example.com/mcp/oauth",
+                    "scopes_supported": ["mcp.read", "mcp.call"],
+                }))
+                .expect("the example's resource_server block deserializes");
+            let provider = sbproxy_mcp_gateway::McpResourceServerProvider::new(cfg)
+                .expect("the example's resource_server block is valid");
+            assert!(
+                !provider.uses_local_jwks(),
+                "a provider with no key set handed to it must fall back to the fetch"
+            );
+
+            let key_set: jsonwebtoken::jwk::JwkSet = serde_json::from_value(serde_json::json!({
+                "keys": [{
+                    "kty": "EC", "crv": "P-256", "kid": "broker-2026-08",
+                    "alg": "ES256", "use": "sig",
+                    "x": "DpZdjog3y9hgIyKgEPltBi5ptXKUeuRwVOAPSmoQAu4",
+                    "y": "bfVVYV9slbMcg4dvtvYbeekYtpFXsYCWcIa9RCrBmTc"
+                }]
+            }))
+            .expect("fixture JWK set");
+            let bound = provider
+                .with_local_jwks(key_set)
+                .expect("a non-empty key set binds");
+            assert!(
+                bound.uses_local_jwks(),
+                "the colocated binding must leave the verifier reading the in-process key set; \
+                 inside a pod the proxy's own jwks_url resolves to an address the OAuth egress \
+                 policy refuses, so a fetch here 401s every MCP request"
             );
         }
     }
