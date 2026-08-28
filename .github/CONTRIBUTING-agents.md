@@ -156,6 +156,21 @@ keep the stack guard tests green under the dev profile; a merge from main can le
 examples catalog or a nested lockfile stale even when nothing conflicted, which is what
 `scripts/post-merge-rederive.sh` is for.
 
+### When the test run wedges on macOS with no output
+
+Not a bug in the tests. On macOS the first exec of a freshly linked binary blocks inside
+`posix_spawn` while `syspolicyd` assesses its provenance, and the verdict is then cached by
+cdhash, so the second exec is instant. `cargo nextest run` execs all 190 test binaries while
+building its test list, so a wedged daemon turns that into tens of minutes of silence at low
+CPU. The same thing stalled two `sbproxy-classifier` tests for over thirty minutes, which is
+why they now pay that cost once, up front, on a bounded thread that fails with this diagnosis
+instead of hanging.
+
+Confirm it with `ps aux | grep -iE 'syspolicyd|XprotectService'` (sustained CPU) and `sample
+<pid>` on a stuck child, which sits at `_dyld_start +0` before any of its own code runs. Clear
+it with `sudo spctl --global-disable` (no reboot; re-enable with `--global-enable`) or by
+rebooting. It comes back after a restart, so expect to do this again.
+
 ## Ratchets only fall
 
 The seven `scripts/*-baseline.count` files may only go down. Use the workspace's

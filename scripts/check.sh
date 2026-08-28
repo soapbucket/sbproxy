@@ -126,17 +126,30 @@ fi
 
 # Default: every phase runs. Scoping can only ever turn entries off, and
 # only after gate-scope.py has said so.
-declare -A GATE_PHASE=()
+#
+# A space-delimited list of the phases turned OFF rather than an
+# associative array of every phase: `declare -A` is bash 4, macOS ships
+# /bin/bash 3.2, and this file is run as `bash scripts/check.sh` by
+# whatever bash is first on PATH. Recording only the off set also keeps
+# the safe default structural rather than conditional: a name that is not
+# in the list runs, and the empty list runs everything.
+GATE_PHASES_OFF=''
 SCOPE_REASON=''
 if [ "$SCOPE_TO_DIFF" = "1" ]; then
   SCOPE_OUTPUT="$(python3 "$ROOT/scripts/gate-scope.py" --base "$SCOPE_BASE" || true)"
   if printf '%s' "$SCOPE_OUTPUT" | grep -q '^GATE_PHASE_'; then
     while IFS='=' read -r key value; do
       case "$key" in
-        GATE_PHASE_*) GATE_PHASE["${key#GATE_PHASE_}"]="$value" ;;
+        GATE_PHASE_*)
+          if [ "$value" = "0" ]; then
+            GATE_PHASES_OFF="$GATE_PHASES_OFF ${key#GATE_PHASE_}"
+          fi
+          ;;
         GATE_SCOPE_REASON) SCOPE_REASON="$value" ;;
       esac
-    done <<<"$SCOPE_OUTPUT"
+    done <<EOF
+$SCOPE_OUTPUT
+EOF
   else
     # The classifier could not speak. That is not permission to skip.
     printf '\n\033[1;33mgate-scope.py produced no decision; running every phase.\033[0m\n'
@@ -149,8 +162,10 @@ fi
 # two files drifted.
 phase_wanted() {
   [ "$SCOPE_TO_DIFF" = "1" ] || return 0
-  [ -n "${GATE_PHASE[$1]+set}" ] || return 0
-  [ "${GATE_PHASE[$1]}" = "1" ]
+  case " $GATE_PHASES_OFF " in
+    *" $1 "*) return 1 ;;
+  esac
+  return 0
 }
 
 # Per-phase wall-clock. Each `step` call closes out the previous phase
