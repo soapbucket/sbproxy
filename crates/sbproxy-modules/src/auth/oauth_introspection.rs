@@ -250,12 +250,48 @@ impl OauthIntrospectionProvider {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| anyhow::anyhow!("oauth_introspection client build failed: {e}"))?;
+        // WOR-1784: resolve a provider-URI secret reference before the
+        // secret is used, so `env:`, `file:`, and `vault://` reach the
+        // authorization server as the credential they name rather than
+        // verbatim. `${VAR}` works without this because the config
+        // layer rewrites the raw YAML, which is exactly why the other
+        // three forms are easy to miss: `sbproxy validate` passes them,
+        // the proxy boots, and every introspection call then sends the
+        // reference as the password and gets a 401 the operator reads
+        // as an outage.
+        let client_secret = match raw.client_secret {
+            Some(reference) => {
+                // WOR-2673 review F1, same shape one crate over: the
+                // config layer leaves an unset `${VAR}` as its own
+                // literal text, and without this the literal became the
+                // password. `sbproxy validate` passes it, the proxy
+                // boots, and the authorization server answers 401 on
+                // every request.
+                if let Some(name) = sbproxy_vault::unexpanded_env_placeholder(&reference) {
+                    anyhow::bail!(
+                        "oauth_introspection client_secret still reads '${{{name}}}': the \
+                         environment variable is not set, so the placeholder itself would have \
+                         been sent as the client secret"
+                    );
+                }
+                match sbproxy_vault::process_resolver() {
+                    Some(resolver) => resolver.resolve(&reference).map_err(|e| {
+                        // The error names the backend and the key, never
+                        // the value; the reference itself is operator
+                        // config and is safe in the message.
+                        anyhow::anyhow!("oauth_introspection: resolving client_secret: {e}")
+                    })?,
+                    None => reference,
+                }
+            }
+            None => String::new(),
+        };
         let capacity = NonZeroUsize::new(MAX_CACHED_VERDICTS)
             .ok_or_else(|| anyhow::anyhow!("verdict cache capacity must be non-zero"))?;
         Ok(Self {
             introspection_url: raw.introspection_url,
             client_id: raw.client_id,
-            client_secret: raw.client_secret.unwrap_or_default(),
+            client_secret,
             token_type_hint: raw.token_type_hint,
             cache_ttl: Duration::from_secs(raw.cache_ttl),
             required_scopes: raw.required_scopes,
@@ -282,14 +318,20 @@ impl OauthIntrospectionProvider {
     ///
     /// Records the outcome on
     /// `sbproxy_oauth_introspection_results_total` before returning, so
-    /// the metric cannot disagree with what the request did. A cache
-    /// hit is recorded as `cached` rather than as the verdict it
-    /// replays, so the two questions ("what did the server say" and
-    /// "how often did we have to ask") stay separable.
+    /// the metric cannot disagree with what the request did. Two label
+    /// values are not verdicts: a cache hit records `cached` rather
+    /// than the verdict it replays, and a request carrying no bearer
+    /// token at all records `no_token`, because nothing was asked. That
+    /// keeps "what did the server say" and "how often did we have to
+    /// ask" separable.
     pub async fn authenticate(&self, headers: &http::HeaderMap) -> IntrospectionOutcome {
         let Some(token) = Self::extract_token(headers) else {
-            // No token is not an introspection result: nothing was
-            // asked. The caller maps this to a 401 challenge.
+            // Nothing was presented, so nothing was asked of the
+            // authorization server. Still recorded: the rustdoc above
+            // promises every call records, and a provider seeing only
+            // credential-less requests is a real thing an operator
+            // wants to see rather than an absence on every series.
+            sbproxy_observe::metrics::record_oauth_introspection_result("no_token");
             return IntrospectionOutcome::Inactive;
         };
         let key = token_hash(token);
@@ -515,6 +557,73 @@ mod tests {
             http::HeaderValue::from_str(value).expect("header value"),
         );
         headers
+    }
+
+    /// WOR-2667 review M1. `${VAR}` works by accident because the
+    /// config layer rewrites the raw YAML; `env:`, `file:`, and every
+    /// provider URI reach the provider verbatim unless it resolves
+    /// them. Before the fix, `vault://...` was sent to the
+    /// authorization server as the password, which answers 401, which
+    /// the provider reports as an outage.
+    #[test]
+    fn a_provider_uri_client_secret_is_resolved_not_sent_verbatim() {
+        sbproxy_vault::reset_process_resolver_for_test();
+        let vault = sbproxy_vault::LocalVault::new();
+        vault
+            .set_secret("introspection", "resolved-client-secret")
+            .expect("fixture secret");
+        let mut manager = sbproxy_vault::VaultManager::new();
+        manager.register("fixture", Box::new(vault));
+        sbproxy_vault::install_process_resolver(std::sync::Arc::new(
+            sbproxy_vault::SecretResolver::new().with_manager(std::sync::Arc::new(manager)),
+        ));
+
+        let provider = OauthIntrospectionProvider::from_config(serde_json::json!({
+            "type": "oauth_introspection",
+            "introspection_url": "https://idp.internal/introspect",
+            "client_id": "sbproxy",
+            "client_secret": "secret://fixture/introspection",
+        }))
+        .expect("provider compiles");
+        assert_eq!(provider.client_secret, "resolved-client-secret");
+        sbproxy_vault::reset_process_resolver_for_test();
+    }
+
+    /// An unresolvable reference refuses at config compile rather than
+    /// becoming the credential. The failure an operator sees is the
+    /// config error, not a 503 on every request.
+    #[test]
+    fn an_unresolvable_client_secret_reference_refuses_to_compile() {
+        sbproxy_vault::reset_process_resolver_for_test();
+        let manager = sbproxy_vault::VaultManager::new();
+        sbproxy_vault::install_process_resolver(std::sync::Arc::new(
+            sbproxy_vault::SecretResolver::new().with_manager(std::sync::Arc::new(manager)),
+        ));
+
+        let error = OauthIntrospectionProvider::from_config(serde_json::json!({
+            "type": "oauth_introspection",
+            "introspection_url": "https://idp.internal/introspect",
+            "client_id": "sbproxy",
+            "client_secret": "secret://missing-backend/key",
+        }))
+        .expect_err("an unresolvable reference must not become the credential");
+        assert!(error.to_string().contains("client_secret"), "{error:#}");
+        sbproxy_vault::reset_process_resolver_for_test();
+    }
+
+    /// WOR-2673 review F1, checked across every secret field the ports
+    /// added. An unset variable must not become the credential.
+    #[test]
+    fn an_unexpanded_placeholder_client_secret_refuses_to_compile() {
+        let error = OauthIntrospectionProvider::from_config(serde_json::json!({
+            "type": "oauth_introspection",
+            "introspection_url": "https://idp.internal/introspect",
+            "client_id": "sbproxy",
+            "client_secret": "${SB_INTROSPECTION_SECRET}",
+        }))
+        .expect_err("an unset variable must not become the client secret");
+        let message = format!("{error:#}");
+        assert!(message.contains("SB_INTROSPECTION_SECRET"), "{message}");
     }
 
     #[test]
