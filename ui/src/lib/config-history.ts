@@ -66,7 +66,7 @@ export function isConfigHistoryDisabled(error: ApiError | null): boolean {
  * does not name the target. This is the same rule on the client side, so
  * the button can be disabled and explained rather than the operator
  * finding out from a 409. The server refusal is the enforcer; this is
- * the affordance.
+ * the affordance, and where the two disagree the enforcer wins.
  *
  * **Nothing calls this yet.** The Roll back button belongs to the admin
  * console work that owns `ConfigView.vue`, and until it lands the
@@ -100,6 +100,16 @@ const TYPED_CONFIRMATION_RADII: ReadonlySet<string> = new Set([
  *
  * @param radius blast radius of rolling back to this revision, as
  *   `GET /admin/config/history` reports it.
+ *
+ *   **This is not the radius the server gates on.** The history entry's
+ *   radius was measured against the revision before it, at the time it
+ *   applied; `POST /admin/config/rollback` measures the running document
+ *   against the target, at the moment of the call. Different pairs of
+ *   documents, so the two can disagree in either direction, and the
+ *   route is the one that decides. Whoever wires the Roll back button
+ *   should prefer a radius read from the rollback response or from
+ *   `GET /admin/config/diff?to=<rev>`, and treat this one as a hint for
+ *   disabling the button early rather than as the rule.
  * @param targetRevision the revision the operator is rolling back to.
  * @param typed what they typed into the confirmation field, verbatim.
  */

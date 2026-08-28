@@ -2978,7 +2978,7 @@ has the runnable form.
 | Field | Type | Description |
 |---|---|---|
 | `restored_revision` | number | The ring revision whose document is now serving. |
-| `previous_revision` | number | The revision that was running, now marked `reverted`. |
+| `previous_revision` | number | The revision that was running before this rollback. Marked `reverted` only when `appended_revision` is non-null: a rollback onto the document already running is deduplicated by the ring, so it appends nothing and annotates nothing. |
 | `appended_revision` | number | The **new** entry this rollback appended. History is append-only, so a rollback is itself in the history. `null` when the restored document is byte identical to what was already running. |
 | `blast_radius` | string | `hitless`, `reload`, `restart`, or `breaking`, computed between the two stored documents. `null` in three cases: the ring holds no prior entry to compare against, the running revision's stored blob could not be read, or either document no longer parses. A `null` radius is treated as one that needs confirming, not as a safe one. |
 | `soaking` | bool | Whether a soak window is now open on the restored revision. |

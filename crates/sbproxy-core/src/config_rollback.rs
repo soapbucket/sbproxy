@@ -40,8 +40,15 @@
 //! A successful rollback appends a **new** entry carrying the restored
 //! document rather than rewinding the ring, so a rollback is itself
 //! visible in history and a second rollback can undo it. The entry that
-//! was rolled away from is annotated
+//! was rolled away from is then annotated
 //! [`sbproxy_config::RevisionState::Reverted`] and otherwise left alone.
+//!
+//! Both halves are conditional on there being something to roll away
+//! from. A rollback onto the document already running is deduplicated by
+//! the ring, so it appends no entry and annotates none either: the
+//! revision it restored is the revision it was already serving, and
+//! marking that `reverted` would render the running revision, often the
+//! last known good itself, as one this node rolled away from.
 //!
 //! # What this deliberately does not do
 //!
@@ -672,11 +679,22 @@ fn rollback_inner(
     // usually the last known good itself) to `reverted`, so the history
     // panel would render the good revision as the one this node rolled
     // away from.
-    if let Some(before) = running.as_ref() {
-        if appended.is_some() && before.revision != target.revision {
+    //
+    // `appended.is_some()` is exactly that condition and not an
+    // approximation of it: `appended` is the newest entry filtered to
+    // one whose revision differs from what was running, and a target
+    // identical to what is running is deduplicated by `record` so the
+    // newest entry stays `before` and filters out. So appended present
+    // implies the target really was a different document. Every surface
+    // that tells an operator a revision was marked `reverted` keys on
+    // this same fact, through `appended_revision` on the response.
+    let annotated = running
+        .as_ref()
+        .filter(|_| appended.is_some())
+        .map(|before| {
             recorder.mark_reverted(before.revision);
-        }
-    }
+            before.revision
+        });
 
     let secrets_fingerprint_changed = match (
         target.secrets_fingerprint.as_deref(),
@@ -699,10 +717,8 @@ fn rollback_inner(
         previous_revision = running.as_ref().map(|entry| entry.revision),
         appended_revision = appended,
         blast_radius = blast_radius.map(blast_radius_label),
-        "this node rolled back to a stored config revision. the revision it rolled away from \
-         is marked reverted, the restored document was appended as a new ring entry, and it \
-         soaks like any other candidate. the node's config file is unchanged, so fix the \
-         source of truth before the next reload trigger re-applies it",
+        message = rollback_log_message(annotated),
+        "this node rolled back to a stored config revision",
     );
 
     Ok(RollbackOutcome {
@@ -1043,6 +1059,12 @@ fn resolve_target(
 /// document is refused a few lines later by the reload transaction with
 /// a message that names the actual problem, and turning it into "the
 /// blast radius is unknown" here would refuse it with the wrong reason.
+pub(crate) fn plan_radius(baseline: &str, proposed: &str) -> Option<BlastRadius> {
+    let baseline = serde_yaml::from_str::<sbproxy_config::ConfigFile>(baseline).ok()?;
+    let proposed = serde_yaml::from_str::<sbproxy_config::ConfigFile>(proposed).ok()?;
+    Some(sbproxy_config::plan(&baseline, &proposed).max_blast_radius)
+}
+
 /// Whether one stored document still deserializes on this binary.
 ///
 /// Used to tell the two unmeasurable-radius cases apart: a baseline that
@@ -1051,12 +1073,6 @@ fn resolve_target(
 /// apply itself with a compile error worth more than a prompt.
 fn parses_as_config(text: &str) -> bool {
     serde_yaml::from_str::<sbproxy_config::ConfigFile>(text).is_ok()
-}
-
-pub(crate) fn plan_radius(baseline: &str, proposed: &str) -> Option<BlastRadius> {
-    let baseline = serde_yaml::from_str::<sbproxy_config::ConfigFile>(baseline).ok()?;
-    let proposed = serde_yaml::from_str::<sbproxy_config::ConfigFile>(proposed).ok()?;
-    Some(sbproxy_config::plan(&baseline, &proposed).max_blast_radius)
 }
 
 /// Publish one `config_rollback` decision event.
@@ -1115,6 +1131,28 @@ pub(crate) fn rollback_event(
         String::new(),
         data,
     )
+}
+
+/// What actually happened to the ring on a successful rollback, as one
+/// sentence for the operator-facing log line.
+///
+/// Two arms, because a rollback onto the document already running
+/// appends nothing and annotates nothing. Saying otherwise is the
+/// failure this function exists to prevent: the log line used to claim
+/// both on every rollback, including the `{}` shortest form that is
+/// most likely to be a no-op mid-incident.
+pub(crate) const fn rollback_log_message(annotated: Option<u64>) -> &'static str {
+    if annotated.is_some() {
+        "the revision it rolled away from is marked reverted, the restored document was \
+         appended as a new ring entry, and it soaks like any other candidate. the node's \
+         config file is unchanged, so fix the source of truth before the next reload trigger \
+         re-applies it"
+    } else {
+        "the restored document was already what this node was running, so the ring \
+         deduplicated it: nothing was appended and no revision was marked reverted. the \
+         node's config file is unchanged, so fix the source of truth before the next reload \
+         trigger re-applies it"
+    }
 }
 
 /// Build the `config_rollback` event payload for an auto-revert that
@@ -2257,6 +2295,93 @@ mod tests {
         assert!(AutoRevertDecision::Disarmed.decline_reason().is_none());
         crate::config_soak::clear();
         crate::config_history::clear_config_history_recorder();
+    }
+
+    /// Re-review N1. The Major 2 fix made the `reverted` annotation
+    /// conditional and left five surfaces asserting it unconditionally,
+    /// so the CLI printed "revision N is marked reverted" on exactly the
+    /// no-op rollback the fix exists to handle, and the WARN line
+    /// additionally claimed an entry had been appended when none was.
+    ///
+    /// This watches all five together, because the failure was never
+    /// one wrong sentence: it was one behavior change and five places
+    /// that describe it, which is the same shape as the first round's
+    /// Major 6. The two code surfaces are driven; the three prose
+    /// surfaces are read off disk, because a doc nobody executes is
+    /// exactly where this class of drift survives a test suite.
+    #[test]
+    fn every_surface_describing_a_rollback_admits_it_may_annotate_nothing() {
+        // 1. The log line, both arms.
+        let appended = rollback_log_message(Some(7));
+        assert!(appended.contains("is marked reverted"), "{appended}");
+        assert!(
+            appended.contains("appended as a new ring entry"),
+            "{appended}"
+        );
+        let noop = rollback_log_message(None);
+        assert!(
+            noop.contains("nothing was appended and no revision was marked reverted"),
+            "the no-op arm has to say so rather than reusing the other sentence: {noop}",
+        );
+        assert!(
+            !noop.contains("is marked reverted, the restored"),
+            "and it must not carry the unconditional claim: {noop}",
+        );
+
+        // 2. The module rustdoc, read from this file.
+        let module = include_str!("config_rollback.rs");
+        let heading = module
+            .split("# History stays append-only")
+            .nth(1)
+            .expect("the module rustdoc still has that heading");
+        assert!(
+            heading.contains("deduplicated by the ring"),
+            "the module rustdoc must say the annotation is conditional",
+        );
+
+        // 3 and 4. The two operator docs.
+        for (path, doc, needle) in [
+            (
+                "docs/admin-api-reference.md",
+                include_str!("../../../docs/admin-api-reference.md"),
+                "Marked `reverted` only when `appended_revision` is non-null",
+            ),
+            (
+                "docs/configuration.md",
+                include_str!("../../../docs/configuration.md"),
+                "unless there was\nnothing to roll away from",
+            ),
+        ] {
+            assert!(
+                doc.contains(needle),
+                "{path} still describes the annotation as unconditional; it is not, and this \
+                 is the doc an operator reads mid-incident",
+            );
+        }
+
+        // 5. The CLI, which is the surface the finding was filed against.
+        let cli = include_str!("../../sbproxy/src/main.rs");
+        let rendered = cli
+            .split("fn print_config_rollback_text")
+            .nth(1)
+            .expect("the renderer is still there");
+        let body = &rendered[..rendered.find("\nfn ").unwrap_or(rendered.len())];
+        assert!(
+            body.contains("nothing\n             was appended and no revision was marked reverted")
+                || body.contains("was appended and no revision was marked reverted"),
+            "the CLI must have a no-op arm",
+        );
+        let marked = body
+            .find("is marked reverted")
+            .expect("the CLI still prints the annotation line");
+        let gate = body
+            .find("appended_revision")
+            .expect("the CLI still reads appended_revision");
+        assert!(
+            gate < marked,
+            "the annotation line has to sit behind the appended_revision gate, or it prints a \
+             false claim on the no-op rollback again",
+        );
     }
 
     /// Review Minor 11. Every other field in the payload is a closed

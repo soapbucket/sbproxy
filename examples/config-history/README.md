@@ -366,7 +366,9 @@ the same signals and a second swap does not fix that.
 
 The console's Config page already draws the ring: every revision with its state badge and blast radius, the lineage, which revision the last-known-good pointer names, and the stored document and plan for any row you click. What it has no control for is acting on one. Rolling back is the admin API and the CLI only, and the Roll back button is tracked separately.
 
-The gating rule that button will use (a `restart` or `breaking` rollback, or one whose radius could not be measured, needs the revision typed back) ships ahead of it as a tested function in `ui/src/lib/config-history.ts`, so the panel inherits the rule rather than reinventing it and the two cannot disagree about which revisions need typing. The server enforces the same rule regardless.
+The gating rule that button will use (a `restart` or `breaking` rollback, or one whose radius could not be measured, needs the revision typed back) ships ahead of it as a tested function in `ui/src/lib/config-history.ts`, so the panel inherits the rule rather than reinventing it.
+
+The two are not computing the same radius, though, and whoever wires the button has to close that. The client can only see the radius `GET /admin/config/history` stored on the entry, which was measured against the revision before it at the time it applied. The server measures the running document against the target at the moment you ask. Those are different pairs of documents, so the two can disagree in either direction: the button may wave through a rollback the route then refuses with a `409`, or demand a confirmation the route would not have. The route is always the one that decides.
 
 ## Reference
 

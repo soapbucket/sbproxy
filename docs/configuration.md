@@ -1500,10 +1500,13 @@ keeps working.
 History stays append-only. A successful rollback **appends** a new entry
 carrying the restored document rather than rewinding the ring, so the
 rollback is itself visible in history and a second rollback can undo it.
-The revision you rolled away from is marked `reverted`. The
-last-known-good pointer does not move on a rollback: what is good is
-whatever a soak promoted, and the rollback's own candidate soaks like any
-other before it can become that.
+The revision you rolled away from is marked `reverted`, unless there was
+nothing to roll away from: rolling back onto the document already running
+is deduplicated by the ring, so it appends no entry and marks none
+`reverted`. The response says which happened through `appended_revision`.
+The last-known-good pointer does not move on a rollback either way: what
+is good is whatever a soak promoted, and the rollback's own candidate
+soaks like any other before it can become that.
 
 **The node's config file is not rewritten.** The ring holds what this node
 applied, and on an authority-owned or git-sourced node the local file is a

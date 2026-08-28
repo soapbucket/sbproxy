@@ -10671,20 +10671,32 @@ fn print_config_rollback_text(body: &serde_json::Value) {
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown");
     println!("config rollback: restored revision {restored} ({digest}), blast radius {radius}");
-    if let Some(previous) = body
-        .get("previous_revision")
-        .and_then(serde_json::Value::as_u64)
-    {
-        println!("config rollback: revision {previous} is marked reverted");
-    }
-    if let Some(appended) = body
-        .get("appended_revision")
-        .and_then(serde_json::Value::as_u64)
-    {
-        println!(
-            "config rollback: appended as revision {appended}; history is append-only, so this \
-             rollback is itself in the history"
-        );
+    // Both of these are conditional on `appended_revision`, and on the
+    // same one: a rollback onto the document already running is
+    // deduplicated by the ring, so it appends nothing and marks nothing
+    // reverted. Keying the "marked reverted" line on `previous_revision`
+    // printed a false claim on exactly the no-op rollback the server
+    // side exists to handle, which is also the one an operator is most
+    // likely to reach for mid-incident.
+    match (
+        body.get("appended_revision")
+            .and_then(serde_json::Value::as_u64),
+        body.get("previous_revision")
+            .and_then(serde_json::Value::as_u64),
+    ) {
+        (Some(appended), previous) => {
+            if let Some(previous) = previous {
+                println!("config rollback: revision {previous} is marked reverted");
+            }
+            println!(
+                "config rollback: appended as revision {appended}; history is append-only, so \
+                 this rollback is itself in the history"
+            );
+        }
+        (None, _) => println!(
+            "config rollback: that revision was already what this node was running, so nothing \
+             was appended and no revision was marked reverted"
+        ),
     }
     if body
         .get("soaking")

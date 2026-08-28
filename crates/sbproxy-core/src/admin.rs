@@ -4003,6 +4003,13 @@ fn config_auto_revert_json(
 /// That function is the affordance and nothing calls it yet; this
 /// route's `confirm_revision` check is the enforcer and is what
 /// actually refuses.
+///
+/// The two do not read the same radius, which whoever wires the button
+/// has to close. `rollbackGate` is handed the radius
+/// `GET /admin/config/history` stored on the entry, measured against the
+/// revision before it when it applied; this route measures the running
+/// document against the target at call time. They can disagree in either
+/// direction, and this route decides.
 fn handle_config_rollback(state: &AdminState, body: Option<&str>) -> (u16, &'static str, String) {
     // Answered before the ring is consulted, so a node that never opted
     // into `proxy.config_history` gets the same "not enabled" body as

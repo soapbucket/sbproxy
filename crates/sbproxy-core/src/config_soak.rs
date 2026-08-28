@@ -1256,8 +1256,11 @@ pub(crate) fn spawn(config_path: String) {
                 error = %error,
                 "config soak: could not build the probe HTTP client, so the soak supervisor \
                  did not start. for the life of this process the operator-probe signal \
-                 abstains, no soak window is ever closed, no revision is promoted to last \
-                 known good, and proxy.config_history.soak.auto_revert cannot fire",
+                 abstains and nothing closes a soak window on its timer, so no revision is \
+                 promoted to last known good and auto_revert never fires on its own. \
+                 POST /admin/config/confirm still works and is the way out: it closes the \
+                 window in flight, records the verdict, promotes on a pass, and reverts on a \
+                 failure when auto_revert is armed",
             );
             return;
         }
