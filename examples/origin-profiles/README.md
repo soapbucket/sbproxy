@@ -1,6 +1,6 @@
 # Project-owned origin profiles
 
-*Last modified: 2026-08-27*
+*Last modified: 2026-08-28*
 
 A service team changes its own rate limit by merging in its own repository, with no pull request against the runtime config repository, and the platform team keeps a security floor no project can switch off. Neither side can author a whole origin alone.
 
@@ -65,7 +65,7 @@ Later layers win, and the runtime bookends the stack, so a project can be given 
 
 There is no delete verb, matching the rest of the merge contract. `disabled: true` leaves a record; an absence does not. `policies: []` in a project profile therefore leaves the floor intact, which is the scenario the whole floor concept exists to prevent.
 
-A lock binds what an entry does, not what it is called. Refusing only a same-name override would leave the project one rename away from the thing the lock exists to stop, because every project addition lands after the floor and for anything last-write-wins the later entry simply wins. So a project addition is refused when it shares an effect with a locked entry: the `type:` for a policy or transform, and the set of leaf paths written for a modifier.
+A lock binds what an entry does, not what it is called. Refusing only a same-name override would leave the project one rename away from the thing the lock exists to stop, because every project addition lands after the floor and for anything last-write-wins the later entry simply wins. So a project layer is refused when it shares an effect with a locked entry (the `type:` for a policy or transform, the leaf paths written for a modifier), when it brings a script body into a modifier list that holds a lock (a `lua_script` writes headers from inside a string the comparison cannot read), and when an override of an unlocked entry introduces an effect a lock above it already holds. See [configuration.md](../../docs/configuration.md#list-merge-by-name) for the exact rules and what each one cannot see.
 
 `name`, `locked` and `disabled` are stripped before the composed origin is emitted, because the modules those lists feed reject unknown keys.
 

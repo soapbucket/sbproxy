@@ -1379,16 +1379,17 @@ fn an_entry_override_block_is_checked_the_same_way_with_optional_types() {
 
 // --- WOR-2436: the metric, on every load -------------------------------
 
-/// Every series on every load, including the loads where the block is
-/// absent. A gauge only written on the present path keeps its last value
-/// when the block is deleted and keeps the old tier's series when a
-/// document is promoted, which are the two readings the dashboard panel
-/// and the docs tell an operator to alert on.
+/// Every tier, every document, including the document with no block.
+///
+/// The metric write itself lives at the apply seam (see
+/// `sbproxy-core`'s `origin_composition_modules`); this is the pure half,
+/// which is what makes "the tier not in force reads zero" checkable
+/// without a registry.
 #[test]
-fn the_entry_counts_cover_every_tier_on_every_load() {
+fn the_entry_counts_cover_every_tier_for_every_document() {
     // No block at all: both tiers read zero, so a deleted block shows up
     // as the drop to zero the panel describes.
-    for (tier, pinned, unpinned) in sbproxy_config::origin_source_entry_counts(None) {
+    for (tier, pinned, unpinned) in sbproxy_config::origin_source_entry_counts(None).rows() {
         assert_eq!((pinned, unpinned), (0, 0), "{tier:?}");
     }
 
@@ -1400,15 +1401,11 @@ fn the_entry_counts_cover_every_tier_on_every_load() {
     )
     .expect("parses");
     let counts = sbproxy_config::origin_source_entry_counts(Some(&production));
-    for (tier, pinned, unpinned) in counts {
-        match tier {
-            EnvironmentTier::Production => assert_eq!((pinned, unpinned), (2, 0)),
-            // The tier that is not in force must be written as zero, or a
-            // promotion from development to production leaves the old
-            // series standing at its last reading forever.
-            EnvironmentTier::Development => assert_eq!((pinned, unpinned), (0, 0)),
-        }
-    }
+    assert_eq!(counts.production, (2, 0));
+    // The tier that is not in force must read zero, or a promotion from
+    // development to production leaves the old series standing at its
+    // last reading forever.
+    assert_eq!(counts.development, (0, 0));
 
     let development: OriginSourcesConfig = serde_yaml::from_str(
         "entries:\n  - name: a\n    repo: https://git.test/a/b\n    path: p.yaml\n    \
@@ -1416,12 +1413,10 @@ fn the_entry_counts_cover_every_tier_on_every_load() {
     )
     .expect("parses");
     let counts = sbproxy_config::origin_source_entry_counts(Some(&development));
-    for (tier, pinned, unpinned) in counts {
-        match tier {
-            EnvironmentTier::Development => assert_eq!((pinned, unpinned), (0, 1)),
-            EnvironmentTier::Production => assert_eq!((pinned, unpinned), (0, 0)),
-        }
-    }
+    assert_eq!(counts.development, (0, 1));
+    assert_eq!(counts.production, (0, 0));
+    // And the row view a metric writer iterates covers both tiers.
+    assert_eq!(counts.rows().len(), 2);
 }
 
 // --- WOR-2434: a refusal never carries a value -------------------------
@@ -1472,6 +1467,48 @@ spec:
     );
 }
 
+/// N2: a value containing a double quote must not leak past the scrub.
+///
+/// Serde renders a string value with `{:?}`, which escapes an inner
+/// quote. A scan that toggled on that escaped quote would close the run
+/// in the middle of the value and copy the rest out verbatim, and the
+/// sentinel test above cannot see it because its sentinel has no quote
+/// in it.
+#[test]
+fn a_value_containing_a_quote_does_not_leak_past_the_redaction() {
+    const HEAD: &str = "sk-live-QUOTEHEAD";
+    const TAIL: &str = "QUOTETAIL-TOPSECRET";
+    let profile = r#"
+name: checkout
+inputs:
+  - name: ratio
+spec:
+  api:
+    base:
+      action: {type: proxy, url: https://checkout.internal}
+      token_bytes_ratio: "{{vars.ratio}}"
+"#;
+    let entry_yaml = format!(
+        "name: checkout\nrepo: https://git.test/acme/checkout\npath: sbproxy/origin.yaml\n\
+         hosts:\n  api: [\"checkout.acme.test\"]\ninputs:\n  ratio: '{HEAD}\"{TAIL}'\n"
+    );
+    let error = compose_err(profile, &entry_yaml, None);
+    let text = error.to_string();
+    assert!(
+        matches!(error, OriginResolveError::ProfileParse { .. }),
+        "expected the typed parse to refuse it, got: {text}"
+    );
+    for fragment in [HEAD, TAIL] {
+        assert!(
+            !text.contains(fragment),
+            "`{fragment}` survived the redaction: {text}"
+        );
+    }
+    assert!(text.contains("[redacted]"), "{text}");
+    // The diagnostic tail must survive too: an early close ate it.
+    assert!(text.contains("f32"), "the reason was eaten: {text}");
+}
+
 /// Redaction must not take the field name with it. The write boundary's
 /// whole job is naming the key a project may not set, and serde spells an
 /// identifier with backticks and a value with double quotes, which is
@@ -1483,6 +1520,269 @@ fn redaction_keeps_the_field_name_the_write_boundary_has_to_name() {
     let error = compose_err(profile, CHECKOUT_ENTRY, None).to_string();
     assert!(error.contains("force_ssl"), "{error}");
     assert!(error.contains("unknown field"), "{error}");
+}
+
+/// N3: a script body is opaque to the effect comparison, so a project
+/// modifier carrying one into a list that holds a lock is refused.
+///
+/// `lua_script`, `js_script`, `rego_module` and `rego_module_path` all
+/// return `set_headers`, so an entry carrying one can write the very
+/// header the floor locked while its effect keys intersect nothing. The
+/// comparison cannot read a program, so the honest answer is that it
+/// cannot clear one.
+#[test]
+fn a_project_modifier_with_a_script_body_is_refused_when_the_list_holds_a_lock() {
+    let floor = r#"
+response_modifiers:
+  - name: platform_security
+    locked: true
+    headers:
+      set:
+        Content-Security-Policy: "default-src 'self'"
+"#;
+    for script in ["lua_script", "js_script", "rego_module"] {
+        let profile = format!(
+            "name: checkout\nspec:\n  api:\n    base:\n      action: {{type: proxy, \
+             url: https://checkout.internal}}\n      response_modifiers:\n        \
+             - name: mine\n          {script}: \"set_headers\"\n"
+        );
+        let error = compose_err(&profile, CHECKOUT_ENTRY, Some(floor));
+        let text = error.to_string();
+        assert!(
+            matches!(error, OriginResolveError::LockedEffectShadowed { .. }),
+            "`{script}` must be refused: {text}"
+        );
+        assert!(text.contains(script), "names the script key: {text}");
+        assert!(text.contains("platform_security"), "names the lock: {text}");
+    }
+}
+
+/// The same script body is fine when nothing in that list is locked.
+#[test]
+fn a_project_modifier_with_a_script_body_lands_when_no_lock_is_present() {
+    let floor = r#"
+response_modifiers:
+  - name: platform_headers
+    headers:
+      set:
+        X-Served-By: sbproxy
+"#;
+    let profile = r#"
+name: checkout
+spec:
+  api:
+    base:
+      action: {type: proxy, url: https://checkout.internal}
+      response_modifiers:
+        - name: mine
+          lua_script: "set_headers"
+"#;
+    let resolution = compose(profile, CHECKOUT_ENTRY, Some(floor));
+    assert_eq!(
+        list(
+            &as_yaml(&resolution, "checkout.acme.test"),
+            "response_modifiers"
+        )
+        .len(),
+        2
+    );
+}
+
+/// N4: a lock can be reached without renaming anything and without
+/// adding anything.
+///
+/// `merge_plain` replaces scalars, `type:` included, so a project layer
+/// matching an **unlocked** floor entry by name can rewrite it into the
+/// mechanism a locked entry above it holds. No rename, no addition, and
+/// the rewritten entry already sits after the lock.
+#[test]
+fn a_project_override_that_rewrites_type_onto_a_locked_mechanism_is_refused() {
+    let floor = r#"
+policies:
+  - name: platform_waf
+    type: waf
+    owasp_crs:
+      enabled: true
+    locked: true
+  - name: allowlist
+    type: ip_filter
+    whitelist:
+      - 10.0.0.0/8
+"#;
+    let profile = r#"
+name: checkout
+spec:
+  api:
+    base:
+      action: {type: proxy, url: https://checkout.internal}
+      policies:
+        - name: allowlist
+          type: waf
+          owasp_crs:
+            enabled: false
+"#;
+    let error = compose_err(profile, CHECKOUT_ENTRY, Some(floor));
+    let text = error.to_string();
+    assert!(
+        matches!(error, OriginResolveError::LockedEffectShadowed { .. }),
+        "expected a shadow refusal, got: {text}"
+    );
+    assert!(text.contains("platform_waf"), "names the lock: {text}");
+    assert!(text.contains("type=waf"), "names the shared effect: {text}");
+}
+
+/// The same route on a modifier: merging a header path onto an unlocked
+/// entry that sits after a locked one writing the same header.
+#[test]
+fn a_project_override_that_adds_a_locked_header_to_a_later_entry_is_refused() {
+    let floor = r#"
+response_modifiers:
+  - name: platform_security
+    locked: true
+    headers:
+      set:
+        Content-Security-Policy: "default-src 'self'"
+  - name: platform_branding
+    headers:
+      set:
+        X-Served-By: sbproxy
+"#;
+    let profile = r#"
+name: checkout
+spec:
+  api:
+    base:
+      action: {type: proxy, url: https://checkout.internal}
+      response_modifiers:
+        - name: platform_branding
+          headers:
+            set:
+              Content-Security-Policy: "default-src *"
+"#;
+    assert!(matches!(
+        compose_err(profile, CHECKOUT_ENTRY, Some(floor)),
+        OriginResolveError::LockedEffectShadowed { .. }
+    ));
+}
+
+/// The merge-branch check is narrow in both directions it has to be.
+///
+/// Only the effects the merge *introduced* are compared, so the floor's
+/// own arrangement of two entries touching one thing stays the
+/// platform's business; and only locks the merged entry already sits
+/// after are considered, because an entry does not shadow one that comes
+/// later.
+#[test]
+fn a_project_override_that_introduces_nothing_new_still_lands() {
+    let floor = r#"
+policies:
+  - name: platform_waf
+    type: waf
+    owasp_crs:
+      enabled: true
+    locked: true
+  - name: rate_limit
+    type: rate_limiting
+    requests_per_minute: 600
+    burst: 100
+"#;
+    let profile = r#"
+name: checkout
+spec:
+  api:
+    base:
+      action: {type: proxy, url: https://checkout.internal}
+      policies:
+        - name: rate_limit
+          requests_per_minute: 1200
+"#;
+    let resolution = compose(profile, CHECKOUT_ENTRY, Some(floor));
+    let origin = as_yaml(&resolution, "checkout.acme.test");
+    assert_eq!(names(&origin, "policies"), vec!["waf", "rate_limiting"]);
+    assert_eq!(
+        list(&origin, "policies")[1].get("requests_per_minute"),
+        Some(&serde_yaml::Value::Number(1200.into()))
+    );
+}
+
+/// A lock that sits *after* the entry a project overrides is not
+/// shadowed by it, because ordering is what last-write-wins means.
+#[test]
+fn a_lock_later_in_the_list_is_not_shadowed_by_an_earlier_override() {
+    let floor = r#"
+response_modifiers:
+  - name: platform_branding
+    headers:
+      set:
+        X-Served-By: sbproxy
+  - name: platform_security
+    locked: true
+    headers:
+      set:
+        Content-Security-Policy: "default-src 'self'"
+"#;
+    let profile = r#"
+name: checkout
+spec:
+  api:
+    base:
+      action: {type: proxy, url: https://checkout.internal}
+      response_modifiers:
+        - name: platform_branding
+          headers:
+            set:
+              Content-Security-Policy: "the lock is applied after this entry"
+"#;
+    let resolution = compose(profile, CHECKOUT_ENTRY, Some(floor));
+    assert_eq!(
+        list(
+            &as_yaml(&resolution, "checkout.acme.test"),
+            "response_modifiers"
+        )
+        .len(),
+        2
+    );
+}
+
+// --- WOR-2436: an unrecognized policy type -----------------------------
+
+/// N5: the bare `KNOWN_POLICY_TYPES` is not the whole vocabulary.
+///
+/// An installed extension bundle provides types that are by construction
+/// absent from the built-in list, so a hard refusal made the floor
+/// strictly less expressive than the origins it is a floor for. The
+/// question `compile_config` can answer is whether the document declares
+/// a bundle source at all.
+#[test]
+fn an_unrecognized_type_is_refused_without_bundles_and_warned_with_them() {
+    let floor = defaults("policies:\n  - name: house\n    type: acme_house_rules\n");
+    assert!(
+        matches!(
+            sbproxy_config::validate_origin_defaults_with(&floor, false)
+                .expect_err("a document with no bundle source cannot acquire the type"),
+            OriginResolveError::UnknownEntryType { .. }
+        ),
+        "a typo in a document with no bundles is still a typo"
+    );
+    sbproxy_config::validate_origin_defaults_with(&floor, true)
+        .expect("a document declaring a bundle source may name a type it provides");
+}
+
+/// The same split driven from the whole document, so the flag is really
+/// derived from the `extensions:` block rather than passed by a test.
+#[test]
+fn the_bundle_aware_type_rule_is_derived_from_the_documents_own_extensions_block() {
+    let floor = "origin_defaults:\n  policies:\n    - name: house\n      \
+                 type: acme_house_rules\n";
+    let without = format!("origins: {{}}\n{floor}");
+    let error = match sbproxy_config::compile_config(&without) {
+        Ok(_) => panic!("no bundle source, so an unrecognized type is a typo"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("acme_house_rules"), "{error}");
+
+    let with = format!("origins: {{}}\nextensions:\n  bundles_dir: ./bundles\n{floor}");
+    sbproxy_config::compile_config(&with).expect("a declared bundle source may provide the type");
 }
 
 // --- WOR-2435: the read boundary --------------------------------------
@@ -1815,16 +2115,30 @@ fn the_resolver_composes_from_text_alone() {
 /// # What this cannot see
 ///
 /// It is a textual scan of one file, so it says nothing about what the
-/// module *calls*. The resolver reaches outside itself three times, and
-/// each one is named here rather than left to the reader:
-/// `crate::source::redact_repo` (a string rewrite),
-/// `crate::source::is_full_commit_sha` (a length and hex-digit check),
-/// and `crate::validate::KNOWN_POLICY_TYPES` / `KNOWN_TRANSFORM_TYPES`
-/// (two `&[&str]` constants). None of the four opens anything, and they
-/// are listed because the next call added is the one this scan would
-/// wave through. The scan is still the wider half of the claim: the
-/// module cannot open a file or a socket itself, and its four callees
-/// are small enough to have been read.
+/// module *calls*. The resolver reaches outside itself in four functions
+/// and two constants, and every one is named here rather than left to
+/// the reader:
+///
+/// * `crate::confined_template::resolve_confined_fragment`, the
+///   confinement engine and by far the largest of them. It parses the
+///   document, walks the tree, substitutes from a binding map its caller
+///   supplies, and returns text. It reads no file and opens no socket:
+///   sealing the process environment is the whole reason it exists, and
+///   `crate::confined_template`'s own suite is what holds that.
+/// * `crate::source::redact_repo`, a string rewrite.
+/// * `crate::source::is_full_commit_sha`, a length and hex-digit check.
+/// * `crate::types::is_secret_reference`, a prefix and shape check whose
+///   doc says in so many words that it never resolves anything.
+/// * `crate::validate::KNOWN_POLICY_TYPES` and `KNOWN_TRANSFORM_TYPES`,
+///   two `&[&str]` constants.
+///
+/// The earlier version of this list said "three times" and left
+/// `resolve_confined_fragment` out, which is exactly the call a reader
+/// would most want asserted (WOR-2432 re-review N6). They are enumerated
+/// because the next call added is the one this scan would wave through.
+/// The scan is still the wider half of the claim: the module cannot open
+/// a file or a socket itself, and each callee above is small enough to
+/// have been read.
 #[test]
 fn nothing_in_the_resolver_opens_a_file_or_a_socket() {
     let source = std::fs::read_to_string(

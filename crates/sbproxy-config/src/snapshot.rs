@@ -284,6 +284,15 @@ pub struct CompiledConfig {
     /// Extension bundle discovery configuration preserved for the pipeline
     /// candidate loader. This crate does not resolve paths or fetch sources.
     pub extension_bundles: crate::extensions::ExtensionBundlesConfig,
+    /// Per-tier `origin_sources` entry counts, computed at compile and
+    /// published by the seam that applies a pipeline.
+    ///
+    /// Carried rather than written at compile because `compile_config`
+    /// also runs on candidate documents, and a candidate can never carry
+    /// `origin_sources` (it is on [`crate::AUTHORITY_DENIED_PATHS`]), so
+    /// writing there would zero the live series on every authority
+    /// publish. See [`crate::origin_profile::origin_source_entry_counts`].
+    pub origin_source_entries: crate::origin_profile::OriginSourceEntryCounts,
     /// All compiled origins, sorted by their config key.
     ///
     /// The order is part of the compiled output rather than an accident

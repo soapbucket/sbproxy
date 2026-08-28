@@ -103,6 +103,30 @@ pub const PROFILE_LIST_MERGE_KEYS: &[&str] = &[
 /// long after the compose that put it there.
 const BOOKKEEPING_KEYS: &[&str] = &["name", "locked", "disabled"];
 
+/// The keys that make a `request_modifiers:` or `response_modifiers:`
+/// entry opaque to [`effect_keys`].
+///
+/// Those two lists have no `type:` discriminator, so what an entry does
+/// is read off the leaf paths it writes. A script body writes nothing
+/// declaratively: `RequestModifierConfig` and `ResponseModifierConfig`
+/// both take `lua_script`, `js_script`, `rego_module` and
+/// `rego_module_path`, and all four can return `set_headers`. So a
+/// project entry carrying one has effect keys that intersect nothing,
+/// lands after the floor, and wins whatever it writes
+/// (WOR-2432 re-review N3).
+///
+/// A project addition carrying one of these into a list that holds any
+/// locked entry is therefore refused outright, which is the same
+/// wider-than-the-hazard posture the type rule already takes: the
+/// comparison cannot read the body, so the honest answer is that it
+/// cannot clear it.
+///
+/// The typed lists need no equivalent. A `policies:` or `transforms:`
+/// entry running a script is discriminated by its own `type:`
+/// (`rego`, `lua`, ...), which [`effect_keys`] already compares.
+const MODIFIER_SCRIPT_KEYS: &[&str] =
+    &["js_script", "lua_script", "rego_module", "rego_module_path"];
+
 /// Mapping keys in a profile whose string value must be a secret
 /// reference rather than the secret itself.
 ///
@@ -968,7 +992,66 @@ pub struct OriginResolution {
 /// [`OriginResolveError::DefaultsListShape`], each naming the block and
 /// the offending key or position.
 pub fn validate_origin_defaults(defaults: &Mapping) -> Result<(), OriginResolveError> {
-    validate_origin_body("origin_defaults", defaults, TypeRule::Required)
+    validate_origin_defaults_with(defaults, false)
+}
+
+/// [`validate_origin_defaults`] with the caller saying whether this
+/// document declares an extension bundle source. See [`UnknownTypes`].
+///
+/// # Errors
+///
+/// The same set as [`validate_origin_defaults`].
+pub fn validate_origin_defaults_with(
+    defaults: &Mapping,
+    declares_extension_bundles: bool,
+) -> Result<(), OriginResolveError> {
+    validate_origin_body(
+        "origin_defaults",
+        defaults,
+        TypeRule::Required,
+        UnknownTypes::for_document(declares_extension_bundles),
+    )
+}
+
+/// Whether a `type:` this build does not recognize is a refusal or a
+/// warning.
+///
+/// The bare `KNOWN_POLICY_TYPES` is not the whole vocabulary. The
+/// existing validator asks `KNOWN_POLICY_TYPES.contains(t) ||
+/// opts.extra_policy_types.contains(t)`, the second half being the
+/// escape hatch for a type an installed extension bundle provides, and a
+/// bundle-provided type is by construction absent from the built-in list
+/// because `reserved_builtin_hook_names` reserves that whole list against
+/// bundles. Refusing unconditionally would make the floor strictly less
+/// expressive than the origins it is a floor for (WOR-2432 re-review N5).
+///
+/// `compile_config` cannot resolve the installed set: bundle sources are
+/// paths and URLs it deliberately does not fetch. So the question it can
+/// answer is whether this document declares any bundle source at all. A
+/// document with none has no way to acquire a type outside the built-in
+/// list, so an unrecognized one there is a typo and is refused. A
+/// document with one warns instead, and the composed origin still meets
+/// the real dispatcher at boot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnknownTypes {
+    /// No extension bundle source is declared, so an unrecognized type
+    /// cannot be provided by anything.
+    Refuse,
+    /// A bundle source is declared, so an unrecognized type may be one
+    /// this build cannot see from here.
+    Warn,
+}
+
+impl UnknownTypes {
+    /// The posture for a document that does or does not declare a bundle
+    /// source.
+    fn for_document(declares_extension_bundles: bool) -> Self {
+        if declares_extension_bundles {
+            Self::Warn
+        } else {
+            Self::Refuse
+        }
+    }
 }
 
 /// Whether a `policies:` or `transforms:` entry in a runtime-authored
@@ -1020,6 +1103,7 @@ fn validate_origin_body(
     block: &str,
     body: &Mapping,
     type_rule: TypeRule,
+    unknown_types: UnknownTypes,
 ) -> Result<(), OriginResolveError> {
     for key in body.keys() {
         let Some(key) = key.as_str() else {
@@ -1059,6 +1143,17 @@ fn validate_origin_body(
                 .and_then(Value::as_str);
             match kind {
                 Some(kind) if known.contains(&kind) => {}
+                Some(kind) if unknown_types == UnknownTypes::Warn => {
+                    tracing::warn!(
+                        block,
+                        list,
+                        name = named.unwrap_or("?"),
+                        kind,
+                        "origin block names a type this build does not recognize; accepted \
+                         because the document declares an extension bundle source that may \
+                         provide it, and refused at boot if nothing does"
+                    );
+                }
                 Some(kind) => {
                     return Err(OriginResolveError::UnknownEntryType {
                         block: block.to_string(),
@@ -1113,6 +1208,24 @@ fn origin_field_exists(key: &str) -> bool {
 /// Returns the [`OriginResolveError`] variant naming the entry and what
 /// about it was refused.
 pub fn validate_origin_sources(sources: &OriginSourcesConfig) -> Result<(), OriginResolveError> {
+    validate_origin_sources_with(sources, false)
+}
+
+/// [`validate_origin_sources`] with the caller saying whether this
+/// document declares an extension bundle source.
+///
+/// Split out rather than folded in because `compile_config` is the only
+/// caller that can answer that question, and every other caller (a test,
+/// a tool reading one block) legitimately cannot. See [`UnknownTypes`].
+///
+/// # Errors
+///
+/// The same set as [`validate_origin_sources`].
+pub fn validate_origin_sources_with(
+    sources: &OriginSourcesConfig,
+    declares_extension_bundles: bool,
+) -> Result<(), OriginResolveError> {
+    let unknown_types = UnknownTypes::for_document(declares_extension_bundles);
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     for entry in &sources.entries {
         if entry.name.trim().is_empty() {
@@ -1188,6 +1301,7 @@ pub fn validate_origin_sources(sources: &OriginSourcesConfig) -> Result<(), Orig
                 &format!("origin_sources entry `{}` overrides", entry.name),
                 overrides,
                 TypeRule::OptionalButKnown,
+                unknown_types,
             )?;
         }
         let timeout_secs = entry.timeout_secs;
@@ -1204,41 +1318,66 @@ pub fn validate_origin_sources(sources: &OriginSourcesConfig) -> Result<(), Orig
     Ok(())
 }
 
-/// The per-tier entry counts a config load should publish, for **every**
-/// tier, whether or not the block is present.
+/// Per-tier `origin_sources` entry counts, carried on the compiled
+/// config and published by the seam that applies one.
 ///
-/// A pure function rather than two `set` calls inside the `if let` that
-/// reads the block, because the readings an operator is told to alert on
-/// are the ones the block's *absence* produces. A gauge only written on
-/// the present path keeps its last value when the block is deleted, and
-/// keeps the old tier's series when a document is promoted from
-/// `development` to `production`, so the two transitions the metric
-/// exists to show were the two it could not express.
+/// Every tier, always, including the tier that is not in force and the
+/// case where the block is absent: a gauge only written for the tier in
+/// force keeps the other tier's last reading forever, and one only
+/// written when the block is present keeps its last reading when the
+/// block is deleted. Those are the two transitions the metric exists to
+/// show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OriginSourceEntryCounts {
+    /// `(pinned, unpinned)` when the document is `tier: development`.
+    pub development: (usize, usize),
+    /// `(pinned, unpinned)` when the document is `tier: production`.
+    pub production: (usize, usize),
+}
+
+impl OriginSourceEntryCounts {
+    /// The counts as `(tier, pinned, unpinned)` rows, one per tier, in
+    /// [`EnvironmentTier::ALL`] order. What a metric writer iterates.
+    #[must_use]
+    pub fn rows(self) -> [(EnvironmentTier, usize, usize); 2] {
+        EnvironmentTier::ALL.map(|tier| match tier {
+            EnvironmentTier::Development => (tier, self.development.0, self.development.1),
+            EnvironmentTier::Production => (tier, self.production.0, self.production.1),
+        })
+    }
+}
+
+/// The per-tier entry counts for a document, for **every** tier.
 ///
-/// Returns `(tier, pinned, unpinned)` for each tier in
-/// [`EnvironmentTier::ALL`]. Every tier that is not in force reads zero.
+/// A pure function of the block, and deliberately not a metric write.
+/// `compile_config` runs on candidate documents as well as on the one a
+/// node applies: `ConfigAuthority::publish` validates its payload
+/// through it, and `origin_sources` is on
+/// [`crate::AUTHORITY_DENIED_PATHS`], so a payload can never carry the
+/// block. A write there would drive every series to zero on each
+/// publish, which is exactly the reading the shipped dashboard panel and
+/// `docs/configuration.md` tell an operator to page on
+/// (WOR-2432 re-review N1). So the compile computes and the apply seam
+/// publishes.
 #[must_use]
 pub fn origin_source_entry_counts(
     sources: Option<&OriginSourcesConfig>,
-) -> [(EnvironmentTier, usize, usize); 2] {
-    let declared = sources.map(|sources| {
-        let pinned = sources
-            .entries
-            .iter()
-            .filter(|entry| entry.revision.as_deref().is_some_and(revision_is_immutable))
-            .count();
-        (
-            sources.tier,
-            pinned,
-            sources.entries.len().saturating_sub(pinned),
-        )
-    });
-    EnvironmentTier::ALL.map(|tier| match declared {
-        Some((declared_tier, pinned, unpinned)) if declared_tier == tier => {
-            (tier, pinned, unpinned)
-        }
-        _ => (tier, 0, 0),
-    })
+) -> OriginSourceEntryCounts {
+    let mut counts = OriginSourceEntryCounts::default();
+    let Some(sources) = sources else {
+        return counts;
+    };
+    let pinned = sources
+        .entries
+        .iter()
+        .filter(|entry| entry.revision.as_deref().is_some_and(revision_is_immutable))
+        .count();
+    let split = (pinned, sources.entries.len().saturating_sub(pinned));
+    match sources.tier {
+        EnvironmentTier::Development => counts.development = split,
+        EnvironmentTier::Production => counts.production = split,
+    }
+    counts
 }
 
 /// Whether a revision names something git cannot move underneath the
@@ -1504,19 +1643,31 @@ fn parse_profile(
 fn redact_serde_message(message: &str) -> String {
     let mut out = String::with_capacity(message.len());
     let mut in_quotes = false;
+    let mut escaped = false;
     for character in message.chars() {
-        if character == '"' {
-            if in_quotes {
+        if in_quotes {
+            // Inside a quoted run nothing is emitted, and the escape
+            // state is tracked so `\"` does not close it. Serde renders a
+            // string value with `{:?}`, which escapes an inner quote
+            // exactly that way, so a scan that toggled on it would close
+            // the run in the middle of the value and then copy the rest
+            // out verbatim (WOR-2432 re-review N2).
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
                 out.push_str("[redacted]\"");
-            } else {
-                out.push('"');
+                in_quotes = false;
             }
-            in_quotes = !in_quotes;
             continue;
         }
-        if !in_quotes {
-            out.push(character);
+        if character == '"' {
+            out.push('"');
+            in_quotes = true;
+            continue;
         }
+        out.push(character);
     }
     if in_quotes {
         // An unterminated quote means the rest of the message was inside
@@ -1722,6 +1873,12 @@ fn merge_plain(base: &mut Mapping, over: &Mapping) {
 /// * A project addition that would shadow a locked entry's effect is the
 ///   same refusal, because a lock that bound only the name would be one
 ///   rename away from useless. See [`effect_keys`].
+/// * A project addition carrying a script body into a modifier list that
+///   holds a lock is refused too, because the effect comparison cannot
+///   read a program. See [`opaque_addition_over_a_lock`].
+/// * A project override of an **unlocked** entry that introduces an
+///   effect a lock above it already holds is the same refusal, because
+///   `merge_plain` replaces scalars and `type:` is one of them.
 /// * `disabled: true` from `over` drops the entry and records the drop.
 /// * An unnamed `over` entry is always an addition.
 fn merge_named_list(
@@ -1751,6 +1908,13 @@ fn merge_named_list(
         });
         match existing {
             Some(index) => {
+                // Read before the mutable borrow: what this entry did
+                // before the project layer touched it.
+                let before = result
+                    .get(index)
+                    .and_then(Option::as_ref)
+                    .map(effect_keys)
+                    .unwrap_or_default();
                 let Some(slot) = result.get_mut(index) else {
                     continue;
                 };
@@ -1783,6 +1947,42 @@ fn merge_named_list(
                         *slot_value = incoming.clone();
                     }
                 }
+                // An override can reach a lock without renaming anything
+                // and without adding anything. `merge_plain` replaces
+                // scalars, `type:` included, so a project layer matching
+                // an **unlocked** floor entry by name can rewrite it into
+                // the mechanism a locked entry above it holds, or make it
+                // write a header that entry writes, and it already sits
+                // after that entry (WOR-2432 re-review N4).
+                //
+                // Only the effects the merge *introduced* are checked, and
+                // only against locks the merged entry already sits after.
+                // Both narrowings matter: the floor's own arrangement of
+                // two entries touching one thing is the platform's
+                // business, and a lock later in the list is not shadowed
+                // by an entry before it.
+                if context.author == LayerAuthor::Project {
+                    let after = result
+                        .get(index)
+                        .and_then(Option::as_ref)
+                        .map(effect_keys)
+                        .unwrap_or_default();
+                    let introduced: BTreeSet<String> = after.difference(&before).cloned().collect();
+                    if let Some((locked, shadowed)) =
+                        shadowed_lock(result[..index].iter().flatten(), &introduced)
+                    {
+                        return Err(OriginResolveError::LockedEffectShadowed(Box::new(
+                            LockedEffectShadow {
+                                entry: context.entry.name.clone(),
+                                profile: context.profile.to_string(),
+                                list: list.to_string(),
+                                locked,
+                                addition: incoming_name.unwrap_or("(unnamed)").to_string(),
+                                shadowed,
+                            },
+                        )));
+                    }
+                }
             }
             None => {
                 if flag(item, "disabled") {
@@ -1804,7 +2004,29 @@ fn merge_named_list(
                 // append an entry of the same shape, land after the floor,
                 // and win whatever is last-write-wins.
                 if context.author == LayerAuthor::Project {
-                    if let Some((locked, shadowed)) = shadowed_lock(result.iter().flatten(), item) {
+                    // An opaque body is checked first, because when one is
+                    // present the effect comparison below is answering a
+                    // question it cannot see the input to.
+                    if let Some((locked, script)) =
+                        opaque_addition_over_a_lock(result.iter().flatten(), item, list)
+                    {
+                        return Err(OriginResolveError::LockedEffectShadowed(Box::new(
+                            LockedEffectShadow {
+                                entry: context.entry.name.clone(),
+                                profile: context.profile.to_string(),
+                                list: list.to_string(),
+                                locked,
+                                addition: incoming_name.unwrap_or("(unnamed)").to_string(),
+                                shadowed: format!(
+                                    "an opaque `{script}` body, which the effect comparison \
+                                     cannot read"
+                                ),
+                            },
+                        )));
+                    }
+                    if let Some((locked, shadowed)) =
+                        shadowed_lock(result.iter().flatten(), &effect_keys(item))
+                    {
                         return Err(OriginResolveError::LockedEffectShadowed(Box::new(
                             LockedEffectShadow {
                                 entry: context.entry.name.clone(),
@@ -1848,11 +2070,10 @@ fn flag(value: &Value, key: &str) -> bool {
 /// shadow, with the effect they share.
 ///
 /// Returns `(locked entry name, shared effect key)`.
-fn shadowed_lock<'a, I>(existing: I, addition: &Value) -> Option<(String, String)>
+fn shadowed_lock<'a, I>(existing: I, incoming: &BTreeSet<String>) -> Option<(String, String)>
 where
     I: IntoIterator<Item = &'a Value>,
 {
-    let incoming = effect_keys(addition);
     if incoming.is_empty() {
         return None;
     }
@@ -1869,6 +2090,37 @@ where
         }
     }
     None
+}
+
+/// The first locked entry in `existing`, and the script key that makes
+/// `addition` unreadable to [`effect_keys`], when both are present.
+///
+/// Only the two modifier lists are asked. A `policies:` or `transforms:`
+/// entry running a script is discriminated by its own `type:`, which the
+/// effect comparison already reads. See [`MODIFIER_SCRIPT_KEYS`].
+fn opaque_addition_over_a_lock<'a, I>(
+    existing: I,
+    addition: &Value,
+    list: &str,
+) -> Option<(String, &'static str)>
+where
+    I: IntoIterator<Item = &'a Value>,
+{
+    if !matches!(list, "request_modifiers" | "response_modifiers") {
+        return None;
+    }
+    let map = addition.as_mapping()?;
+    let script = MODIFIER_SCRIPT_KEYS
+        .iter()
+        .find(|key| map.contains_key(**key))
+        .copied()?;
+    let locked = existing
+        .into_iter()
+        .find(|candidate| flag(candidate, "locked"))?;
+    Some((
+        entry_name(locked).unwrap_or("(unnamed)").to_string(),
+        script,
+    ))
 }
 
 /// What an entry in one of the four merged lists actually does, reduced
@@ -1894,6 +2146,20 @@ where
 /// Paths are lowercased because a header name is case-insensitive and a
 /// comparison that was not would be a boundary its own header could walk
 /// through.
+///
+/// # What this cannot see
+///
+/// A script body. `lua_script`, `js_script`, `rego_module` and
+/// `rego_module_path` on a modifier all return `set_headers`, and what
+/// they set is inside a string this function does not read, so an entry
+/// carrying one reduces to the key name and intersects nothing. That is
+/// not closed here, because reading it would mean interpreting three
+/// languages; it is closed one level up, by
+/// [`opaque_addition_over_a_lock`] refusing such an addition into a list
+/// that holds a lock at all. The same limit applies to any future
+/// modifier field whose value is a program rather than a declaration,
+/// which is why the list it is closed against is a named const
+/// ([`MODIFIER_SCRIPT_KEYS`]) rather than four literals here.
 fn effect_keys(entry: &Value) -> BTreeSet<String> {
     let mut keys = BTreeSet::new();
     let Some(map) = entry.as_mapping() else {

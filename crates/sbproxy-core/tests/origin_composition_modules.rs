@@ -106,22 +106,26 @@ fn the_same_policy_with_its_bookkeeping_left_in_is_refused_by_the_module() {
     }
 }
 
-/// The gauge is written for every tier on every load, including the load
-/// where the block is gone.
+/// The gauge is written for every tier every time a pipeline is applied,
+/// including the apply where the block is gone.
 ///
 /// The reading the dashboard panel and `docs/configuration.md` both tell
 /// an operator to alert on is "the total dropped to zero", and the one
 /// after it is "a non-zero `pinned=false` under `tier=production`". Both
-/// are transitions *out* of a state, so a gauge only written on the path
-/// that reads the block could never produce either: deleting the block
-/// left the last value standing, and promoting a document from
-/// development to production left the development series behind.
+/// are transitions *out* of a state, so a gauge only written for the tier
+/// in force could never produce either.
 ///
-/// Reads the real Prometheus default registry rather than a helper,
-/// because `register_int_gauge_vec!` is where the series actually lands
-/// and a test against anything else would be testing the test.
+/// Driven through `load_pipeline`, not `compile_config`, and that is the
+/// point. `compile_config` also validates candidate documents:
+/// `ConfigAuthority::publish` runs it on a payload, and a payload can
+/// never carry `origin_sources` because the path is denied to an
+/// authority. Writing there meant every publish zeroed all four series,
+/// which is precisely the page this metric exists to raise
+/// (WOR-2432 re-review N1). The second half of this test is that
+/// regression: compile a payload-shaped document and assert the live
+/// series are untouched.
 #[test]
-fn the_entry_gauge_covers_every_tier_and_clears_when_the_block_goes() {
+fn the_entry_gauge_follows_the_applied_pipeline_and_not_a_candidate_compile() {
     fn series() -> std::collections::BTreeMap<(String, String), i64> {
         let mut out = std::collections::BTreeMap::new();
         for family in prometheus::gather() {
@@ -147,10 +151,18 @@ fn the_entry_gauge_covers_every_tier_and_clears_when_the_block_goes() {
         out
     }
 
+    fn apply(yaml: &str) {
+        let compiled = sbproxy_config::compile_config(yaml).expect("the document compiles");
+        let pipeline =
+            sbproxy_core::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+                .expect("the document constructs");
+        sbproxy_core::reload::load_pipeline(pipeline);
+    }
+
     let with_block = "origins: {}\norigin_sources:\n  tier: production\n  entries:\n    \
                       - name: checkout\n      repo: https://git.test/acme/checkout\n      \
                       revision: refs/tags/v1.4.2\n      path: sbproxy/origin.yaml\n";
-    sbproxy_config::compile_config(with_block).expect("the pinned production config compiles");
+    apply(with_block);
     let after_declaration = series();
     assert_eq!(
         after_declaration.get(&("production".to_string(), "true".to_string())),
@@ -171,10 +183,21 @@ fn the_entry_gauge_covers_every_tier_and_clears_when_the_block_goes() {
         );
     }
 
-    // The block is deleted. Every series has to fall to zero: this is
-    // the transition the panel description names.
-    sbproxy_config::compile_config("origins: {}\n").expect("a config with no block compiles");
+    // A candidate compile must not touch the live series. This is the
+    // exact shape an authority payload has: no `origin_sources`, because
+    // the path is denied to it.
+    sbproxy_config::compile_config("origins: {}\n").expect("a candidate compiles");
+    assert_eq!(
+        series(),
+        after_declaration,
+        "compiling a candidate document moved the live series"
+    );
+
+    // Applying a document with the block deleted is the transition the
+    // panel description names, and every series has to fall to zero.
+    apply("origins: {}\n");
     let after_removal = series();
+    assert!(!after_removal.is_empty(), "the series must still exist");
     for (key, value) in &after_removal {
         assert_eq!(
             *value, 0,

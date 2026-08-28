@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-08-27*
+*Last modified: 2026-08-28*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -7824,6 +7824,8 @@ Every entry under `policies`, `transforms`, `request_modifiers` and `response_mo
 
 Three things about this block are checked at config load rather than at the aggregator, because neither this block nor an entry's `overrides:` carries `deny_unknown_fields` (the merge runs before the typed parse, and the typed modifier structs reject the `name:` key the merge is keyed on). Every top-level key must be a real origin field, every list entry must carry a `name:`, and every `policies:` and `transforms:` entry must name a `type:` some module answers to. A misspelling in any of the three used to pass `sbproxy validate` clean and then fail every compose at the far end of a GitOps loop.
 
+A `type:` is required in `origin_defaults` and optional in an entry's `overrides:`, because a named override is usually a partial edit of a floor entry that already carries one. And "some module answers to" is read off the built-in list, which is not the whole vocabulary: an installed extension bundle provides types that are by construction absent from it. Config load cannot resolve the installed set, because bundle sources are paths and URLs it deliberately does not fetch, so the question it asks instead is whether this document declares any bundle source at all. A document with none is refused for an unrecognized type, since it has no way to acquire one; a document with one warns and lets the composed origin meet the real dispatcher at boot.
+
 This block is authority-writable. The platform raising a security floor across the fleet is exactly what that channel exists for.
 
 ### `origin_sources`
@@ -7946,9 +7948,13 @@ There is no delete verb. `disabled: true` leaves a record; an absence does not. 
 
 `locked:` protects the floor from the project, not from the platform that wrote it. The entry's `overrides:` block passes straight through a lock. A project that sets `locked:` itself is refused: locking is the runtime config's verb.
 
-A lock binds what an entry does, not what it is called. Refusing only a same-name override would leave the project one rename away from the thing the lock exists to stop: every project addition lands after the floor, and for anything last-write-wins the later entry simply wins. So a project addition is refused when it shares an effect with a locked entry, where "effect" is the `type:` for a `policies:` or `transforms:` entry and the set of leaf paths written for a modifier. A floor that locks `response_modifiers[].headers.set.Content-Security-Policy` therefore refuses a project entry writing that header under any name and in any case.
+A lock binds what an entry does, not what it is called. Refusing only a same-name override would leave the project one rename away from the thing the lock exists to stop: every project addition lands after the floor, and for anything last-write-wins the later entry simply wins. So a project layer is refused in three places:
 
-That is deliberately wider than the hazard: two policies of the same type do not always shadow each other, and a project that needs a second one of a locked type asks whoever owns `origin_defaults` to carry it. The alternative is a per-module table of which mechanisms compose, which nothing else in the tree maintains and which would be wrong the first time a module changed.
+- **An addition that shares an effect with a locked entry.** "Effect" is the `type:` for a `policies:` or `transforms:` entry, and the set of leaf paths written for a modifier, compared case-insensitively. A floor that locks `response_modifiers[].headers.set.Content-Security-Policy` refuses a project entry that *declares* that header under any name and in any case.
+- **An addition carrying a script body into a modifier list that holds a lock.** `lua_script`, `js_script`, `rego_module` and `rego_module_path` all return `set_headers`, and what they set is inside a string, so the effect comparison cannot read it. Rather than promise a boundary it cannot hold, the composition refuses the addition outright while any entry in that list is locked. This is why the bullet above says "declares": a locked header is safe from a declarative entry by comparison, and safe from a script by refusal.
+- **An override of an unlocked entry that introduces an effect a lock above it already holds.** Merging replaces scalars, `type:` included, so a project matching an unlocked floor entry by name can rewrite it into a locked entry's mechanism, or make it write a locked header, without renaming or adding anything. Only the effects the merge introduced are compared, and only against locks the entry already sits after: the floor's own arrangement of two entries touching one thing is the platform's business, and an entry does not shadow a lock that comes later.
+
+The first rule is deliberately wider than the hazard: two policies of the same type do not always shadow each other, and a project that needs a second one of a locked type asks whoever owns `origin_defaults` to carry it. The alternative is a per-module table of which mechanisms compose, which nothing else in the tree maintains and which would be wrong the first time a module changed.
 
 ### What a project may set
 

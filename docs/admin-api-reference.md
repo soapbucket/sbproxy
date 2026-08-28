@@ -1,6 +1,6 @@
 # Admin API reference
 
-*Last modified: 2026-08-27*
+*Last modified: 2026-08-28*
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential

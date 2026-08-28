@@ -1783,12 +1783,17 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
     // inherit the same refusals. An operator learns that a production
     // entry follows a branch, or that two project repositories claim the
     // same hostname, before anything has been fetched.
+    // A document that declares an extension bundle source may name a
+    // policy or transform type this build cannot resolve from here; see
+    // `origin_profile::UnknownTypes`.
+    let declares_extension_bundles =
+        config_file.extensions.bundles_dir.is_some() || !config_file.extensions.sources.is_empty();
     if let Some(defaults) = config_file.origin_defaults.as_ref() {
-        crate::origin_profile::validate_origin_defaults(defaults)
+        crate::origin_profile::validate_origin_defaults_with(defaults, declares_extension_bundles)
             .map_err(|error| anyhow::anyhow!("config compile: {error}"))?;
     }
     if let Some(sources) = config_file.origin_sources.as_ref() {
-        crate::origin_profile::validate_origin_sources(sources)
+        crate::origin_profile::validate_origin_sources_with(sources, declares_extension_bundles)
             .map_err(|error| anyhow::anyhow!("config compile: {error}"))?;
         let hand_written: std::collections::BTreeSet<String> =
             config_file.origins.keys().cloned().collect();
@@ -1813,14 +1818,11 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
             "origin_sources declared; composition runs in the aggregator, not on this node"
         );
     }
-    // Every series, every load, whether or not the block is present. See
-    // `origin_source_entry_counts` for why this is outside the `if let`.
-    for (tier, pinned, unpinned) in
-        crate::origin_profile::origin_source_entry_counts(config_file.origin_sources.as_ref())
-    {
-        sbproxy_observe::metrics::set_origin_source_entries(tier.as_str(), true, pinned as i64);
-        sbproxy_observe::metrics::set_origin_source_entries(tier.as_str(), false, unpinned as i64);
-    }
+    // The counts ride on the compiled config rather than being written
+    // here: this function also compiles candidate documents. See
+    // `origin_profile::origin_source_entry_counts`.
+    let origin_source_entries =
+        crate::origin_profile::origin_source_entry_counts(config_file.origin_sources.as_ref());
 
     if config_file
         .proxy
@@ -2507,6 +2509,7 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
 
     Ok(CompiledConfig {
         extension_bundles: config_file.extensions,
+        origin_source_entries,
         origins,
         host_map,
         server: config_file.proxy,

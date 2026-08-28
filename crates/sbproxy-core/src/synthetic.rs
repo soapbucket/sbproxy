@@ -245,6 +245,7 @@ mod tests {
         let mut host_map = HashMap::new();
         host_map.insert(CompactString::new(hostname), 0);
         let compiled = sbproxy_config::CompiledConfig {
+            origin_source_entries: Default::default(),
             extension_bundles: Default::default(),
             origins: vec![origin],
             host_map,

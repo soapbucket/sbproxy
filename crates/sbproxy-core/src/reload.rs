@@ -149,6 +149,17 @@ fn feature_flag_store(
 /// derived from the pipeline's compiled config so any reader on the
 /// new path sees consistent data within sub-microsecond skew.
 pub fn load_pipeline(new_pipeline: CompiledPipeline) {
+    // The one seam every install goes through, boot and reload alike, so
+    // it is where a gauge describing the running document belongs.
+    // `compile_config` is not that seam: it also validates candidate
+    // documents, and an authority payload can never carry
+    // `origin_sources` because the path is denied to it, so publishing
+    // from there zeroed every series on each publish (WOR-2432
+    // re-review N1).
+    for (tier, pinned, unpinned) in new_pipeline.config.origin_source_entries.rows() {
+        sbproxy_observe::metrics::set_origin_source_entries(tier.as_str(), true, pinned as i64);
+        sbproxy_observe::metrics::set_origin_source_entries(tier.as_str(), false, unpinned as i64);
+    }
     let next_feature_flags = feature_flag_store(&new_pipeline.config);
     let previous_cache_reserve_health = current_pipeline_full().cache_reserve_health.clone();
     // --- Wave 4 / G4.10 wire: projection cache refresh ---
@@ -695,6 +706,7 @@ mod tests {
         let mut host_map = HashMap::new();
         host_map.insert(CompactString::new(hostname), 0);
         CompiledConfig {
+            origin_source_entries: Default::default(),
             extension_bundles: Default::default(),
             origins: vec![sbproxy_config::CompiledOrigin {
                 hostname: CompactString::new(hostname),
