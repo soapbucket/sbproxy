@@ -385,6 +385,20 @@ impl McpResourceServerProvider {
         Self::new_with_security_context(config, crate::McpSecurityContext::new())
     }
 
+    /// Whether this provider verifies against an in-process key set
+    /// rather than dialing `jwks_url`.
+    ///
+    /// Exists so a caller that wires the colocated shortcut can assert
+    /// it took effect. The binding is a string comparison between two
+    /// operator-supplied config values, and its failure mode is silent
+    /// and total: the verifier falls back to the fetch, the egress
+    /// policy refuses the proxy's own address, and every MCP request
+    /// 401s. Nothing went red for that until this accessor let a test
+    /// look.
+    pub fn uses_local_jwks(&self) -> bool {
+        self.local_jwks.is_some()
+    }
+
     /// Verify against `jwks` held in this process instead of fetching
     /// `jwks_url`.
     ///
@@ -400,20 +414,6 @@ impl McpResourceServerProvider {
     /// failure this exists to prevent: a broker signing key configured
     /// as a PEM with no `public_jwk` publishes an empty key set, and
     /// binding the verifier to it would 401 every request forever.
-    /// Whether this provider verifies against an in-process key set
-    /// rather than dialing `jwks_url`.
-    ///
-    /// Exists so a caller that wires the colocated shortcut can assert
-    /// it took effect. The binding is a string comparison between two
-    /// operator-supplied config values, and its failure mode is silent
-    /// and total: the verifier falls back to the fetch, the egress
-    /// policy refuses the proxy's own address, and every MCP request
-    /// 401s. Nothing went red for that until this accessor let a test
-    /// look.
-    pub fn uses_local_jwks(&self) -> bool {
-        self.local_jwks.is_some()
-    }
-
     pub fn with_local_jwks(mut self, jwks: JwkSet) -> Result<Self> {
         if jwks.keys.is_empty() {
             return Err(anyhow!(

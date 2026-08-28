@@ -449,9 +449,7 @@ async fn walk_authority_hints(
         // Is the superior a configured trust anchor? If so we can
         // assemble + validate the chain right now.
         if resolver.anchors().jwks_for(superior_url.as_str()).is_some() {
-            if let Err(e) = budget.claim_fetch() {
-                return Err(e);
-            }
+            budget.claim_fetch()?;
             let subordinate_compact = match fetcher
                 .fetch_subordinate_statement(&fetch_endpoint, current_entity_id)
                 .await
@@ -462,9 +460,7 @@ async fn walk_authority_hints(
                     continue;
                 }
             };
-            if let Err(e) = budget.record_bytes(subordinate_compact.len()) {
-                return Err(e);
-            }
+            budget.record_bytes(subordinate_compact.len())?;
             let chain = leaf_to_anchor_chain(
                 visited,
                 &subordinate_compact,
@@ -492,9 +488,7 @@ async fn walk_authority_hints(
         match recurse_result {
             Ok(child_chain) => {
                 // Fetch the subordinate statement only AFTER the superior's chain is authenticated
-                if let Err(e) = budget.claim_fetch() {
-                    return Err(e);
-                }
+                budget.claim_fetch()?;
                 let subordinate_compact = match fetcher
                     .fetch_subordinate_statement(&fetch_endpoint, current_entity_id)
                     .await
@@ -505,9 +499,7 @@ async fn walk_authority_hints(
                         continue;
                     }
                 };
-                if let Err(e) = budget.record_bytes(subordinate_compact.len()) {
-                    return Err(e);
-                }
+                budget.record_bytes(subordinate_compact.len())?;
 
                 // Splice this step's subordinate statement onto
                 // the chain returned by the deeper walk. The

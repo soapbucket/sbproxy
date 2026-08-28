@@ -154,7 +154,7 @@ fn is_link_local_v6(ip: &Ipv6Addr) -> bool {
 /// carry an IPv4 address inside a v6 one, and unwrapping each would
 /// mean deciding what the embedded address means on a network whose
 /// translation policy this crate cannot see. They are refused outright
-/// by [`is_reserved_non_dialable`] instead:
+/// by the dial-time reserved-space check instead:
 ///
 /// * `::a.b.c.d`, the deprecated IPv4-compatible form.
 /// * `64:ff9b::/96` and `64:ff9b:1::/48`, the NAT64 well-known
