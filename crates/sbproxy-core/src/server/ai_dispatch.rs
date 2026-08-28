@@ -22401,8 +22401,16 @@ mod external_guardrail_context_tests {
             )
         }
 
-        /// Complete SSE data frames carrying a JSON payload in a relayed
-        /// response.
+        /// Starts of SSE data frames carrying a JSON payload in a
+        /// relayed response.
+        ///
+        /// Starts, not completed frames: this matches the `data:`
+        /// prefix and the byte that opens its JSON payload, and never
+        /// looks for the terminating blank line, so a caller waiting on
+        /// `n` has `n - 1` frames delivered whole and one begun.
+        /// Callers want a lower bound on delivered content and get one;
+        /// the caller below needs 9 completion tokens and waits for
+        /// about 70.
         ///
         /// `data: [DONE]` and the response headers are deliberately not
         /// counted: a caller waiting on this wants frames the usage
@@ -23442,13 +23450,17 @@ mod external_guardrail_context_tests {
                             "the relay never delivered its first frames downstream, so the \
                              dispatch was never mid-stream and this test could not run",
                         )
-                        .expect("the downstream client outlived the frames it was counting");
+                        .expect(
+                            "the downstream client task ended before it counted the frames, \
+                             so the relay closed the socket or the fixture itself failed",
+                        );
                     None
                 }
             };
             assert!(
                 finished.is_none(),
-                "the fixture has to still be streaming when the future is dropped"
+                "the fixture has to still be streaming when the future is dropped, but the \
+                 dispatch returned first: {finished:?}"
             );
             // The drop, and with it the guard's `Drop`.
             drop(dispatch);
