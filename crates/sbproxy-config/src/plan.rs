@@ -615,6 +615,33 @@ pub const BLAST_RADIUS_MATRIX: &[BlastRadiusRule] = &[
         radius: BlastRadius::Reload,
         reason: "proxy block re-read on reload",
     },
+    // --- Composition inputs. Re-read and re-validated on reload, but a
+    //     node composes nothing: the origins these produce change when
+    //     the aggregator next composes and publishes ---
+    BlastRadiusRule {
+        pattern: "origin_defaults.**",
+        radius: BlastRadius::Reload,
+        reason: "the composition floor is re-read and re-validated on reload; composed \
+                 origins change when the aggregator next composes and publishes",
+    },
+    BlastRadiusRule {
+        pattern: "origin_defaults",
+        radius: BlastRadius::Reload,
+        reason: "the composition floor is re-read and re-validated on reload; composed \
+                 origins change when the aggregator next composes and publishes",
+    },
+    BlastRadiusRule {
+        pattern: "origin_sources.**",
+        radius: BlastRadius::Reload,
+        reason: "the source list is re-read and re-validated on reload; the origins it \
+                 produces change when the aggregator next composes and publishes",
+    },
+    BlastRadiusRule {
+        pattern: "origin_sources",
+        radius: BlastRadius::Reload,
+        reason: "the source list is re-read and re-validated on reload; the origins it \
+                 produces change when the aggregator next composes and publishes",
+    },
 ];
 
 /// Look up the blast radius for a single canonicalised path by
@@ -1768,6 +1795,29 @@ origins:
     fn matrix_lookup_admin_port_is_restart() {
         let (r, _) = lookup_blast_radius("proxy.admin.port");
         assert_eq!(r, BlastRadius::Restart);
+    }
+
+    /// The composition blocks are Reload, and the reason says what an
+    /// operator would otherwise get wrong: a node re-reads them but
+    /// composes nothing, so the origins they produce move when the
+    /// aggregator next publishes. Without a rule they would fall to the
+    /// default, whose reason reads "no specific rule matched".
+    #[test]
+    fn matrix_lookup_composition_blocks_are_reload_with_a_real_reason() {
+        for path in [
+            "origin_defaults",
+            "origin_defaults.policies.*.mode",
+            "origin_sources",
+            "origin_sources.tier",
+            "origin_sources.entries.*.revision",
+        ] {
+            let (radius, reason) = lookup_blast_radius(path);
+            assert_eq!(radius, BlastRadius::Reload, "{path}");
+            assert!(
+                reason.contains("aggregator"),
+                "{path}: fell through to the default reason: {reason}"
+            );
+        }
     }
 
     // The whole admin subtree is Restart, not just the listener fields.
