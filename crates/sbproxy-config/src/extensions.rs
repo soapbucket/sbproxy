@@ -57,6 +57,30 @@ pub struct ExtensionBundlesConfig {
 }
 
 impl ExtensionBundlesConfig {
+    /// Whether this document names any place an extension bundle could
+    /// come from.
+    ///
+    /// One function rather than the same two-clause expression at every
+    /// call site. Two things ask it and they must not drift: config
+    /// compile decides whether an unrecognized policy `type:` in
+    /// `origin_defaults` is a typo or a bundle-provided type, and the
+    /// aggregator decides the same thing about the same document. A
+    /// detector narrower than the enforcer would have `sbproxy validate`
+    /// warn where the aggregator hard-refuses, which is the
+    /// far-end-of-a-GitOps-loop failure those checks exist to move
+    /// earlier.
+    ///
+    /// # What this cannot see
+    ///
+    /// Whether any bundle actually loads. `bundles_dir` may be empty and
+    /// a source may 404. The question is deliberately the weaker one: a
+    /// document with nowhere to get a type from could not have acquired
+    /// it, and that is answerable without fetching anything.
+    #[must_use]
+    pub fn declares_any_source(&self) -> bool {
+        self.bundles_dir.is_some() || !self.sources.is_empty()
+    }
+
     /// Validate source fields without touching the filesystem or network.
     ///
     /// # Errors

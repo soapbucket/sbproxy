@@ -379,6 +379,7 @@ fn every_example_origin_profile_composes_and_constructs() {
             .map(|entry| sbproxy_config::origin_profile::ProfileBinding {
                 entry,
                 document: &profile,
+                commit: None,
             })
             .collect();
         let resolution = match sbproxy_config::origin_profile::resolve_origins(

@@ -932,13 +932,23 @@ pub struct ProfileBinding<'a> {
     pub entry: &'a OriginSourceEntry,
     /// The profile document exactly as committed.
     pub document: &'a str,
+    /// The commit this document was read at, when the caller resolved
+    /// one.
+    ///
+    /// The resolver stays pure: it never asks a repository anything, so
+    /// the sha is the fetching caller's to supply. `None` is honest
+    /// rather than empty, and it is what a fixture or an offline compose
+    /// from a file on disk reports; the provenance then names the
+    /// repository and the requested revision without claiming a commit
+    /// nobody resolved.
+    pub commit: Option<&'a str>,
 }
 
 /// A default a project switched off, recorded so the drop is auditable.
 ///
 /// There is no delete verb, matching the existing merge contract.
 /// `disabled: true` leaves a record; an absence would not.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DroppedDefault {
     /// The entry whose profile switched it off.
     pub entry: String,
@@ -948,6 +958,248 @@ pub struct DroppedDefault {
     pub list: String,
     /// The dropped entry's `name:`.
     pub name: String,
+    /// The composition layer that switched it off.
+    pub dropped_by: CompositionLayer,
+    /// The composition layer that had introduced it, when one had.
+    ///
+    /// `None` for a `disabled: true` naming something no earlier layer
+    /// had put there. That case is not a silent no-op: the entry is
+    /// dropped rather than appended, so the record is the only trace,
+    /// and an operator reading a drop with no introducer is reading a
+    /// profile switching off something that was never on.
+    pub introduced_by: Option<CompositionLayer>,
+}
+
+// --- Composition provenance (WOR-2440) -------------------------------
+
+/// Which composition layer wrote a leaf.
+///
+/// The four layers of one composed origin, in application order. The
+/// answer to "who do I talk to about this policy" is different for each
+/// of them: `origin_defaults` and an entry `overrides:` block are the
+/// platform's runtime document, `spec.base` and `spec.environments[env]`
+/// are the project's repository.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "layer", rename_all = "snake_case")]
+pub enum CompositionLayer {
+    /// The platform floor every composed origin starts from.
+    OriginDefaults,
+    /// The project profile's environment-independent layer.
+    ProfileBase,
+    /// The project profile's layer for the environment this entry
+    /// selected.
+    ProfileEnvironment {
+        /// The `environments:` key, which is [`OriginSourceEntry::environment`].
+        environment: String,
+    },
+    /// The runtime entry's `overrides:` block, layered last.
+    EntryOverride,
+}
+
+impl CompositionLayer {
+    /// The config path this layer is spelled at, which is what an
+    /// operator greps for.
+    #[must_use]
+    pub fn path(&self) -> String {
+        match self {
+            Self::OriginDefaults => "origin_defaults".to_string(),
+            Self::ProfileBase => "spec.base".to_string(),
+            Self::ProfileEnvironment { environment } => {
+                format!("spec.environments[{environment}]")
+            }
+            Self::EntryOverride => "origin_sources.entries[].overrides".to_string(),
+        }
+    }
+
+    /// Whether the project repository authored this layer.
+    ///
+    /// The other two are the runtime document, which is the same split
+    /// [`LayerAuthor`] enforces during the merge. Kept as one question
+    /// rather than a match at every call site, because "is this the
+    /// project's to change" is the question provenance exists to answer.
+    #[must_use]
+    pub(crate) const fn is_project_authored(&self) -> bool {
+        matches!(self, Self::ProfileBase | Self::ProfileEnvironment { .. })
+    }
+}
+
+/// Where one leaf of a composed origin came from.
+///
+/// No value, ever. Provenance says which layer set a leaf and which
+/// repository that layer came from; the leaf's value is in the composed
+/// document, which is the thing under access control. A composed leaf
+/// can be a `secret://backend/name` reference an entry bound, so
+/// carrying values here would put a reference into every surface that
+/// renders provenance, including a `sbproxy plan` a developer pastes
+/// into a ticket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeafOrigin {
+    /// The layer that last wrote this leaf.
+    #[serde(flatten)]
+    pub layer: CompositionLayer,
+    /// The `origin_sources` entry that deployed the profile. `None` only
+    /// for [`CompositionLayer::OriginDefaults`], which no entry owns.
+    pub entry: Option<String>,
+    /// The profile document's own `name:`, for the two layers the
+    /// project authored. `None` for the two runtime-authored layers,
+    /// because naming a profile there would credit a repository for a
+    /// line the platform wrote.
+    pub profile: Option<String>,
+    /// The repository the layer was read from and the revision it
+    /// resolved to, for the two project-authored layers.
+    ///
+    /// [`crate::config_merge::Provenance`] rather than a parallel type:
+    /// the node-side merge already answers "which repository and which
+    /// commit" in exactly this shape, and an operator reading
+    /// `/admin/config/effective` beside a composition should not have to
+    /// learn a second vocabulary. `Provenance::Local` is never used
+    /// here; a runtime-authored layer reports `None` instead, because
+    /// the runtime document's own origin is the node's to report and not
+    /// the composition's.
+    pub source: Option<crate::config_merge::Provenance>,
+}
+
+/// Composition provenance for one composed origin.
+///
+/// A leaf path here is **not** a path into the composed document. The
+/// four merged lists are keyed by `name:` (`policies[waf].action_on_match`)
+/// because a list index moves whenever an earlier entry is dropped or a
+/// project appends one, and an audit trail that renumbered itself
+/// between two composes would be worse than none. The composed document
+/// carries indices and no names, since `strip_bookkeeping` removes
+/// `name:` before the typed parse.
+///
+/// # What this cannot see
+///
+/// Attribution is derived by asking which layer last wrote each leaf,
+/// not by observing the merge as it runs. The two agree because both
+/// read the same per-layer mappings under the same replace rule, and
+/// [`Self::unattributed`] is the check on that: a leaf in the composed
+/// origin that no layer claims means the derivation and the merge have
+/// diverged. An unnamed entry in one of the four lists is matched by
+/// value rather than by name, so two byte-identical unnamed entries in
+/// different layers are credited to the later one. A list entry whose
+/// `name:` literally begins with `#` collides with the placeholder used
+/// for unnamed entries.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompositionProvenance {
+    /// Leaf path to the layer that wrote it, in path order.
+    leaves: BTreeMap<String, LeafOrigin>,
+    /// Every default this origin's composition switched off.
+    drops: Vec<DroppedDefault>,
+    /// Composed leaves no layer claimed. Empty in every composition this
+    /// repository can produce; see the type's `What this cannot see`.
+    unattributed: Vec<String>,
+}
+
+impl CompositionProvenance {
+    /// The layer that wrote `path`, or `None` when nothing composed
+    /// there.
+    #[must_use]
+    pub fn get(&self, path: &str) -> Option<&LeafOrigin> {
+        self.leaves.get(path)
+    }
+
+    /// Every recorded `(path, origin)` pair, in path order.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &LeafOrigin)> {
+        self.leaves.iter()
+    }
+
+    /// Every recorded path, in path order.
+    pub fn paths(&self) -> impl Iterator<Item = &str> {
+        self.leaves.keys().map(String::as_str)
+    }
+
+    /// Number of attributed leaves.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.leaves.len()
+    }
+
+    /// Whether nothing was attributed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.leaves.is_empty()
+    }
+
+    /// Every default this origin's composition dropped.
+    #[must_use]
+    pub fn drops(&self) -> &[DroppedDefault] {
+        &self.drops
+    }
+
+    /// Composed leaves no layer claimed.
+    #[must_use]
+    pub fn unattributed(&self) -> &[String] {
+        &self.unattributed
+    }
+
+    /// Render this origin's provenance as aligned text.
+    ///
+    /// The form `sbproxy plan` prints. A human reading "why is this WAF
+    /// rule here" needs the layer and the repository on the same line as
+    /// the field, and needs it without a JSON tool, which is the whole
+    /// point of the surface.
+    #[must_use]
+    pub fn render(&self, host: &str) -> String {
+        let mut out = String::new();
+        out.push_str(host);
+        out.push('\n');
+        if self.leaves.is_empty() {
+            out.push_str("  (nothing composed)\n");
+            return out;
+        }
+        let width = self
+            .leaves
+            .keys()
+            .map(String::len)
+            .max()
+            .unwrap_or(0)
+            .min(60);
+        for (path, origin) in &self.leaves {
+            let mut line = format!("  {path:<width$}  {}", origin.layer.path());
+            if let Some(entry) = origin.entry.as_deref() {
+                line.push_str(&format!("  entry {entry}"));
+            }
+            if let Some(crate::config_merge::Provenance::Git { repo, commit, .. }) =
+                origin.source.as_ref()
+            {
+                line.push_str(&format!("  {repo}@{}", short_commit(commit)));
+            }
+            out.push_str(&line);
+            out.push('\n');
+        }
+        for drop in &self.drops {
+            let introduced = drop
+                .introduced_by
+                .as_ref()
+                .map_or_else(|| "nothing".to_string(), CompositionLayer::path);
+            out.push_str(&format!(
+                "  dropped {}[{}]  {} dropped a default introduced by {introduced}  entry {}\n",
+                drop.list,
+                drop.name,
+                drop.dropped_by.path(),
+                drop.entry
+            ));
+        }
+        for path in &self.unattributed {
+            out.push_str(&format!(
+                "  {path}  UNATTRIBUTED: no composition layer claims this leaf, which means the \
+                 provenance derivation and the merge have diverged\n"
+            ));
+        }
+        out
+    }
+}
+
+/// A commit shortened for a human-readable line, left whole when it is
+/// not a sha (`HEAD`, a branch name a development tier allows).
+fn short_commit(commit: &str) -> &str {
+    if commit.len() > 12 && commit.chars().all(|c| c.is_ascii_hexdigit()) {
+        &commit[..12]
+    } else {
+        commit
+    }
 }
 
 /// One host an entry claims, before anything is fetched.
@@ -974,6 +1226,24 @@ pub struct OriginResolution {
     /// may deploy the API half of a profile and leave the webhook half
     /// to another environment.
     pub unbound_profile_origins: Vec<String>,
+    /// Which layer set each leaf of each composed origin, keyed by the
+    /// same hostname `origins` is keyed by (WOR-2440).
+    pub provenance: BTreeMap<String, CompositionProvenance>,
+    /// The composed origins as the mapping the merge produced, keyed
+    /// the same way.
+    ///
+    /// The same content as [`Self::origins`], and both are kept because
+    /// they answer different questions. `origins` is the typed
+    /// round-trip: a composition that will not deserialize into
+    /// `RawOriginConfig` is refused, and that check has to run. This is
+    /// what an aggregator publishes, because `RawOriginConfig` carries
+    /// no `skip_serializing_if`, so re-serializing the typed struct
+    /// writes all fifty-two fields per origin, most of them nulls and
+    /// empty lists nobody authored. At a hundred origins that is a
+    /// document several times the size of the one anybody wrote, and it
+    /// is also a document whose leaves provenance cannot attribute,
+    /// because no layer set them.
+    pub composed: BTreeMap<String, Mapping>,
 }
 
 // --- Load-time validation --------------------------------------------
@@ -1547,7 +1817,8 @@ pub fn resolve_origins_with(
                     declared: names_of(profile.spec.keys()),
                 });
             };
-            let composed = compose_one(defaults, entry, &profile, declared, &mut resolution.drops)?;
+            let (composed, provenance) =
+                compose_one(defaults, binding, &profile, declared, &mut resolution.drops)?;
             for host in hosts {
                 let origin: RawOriginConfig =
                     serde_yaml::from_value(Value::Mapping(composed.clone())).map_err(|source| {
@@ -1557,6 +1828,10 @@ pub fn resolve_origins_with(
                             reason: redact_serde_message(&source.to_string()),
                         }
                     })?;
+                resolution
+                    .provenance
+                    .insert(host.clone(), provenance.clone());
+                resolution.composed.insert(host.clone(), composed.clone());
                 tracing::info!(
                     host = %host,
                     entry = %entry.name,
@@ -1785,33 +2060,261 @@ struct DeclaredInputs {
     inputs: Vec<OriginProfileInput>,
 }
 
-/// Layer one profile origin into a single composed origin mapping.
+/// Layer one profile origin into a single composed origin mapping, and
+/// record which layer set each leaf.
+///
+/// The layer list is built before the fold rather than during it,
+/// because two things need it: the drop record has to name the layer
+/// that had introduced the entry being switched off, and the
+/// provenance walk has to ask every layer, in order, which of them last
+/// wrote each composed leaf.
 fn compose_one(
     defaults: Option<&Mapping>,
-    entry: &OriginSourceEntry,
+    binding: &ProfileBinding<'_>,
     profile: &OriginProfile,
     declared: &OriginProfileOrigin,
     drops: &mut Vec<DroppedDefault>,
-) -> Result<Mapping, OriginResolveError> {
-    let mut accumulated = defaults.cloned().unwrap_or_default();
-    let mut context = LayerContext {
-        entry,
-        profile: &profile.name,
-        author: LayerAuthor::Project,
-        drops,
-    };
-    layer(&mut accumulated, &declared.base.to_mapping()?, &mut context)?;
+) -> Result<(Mapping, CompositionProvenance), OriginResolveError> {
+    let entry = binding.entry;
+    let mut layers: Vec<(CompositionLayer, Mapping)> = Vec::with_capacity(4);
+    if let Some(defaults) = defaults {
+        layers.push((CompositionLayer::OriginDefaults, defaults.clone()));
+    }
+    layers.push((CompositionLayer::ProfileBase, declared.base.to_mapping()?));
     if let Some(environment) = entry.environment.as_deref() {
         if let Some(overlay) = declared.environments.get(environment) {
-            layer(&mut accumulated, &overlay.to_mapping()?, &mut context)?;
+            layers.push((
+                CompositionLayer::ProfileEnvironment {
+                    environment: environment.to_string(),
+                },
+                overlay.to_mapping()?,
+            ));
         }
     }
     if let Some(overrides) = entry.overrides.as_ref() {
-        context.author = LayerAuthor::Runtime;
-        layer(&mut accumulated, overrides, &mut context)?;
+        layers.push((CompositionLayer::EntryOverride, overrides.clone()));
     }
+
+    // The floor is cloned in rather than layered over an empty mapping.
+    // Layering it would run the platform's own document through the
+    // merge's project checks, which is a different question from the one
+    // those checks answer.
+    let mut accumulated = defaults.cloned().unwrap_or_default();
+    let first_project_layer = usize::from(defaults.is_some());
+    let drops_before = drops.len();
+    for index in first_project_layer..layers.len() {
+        let (identity, mapping) = &layers[index];
+        let mut context = LayerContext {
+            entry,
+            profile: &profile.name,
+            author: if identity.is_project_authored() {
+                LayerAuthor::Project
+            } else {
+                LayerAuthor::Runtime
+            },
+            drops,
+            layer: identity.clone(),
+            earlier: &layers[..index],
+        };
+        layer(&mut accumulated, mapping, &mut context)?;
+    }
+
+    let provenance = attribute_leaves(
+        &accumulated,
+        &layers,
+        binding,
+        &profile.name,
+        drops[drops_before..].to_vec(),
+    );
     strip_bookkeeping(&mut accumulated);
-    Ok(accumulated)
+    Ok((accumulated, provenance))
+}
+
+/// Which layer last wrote each leaf of one composed origin.
+///
+/// Derived from the composed mapping rather than stamped during the
+/// merge, so coverage is exact by construction: every path this returns
+/// is a leaf that really composed, and every composed leaf is asked
+/// about. The rule is the merge's own, `merge_plain` replaces and the
+/// four named lists merge by `name:`, so the last layer carrying a leaf
+/// at a path is the layer whose value survived there.
+///
+/// Runs on the mapping **before** `strip_bookkeeping`, because `name:`
+/// is the key the four lists are addressed by and stripping removes it.
+fn attribute_leaves(
+    composed: &Mapping,
+    layers: &[(CompositionLayer, Mapping)],
+    binding: &ProfileBinding<'_>,
+    profile_name: &str,
+    drops: Vec<DroppedDefault>,
+) -> CompositionProvenance {
+    let per_layer: Vec<BTreeSet<String>> = layers
+        .iter()
+        .map(|(_, mapping)| leaf_paths_of(mapping))
+        .collect();
+    let unnamed_per_layer: Vec<Vec<(&str, &Value)>> = layers
+        .iter()
+        .map(|(_, mapping)| unnamed_list_entries(mapping))
+        .collect();
+
+    let mut composed_leaves: Vec<String> = Vec::new();
+    let mut unnamed_prefixes: Vec<(String, &Value, &str)> = Vec::new();
+    collect_leaves(
+        "",
+        composed,
+        &mut composed_leaves,
+        &mut unnamed_prefixes,
+        None,
+    );
+
+    let mut leaves: BTreeMap<String, LeafOrigin> = BTreeMap::new();
+    let mut unattributed: Vec<String> = Vec::new();
+    for path in composed_leaves {
+        // An unnamed list entry keeps no stable key across layers: its
+        // index in the composed list is a position the merge produced,
+        // not one any layer wrote. It is also never merged, only
+        // appended, so it appears verbatim in the layer that wrote it
+        // and matching by value is exact.
+        let owner = unnamed_prefixes
+            .iter()
+            .find(|(prefix, _, _)| path.starts_with(prefix.as_str()))
+            .and_then(|(_, value, list)| {
+                unnamed_per_layer.iter().rposition(|entries| {
+                    entries.iter().any(|(candidate_list, candidate)| {
+                        candidate_list == list && candidate == value
+                    })
+                })
+            })
+            .or_else(|| per_layer.iter().rposition(|paths| paths.contains(&path)));
+        match owner {
+            Some(index) => {
+                leaves.insert(path, leaf_origin(&layers[index].0, binding, profile_name));
+            }
+            None => unattributed.push(path),
+        }
+    }
+    CompositionProvenance {
+        leaves,
+        drops,
+        unattributed,
+    }
+}
+
+/// One attributed leaf, with the repository facts filled in for the two
+/// project-authored layers.
+fn leaf_origin(
+    layer: &CompositionLayer,
+    binding: &ProfileBinding<'_>,
+    profile_name: &str,
+) -> LeafOrigin {
+    let project = layer.is_project_authored();
+    LeafOrigin {
+        layer: layer.clone(),
+        entry: match layer {
+            CompositionLayer::OriginDefaults => None,
+            _ => Some(binding.entry.name.clone()),
+        },
+        profile: project.then(|| profile_name.to_string()),
+        source: project.then(|| crate::config_merge::Provenance::Git {
+            repo: crate::source::redact_repo(&binding.entry.repo),
+            reference: binding
+                .entry
+                .revision
+                .clone()
+                .unwrap_or_else(|| "HEAD".to_string()),
+            commit: binding
+                .commit
+                .map_or_else(|| "(unresolved)".to_string(), str::to_string),
+        }),
+    }
+}
+
+/// Every leaf path in one origin mapping, in the provenance grammar.
+fn leaf_paths_of(mapping: &Mapping) -> BTreeSet<String> {
+    let mut paths = Vec::new();
+    let mut unnamed = Vec::new();
+    collect_leaves("", mapping, &mut paths, &mut unnamed, None);
+    paths.into_iter().collect()
+}
+
+/// Every unnamed entry of the four merged lists, as `(list, entry)`.
+fn unnamed_list_entries(mapping: &Mapping) -> Vec<(&str, &Value)> {
+    let mut out = Vec::new();
+    for list in PROFILE_LIST_MERGE_KEYS {
+        let Some(items) = mapping.get(*list).and_then(Value::as_sequence) else {
+            continue;
+        };
+        for item in items {
+            if entry_name(item).is_none() {
+                out.push((*list, item));
+            }
+        }
+    }
+    out
+}
+
+/// Walk one origin mapping and record every leaf path.
+///
+/// A leaf is anything that is not a non-empty mapping, matching
+/// [`crate::config_merge::ProvenanceMap`]'s contract: a sequence merges
+/// or replaces wholesale, so its elements are not separate leaves, and
+/// an empty mapping carries a statement even with no children.
+///
+/// The four merged lists are the exception, and the reason this is not
+/// the merge module's walker: their elements *are* addressed
+/// individually, by `name:`, so they are walked and keyed by that name.
+/// `unnamed` collects the path prefix of each element that has none,
+/// paired with the element itself so the caller can attribute it by
+/// value.
+fn collect_leaves<'a>(
+    prefix: &str,
+    mapping: &'a Mapping,
+    out: &mut Vec<String>,
+    unnamed: &mut Vec<(String, &'a Value, &'a str)>,
+    inside_list_entry: Option<&str>,
+) {
+    for (key, value) in mapping {
+        let Some(key) = key.as_str() else {
+            continue;
+        };
+        if inside_list_entry.is_some() && BOOKKEEPING_KEYS.contains(&key) {
+            // Stripped from the composed origin, so not a leaf of it.
+            continue;
+        }
+        let path = if prefix.is_empty() {
+            key.to_string()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        if inside_list_entry.is_none() && PROFILE_LIST_MERGE_KEYS.contains(&key) {
+            if let Some(items) = value.as_sequence() {
+                for (index, item) in items.iter().enumerate() {
+                    let element_key = match entry_name(item) {
+                        Some(name) => name.to_string(),
+                        None => {
+                            let placeholder = format!("#{index}");
+                            unnamed.push((format!("{path}[{placeholder}]"), item, key));
+                            placeholder
+                        }
+                    };
+                    let element_path = format!("{path}[{element_key}]");
+                    match item.as_mapping() {
+                        Some(item) => {
+                            collect_leaves(&element_path, item, out, unnamed, Some(key));
+                        }
+                        None => out.push(element_path),
+                    }
+                }
+                continue;
+            }
+        }
+        match value {
+            Value::Mapping(child) if !child.is_empty() => {
+                collect_leaves(&path, child, out, unnamed, inside_list_entry);
+            }
+            _ => out.push(path),
+        }
+    }
 }
 
 /// Who wrote the layer being applied.
@@ -1832,6 +2335,48 @@ struct LayerContext<'a> {
     profile: &'a str,
     author: LayerAuthor,
     drops: &'a mut Vec<DroppedDefault>,
+    /// Which layer is being applied, for the drop record.
+    layer: CompositionLayer,
+    /// The layers already applied, newest last, so a drop can name the
+    /// layer that had introduced what it switched off.
+    earlier: &'a [(CompositionLayer, Mapping)],
+}
+
+impl LayerContext<'_> {
+    /// The drop record for one `disabled: true`, with both layers named.
+    fn dropped(&self, list: &str, name: Option<&str>) -> DroppedDefault {
+        DroppedDefault {
+            entry: self.entry.name.clone(),
+            profile: self.profile.to_string(),
+            list: list.to_string(),
+            name: name.unwrap_or("?").to_string(),
+            dropped_by: self.layer.clone(),
+            introduced_by: name.and_then(|name| self.introduced_by(list, name)),
+        }
+    }
+
+    /// The last layer before this one carrying `name` in `list`.
+    ///
+    /// Last rather than first: an entry a project's `base` layer already
+    /// edited and its `environments` layer then disabled was most
+    /// recently set by `base`, and that is the layer whose author gets
+    /// asked about the drop.
+    fn introduced_by(&self, list: &str, name: &str) -> Option<CompositionLayer> {
+        self.earlier
+            .iter()
+            .rev()
+            .find(|(_, mapping)| {
+                mapping
+                    .get(list)
+                    .and_then(Value::as_sequence)
+                    .is_some_and(|items| {
+                        items
+                            .iter()
+                            .any(|item| entry_name(item).is_some_and(|existing| existing == name))
+                    })
+            })
+            .map(|(identity, _)| identity.clone())
+    }
 }
 
 /// Apply one layer over the accumulated origin.
@@ -1980,12 +2525,8 @@ fn merge_named_list(
                     });
                 }
                 if flag(item, "disabled") {
-                    context.drops.push(DroppedDefault {
-                        entry: context.entry.name.clone(),
-                        profile: context.profile.to_string(),
-                        list: list.to_string(),
-                        name: incoming_name.unwrap_or("?").to_string(),
-                    });
+                    let record = context.dropped(list, incoming_name);
+                    context.drops.push(record);
                     *slot = None;
                     continue;
                 }
@@ -2049,12 +2590,8 @@ fn merge_named_list(
                     // still a statement that it must not run. Appending it
                     // and stripping the flag would install exactly what
                     // the author asked to switch off.
-                    context.drops.push(DroppedDefault {
-                        entry: context.entry.name.clone(),
-                        profile: context.profile.to_string(),
-                        list: list.to_string(),
-                        name: incoming_name.unwrap_or("?").to_string(),
-                    });
+                    let record = context.dropped(list, incoming_name);
+                    context.drops.push(record);
                     continue;
                 }
                 // A lock has to bind the entry's effect, not its name.

@@ -84,6 +84,7 @@ fn compose(
         &[ProfileBinding {
             entry: &entry,
             document: profile,
+            commit: None,
         }],
         &no_local_origins(),
     )
@@ -98,6 +99,7 @@ fn compose_err(profile: &str, entry_yaml: &str, floor: Option<&str>) -> OriginRe
         &[ProfileBinding {
             entry: &entry,
             document: profile,
+            commit: None,
         }],
         &no_local_origins(),
     )
@@ -2205,10 +2207,12 @@ spec:
             ProfileBinding {
                 entry: &first,
                 document: CHECKOUT_PROFILE,
+                commit: None,
             },
             ProfileBinding {
                 entry: &second,
                 document: billing_profile,
+                commit: None,
             },
         ],
         &no_local_origins(),
@@ -2371,6 +2375,7 @@ fn the_shipped_example_pair_composes() {
         .map(|entry| ProfileBinding {
             entry,
             document: &profile,
+            commit: None,
         })
         .collect();
     let resolution = resolve_origins(Some(defaults), &bindings, &hand_written)

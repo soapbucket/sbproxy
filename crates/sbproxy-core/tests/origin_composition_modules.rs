@@ -62,6 +62,7 @@ fn a_composed_rate_limit_budget_policy_parses_through_the_real_module() {
         &[ProfileBinding {
             entry: &entry,
             document: PROFILE,
+            commit: None,
         }],
         &BTreeSet::new(),
     )
