@@ -17,10 +17,12 @@
 # still carried to policy as `request.kya.kyab_balance.amount`, so a
 # CEL or Lua policy can price its own routes.
 #
-# Every verdict, including the refusing ones, lands on
-# `request.kya.verdict` for policy and on the trust tier: a verified
-# token earns `strong`, a presented-and-rejected one drops the request
-# to `suspicious`.
+# Every verdict feeds the trust tier: a verified token earns `strong`,
+# a presented-and-rejected one drops the request to `suspicious`. Two
+# of them reach `request.kya.verdict`, and only two, because only two
+# continue into the policy chain: `verified`, and
+# `directory_unavailable` when `fail_open: true` admitted anyway.
+# Everything else refuses, so no policy runs to read it.
 #
 # This example needs an issuer publishing /.well-known/jwks.json at
 # `issuers[].url`; the README has one. Without it every request answers
@@ -67,8 +69,12 @@ origins:
           # issuer is unreachable. Same window the Web Bot Auth
           # directory cache uses, on purpose.
           stale_grace_secs: 86400
-      # Smallest currency unit, so 1000 is $10.00 for a USD balance.
+      # Smallest unit of `min_kyab_currency`, so 1000 is $10.00.
       min_kyab_balance: 1000
+      # The floor is denominated. A balance in another currency counts
+      # as zero rather than being compared numerically: 5000 COP is
+      # about a dollar twenty, and the proxy holds no exchange rate.
+      min_kyab_currency: USD
       # Leave false unless you have decided that serving unverified
       # agent traffic beats refusing it while an issuer is down.
       fail_open: false

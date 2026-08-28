@@ -300,24 +300,39 @@ impl ExtAuthzProvider {
         outcome
     }
 
+    /// The subset of the request's headers the check document carries.
+    ///
+    /// Its own function, and `pub(crate)` rather than inlined into
+    /// [`Self::authorize_inner`], because it is this provider's whole
+    /// security posture: an operator who names nothing gets a check
+    /// document with no request headers in it at all. WOR-2667's first
+    /// test for that copied the filter expression into the test body,
+    /// so reverting the filter to the enterprise
+    /// `is_empty() || contains(..)` semantics left the test green. The
+    /// production path and the test call this.
+    pub(crate) fn forwarded_headers<'a>(
+        &'a self,
+        headers: &'a http::HeaderMap,
+    ) -> BTreeMap<&'a str, &'a str> {
+        self.headers_to_forward
+            .iter()
+            .filter_map(|name| {
+                let value = headers.get(name.as_str())?.to_str().ok()?;
+                Some((name.as_str(), value))
+            })
+            .collect()
+    }
+
     async fn authorize_inner(
         &self,
         method: &str,
         path: &str,
         headers: &http::HeaderMap,
     ) -> ExtAuthzOutcome {
-        let forwarded: BTreeMap<&str, &str> = self
-            .headers_to_forward
-            .iter()
-            .filter_map(|name| {
-                let value = headers.get(name.as_str())?.to_str().ok()?;
-                Some((name.as_str(), value))
-            })
-            .collect();
         let document = CheckRequest {
             method,
             path,
-            headers: forwarded,
+            headers: self.forwarded_headers(headers),
         };
 
         // The caller instruments this future with
@@ -344,6 +359,21 @@ impl ExtAuthzProvider {
                 return self.on_failure();
             }
         };
+
+        // Envoy treats a non-2xx from the authorization service as a
+        // failure of the check rather than as a decision, and so does
+        // `oauth_introspection` a file over. A 500 whose body happens
+        // to parse as `{"allowed": true}` is not an authorization.
+        let status = response.status();
+        if !status.is_success() {
+            warn!(
+                url = %sbproxy_security::url_redact::redacted_url(&self.url),
+                status = status.as_u16(),
+                failure_mode_allow = self.failure_mode_allow,
+                "ext_authz service answered a non-success status"
+            );
+            return self.on_failure();
+        }
 
         if let Some(length) = response.content_length() {
             if length > MAX_CHECK_RESPONSE_BYTES as u64 {
@@ -640,18 +670,13 @@ mod tests {
         );
         headers.insert(http::header::COOKIE, http::HeaderValue::from_static("s=1"));
 
-        let forwarded: BTreeMap<&str, &str> = provider
-            .headers_to_forward
-            .iter()
-            .filter_map(|name| {
-                let value = headers.get(name.as_str())?.to_str().ok()?;
-                Some((name.as_str(), value))
-            })
-            .collect();
+        // The production filter, not a copy of it. Reverting
+        // `forwarded_headers` to the enterprise
+        // `is_empty() || contains(..)` semantics turns this red.
         let document = serde_json::to_string(&CheckRequest {
             method: "GET",
             path: "/",
-            headers: forwarded,
+            headers: provider.forwarded_headers(&headers),
         })
         .expect("document serializes");
 
@@ -661,5 +686,26 @@ mod tests {
             "an un-allowlisted Authorization header must not leave the proxy: {document}"
         );
         assert!(!document.contains("s=1"), "{document}");
+    }
+
+    /// The empty allowlist is the default and it is the whole point.
+    /// Same production entry point, so the two cannot drift.
+    #[test]
+    fn an_empty_allowlist_forwards_no_request_header() {
+        let provider = ExtAuthzProvider::from_config(serde_json::json!({
+            "type": "ext_authz",
+            "url": "https://authz.internal/check",
+        }))
+        .expect("config compiles");
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer super-secret"),
+        );
+        headers.insert("x-tenant", http::HeaderValue::from_static("acme"));
+        assert!(
+            provider.forwarded_headers(&headers).is_empty(),
+            "an operator who named no headers must ship none"
+        );
     }
 }

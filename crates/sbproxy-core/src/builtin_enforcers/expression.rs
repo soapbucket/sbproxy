@@ -115,7 +115,14 @@ pub(crate) fn decision_views(ctx: &RequestContext) -> sbproxy_modules::Expressio
     #[cfg(feature = "agent-class")]
     let kya_view = Some(sbproxy_extension::cel::context::KyaVerdictView {
         verdict: ctx.kya_verdict,
-        agent_id: ctx.agent_id.as_ref().map(|id| id.as_str()),
+        // WOR-2667: the token's claim, not the resolver's. Reading
+        // `ctx.agent_id` here served a User-Agent-derived guess inside
+        // a namespace documented as verified identity, so
+        // `request.kya.agent_id == "gptbot"` was clearable by anyone
+        // sending that User-Agent, and a pin on the issuer-minted id
+        // never matched at all.
+        agent_id: ctx.kya_agent_id.as_deref(),
+        agent_class: ctx.kya_agent_class.as_deref(),
         vendor: ctx.kya_vendor.as_deref(),
         kya_version: ctx.kya_version.as_deref(),
         kyab_balance: ctx.kya_kyab_balance,

@@ -442,7 +442,8 @@ proxy:
 | `config_authority` | object | unset | Subscribe to or publish signed configuration bundles. |
 | `key_management` | object | unset | Mutable key store, policy cache, encryption, claim mapping, and declarative seed. |
 | `l2_cache_settings` | object | | Optional shared-state backend. Alias: `l2_cache`. |
-| `cache_reserve` | object | unset | Optional cold-tier response cache backed by memory, filesystem, or Redis. |
+| `anomaly` | object | unset | Behavioral anomaly detection over the TLS fingerprint, resolver source, headless-library signal, and per-address rate, plus the per-agent-class reputation score it feeds and the optional admission thresholds that read it. Disabled by default. See [anomaly-detection.md](anomaly-detection.md). |
+| `cache_reserve` | object | unset | Optional cold-tier response cache backed by memory, filesystem, Redis, or object storage (S3, GCS, Azure Blob, or a local directory), with optional at-rest sealing. See [cache-reserve.md](cache-reserve.md). |
 | `compression_state` | object | unset | Process-owned Local AI summary-state path. See [compression_state](#compression_state). |
 | `config_history` | object | unset | Durable local ring of every applied config revision, kept for inspection and future rollback. Disabled by default. See [config_history](#config_history). |
 | `response_cache_store` | object | unset | Picks the backing store for the shared response cache and optionally encrypts entries at rest. See [Choosing the backing store](#choosing-the-backing-store). When unset, the store is Redis if `l2_cache_settings` is configured and an in-process map otherwise. |
@@ -3226,12 +3227,12 @@ The check document and the answer:
 
 Four behaviors are worth knowing before you point this at a service:
 
-- **`headers_to_forward` is an allowlist and it starts empty.** Nothing from the request reaches the service until you name it. That is deliberate: a default that forwarded everything would ship `Authorization` and `Cookie` to the authorization service on the first request after you set the URL.
+- **`headers_to_forward` is an allowlist and it starts empty.** Nothing from the request reaches the service until you name it. That is deliberate: a default that forwarded everything would ship `Authorization` and `Cookie` to the authorization service on the first request after you set the URL. If you are moving a config off a build that linked the enterprise auth crate, that build read an empty list as "forward everything"; see [config-stability.md](config-stability.md#ext_authzheaders_to_forward--forwards-nothing-not-everything).
 - **Failure is closed.** A service that times out, refuses the connection, or answers something that is not a check document refuses the request with a `503`. `failure_mode_allow: true` inverts that, and every request it admits is counted on `sbproxy_ext_authz_decisions_total{outcome="fail_open"}` rather than folded into the allow count, because a request that proceeded without the decision being made is the event worth alerting on.
 - **Headers on an allow are not copied upstream.** The service can name a subject, and that lands on the principal, but arbitrary header injection into the upstream request is `forward_auth`'s `trust_headers`, not this provider.
 - **Like `ldap_auth` and `forward_auth`, this dials out on the request path.** Authentication runs before an origin's `policies:`, so the origin's own `rate_limit` cannot cap what this provider dials. Budget `timeout_ms` for a service sitting next to the proxy.
 
-Unlike `forward_auth`, this provider composes inside an `authentication:` list and evaluates on the HTTP/3 dispatch path.
+Unlike `forward_auth`, this provider composes inside an `authentication:` list. It also evaluates on the HTTP/3 dispatch path, which is not a reason to pick it today: [HTTP/3 is not served by this build](#http3-fields).
 
 See [examples/auth-ext-authz/](../examples/auth-ext-authz/) for a runnable setup with a stub authorization service.
 
@@ -3277,7 +3278,7 @@ See [examples/auth-oauth-introspection/](../examples/auth-oauth-introspection/) 
 
 Verify a Know Your Agent token: an issuer-signed identity an AI agent presents in the `X-Skyfire-KYA` header, carrying who the agent is, who operates it, and optionally how much it can spend.
 
-This is the provider for admitting agent traffic by identity rather than by credential. A verified token establishes an agent id, a vendor, an agent class, and an advisory spend balance, and every one of those is readable from policy as `request.kya.*`.
+This is the provider for admitting agent traffic by identity rather than by credential. A verified token establishes an agent id, a vendor, an agent class, and an advisory spend balance, and every one of those is readable from policy as `request.kya.*`, from the token's own claims rather than from the User-Agent-derived resolver.
 
 ```yaml
 origins:
@@ -3292,6 +3293,7 @@ origins:
           jwks_refresh_interval_secs: 3600
           stale_grace_secs: 86400
       min_kyab_balance: 1000
+      min_kyab_currency: USD
       fail_open: false
 ```
 
@@ -3302,18 +3304,27 @@ origins:
 | `issuers[].url` | string | required | Issuer URL, matched verbatim against the token's `iss`. Must be `https://` |
 | `issuers[].jwks_refresh_interval_secs` | int | 3600 | How long a fetched JWKS and denylist stay fresh. Clamped to 300 to 86400 |
 | `issuers[].stale_grace_secs` | int | 86400 | How long past the refresh interval a cached copy still serves while the issuer is unreachable |
-| `min_kyab_balance` | int | none | Spend floor in the smallest currency unit. A verified token below it is refused with `402` |
+| `min_kyab_balance` | int | none | Spend floor in the smallest unit of `min_kyab_currency`. A verified token below it is refused with `402` |
+| `min_kyab_currency` | string | `USD` | Currency the floor is denominated in. A balance in another currency counts as zero |
 | `fail_open` | bool | `false` | Admit the request when the issuer's directory cannot be reached |
 
 Verification is the eight steps the KYA profile defines, in order: decode the header, pin `alg` to ES256 or RS256, check `iss` against the allowlist before any network fetch, resolve the signing key from the issuer's `/.well-known/jwks.json`, verify the signature, verify `exp` and `iat` with two seconds of skew, check that `aud` names this gateway's hostname or the literal `*`, and check the token's `jti` against the issuer's `/.well-known/kya-denylist.json`. A `404` on the denylist is an empty denylist, not an outage: an issuer that has revoked nothing does not have to publish the document.
 
+A token carrying no `jti` cannot be revoked, so it is refused when the issuer publishes a non-empty denylist. Admitting it would make "revocation is checked on every verification" false for a whole class of token while the fetch still succeeds and logs nothing. An issuer with nothing to revoke has made no promise this breaks, so a token with no `jti` still verifies against an empty denylist.
+
 What the caller sees: a verified token is admitted, and its `sub` becomes the principal. A missing token gets `401`, and so does an expired, revoked, or otherwise invalid one. A verified token below `min_kyab_balance` gets `402 Payment Required`, which is a status a paying client can act on, rather than the `401` that would tell it to fetch a credential it already has. An issuer whose JWKS or denylist could not be fetched, with no cached copy still inside its stale-grace window, gets `503` unless `fail_open: true`.
 
-A balance whose `expires_at` has passed counts as zero, and so does one whose `expires_at` does not parse. Leave `min_kyab_balance` unset and the balance gates nothing; it is still carried to policy as `request.kya.kyab_balance.amount`.
+Three ways a balance is worth nothing against the floor, and each is a refusal rather than a guess: it names a currency other than `min_kyab_currency`, its `expires_at` has passed, or its `expires_at` does not parse. The currency rule matters more than it looks: 5000 JPY is about 32 dollars and 5000 COP is about a dollar twenty, so a floor of `1000` meaning ten dollars is cleared by both if the comparison is numeric. The proxy holds no exchange rate and will not invent one.
+
+Leave `min_kyab_balance` unset and the balance gates nothing; it is still carried to policy as `request.kya.kyab_balance.amount`.
 
 Verdicts are not cached. The JWKS and the denylist are, per issuer, but a token is verified on every request, because a cached verdict is a revocation the proxy has decided not to see.
 
-Every verdict, including the refusing ones, is published on `sbproxy_kya_verdicts_total{verdict}` and stamped onto `request.kya.verdict` for CEL, Lua, JavaScript, and WASM policies. The verdict also feeds the [trust tier](trust-tiers.md): a verified token earns `strong`, a presented-and-rejected one drops the request to `suspicious`, and an unreachable directory stays neutral, because a fetch failure is not evidence about the caller.
+Every verdict, including the refusing ones, is published on `sbproxy_kya_verdicts_total{verdict}`. The verdict also feeds the [trust tier](trust-tiers.md): a verified token earns `strong`, a presented-and-rejected one drops the request to `suspicious`, and an unreachable directory stays neutral, because a fetch failure is not evidence about the caller.
+
+Two verdicts reach `request.kya.verdict`, and only two, because only two continue into the policy chain: `verified`, and `directory_unavailable` when `fail_open: true` admitted the request anyway. Every other verdict refuses, so no policy runs to read it. A policy that tightens behavior while an issuer is down is therefore written against `directory_unavailable` and works; one written against `revoked` never fires, because a revoked token never gets that far.
+
+A verified token also populates `request.kya.agent_id`, `request.kya.agent_class`, `request.kya.vendor`, and `request.kya.kya_version` from the token's own claims. `request.kya.agent_id` is deliberately not `request.agent_id`: the latter is what the agent-class resolver worked out from the User-Agent and the operator catalog, and pinning an identity on it is pinning something the caller chose. Pin `request.kya.agent_id` when you mean the identity the issuer signed.
 
 See [examples/auth-kya/](../examples/auth-kya/) for a runnable setup with a local issuer fixture.
 

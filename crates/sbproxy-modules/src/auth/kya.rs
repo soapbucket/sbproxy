@@ -14,7 +14,8 @@
 //! An agent identity that carries a balance lets an origin refuse a
 //! caller that cannot pay before the request reaches the upstream that
 //! would bill for it. `min_kyab_balance` is that gate: a token whose
-//! balance is below the configured floor is refused with a `402
+//! balance is below the configured floor, or denominated in a currency
+//! other than `min_kyab_currency`, is refused with a `402
 //! Payment Required`, which is the status a paying client can act on,
 //! rather than the `401` that tells it to go get a new credential it
 //! does not need. Leave `min_kyab_balance` unset and the balance is
@@ -23,9 +24,11 @@
 //!
 //! # Where the verdict lands
 //!
-//! Every verdict, not just the accepting one, is stamped onto the
-//! per-request context as `request.kya.verdict` for CEL, Lua,
-//! JavaScript, and WASM policies, and it feeds the trust tier: a
+//! Two verdicts reach the per-request context as
+//! `request.kya.verdict`, and only two, because only two continue into
+//! the policy chain: `verified`, and `directory_unavailable` when
+//! `fail_open` admitted the request anyway. Everything else refuses, so
+//! no policy runs to read it. Every verdict feeds the trust tier: a
 //! verified token earns `strong`, a presented-and-rejected one drops
 //! the request to `suspicious`, and a directory the proxy could not
 //! reach stays neutral because a fetch failure is not evidence about
@@ -49,7 +52,13 @@
 //!   different gateway does not verify here.
 //! * **Revocation is checked on every verification**, against the
 //!   issuer's published denylist, cached with the same stale-grace
-//!   window as the JWKS.
+//!   window as the JWKS. A token carrying no `jti` cannot be revoked,
+//!   so it is refused outright when the issuer publishes a non-empty
+//!   denylist rather than admitted past a check that cannot run.
+//! * **The balance floor is denominated.** `min_kyab_currency`
+//!   defaults to `USD`, and a balance in another currency counts as
+//!   zero rather than being compared numerically or converted at a
+//!   rate the proxy does not hold.
 //! * **A fetch failure fails closed by default.** `fail_open: true`
 //!   inverts it for deployments that would rather serve than refuse
 //!   while an issuer is down; the verdict is still recorded as
@@ -109,6 +118,12 @@ const MAX_DOCUMENT_BYTES: usize = 256 * 1024;
 /// Clock skew tolerated on `exp` and `iat`, in seconds.
 const CLOCK_SKEW_SECS: u64 = 2;
 
+/// Currency a balance floor is denominated in when the operator does
+/// not say. USD because that is what the KYA profile's issuers mint in
+/// today; naming it explicitly is what keeps the floor from being a
+/// bare number that means whatever the token says it means.
+const DEFAULT_KYAB_CURRENCY: &str = "USD";
+
 /// Advisory spend balance carried in a KYA token.
 ///
 /// Defined here rather than reusing a wallet type: this is the
@@ -143,11 +158,13 @@ pub enum KyaVerdict {
     /// The token's `jti` is on the issuer's denylist.
     Revoked,
     /// The token verified but its balance is below the configured
-    /// floor.
+    /// floor, or is denominated in another currency.
     InsufficientBalance {
-        /// The floor the origin requires, in the smallest currency
-        /// unit. Operator config, safe to return to the caller.
+        /// The floor the origin requires, in the smallest unit of
+        /// `currency`. Operator config, safe to return to the caller.
         required: u64,
+        /// Currency the floor is denominated in.
+        currency: String,
     },
     /// The JWKS or denylist could not be fetched and no cached copy is
     /// still inside its stale-grace window.
@@ -271,9 +288,19 @@ struct CachedDocument<T> {
 /// KYA token verifier.
 pub struct KyaVerifier {
     issuers: Vec<KyaIssuer>,
-    /// Balance floor, in the smallest currency unit. `None` leaves the
-    /// balance advisory.
+    /// Balance floor, in the smallest unit of
+    /// [`Self::min_kyab_currency`]. `None` leaves the balance
+    /// advisory.
     pub min_kyab_balance: Option<u64>,
+    /// Currency the floor is denominated in. Defaults to `USD`.
+    ///
+    /// A floor without one is incoherent the moment two issuers
+    /// denominate differently: 5000 JPY and 5000 COP both clear a
+    /// floor of 1000 meant as ten dollars, and the second is about a
+    /// dollar twenty. A token whose balance names another currency is
+    /// refused rather than converted, because the proxy holds no rate
+    /// and a wrong rate is worse than a refusal.
+    pub min_kyab_currency: String,
     /// When true, an unreachable issuer admits the request instead of
     /// refusing it.
     pub fail_open: bool,
@@ -287,6 +314,7 @@ impl std::fmt::Debug for KyaVerifier {
         f.debug_struct("KyaVerifier")
             .field("issuers", &self.issuers.len())
             .field("min_kyab_balance", &self.min_kyab_balance)
+            .field("min_kyab_currency", &self.min_kyab_currency)
             .field("fail_open", &self.fail_open)
             .finish()
     }
@@ -323,6 +351,11 @@ impl KyaVerifier {
             fail_open: bool,
             #[serde(default)]
             min_kyab_balance: Option<u64>,
+            #[serde(default = "default_min_kyab_currency")]
+            min_kyab_currency: String,
+        }
+        fn default_min_kyab_currency() -> String {
+            DEFAULT_KYAB_CURRENCY.to_string()
         }
 
         let raw: RawConfig = super::provider_config_from_value(value)?;
@@ -343,6 +376,7 @@ impl KyaVerifier {
         Ok(Self {
             issuers: raw.issuers,
             min_kyab_balance: raw.min_kyab_balance,
+            min_kyab_currency: raw.min_kyab_currency.to_ascii_uppercase(),
             fail_open: raw.fail_open,
             jwks_cache: RwLock::new(HashMap::new()),
             denylist_cache: RwLock::new(HashMap::new()),
@@ -450,8 +484,8 @@ impl KyaVerifier {
             Some(denylist) => denylist,
             None => return KyaVerdict::DirectoryUnavailable,
         };
-        if !decoded.claims.jti.is_empty() && denylist.contains(&decoded.claims.jti) {
-            return KyaVerdict::Revoked;
+        if let Some(verdict) = revocation_verdict(&decoded.claims.jti, &denylist) {
+            return verdict;
         }
 
         if let Some(required) = self.min_kyab_balance {
@@ -459,10 +493,15 @@ impl KyaVerifier {
                 .claims
                 .kyab_balance
                 .as_ref()
-                .map(|balance| spendable_amount(balance, chrono::Utc::now()))
+                .map(|balance| {
+                    spendable_amount(balance, &self.min_kyab_currency, chrono::Utc::now())
+                })
                 .unwrap_or(0);
             if available < required {
-                return KyaVerdict::InsufficientBalance { required };
+                return KyaVerdict::InsufficientBalance {
+                    required,
+                    currency: self.min_kyab_currency.clone(),
+                };
             }
         }
 
@@ -609,6 +648,32 @@ fn store<T>(
     );
 }
 
+/// What the issuer's denylist says about this token.
+///
+/// `None` admits. Two ways to refuse:
+///
+/// * the `jti` is on the list, which is a revocation;
+/// * the token carries no `jti` at all and the issuer publishes a
+///   non-empty list, which is a token that *cannot* be revoked.
+///
+/// The second is the one worth writing down. `jti` is optional in the
+/// claim set, so an absent one used to short-circuit the check
+/// silently: the denylist was fetched, the lookup never ran, and the
+/// module doc's "revocation is checked on every verification" was false
+/// for a whole class of token. An issuer with nothing to revoke has not
+/// made that promise, so an empty denylist still admits.
+fn revocation_verdict(jti: &str, denylist: &HashSet<String>) -> Option<KyaVerdict> {
+    if jti.is_empty() {
+        return denylist.is_empty().then_some(()).map_or(
+            Some(KyaVerdict::Invalid {
+                reason: "missing_jti",
+            }),
+            |()| None,
+        );
+    }
+    denylist.contains(jti).then_some(KyaVerdict::Revoked)
+}
+
 /// Read the `iss` claim out of a token without verifying anything.
 fn peek_issuer(token: &str) -> Option<String> {
     use base64::Engine as _;
@@ -656,13 +721,28 @@ fn classify_jwt_error(error: &jsonwebtoken::errors::Error) -> KyaVerdict {
     }
 }
 
-/// How much of a balance is actually spendable right now.
+/// How much of a balance is actually spendable against a floor
+/// denominated in `required_currency`.
 ///
-/// A balance whose `expires_at` has passed is worth nothing: the
-/// issuer said so, and admitting on it would be spending an allowance
-/// the issuer has already withdrawn. An unparseable `expires_at` is
-/// treated the same way rather than as an unlimited one.
-fn spendable_amount(balance: &KyabBalance, now: chrono::DateTime<chrono::Utc>) -> u64 {
+/// Three ways to be worth nothing, and each is a refusal rather than a
+/// guess:
+///
+/// * **Another currency.** The proxy holds no exchange rate, and a
+///   wrong rate admits an agent on a fraction of the balance the
+///   operator asked for. 5000 COP is about a dollar twenty.
+/// * **Expired.** The issuer already withdrew the allowance; spending
+///   it would be spending money the issuer says is gone.
+/// * **An `expires_at` that does not parse.** Treated as expired
+///   rather than as unlimited, which is the direction that fails
+///   closed.
+fn spendable_amount(
+    balance: &KyabBalance,
+    required_currency: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> u64 {
+    if !balance.currency.eq_ignore_ascii_case(required_currency) {
+        return 0;
+    }
     match chrono::DateTime::parse_from_rfc3339(&balance.expires_at) {
         Ok(expires_at) if expires_at.with_timezone(&chrono::Utc) > now => balance.amount,
         _ => 0,
@@ -841,24 +921,91 @@ mod tests {
     }
 
     #[test]
+    fn a_balance_in_another_currency_is_worth_nothing() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-27T12:00:00Z")
+            .expect("fixed now parses")
+            .with_timezone(&chrono::Utc);
+        let far_future = "2027-01-01T00:00:00Z";
+        // 5000 JPY is about 32 dollars and 5000 COP is about one
+        // twenty. A floor of 1000 meaning ten dollars is cleared by
+        // both if the comparison is numeric.
+        let mut jpy = balance(5_000, far_future);
+        jpy.currency = "JPY".to_string();
+        assert_eq!(
+            spendable_amount(&jpy, "USD", now),
+            0,
+            "a floor in USD must not be cleared by a balance in another currency"
+        );
+        // Case is not the difference between two currencies.
+        let mut lower = balance(5_000, far_future);
+        lower.currency = "usd".to_string();
+        assert_eq!(spendable_amount(&lower, "USD", now), 5_000);
+    }
+
+    #[test]
+    fn the_floor_currency_defaults_to_usd_and_is_normalized() {
+        let verifier = KyaVerifier::from_config(serde_json::json!({
+            "type": "kya",
+            "issuers": [{"url": "https://api.skyfire.test"}],
+            "min_kyab_balance": 1000,
+        }))
+        .expect("verifier compiles");
+        assert_eq!(verifier.min_kyab_currency, "USD");
+
+        let explicit = KyaVerifier::from_config(serde_json::json!({
+            "type": "kya",
+            "issuers": [{"url": "https://api.skyfire.test"}],
+            "min_kyab_balance": 1000,
+            "min_kyab_currency": "eur",
+        }))
+        .expect("verifier compiles");
+        assert_eq!(explicit.min_kyab_currency, "EUR");
+    }
+
+    #[test]
     fn an_expired_balance_is_worth_nothing() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-08-27T12:00:00Z")
             .expect("fixed now parses")
             .with_timezone(&chrono::Utc);
         assert_eq!(
-            spendable_amount(&balance(5_000, "2026-08-27T13:00:00Z"), now),
+            spendable_amount(&balance(5_000, "2026-08-27T13:00:00Z"), "USD", now),
             5_000
         );
         assert_eq!(
-            spendable_amount(&balance(5_000, "2026-08-27T11:00:00Z"), now),
+            spendable_amount(&balance(5_000, "2026-08-27T11:00:00Z"), "USD", now),
             0,
             "a balance the issuer already withdrew must not be spendable"
         );
         assert_eq!(
-            spendable_amount(&balance(5_000, "not-a-timestamp"), now),
+            spendable_amount(&balance(5_000, "not-a-timestamp"), "USD", now),
             0,
             "an unparseable expiry must not read as unlimited"
         );
+    }
+
+    #[test]
+    fn a_token_with_no_jti_is_refused_when_the_issuer_publishes_revocations() {
+        let mut published = HashSet::new();
+        published.insert("01JB0Z3M2K".to_string());
+
+        // Revoked, the case that always worked.
+        assert_eq!(
+            revocation_verdict("01JB0Z3M2K", &published),
+            Some(KyaVerdict::Revoked)
+        );
+        // Not on the list.
+        assert_eq!(revocation_verdict("01JB0OTHER", &published), None);
+        // No `jti` at all: the check cannot run, so the token cannot be
+        // admitted past it. Before WOR-2666's review this returned
+        // `None` and the token was verified.
+        assert_eq!(
+            revocation_verdict("", &published),
+            Some(KyaVerdict::Invalid {
+                reason: "missing_jti"
+            })
+        );
+        // An issuer that publishes nothing has promised nothing.
+        assert_eq!(revocation_verdict("", &HashSet::new()), None);
     }
 
     #[test]
@@ -871,7 +1018,11 @@ mod tests {
             "directory_unavailable"
         );
         assert_eq!(
-            KyaVerdict::InsufficientBalance { required: 1 }.metric_label(),
+            KyaVerdict::InsufficientBalance {
+                required: 1,
+                currency: "USD".to_string()
+            }
+            .metric_label(),
             "insufficient_balance"
         );
         assert_eq!(

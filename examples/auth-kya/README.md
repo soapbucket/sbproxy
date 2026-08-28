@@ -41,6 +41,8 @@ pay, before the request reaches an upstream that bills for it.
 | No `X-Skyfire-KYA` header | `401` | Nothing was presented |
 | Expired, revoked, or badly signed | `401` | A credential was presented and it did not verify |
 | Verified, balance below `min_kyab_balance` | `402` | The credential is fine and the account is empty. A paying client can act on that; a `401` would send it to fetch a token it already has |
+| Verified, balance in another currency | `402` | The floor is denominated in `min_kyab_currency`. 5000 COP is about a dollar twenty, so a numeric comparison would clear a floor meaning ten dollars |
+| Verified, no `jti`, issuer publishes revocations | `401` | A token with no `jti` cannot be revoked, and admitting it past a check that cannot run makes the revocation promise false for that class of token |
 | Issuer's JWKS or denylist unreachable | `503` | The proxy could not verify, so it refuses. `fail_open: true` inverts this |
 
 ## You need an issuer
@@ -113,7 +115,9 @@ identity half. Everything the verified token carried is addressable:
 
 | Expression | Value |
 |---|---|
-| `request.kya.verdict` | `verified`, `missing`, `expired`, `revoked`, `invalid`, `insufficient_balance`, `directory_unavailable` |
+| `request.kya.verdict` | `verified`, or `directory_unavailable` when `fail_open: true` admitted the request anyway. Every other verdict refuses, so no policy runs to read it |
+| `request.kya.agent_id` | The agent identifier the **token** carried. Not `request.agent_id`, which is what the resolver worked out from the User-Agent |
+| `request.kya.agent_class` | The agent class the token claimed |
 | `request.kya.vendor` | The vendor from the token |
 | `request.kya.kya_version` | The KYA spec version the token was minted under |
 | `request.kya.kyab_balance.amount` | The balance, in the smallest currency unit, or `0` |

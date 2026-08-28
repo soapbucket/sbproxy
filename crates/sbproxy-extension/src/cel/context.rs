@@ -341,9 +341,17 @@ pub struct KyaVerdictView<'a> {
     /// `"expired"`, `"revoked"`, `"invalid"`,
     /// `"directory_unavailable"`. `None` when no KYA hook ran.
     pub verdict: Option<&'a str>,
-    /// Resolved agent identifier (mirrors `request.agent_id` for the
-    /// KYA case). Empty when the verdict is not `"verified"`.
+    /// Agent identifier the verified token carried. Empty when the
+    /// verdict is not `"verified"`.
+    ///
+    /// WOR-2667: this is the token's own `agent_id` claim, not
+    /// `request.agent_id`, which the agent-class resolver fills from
+    /// the User-Agent. A policy pinning this is pinning something the
+    /// issuer signed.
     pub agent_id: Option<&'a str>,
+    /// Agent class the verified token claimed (`"crawler"`,
+    /// `"assistant"`). Empty when the verdict is not `"verified"`.
+    pub agent_class: Option<&'a str>,
     /// KYA agent vendor (e.g. `"skyfire"`).
     pub vendor: Option<&'a str>,
     /// KYA spec version (e.g. `"v1"`).
@@ -371,7 +379,7 @@ pub struct KyaVerdictView<'a> {
 /// previous fields so request-time and response-time evaluations can
 /// share one CEL context.
 pub fn populate_kya_namespace(ctx: &mut CelContext, view: &KyaVerdictView<'_>) {
-    let mut kya_map = HashMap::with_capacity(5);
+    let mut kya_map = HashMap::with_capacity(6);
     kya_map.insert(
         "verdict".to_string(),
         CelValue::String(view.verdict.unwrap_or("").to_string()),
@@ -379,6 +387,10 @@ pub fn populate_kya_namespace(ctx: &mut CelContext, view: &KyaVerdictView<'_>) {
     kya_map.insert(
         "agent_id".to_string(),
         CelValue::String(view.agent_id.unwrap_or("").to_string()),
+    );
+    kya_map.insert(
+        "agent_class".to_string(),
+        CelValue::String(view.agent_class.unwrap_or("").to_string()),
     );
     kya_map.insert(
         "vendor".to_string(),
@@ -1947,7 +1959,8 @@ mod tests {
         let mut ctx = build_request_context("GET", "/", &HeaderMap::new(), None, None, "h.com");
         let view = KyaVerdictView {
             verdict: Some("verified"),
-            agent_id: Some("openai-gptbot"),
+            agent_id: Some("agt_01H8XYZ"),
+            agent_class: Some("assistant"),
             vendor: Some("skyfire"),
             kya_version: Some("v1"),
             kyab_balance: Some(1000),
@@ -1959,7 +1972,10 @@ mod tests {
             .eval_bool_source(r#"request.kya.verdict == "verified""#, &ctx)
             .unwrap());
         assert!(engine
-            .eval_bool_source(r#"request.kya.agent_id == "openai-gptbot""#, &ctx)
+            .eval_bool_source(r#"request.kya.agent_id == "agt_01H8XYZ""#, &ctx)
+            .unwrap());
+        assert!(engine
+            .eval_bool_source(r#"request.kya.agent_class == "assistant""#, &ctx)
             .unwrap());
         assert!(engine
             .eval_bool_source(r#"request.kya.vendor == "skyfire""#, &ctx)

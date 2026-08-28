@@ -339,7 +339,7 @@ Auth blocks turn into OpenAPI `securitySchemes` and a `security` requirement att
 | `digest` | `http` scheme `digest` |
 | `bearer` | `http` scheme `bearer`, with `x-sbproxy-require-dpop` when the origin demands an RFC 9449 proof |
 | `jwt` | `http` scheme `bearer`, `bearerFormat: JWT`, plus the required audience and any DPoP or mTLS binding as extensions |
-| `hmac_auth`, `bot_auth` | `http` scheme `signature` (RFC 9421) |
+| `hmac_auth`, `bot_auth` | `apiKey` in the `Signature` header (RFC 9421). Not `http` scheme `signature`, which is not an IANA scheme: a generated client would send `Authorization: Signature ...`, which no verifier reads |
 | `cap` | `http` scheme `bearer`, `bearerFormat: cap` |
 | `oidc` | `openIdConnect`, pointing at the pinned issuer's discovery document |
 | `forward_auth` | `apiKey` in the `Authorization` header, with a description saying the gateway does not know what the authorization service requires |

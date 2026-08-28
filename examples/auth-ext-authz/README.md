@@ -86,6 +86,11 @@ curl -i -H 'Host: authz.local' -H 'X-Tenant: over-quota' http://127.0.0.1:8080/g
 # quota exhausted
 ```
 
+A service that answers a non-2xx status is a failed check, not a
+decision: a `500` whose body happens to parse as `{"allowed": true}` is
+not an authorization, and the request is refused the same way an
+unreachable service is.
+
 Stop the stub service and try again. The request is refused rather than
 admitted, because `failure_mode_allow` is false:
 

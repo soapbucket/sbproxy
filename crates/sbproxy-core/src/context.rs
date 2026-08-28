@@ -1120,6 +1120,22 @@ pub struct RequestContext {
     /// token did not carry a balance, or when no KYA hook ran.
     #[cfg(feature = "agent-class")]
     pub kya_kyab_balance: Option<u64>,
+    /// WOR-2667: the agent identifier the *verified token* carried,
+    /// exposed under `request.kya.agent_id`.
+    ///
+    /// Deliberately separate from [`Self::agent_id`], which the
+    /// agent-class resolver fills from the User-Agent and the operator
+    /// catalog. Those are different claims with different strengths: a
+    /// policy that pins `request.kya.agent_id` is pinning an
+    /// issuer-signed identity, and serving it the resolver's guess
+    /// would let any caller sending the right User-Agent clear the pin.
+    #[cfg(feature = "agent-class")]
+    pub kya_agent_id: Option<String>,
+    /// WOR-2667: the agent class the verified token claimed, exposed
+    /// under `request.kya.agent_class`. Also from the token, not from
+    /// the resolver.
+    #[cfg(feature = "agent-class")]
+    pub kya_agent_class: Option<String>,
 
     // --- aipref signal (Wave 4 / G4.9) ---
     //
@@ -1938,6 +1954,10 @@ impl RequestContext {
             kya_version: None,
             #[cfg(feature = "agent-class")]
             kya_kyab_balance: None,
+            #[cfg(feature = "agent-class")]
+            kya_agent_id: None,
+            #[cfg(feature = "agent-class")]
+            kya_agent_class: None,
             aipref: None,
             canonical_url: None,
             metrics: RequestMetrics::default(),

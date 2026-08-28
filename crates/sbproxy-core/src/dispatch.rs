@@ -309,12 +309,14 @@ async fn check_auth(
         }
         Auth::Kya(verifier) => {
             use sbproxy_modules::auth::KyaVerdict;
-            let hostname = headers
-                .get(http::header::HOST)
-                .and_then(|value| value.to_str().ok())
-                .map(strip_port)
-                .unwrap_or("");
-            match verifier.verify(headers, hostname).await {
+            // The same resolution the dispatch used to route the
+            // request. Reading `Host` alone yields `""` on H3, which
+            // Pingora surfaces as `:authority`, and an empty audience
+            // fails every token minted for this gateway with
+            // `audience_mismatch`: the operator sees a rising `invalid`
+            // count and goes looking at the issuer.
+            let hostname = extract_hostname(headers, uri);
+            match verifier.verify(headers, &hostname).await {
                 KyaVerdict::Verified(_) => true,
                 KyaVerdict::DirectoryUnavailable => verifier.fail_open,
                 _ => false,

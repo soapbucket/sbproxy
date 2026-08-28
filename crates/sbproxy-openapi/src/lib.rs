@@ -876,7 +876,12 @@ fn map_auth(auth: &Value, scheme_name: &str) -> Option<Value> {
     // scope is what its token has to carry, a KYA issuer is whose token
     // the origin accepts. No arm reads a key, a secret, a client id, an
     // introspection credential, or the address of an internal service,
-    // and none should start. The enterprise mappers this replaces
+    // and none should start, with one carve-out stated rather than
+    // hidden: `oauth_client_creds` emits its `token_url`, because the
+    // OpenAPI `clientCredentials` flow object requires `tokenUrl` and a
+    // caller cannot get a token without it. That is a client-facing
+    // endpoint by construction, unlike an introspection endpoint, which
+    // only the gateway calls. The enterprise mappers this replaces
     // published an `oauth_introspection` endpoint URL and an `ext_authz`
     // service address on exactly this document; those are infrastructure
     // a caller has no use for and an attacker does. If a future auth
@@ -961,12 +966,18 @@ fn map_auth(auth: &Value, scheme_name: &str) -> Option<Value> {
             }
             scheme
         }
+        // `Signature` is not an IANA HTTP authentication scheme, so
+        // `{"type":"http","scheme":"signature"}` makes a generated
+        // client send `Authorization: Signature ...`, which no RFC 9421
+        // verifier reads. What the caller actually sends is a
+        // `Signature` header, which `apiKey` expresses exactly.
         "hmac_auth" => json!({
-            "type": "http",
-            "scheme": "signature",
-            "description": "RFC 9421 HTTP Message Signatures with `hmac-sha256`. Sign the \
-                            request and send `Signature` and `Signature-Input`; a token on \
-                            its own is not accepted.",
+            "type": "apiKey",
+            "in": "header",
+            "name": "Signature",
+            "description": "RFC 9421 HTTP Message Signatures with `hmac-sha256`. Send \
+                            `Signature` and `Signature-Input`; a token on its own is not \
+                            accepted.",
             "x-sbproxy-auth-type": auth_type,
         }),
         "ldap_auth" | "ldap" => json!({
@@ -978,8 +989,9 @@ fn map_auth(auth: &Value, scheme_name: &str) -> Option<Value> {
             "x-sbproxy-auth-type": auth_type,
         }),
         "bot_auth" | "web_bot_auth" => json!({
-            "type": "http",
-            "scheme": "signature",
+            "type": "apiKey",
+            "in": "header",
+            "name": "Signature",
             "description": "Web Bot Auth: an RFC 9421 message signature from a key in the \
                             gateway's agent directory. Send `Signature`, `Signature-Input`, \
                             and `Signature-Agent`.",
