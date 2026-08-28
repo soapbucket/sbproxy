@@ -196,6 +196,19 @@ pub struct AccessLogEntry {
     /// Completion / output tokens generated.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_out: Option<u64>,
+    /// WOR-2622: where `tokens_in` / `tokens_out` came from -
+    /// `measured` (the provider reported them), `estimated` (it did not,
+    /// so the gateway counted the delivered text with the model's
+    /// tokenizer) or `absent` (neither was possible, and nothing was
+    /// billed). Omitted whenever `tokens_in` and `tokens_out` are
+    /// themselves omitted.
+    ///
+    /// This is the per-request answer to whether an invoice line was
+    /// measured or estimated. `sbproxy_ai_usage_parse_miss_total` gives
+    /// the same answer in aggregate; no counter can attribute one
+    /// request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage_source: Option<String>,
     /// Classified AI surface label (`chat_completions`, `assistants`,
     /// `image_generation`, ...) for AI gateway requests. None for
     /// non-AI origins or when the surface could not be classified.
@@ -740,6 +753,7 @@ impl Default for AccessLogEntry {
             custom: std::collections::BTreeMap::new(),
             tokens_in: None,
             tokens_out: None,
+            usage_source: None,
             ai_surface: None,
             trace_id: None,
             cache_result: None,
@@ -1063,6 +1077,7 @@ mod tests {
             custom: std::collections::BTreeMap::new(),
             tokens_in: None,
             tokens_out: None,
+            usage_source: None,
             ai_surface: None,
             trace_id: None,
             cache_result: None,

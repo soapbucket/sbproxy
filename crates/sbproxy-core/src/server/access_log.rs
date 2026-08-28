@@ -704,6 +704,7 @@ pub(super) fn emit_access_log(
         },
         tokens_in: ctx.ai_tokens_in,
         tokens_out: ctx.ai_tokens_out,
+        usage_source: ctx.ai_usage_source,
         ai_surface: ctx.ai_surface.clone(),
         cache_result,
         // WOR-1131: omitted unless the boilerplate transform stripped
@@ -910,6 +911,9 @@ pub(super) struct AccessLogContext {
     pub(super) tokens_in: Option<u64>,
     /// Completion / output tokens generated.
     pub(super) tokens_out: Option<u64>,
+    /// WOR-2622: `measured`, `estimated` or `absent` for the two counts
+    /// above. `None` on requests the AI gateway did not settle.
+    pub(super) usage_source: Option<&'static str>,
     /// Classified AI surface label (`chat_completions`, `assistants`,
     /// `image_generation`, ...). Stamped by `handle_ai_proxy` so the
     /// access log carries it alongside provider/model/token counts.
@@ -1009,6 +1013,7 @@ impl AccessLogContext {
             attribution: std::collections::BTreeMap::new(),
             custom: std::collections::BTreeMap::new(),
             tokens_in: None,
+            usage_source: None,
             tokens_out: None,
             ai_surface: None,
             cache_result: None,
@@ -1250,6 +1255,7 @@ pub(super) fn emit_access_log_entry(
         custom: context.custom,
         tokens_in: context.tokens_in,
         tokens_out: context.tokens_out,
+        usage_source: context.usage_source.map(str::to_string),
         ai_surface: context.ai_surface,
         trace_id,
         cache_result: context.cache_result,
