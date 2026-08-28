@@ -92,6 +92,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_agent_detect_inference_seconds` | Histogram | `stable` | `stable` | none | Agent-detect scorer inference latency in seconds. |
 | `sbproxy_agent_detect_score` | Histogram | `stable` | `stable` | none | Agent-detect scorer output score, scaled 0-100. |
 | `sbproxy_agent_detect_total` | Counter | `stable` | `stable` | `agent_id`, `provenance` | Agent-detect scorer verdicts by agent id and provenance. |
+| `sbproxy_agent_reputation_score` | Gauge | `stable` | `beta` | `tenant_id`, `agent_class` | Agent-class reputation in [0.0, 1.0] over the anomaly detector's rolling window; 1.0 is a class that has produced nothing. |
 | `sbproxy_agent_skill_digest_mismatch_total` | Counter | `stable` | `beta` | `skill` | Agent Skills artifact digest mismatches detected at serve time. |
 | `sbproxy_ai_admission_decisions_total` | Counter | `stable` | `beta` | `surface`, `reason`, `outcome` | Pre-provider AI gateway admission decisions: a request refused at the inbound native-format shim before any provider saw it, by inbound surface and bounded reason code. |
 | `sbproxy_ai_audio_seconds_attributed_total` | Counter | `stable` | `beta` | `provider`, `model`, `surface`, `project`, `feature`, `team`, `agent_type`, `environment`, `tenant_id`, `api_key_id` | AI audio seconds consumed (realtime + audio surfaces), partitioned by attribution tag. |
@@ -201,10 +202,11 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_ai_usage_parse_miss_total` | Counter | `stable` | `beta` | `provider`, `surface` | 2xx AI responses on a token surface that carried no parseable usage block (budget debited from an estimate). |
 | `sbproxy_ai_wasted_cost_dollars_total` | Counter | `stable` | `beta` | `kind`, `provider`, `model`, `surface`, `project`, `feature`, `team`, `agent_type`, `environment` | Estimated USD cost of AI spend classified as wasted. |
 | `sbproxy_ai_wasted_tokens_total` | Counter | `stable` | `beta` | `kind`, `provider`, `model`, `surface`, `project`, `feature`, `team`, `agent_type`, `environment` | AI tokens classified as wasted, by waste class. |
+| `sbproxy_anomaly_detected_total` | Counter | `stable` | `beta` | `kind`, `severity` | Behavioral anomalies flagged by a registered detector hook, by kind and severity. |
+| `sbproxy_anomaly_key_budget_spent_total` | Counter | `stable` | `beta` | none | Requests that arrived for an agent class the anomaly detector had no tracking slot for. Non-zero means windows are being displaced, which churns the baseline a `reputation.deny_below` floor reads; a key with no window has no score, and no score is admitted. |
+| `sbproxy_anomaly_tracked_keys` | Gauge | `stable` | `beta` | none | (tenant, agent class) pairs the anomaly detector currently holds a 28-day window for. The detector's resident set is this times the per-key window, so it is the figure to size the process against; the cap is 512. |
 | `sbproxy_audit_chain_read_total` | Counter | `stable` | `beta` | `channel`, `outcome` | Audit-chain read attempts, by verification outcome (verified, broken, unreadable, denied). |
 | `sbproxy_audit_emit_duration_seconds` | Histogram | `stable` | `beta` | `channel`, `outcome` | Wall-clock latency of one audit-channel emission. |
-| `sbproxy_agent_reputation_score` | Gauge | `stable` | `beta` | `tenant_id`, `agent_class` | Agent-class reputation in [0.0, 1.0] over the anomaly detector's rolling window; 1.0 is a class that has produced nothing. |
-| `sbproxy_anomaly_detected_total` | Counter | `stable` | `beta` | `kind`, `severity` | Behavioral anomalies flagged by a registered detector hook, by kind and severity. |
 | `sbproxy_audit_write_failures_total` | Counter | `stable` | `beta` | `channel` | Audit emissions that did not reach a sink they were promised, by audit channel; healthy systems read 0. |
 | `sbproxy_auth_results_total` | Counter | `stable` | `stable` | `origin`, `auth_type`, `result` | Auth check results. |
 | `sbproxy_boilerplate_stripped_bytes_total` | Counter | `stable` | `beta` | `hostname` | Bytes removed by the boilerplate transform, by hostname. |

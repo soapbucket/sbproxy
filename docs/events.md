@@ -223,6 +223,13 @@ events:
     - policy_denied
 ```
 
+The file is created owner-only (`0600`), as is a directory SBproxy
+creates for it (`0700`). A decision event names the tenant, the rule,
+and what was refused, so the feed is a map of the policy surface. A
+file already on disk at a wider mode is tightened when the sink opens
+it, which means a collector running as another user loses access after
+an upgrade unless it runs as the proxy user or reads a fifo instead.
+
 ### The webhook contract
 
 One POST per batch, up to 256 events, `Content-Type: application/json`:

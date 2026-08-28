@@ -673,7 +673,10 @@ impl AnomalyDetector {
     }
 
     /// Tracked keys, for the gauge and for `Debug`.
-    pub fn tracked_keys(&self) -> usize {
+    ///
+    /// Private: `analyze_on` publishes it and the tests in this file
+    /// assert on it, and nothing outside has a reason to ask.
+    fn tracked_keys(&self) -> usize {
         self.tracked.load(Ordering::Acquire)
     }
 

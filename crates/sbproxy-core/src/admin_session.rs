@@ -44,9 +44,20 @@ pub struct Session {
 }
 
 /// Ephemeral HMAC signer for session tokens (random key per process).
-#[derive(Debug)]
 pub struct SessionSigner {
     key: [u8; 32],
+}
+
+/// Redacted `Debug` (WOR-2640). The key signs admin session tokens, so
+/// anything that reads it mints a session for any operator and any
+/// role. Nothing else is in this struct, so there is no identifier
+/// worth keeping: the type name is the whole diagnostic.
+impl std::fmt::Debug for SessionSigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionSigner")
+            .field("key", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl SessionSigner {
@@ -207,5 +218,25 @@ mod tests {
         assert!(!ct_eq(b"session-mac", b"session-maX"));
         assert!(!ct_eq(b"session-mac", b"session-ma"));
         assert!(ct_eq(b"", b""));
+    }
+
+    /// WOR-2640: the session signing key mints an admin session for any
+    /// operator and any role, so it does not belong in a `{:?}`.
+    #[test]
+    fn debug_never_renders_the_session_signing_key() {
+        let signer = SessionSigner::random();
+        let rendered = format!("{signer:?}");
+        assert!(
+            rendered.contains("REDACTED"),
+            "the signing key must render as redacted: {rendered}"
+        );
+        // The key is 32 random bytes, so there is no sentinel to look
+        // for. What is checkable is the whole rendering: a derived
+        // Debug prints the byte array, and an exact match is what
+        // catches a field added next to the key later.
+        assert_eq!(
+            rendered, "SessionSigner { key: \"[REDACTED]\" }",
+            "the key bytes reached Debug: {rendered}"
+        );
     }
 }

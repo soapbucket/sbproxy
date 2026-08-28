@@ -1832,6 +1832,24 @@ pub struct CompiledIdempotency {
     /// Acquire a permit on engagement; pool exhaustion forces the
     /// request through the no-cache path.
     pub permits: Arc<tokio::sync::Semaphore>,
+    /// Per-origin semaphore capping requests parked on another
+    /// request's claim (WOR-2609).
+    ///
+    /// Separate from `permits`, and sized the same, because the two
+    /// bound different things: buffering is microseconds on the way
+    /// upstream, waiting is up to `claim_wait` of doing nothing. Shared,
+    /// one client's retry storm on one key parked every buffering slot
+    /// at the origin and pushed every request on every other key onto
+    /// the no-cache path. Worst-case memory is the sum of the two pools
+    /// times `max_request_body_bytes`.
+    pub wait_permits: Arc<tokio::sync::Semaphore>,
+    /// How long the request that took an idempotency key holds it
+    /// before another request may take it over (WOR-2609). The bound on
+    /// how long a crashed request can wedge one key.
+    pub claim_lease_secs: u64,
+    /// How long an overlapping request waits for the key holder's
+    /// response before answering 409 `ledger.idempotency_in_flight`.
+    pub claim_wait: std::time::Duration,
 }
 
 /// Immutable MCP catalog sources owned by one compiled pipeline generation.
@@ -3707,7 +3725,9 @@ fn compile_origin_idempotency(
             .collect::<anyhow::Result<smallvec::SmallVec<[http::Method; 4]>>>()?,
         None => {
             // Default: the three methods that conventionally carry an
-            // Idempotency-Key per RFC 8594 §2.
+            // Idempotency-Key. RFC 8594 is the `Sunset` header and has
+            // nothing to do with this; the spec of record is
+            // draft-ietf-httpapi-idempotency-key-header.
             smallvec::smallvec![http::Method::POST, http::Method::PUT, http::Method::PATCH,]
         }
     };
@@ -3739,7 +3759,25 @@ fn compile_origin_idempotency(
         .max_concurrent_buffers
         .unwrap_or(sbproxy_config::DEFAULT_IDEMPOTENCY_MAX_CONCURRENT_BUFFERS);
     let permits = Arc::new(tokio::sync::Semaphore::new(max_concurrent_buffers));
+    // A waiter is not a buffered request. Sized the same and pooled
+    // separately so a retry storm on one key cannot spend the slots
+    // every other key needs.
+    let wait_permits = Arc::new(tokio::sync::Semaphore::new(max_concurrent_buffers));
+    let claim_lease_secs = cfg
+        .claim_lease_secs
+        .unwrap_or(sbproxy_middleware::idempotency::DEFAULT_CLAIM_LEASE_SECS);
+    if claim_lease_secs == 0 {
+        anyhow::bail!(
+            "idempotency.claim_lease_secs must be at least 1: a zero lease expires the instant \
+             it is taken, so every overlapping retry reaches the upstream"
+        );
+    }
+    let claim_wait_ms = cfg
+        .claim_wait_ms
+        .unwrap_or(sbproxy_middleware::idempotency::DEFAULT_CLAIM_WAIT_MS);
     Ok(CompiledIdempotency {
+        claim_lease_secs,
+        claim_wait: std::time::Duration::from_millis(claim_wait_ms),
         cache,
         header_name,
         ttl_secs,
@@ -3747,6 +3785,7 @@ fn compile_origin_idempotency(
         max_request_body_bytes,
         max_response_body_bytes,
         permits,
+        wait_permits,
     })
 }
 
@@ -5909,6 +5948,186 @@ hooks:
             usage_reporters: sbproxy_config::UsageReportersConfig::default(),
         });
         config
+    }
+
+    /// WOR-2606: the lease and the wait are operator settings, with
+    /// today's constants as their defaults.
+    ///
+    /// The lease has to be raised above the slowest response an origin
+    /// produces, and there was no way to raise it: a payment with a 3DS
+    /// step-up or a long AI completion outlived the sixty-second
+    /// constant, its claim row expired, and the operator had no key to
+    /// turn. The defaults are what the constants were, so an existing
+    /// config compiles to the same numbers.
+    #[test]
+    fn the_claim_lease_and_wait_are_config_keys_defaulting_to_the_constants() {
+        let defaults = r#"
+origins:
+  "api.localhost":
+    action:
+      type: static
+      status_code: 200
+      body: "ok"
+    idempotency:
+      enabled: true
+"#;
+        let pipeline = CompiledPipeline::from_config_for_validation(
+            sbproxy_config::compile_config(defaults).expect("default config compiles"),
+        )
+        .expect("default pipeline compiles");
+        let idem = pipeline.idempotencies[0].as_ref().expect("idempotency");
+        assert_eq!(
+            idem.claim_lease_secs,
+            sbproxy_middleware::idempotency::DEFAULT_CLAIM_LEASE_SECS
+        );
+        assert_eq!(
+            idem.claim_wait.as_millis() as u64,
+            sbproxy_middleware::idempotency::DEFAULT_CLAIM_WAIT_MS
+        );
+
+        let authored = r#"
+origins:
+  "api.localhost":
+    action:
+      type: static
+      status_code: 200
+      body: "ok"
+    idempotency:
+      enabled: true
+      claim_lease_secs: 300
+      claim_wait_ms: 500
+"#;
+        let pipeline = CompiledPipeline::from_config_for_validation(
+            sbproxy_config::compile_config(authored).expect("authored config compiles"),
+        )
+        .expect("authored pipeline compiles");
+        let idem = pipeline.idempotencies[0].as_ref().expect("idempotency");
+        assert_eq!(idem.claim_lease_secs, 300);
+        assert_eq!(idem.claim_wait, std::time::Duration::from_millis(500));
+
+        // Zero is refused rather than normalized. A zero lease expires
+        // the instant it is taken, which turns single-flight off
+        // without saying so.
+        let zero = r#"
+origins:
+  "api.localhost":
+    action:
+      type: static
+      status_code: 200
+      body: "ok"
+    idempotency:
+      enabled: true
+      claim_lease_secs: 0
+"#;
+        let config = sbproxy_config::compile_config(zero).expect("the yaml itself parses");
+        let error = match CompiledPipeline::from_config_for_validation(config) {
+            Err(error) => error,
+            Ok(_) => panic!("a zero lease must be refused"),
+        };
+        assert!(
+            error.to_string().contains("claim_lease_secs"),
+            "the refusal must name the key: {error}"
+        );
+    }
+
+    /// WOR-2606: a request parked on somebody else's claim draws on its
+    /// own pool, so one key's retry storm cannot spend the buffering
+    /// slots every other key needs.
+    #[test]
+    fn waiters_and_buffered_requests_draw_on_separate_pools() {
+        let yaml = r#"
+origins:
+  "api.localhost":
+    action:
+      type: static
+      status_code: 200
+      body: "ok"
+    idempotency:
+      enabled: true
+      max_concurrent_buffers: 4
+"#;
+        let pipeline = CompiledPipeline::from_config_for_validation(
+            sbproxy_config::compile_config(yaml).expect("config compiles"),
+        )
+        .expect("pipeline compiles");
+        let idem = pipeline.idempotencies[0].as_ref().expect("idempotency");
+        assert_eq!(idem.permits.available_permits(), 4);
+        assert_eq!(idem.wait_permits.available_permits(), 4);
+        assert!(
+            !Arc::ptr_eq(&idem.permits, &idem.wait_permits),
+            "one shared pool is what let waiters starve the buffering path"
+        );
+    }
+
+    /// WOR-2609: the compiled origin hands the request path a cache
+    /// that actually serializes two callers on one key.
+    ///
+    /// The middleware's own suite proves the claim protocol. This proves
+    /// the pipeline is what wires it: `idempotency.backend` selects the
+    /// implementation at compile time, and a backend that answered
+    /// "claimed" to everybody would pass every single-request test in
+    /// this file while putting the stampede straight back.
+    #[test]
+    fn a_compiled_idempotency_origin_single_flights_one_key() {
+        let yaml = r#"
+origins:
+  "api.localhost":
+    action:
+      type: static
+      status_code: 200
+      body: "ok"
+    idempotency:
+      enabled: true
+"#;
+        let config = sbproxy_config::compile_config(yaml).expect("idempotency config compiles");
+        let pipeline = CompiledPipeline::from_config_for_validation(config)
+            .expect("idempotency pipeline compiles");
+        let idem = pipeline.idempotencies[0]
+            .as_ref()
+            .expect("the origin compiles an idempotency block");
+
+        assert!(
+            idem.claim_lease_secs > 0,
+            "a zero lease releases the key before the holder can use it"
+        );
+        assert!(
+            !idem.claim_wait.is_zero(),
+            "a zero wait budget makes every overlapping retry a 409"
+        );
+
+        let held = match sbproxy_middleware::idempotency::claim(
+            &idem.cache,
+            "ws",
+            "order-1",
+            idem.claim_lease_secs,
+        ) {
+            sbproxy_middleware::idempotency::ClaimState::Claimed(held) => held,
+            other => panic!("the first request must take the key, got {other:?}"),
+        };
+        match sbproxy_middleware::idempotency::claim(
+            &idem.cache,
+            "ws",
+            "order-1",
+            idem.claim_lease_secs,
+        ) {
+            sbproxy_middleware::idempotency::ClaimState::InFlight { .. } => {}
+            other => {
+                panic!("a second overlapping request must not take the same key, got {other:?}")
+            }
+        }
+
+        // And the key comes back the instant the holder is gone, rather
+        // than waiting out the lease.
+        drop(held);
+        assert!(matches!(
+            sbproxy_middleware::idempotency::claim(
+                &idem.cache,
+                "ws",
+                "order-1",
+                idem.claim_lease_secs,
+            ),
+            sbproxy_middleware::idempotency::ClaimState::Claimed(_)
+        ));
     }
 
     #[test]

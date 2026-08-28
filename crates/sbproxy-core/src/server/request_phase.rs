@@ -636,6 +636,33 @@ async fn resolve_impersonation_ticket(
     })
 }
 
+/// Hand back the buffering slot and take a waiter slot, for a request
+/// that has finished buffering and is about to park on somebody else's
+/// response (WOR-2609).
+///
+/// The two bounds cover different things and used to be one. The
+/// buffering pool bounds requests that are accumulating a body on their
+/// way upstream, which is microseconds of work; the wait is up to three
+/// seconds of doing nothing. Sharing one pool meant a client that timed
+/// out and fired three hundred retries of a single key parked every
+/// slot the origin had, and every subsequent request on *any* key took
+/// the pool-full path, claimed nothing, and went upstream unprotected.
+/// The requests that bypassed the claim were the ones arriving during
+/// the storm, which is exactly when duplicates are most likely.
+///
+/// Returns `None` when the waiter pool is full too, which the caller
+/// answers with the 409 it would have answered after the wait anyway.
+/// The buffering permit is handed back either way: this request is not
+/// going upstream.
+fn enter_idempotency_wait_slot(
+    buffering: &mut Option<tokio::sync::OwnedSemaphorePermit>,
+    waiters: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let waiter = waiters.clone().try_acquire_owned().ok();
+    *buffering = None;
+    waiter
+}
+
 /// Whether the request already declares more body than the body-matching
 /// cap will hold (WOR-2306).
 ///
@@ -3923,8 +3950,54 @@ pub(super) async fn request_filter(
                             .map(|s| s.trim().to_string())
                             .unwrap_or_default();
                         let workspace = ctx.idempotency_workspace.clone().unwrap_or_default();
-                        let cached = idem.cache.get(&workspace, &key);
-                        if let Some(cached_resp) = cached {
+                        // WOR-2609: take the key, do not merely look at
+                        // it. A read-only probe is what let fifty
+                        // overlapping retries of one POST all see
+                        // "nothing here" and all reach the upstream.
+                        // The claim is atomic against every other
+                        // request that can reach this key, including
+                        // requests on other nodes when the backend is
+                        // the shared store, so exactly one of them goes
+                        // upstream and the rest resolve below.
+                        // Boxed and awaited rather than called inline:
+                        // a shared backend's claim is up to six network
+                        // round trips, and a Pingora worker that blocks
+                        // on one stops serving every other connection
+                        // assigned to it. The box is for the stack, the
+                        // await is for the worker (WOR-2609).
+                        let claimed = Box::pin(sbproxy_middleware::idempotency::claim_async(
+                            &idem.cache,
+                            &workspace,
+                            &key,
+                            idem.claim_lease_secs,
+                        ))
+                        .await;
+                        // `Some(_)` means this request is not the one
+                        // producing the response, so it needs its body
+                        // to compare hashes and is never going upstream.
+                        // The inner `Option` is the response, when one
+                        // already exists.
+                        let resolving = match claimed {
+                            sbproxy_middleware::idempotency::ClaimState::Claimed(held) => {
+                                // This request owns the key. Set the
+                                // buffering flag so `request_body_filter`
+                                // accumulates the body, hashes it, and
+                                // records the response; Pingora's normal
+                                // upstream forwarding handles the body
+                                // delivery. Dropping the claim with the
+                                // context releases the key.
+                                ctx.idempotency_claim = Some(held);
+                                ctx.idempotency_buffering = true;
+                                None
+                            }
+                            sbproxy_middleware::idempotency::ClaimState::Completed(stored) => {
+                                Some(Some(*stored))
+                            }
+                            sbproxy_middleware::idempotency::ClaimState::InFlight { .. } => {
+                                Some(None)
+                            }
+                        };
+                        if let Some(already_stored) = resolving {
                             // Drain the body to compare hashes.
                             let max = idem.max_request_body_bytes;
                             let mut buf = bytes::BytesMut::new();
@@ -4013,44 +4086,153 @@ pub(super) async fn request_filter(
                             }
 
                             let body_hash = sbproxy_middleware::idempotency::hash_body(&buf);
-                            if body_hash == cached_resp.request_body_hash {
-                                // Cache hit: replay the cached response. The
-                                // shared helper also serves GraphQL hits that
-                                // must wait until final-request validation.
-                                let status =
-                                    send_idempotency_cache_hit(session, cached_resp).await?;
-                                ctx.response_status = Some(status);
-                                return Ok(true);
-                            } else {
-                                // Body conflict: same key,
-                                // different body. Return 409
-                                // per RFC 8594.
-                                let (status, content_type, body) =
-                                    sbproxy_middleware::idempotency::conflict_response();
-                                let status_u16 = status.as_u16();
-                                let mut header =
-                                    pingora_http::ResponseHeader::build(status_u16, Some(2))?;
-                                let _ = header.insert_header("content-type", content_type);
-                                let _ =
-                                    header.insert_header("content-length", body.len().to_string());
-                                session
-                                    .write_response_header(Box::new(header), false)
-                                    .await?;
-                                session
-                                    .write_response_body(Some(bytes::Bytes::from(body)), true)
-                                    .await?;
-                                ctx.response_status = Some(status_u16);
-                                return Ok(true);
+                            // A request that found a live claim waits
+                            // for the holder's response instead of
+                            // opening a second upstream connection.
+                            // When the wait runs out it answers 409 and
+                            // the client's retry, which still has an
+                            // undrained body, is what takes the lapsed
+                            // key over: this request cannot, because it
+                            // just consumed its own body to hash it.
+                            //
+                            // Boxed because this is `request_filter`,
+                            // which is already at the worker's stack
+                            // budget on the AI path; an inline future
+                            // here grows every caller's state machine.
+                            // Whether this request parked on somebody
+                            // else's claim. It decides which outcome
+                            // the replay below records (`coalesced`
+                            // rather than `hit`) and whether the 409
+                            // needs one recorded at all: a wait that
+                            // ran out has already counted itself under
+                            // `wait_timeout` or `abandoned`.
+                            let mut waited = false;
+                            let resolved = match already_stored {
+                                Some(stored) => Some(stored),
+                                None => {
+                                    // Waiting is not buffering. This
+                                    // request has drained and hashed its
+                                    // body and is never going upstream,
+                                    // so it hands its buffering slot
+                                    // back and takes a waiter slot
+                                    // instead. Holding the buffering
+                                    // permit across a three-second wait
+                                    // is what let one client's retry
+                                    // storm park every slot at the
+                                    // origin and push every request on
+                                    // every other key onto the
+                                    // no-cache path, during the exact
+                                    // window duplicates are most
+                                    // likely (WOR-2609).
+                                    match enter_idempotency_wait_slot(
+                                        &mut ctx.idempotency_permit,
+                                        &idem.wait_permits,
+                                    ) {
+                                        Some(wait_permit) => {
+                                            waited = true;
+                                            let resolved = Box::pin(
+                                                sbproxy_middleware::idempotency::await_completion(
+                                                    &idem.cache,
+                                                    &workspace,
+                                                    &key,
+                                                    idem.claim_wait,
+                                                ),
+                                            )
+                                            .await;
+                                            drop(wait_permit);
+                                            resolved
+                                        }
+                                        // Every waiter slot is taken.
+                                        // Answer 409 now rather than
+                                        // queueing behind the queue.
+                                        None => None,
+                                    }
+                                }
+                            };
+                            // The streaming proxy path resolves an
+                            // overlap here rather than through
+                            // `check_request`, so until WOR-2606 it
+                            // recorded `miss` or `takeover` from the
+                            // claim and nothing else, ever. Every
+                            // dashboard built on the documented
+                            // outcome set therefore read a near-100%
+                            // miss rate for all proxied traffic and a
+                            // denominator that was not the request
+                            // count. Each arm below records exactly the
+                            // value the reference says it does.
+                            let backend = idem.cache.backend_label();
+                            let (body, marker) = match resolved {
+                                Some(cached_resp) if cached_resp.request_body_hash == body_hash => {
+                                    // Replay. The shared helper also
+                                    // serves GraphQL hits that must wait
+                                    // until final-request validation.
+                                    sbproxy_observe::metrics::record_idempotency_cache_result(
+                                        backend,
+                                        if waited { "coalesced" } else { "hit" },
+                                    );
+                                    let status =
+                                        send_idempotency_cache_hit(session, cached_resp).await?;
+                                    ctx.response_status = Some(status);
+                                    return Ok(true);
+                                }
+                                // Body conflict: same key, different
+                                // body. 409 per
+                                // draft-ietf-httpapi-idempotency-key-header.
+                                Some(_) => {
+                                    sbproxy_observe::metrics::record_idempotency_cache_result(
+                                        backend, "conflict",
+                                    );
+                                    (
+                                        sbproxy_middleware::idempotency::conflict_response(),
+                                        "CONFLICT",
+                                    )
+                                }
+                                // The holder is still working, or died
+                                // without publishing. 409 per
+                                // draft-ietf-httpapi-idempotency-key-header:
+                                // the client retries with the same key.
+                                None => {
+                                    // A request that waited has already
+                                    // been counted by the wait itself.
+                                    // One that never got a waiter slot
+                                    // has not, and it is the other
+                                    // population `in_flight` names: a
+                                    // live claim found by a request
+                                    // that could not wait for it.
+                                    if !waited {
+                                        sbproxy_observe::metrics::record_idempotency_cache_result(
+                                            backend,
+                                            "in_flight",
+                                        );
+                                    }
+                                    (
+                                        sbproxy_middleware::idempotency::in_flight_response(),
+                                        "IN-FLIGHT",
+                                    )
+                                }
+                            };
+                            let (status, content_type, body) = body;
+                            let status_u16 = status.as_u16();
+                            let mut header =
+                                pingora_http::ResponseHeader::build(status_u16, Some(4))?;
+                            let _ = header.insert_header("content-type", content_type);
+                            let _ = header.insert_header("content-length", body.len().to_string());
+                            let _ = header.insert_header("x-sbproxy-idempotency", marker);
+                            if marker == "IN-FLIGHT" {
+                                // A hint, not a contract: the holder's
+                                // lease is the real bound and the client
+                                // may retry sooner.
+                                let _ = header.insert_header("retry-after", "1");
                             }
+                            session
+                                .write_response_header(Box::new(header), false)
+                                .await?;
+                            session
+                                .write_response_body(Some(bytes::Bytes::from(body)), true)
+                                .await?;
+                            ctx.response_status = Some(status_u16);
+                            return Ok(true);
                         }
-
-                        // No cached entry. Set the buffering flag
-                        // so `request_body_filter` accumulates the
-                        // body, hashes it, and records the
-                        // response. This is the first-call (cache
-                        // miss) path; Pingora's normal upstream
-                        // forwarding handles the body delivery.
-                        ctx.idempotency_buffering = true;
                     }
                     Err(_) => {
                         ctx.idempotency_skip_reason = Some("SKIPPED-POOL-FULL");
@@ -8506,5 +8688,66 @@ mod kya_context_tests {
             "an unparseable balance must not read as zero, which a \
              `min_balance` script would treat as a real answer"
         );
+    }
+}
+
+#[cfg(test)]
+mod idempotency_wait_slot_tests {
+    use super::*;
+
+    /// WOR-2609: a follower parked on somebody else's response must not
+    /// be holding a buffering slot while it waits.
+    ///
+    /// The failure this forecloses: `max_concurrent_buffers` defaults
+    /// to 256, a client that times out fires 300 retries of one key,
+    /// 256 of them park in `await_completion` for three seconds each,
+    /// and every subsequent request on *any* key at that origin takes
+    /// the pool-full path, claims nothing, and goes upstream. The
+    /// requests that bypass the claim are the ones arriving during the
+    /// storm, which is when duplicates are most likely.
+    #[tokio::test]
+    async fn a_waiter_hands_its_buffering_slot_back() {
+        let buffers = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let waiters = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+
+        let mut held = Some(
+            buffers
+                .clone()
+                .try_acquire_owned()
+                .expect("the only buffering slot"),
+        );
+        assert_eq!(buffers.available_permits(), 0);
+
+        let waiter = enter_idempotency_wait_slot(&mut held, &waiters);
+        assert!(waiter.is_some(), "a free waiter slot must be handed out");
+        assert!(held.is_none(), "the buffering permit must be given up");
+        assert_eq!(
+            buffers.available_permits(),
+            1,
+            "a request on another key still cannot buffer"
+        );
+        assert_eq!(waiters.available_permits(), 0);
+
+        drop(waiter);
+        assert_eq!(waiters.available_permits(), 1);
+    }
+
+    /// When the waiter pool is full too, the caller gets nothing and
+    /// answers 409 now rather than queueing behind the queue. The
+    /// buffering slot is still handed back: this request has drained
+    /// its body and is not going upstream either way.
+    #[tokio::test]
+    async fn a_full_waiter_pool_refuses_rather_than_queueing() {
+        let buffers = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let waiters = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let _parked = waiters
+            .clone()
+            .try_acquire_owned()
+            .expect("the only waiter slot");
+
+        let mut held = Some(buffers.clone().try_acquire_owned().expect("buffering slot"));
+        assert!(enter_idempotency_wait_slot(&mut held, &waiters).is_none());
+        assert!(held.is_none());
+        assert_eq!(buffers.available_permits(), 1);
     }
 }

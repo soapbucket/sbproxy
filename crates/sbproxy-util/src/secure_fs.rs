@@ -160,6 +160,52 @@ pub fn ensure_file_owner_only(path: &Path) -> io::Result<()> {
     open_with_mode(options, path).map(drop)
 }
 
+/// Creates `path` owner-only, truncating whatever was there.
+///
+/// The opener for a sink that writes a whole file in one pass instead
+/// of appending to it: the gzip of a rotated access log. Appending
+/// would be wrong there rather than merely untidy, because a partial
+/// `.gz` left by a rotation that died mid-write is not a prefix of the
+/// member this call is about to write, and the reader would see one
+/// corrupt stream instead of one truncated one.
+///
+/// # Errors
+///
+/// As [`open_append_owner_only`].
+pub fn create_truncate_owner_only(path: &Path) -> io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    open_with_mode(options, path)
+}
+
+/// Tightens a file that is already on disk, and does nothing when it
+/// is not there.
+///
+/// The opener for a file this process did not write and will not
+/// write: a rotated backup left by an older build, an archive moved
+/// into place by `rename(2)`. Unlike [`ensure_file_owner_only`] it
+/// never creates, because a sweep that creates is a sweep that
+/// resurrects a file somebody just deleted.
+///
+/// A path that does not exist is `Ok(())`. Every other failure is
+/// reported, because a backup that cannot be tightened is a backup
+/// other accounts can still read.
+///
+/// # Errors
+///
+/// As [`open_append_owner_only`], minus the not-found case.
+pub fn tighten_existing_owner_only(path: &Path) -> io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    // Read-only and no `create`: this call is a chmod through a
+    // descriptor, not an open of something to write.
+    options.read(true);
+    match open_with_mode(options, path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// Creates `path` and every missing parent, each at `0o700`.
 ///
 /// Directories that already exist are left exactly as they are, mode

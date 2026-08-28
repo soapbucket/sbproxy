@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use redb::{Database, TableDefinition};
+use redb::{Database, ReadableTable, TableDefinition};
 
 use super::KVStore;
 
@@ -54,6 +54,63 @@ impl KVStore for RedbKVStore {
             table.insert(key, value).context("insert key")?;
         }
         write_txn.commit().context("commit write transaction")
+    }
+
+    fn put_if_absent_with_ttl(&self, key: &[u8], value: &[u8], _ttl_secs: u64) -> Result<bool> {
+        // A redb write transaction serializes against every other
+        // writer, so the read and the insert below cannot interleave
+        // with another caller's. That is the whole primitive: exactly
+        // one of two simultaneous first requests creates the key.
+        //
+        // The TTL is not modeled. redb has no expiry, and a caller
+        // that needs one carries the deadline inside the value and
+        // re-checks it on read, which the idempotency backend does.
+        // What that costs is space rather than correctness: a row
+        // nobody overwrites stays on disk until something sweeps it.
+        let write_txn = self.db.begin_write().context("begin write transaction")?;
+        let created = {
+            let mut table = write_txn.open_table(TABLE).context("open kv table")?;
+            if table.get(key).context("get key")?.is_some() {
+                false
+            } else {
+                table.insert(key, value).context("insert key")?;
+                true
+            }
+        };
+        write_txn.commit().context("commit write transaction")?;
+        Ok(created)
+    }
+
+    fn compare_and_swap_with_ttl(
+        &self,
+        key: &[u8],
+        expected: &[u8],
+        value: &[u8],
+        _ttl_secs: u64,
+    ) -> Result<bool> {
+        // Same transaction, same reason. Without this, a caller that
+        // took a key with `put_if_absent_with_ttl` could never hand it
+        // on: taking over a lapsed row is a conditional replace, and a
+        // backend with the create half but not the swap half wedges
+        // every key whose holder died.
+        let write_txn = self.db.begin_write().context("begin write transaction")?;
+        let swapped = {
+            let mut table = write_txn.open_table(TABLE).context("open kv table")?;
+            let matches = table
+                .get(key)
+                .context("get key")?
+                .is_some_and(|guard| guard.value() == expected);
+            if matches {
+                table.insert(key, value).context("insert key")?;
+            }
+            matches
+        };
+        write_txn.commit().context("commit write transaction")?;
+        Ok(swapped)
+    }
+
+    fn supports_atomic_create(&self) -> bool {
+        true
     }
 
     fn delete(&self, key: &[u8]) -> Result<()> {
@@ -150,6 +207,41 @@ mod tests {
     fn make_store() -> RedbKVStore {
         let path = unique_path();
         RedbKVStore::new(&path).unwrap()
+    }
+
+    /// WOR-2609: the single-flight primitive, on a store the review
+    /// found inheriting the erroring default although a redb write
+    /// transaction creates atomically. An operator running
+    /// `proxy.l2_store: {type: redb}` with `idempotency.backend: redis`
+    /// got the full pre-WOR-2609 stampede on a store perfectly capable
+    /// of preventing it.
+    #[test]
+    fn atomic_create_and_conditional_swap() {
+        let path = unique_path();
+        let store = RedbKVStore::new(&path).unwrap();
+
+        assert!(store.put_if_absent_with_ttl(b"claim", b"a", 60).unwrap());
+        assert!(
+            !store.put_if_absent_with_ttl(b"claim", b"b", 60).unwrap(),
+            "a present key must refuse a second creator"
+        );
+        assert_eq!(store.get(b"claim").unwrap().unwrap(), &b"a"[..]);
+
+        // Taking a key over is a conditional replace. Without it the
+        // create half alone wedges every key whose holder died.
+        assert!(
+            !store
+                .compare_and_swap_with_ttl(b"claim", b"wrong", b"c", 60)
+                .unwrap(),
+            "a swap against the wrong bytes must be refused"
+        );
+        assert!(store
+            .compare_and_swap_with_ttl(b"claim", b"a", b"c", 60)
+            .unwrap());
+        assert_eq!(store.get(b"claim").unwrap().unwrap(), &b"c"[..]);
+
+        assert!(store.supports_atomic_create());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

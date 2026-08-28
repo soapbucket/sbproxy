@@ -717,17 +717,115 @@ pub(crate) would leave items whose only callers are cfg(test) code, which
 same-file constant `AI_TOOLKIT_EVENT_ID_MAX_BYTES` was narrowed to
 pub(crate) before recording this result.
 
+No move on the WOR-2606 storage tree, after one. WOR-2609 added
+`EntryState` and `TryClaim` to `sbproxy-middleware/src/idempotency.rs`,
+the return types of the `IdempotencyCache` trait's `peek` and
+`try_claim`, and both landed in both buckets: the trait is pub, so
+narrowing either to pub(crate) makes it unimplementable from outside
+the crate, and the only cross-file consumer in tree was a test double
+in `sbproxy-core`. The first read of that was "raise the baseline by
+two and record why", which is what the count is there to make somebody
+argue for.
+
+The argument did not hold, because the reason both items looked
+write-only was a 2000-line file rather than an over-exposed item. The
+two backends that consume them, `InMemoryIdempotencyCache` and
+`KvIdempotencyCache`, sat in the same file as the trait, so every
+production reference was an in-file one and the scanner correctly saw
+nothing outside. Moving the backends to
+`idempotency/backends.rs`, which the file wanted anyway (the protocol
+and its two implementations are different things to read), puts the
+production consumers where they always were logically and both counts
+return to 314 and 1462.
+
+Worth naming for the next person who reads a two-item move: the
+question the bucket asks is "does anything but a test name this", and
+a file large enough to contain both the declaration and every caller
+answers it wrongly by construction. Splitting the file is a real fix
+for that; adding a caller would not have been.
+
 2026-08-27 (WOR-2690): unreferenced baseline 1462 -> 1461. Ground gained,
 not given. `pipeline::CompiledFallback` had only ever been named inside
 `pipeline.rs`; the AI client-disconnect work moved `fail_to_proxy`'s
 `on_error` condition into a named function that takes one, so the type is
 now referenced from `server/proxy_http.rs` and leaves the bucket.
 
-2026-08-27 (WOR-2666): tests-only baseline 314 -> 315. One addition:
-`AnomalyReputationConfig` in `sbproxy-config/src/types.rs`. It is the
-`reputation:` block under `proxy.anomaly`, so it is pub for the same
-reason every other node of the config tree is: serde constructs it and
-the schema generator walks it, and narrowing it would break the derive
-on the pub parent. Production reads its two fields through
-`AnomalySettings::from_config`; the scanner counts the type rather than
-the fields, and it says so itself ("pub is required").
+2026-08-27 (WOR-2658 / WOR-2654, the shadow-eval comparison surface):
+unreferenced 1461 -> 1477, tests-only unchanged at 314. Recomputed
+against the tree after merging the WOR-2690 entry above, not carried
+over from the pre-merge run: the two entries move the same counter and
+only a recount can say what the merged tree holds.
+
+Four avoidable items were removed before recording this.
+`ShadowEvalContext::retains_responses` was deleted rather than narrowed,
+since the public field it wrapped says the same thing, and
+`ShadowPairLedger::is_armed` was removed, since its only reader was a
+test and the behavior it described is asserted through the report
+instead. `AiShadowJudge::model` and `AiShadowJudge::divergence_prefilter`
+were removed outright: both parsed and nothing read them, and a
+parse-only config key is worse than an absent one. `TargetSummary` was
+already reachable from `sbproxy-core` and is now named there explicitly
+so the scan can see it.
+
+The additions fall in two groups, and both were tried as pub(crate)
+first.
+
+Four are the nested blocks of the `GET /api/ai/shadow/report` response:
+`TargetProvenance`, `TargetCost`, `TargetLatency`, and `TargetErrors` in
+`sbproxy-ai/src/shadow_eval.rs`. They are pub because they are field
+types of the pub `TargetSummary`, which `sbproxy-core`'s admin handler
+returns. Nothing names them in Rust because nothing reads them in Rust:
+they exist to give that response its shape, and their consumer is the
+JSON an operator reads. The e2e
+(`e2e/tests/sota_gateway_integration.rs::
+the_shadow_report_leads_with_provenance_and_names_every_target`) asserts
+on the rendered JSON of `TargetProvenance` and `TargetLatency` and not
+on `TargetCost` or `TargetErrors`, whose fields are covered by
+`shadow_eval.rs`'s own tests rather than end to end. Narrowing any of
+them would leave a pub struct whose fields the crate returning it cannot
+reach.
+
+The rest are the batch judge's planning API in
+`sbproxy-ai/src/shadow_judge.rs`: `JUDGE_CALLS_PER_PAIR`, `Divergence`,
+`DivergenceKind`, `JudgeCandidate`, `classify_pair`, `JudgeAdmission`,
+`JudgeSpendSnapshot`, `JudgeBudget`, `JudgePair`, `PairPlan`,
+`JudgePlan`, and `plan_batch`. These have no production caller yet by
+design: the deterministic divergence pre-filter and the hard spend cap
+ship now, and the judge prompt and scoring loop are a scoped follow-up,
+WOR-2691, which names these twelve items as the delta it is answerable
+for. The shadow-eval section of `docs/ai-gateway.md` carries the same
+scope for an operator, and says in so many words that nothing behind the
+`judge:` key is running yet. Narrowing
+them to pub(crate) was tried and produced eleven `never used` errors
+under `-D warnings`, which is the #757 shape the 2026-08-25 entry above
+describes: an item whose only callers are cfg(test) code is dead code.
+They stay pub until the scorer calls them, and their contracts are
+pinned by in-file tests in the meantime.
+
+Deliberately not lowered to 1476, which is what the scan reads at the
+end of the fix round. The one item that left the bucket, `TargetCost`,
+left it because a comment in `sbproxy-ai/src/client.rs` names
+`TargetCost::delta_usd` while explaining why both vendors' cache
+spellings are read from one body. That is a comment naming the symbol,
+not a caller, so the item is exactly as unreferenced as it was; holding
+1476 would make deleting one comment line turn the gate red for no real
+regression. The number moves when a caller appears.
+
+2026-08-27 (WOR-2666): tests-only baseline 314 -> 315, recounted after
+merging the shadow-eval entry above rather than carried over from the
+pre-merge run. One addition: `AnomalyReputationConfig` in
+`sbproxy-config/src/types.rs`. It is the `reputation:` block under
+`proxy.anomaly`, so it is pub for the same reason every other node of
+the config tree is: serde constructs it and the schema generator walks
+it, and narrowing it would break the derive on the pub parent.
+Production reads its two fields through `AnomalySettings::from_config`;
+the scanner counts the type rather than the fields, and it says so
+itself ("pub is required").
+
+Two avoidable items were narrowed before recording this rather than
+raising the number for them. `AnomalyDetector::install_detector` is
+`#[cfg(test)] pub(crate)`, since production installs through `install`,
+which owns the reuse decision. `AnomalyDetector::tracked_keys` is
+private: `analyze_on` publishes it to the gauge and the tests in that
+file assert on it, and nothing outside the module has a reason to ask.
+The unreferenced baseline is unchanged at 1475.

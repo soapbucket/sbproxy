@@ -617,7 +617,7 @@ impl AiHandlerConfig {
                         .map(|dir| std::path::Path::new(&dir).join("value-ledger.redb"))
                         .unwrap_or_default();
                     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                        let _ = std::fs::create_dir_all(parent);
+                        let _ = sbproxy_util::secure_fs::create_dir_all_owner_only(parent);
                     }
                     // Every handler obtains the one stable process facade.
                     // A configured cache path promotes that facade in place,
@@ -1176,6 +1176,51 @@ pub struct AiShadowConfig {
     ///   sample_rate: 0.1
     /// ```
     pub targets: Vec<AiShadowTarget>,
+    /// Optional batch judge over retained pairs (WOR-2654).
+    ///
+    /// Accepted in both spellings, so a single-target `shadow:` block
+    /// can carry a `judge:` beside its `provider:` key. Absent by
+    /// default: shadow eval reports numbers with no judge at all, and
+    /// `GET /api/ai/shadow/report` then says `not_configured` on the
+    /// agreement row rather than reporting a zero that reads as a tie.
+    pub judge: Option<AiShadowJudge>,
+}
+
+/// The batch judge attached to a `shadow:` block.
+///
+/// Judging is a batch job over pairs the content-recording consent
+/// already retained, never an inline call on the request path: the
+/// shadow leg is fire-and-forget, so by the time the candidate answers
+/// the caller has been served and there is nothing to block on. See
+/// [`crate::shadow_judge`] for the budget and the divergence
+/// pre-filter, and the shadow-eval section of `docs/ai-gateway.md` for
+/// what is and is not implemented behind this key today.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct AiShadowJudge {
+    /// Provider entry on this action the judge calls. Named rather
+    /// than defaulted to the primary, because judging with the model
+    /// under evaluation is how a candidate grades its own homework.
+    ///
+    /// Resolved against `providers[]` at config load and refused when
+    /// it names nothing, so a typo is a boot-time error rather than a
+    /// report that reads `scoring_pending` forever.
+    pub provider: String,
+    /// Hard spend cap per `spend_window`, in USD, shared by every
+    /// target in this `shadow:` block. Required, not defaulted: an
+    /// unbounded judge is the exact failure this key exists to
+    /// prevent, and a default would be an operator's bill chosen by
+    /// us.
+    pub max_spend_usd: f64,
+    /// How long the cap covers before it resets. `daily` (the default)
+    /// or `weekly`, both rolling from when the window opened rather
+    /// than from a calendar boundary.
+    #[serde(default = "default_judge_spend_window")]
+    pub spend_window: crate::shadow_judge::JudgeSpendWindow,
+}
+
+fn default_judge_spend_window() -> crate::shadow_judge::JudgeSpendWindow {
+    crate::shadow_judge::JudgeSpendWindow::Daily
 }
 
 /// One provider this route is shadowed against.
@@ -1236,7 +1281,45 @@ impl<'de> Deserialize<'de> for AiShadowConfig {
         // variant" for a typo anywhere in either arm, which for a block
         // with five sibling keys is a worse error than the one
         // `deny_unknown_fields` gives.
-        let value = serde_json::Value::deserialize(deserializer)?;
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        // Lift `judge:` out before branching. Both spellings carry it,
+        // and the flat branch deserializes straight into
+        // `AiShadowTarget`, whose `deny_unknown_fields` would otherwise
+        // reject a judge written beside a single `provider:`.
+        let judge_value = value
+            .as_object_mut()
+            .and_then(|object| object.remove("judge"));
+        let judge = match judge_value {
+            Some(raw) => Some(
+                serde_json::from_value::<AiShadowJudge>(raw)
+                    .map_err(|error| {
+                        D::Error::custom(format!(
+                            "ai shadow.judge: {error}; `provider` and `max_spend_usd` are \
+                             both required, because a judge with no spend cap is the \
+                             failure the key exists to prevent"
+                        ))
+                    })
+                    .and_then(|judge| {
+                        if !(judge.max_spend_usd.is_finite() && judge.max_spend_usd > 0.0) {
+                            return Err(D::Error::custom(format!(
+                                "ai shadow.judge.max_spend_usd must be a positive number of \
+                                 US dollars, got {}; remove the judge block to disable \
+                                 judging rather than capping it at zero",
+                                judge.max_spend_usd
+                            )));
+                        }
+                        if judge.provider.trim().is_empty() {
+                            return Err(D::Error::custom(
+                                "ai shadow.judge.provider must name a providers[] entry on \
+                                 this action; judging with the model under evaluation is \
+                                 how a candidate grades its own homework",
+                            ));
+                        }
+                        Ok(judge)
+                    })?,
+            ),
+            None => None,
+        };
         let targets = if value.get("targets").is_some() {
             serde_json::from_value::<AiShadowTargetList>(value)
                 .map_err(D::Error::custom)?
@@ -1267,7 +1350,7 @@ impl<'de> Deserialize<'de> for AiShadowConfig {
                 )));
             }
         }
-        Ok(Self { targets })
+        Ok(Self { targets, judge })
     }
 }
 
@@ -1883,6 +1966,33 @@ impl AiHandlerConfig {
             }
         }
 
+        // WOR-2654: the judge's provider is a `providers[]` entry, and
+        // the deserializer's refusal already says so, so resolve it
+        // here where the list exists. Without this a typo boots clean
+        // and surfaces only when the scorer ships, against a config
+        // that has been in production for months.
+        if let Some(judge) = config
+            .shadow
+            .as_ref()
+            .and_then(|shadow| shadow.judge.as_ref())
+        {
+            let named = judge.provider.trim();
+            if !config
+                .providers
+                .iter()
+                .any(|provider| provider.name == named)
+            {
+                let known: Vec<&str> = config
+                    .providers
+                    .iter()
+                    .map(|provider| provider.name.as_str())
+                    .collect();
+                anyhow::bail!(
+                    "ai shadow.judge.provider {named:?} names no providers[] entry on this \
+                     action; declared providers are {known:?}"
+                );
+            }
+        }
         // WOR-1880: reject strong consistency / invalid pool shapes at load.
         if let Some(pool) = &config.quota_pool {
             crate::quota_pool::validate_quota_pool_config(pool)
@@ -2047,6 +2157,30 @@ impl AiHandlerConfig {
             crate::budget::build_price_table(&config.model_prices, config.rate_card.as_deref());
         if install_price_table {
             crate::budget::set_price_table(price_table);
+        }
+        // WOR-2654: install this route's judge spend caps beside the
+        // price table, on the same reload footing, and for the same
+        // reason: both are operator money decisions that have to move
+        // when the config moves. A validation-only compile installs
+        // nothing, so a rejected candidate cannot re-cap a live judge.
+        if install_price_table {
+            if let Some(shadow) = config.shadow.as_ref() {
+                if let Some(judge) = shadow.judge.as_ref() {
+                    // One budget for the whole block, not one per
+                    // target: the operator wrote one number and it has
+                    // to be one ceiling.
+                    let targets: Vec<String> = shadow
+                        .targets
+                        .iter()
+                        .map(|target| target.provider.clone())
+                        .collect();
+                    crate::shadow_judge::JudgeRegistry::global().install(
+                        &targets,
+                        judge.max_spend_usd,
+                        judge.spend_window,
+                    );
+                }
+            }
         }
         Ok(config)
     }
@@ -3571,6 +3705,7 @@ mod tests {
                 {"name": "primary", "api_key": "k"},
                 {"name": "anthropic", "api_key": "k"},
                 {"name": "gemini", "api_key": "k"},
+                {"name": "judge-openai", "api_key": "k"},
             ],
             "shadow": block,
         }))
@@ -3642,6 +3777,157 @@ mod tests {
         .to_string();
         assert!(error.contains("anthropic"), "{error}");
         assert!(error.contains("targets[1]"), "{error}");
+    }
+
+    /// WOR-2654: the cap has no default, and the refusal says why.
+    /// Red without it in the way that matters: a judge block that
+    /// parsed with no cap would bill an operator an amount nobody
+    /// chose.
+    #[test]
+    fn a_judge_without_a_spend_cap_is_refused() {
+        let error = shadow_config(serde_json::json!({
+            "targets": [{"provider": "anthropic"}],
+            "judge": {"provider": "judge-openai"}
+        }))
+        .expect_err("a judge with no cap is refused at config load")
+        .to_string();
+        assert!(error.contains("max_spend_usd"), "{error}");
+        assert!(error.contains("spend cap"), "{error}");
+    }
+
+    /// Zero is not a cap, it is judging turned off with extra steps,
+    /// and the message says which key to remove instead.
+    #[test]
+    fn a_judge_capped_at_zero_is_refused() {
+        let error = shadow_config(serde_json::json!({
+            "targets": [{"provider": "anthropic"}],
+            "judge": {"provider": "judge-openai", "max_spend_usd": 0}
+        }))
+        .expect_err("a zero cap is refused")
+        .to_string();
+        assert!(error.contains("positive number"), "{error}");
+        assert!(error.contains("remove the judge block"), "{error}");
+    }
+
+    /// The judge rides both spellings of the block. The flat form
+    /// deserializes straight into `AiShadowTarget`, whose
+    /// `deny_unknown_fields` would reject a sibling key it had not been
+    /// told to lift out first.
+    #[test]
+    fn a_judge_parses_beside_a_single_flat_target() {
+        let config = shadow_config(serde_json::json!({
+            "provider": "anthropic",
+            "sample_rate": 1.0,
+            "judge": {"provider": "judge-openai", "max_spend_usd": 2.5}
+        }))
+        .expect("a judge beside the flat form parses");
+        let shadow = config.shadow.expect("shadow block");
+        assert_eq!(shadow.targets.len(), 1);
+        let judge = shadow.judge.expect("judge block");
+        assert_eq!(judge.provider, "judge-openai");
+        assert!((judge.max_spend_usd - 2.5).abs() < f64::EPSILON);
+        assert_eq!(
+            judge.spend_window,
+            crate::shadow_judge::JudgeSpendWindow::Daily,
+            "daily is the default window"
+        );
+    }
+
+    /// The seam nothing tested: a `judge:` block in the config, and the
+    /// agreement row the admin report serializes for it. Every piece
+    /// between the two (the compile-time install, the registry lookup,
+    /// the snapshot, the row) was covered alone; the path from one end
+    /// to the other was not, so a compile that stopped installing
+    /// budgets would have left every test green.
+    #[test]
+    fn a_judge_block_reaches_the_reports_agreement_row() {
+        crate::shadow_judge::JudgeRegistry::global().clear_for_test();
+        let config = shadow_config(serde_json::json!({
+            "targets": [{"provider": "anthropic"}, {"provider": "gemini"}],
+            "judge": {
+                "provider": "judge-openai",
+                "max_spend_usd": 5.0,
+                "spend_window": "weekly",
+            }
+        }))
+        .expect("a two-target block with a judge parses and compiles");
+        assert_eq!(config.shadow.as_ref().expect("shadow").targets.len(), 2);
+
+        let ledger = crate::shadow_eval::ShadowPairLedger::default();
+        for target in ["anthropic", "gemini"] {
+            let id = format!("req-seam-{target}");
+            ledger.open(&id, &[(target.to_string(), 1.0, None)]);
+            ledger.record_primary(
+                &id,
+                crate::shadow_eval::PrimaryLeg {
+                    provider: "primary".to_string(),
+                    model: "primary-model".to_string(),
+                    cost_usd: 0.01,
+                    latency_ms: 100,
+                    status: 200,
+                },
+            );
+            ledger.record_shadow(
+                &id,
+                target,
+                crate::shadow_eval::ShadowLeg {
+                    model: "candidate".to_string(),
+                    status: 200,
+                    cost_usd: 0.005,
+                    latency_ms: 80,
+                    finish_reason: Some("stop".to_string()),
+                    response_retained: false,
+                },
+            );
+        }
+        let rows = ledger.report(
+            std::time::Duration::from_secs(60),
+            &crate::shadow_judge::agreement_for,
+        );
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        for row in &rows {
+            assert_eq!(
+                row.agreement.status, "scoring_pending",
+                "a configured judge is pending, not absent: {row:?}"
+            );
+            assert_eq!(
+                row.agreement.judge_spend_cap_usd,
+                Some(5.0),
+                "the one cap the operator wrote is the cap both targets report: {row:?}"
+            );
+        }
+        crate::shadow_judge::JudgeRegistry::global().clear_for_test();
+    }
+
+    /// The refusal message promises `providers[]` resolution, so the
+    /// resolution has to run. A typo that boots clean surfaces only
+    /// when the scorer ships, against a config that has been in
+    /// production for months.
+    #[test]
+    fn a_judge_naming_an_undeclared_provider_is_refused() {
+        let error = shadow_config(serde_json::json!({
+            "targets": [{"provider": "anthropic"}],
+            "judge": {"provider": "judge-opeani", "max_spend_usd": 1.0}
+        }))
+        .expect_err("a judge naming no providers[] entry is refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("judge-opeani") && message.contains("providers[]"),
+            "the refusal must name the typo and what it failed to resolve against: {message}"
+        );
+    }
+
+    /// A judge naming no provider would fall back to whatever answered,
+    /// which is the model under evaluation grading its own homework.
+    #[test]
+    fn a_judge_with_a_blank_provider_is_refused() {
+        let error = shadow_config(serde_json::json!({
+            "targets": [{"provider": "anthropic"}],
+            "judge": {"provider": "  ", "max_spend_usd": 1.0}
+        }))
+        .expect_err("a blank judge provider is refused")
+        .to_string();
+        assert!(error.contains("providers[] entry"), "{error}");
     }
 
     #[test]
