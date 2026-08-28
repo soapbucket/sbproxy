@@ -15008,6 +15008,12 @@ hooks:
         let plan_style = [
             vec!["sbproxy", "config", "pull", "sb.yml", "--dry-run"],
             vec!["sbproxy", "config", "authority", "status"],
+            // WOR-2460. `config diff` prints a plan, so it reports the
+            // same way. Listed here rather than trusted: this test is
+            // named for the property, and a member of the set it does
+            // not name is a member nothing checks.
+            vec!["sbproxy", "config", "diff", "7"],
+            vec!["sbproxy", "config", "diff", "--from", "5", "--to", "7"],
         ];
         for argv in plan_style {
             let cli = Cli::try_parse_from(&argv).expect("parses");
@@ -15317,6 +15323,138 @@ hooks:
         assert!(
             msg.contains("required") || msg.contains("REVISION"),
             "expected a missing-argument message, got: {msg}"
+        );
+    }
+
+    /// WOR-2460. The escape hatch's own surface: the target defaults to
+    /// the last known good, and every guard the route offers is
+    /// reachable from the command line, because an operator who has to
+    /// open a browser mid-incident does not have the escape hatch.
+    #[test]
+    fn parses_config_rollback_subcommand_with_every_guard() {
+        let cli = parse(&["sbproxy", "config", "rollback"]);
+        let Some(Cmd::Config(cmd)) = cli.cmd else {
+            panic!("expected Config");
+        };
+        assert!(
+            !cmd.uses_plan_exit_codes(),
+            "a rollback applies; it does not print a plan",
+        );
+        let ConfigSub::Rollback(args) = cmd.sub else {
+            panic!("expected Rollback");
+        };
+        assert_eq!(
+            args.to, "last-known-good",
+            "the bare form is the one an operator types under pressure",
+        );
+        assert_eq!(args.expected_current, None);
+        assert_eq!(args.confirm, None);
+        assert!(!args.force);
+
+        let cli = parse(&[
+            "sbproxy",
+            "config",
+            "rollback",
+            "--to",
+            "41",
+            "--expected-current",
+            "43",
+            "--confirm",
+            "41",
+            "--lineage",
+            "0f9c2c1e-0000-4000-8000-000000000000",
+            "--force",
+            "--format",
+            "json",
+        ]);
+        let Some(Cmd::Config(cmd)) = cli.cmd else {
+            panic!("expected Config");
+        };
+        let ConfigSub::Rollback(args) = cmd.sub else {
+            panic!("expected Rollback");
+        };
+        assert_eq!(args.to, "41");
+        assert_eq!(args.expected_current, Some(43));
+        assert_eq!(args.confirm, Some(41));
+        assert_eq!(
+            args.lineage.as_deref(),
+            Some("0f9c2c1e-0000-4000-8000-000000000000")
+        );
+        assert!(args.force);
+        assert!(matches!(args.format, OutputFormat::Json));
+    }
+
+    /// WOR-2460. `config diff` takes its target as a positional or as
+    /// `--to`, and naming it twice or not at all is a usage error rather
+    /// than a precedence rule. Both refusals are reached before any
+    /// admin request, so this drives the real handler.
+    #[test]
+    fn config_diff_wants_its_target_named_exactly_once() {
+        let both = parse(&["sbproxy", "config", "diff", "7", "--to", "9"]);
+        let Some(Cmd::Config(cmd)) = both.cmd else {
+            panic!("expected Config");
+        };
+        let ConfigSub::Diff(args) = cmd.sub else {
+            panic!("expected Diff");
+        };
+        assert_eq!(
+            handle_config_diff(&args).expect("a usage error is not an anyhow failure"),
+            1,
+            "naming the target twice is refused rather than resolved by precedence",
+        );
+
+        let neither = parse(&["sbproxy", "config", "diff"]);
+        let Some(Cmd::Config(cmd)) = neither.cmd else {
+            panic!("expected Config");
+        };
+        let ConfigSub::Diff(args) = cmd.sub else {
+            panic!("expected Diff");
+        };
+        assert_eq!(handle_config_diff(&args).expect("a usage error"), 1);
+
+        // And the two accepted forms carry what they were given.
+        let positional = parse(&["sbproxy", "config", "diff", "7"]);
+        let Some(Cmd::Config(cmd)) = positional.cmd else {
+            panic!("expected Config");
+        };
+        let ConfigSub::Diff(args) = cmd.sub else {
+            panic!("expected Diff");
+        };
+        assert_eq!(args.to.as_deref(), Some("7"));
+        assert_eq!(args.from, None);
+
+        let pair = parse(&[
+            "sbproxy", "config", "diff", "--from", "5", "--to", "7", "--format", "json",
+        ]);
+        let Some(Cmd::Config(cmd)) = pair.cmd else {
+            panic!("expected Config");
+        };
+        let ConfigSub::Diff(args) = cmd.sub else {
+            panic!("expected Diff");
+        };
+        assert_eq!(args.from.as_deref(), Some("5"));
+        assert_eq!(args.to_flag.as_deref(), Some("7"));
+        assert_eq!(args.to, None);
+    }
+
+    /// WOR-2460. The query-string encoder exists so a typed revision
+    /// selector cannot smuggle a second parameter into the diff request,
+    /// which is the only claim it makes and therefore the one to pin.
+    #[test]
+    fn a_revision_selector_cannot_smuggle_a_query_parameter() {
+        assert_eq!(urlencoding_lite("7"), "7");
+        assert_eq!(urlencoding_lite("last-known-good"), "last-known-good");
+        assert_eq!(
+            urlencoding_lite("7&from=1"),
+            "7%26from%3D1",
+            "an ampersand and an equals sign are both encoded, so neither opens a parameter",
+        );
+        assert_eq!(urlencoding_lite("a b"), "a%20b");
+        assert_eq!(urlencoding_lite("../etc"), "..%2Fetc");
+        assert_eq!(
+            urlencoding_lite("7#frag"),
+            "7%23frag",
+            "a fragment marker would otherwise truncate the path at the server",
         );
     }
 
