@@ -639,6 +639,30 @@ run_batch "generator --check drift scans" \
   batch_examples_catalog "examples catalog is current" \
   batch_review_evidence "review-evidence parser fixtures"
 
+# CI: docs-ci.yml, both halves. This gate named docs-ci.yml in six
+# comments as the lane a phase mirrors and never ran the script itself,
+# so two of its checks had NO local equivalent at all: the `rust` code
+# blocks in docs/*.md are type-checked by rustc, and every in-tree
+# anchor is resolved offline by lychee. On 2026-08-27 that gap cost two
+# CI round trips in one day, one for three code blocks that did not
+# compile standalone and one for an anchor pointing at a heading another
+# page had renamed.
+#
+# Serial, and not in a batch: run_code spawns one rustc per code block
+# across its own pool and would fight anything running beside it.
+# Needs rustc and lychee; a `rust` block that cannot compile standalone
+# is tagged `rust,no_run` at the source rather than skipped here.
+if ! phase_wanted DOCSCI; then
+  scope_skip "docs-ci (rust code blocks and offline anchor resolution)"
+elif ! command -v lychee >/dev/null 2>&1; then
+  note_skip "docs-ci link half (lychee not on PATH; docs anchors and cross-page links are unchecked locally). Install with 'cargo install lychee --locked' or 'brew install lychee'."
+  step "docs code blocks compile"
+  bash "$ROOT/scripts/docs-ci.sh" --code
+else
+  step "docs code blocks compile and every anchor resolves"
+  bash "$ROOT/scripts/docs-ci.sh"
+fi
+
 # Serial: the opt-in replay path spawns fixture and proxy processes on
 # real ports, and the phase records a skip on the default path.
 # CI: ci.yml guards lane runs the structural half on every pull request;
