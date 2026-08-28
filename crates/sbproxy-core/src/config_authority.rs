@@ -385,10 +385,11 @@ pub struct BundleFetch<'a> {
     /// What the subscriber says it last **applied** (WOR-2464), as
     /// distinct from what it was last served.
     ///
-    /// Already parsed by [`parse_apply_report`], which is what the
+    /// Already parsed by `parse_apply_report`, which is what the
     /// listener calls: a partial or unrecognized report is `None` by the
     /// time it reaches here rather than something this decision has to
-    /// re-validate.
+    /// re-validate. (Not linked: that function is crate-private, and a
+    /// private intra-doc link on a public item fails the docs lane.)
     ///
     /// `None` for a subscriber that sent none of the report headers: an
     /// older build, or one that has not completed a cycle yet. Handled
