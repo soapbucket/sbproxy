@@ -565,6 +565,17 @@ mod runtime {
                 let (Some(provider), Some(model)) = (&ctx.ai_provider, &ctx.ai_model) else {
                     return Vec::new();
                 };
+                // WOR-2622: a streamed response whose provider sent no
+                // usage frame carries this gateway's own tokenizer count
+                // on `ai_tokens_*`, marked `estimated`. Those counts move
+                // the operator's caps; they must never become an invoiced
+                // quantity, because the customer's bill has to be a
+                // number the provider stands behind. An estimate reports
+                // no row at all rather than a row nobody can defend in a
+                // dispute.
+                if ctx.ai_usage_source == Some("estimated") {
+                    return Vec::new();
+                }
                 map_ai(
                     &binding.unit,
                     provider,

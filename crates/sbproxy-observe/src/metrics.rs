@@ -6605,22 +6605,23 @@ pub fn record_ai_cost_usd_micros(
 /// token debit against the budget. A sustained miss rate per provider
 /// is an operability signal (an upstream wrapper stripping usage, or a
 /// surface the estimator does not yet cover) and can be alerted on.
-pub fn record_ai_usage_parse_miss(provider: &str, surface: &str) {
+pub fn record_ai_usage_parse_miss(provider: &str, surface: &str, usage_source: &str) {
     use prometheus::{register_int_counter_vec, IntCounterVec};
     use std::sync::OnceLock;
     static C: OnceLock<IntCounterVec> = OnceLock::new();
     let counter = C.get_or_init(|| {
         register_int_counter_vec!(
             "sbproxy_ai_usage_parse_miss_total",
-            "2xx AI responses on a token surface that carried no parseable usage block (budget debited from an estimate)",
-            &["provider", "surface"],
+            "2xx AI responses on a token surface that carried no parseable usage block, by what was billed instead: `estimated` (this gateway's own tokenizer count) or `absent` (nothing could be counted, so nothing was billed)",
+            &["provider", "surface", "usage_source"],
         )
         .expect("ai usage parse miss counter registers")
     });
     let provider = sanitize_label("provider", provider);
     let surface = sanitize_label("surface", surface);
+    let usage_source = sanitize_label("usage_source", usage_source);
     counter
-        .with_label_values(&[provider.as_str(), surface.as_str()])
+        .with_label_values(&[provider.as_str(), surface.as_str(), usage_source.as_str()])
         .inc();
 }
 

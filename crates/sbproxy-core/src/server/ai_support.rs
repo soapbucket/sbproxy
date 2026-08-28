@@ -2647,8 +2647,25 @@ fn usage_event_from_context(
     ctx: &crate::context::RequestContext,
     provider: String,
 ) -> sbproxy_ai::usage_sink::LlmUsageEvent {
-    let prompt_tokens = ctx.ai_tokens_in.unwrap_or(0);
-    let completion_tokens = ctx.ai_tokens_out.unwrap_or(0);
+    // WOR-2622: measured usage only, for the same reason the payment
+    // bridge skips an estimate. A usage sink is an external spend report
+    // (LiteLLM's `success_callback` shape), the event carries no
+    // provenance column of its own, and a report that silently blends a
+    // provider's count with this gateway's own is worse than one that
+    // reports zero. An estimated stream is visible on the access log's
+    // `usage_source` and on
+    // `sbproxy_ai_usage_parse_miss_total{usage_source="estimated"}`.
+    let measured = ctx.ai_usage_source != Some("estimated");
+    let prompt_tokens = if measured {
+        ctx.ai_tokens_in.unwrap_or(0)
+    } else {
+        0
+    };
+    let completion_tokens = if measured {
+        ctx.ai_tokens_out.unwrap_or(0)
+    } else {
+        0
+    };
     sbproxy_ai::usage_sink::LlmUsageEvent {
         provider,
         model: ctx.ai_model.clone().unwrap_or_default(),

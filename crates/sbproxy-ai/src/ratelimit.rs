@@ -176,6 +176,24 @@ impl Admission {
         // Dropping releases the permit.
     }
 
+    /// Reconcile against a count this gateway estimated rather than one
+    /// the provider reported.
+    ///
+    /// The bucket settles exactly as [`Self::reconcile`] settles it: an
+    /// estimate is still the best number available and a reservation is
+    /// enforcement, not a report. What is skipped is the
+    /// `sbproxy_ai_token_estimate_error_ratio` sample, because
+    /// `actual_tokens` here is derived from the same request-path
+    /// estimator that produced `reserved_tokens`. Observing that pair
+    /// reports a perfect zero error on exactly the traffic where nothing
+    /// was measured, which is worse than reporting nothing: the
+    /// histogram is what operators tune TPM headroom against.
+    pub fn reconcile_unmeasured(mut self, actual_tokens: u64) {
+        self.bucket
+            .reconcile_tokens(self.reserved_tokens, actual_tokens);
+        self.reconciled = true;
+    }
+
     /// Token count this admission reserved at request entry. Exposed so
     /// the request filter can compute its own estimate-vs-actual delta
     /// for logs and audit events without having to re-parse the prompt.
