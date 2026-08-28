@@ -431,33 +431,46 @@ async fn a_batch_the_broker_took_is_not_resent_when_its_acknowledgement_is_lost(
     )
     .await;
 
-    let sink = EventIngest::start(
-        IngestTarget::Nats {
-            address: broker.address.clone(),
-            subject_prefix: "sb.events".into(),
-            token: None,
-        },
-        16,
+    // The connection is built here rather than through `EventIngest::start`
+    // so the flush window can be shortened on the connection this test
+    // owns. Waiting out the real five-second window would put the only
+    // multi-second sleep in the crate on every run of the lane, and a
+    // process-global override would hand a concurrently running test the
+    // short window under any runner that shares a process.
+    let mut connection = Some(
+        NatsConnection::connect(&broker.address, None)
+            .await
+            .expect("the stub answers the CONNECT ping"),
+    );
+    if let Some(live) = connection.as_mut() {
+        live.flush_timeout = std::time::Duration::from_millis(150);
+    }
+    let mut dialed = true;
+
+    // The stub goes silent after the CONNECT ping, so the publishes land
+    // and the acknowledgement never does.
+    let delivered = publish_to_nats(
+        &mut connection,
+        &mut dialed,
+        &broker.address,
+        "sb.events",
         None,
+        &[event("acme")],
     )
-    .expect("sink");
-    // The flush timeout is what this test has to outwait, so shorten it
-    // rather than sleeping seven real seconds on every run of the lane.
-    set_flush_timeout(std::time::Duration::from_millis(150));
-    sink.publish(event("acme"));
+    .await;
 
     assert!(
-        eventually(|| !broker.observed().published.is_empty()).await,
-        "the broker has to receive the batch once"
+        delivered,
+        "a batch the server took is delivered, not an error, even with no acknowledgement"
     );
-    // Past the flush timeout, which is when a resend would land.
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-    let published = broker.observed().published.len();
-    set_flush_timeout(NETWORK_TIMEOUT);
-    drop(sink);
     assert_eq!(
-        published, 1,
+        broker.observed().published.len(),
+        1,
         "a batch the broker already took must not be resent"
+    );
+    assert!(
+        connection.is_none(),
+        "the connection is dropped, so the next batch redials"
     );
 }
 

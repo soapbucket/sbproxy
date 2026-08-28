@@ -535,7 +535,7 @@ authenticate.
 The fourth group is capacity, and it is the one worth an alert.
 `queue_full` on `op="register"` means the pending queue has reached its
 5,000-record cap and every new submission is being refused until a reviewer
-works it down; nothing recovers on its own.  `dedup_window_full` is the
+works it down; nothing recovers on its own. `dedup_window_full` is the
 softer sibling: the duplicate-detection window is at its cap, so an
 identical resubmission of a registration nobody has decided yet takes a
 fresh slot instead of being recognized as a retry. The durable index still

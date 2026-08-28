@@ -198,12 +198,15 @@ TTL timestamp + INTERVAL 30 DAY DELETE
 SETTINGS index_granularity = 8192;
 ```
 
-Every optional field is **omitted** when it is absent rather than sent as
-`null`: `RequestEvent` carries `skip_serializing_if = "Option::is_none"` on
-all twenty of them, so a typical row carries about ten keys and the other
-twenty are simply not there. The setting that governs an omitted key in
-`JSONEachRow` is `input_format_defaults_for_omitted_fields`, which is
-ClickHouse's default of `1` and fills the column's `DEFAULT`. It is not
+Every absent field is **omitted** rather than sent as `null`. Five of
+`RequestEvent`'s thirty fields are always serialized (`request_id`,
+`workspace_id`, `hostname`, `timestamp_ms`, `event_type`) and the other
+twenty-five carry a `skip_serializing_if`: twenty-four on
+`Option::is_none`, and `properties` on `BTreeMap::is_empty`. A row for a
+plain proxied request carries about ten keys and the rest are simply not
+there. The setting that governs an omitted key in `JSONEachRow` is
+`input_format_defaults_for_omitted_fields`, which is ClickHouse's default of
+`1` and fills the column's `DEFAULT`. It is not
 `input_format_null_as_default`, which governs an explicit `null` and never
 fires here; an operator debugging a refused insert should check the first.
 

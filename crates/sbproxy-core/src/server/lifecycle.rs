@@ -3655,17 +3655,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
             // which the docs tell them to do, would page on a working
             // config. This is the same condition `RegistrySummary`
             // publishes as `feed_configured`.
-            if agent_registry_feed_configured(registry_cfg) {
-                agent_registry_refresher = Some((
-                    std::sync::Arc::clone(&registry),
-                    agent_registry_refresh_interval(registry_cfg),
-                ));
-            } else {
-                tracing::info!(
-                    "the agent registry is enabled with no feed configured; the approval \
-                     queue is live and no catalog refresh will run"
-                );
-            }
+            agent_registry_refresher = agent_registry_refresher_for(registry_cfg, &registry);
             admin_state_inner = admin_state_inner.with_agent_registry(registry);
         }
 
@@ -7255,12 +7245,26 @@ mod boot_only_block_tests {
     /// `docs/agent-registry.md` tells them to do, paged on a working proxy.
     #[test]
     fn a_registry_with_no_feed_runs_no_refresh_loop() {
+        // A real registry, so this drives the decision `run` makes rather
+        // than only the predicate underneath it: `agent_registry_refresher_for`
+        // is the whole install decision, so reverting it is reverting
+        // something this test reads.
+        let path = format!(
+            "{}/sbproxy_refresher_test_{}.redb",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
         let queue_only = AgentRegistryConfig {
             enabled: true,
-            store_path: "/tmp/a.redb".into(),
+            store_path: path.clone().into(),
             ..Default::default()
         };
-        assert!(!agent_registry_feed_configured(&queue_only));
+        let registry = build_agent_registry(&queue_only).expect("registry opens");
+
+        assert!(
+            agent_registry_refresher_for(&queue_only, &registry).is_none(),
+            "a queue-only registry must install no refresh loop"
+        );
 
         // Half a feed is not a feed. `validate` refuses this shape at
         // startup, and the loop must not run for it either.
@@ -7268,13 +7272,18 @@ mod boot_only_block_tests {
             feed_path: Some("/tmp/feed.json".into()),
             ..queue_only.clone()
         };
-        assert!(!agent_registry_feed_configured(&half));
+        assert!(agent_registry_refresher_for(&half, &registry).is_none());
 
         let full = AgentRegistryConfig {
             key_directory_path: Some("/tmp/keys.json".into()),
             ..half
         };
-        assert!(agent_registry_feed_configured(&full));
+        let installed = agent_registry_refresher_for(&full, &registry)
+            .expect("a configured feed installs the loop");
+        assert_eq!(installed.1, AGENT_REGISTRY_REFRESH_DEFAULT);
+
+        drop(registry);
+        std::fs::remove_file(&path).ok();
     }
 
     /// The refresh loop's interval is derived rather than configured, so
@@ -8591,6 +8600,34 @@ fn agent_catalog_component(
             Some(format!("unrecognized catalog state: {other:?}")),
         ),
     }
+}
+
+/// The refresh loop to install for this registry, or `None` when there is
+/// nothing to refresh from.
+///
+/// A function rather than an `if` at the call site, which is inside `run`
+/// and therefore unreachable from a test. The decision lives here in one
+/// piece, so reverting it is reverting something a test drives; a bare
+/// condition at the call site left the predicate covered and the decision
+/// not.
+fn agent_registry_refresher_for(
+    cfg: &sbproxy_config::AgentRegistryConfig,
+    registry: &std::sync::Arc<sbproxy_agent_registry::AgentRegistry>,
+) -> Option<(
+    std::sync::Arc<sbproxy_agent_registry::AgentRegistry>,
+    std::time::Duration,
+)> {
+    if !agent_registry_feed_configured(cfg) {
+        tracing::info!(
+            "the agent registry is enabled with no feed configured; the approval queue is \
+             live and no catalog refresh will run"
+        );
+        return None;
+    }
+    Some((
+        std::sync::Arc::clone(registry),
+        agent_registry_refresh_interval(cfg),
+    ))
 }
 
 /// Whether this registry has a catalog feed to refresh from.

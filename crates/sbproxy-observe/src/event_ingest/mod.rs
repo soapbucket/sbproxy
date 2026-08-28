@@ -76,29 +76,6 @@ const DRAIN_BATCH: usize = 256;
 /// Per-attempt network timeout, for the connect, the flush, and the POST.
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The flush timeout actually in force.
-///
-/// A cell rather than the constant so the no-resend test can wait past a
-/// lost acknowledgement in milliseconds instead of sleeping seven real
-/// seconds on every run of the lane. Production never writes it, so the
-/// load is one relaxed read per flush.
-static FLUSH_TIMEOUT_MILLIS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(5_000);
-
-/// How long to wait for the server's acknowledgement of a written batch.
-fn flush_timeout() -> Duration {
-    Duration::from_millis(FLUSH_TIMEOUT_MILLIS.load(std::sync::atomic::Ordering::Relaxed))
-}
-
-/// Shorten the flush timeout for one test. Test-only by construction.
-#[cfg(test)]
-fn set_flush_timeout(value: Duration) {
-    FLUSH_TIMEOUT_MILLIS.store(
-        value.as_millis().min(u128::from(u64::MAX)) as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-}
-
 /// Ceiling on the bytes read from a ClickHouse reply. Only the status
 /// decides whether the batch landed; the cap exists because something has
 /// to bound the read.
@@ -614,6 +591,15 @@ struct NatsConnection {
     /// one oversized event would otherwise take its whole 256-event batch
     /// with it, repeatedly, for as long as such events arrive.
     max_payload: usize,
+    /// How long to wait for the server's acknowledgement of a written
+    /// batch.
+    ///
+    /// A field rather than a process-global, so a test that needs a short
+    /// window shortens it on the connection it owns. The global this
+    /// replaces was correct under nextest, which gives every test its own
+    /// process, and would have handed a concurrently running test a 150 ms
+    /// flush window under any runner that shares one.
+    flush_timeout: Duration,
 }
 
 impl NatsConnection {
@@ -634,6 +620,7 @@ impl NatsConnection {
             stream,
             buffer: Vec::with_capacity(1024),
             max_payload: NATS_DEFAULT_MAX_PAYLOAD,
+            flush_timeout: NETWORK_TIMEOUT,
         };
 
         let info = connection.read_line().await?;
@@ -774,7 +761,7 @@ impl NatsConnection {
         self.stream.flush().await?;
         // Past this point the server has the publishes. Anything that fails
         // now is a missing acknowledgement, and the caller must not resend.
-        tokio::time::timeout(flush_timeout(), self.expect_pong())
+        tokio::time::timeout(self.flush_timeout, self.expect_pong())
             .await
             .unwrap_or_else(|_| Err(anyhow::anyhow!("nats acknowledgement timed out")))
             .map_err(|error| anyhow::Error::new(PublishPhase).context(error.to_string()))

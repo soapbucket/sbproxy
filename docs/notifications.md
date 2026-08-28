@@ -332,7 +332,7 @@ deadletter queue, and a replay button.
 
 | Family | Labels | Reading it |
 |---|---|---|
-| `sbproxy_notify_deliveries_total` | `outcome` | `delivered`, `retried`, `deadlettered`, `dropped`, plus `deadletter_evicted`, `deadletter_failed`, `serialize_error`, `worker_stopped`, and the admin mutations (`create`, `update`, `rotate`, `delete`, `replay`, `discard`, `replay_refused`). Alert on `deadlettered`: it is the only outcome that needs a human. The four loss outcomes, `dropped`, `deadletter_evicted`, `deadletter_failed`, and `worker_stopped`, all mean events nobody will ever receive. `replay_refused` is not one of them: the record was kept and the caller was told to retry, which is why it is counted apart. |
+| `sbproxy_notify_deliveries_total` | `outcome` | `delivered`, `retried`, `deadlettered`, `dropped`, plus `deadletter_evicted`, `deadletter_failed`, `serialize_error`, `worker_stopped`, and the admin mutations (`create`, `update`, `rotate`, `delete`, `replay`, `discard`). Alert on `deadlettered`: it is the only outcome that needs a human. The four loss outcomes, `dropped`, `deadletter_evicted`, `deadletter_failed`, and `worker_stopped`, all mean events nobody will ever receive. `replay_refused` is not one of them: the record was kept and the caller was told to retry, which is why it is counted apart. |
 | `sbproxy_notify_queue` | `collection` | `subscriptions` and `deadletters`. A configured notifier publishes both at zero on boot, so no data means it is not configured. |
 
 Neither family is labeled by subscription id or destination. Both are

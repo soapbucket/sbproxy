@@ -688,11 +688,28 @@ mod tests {
         }
     }
 
+    /// The sentinel has to be the value the type holds, not a substring
+    /// that happens to appear when the fixture's secret is the literal
+    /// `"secret"`. Asserting the substring made the test vacuous the
+    /// moment somebody changed the fixture, while
+    /// `scripts/secret-debug-registry.txt` went on claiming this type is
+    /// pinned; the guard's own header names that as the failure its rule 3
+    /// cannot see.
     #[test]
     fn the_debug_impl_never_prints_the_signing_secret() {
-        let rendered = format!("{:?}", subscription(&["*"]));
+        let mut record = subscription(&["*"]);
+        record.signing_secret =
+            "9f2c4b81a07d3e56cc1188f4a2be7d90e5137a6c0b48d2f9317ea5c68b04d7f1".into();
+        let rendered = format!("{record:?}");
         assert!(rendered.contains("<redacted>"));
-        assert!(!rendered.contains("secret\""));
+        assert!(
+            !rendered.contains(&record.signing_secret),
+            "the Debug rendered the signing secret: {rendered}"
+        );
+        assert!(
+            rendered.contains(&record.subscription_id),
+            "and it still has to name what it is, or a log line cannot be acted on"
+        );
     }
 
     #[test]

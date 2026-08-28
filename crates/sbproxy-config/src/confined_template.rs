@@ -830,8 +830,10 @@ fn compression_lever_endpoint_is_a_host_path(value: &str, _sibling_type: Option<
 /// signature chain hangs off: the directory vouches for the keys that
 /// sign the feed, so a document that names the directory names what the
 /// signatures are checked against. `store_path` is scoped per parent
-/// rather than `Anywhere` because `model_host` and `key_management`
-/// already use the name for their own stores.
+/// rather than `Anywhere` because `proxy.model_host` already uses that
+/// exact name for its revision store; `key_management`'s store is
+/// `proxy.key_management.store.path` and is covered by `Under("store")`,
+/// so it is not a second reason.
 ///
 /// **Trust anchors and sockets the process opens.** `acme.ca_root` is a
 /// PEM read with `std::fs::read` at issuance, and refusing to fall back
@@ -1124,19 +1126,22 @@ const HOST_FILE_KEYS: &[HostFileKey] = &[
     HostFileKey {
         scope: KeyScope::Under("agent_registry"),
         key: "feed_path",
-        remedy: "leave the catalog feed to the layer this node owns; the registry reads                  it off the host filesystem and has no inline form",
+        remedy: "leave the catalog feed to the layer this node owns; the registry reads \
+                 it off the host filesystem and has no inline form",
         host_path_value: None,
     },
     HostFileKey {
         scope: KeyScope::Under("agent_registry"),
         key: "key_directory_path",
-        remedy: "leave the key directory to the layer this node owns; naming it is naming                  what the feed's signatures are checked against",
+        remedy: "leave the key directory to the layer this node owns; naming it is naming \
+                 what the feed's signatures are checked against",
         host_path_value: None,
     },
     HostFileKey {
         scope: KeyScope::Under("notifications"),
         key: "store_path",
-        remedy: "leave the notifier's store to the layer this node owns; the file holds                  live webhook signing secrets",
+        remedy: "leave the notifier's store to the layer this node owns; the file holds \
+                 live webhook signing secrets",
         host_path_value: None,
     },
     HostFileKey {
@@ -3206,6 +3211,17 @@ mod tests {
                         "`{name}` was refused at `{path}`, which is not the key it names",
                     );
                     assert!(!remedy.is_empty(), "`{name}` has no remedy");
+                    // A `remedy` is interpolated into the operator-facing
+                    // refusal, so a literal written across two source
+                    // lines without a `\`-continuation ships the source
+                    // indentation as a run of spaces. Three of these
+                    // entries did exactly that, and the emptiness check
+                    // above could not see it.
+                    assert!(
+                        !remedy.contains("  "),
+                        "`{name}`'s remedy carries a run of spaces where a line \
+                         continuation was meant: {remedy}",
+                    );
                 }
                 other => panic!("expected a HostFileInlining refusal for `{name}`, got {other:?}"),
             }
