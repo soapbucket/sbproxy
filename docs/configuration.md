@@ -6441,20 +6441,29 @@ engine name you choose.
 |---|---|
 | Compiled by the pipeline | `rego_module_path`, `module_path`, `spec_file`, `sha1_file`, `transcode.descriptor_set`, `bulk_list.path`, `feed.cache_dir`, `feed.cache_file`, `spec_path`, `argument_policies.path`, `result_policies.path`, `agent_skills.path`, `agent_skills.url` (any value that is not an absolute `http(s)` URL), `action.path` (the `local` storage backend), `tool_versioning.lockfile` |
 | Model, tokenizer and rule-pack weights | `model_path`, `tokenizer_path`, `model_signature_path`, `tokenizer_signature_path`, `rule_pack_path`, `onnx_model_path` |
-| Extension code | `extensions.bundles_dir`, `sources.path` |
-| Node identity and node state | `tls_cert_file`, `tls_key_file`, `cert_file`, `key_file`, `ca_file`, `client_ca_file`, `tls.cert`, `tls.key`, `authority_dir`, `signing_key_file`, `verifying_key_file`, `verifying_keys_file`, `state_dir`, `state_path`, `store_dir`, `store.path`, `model_host.store_path`, `model_host.catalog_file`, `cache.directory`, `engines.*.path`, `socket_path`, `tls_certificate_path`, `jwt_path`, `auth.path`, `service_account_key_file.path`, `external_account_file.path`, `backends.path`, `proxy.ai_providers_file` |
+| Extension code | `extensions.bundles_dir`, `sources.path` (a `type: directory` source, and a `type: git` source whose `path` leaves the repository) |
+| A binary this node runs | `serve.cache_dir`, `acquire.path`, `lora_adapters.source` (any value that is not an `hf:Org/Repo` reference) |
+| Node identity and node state | `tls_cert_file`, `tls_key_file`, `cert_file`, `key_file`, `ca_file`, `client_ca_file`, `tls.cert`, `tls.key`, `authority_dir`, `signing_key_file`, `verifying_key_file`, `verifying_keys_file`, `state_dir`, `state_path`, `store_dir`, `store.path`, `model_host.store_path`, `catalog_file`, `cache.directory`, `engines.*.path`, `socket_path`, `tls_certificate_path`, `jwt_path`, `auth.path`, `service_account_key_file.path`, `external_account_file.path`, `backends.path`, `proxy.ai_providers_file` |
 | Durable sinks and evidence | `audit.path`, `audit.config_path`, `audit.key_path`, `audit.admin_path`, `output.path`, `events.path`, `request_events.path`, `session_ledger.path`, `usage_rollups.path`, `usage_sinks.path`, `ledger.path`, `queue.path`, `config_history.dir`, `revocation_store.path`, `cache_path`, `storage_path`, `compression_state.local_path`, `prompt_persistence_path`, `backend.path` |
+| Trust anchors and sockets | `acme.ca_root`, `levers.endpoint` (a `unix://` value only) |
 
 Three things about that table.
 
 It is a list, so it is exactly as wide as its entries: a module added
 later opens a path the list has never heard of until somebody adds it.
-What keeps it honest is a test that walks the shipped JSON Schema for
-every property whose name looks like a path and requires each one to be
-on this list or on a written allowlist saying why it is not a path on
-this host. The untyped blocks the schema cannot see (`policies[]`,
-`action`, `ai`, `proxy.extensions[]`) are swept out of the crates that
-deserialize them.
+What keeps it honest is a test that walks **every schema this
+repository generates** and requires each path-shaped property to be on
+this list or on a written allowlist saying why it is not a path on this
+host. All six files under `schemas/` are swept, because
+`sb-config.schema.json` alone is not the config surface: it leaves
+`policies[]`, `action`, `ai` and `proxy.extensions.*` untyped, and five
+of those blocks ship a generated schema of their own. That is where
+`origins.*.ai.providers[].serve` lives, the block that names an engine
+binary this node executes. A property counts as path-shaped when its
+name looks like a path **or** its own description says it is a file, a
+path, a directory or a socket, because a name-only rule is exactly as
+wide as its list of name fragments and `proxy.acme.ca_root` carries
+none of them.
 
 It refuses the *document's* choice of path, not the key.
 `state_dir: "${SB_STATE_DIR}"` is fine, because the node resolves that
