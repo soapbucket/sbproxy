@@ -1880,7 +1880,7 @@ mod tests {
         config.external_base_url = "https://broker.example".to_string();
         config.device_code_verification_uri = "https://id.acme.example/consent".to_string();
 
-        let app = build_app(config);
+        let app = authenticated(build_app(config));
         let token = consent_form_token(app.clone()).await;
         let body = format!("user_code=ZZZZ-ZZZZ&action=approve&form_token={token}");
         // `CONSENT_ORIGIN` is the broker's own origin, not the
@@ -1904,7 +1904,7 @@ mod tests {
         config.external_base_url = "https://broker.example".to_string();
         config.device_code_verification_uri = "https://id.acme.example/consent".to_string();
 
-        let app = build_app(config);
+        let app = authenticated(build_app(config));
         let token = consent_form_token(app.clone()).await;
         let body = format!("user_code=ZZZZ-ZZZZ&action=approve&form_token={token}");
         let (status, _text) = post_form_from(

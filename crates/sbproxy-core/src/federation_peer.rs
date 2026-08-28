@@ -180,6 +180,24 @@ impl FederationPeerVerifier {
         self.required
     }
 
+    /// Swap the fetcher, for tests that need to drive the walk without
+    /// a network.
+    ///
+    /// The production constructor hardcodes `ReqwestFederationFetcher`
+    /// because the fetcher is where the SSRF and egress guards live and
+    /// an injectable one is a way to bypass them. This seam is
+    /// `cfg(test)` for that reason: it exists so the wall-clock budget
+    /// can be tested against a peer that stalls, which is the one
+    /// behavior no reachable configuration can produce on demand.
+    #[cfg(test)]
+    pub(crate) fn with_fetcher(
+        mut self,
+        fetcher: Arc<dyn sbproxy_federation::FederationFetcher>,
+    ) -> Self {
+        self.fetcher = fetcher;
+        self
+    }
+
     /// How many peers are currently cached, for the admin surface.
     pub(crate) fn cached_peers(&self) -> usize {
         self.cache
@@ -636,4 +654,68 @@ mod tests {
             PeerVerdict::Refused("chain_unresolved")
         ));
     }
+
+    /// A peer that accepts and then stalls cannot hold the request
+    /// past the configured wall-clock budget.
+    ///
+    /// `FetchBudget` checks its deadline immediately **before** each
+    /// fetch, which bounds a walk that keeps making progress. It
+    /// cannot bound one that stops: without the `tokio::time::timeout`
+    /// wrapper this future lives for the budget plus one full
+    /// per-fetch timeout, 5s + 30s at the defaults, inside an
+    /// unauthenticated `request_filter`.
+    ///
+    /// Red without the wrapper: the stub below never returns, so the
+    /// walk never completes and the test hangs rather than refusing.
+    #[tokio::test(start_paused = true)]
+    async fn security_boundary_a_stalling_peer_cannot_outlive_the_walk_budget() {
+        /// Accepts the request and never answers.
+        struct StallingFetcher;
+
+        #[async_trait::async_trait]
+        impl sbproxy_federation::FederationFetcher for StallingFetcher {
+            async fn fetch_entity_configuration(
+                &self,
+                _entity_id: &str,
+            ) -> sbproxy_federation::FederationResult<String> {
+                // Far longer than any per-fetch timeout. On a paused
+                // clock this advances only when the runtime has
+                // nothing else to do, so the timeout is what fires.
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                unreachable!("the walk budget must refuse before this resolves")
+            }
+
+            async fn fetch_subordinate_statement(
+                &self,
+                _fetch_endpoint: &str,
+                _subordinate: &str,
+            ) -> sbproxy_federation::FederationResult<String> {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                unreachable!("the walk budget must refuse before this resolves")
+            }
+        }
+
+        let mut config = peer_config();
+        config.max_chain_duration_ms = 5_000;
+        let verifier = FederationPeerVerifier::new(&config)
+            .expect("verifier")
+            .with_fetcher(Arc::new(StallingFetcher));
+
+        let started = tokio::time::Instant::now();
+        let verdict = verifier
+            .verify("198.51.100.7", "https://peer.example")
+            .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            verdict,
+            PeerVerdict::Refused("chain_unresolved"),
+            "a stalling peer must be refused, not waited on"
+        );
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "the walk must end on its own budget rather than on a per-fetch timeout; took {elapsed:?}"
+        );
+    }
+
 }
