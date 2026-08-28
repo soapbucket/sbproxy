@@ -2670,6 +2670,61 @@ mod tests {
         }
     }
 
+    /// WOR-2433, after CI's secret-resolver drift guard. A detector must
+    /// be as wide as the enforcer, so the property is stated over the
+    /// shared table rather than over a handful of literals: every prefix
+    /// `SecretResolver::resolve_with_limit` reads off this host is one
+    /// the confined pass refuses, in value position and in mapping-key
+    /// position, under both the sealed and the remote-document policies,
+    /// and with whitespace around it. A prefix added to
+    /// `HOST_BACKED_SECRET_PREFIXES` that the confined walk does not
+    /// refuse fails here.
+    #[test]
+    fn every_host_backed_prefix_the_resolver_reads_is_refused() {
+        assert!(
+            !crate::types::HOST_BACKED_SECRET_PREFIXES.is_empty(),
+            "an empty table would make every assertion below vacuous",
+        );
+        for (prefix, _) in crate::types::HOST_BACKED_SECRET_PREFIXES {
+            for reference in [
+                format!("{prefix}SB_SECRET_2433"),
+                format!("  {prefix}SB_SECRET_2433"),
+                format!("{prefix}SB_SECRET_2433\t"),
+            ] {
+                for policy in [
+                    ConfinementPolicy::remote_document(),
+                    ConfinementPolicy::bundle_manifest(),
+                ] {
+                    // Value position.
+                    let document = format!(
+                        "origins:\n  api:\n    authentication:\n      type: api_key\n      api_key: {reference:?}\n"
+                    );
+                    let error = check_confined_document("acme/runtime-config", &document, &policy)
+                        .expect_err("the resolver reads this off the host, so it must be refused");
+                    assert!(
+                        matches!(
+                            error,
+                            ConfinedTemplateError::HostSecretReference { .. }
+                                | ConfinedTemplateError::SecretReference { .. }
+                        ),
+                        "`{reference}` was refused as {error:?}, not as a secret reference",
+                    );
+                    assert!(
+                        !error.to_string().contains("SB_SECRET_2433"),
+                        "the refusal echoed the reference: {error}",
+                    );
+
+                    // Mapping-key position, which the pre-parse pass
+                    // substitutes into just as readily.
+                    let document =
+                        format!("origins:\n  api:\n    request_headers:\n      {reference:?}: v\n");
+                    check_confined_document("acme/runtime-config", &document, &policy)
+                        .expect_err("a reference in key position is still a host read");
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_host_backed_secret_reference_names_the_form_and_never_the_value() {
         let _env = secret_env();
