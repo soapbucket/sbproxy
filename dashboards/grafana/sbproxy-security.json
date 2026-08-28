@@ -1192,15 +1192,15 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "min by (agent_class) (sbproxy_agent_reputation_score)",
-          "legendFormat": "{{agent_class}}",
+          "expr": "min by (tenant_id, agent_class) (sbproxy_agent_reputation_score)",
+          "legendFormat": "{{tenant_id}} / {{agent_class}}",
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           }
         }
       ],
-      "description": "Reputation per agent class, 1.0 down to 0.0, over the detector's rolling 28-day window. A critical verdict costs five times a warning, and weight decays by rolling out of the window rather than on a timer, so a class that stops misbehaving recovers on its own. Nothing on the request path reads this number: it is published for an operator to act on, because what a request should do when its class scores 0.4 has not been decided."
+      "description": "Reputation per tenant and agent class, 1.0 down to 0.0, over the detector's rolling 28-day window. A critical verdict costs five times a warning, and weight decays by rolling out of the window rather than on a timer, so a class that stops misbehaving recovers on its own; the gauge is republished on every analysis, not only when a verdict fires, so the number moves while the class recovers. A class that goes entirely silent keeps its last score until it sends again. Advisory unless an operator sets proxy.anomaly.reputation.deny_below or challenge_below, which turn it into an admission decision."
     }
   ],
   "templating": {

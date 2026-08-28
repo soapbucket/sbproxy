@@ -5719,6 +5719,52 @@ pub struct AnomalyConfig {
     /// engage, so a single burst against an idle class is not a spike.
     #[serde(default = "default_anomaly_rate_spike_min_mean")]
     pub rate_spike_min_mean: f64,
+
+    /// What admission does with the reputation score. Both thresholds
+    /// are unset by default, which leaves the score advisory.
+    #[serde(default)]
+    pub reputation: AnomalyReputationConfig,
+}
+
+/// Admission thresholds on the reputation score (WOR-2666).
+///
+/// The score is published whether or not anything acts on it, and
+/// nothing acts on it until an operator names a number. That split is
+/// deliberate and it is the same one Cloudflare's threat score has: the
+/// gateway computes it always, and a rule decides what it means. An
+/// operator watches the gauge for a while, sees what their own traffic
+/// scores, and only then writes a floor.
+///
+/// # Read this before setting one
+///
+/// The score is keyed on the agent class the resolver produced, and
+/// that class is a *claim* unless the resolver source was a verified
+/// one (`bot_auth`, `kya`, `rdns`, `tls_fingerprint`). Anyone can send
+/// GPTBot's `User-Agent`, be resolved into the `gptbot` class, and
+/// misbehave there, which moves the score the real GPTBot is then
+/// admitted against. The decision record carries the resolver source
+/// for exactly this reason, so a rule written after the fact can tell
+/// the two apart.
+///
+/// The class `unknown` is a single shared bucket for everything the
+/// resolver did not recognize. A floor that catches `unknown` catches
+/// most of the unclassified web with it.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AnomalyReputationConfig {
+    /// Score below which admission refuses the request with a `403`.
+    ///
+    /// Unset by default. `0.0` to `1.0`, where 1.0 is a class that has
+    /// produced no anomalies in the window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny_below: Option<f64>,
+
+    /// Score below which admission answers `429` instead of proxying.
+    ///
+    /// Unset by default. Set above `deny_below` to get a two-step
+    /// posture; `deny_below` wins when a score is under both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub challenge_below: Option<f64>,
 }
 
 impl Default for AnomalyConfig {
@@ -5729,6 +5775,7 @@ impl Default for AnomalyConfig {
             outlier_frequency: default_anomaly_outlier_frequency(),
             rate_spike_multiplier: default_anomaly_rate_spike_multiplier(),
             rate_spike_min_mean: default_anomaly_rate_spike_min_mean(),
+            reputation: AnomalyReputationConfig::default(),
         }
     }
 }

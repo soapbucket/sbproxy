@@ -284,10 +284,19 @@ const authResults = computed(() => {
     }));
 });
 /* One card for the three callout providers. Renders nothing until an
- * origin configures one, and colours the outcomes that mean a request
+ * origin configures one, and colors the outcomes that mean a request
  * was refused, or admitted without a decision, as failures. `fail_open`
  * is red rather than green for that reason: the request went through,
  * but nothing authorized it. */
+/* The outcomes that mean the caller got in. Everything else on these
+ * three families is a refusal, a fail-open, or an outage. */
+const SUCCESS_OUTCOMES = new Set([
+  "ext_authz allow",
+  "introspection active",
+  "introspection cached",
+  "kya verified",
+]);
+
 const authCallouts = computed(() => {
   const rows: { key: string; value: number; color?: string }[] = [];
   const push = (
@@ -296,12 +305,16 @@ const authCallouts = computed(() => {
     label: string,
   ) => {
     for (const row of groupByLabel(family, label)) {
+      const key = `${prefix} ${row.key}`;
       rows.push({
-        key: `${prefix} ${row.key}`,
+        key,
         value: row.value,
-        color: /allow|active|verified|cached/i.test(row.key)
-          ? "var(--sb-ok)"
-          : "var(--sb-err)",
+        /* An explicit success set, not a substring match: `/active/`
+         * also matches `inactive`, so a rejected token rendered
+         * green. The set is keyed on the prefixed row, because
+         * `active` means one thing under `introspection` and nothing
+         * under the other two families. */
+        color: SUCCESS_OUTCOMES.has(key) ? "var(--sb-ok)" : "var(--sb-err)",
       });
     }
   };
@@ -312,7 +325,7 @@ const authCallouts = computed(() => {
 });
 
 /* Verdicts by kind and severity, then the score each class currently
- * carries. Severity colours the row: an `info` verdict is a note, a
+ * carries. Severity colors the row: an `info` verdict is a note, a
  * `critical` one is a page. */
 const anomalies = computed(() => {
   const rows: { key: string; value: number; color?: string }[] = [];
@@ -327,7 +340,13 @@ const anomalies = computed(() => {
           : undefined,
     });
   }
-  for (const row of groupByLabel(reputationFamily.value, "agent_class")) {
+  /* Both labels, not just the class. The score is keyed by tenant, so
+   * grouping on the class alone would add two tenants' gauges together
+   * and render a number that is not a score. */
+  for (const row of groupByLabels(reputationFamily.value, [
+    "tenant_id",
+    "agent_class",
+  ])) {
     rows.push({
       key: `reputation / ${row.key}`,
       value: Math.round(row.value * 100) / 100,

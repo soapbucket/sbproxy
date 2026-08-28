@@ -8883,6 +8883,7 @@ dependencies = [
  "ipnetwork",
  "jsonwebtoken",
  "loom",
+ "lru",
  "notify",
  "object_store",
  "parking_lot",

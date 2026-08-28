@@ -39,6 +39,20 @@
 //! available and is configured on the bucket, where it belongs: it is
 //! orthogonal to this setting and the two compose.
 //!
+//! # Object naming
+//!
+//! An entry's object is named `hex(sha256(cache key))`, fanned out two
+//! levels (`ab/cd/abcdef...`) under the configured prefix. The digest
+//! rather than the key because a cache key runs to a couple of hundred
+//! bytes and encoding it inline puts the object name past `NAME_MAX` on
+//! the `local` backend and eventually past S3's 1,024-byte key limit;
+//! the fan-out because a flat prefix with a million entries is a
+//! directory listing problem on extN and XFS. The digest is also the
+//! associated data an entry is sealed under, so an object copied to
+//! another entry's path fails to authenticate, and the eviction sweep
+//! can open what it finds by listing without recovering the plaintext
+//! key first.
+//!
 //! # One object per entry
 //!
 //! Each entry is a single object whose payload is
@@ -58,6 +72,13 @@
 //! rather than judge it from the listing. The sweep is therefore bounded
 //! at `MAX_EVICTION_SCAN` (1,000) objects per call and reports how many
 //! it deleted.
+//!
+//! The proxy runs it on a timer (every fifteen minutes, from the
+//! pipeline's background tasks), so a small reserve does expire without
+//! any bucket configuration. That is what the bound is for: one
+//! bounded pass per interval whatever the reserve holds. It is not a
+//! substitute for a lifecycle rule at scale, and the sections below and
+//! `docs/cache-reserve.md` say so in the same words.
 //!
 //! An index of empty marker objects named `{expiry}/{key}` would make
 //! the sweep a single lexicographically-ordered list with no reads at
@@ -122,6 +143,12 @@ pub struct ObjectStoreReserve {
     /// Key ring sealing new entries and opening existing ones. `None`
     /// stores payloads as they arrive.
     keys: Option<Arc<SealKeyRing>>,
+    /// Largest object this instance will write or read.
+    ///
+    /// A field rather than [`MAX_ENTRY_BYTES`] read at each site so the
+    /// cap can be exercised at a size a test can afford. Every
+    /// production constructor sets it to the constant.
+    max_entry_bytes: usize,
 }
 
 impl std::fmt::Debug for ObjectStoreReserve {
@@ -166,7 +193,16 @@ impl ObjectStoreReserve {
             },
             backend: backend.into(),
             keys,
+            max_entry_bytes: MAX_ENTRY_BYTES,
         }
+    }
+
+    /// Shrink the entry cap so a test can reach it without allocating
+    /// 64 MiB.
+    #[cfg(test)]
+    fn with_max_entry_bytes(mut self, cap: usize) -> Self {
+        self.max_entry_bytes = cap;
+        self
     }
 
     /// True when entries are sealed before they leave the process.
@@ -174,31 +210,83 @@ impl ObjectStoreReserve {
         self.keys.is_some()
     }
 
-    /// Object path for a cache key.
+    /// The object name a cache key maps to: `hex(sha256(key))`.
     ///
-    /// The key is hex-encoded rather than embedded, because a cache key
-    /// carries a path and a query string, and an object-store `Path`
-    /// normalizes `.` and `..` segments and rejects some byte sequences
-    /// outright. Encoding removes the whole class: no cache key can
-    /// escape the prefix, collide with another after normalization, or
-    /// fail to be storable.
-    fn object_path(&self, key: &str) -> Path {
-        Path::from(format!("{}{}", self.prefix, hex::encode(key.as_bytes())))
+    /// A digest rather than the key itself, and a digest rather than
+    /// `hex(key)`, which is what shipped first and what WOR-2673's
+    /// review found. A cache key is
+    /// `v2:<workspace>:<tenant>:<hostname>:<method>:<path>:<identity>:<query>:<vary_fp>:<config_fp>`,
+    /// which for an ordinary API request runs to roughly 190 bytes.
+    /// Hex-encoded that is 380 characters in one path segment, past
+    /// `NAME_MAX` (255) on ext4, XFS, and APFS, so every `put` on the
+    /// `local` backend returned `ENAMETOOLONG` forever, with the
+    /// symptom being `sbproxy_cache_reserve_errors_total` climbing and
+    /// hits flat at zero. S3's 1,024-byte key limit is the same wall
+    /// further out. A digest is 64 characters whatever the key was.
+    ///
+    /// It is also the associated data the entry is sealed under, so an
+    /// object copied to another entry's path still fails to
+    /// authenticate: the digest is derived from the key, and a
+    /// different key gives a different digest and a different path.
+    /// That is what lets the eviction sweep open an object it found by
+    /// listing, without having to recover the plaintext key first.
+    fn key_digest(key: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(key.as_bytes());
+        hex::encode(hasher.finalize())
     }
 
-    /// Recover the cache key an object path encodes. `None` for anything
+    /// Object path for a digest, fanned out two levels.
+    ///
+    /// `ab/cd/abcdef...`, the shape [`super::filesystem::FsReserve`]
+    /// uses and for the same reason it gives: without it every entry
+    /// lands in one directory, and a directory with a million entries
+    /// is a problem on extN and XFS long before it is a problem for the
+    /// proxy.
+    fn digest_path(&self, digest: &str) -> Path {
+        Path::from(format!(
+            "{}{}/{}/{}",
+            self.prefix,
+            &digest[..2],
+            &digest[2..4],
+            &digest[4..]
+        ))
+    }
+
+    /// Object path for a cache key.
+    fn object_path(&self, key: &str) -> Path {
+        self.digest_path(&Self::key_digest(key))
+    }
+
+    /// Recover the digest an object path encodes. `None` for anything
     /// under the prefix this backend did not write.
-    fn key_from_path(&self, path: &Path) -> Option<String> {
+    ///
+    /// The comparison is against `Path::from(&self.prefix)` rather than
+    /// the raw prefix string. `object_store` percent-encodes a set of
+    /// bytes on the way into a `Path` (`%`, `[`, `]`, `{`, `}`, `^`,
+    /// backtick, `"`, `<`, `>`, `\\`), so stripping the raw prefix off
+    /// an encoded path failed the round trip for every object this
+    /// backend wrote under a prefix containing one of them, and the
+    /// sweep then skipped its own entries as "somebody else's".
+    fn digest_from_path(&self, path: &Path) -> Option<String> {
+        let encoded_prefix = Path::from(self.prefix.trim_end_matches('/'));
         let full = path.as_ref();
-        let encoded = full.strip_prefix(self.prefix.trim_end_matches('/'))?;
-        let encoded = encoded.strip_prefix('/').unwrap_or(encoded);
-        let bytes = hex::decode(encoded).ok()?;
-        String::from_utf8(bytes).ok()
+        let rest = if encoded_prefix.as_ref().is_empty() {
+            full
+        } else {
+            full.strip_prefix(encoded_prefix.as_ref())?
+                .strip_prefix('/')?
+        };
+        let digest: String = rest.split('/').collect();
+        // 32 bytes of SHA-256, hex. Anything else is not ours.
+        (digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then_some(digest)
     }
 
     /// Frame metadata and body into one payload, sealing it when a key
     /// ring is configured.
-    fn encode(&self, key: &str, value: &Bytes, metadata: &ReserveMetadata) -> Result<Vec<u8>> {
+    fn encode(&self, digest: &str, value: &Bytes, metadata: &ReserveMetadata) -> Result<Vec<u8>> {
         let meta = serde_json::to_vec(metadata).context("encode reserve metadata")?;
         let meta_len = u32::try_from(meta.len())
             .context("reserve metadata is larger than the 4 GiB length prefix allows")?;
@@ -207,10 +295,12 @@ impl ObjectStoreReserve {
         payload.extend_from_slice(&meta);
         payload.extend_from_slice(value);
         match self.keys.as_ref() {
-            // The cache key is the associated data, so an object lifted
-            // to another key fails to authenticate rather than being
-            // served as that key's entry.
-            Some(ring) => ring.seal(&payload, key.as_bytes()),
+            // The key's digest is the associated data, so an object
+            // lifted to another entry's path fails to authenticate
+            // rather than being served as that entry. The digest and
+            // not the key itself because the eviction sweep finds
+            // objects by listing and has only the path to work from.
+            Some(ring) => ring.seal(&payload, digest.as_bytes()),
             None => Ok(payload),
         }
     }
@@ -218,7 +308,7 @@ impl ObjectStoreReserve {
     /// Reverse [`Self::encode`]. `Ok(None)` means the object is not one
     /// this backend can read, which the caller treats as a miss so the
     /// request falls through to origin rather than failing.
-    fn decode(&self, key: &str, stored: &[u8]) -> Result<Option<(Bytes, ReserveMetadata)>> {
+    fn decode(&self, digest: &str, stored: &[u8]) -> Result<Option<(Bytes, ReserveMetadata)>> {
         let plaintext: Vec<u8> = match self.keys.as_ref() {
             Some(ring) => {
                 let Some(envelope) =
@@ -234,7 +324,7 @@ impl ObjectStoreReserve {
                     );
                     return Ok(None);
                 };
-                match ring.open(&envelope, key.as_bytes()) {
+                match ring.open(&envelope, digest.as_bytes()) {
                     OpenOutcome::Opened(plaintext) => plaintext,
                     OpenOutcome::AuthFailed => {
                         tracing::warn!(
@@ -280,35 +370,51 @@ impl ObjectStoreReserve {
 #[async_trait]
 impl CacheReserveBackend for ObjectStoreReserve {
     async fn put(&self, key: &str, value: Bytes, metadata: ReserveMetadata) -> Result<()> {
-        if value.len() > MAX_ENTRY_BYTES {
+        let digest = Self::key_digest(key);
+        let payload = self.encode(&digest, &value, &metadata)?;
+        // The cap is on what gets written, not on the body it was
+        // framed from. Capping the body meant a response at exactly
+        // `max_size_bytes == MAX_ENTRY_BYTES` was accepted by `put`,
+        // stored with its metadata frame and seal overhead on top, and
+        // then refused by `get` on every subsequent lookup: an entry
+        // paid for and unreadable forever.
+        if payload.len() > self.max_entry_bytes {
             anyhow::bail!(
-                "reserve entry is {} bytes, past the {MAX_ENTRY_BYTES}-byte backend cap",
-                value.len()
+                "reserve entry frames to {} bytes, past the {}-byte backend cap",
+                payload.len(),
+                self.max_entry_bytes
             );
         }
-        let payload = self.encode(key, &value, &metadata)?;
         self.store
-            .put(&self.object_path(key), PutPayload::from(payload))
+            .put(&self.digest_path(&digest), PutPayload::from(payload))
             .await
             .context("cache reserve object put")?;
         Ok(())
     }
 
     async fn get(&self, key: &str) -> Result<Option<(Bytes, ReserveMetadata)>> {
-        let path = self.object_path(key);
+        let digest = Self::key_digest(key);
+        let path = self.digest_path(&digest);
         let result = match self.store.get(&path).await {
             Ok(result) => result,
             Err(object_store::Error::NotFound { .. }) => return Ok(None),
             Err(error) => return Err(error).context("cache reserve object get"),
         };
-        let stored = result.bytes().await.context("cache reserve object read")?;
-        if stored.len() > MAX_ENTRY_BYTES {
+        // Checked from the listing metadata, before the read allocates.
+        // The docs recommend sharing a bucket, so anything with write
+        // access to the prefix (a backup job, a colleague's `aws s3
+        // cp`, a compromised CI credential) can leave a 4 GiB object at
+        // a path that happens to look like ours. Checking the length
+        // after `bytes()` is a cap the process has already paid for.
+        if result.meta.size > self.max_entry_bytes {
             anyhow::bail!(
-                "reserve object is {} bytes, past the {MAX_ENTRY_BYTES}-byte backend cap",
-                stored.len()
+                "reserve object is {} bytes, past the {}-byte backend cap",
+                result.meta.size,
+                self.max_entry_bytes
             );
         }
-        self.decode(key, &stored)
+        let stored = result.bytes().await.context("cache reserve object read")?;
+        self.decode(&digest, &stored)
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
@@ -338,11 +444,18 @@ impl CacheReserveBackend for ObjectStoreReserve {
             }
             let meta = entry.context("cache reserve object listing")?;
             examined += 1;
-            let Some(key) = self.key_from_path(&meta.location) else {
+            let Some(digest) = self.digest_from_path(&meta.location) else {
                 // Something else's object under the same prefix. Never
                 // delete it: the operator may be sharing the bucket.
                 continue;
             };
+            // Same cap as the read path, and for the same reason: an
+            // oversized object under a shared prefix must not be
+            // allocated to decide it is not ours. Skipped rather than
+            // deleted, because it is not this backend's to remove.
+            if meta.size > self.max_entry_bytes {
+                continue;
+            }
             let stored = match self.store.get(&meta.location).await {
                 Ok(result) => result.bytes().await.context("cache reserve object read")?,
                 Err(object_store::Error::NotFound { .. }) => continue,
@@ -351,7 +464,7 @@ impl CacheReserveBackend for ObjectStoreReserve {
             // An object this backend cannot decode is left alone rather
             // than deleted. Deleting it would turn a key-rotation
             // mistake into data loss.
-            let Some((_, metadata)) = self.decode(&key, &stored)? else {
+            let Some((_, metadata)) = self.decode(&digest, &stored)? else {
                 continue;
             };
             if metadata.is_expired(before) {
@@ -591,8 +704,12 @@ mod tests {
     #[test]
     fn an_empty_prefix_writes_at_the_bucket_root() {
         let reserve = ObjectStoreReserve::new(memory_store(), "s3", "", None);
+        let digest = ObjectStoreReserve::key_digest("/a");
         let path = reserve.object_path("/a");
-        assert_eq!(path.as_ref(), hex::encode("/a"));
+        assert_eq!(
+            path.as_ref(),
+            format!("{}/{}/{}", &digest[..2], &digest[2..4], &digest[4..])
+        );
     }
 
     #[test]
@@ -607,18 +724,133 @@ mod tests {
     }
 
     #[test]
-    fn a_path_round_trips_back_to_its_cache_key() {
+    fn a_path_round_trips_back_to_its_digest() {
         let reserve = ObjectStoreReserve::new(memory_store(), "s3", "reserve/", None);
         let key = "/articles/1?full=1";
         let path = reserve.object_path(key);
-        assert_eq!(reserve.key_from_path(&path).as_deref(), Some(key));
+        assert_eq!(
+            reserve.digest_from_path(&path).as_deref(),
+            Some(ObjectStoreReserve::key_digest(key).as_str())
+        );
+    }
+
+    /// WOR-2673 review F22, red first. `object_store` percent-encodes a
+    /// set of bytes on the way into a `Path`, so stripping the *raw*
+    /// prefix off an *encoded* path failed the round trip for every
+    /// object this backend wrote under a prefix containing one of them,
+    /// and the sweep then skipped its own entries.
+    #[test]
+    fn a_prefix_with_an_encoded_byte_still_round_trips() {
+        let reserve = ObjectStoreReserve::new(memory_store(), "s3", "sb%reserve/", None);
+        let key = "/articles/1";
+        let path = reserve.object_path(key);
+        assert_eq!(
+            reserve.digest_from_path(&path).as_deref(),
+            Some(ObjectStoreReserve::key_digest(key).as_str()),
+            "the sweep has to recognize objects this backend wrote: {path}"
+        );
     }
 
     #[test]
-    fn a_foreign_path_does_not_decode_as_a_cache_key() {
+    fn a_foreign_path_does_not_decode_as_a_digest() {
         let reserve = ObjectStoreReserve::new(memory_store(), "s3", "reserve", None);
-        assert_eq!(reserve.key_from_path(&Path::from("reserve/not-hex")), None);
-        assert_eq!(reserve.key_from_path(&Path::from("elsewhere/aabb")), None);
+        assert_eq!(
+            reserve.digest_from_path(&Path::from("reserve/not-hex")),
+            None
+        );
+        assert_eq!(reserve.digest_from_path(&Path::from("elsewhere/aabb")), None);
+    }
+
+    /// WOR-2673 review F4, red first. Object names used to be
+    /// `hex(cache key)` in one flat segment: twice the length of a key
+    /// that already runs to a couple of hundred bytes, which is past
+    /// `NAME_MAX` on ext4, XFS, and APFS, so every `put` for an
+    /// ordinary API path failed forever on the `local` backend the
+    /// shipped example uses.
+    #[tokio::test]
+    async fn a_realistic_cache_key_produces_a_storable_object_name() {
+        let reserve = ObjectStoreReserve::new(memory_store(), "local", "sbproxy/reserve/", None);
+        let key = format!(
+            "v2:acme-workspace:acme-prod:api.acme.com:POST:\
+             /v1/organizations/12345/projects/67890/documents/abcdef:\
+             {identity}:{query}:{vary}:{config}",
+            identity = "a".repeat(40),
+            query = "b".repeat(30),
+            vary = "c".repeat(16),
+            config = "d".repeat(16),
+        );
+        let path = reserve.object_path(&key);
+        for segment in path.as_ref().split('/') {
+            assert!(
+                segment.len() <= 255,
+                "no path segment may exceed NAME_MAX: {segment}"
+            );
+        }
+        assert!(
+            path.as_ref().len() <= 1024,
+            "and the whole name has to fit S3's key limit: {path}"
+        );
+        // Fanned out, so one prefix does not hold every entry.
+        assert!(
+            path.as_ref().starts_with("sbproxy/reserve/"),
+            "unexpected path: {path}"
+        );
+        assert_eq!(path.as_ref().split('/').count(), 5, "unexpected path: {path}");
+
+        let (body, metadata) = sample(Duration::from_secs(60));
+        reserve
+            .put(&key, body.clone(), metadata)
+            .await
+            .expect("a realistic cache key has to be storable");
+        assert_eq!(
+            reserve.get(&key).await.expect("get").expect("present").0,
+            body
+        );
+    }
+
+    /// WOR-2673 review F3, as a seam test. The cap used to be checked
+    /// after `result.bytes()` had already materialized the whole
+    /// object, which is a cap the process has paid for. It is read off
+    /// the listing metadata now, so the refusal happens before the
+    /// allocation.
+    #[tokio::test]
+    async fn an_oversized_object_is_refused_from_its_metadata() {
+        let store = memory_store();
+        let reserve = ObjectStoreReserve::new(store.clone(), "s3", "reserve", None)
+            .with_max_entry_bytes(64);
+        // Written out of band, the way a shared bucket lets anything
+        // with write access to the prefix do.
+        store
+            .put(
+                &reserve.object_path("/a"),
+                PutPayload::from(vec![0u8; 4096]),
+            )
+            .await
+            .expect("foreign put");
+        let error = reserve
+            .get("/a")
+            .await
+            .expect_err("an object past the cap must be refused");
+        assert!(format!("{error:#}").contains("4096"), "{error:#}");
+    }
+
+    /// WOR-2673 review F19, red first. `put` capped the body and `get`
+    /// capped the framed-and-sealed object, so an entry at exactly the
+    /// cap was written and then unreadable forever.
+    #[tokio::test]
+    async fn an_entry_at_the_cap_is_refused_rather_than_written_unreadable() {
+        let reserve = ObjectStoreReserve::new(memory_store(), "s3", "reserve", Some(key_ring()))
+            .with_max_entry_bytes(256);
+        let (_, metadata) = sample(Duration::from_secs(60));
+        let body = Bytes::from(vec![0u8; 256]);
+        reserve
+            .put("/a", body, metadata)
+            .await
+            .expect_err("a body that frames past the cap must be refused at write");
+        assert!(
+            reserve.get("/a").await.expect("get").is_none(),
+            "and nothing must have been written"
+        );
     }
 
     #[test]
@@ -628,9 +860,28 @@ mod tests {
         // holds. Slicing on it without a check would panic a worker.
         let mut corrupt = u32::MAX.to_be_bytes().to_vec();
         corrupt.extend_from_slice(b"{}");
-        assert!(reserve.decode("/a", &corrupt).expect("decode").is_none());
-        assert!(reserve.decode("/a", b"ab").expect("decode").is_none());
-        assert!(reserve.decode("/a", &[]).expect("decode").is_none());
+        let digest = ObjectStoreReserve::key_digest("/a");
+        assert!(reserve.decode(&digest, &corrupt).expect("decode").is_none());
+        assert!(reserve.decode(&digest, b"ab").expect("decode").is_none());
+        assert!(reserve.decode(&digest, &[]).expect("decode").is_none());
+    }
+
+    /// The same corruption reached through the production entry point,
+    /// so the claim is about the surface rather than about `decode`.
+    #[tokio::test]
+    async fn a_corrupt_object_read_through_get_is_a_miss() {
+        let store = memory_store();
+        let reserve = ObjectStoreReserve::new(store.clone(), "s3", "reserve", None);
+        let mut corrupt = u32::MAX.to_be_bytes().to_vec();
+        corrupt.extend_from_slice(b"{}");
+        store
+            .put(&reserve.object_path("/a"), PutPayload::from(corrupt))
+            .await
+            .expect("corrupt put");
+        assert!(
+            reserve.get("/a").await.expect("get is not an error").is_none(),
+            "a corrupt object falls through to origin rather than panicking a worker"
+        );
     }
 
     #[test]

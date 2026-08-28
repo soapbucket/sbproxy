@@ -4791,6 +4791,7 @@ impl ProxyHttp for SbProxy {
                     Option<&str>,
                 ) = (None, false, None);
                 let view = sbproxy_plugin::RequestContextView {
+                    tenant_id: ctx.tenant_id.as_str(),
                     hostname: ctx.hostname.as_str(),
                     method: method_str,
                     path: path_str,
@@ -4812,6 +4813,16 @@ impl ProxyHttp for SbProxy {
                     // watches would move.
                     for verdict in hook.analyze(&view).await {
                         crate::anomaly::record_verdict(ctx.hostname.as_str(), &verdict);
+                        // WOR-2666 review F16: the counter carries
+                        // `kind` and `severity` and nothing else, and a
+                        // log line is not the audit trail. The typed
+                        // record is where every other decision surface
+                        // in this workspace publishes.
+                        crate::server::record_anomaly_decision(
+                            ctx,
+                            &verdict,
+                            agent_id_source_label,
+                        );
                     }
                 }
             }

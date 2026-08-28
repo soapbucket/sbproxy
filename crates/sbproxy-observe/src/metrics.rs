@@ -547,11 +547,13 @@ pub struct ProxyMetrics {
     pub ext_authz_decisions: Option<IntCounterVec>,
     /// WOR-2667: RFC 7662 token-introspection results, by result
     /// (`active`, `inactive`, `insufficient_scope`, `cached`,
-    /// `unavailable`).
+    /// `no_token`, `unavailable`).
     ///
-    /// `cached` counts the requests a verdict cache answered without
-    /// reaching the authorization server, which is what tells an
-    /// operator whether `cache_ttl` is doing anything.
+    /// Two of those are not verdicts. `cached` counts the requests a
+    /// verdict cache answered without reaching the authorization
+    /// server, which is what tells an operator whether `cache_ttl` is
+    /// doing anything; `no_token` counts requests that presented no
+    /// bearer token, so nothing was asked.
     pub oauth_introspection_results: Option<IntCounterVec>,
     /// WOR-2667: Know Your Agent token verdicts, by verdict
     /// (`verified`, `missing`, `expired`, `revoked`, `invalid`,
@@ -1138,7 +1140,7 @@ impl ProxyMetrics {
             &registry,
             "sbproxy_agent_reputation_score",
             "Agent-class reputation in [0.0, 1.0]; 1.0 is a class with no anomalies in the window",
-            &["agent_class"],
+            &["tenant_id", "agent_class"],
         );
 
         let cache_reserve_errors = registered_counter_vec(
@@ -1716,24 +1718,50 @@ pub fn record_anomaly_detected(kind: &str, severity: &str) {
     }
 }
 
-/// Publish one agent class's reputation score (WOR-2666).
+/// Publish one tenant's agent-class reputation score (WOR-2666).
 ///
-/// `agent_class` goes through the cardinality limiter: it is a closed
-/// taxonomy value in every path that reaches this today, and the
-/// limiter is what keeps that from being an invariant held by
-/// convention.
-pub fn set_agent_reputation_score(agent_class: &str, score: f64) {
-    let agent_class = sanitize_label("agent_class", agent_class);
+/// `agent_class` goes through the cardinality limiter's **budget**
+/// door, the one that knows `agent_class` is capped at 8 and counts an
+/// overflow on `sbproxy_label_cardinality_overflow_total`.
+///
+/// The plain `sanitize_label` door this used is a 1,000-value cap, and
+/// it writes into a set keyed by label name alone. So a gauge admitting
+/// 40 classes through the wide door did not only widen itself: it
+/// raised the effective `agent_class` cardinality of
+/// `sbproxy_requests_total` from 8 to whatever it had admitted, with no
+/// overflow counter to show it had happened. Every other `agent_class`
+/// writer uses the budget form, and now so does this one.
+///
+/// `tenant_id` is a label because reputation is an input a policy can
+/// act on: without it, one tenant's noisy crawler decides what another
+/// tenant's admission threshold sees.
+pub fn set_agent_reputation_score(tenant_id: &str, agent_class: &str, score: f64) {
+    const METRIC: &str = "sbproxy_agent_reputation_score";
+    let tenant_id = sanitize_label_budget(METRIC, "tenant_id", tenant_id);
+    let agent_class = sanitize_label_budget_tenant(METRIC, "agent_class", agent_class, &tenant_id);
     if let Some(gauge) = metrics().agent_reputation_score.as_ref() {
-        gauge.with_label_values(&[agent_class.as_str()]).set(score);
+        gauge
+            .with_label_values(&[tenant_id.as_str(), agent_class.as_str()])
+            .set(score);
     }
 }
 
 /// Record one cache-reserve operation the backend refused (WOR-2673).
 ///
-/// `operation` is the closed set `put` / `get` / `delete`, naming the
-/// trait method that failed. `origin` is the config-bounded origin id,
-/// matching the other `sbproxy_cache_reserve_*` families.
+/// `operation` is the closed set `put` / `get` / `delete` / `sweep` /
+/// `init`, naming the trait method that failed. `origin` is the
+/// config-bounded origin id, matching the other
+/// `sbproxy_cache_reserve_*` families, or one of two proxy-wide
+/// sentinels: `__init__` for a reserve that never got built and
+/// `__sweep__` for the expiry sweep, neither of which belongs to an
+/// origin.
+///
+/// `init` is the one an operator most needs. A reserve whose backend
+/// failed to construct is *absent*, so no call site runs and every
+/// other family reads flat zero, which is byte-for-byte identical to
+/// "no reserve configured". Without this series the most likely
+/// real-world failure of the feature, a wrong region or an expired
+/// instance profile, is invisible on every dashboard.
 pub fn record_cache_reserve_error(origin: &str, operation: &'static str) {
     if let Some(counter) = metrics().cache_reserve_errors.as_ref() {
         let origin = sanitize_label("origin", origin);
@@ -1759,7 +1787,7 @@ pub fn record_ext_authz_decision(outcome: &'static str) {
 /// Record one RFC 7662 introspection result (WOR-2667).
 ///
 /// `result` is the closed set `active` / `inactive` /
-/// `insufficient_scope` / `cached` / `unavailable`.
+/// `insufficient_scope` / `cached` / `no_token` / `unavailable`.
 pub fn record_oauth_introspection_result(result: &'static str) {
     if let Some(counter) = metrics().oauth_introspection_results.as_ref() {
         counter.with_label_values(&[result]).inc();

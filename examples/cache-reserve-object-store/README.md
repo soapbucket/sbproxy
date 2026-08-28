@@ -18,7 +18,7 @@ walkthrough runs with nothing installed.
 
 ```bash
 rm -rf /tmp/sbproxy-reserve-objects
-export SBPROXY_RESERVE_KEY=$(head -c 32 /dev/urandom | base64)
+head -c 32 /dev/urandom | base64 > /tmp/sbproxy-reserve.key
 python3 examples/cache-reserve/fixture.py &
 make run CONFIG=examples/cache-reserve-object-store/sb.yml
 ```
@@ -108,13 +108,16 @@ for everything, so `0.05` to `0.1` is the usual range. Raise `min_ttl`
 alongside it: an entry that will not outlive a hot eviction window is
 not worth an object.
 
-**Set a bucket lifecycle rule.** Expiry lives inside each object, so the
-proxy's own `evict_expired` sweep has to read each candidate and is
-bounded at 1,000 objects per call. S3 lifecycle expiration, GCS object
-lifecycle management, and Azure blob lifecycle all do the same job on
-the reserve's prefix for free. The built-in sweep is the answer for
-small reserves and for correctness after a TTL change; it is not the
-answer at scale.
+**Set a bucket lifecycle rule.** The proxy runs its own expiry sweep on
+a fifteen-minute timer, so a small reserve does expire without any
+bucket configuration. But expiry lives inside each object, so the sweep
+has to read each candidate and is bounded at 1,000 objects per call:
+one bounded pass per interval whatever the reserve holds, which means a
+large backlog is worked through over many ticks rather than in one. S3
+lifecycle expiration, GCS object lifecycle management, and Azure blob
+lifecycle all do the same job on the reserve's prefix for free. The
+built-in sweep is the answer for small reserves and for correctness
+after a TTL change; it is not the answer at scale.
 
 ## Watching it
 

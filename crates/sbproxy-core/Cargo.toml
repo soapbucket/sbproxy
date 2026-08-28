@@ -215,6 +215,10 @@ arc-swap.workspace = true
 # parking_lot: no-poison mutexes on the request-path budget/mesh
 # counters so a panic while held cannot cascade (WOR-1691).
 parking_lot.workspace = true
+# lru: the anomaly detector's per-day distinct-value sets are keyed on
+# client-controlled strings, so they need bounded memory and O(1)
+# eviction rather than a map that grows with whatever arrives.
+lru.workspace = true
 compact_str.workspace = true
 smallvec.workspace = true
 bytes.workspace = true

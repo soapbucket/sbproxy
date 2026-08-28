@@ -2695,6 +2695,17 @@ enum AuthTrustOutcome {
     Challenge,
     InvalidProof,
     BackendFailure,
+    /// WOR-2667: the request proceeded without the decision being made,
+    /// because the provider's backend failed and the operator asked it
+    /// to fail open.
+    ///
+    /// Distinct from [`Self::Allowed`] because the per-request evidence
+    /// feed has to say so. `sbproxy_ext_authz_decisions_total` already
+    /// counts fail-opens in aggregate; an analyst reconstructing *which*
+    /// requests were admitted without an authorization decision needs
+    /// the record, not the counter. Trust-wise it behaves as `Allowed`:
+    /// nothing about the caller is in question.
+    FailedOpen,
 }
 
 impl AuthTrustOutcome {
@@ -2709,7 +2720,7 @@ impl AuthTrustOutcome {
     /// because a success short-circuits the loop.
     fn severity(self) -> u8 {
         match self {
-            Self::Allowed => 0,
+            Self::Allowed | Self::FailedOpen => 0,
             Self::Missing => 1,
             Self::Challenge => 2,
             Self::BackendFailure => 3,
@@ -3640,11 +3651,13 @@ async fn check_auth_with_tls_outcome(
                 ExtAuthzOutcome::FailedOpen => (
                     AuthResult::allow_anonymous(),
                     Some(sbproxy_plugin::Principal::anonymous_for(tenant_id.clone())),
-                    // Allowed, because the request proceeds. The
-                    // fail-open itself is counted separately on
-                    // `sbproxy_ext_authz_decisions_total{outcome="fail_open"}`,
-                    // which is the series an operator alerts on.
-                    AuthTrustOutcome::Allowed,
+                    // The request proceeds, and the record says why.
+                    // Folded into `Allowed` this was an
+                    // `Auth`/`Allow`/`credential accepted` audit record
+                    // identical to a real admission, which is the one
+                    // thing an analyst reconstructing an outage cannot
+                    // work around.
+                    AuthTrustOutcome::FailedOpen,
                 ),
             }
         }
@@ -3798,10 +3811,10 @@ async fn check_auth_with_tls_outcome(
                         AuthTrustOutcome::InvalidProof,
                     )
                 }
-                KyaVerdict::InsufficientBalance { required } => (
+                KyaVerdict::InsufficientBalance { required, currency } => (
                     AuthResult::Deny(
                         402,
-                        format!("kya: agent balance below the required {required}"),
+                        format!("kya: agent balance below the required {required} {currency}"),
                     ),
                     None,
                     // The token verified. The agent cannot pay, which
@@ -3813,7 +3826,7 @@ async fn check_auth_with_tls_outcome(
                         (
                             AuthResult::allow_anonymous(),
                             Some(sbproxy_plugin::Principal::anonymous_for(tenant_id.clone())),
-                            AuthTrustOutcome::Allowed,
+                            AuthTrustOutcome::FailedOpen,
                         )
                     } else {
                         (
@@ -4505,6 +4518,124 @@ pub(crate) fn record_auth_decision(
         &ctx.tenant_id,
         reason,
         sbproxy_observe::decision::DecisionDetails::auth(auth_type),
+    );
+}
+
+/// Publish one behavioral-anomaly verdict onto the decision feed
+/// (WOR-2666).
+///
+/// The counter and the log line already existed. What did not was a
+/// record on the typed feed, which is where every other decision
+/// surface in this workspace publishes and where an operator's SIEM
+/// rules live. A counter carrying `kind` and `severity` cannot answer
+/// "which requests, on which origin, for which caller", and the log
+/// line is not the audit trail.
+///
+/// The outcome is always `Allow`: a verdict is an observation, and the
+/// request proceeds whatever it says. What refuses is the reputation
+/// gate, and that publishes its own record through
+/// [`record_reputation_decision`].
+pub(crate) fn record_anomaly_decision(
+    ctx: &RequestContext,
+    verdict: &sbproxy_plugin::AnomalyVerdict,
+    identity_source: Option<&str>,
+) {
+    use sbproxy_observe::decision::{DecisionEngine, DecisionEvent, DecisionOutcome};
+
+    let origin_id = ctx
+        .origin_idx
+        .and_then(|idx| ctx.pipeline.config.origins.get(idx))
+        .map(|origin| origin.origin_id.to_string());
+    sbproxy_observe::decision::record_decision(
+        DecisionEvent::Anomaly,
+        DecisionEngine::BuiltIn,
+        DecisionOutcome::Allow,
+        origin_id.as_deref().unwrap_or(DEFAULT_ORIGIN_LABEL),
+        &ctx.tenant_id,
+    );
+
+    let Some(origin_id) = origin_id else {
+        return;
+    };
+    if !crate::server::proxy_http::audit_publishes(
+        &ctx.pipeline,
+        DecisionEvent::Anomaly,
+        Some(&ctx.tenant_id),
+        Some(&origin_id),
+    ) {
+        return;
+    }
+    crate::policy_bus::emit_decision_audit_detailed(
+        DecisionEvent::Anomaly,
+        DecisionEngine::BuiltIn,
+        DecisionOutcome::Allow,
+        &ctx.request_id,
+        &origin_id,
+        &origin_id,
+        &ctx.tenant_id,
+        &verdict.reason,
+        sbproxy_observe::decision::DecisionDetails::anomaly(
+            verdict.kind,
+            verdict.severity,
+            identity_source,
+        ),
+    );
+}
+
+/// Publish one reputation admission decision onto the decision feed
+/// (WOR-2666).
+///
+/// The record carries the band and the resolver source and nothing
+/// else. Not the score, which moves on every request and is on the
+/// gauge for anyone who wants the trend, and not the signals behind it:
+/// a JA4 or a client address on this half of the record ships
+/// unredacted.
+pub(crate) fn record_reputation_decision(
+    ctx: &RequestContext,
+    action: crate::anomaly::ReputationAction,
+    bucket: &str,
+    identity_source: Option<&str>,
+    reason: &str,
+) {
+    use sbproxy_observe::decision::{DecisionEngine, DecisionEvent, DecisionOutcome};
+
+    let origin_id = ctx
+        .origin_idx
+        .and_then(|idx| ctx.pipeline.config.origins.get(idx))
+        .map(|origin| origin.origin_id.to_string());
+    sbproxy_observe::decision::record_decision(
+        DecisionEvent::Anomaly,
+        DecisionEngine::BuiltIn,
+        DecisionOutcome::Deny,
+        origin_id.as_deref().unwrap_or(DEFAULT_ORIGIN_LABEL),
+        &ctx.tenant_id,
+    );
+
+    let Some(origin_id) = origin_id else {
+        return;
+    };
+    if !crate::server::proxy_http::audit_publishes(
+        &ctx.pipeline,
+        DecisionEvent::Anomaly,
+        Some(&ctx.tenant_id),
+        Some(&origin_id),
+    ) {
+        return;
+    }
+    crate::policy_bus::emit_decision_audit_detailed(
+        DecisionEvent::Anomaly,
+        DecisionEngine::BuiltIn,
+        DecisionOutcome::Deny,
+        &ctx.request_id,
+        &origin_id,
+        &origin_id,
+        &ctx.tenant_id,
+        reason,
+        sbproxy_observe::decision::DecisionDetails::reputation(
+            bucket,
+            action.as_label(),
+            identity_source,
+        ),
     );
 }
 

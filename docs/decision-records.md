@@ -28,6 +28,7 @@ What a consumer may rely on from the decision-audit feed. Retrofitting a field i
 | `log.custom_field` | not yet | No emitter. Enabling it publishes nothing. |
 | `mcp.tool` | yes |  |
 | `payment.lifecycle` | no, by design | Recorded on the durable settlement store. This feed drops records under load, which is the wrong trade for money. |
+| `anomaly` | yes |  |
 
 ## Structured detail
 
@@ -41,6 +42,15 @@ Every field below rides under OCSF `unmapped`, which the spec defines as the con
 - `unmapped.decision_latency_ms`
 
 Only under `policy_record_format: decision`. `policy_id` is the module that decided, which is how `waf` and the rate-limit family are selected now that they have no separate event. `verdict` is the policy's own tag and is not the record outcome: a faulted engine still returns a verdict while the decision outcome is `error`.
+
+### `anomaly`
+
+- `unmapped.anomaly_kind`
+- `unmapped.reputation_bucket`
+- `unmapped.verdict`
+- `unmapped.identity_source`
+
+Two decisions on one event. A detection record carries `anomaly_kind` and a `verdict` holding the severity, and its outcome is always an allow, because a verdict is an observation and the request proceeds. An admission record carries `reputation_bucket` and a `verdict` holding the action, and its outcome is a deny. `identity_source` is on both, because the class the score is keyed on is a claim unless that source is a verified one. Never the raw score, the fingerprint, or the client address.
 
 ### `auth`
 

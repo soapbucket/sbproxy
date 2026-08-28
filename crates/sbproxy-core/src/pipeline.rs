@@ -886,6 +886,20 @@ fn build_cache_reserve(
     if built.is_some() {
         (built, Some(admission))
     } else {
+        if !validating {
+            // WOR-2673 review F5. An operator asked for a reserve and
+            // does not have one. Every other `sbproxy_cache_reserve_*`
+            // family reads flat zero from here on, which is exactly
+            // what "no reserve configured" reads like, so without this
+            // series the most likely failure of the feature (a wrong
+            // region, an expired instance profile, a bucket policy
+            // change) is invisible on every dashboard and the startup
+            // `warn!` is the only record.
+            sbproxy_observe::metrics::record_cache_reserve_error(
+                CACHE_RESERVE_INIT_ORIGIN,
+                "init",
+            );
+        }
         (None, None)
     }
 }
@@ -913,6 +927,16 @@ fn build_object_store_reserve(
 ) -> anyhow::Result<sbproxy_cache::ObjectStoreReserve> {
     use anyhow::Context as _;
 
+    // WOR-2673 review F18. `path` is documented "required for `local`
+    // and refused elsewhere", and the three cloud arms below ignore it
+    // silently. An operator who left `path` behind while switching
+    // `backend: local` to `backend: s3` would otherwise get a working
+    // reserve on S3 and a config line that says it is on disk.
+    if backend != "local" && path.is_some() {
+        anyhow::bail!(
+            "cache_reserve.backend.path is only for the local backend; remove it or set              backend: local"
+        );
+    }
     let store: Arc<dyn object_store::ObjectStore> = match backend {
         "local" => {
             let path = path.as_deref().ok_or_else(|| {
@@ -1003,6 +1027,29 @@ fn build_object_store_reserve(
     ))
 }
 
+/// How often the reserve's expiry sweep runs.
+///
+/// Fifteen minutes: long enough that a paid object store sees one
+/// `LIST` per interval rather than a stream of them, short enough that
+/// a TTL change takes effect the same hour. Not operator-configurable
+/// yet, deliberately: the knob worth having is the bucket lifecycle
+/// rule, and offering a second one invites tuning the wrong lever.
+const CACHE_RESERVE_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// Origin label a failed reserve construction is counted under.
+///
+/// Not an origin: the reserve is proxy-wide and the failure happens
+/// before any request. A named sentinel keeps it out of the per-origin
+/// series while still landing on the family an operator alerts on.
+const CACHE_RESERVE_INIT_ORIGIN: &str = "__init__";
+
+/// Origin label the sweep's failures are counted under.
+///
+/// The sweep is proxy-wide, not per-origin, so it cannot borrow an
+/// origin id without inventing one. A named constant keeps it out of
+/// the per-origin series an operator reads for a specific host.
+const CACHE_RESERVE_SWEEP_ORIGIN: &str = "__sweep__";
+
 /// Build the reserve's key ring from resolved material.
 ///
 /// Its own function rather than `sbproxy_cache::cache_key_ring` because
@@ -1038,11 +1085,51 @@ fn reserve_key_ring(
 ///
 /// There is no plaintext fallback anywhere on this path: a reference that looks
 /// like a secret URI with no backend to resolve it is an error rather than key
-/// material spelled `secret://...`.
+/// material spelled `secret://...`, and a `${VAR}` the config layer could not
+/// expand is an error rather than 22 bytes of ASCII this repository publishes.
+///
+/// # WOR-2673 review F1
+///
+/// The placeholder refusal is first, ahead of the resolver, because the two
+/// no-op paths that used to swallow it are on opposite sides of it: with no
+/// process resolver installed the literal fell all the way through to
+/// `Ok(reference.as_bytes())`, and `${SBPROXY_RESERVE_KEY}` is 22 bytes, which
+/// clears `MIN_KEY_MATERIAL_BYTES`. An operator who copied the documented block
+/// into a Kubernetes manifest and forgot the variable in the pod spec got a
+/// clean start, `encrypts_at_rest() == true`, and a whole cold tier sealed under
+/// a string anyone can read here. A `${VAR}` that reached this function was
+/// never resolvable anyway: `interpolate_env_vars` rewrites the raw YAML and
+/// only leaves a placeholder standing when the variable is unset.
+///
+/// The length floor is checked here as well as in `SealKey::new`, because the
+/// message an operator needs names the config block they have to fix, and by
+/// the time the ring is built that block is three frames away.
 pub(crate) fn resolve_at_rest_key_material(
     reference: &str,
     config_path: &str,
 ) -> anyhow::Result<Vec<u8>> {
+    if let Some(name) = sbproxy_vault::unexpanded_env_placeholder(reference) {
+        anyhow::bail!(
+            "{config_path} still reads '${{{name}}}': the environment variable is not set, so \
+             the placeholder itself would have become the encryption key. Set {name}, or use a \
+             file: or provider reference"
+        );
+    }
+    let material = resolve_at_rest_reference(reference, config_path)?;
+    if material.len() < sbproxy_security::sealed_record::MIN_KEY_MATERIAL_BYTES {
+        anyhow::bail!(
+            "{config_path} resolved to {} bytes of key material; at-rest encryption needs at \
+             least {}. Use 32 random bytes, base64 or hex encoded, not a passphrase",
+            material.len(),
+            sbproxy_security::sealed_record::MIN_KEY_MATERIAL_BYTES
+        );
+    }
+    Ok(material)
+}
+
+/// The reference forms themselves, split out so the two refusals above read as
+/// one list rather than as interruptions inside the resolution ladder.
+fn resolve_at_rest_reference(reference: &str, config_path: &str) -> anyhow::Result<Vec<u8>> {
     use anyhow::Context;
 
     if let Some(resolver) = sbproxy_vault::process_resolver() {
@@ -2999,24 +3086,27 @@ impl CompiledPipeline {
         // unknown or extension-provided backends drop through to `None` with a
         // warning so a pipeline lifecycle hook can swap in its own
         // implementation post-compile.
-        // WOR-2666: install (or remove) the anomaly detector. Done here
-        // rather than at first use so a reload that turns the block off
-        // takes the detector out with it, and so the one hook
-        // registration this process makes happens on the config path
-        // where every other module is built.
-        if !matches!(mode, PipelineConstructionMode::Validation) {
-            let detector = config
-                .server
-                .anomaly
-                .as_ref()
-                .filter(|anomaly| anomaly.enabled)
-                .map(|anomaly| {
-                    Arc::new(crate::anomaly::AnomalyDetector::new(
-                        crate::anomaly::AnomalySettings::from_config(anomaly),
-                    ))
-                });
-            crate::anomaly::install(detector);
-        }
+        // WOR-2666: the settings the anomaly detector will be installed
+        // with, resolved here and applied at the very end of this
+        // function.
+        //
+        // Applied last on purpose. Installing here put a live security
+        // control behind roughly thirty later `?` sites: a reload that
+        // disabled `proxy.anomaly` and, in the same edit, carried an
+        // unrelated typo would fail compilation, keep the running
+        // pipeline, tell the operator "config rejected", and have
+        // already turned the detector off. The same failed reload with
+        // anomaly still enabled replaced a warmed detector with an
+        // empty one for a config change that was never applied.
+        let anomaly_settings = (!matches!(mode, PipelineConstructionMode::Validation))
+            .then(|| {
+                config
+                    .server
+                    .anomaly
+                    .as_ref()
+                    .filter(|anomaly| anomaly.enabled)
+                    .map(crate::anomaly::AnomalySettings::from_config)
+            });
 
         let (cache_reserve, cache_reserve_admission) = build_cache_reserve(
             &config.server.cache_reserve,
@@ -3321,6 +3411,15 @@ impl CompiledPipeline {
         if start_background_tasks {
             pipeline.start_background_tasks();
         }
+
+        // WOR-2666: the last thing this function does, after every
+        // fallible step, so the detector only changes when a config
+        // change is actually going to be applied. `install` keeps the
+        // running detector when the settings match, so a reload that
+        // did not touch `proxy.anomaly` costs nothing.
+        if let Some(settings) = anomaly_settings {
+            crate::anomaly::install(settings);
+        }
         Ok(pipeline)
     }
 
@@ -3367,6 +3466,57 @@ impl CompiledPipeline {
                 _ => {}
             }
         }
+        self.spawn_cache_reserve_sweep_on(handle);
+    }
+
+    /// Run the reserve's expiry sweep on a timer.
+    ///
+    /// WOR-2673's review found `CacheReserveBackend::evict_expired`
+    /// implemented on all four backends and called from nothing outside
+    /// tests, while three operator-facing pages presented the sweep as
+    /// the answer for small reserves. An operator who read that and
+    /// skipped the bucket lifecycle rule got a reserve that never
+    /// expired anything and a bill that only went up.
+    ///
+    /// Bounded per tick by the backends themselves: the object-store
+    /// implementation examines at most 1,000 objects per call, and the
+    /// in-process ones sweep a map they already own. One tick per
+    /// [`CACHE_RESERVE_SWEEP_INTERVAL`] is therefore a bounded amount
+    /// of work whatever the reserve holds, which is also why it is not
+    /// a replacement for a lifecycle rule at scale. The docs say so.
+    ///
+    /// Failures are logged and counted, never fatal: a sweep that
+    /// cannot list is a reserve that keeps serving.
+    fn spawn_cache_reserve_sweep_on(&self, handle: &tokio::runtime::Handle) {
+        let Some(reserve) = self.cache_reserve.clone() else {
+            return;
+        };
+        handle.spawn(async move {
+            let mut ticker = tokio::time::interval(CACHE_RESERVE_SWEEP_INTERVAL);
+            // The first tick fires immediately; skip it so a restart
+            // loop cannot turn startup into a list storm.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                match reserve.evict_expired(std::time::SystemTime::now()).await {
+                    Ok(0) => {}
+                    Ok(removed) => tracing::debug!(
+                        removed,
+                        "cache reserve expiry sweep removed expired entries"
+                    ),
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "cache reserve expiry sweep failed; entries stay until the next tick                              or a bucket lifecycle rule removes them"
+                        );
+                        sbproxy_observe::metrics::record_cache_reserve_error(
+                            CACHE_RESERVE_SWEEP_ORIGIN,
+                            "sweep",
+                        );
+                    }
+                }
+            }
+        });
     }
 
     /// Construct a minimal empty pipeline for unit tests.
@@ -4971,6 +5121,164 @@ mod object_store_reserve_tests {
             false,
         );
         assert!(reserve.is_some(), "a resolvable key must build the reserve");
+    }
+
+    /// WOR-2673 review F6, the seam test. `evict_expired` was
+    /// implemented on all four backends and called from nothing outside
+    /// `#[cfg(test)]`, while three operator-facing pages presented the
+    /// sweep as the answer for small reserves. This drives the real
+    /// background-task registration on a paused clock and asserts the
+    /// backend was actually swept.
+    #[tokio::test(start_paused = true)]
+    async fn the_expiry_sweep_has_a_production_caller() {
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+        #[derive(Default)]
+        struct CountingReserve {
+            sweeps: AtomicU64,
+        }
+
+        #[async_trait::async_trait]
+        impl CacheReserveBackend for CountingReserve {
+            async fn put(
+                &self,
+                _key: &str,
+                _value: bytes::Bytes,
+                _metadata: sbproxy_cache::reserve::ReserveMetadata,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn get(
+                &self,
+                _key: &str,
+            ) -> anyhow::Result<Option<(bytes::Bytes, sbproxy_cache::reserve::ReserveMetadata)>>
+            {
+                Ok(None)
+            }
+            async fn delete(&self, _key: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn evict_expired(&self, _before: std::time::SystemTime) -> anyhow::Result<u64> {
+                self.sweeps.fetch_add(1, AtomicOrdering::AcqRel);
+                Ok(0)
+            }
+        }
+
+        let backend = Arc::new(CountingReserve::default());
+        let mut pipeline = CompiledPipeline::empty_for_test();
+        pipeline.cache_reserve = Some(backend.clone());
+        pipeline.start_background_tasks_on(&tokio::runtime::Handle::current());
+
+        // Let the spawned task reach its first await so the interval is
+        // registered against the paused clock, then walk the clock
+        // forward an interval at a time.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+            tokio::time::advance(CACHE_RESERVE_SWEEP_INTERVAL).await;
+            tokio::task::yield_now().await;
+            if backend.sweeps.load(AtomicOrdering::Acquire) >= 1 {
+                break;
+            }
+        }
+        assert!(
+            backend.sweeps.load(AtomicOrdering::Acquire) >= 1,
+            "a configured reserve must actually be swept, not only be sweepable"
+        );
+    }
+
+    /// And a pipeline with no reserve spawns nothing, so a deployment
+    /// that never configured one pays for no timer.
+    #[tokio::test(start_paused = true)]
+    async fn no_reserve_means_no_sweep_task() {
+        let pipeline = CompiledPipeline::empty_for_test();
+        assert!(pipeline.cache_reserve.is_none());
+        pipeline.start_background_tasks_on(&tokio::runtime::Handle::current());
+        tokio::task::yield_now().await;
+        tokio::time::advance(CACHE_RESERVE_SWEEP_INTERVAL * 2).await;
+    }
+
+    /// WOR-2673 review F1, red first. `interpolate_env_vars` leaves an
+    /// unset `${VAR}` as the literal text, and the literal used to fall
+    /// all the way through to `Ok(reference.as_bytes())`.
+    /// `${SBPROXY_RESERVE_KEY}` is 22 bytes, which clears
+    /// `MIN_KEY_MATERIAL_BYTES`, so the proxy started clean and sealed
+    /// the cold tier under a string this repository publishes.
+    #[test]
+    fn an_unexpanded_placeholder_never_becomes_the_sealing_key() {
+        let error = resolve_at_rest_key_material(
+            "${SBPROXY_RESERVE_KEY}",
+            "cache_reserve.backend.encryption",
+        )
+        .expect_err("an unset variable must not become key material");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("SBPROXY_RESERVE_KEY"),
+            "the message has to name the variable the operator forgot: {message}"
+        );
+        assert!(
+            message.contains("cache_reserve.backend.encryption"),
+            "and the config block they have to fix: {message}"
+        );
+    }
+
+    /// The other half of the same hole: material short enough to guess.
+    /// `SealKey::new` refuses it too, but three frames later and without
+    /// naming the block.
+    #[test]
+    fn key_material_below_the_floor_refuses_with_the_config_path() {
+        let error = resolve_at_rest_key_material("hunter2", "cache_reserve.backend.encryption")
+            .expect_err("a passphrase must not become key material");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("cache_reserve.backend.encryption"),
+            "{message}"
+        );
+        assert!(message.contains("16"), "{message}");
+        assert!(
+            !message.contains("hunter2"),
+            "the value itself never reaches the message: {message}"
+        );
+    }
+
+    /// The whole reason F1 mattered: the refusal has to reach the
+    /// operator as "no reserve", not as a reserve sealed under the
+    /// placeholder.
+    #[test]
+    fn an_unexpanded_placeholder_disables_the_reserve() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let encryption = sbproxy_config::CacheReserveEncryptionConfig {
+            enabled: true,
+            key: Some("${SBPROXY_RESERVE_KEY}".to_string()),
+            previous_keys: Vec::new(),
+        };
+        let (reserve, _) = build_cache_reserve(
+            &reserve_config(local_backend(dir.path(), Some(encryption))),
+            false,
+        );
+        assert!(
+            reserve.is_none(),
+            "a forgotten environment variable must not seal the cold tier"
+        );
+    }
+
+    /// WOR-2673 review F18, red first. The field doc says `path` is
+    /// refused on a cloud backend; the cloud arms used to ignore it.
+    #[test]
+    fn a_cloud_backend_that_still_carries_path_disables_the_reserve() {
+        let backend = sbproxy_config::CacheReserveBackendConfig::ObjectStore {
+            backend: "s3".to_string(),
+            bucket: Some("acme-reserve".to_string()),
+            path: Some("/tmp/left-over".to_string()),
+            region: Some("us-east-1".to_string()),
+            endpoint: None,
+            prefix: None,
+            encryption: None,
+        };
+        let (reserve, _) = build_cache_reserve(&reserve_config(backend), false);
+        assert!(
+            reserve.is_none(),
+            "a leftover local `path` on a cloud backend must be refused, not ignored"
+        );
     }
 
     #[test]

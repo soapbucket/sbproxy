@@ -22,7 +22,7 @@
 #
 # Run:
 #   rm -rf /tmp/sbproxy-reserve-objects
-#   export SBPROXY_RESERVE_KEY=$(head -c 32 /dev/urandom | base64)
+#   head -c 32 /dev/urandom | base64 > /tmp/sbproxy-reserve.key
 #   python3 examples/cache-reserve/fixture.py &
 #   make run CONFIG=examples/cache-reserve-object-store/sb.yml
 #
@@ -74,12 +74,17 @@ proxy:
 
       encryption:
         enabled: true
-        # Should be 32 random bytes, base64 or hex encoded, not a
-        # passphrase. Takes the same reference forms as every other
-        # secret in the config: ${VAR}, env:, file:, vault://. A
-        # reference nothing can resolve aborts startup rather than
-        # becoming the key.
-        key: ${SBPROXY_RESERVE_KEY}
+        # 32 random bytes, base64 or hex encoded, not a passphrase:
+        #   head -c 32 /dev/urandom | base64 > /tmp/sbproxy-reserve.key
+        # Takes the same reference forms as every other secret in the
+        # config: file:, env:, vault://, and a whole-value ${VAR}.
+        # Anything that resolves to under 16 bytes is refused at
+        # startup, and so is a ${VAR} whose variable is unset: the
+        # config layer leaves an unresolved placeholder as its own
+        # literal text, and that text would otherwise have been the
+        # key. Either refusal disables the reserve rather than sealing
+        # under something guessable.
+        key: file:/tmp/sbproxy-reserve.key
         # To rotate: move the current key here and name the new one
         # above. Entries reseal as they are rewritten; entries whose
         # key leaves this list stop opening and are treated as misses.
