@@ -2697,6 +2697,48 @@ pub fn record_stream_guardrail_decode_fallback() {
     STREAM_GUARDRAIL_DECODE_FALLBACK.inc();
 }
 
+/// Tool-call frames an enforcing hook held back and that never reached
+/// the client, by cause (WOR-2430).
+///
+/// Hold-back mode pulls every tool-call frame out of the client stream
+/// until its verdict lands, and a frame whose verdict never lands is
+/// simply dropped. That drop is invisible from every other angle: the
+/// per-call decision record is written when a call is *judged*, so an
+/// unjudged call produces no record at all, and a blocked stream's
+/// record says `Deny` about the call that caused the block while saying
+/// nothing about the other calls whose frames went with it. The
+/// ordering defect this metric was added alongside is the reason it
+/// exists: it shipped for eight releases, and nothing counted it.
+/// Held as an `Option` rather than unwrapped, which is the shape new
+/// families take here: a registration error is a duplicate name or a
+/// malformed label set, and losing one family is not worth ending the
+/// process a request is running through.
+static STREAM_TOOL_FRAMES_DISCARDED: LazyLock<Option<CounterVec>> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_stream_tool_frames_discarded_total",
+            "Held tool-call frames that never reached the client, by cause (WOR-2430)"
+        ),
+        &["cause"] // bounded: `blocked` | `unjudged`
+    )
+    .ok()
+});
+
+/// Record held tool-call frames that never reached the client.
+///
+/// `cause` is `blocked` when a guardrail or extension ended the stream,
+/// which drops held frames by design, and `unjudged` when the stream
+/// simply ended with a call the guard session never returned a verdict
+/// for. `unjudged` is the one that should be zero.
+pub fn record_stream_tool_frames_discarded(cause: &str, n: u64) {
+    if n == 0 {
+        return;
+    }
+    if let Some(metric) = STREAM_TOOL_FRAMES_DISCARDED.as_ref() {
+        metric.with_label_values(&[cause]).inc_by(n as f64);
+    }
+}
+
 /// Request-body inspection the AI gateway skipped because the inbound
 /// body was multipart, by inspection kind and classified surface
 /// (WOR-2309).
