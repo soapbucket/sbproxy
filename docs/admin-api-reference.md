@@ -2381,6 +2381,91 @@ overwritten.
 
 ---
 
+### `GET /admin/origin-composition`
+
+Which project repositories this node's configuration pulls, what hosts
+each one claims, and the platform floor every composed origin starts
+from. See
+[configuration.md](configuration.md#project-owned-origin-profiles).
+
+Read off the **effective** config rather than the node's own file, for
+the same reason [`GET /admin/config/effective`](#get-adminconfigeffective)
+exists: on a git-sourced node the local file is only the pointer that
+selected the repository. `origin_sources` is on the subscriber's
+denied-path list, so an authority never contributes to what this
+reports, and seeing it here is how an operator confirms that.
+
+Nothing is fetched. `origin_sources` names the hosts itself, so the pin
+state and the collision check are both properties of the document.
+Composition runs in an aggregator rather than on a node, so what this
+returns is the declaration and its posture.
+
+```json
+{
+  "declared": true,
+  "tier": "production",
+  "entries": [
+    {
+      "name": "checkout",
+      "repo": "https://git.example.com/acme/checkout",
+      "revision": "refs/tags/v1.4.2",
+      "pinned": true,
+      "path": "sbproxy/origin.yaml",
+      "environment": "prod",
+      "verify_signature": true,
+      "timeout_secs": 30,
+      "credential": "reference",
+      "hosts": {"api": ["checkout.example.com"], "webhooks": ["hooks.example.com"]},
+      "inputs": ["region", "upstream_key"],
+      "has_overrides": true
+    }
+  ],
+  "claimed_hosts": [
+    {
+      "host": "checkout.example.com",
+      "entry": "checkout",
+      "profile_origin": "api",
+      "repo": "https://git.example.com/acme/checkout"
+    }
+  ],
+  "collision": null,
+  "hand_written_origins": ["status.example.com"],
+  "origin_defaults": {
+    "present": true,
+    "keys": ["policies", "request_modifiers"],
+    "addressable": {
+      "policies": [
+        {"name": "platform_waf", "locked": true},
+        {"name": "rate_limit", "locked": false}
+      ]
+    }
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `declared` | bool | Whether the effective config carries an `origin_sources` block. `false` means every origin on this node is hand written, and only `origin_defaults` is reported. |
+| `tier` | string | `development` or `production`. A property of the runtime document, never of an entry. |
+| `entries[].repo` | string | Credential-stripped. A URL with embedded userinfo never appears here. |
+| `entries[].pinned` | bool | Whether `revision` names a full commit sha or a tag spelled `refs/tags/<name>`. Answered by the same predicate config load uses. |
+| `entries[].credential` | string | `"reference"` or `"none"`. Never the value. |
+| `entries[].inputs` | array | Input names only. An input value is exactly where a secret reference lands. |
+| `claimed_hosts` | array | Every `origins:` map key the declared entries will create, and who claims it. |
+| `collision` | string or null | The refusal message when two writers claim one map key, or when an entry claims a host `origins:` already declares. `null` when there is none. |
+| `origin_defaults.addressable` | object | Per merged list, the `name:` a project can address and whether it is locked against override. |
+
+A console page is deferred; this route is the operator surface until it
+lands, and the console will read the same JSON.
+
+| Status | When |
+|---|---|
+| `200` | The declaration was read. A collision is reported in the body rather than as an error status: the config is what it is, and the operator needs to see both claimants. |
+| `500` | The effective document could not be assembled or did not parse. Body carries `code: effective_config_unavailable` or `effective_config_unparseable`. |
+| `503` | The admin server has no `config_path` wired. |
+
+---
+
 ### `GET /admin/owasp-api-pack`
 
 Per-origin outcome of expanding each origin's `owasp_api_top10` policy
