@@ -64,6 +64,23 @@ struct CachedEnvelope {
     expires_at: DateTime<Utc>,
 }
 
+/// What a catalog reports to a readiness endpoint.
+///
+/// Three states rather than a bool, because "no catalog has ever been
+/// applied" and "the catalog we have has expired" are different operator
+/// actions: the first is a feed that has never verified, the second is a
+/// publisher who has stopped republishing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CatalogHealth {
+    /// No verified catalog has been applied since boot.
+    NoCatalog,
+    /// The catalog in memory is past the publisher's `expires_at`.
+    Expired,
+    /// Serving this many entries.
+    Serving(usize),
+}
+
 /// A read-only snapshot of the catalog.
 #[derive(Debug, Clone, Default)]
 pub struct Catalog {
@@ -112,6 +129,22 @@ impl Catalog {
     /// or never-refreshed registry looks like.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// What this catalog reports to a readiness endpoint.
+    ///
+    /// Here rather than at the call site because the three states are a
+    /// claim `docs/agent-registry.md` makes to operators, and a mapping
+    /// that exists only inside a closure in `run()` is one no test can
+    /// reach.
+    pub fn health(&self, now: DateTime<Utc>) -> CatalogHealth {
+        if self.is_empty() {
+            CatalogHealth::NoCatalog
+        } else if self.is_expired(now) {
+            CatalogHealth::Expired
+        } else {
+            CatalogHealth::Serving(self.len())
+        }
     }
 
     /// Whether `now` is past the publisher's expiry.
@@ -431,6 +464,25 @@ mod tests {
         assert_eq!(store.restore().await.expect("restore"), 2);
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// `/readyz` already publishes a component called `agent_registry`,
+    /// which is WOR-1743's agent-class resolver and has nothing to do with
+    /// this block. The catalog reports under its own name, and these three
+    /// states are what `docs/agent-registry.md` tells an operator to read.
+    #[test]
+    fn the_catalog_reports_three_distinct_states_to_a_readiness_endpoint() {
+        assert_eq!(Catalog::default().health(now()), CatalogHealth::NoCatalog);
+
+        let serving = Catalog::from_feed(feed(&["acme-1", "acme-2"]));
+        assert_eq!(serving.health(now()), CatalogHealth::Serving(2));
+
+        // Past the publisher's own expiry, which is a publisher that
+        // stopped republishing rather than a feed that never verified.
+        assert_eq!(
+            serving.health(serving.expires_at().expect("the feed set one")),
+            CatalogHealth::Expired
+        );
     }
 
     #[tokio::test]

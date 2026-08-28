@@ -239,7 +239,20 @@ fn reconcile_boot_only_blocks(
 ) -> anyhow::Result<()> {
     let candidate = boot_only_fingerprints(server, request_events);
     let installed = PROCESS_BOOT_ONLY_FINGERPRINTS.get_or_init(|| candidate.clone());
-    if *installed == candidate {
+    compare_boot_only_fingerprints(installed, &candidate)
+}
+
+/// The comparison and the message, without the process-global.
+///
+/// Split out so a test can drive the refusal itself rather than only the
+/// fingerprints feeding it: a `OnceLock` can be set once per process, so a
+/// test against `reconcile_boot_only_blocks` proves whichever case it
+/// happens to run first and nothing else.
+fn compare_boot_only_fingerprints(
+    installed: &[String; 3],
+    candidate: &[String; 3],
+) -> anyhow::Result<()> {
+    if installed == candidate {
         return Ok(());
     }
     let keys = [
@@ -3624,25 +3637,11 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
                 admin_state_inner
                     .health_registry
                     .register(std::sync::Arc::new(sbproxy_observe::SyntheticProbe::new(
-                        "agent_catalog",
+                        AGENT_CATALOG_COMPONENT,
                         move || {
-                            let catalog = probe_registry.catalog();
-                            if catalog.is_empty() {
-                                (
-                                    sbproxy_observe::ComponentStatus::NotConfigured,
-                                    Some("no verified catalog has been applied".to_string()),
-                                )
-                            } else if catalog.is_expired(chrono::Utc::now()) {
-                                (
-                                    sbproxy_observe::ComponentStatus::Degraded,
-                                    Some("the verified catalog is past its expiry".to_string()),
-                                )
-                            } else {
-                                (
-                                    sbproxy_observe::ComponentStatus::Healthy,
-                                    Some(format!("{} agents", catalog.len())),
-                                )
-                            }
+                            agent_catalog_component(
+                                probe_registry.catalog().health(chrono::Utc::now()),
+                            )
                         },
                     )));
             }
@@ -7153,46 +7152,58 @@ mod boot_only_block_tests {
         }));
 
         // Same shape reconciles clean whichever way round it is read.
-        assert_eq!(
-            boot_only_fingerprints(&before, None),
-            boot_only_fingerprints(&server(before.agent_registry.clone()), None)
-        );
-        assert_ne!(
-            boot_only_fingerprints(&before, None),
-            boot_only_fingerprints(&after, None)
-        );
-
-        // And the refusal names the key that moved rather than the set.
         let installed = boot_only_fingerprints(&before, None);
-        let candidate = boot_only_fingerprints(&after, None);
-        assert_ne!(installed, candidate);
+        assert!(compare_boot_only_fingerprints(
+            &installed,
+            &boot_only_fingerprints(&server(before.agent_registry.clone()), None)
+        )
+        .is_ok());
 
-        let notifications_changed = boot_only_fingerprints(
-            &ProxyServerConfig {
-                notifications: Some(NotificationsConfig {
-                    enabled: true,
+        // A changed block is refused, and the refusal names the key that
+        // moved rather than the set.
+        let refusal =
+            compare_boot_only_fingerprints(&installed, &boot_only_fingerprints(&after, None))
+                .expect_err("a changed boot-only block must be refused");
+        let refusal = refusal.to_string();
+        assert!(refusal.contains("proxy.agent_registry"), "{refusal}");
+        assert!(!refusal.contains("proxy.notifications"), "{refusal}");
+        assert!(refusal.contains("restart sbproxy"), "{refusal}");
+
+        // The other two blocks are refused the same way, so the guard is as
+        // wide as the claim in docs/configuration.md.
+        let notifications = compare_boot_only_fingerprints(
+            &boot_only_fingerprints(&ProxyServerConfig::default(), None),
+            &boot_only_fingerprints(
+                &ProxyServerConfig {
+                    notifications: Some(NotificationsConfig {
+                        enabled: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                None,
+            ),
+        )
+        .expect_err("proxy.notifications is boot-only too")
+        .to_string();
+        assert!(
+            notifications.contains("proxy.notifications"),
+            "{notifications}"
+        );
+
+        let events = compare_boot_only_fingerprints(
+            &boot_only_fingerprints(&ProxyServerConfig::default(), None),
+            &boot_only_fingerprints(
+                &ProxyServerConfig::default(),
+                Some(&RequestEventsConfig {
+                    sink: RequestEventSinkKind::Logging,
                     ..Default::default()
                 }),
-                ..Default::default()
-            },
-            None,
-        );
-        assert_ne!(
-            notifications_changed,
-            boot_only_fingerprints(&ProxyServerConfig::default(), None)
-        );
-
-        let events_changed = boot_only_fingerprints(
-            &ProxyServerConfig::default(),
-            Some(&RequestEventsConfig {
-                sink: RequestEventSinkKind::Logging,
-                ..Default::default()
-            }),
-        );
-        assert_ne!(
-            events_changed,
-            boot_only_fingerprints(&ProxyServerConfig::default(), None)
-        );
+            ),
+        )
+        .expect_err("request_events is boot-only too")
+        .to_string();
+        assert!(events.contains("request_events"), "{events}");
     }
 
     /// A config value must not reach `chrono::Duration::seconds`, which is
@@ -8489,6 +8500,47 @@ origins:
     fn a_config_whose_document_says_everything_warns_not_at_all() {
         let logged = captured_warnings(CLEAN);
         assert!(logged.is_empty(), "got {logged}");
+    }
+}
+
+/// The `/readyz` component name the agent catalog reports under.
+///
+/// Deliberately not `agent_registry`: that name is already taken by
+/// WOR-1743's agent-class resolver, which is a different subsystem, so an
+/// operator reading it would get either `not_configured` for a live
+/// registry or the health of something unrelated.
+const AGENT_CATALOG_COMPONENT: &str = "agent_catalog";
+
+/// Render the catalog's own health verdict as a `/readyz` component.
+///
+/// The three states are decided in `sbproxy-agent-registry`, next to the
+/// catalog and its tests; this is only the mapping onto the shared
+/// component vocabulary.
+fn agent_catalog_component(
+    health: sbproxy_agent_registry::CatalogHealth,
+) -> (sbproxy_observe::ComponentStatus, Option<String>) {
+    use sbproxy_agent_registry::CatalogHealth;
+    match health {
+        CatalogHealth::NoCatalog => (
+            sbproxy_observe::ComponentStatus::NotConfigured,
+            Some("no verified catalog has been applied".to_string()),
+        ),
+        CatalogHealth::Expired => (
+            sbproxy_observe::ComponentStatus::Degraded,
+            Some("the verified catalog is past its expiry".to_string()),
+        ),
+        CatalogHealth::Serving(count) => (
+            sbproxy_observe::ComponentStatus::Healthy,
+            Some(format!("{count} agents")),
+        ),
+        // `CatalogHealth` is `#[non_exhaustive]`, so a variant added later
+        // arrives here rather than as a compile error. Degraded rather than
+        // healthy: a state this build cannot name is not one it should
+        // report as fine on a readiness endpoint.
+        other => (
+            sbproxy_observe::ComponentStatus::Degraded,
+            Some(format!("unrecognized catalog state: {other:?}")),
+        ),
     }
 }
 

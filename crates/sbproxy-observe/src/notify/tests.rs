@@ -461,23 +461,8 @@ async fn a_replay_a_full_queue_cannot_take_keeps_its_record() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
-    assert!(
-        full,
-        "the queue has to reach its bound for this test to mean anything"
-    );
-
-    assert!(
-        matches!(
-            notifier.replay(&delivery_id).await,
-            Err(NotifyError::QueueFull)
-        ),
-        "a full queue has to refuse rather than accept"
-    );
-    assert!(
-        notifier.get_deadletter(&delivery_id).await.is_ok(),
-        "a refused replay must leave the record where it was"
-    );
-
+    let refused = notifier.replay(&delivery_id).await;
+    let record_survived = notifier.get_deadletter(&delivery_id).await.is_ok();
     // The refusal is a 429 carrying `replayed: false`, so a drain loop
     // reading the flag backs off instead of shredding the queue.
     let refusal = crate::notify::admin::dispatch(
@@ -488,16 +473,33 @@ async fn a_replay_a_full_queue_cannot_take_keeps_its_record() {
     )
     .await
     .expect("route exists");
+
+    // Released and torn down before the assertions. Dropping the notifier
+    // joins its worker, and the worker cannot finish while deliveries are
+    // parked on the gate, so a failing assertion above would hang the test
+    // rather than report.
+    transport.gate.close();
+    drop(notifier);
+    std::fs::remove_file(&path).ok();
+
+    assert!(
+        full,
+        "the queue has to reach its bound for this test to mean anything"
+    );
+    assert!(
+        matches!(refused, Err(NotifyError::QueueFull)),
+        "a full queue has to refuse rather than accept, got {refused:?}"
+    );
+    assert!(
+        record_survived,
+        "a refused replay must leave the record where it was"
+    );
     assert_eq!(refusal.status, 429);
     assert!(
         refusal.body.contains("\"replayed\":false"),
         "{}",
         refusal.body
     );
-
-    transport.gate.close();
-    drop(notifier);
-    std::fs::remove_file(&path).ok();
 }
 
 /// One customer's dead receiver used to throttle every other customer's
@@ -529,24 +531,29 @@ async fn a_stalled_receiver_does_not_hold_up_a_healthy_one() {
     notifier.offer(event(EventType::KeyMinted));
     notifier.offer(event(EventType::KeyRevoked));
 
-    assert!(
-        eventually(|| {
-            transport
-                .seen
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .iter()
-                .filter(|url| url.as_str() == "https://fast.example/hook")
-                .count()
-                >= 2
-        })
-        .await,
-        "the healthy receiver must get both events while the other is stalled"
-    );
+    let healthy_saw_both = eventually(|| {
+        transport
+            .seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|url| url.as_str() == "https://fast.example/hook")
+            .count()
+            >= 2
+    })
+    .await;
 
+    // Released and torn down first: the worker cannot finish while a
+    // delivery is parked on the gate, so asserting before this would hang
+    // on failure instead of reporting.
     transport.gate.close();
     drop(notifier);
     std::fs::remove_file(&path).ok();
+
+    assert!(
+        healthy_saw_both,
+        "the healthy receiver must get both events while the other is stalled"
+    );
 }
 
 /// Subscriptions are the operator's configuration of who hears about what.
@@ -590,6 +597,73 @@ async fn subscriptions_and_deadletters_survive_a_restart() {
         deadletters(&notifier).await.len(),
         1,
         "a deadletter is a record of what a receiver missed and has to survive"
+    );
+
+    drop(notifier);
+    std::fs::remove_file(&path).ok();
+}
+
+/// `docs/notifications.md` tells alert authors that a configured notifier
+/// publishes both collections at zero on boot, so no data means it is not
+/// configured. Only the subscription count was published, so a proxy that
+/// restarted holding nine thousand deadletters had no deadletter series at
+/// all, and an alert of the form `deadletters > 100` saw nothing and stayed
+/// green.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn both_gauges_are_published_at_boot() {
+    let path = temp_path();
+    {
+        let transport = FakeTransport::new(vec![AttemptOutcome::Permanent {
+            status: Some(410),
+            reason: "http_rejected",
+        }]);
+        let notifier = Notifier::start_with_transport(store(&path), 16, transport)
+            .await
+            .expect("notifier");
+        notifier
+            .create_subscription(
+                "https://gone.example/hook".into(),
+                vec!["key_minted".into()],
+                false,
+            )
+            .await
+            .expect("subscription");
+        notifier.offer(event(EventType::KeyMinted));
+        eventually_deadletters(&notifier, 1).await;
+        drop(notifier);
+    }
+
+    // The gauge is process-global and the first notifier already set it
+    // while deadlettering, so park it on a value neither notifier would
+    // ever publish. Without this the assertion below would pass on the
+    // first notifier's leftover and prove nothing about the restart.
+    super::metrics::set_deadletters(-1);
+
+    // Fresh notifier over the same store, which is the restart.
+    let transport = FakeTransport::new(vec![AttemptOutcome::Delivered { status: 200 }]);
+    let notifier = Notifier::start_with_transport(store(&path), 16, transport)
+        .await
+        .expect("reopened notifier");
+
+    let mut deadletter_series = None;
+    for family in prometheus::gather() {
+        if family.name() != "sbproxy_notify_queue" {
+            continue;
+        }
+        for metric in family.get_metric() {
+            if metric
+                .get_label()
+                .iter()
+                .any(|label| label.name() == "collection" && label.value() == "deadletters")
+            {
+                deadletter_series = Some(metric.get_gauge().value());
+            }
+        }
+    }
+    assert_eq!(
+        deadletter_series,
+        Some(1.0),
+        "the deadletters series has to exist at boot, not at the first deadletter of the process"
     );
 
     drop(notifier);

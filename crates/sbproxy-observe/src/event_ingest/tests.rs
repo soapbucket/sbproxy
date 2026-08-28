@@ -32,14 +32,47 @@ struct FakeNats {
     observed: Arc<Mutex<Observed>>,
 }
 
+/// How the fake broker answers a `PING`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PingBehavior {
+    /// Answer every ping with `PONG`.
+    Pong,
+    /// Answer every ping with `-ERR`, which is what a rejected `CONNECT`
+    /// looks like.
+    Refuse,
+    /// Answer the `CONNECT` ping and then go silent, which is what a broker
+    /// that took the publishes and then stalled looks like.
+    PongThenSilent,
+}
+
 impl FakeNats {
     async fn start(refuse: bool) -> Self {
-        Self::start_with_info(refuse, r#"{"server_id":"fake","version":"2.10.0"}"#).await
+        Self::start_with(
+            if refuse {
+                PingBehavior::Refuse
+            } else {
+                PingBehavior::Pong
+            },
+            r#"{"server_id":"fake","version":"2.10.0"}"#,
+        )
+        .await
     }
 
     /// Start a broker whose `INFO` greeting is exactly `info`, so a test can
     /// say what the server advertises.
     async fn start_with_info(refuse: bool, info: &'static str) -> Self {
+        Self::start_with(
+            if refuse {
+                PingBehavior::Refuse
+            } else {
+                PingBehavior::Pong
+            },
+            info,
+        )
+        .await
+    }
+
+    async fn start_with(refuse: PingBehavior, info: &'static str) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -70,7 +103,7 @@ impl FakeNats {
 async fn serve(
     mut socket: tokio::net::TcpStream,
     observed: Arc<Mutex<Observed>>,
-    refuse: bool,
+    refuse: PingBehavior,
     info: &'static str,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -85,6 +118,7 @@ async fn serve(
 
     let mut buffer: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
+    let mut pings_on_this_connection = 0usize;
     loop {
         // Consume whole protocol messages out of `buffer`.
         while let Some(index) = buffer.windows(2).position(|window| window == b"\r\n") {
@@ -100,13 +134,23 @@ async fn serve(
                 "PING" => {
                     buffer.drain(..consumed);
                     observed.lock().unwrap_or_else(|e| e.into_inner()).pings += 1;
-                    let answer: &[u8] = if refuse {
-                        b"-ERR 'Authorization Violation'\r\n"
-                    } else {
-                        b"PONG\r\n"
+                    pings_on_this_connection += 1;
+                    let answer: Option<&[u8]> = match refuse {
+                        PingBehavior::Refuse => Some(b"-ERR 'Authorization Violation'\r\n"),
+                        PingBehavior::Pong => Some(b"PONG\r\n"),
+                        // Counted per connection, not per process: a redial
+                        // has to get its `CONNECT` answered, or the resend
+                        // this test is watching for never gets to happen and
+                        // the test would pass for the wrong reason.
+                        PingBehavior::PongThenSilent if pings_on_this_connection == 1 => {
+                            Some(b"PONG\r\n")
+                        }
+                        PingBehavior::PongThenSilent => None,
                     };
-                    if socket.write_all(answer).await.is_err() {
-                        return;
+                    if let Some(answer) = answer {
+                        if socket.write_all(answer).await.is_err() {
+                            return;
+                        }
                     }
                 }
                 "PUB" => {
@@ -370,6 +414,46 @@ async fn one_oversized_event_is_skipped_rather_than_killing_its_batch() {
         "and the oversized one has to be skipped"
     );
     assert!(published[0].1.len() <= 512);
+
+    drop(sink);
+}
+
+/// `docs/event-ingest.md` says out loud that this is at-most-once, and the
+/// window that made it false is a batch whose write completed and whose
+/// acknowledgement did not: NATS processes commands in order, so the server
+/// already has the publishes, and resending them is how 256 events become
+/// 512 rows in a warehouse with no dedup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_batch_the_broker_took_is_not_resent_when_its_acknowledgement_is_lost() {
+    let broker = FakeNats::start_with(
+        PingBehavior::PongThenSilent,
+        r#"{"server_id":"fake","version":"2.10.0"}"#,
+    )
+    .await;
+
+    let sink = EventIngest::start(
+        IngestTarget::Nats {
+            address: broker.address.clone(),
+            subject_prefix: "sb.events".into(),
+            token: None,
+        },
+        16,
+        None,
+    )
+    .expect("sink");
+    sink.publish(event("acme"));
+
+    assert!(
+        eventually(|| !broker.observed().published.is_empty()).await,
+        "the broker has to receive the batch once"
+    );
+    // Past the 5 second flush timeout, which is when a resend would land.
+    tokio::time::sleep(std::time::Duration::from_secs(7)).await;
+    assert_eq!(
+        broker.observed().published.len(),
+        1,
+        "a batch the broker already took must not be resent"
+    );
 
     drop(sink);
 }

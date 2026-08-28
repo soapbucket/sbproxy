@@ -239,8 +239,8 @@ pub enum ApprovalState {
     Approved,
     /// A reviewer refused it. Terminal, and the description stays refused.
     Rejected,
-    /// An approved registration was later withdrawn. Terminal, and the slug
-    /// stays burned.
+    /// An approved registration was later withdrawn. Terminal, and the
+    /// description stays refused.
     Revoked,
 }
 
