@@ -48,11 +48,19 @@
 //! number is therefore a floor on stack usage and a trend, and the
 //! budget it is held against leaves room for the difference.
 //!
-//! A thread that no Pingora runtime started has no recorded base, and
-//! every probe on it is a no-op that reports nothing. That covers the
-//! main thread, the admin runtime, and any `#[tokio::test]`, which is
-//! why the stack budget tests run their dispatch on a real Pingora
-//! runtime rather than on the test harness thread.
+//! A thread that no Pingora runtime or offload pool started has no
+//! recorded base, and every probe on it is a no-op that reports nothing.
+//! That covers the main thread, the admin runtime, and any
+//! `#[tokio::test]`, which is why the stack budget tests run their
+//! dispatch on a real Pingora runtime rather than on the test harness
+//! thread.
+//!
+//! Where the base sits differs by thread flavor, and
+//! `pingora_runtime::worker_stack` documents which. For a work-stealing
+//! worker, the flavor sbproxy runs, it is recorded in tokio's
+//! `on_thread_start` callback rather than at the true top of the thread,
+//! so the number here under-reports by roughly one closure frame: tens
+//! of bytes against a budget in the megabytes.
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -83,12 +91,18 @@ thread_local! {
 /// is the caller's own.
 #[inline]
 pub(crate) fn record_depth() {
-    // `here()` is `#[inline(never)]` in pingora-runtime, so its frame
-    // sits one call below this one. That constant offset is counted in
-    // the reported number, which is the conservative direction.
-    let Some(used) =
-        pingora_runtime::worker_stack::used_here(pingora_runtime::worker_stack::here())
-    else {
+    // `here()` is `#[inline(never)]` in pingora-runtime, so the mark it
+    // returns is taken one call below this frame. That constant offset
+    // is counted in the reported number, which is the direction that
+    // reports more stack used rather than less.
+    //
+    // The mark carries the thread that made it in debug builds, so
+    // comparing it against another thread's stack trips a
+    // `debug_assert` rather than producing a plausible-looking
+    // difference between two unrelated addresses. Release builds carry
+    // neither the field nor the check.
+    let mark = pingora_runtime::worker_stack::here();
+    let Some(used) = pingora_runtime::worker_stack::used_here(mark) else {
         // Not a Pingora runtime thread: nothing to measure against.
         return;
     };
