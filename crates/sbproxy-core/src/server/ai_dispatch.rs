@@ -15933,7 +15933,24 @@ pub(super) async fn relay_ai_response_with_cache(
         extras.push(("retry-after".to_string(), retry_after));
     }
 
-    send_response_with_extras(session, status, &content_type, &client_body, &extras).await
+    let sent =
+        send_response_with_extras(session, status, &content_type, &client_body, &extras).await;
+    if sent
+        .as_ref()
+        .err()
+        .is_some_and(|error| stream_write_failed_downstream(error))
+    {
+        // WOR-2622: the marker declines the `on_error` fallback
+        // (`proxy_http.rs` keys on it), which would otherwise make a
+        // second paid provider call on behalf of a caller who is already
+        // gone. The error itself is attributed downstream by the writer;
+        // this is the half that needs the request context, which the
+        // shared writer does not have.
+        if let Some(context) = ctx.as_deref_mut() {
+            context.ai_upstream_cancelled_on_client_disconnect = true;
+        }
+    }
+    sent
 }
 
 /// WOR-1044: restore reversible PII placeholders. Walks the body and
@@ -17790,7 +17807,7 @@ impl StreamAccounting {
 /// client that vanishes without its FIN reaching a write is billed as
 /// delivered, exactly as it was before, because nothing in this process
 /// ever learns it left.
-fn stream_write_failed_downstream(error: &Error) -> bool {
+pub(super) fn stream_write_failed_downstream(error: &Error) -> bool {
     matches!(
         error.etype(),
         ErrorType::WriteError
@@ -22187,6 +22204,107 @@ mod external_guardrail_context_tests {
             worker
                 .join()
                 .expect("a streamed AI request must fit a 2 MiB Pingora worker stack");
+        }
+
+        /// Seam: the buffered relay's terminal write.
+        ///
+        /// A non-streaming AI response is written in one frame after the
+        /// provider has finished, so a caller that hangs up during that
+        /// write has already been paid for. Pingora reports the failure
+        /// as `WriteError` with no source, so the receipt read
+        /// `delivered` when the 2xx header had committed and
+        /// `origin_5xx` when it had not: a full sale invoiced for a
+        /// response nobody received, and a provider blamed for a
+        /// caller's departure.
+        ///
+        /// The body has to be larger than the socket buffer, or the
+        /// kernel absorbs the whole write and the failure never
+        /// surfaces.
+        #[tokio::test]
+        async fn a_client_that_hangs_up_before_the_buffered_write_is_not_a_delivered_sale() {
+            let (upstream_url, upstream) = large_buffered_upstream_fixture(4 * 1024 * 1024).await;
+            let config = stream_probe_config(&upstream_url);
+            let pipeline = crate::pipeline::CompiledPipeline::default();
+            let (mut session, close, client) = streaming_downstream_session(serde_json::json!({
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }))
+            .await;
+            let mut context = crate::context::RequestContext::new();
+
+            let dispatch = super::super::handle_ai_proxy(
+                &mut session,
+                &config,
+                &pipeline,
+                "ai.test",
+                &mut context,
+                None,
+            );
+            let walk_away = async {
+                // The provider has the request; break the connection
+                // before the gateway finishes writing the answer out.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let _ = close.send(());
+            };
+            let (result, ()) = tokio::join!(dispatch, walk_away);
+
+            let error = result.expect_err("a client that is gone cannot be served");
+            assert_eq!(
+                *error.esource(),
+                pingora_error::ErrorSource::Downstream,
+                "a failed buffered write is the client's failure, not the provider's: {error}"
+            );
+            assert!(
+                crate::server::proxy_http::client_disconnected(
+                    Some(error.esource().clone()),
+                    crate::server::proxy_http::downstream_half_closed(&session),
+                ),
+                "the abandoned response must settle as client_disconnected, not as a sale"
+            );
+            assert!(
+                context.ai_upstream_cancelled_on_client_disconnect,
+                "the marker is what declines the on_error fallback, which would be a \
+                 second paid provider call for a caller who has left"
+            );
+            upstream.abort();
+            drop(session);
+            drop(client);
+        }
+
+        /// A provider that answers one non-streaming request with a body
+        /// of `bytes` bytes.
+        ///
+        /// Sized past the downstream socket buffer on purpose: a small
+        /// body is absorbed by the kernel whatever the peer does, and a
+        /// write that never reaches the wire cannot fail.
+        async fn large_buffered_upstream_fixture(
+            bytes: usize,
+        ) -> (String, tokio::task::JoinHandle<()>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind buffered upstream fixture");
+            let address = listener.local_addr().expect("buffered upstream address");
+            let handle = tokio::spawn(async move {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                drain_upstream_request(&mut stream).await;
+                let filler = "x".repeat(bytes);
+                let body = serde_json::json!({
+                    "id": "fixture",
+                    "choices": [{"message": {"role": "assistant", "content": filler}}],
+                    "usage": {"prompt_tokens": 11, "completion_tokens": 7}
+                })
+                .to_string();
+                let header = format!(
+                    "HTTP/1.1 200 Fixture\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes()).await;
+                let _ = stream.write_all(body.as_bytes()).await;
+                let _ = stream.flush().await;
+            });
+            (format!("http://{address}/v1"), handle)
         }
 
         /// Seam: the request future being dropped mid-stream.

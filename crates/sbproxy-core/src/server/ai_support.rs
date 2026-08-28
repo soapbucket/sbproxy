@@ -3347,10 +3347,12 @@ pub(super) async fn write_ai_cached_response(
     let _ = header.insert_header("x-sbproxy-idempotency", "HIT");
     session
         .write_response_header(Box::new(header), false)
-        .await?;
+        .await
+        .map_err(mark_downstream_write_failure)?;
     session
         .write_response_body(Some(bytes::Bytes::copy_from_slice(body)), true)
-        .await?;
+        .await
+        .map_err(mark_downstream_write_failure)?;
     Ok(())
 }
 
@@ -3612,11 +3614,50 @@ pub(super) async fn send_response_with_extras_and_reason(
     }
     session
         .write_response_header(Box::new(header), false)
-        .await?;
+        .await
+        .map_err(mark_downstream_write_failure)?;
     session
         .write_response_body(Some(bytes::Bytes::copy_from_slice(body)), true)
-        .await?;
+        .await
+        .map_err(mark_downstream_write_failure)?;
     Ok(())
+}
+
+/// Attribute a failed AI response write to the client (WOR-2622,
+/// closing the second half of the WOR-2335 gap).
+///
+/// Pingora's H1 body writer answers a broken pipe with
+/// `Error::e_because(WriteError, ...)` and no source, and nothing on
+/// this path called `into_down()`, so `error.esource()` reached
+/// `logging()` as `Unset`. `client_disconnected` then read false unless
+/// the session had separately observed a FIN, and the receipt for a
+/// caller who walked away read `delivered` when the 2xx header had
+/// committed - a full sale invoiced for a response nobody received, and
+/// wrong evidence in a dispute - or `origin_5xx` when it had not, which
+/// blames a provider for a caller's departure and inflates its
+/// error-rate SLO.
+///
+/// Applied at the shared writers rather than at one relay, so it also
+/// covers the idempotency replay and the refusal writes (402, 403). A
+/// write failure on a refusal is equally the client leaving.
+///
+/// What this can see is exactly the pingora `ErrorType` on the error the
+/// write returned, which is why it reuses the streaming relay's
+/// classifier rather than a second one. What it cannot see: a write
+/// Pingora buffered and never flushed, which is the ordinary case for a
+/// small body. A client that vanishes without its FIN reaching a write
+/// is still billed as delivered, because nothing in this process ever
+/// learns it left.
+fn mark_downstream_write_failure(error: Box<Error>) -> Box<Error> {
+    if !super::ai_dispatch::stream_write_failed_downstream(&error) {
+        return error;
+    }
+    Error::because(
+        ErrorType::ConnectionClosed,
+        "AI response abandoned: the client disconnected before the response was written",
+        error,
+    )
+    .into_down()
 }
 
 /// Compatibility wrapper for call sites with one optional extra header.
