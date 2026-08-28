@@ -30,10 +30,7 @@ use sbproxy_config::types::{
     ConfigAuthorityConfig, ConfigAuthorityPublishConfig, ConfigAuthorityPublishTlsConfig,
     ConfigAuthorityUpstreamConfig,
 };
-use sbproxy_core::config_authority::{
-    poll_state, ApplyReportHeaders, BundleFetch, BundleListener, ConfigAuthority,
-    SUBSCRIBER_STALE_AFTER_MS,
-};
+use sbproxy_core::config_authority::{BundleFetch, BundleListener, ConfigAuthority};
 use sbproxy_core::config_subscriber::{ConfigSubscriber, CycleResult, BUNDLE_ENDPOINT_PATH};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -1380,116 +1377,119 @@ async fn the_admin_routes_publish_register_revoke_and_report() {
 
 // --- WOR-2464: subscribers report what they applied -------------------
 
-/// A fetch carrying the apply-report headers.
-fn reporting_fetch<'a>(
-    credential: &'a str,
+/// The apply-report headers a subscriber sends, as wire strings.
+///
+/// Driven over the real listener rather than through `serve_bundle`
+/// directly, deliberately: the header names are a contract between two
+/// files in two crates, and a test that hands the parsed struct straight
+/// to the decision function would keep passing if the listener stopped
+/// reading one of them off the wire.
+fn apply_headers<'a>(
     status: &'a str,
     revision: &'a str,
     hash: &'a str,
     error: Option<&'a str>,
-) -> BundleFetch<'a> {
-    BundleFetch {
-        apply_report: Some(ApplyReportHeaders {
-            status: Some(status),
-            revision: Some(revision),
-            config_hash: Some(hash),
-            error,
-            soak_verdict: None,
-            fallback_active: Some("false"),
-        }),
-        ..fetch(credential, None)
+) -> Vec<(&'a str, &'a str)> {
+    let mut headers = vec![
+        ("x-sbproxy-config-status", status),
+        ("x-sbproxy-applied-revision", revision),
+        ("x-sbproxy-applied-hash", hash),
+        ("x-sbproxy-fallback-active", "false"),
+    ];
+    if let Some(error) = error {
+        headers.push(("x-sbproxy-config-error", error));
     }
+    headers
+}
+
+/// One subscriber row out of the status page.
+fn subscriber_row(status: &serde_json::Value, id: &str) -> serde_json::Value {
+    status["subscribers"]
+        .as_array()
+        .expect("subscribers")
+        .iter()
+        .find(|record| record["subscriber_id"] == id)
+        .cloned()
+        .unwrap_or_else(|| panic!("subscriber {id} is listed"))
 }
 
 /// WOR-2464. The authority status endpoint tracked per-subscriber
 /// last-**seen** revision, and seen is not applied: a fleet where three
 /// nodes fetched r42, refused it, and kept serving r41 looked identical
 /// from here to a fleet that applied it cleanly. All four report states
-/// in one test, because the page's value is in telling them apart.
-#[test]
-fn the_status_page_tells_applied_from_fetched_for_every_report_state() {
+/// in one test, over the real listener, because the page's value is in
+/// telling them apart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_status_page_tells_applied_from_fetched_for_every_report_state() {
     let temp = tempfile::tempdir().expect("temp");
-    let authority = authority(temp.path());
+    let publish = publish_config(temp.path(), free_port());
+    let authority = Arc::new(ConfigAuthority::from_config(&publish).expect("authority"));
     authority
         .publish(&payload("api.test", "authority"), BundleMode::Overlay)
         .expect("publish");
+    let addr = serve(Arc::clone(&authority), &publish).await;
 
-    let clean = authority
-        .register_subscriber("edge-clean")
-        .expect("register")
-        .into_token();
-    let degraded = authority
-        .register_subscriber("edge-degraded")
-        .expect("register")
-        .into_token();
-    let refused = authority
-        .register_subscriber("edge-refused")
-        .expect("register")
-        .into_token();
-    let silent = authority
-        .register_subscriber("edge-old-build")
-        .expect("register")
-        .into_token();
+    let token = |id: &str| {
+        authority
+            .register_subscriber(id)
+            .expect("register")
+            .into_token()
+    };
+    let clean = token("edge-clean");
+    let degraded = token("edge-degraded");
+    let refused = token("edge-refused");
+    let silent = token("edge-old-build");
 
-    assert_eq!(
-        authority
-            .serve_bundle(&reporting_fetch(&clean, "applied", "1", "sha-clean", None))
-            .status,
-        200,
-    );
-    assert_eq!(
-        authority
-            .serve_bundle(&reporting_fetch(
-                &degraded,
-                "applied_degraded",
-                "1",
-                "sha-clean",
-                None,
-            ))
-            .status,
-        200,
-    );
-    assert_eq!(
-        authority
-            .serve_bundle(&reporting_fetch(
-                &refused,
-                "failed",
-                "0",
-                "",
-                Some("unknown policy type `waf_v3`"),
-            ))
-            .status,
-        200,
-    );
+    for (credential, headers) in [
+        (&clean, apply_headers("applied", "1", "sha-clean", None)),
+        (
+            &degraded,
+            apply_headers("applied_degraded", "1", "sha-clean", None),
+        ),
+        (
+            &refused,
+            apply_headers("failed", "0", "", Some("unknown policy type `waf_v3`")),
+        ),
+    ] {
+        let mut sent = vec![("authorization", format!("Bearer {credential}"))];
+        sent.extend(
+            headers
+                .into_iter()
+                .map(|(name, value)| (name, value.to_string())),
+        );
+        let borrowed: Vec<(&str, &str)> = sent
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect();
+        let reply = raw_get(addr, BUNDLE_ENDPOINT_PATH, &borrowed).await;
+        assert_eq!(reply.status, 200, "the bundle is still served");
+    }
     // The old build fetches without any of the new headers. It must be
     // served, and it must not be rendered as having applied anything.
-    assert_eq!(authority.serve_bundle(&fetch(&silent, None)).status, 200);
+    let reply = raw_get(
+        addr,
+        BUNDLE_ENDPOINT_PATH,
+        &[("authorization", &format!("Bearer {silent}"))],
+    )
+    .await;
+    assert_eq!(reply.status, 200);
 
     let status = authority.status();
-    let by_id = |id: &str| -> serde_json::Value {
-        status["subscribers"]
-            .as_array()
-            .expect("subscribers")
-            .iter()
-            .find(|record| record["subscriber_id"] == id)
-            .cloned()
-            .expect("the subscriber is listed")
-    };
 
-    let clean = by_id("edge-clean");
+    let clean = subscriber_row(&status, "edge-clean");
     assert_eq!(clean["apply_status"], "applied");
     assert_eq!(clean["applied_revision"], 1);
     assert_eq!(clean["applied_config_hash"], "sha-clean");
     assert_eq!(clean["applied_up_to_date"], true);
     assert_eq!(clean["poll_state"], "recent");
 
-    let degraded = by_id("edge-degraded");
     assert_eq!(
-        degraded["apply_status"], "applied_degraded",
+        subscriber_row(&status, "edge-degraded")["apply_status"],
+        "applied_degraded",
         "a degraded apply must stay distinguishable from a clean one on the trip upstream",
     );
 
-    let refused = by_id("edge-refused");
+    let refused = subscriber_row(&status, "edge-refused");
     assert_eq!(refused["apply_status"], "failed");
     assert_eq!(
         refused["applied_revision"], 0,
@@ -1501,7 +1501,7 @@ fn the_status_page_tells_applied_from_fetched_for_every_report_state() {
     // the pair of facts the ticket exists to separate.
     assert_eq!(refused["last_seen_revision"], 1);
 
-    let silent = by_id("edge-old-build");
+    let silent = subscriber_row(&status, "edge-old-build");
     assert_eq!(
         silent["apply_status"], "unknown",
         "an old subscriber is handled without error and rendered as unknown, never as applied",
@@ -1516,44 +1516,36 @@ fn the_status_page_tells_applied_from_fetched_for_every_report_state() {
 }
 
 /// WOR-2464. A subscriber cannot report a revision higher than the
-/// authority has published. That would let one compromised node make
-/// the fleet view say a rollout is complete, which is the one answer an
+/// authority has published. That would let one compromised node make the
+/// fleet view say a rollout is complete, which is the one answer an
 /// operator acts on without checking.
-#[test]
-fn a_subscriber_cannot_claim_a_revision_the_authority_never_published() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_subscriber_cannot_claim_a_revision_the_authority_never_published() {
     let temp = tempfile::tempdir().expect("temp");
-    let authority = authority(temp.path());
+    let publish = publish_config(temp.path(), free_port());
+    let authority = Arc::new(ConfigAuthority::from_config(&publish).expect("authority"));
     authority
         .publish(&payload("api.test", "authority"), BundleMode::Overlay)
         .expect("publish");
+    let addr = serve(Arc::clone(&authority), &publish).await;
     let credential = authority
         .register_subscriber("edge-liar")
         .expect("register")
         .into_token();
 
+    let bearer = format!("Bearer {credential}");
+    let mut headers = vec![("authorization", bearer.as_str())];
+    headers.extend(apply_headers("applied", "9999", "sha-forged", None));
+    let reply = raw_get(addr, BUNDLE_ENDPOINT_PATH, &headers).await;
     assert_eq!(
-        authority
-            .serve_bundle(&reporting_fetch(
-                &credential,
-                "applied",
-                "9999",
-                "sha-forged",
-                None,
-            ))
-            .status,
-        200,
+        reply.status, 200,
         "the node is still served: the report is discarded, not the bundle",
     );
+
     let status = authority.status();
-    let record = status["subscribers"]
-        .as_array()
-        .expect("subscribers")
-        .iter()
-        .find(|record| record["subscriber_id"] == "edge-liar")
-        .cloned()
-        .expect("listed");
     assert_eq!(
-        record["apply_status"], "unknown",
+        subscriber_row(&status, "edge-liar")["apply_status"],
+        "unknown",
         "an over-claim leaves the record as it was rather than poisoning the fleet view",
     );
     assert_eq!(status["applied_current_count"], 0);
@@ -1562,155 +1554,50 @@ fn a_subscriber_cannot_claim_a_revision_the_authority_never_published() {
 
 /// WOR-2464. The report rides the existing bundle fetch, so it carries
 /// the existing subscriber credential and adds no new auth surface. An
-/// unauthenticated request cannot plant one.
-#[test]
-fn an_apply_report_needs_the_subscriber_credential_like_the_fetch_it_rides_on() {
+/// unauthenticated or forged request cannot plant one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_apply_report_needs_the_subscriber_credential_like_the_fetch_it_rides_on() {
     let temp = tempfile::tempdir().expect("temp");
-    let authority = authority(temp.path());
+    let publish = publish_config(temp.path(), free_port());
+    let authority = Arc::new(ConfigAuthority::from_config(&publish).expect("authority"));
     authority
         .publish(&payload("api.test", "authority"), BundleMode::Overlay)
         .expect("publish");
+    let addr = serve(Arc::clone(&authority), &publish).await;
     let credential = authority
         .register_subscriber("edge-01")
         .expect("register")
         .into_token();
 
-    let anonymous = authority.serve_bundle(&BundleFetch {
-        credential: None,
-        apply_report: Some(ApplyReportHeaders {
-            status: Some("applied"),
-            revision: Some("1"),
-            config_hash: Some("sha-forged"),
-            error: None,
-            soak_verdict: None,
-            fallback_active: None,
-        }),
-        ..fetch("unused", None)
-    });
+    let anonymous = raw_get(
+        addr,
+        BUNDLE_ENDPOINT_PATH,
+        &apply_headers("applied", "1", "sha-forged", None),
+    )
+    .await;
     assert_eq!(
         anonymous.status, 401,
-        "no credential, no fetch and no report"
+        "no credential, no fetch and no report",
     );
 
-    let forged = authority.serve_bundle(&BundleFetch {
-        credential: Some("sbca1.not.a.real.token"),
-        apply_report: Some(ApplyReportHeaders {
-            status: Some("applied"),
-            revision: Some("1"),
-            config_hash: Some("sha-forged"),
-            error: None,
-            soak_verdict: None,
-            fallback_active: None,
-        }),
-        ..fetch("unused", None)
-    });
-    assert_eq!(forged.status, 401);
-
-    let status = authority.status();
-    let record = status["subscribers"]
-        .as_array()
-        .expect("subscribers")
-        .iter()
-        .find(|record| record["subscriber_id"] == "edge-01")
-        .cloned()
-        .expect("listed");
+    let mut forged = vec![("authorization", "Bearer sbca1.not.a.real.token")];
+    forged.extend(apply_headers("applied", "1", "sha-forged", None));
     assert_eq!(
-        record["apply_status"], "unknown",
+        raw_get(addr, BUNDLE_ENDPOINT_PATH, &forged).await.status,
+        401
+    );
+
+    assert_eq!(
+        subscriber_row(&authority.status(), "edge-01")["apply_status"],
+        "unknown",
         "neither refused request may have planted a report against the registered subscriber",
     );
+
     // And the credential that is real still works, which proves the two
     // refusals above were about the credential rather than the headers.
-    assert_eq!(
-        authority
-            .serve_bundle(&reporting_fetch(
-                &credential,
-                "applied",
-                "1",
-                "sha-real",
-                None
-            ))
-            .status,
-        200,
-    );
+    let bearer = format!("Bearer {credential}");
+    let mut real = vec![("authorization", bearer.as_str())];
+    real.extend(apply_headers("applied", "1", "sha-real", None));
+    assert_eq!(raw_get(addr, BUNDLE_ENDPOINT_PATH, &real).await.status, 200);
     assert_eq!(authority.status()["applied_current_count"], 1);
-}
-
-/// WOR-2464. A partial or unrecognized report is dropped whole rather
-/// than stored half-parsed: a status page rendering a status against a
-/// revision the node never named would be worse than one saying nothing.
-#[test]
-fn a_partial_or_unrecognized_apply_report_is_dropped_rather_than_half_stored() {
-    let unknown_status = ApplyReportHeaders {
-        status: Some("teleported"),
-        revision: Some("4"),
-        config_hash: Some("sha"),
-        error: None,
-        soak_verdict: None,
-        fallback_active: None,
-    };
-    assert!(unknown_status.parse().is_none());
-
-    let no_revision = ApplyReportHeaders {
-        status: Some("applied"),
-        revision: None,
-        config_hash: Some("sha"),
-        error: None,
-        soak_verdict: None,
-        fallback_active: None,
-    };
-    assert!(no_revision.parse().is_none());
-
-    let unparseable_revision = ApplyReportHeaders {
-        status: Some("applied"),
-        revision: Some("soon"),
-        config_hash: Some("sha"),
-        error: None,
-        soak_verdict: None,
-        fallback_active: None,
-    };
-    assert!(unparseable_revision.parse().is_none());
-
-    assert!(ApplyReportHeaders::default().is_empty());
-
-    let complete = ApplyReportHeaders {
-        status: Some("applied_degraded"),
-        revision: Some("4"),
-        config_hash: Some("sha"),
-        error: Some("  "),
-        soak_verdict: Some("inconclusive"),
-        fallback_active: Some("true"),
-    };
-    let parsed = complete.parse().expect("a complete report parses");
-    assert_eq!(parsed.status.as_str(), "applied_degraded");
-    assert_eq!(parsed.revision, 4);
-    assert_eq!(
-        parsed.error, None,
-        "a whitespace-only error is an absent one, not an empty string on the status page",
-    );
-    assert_eq!(parsed.soak_verdict.as_deref(), Some("inconclusive"));
-    assert!(parsed.fallback_active);
-}
-
-/// WOR-2464: "The status page distinguishes 'has not polled recently'
-/// from 'polled and failed'." Three states, because after an authority
-/// restart the honest answer is neither: fetch times are held in memory
-/// only, and a restart must not make every node look like it went
-/// silent.
-#[test]
-fn the_poll_state_separates_silence_from_failure() {
-    const HOUR: u64 = 60 * 60 * 1_000;
-    assert_eq!(poll_state(None, HOUR), "unknown");
-    assert_eq!(poll_state(Some(HOUR), HOUR), "recent");
-    assert_eq!(
-        poll_state(Some(HOUR), HOUR + SUBSCRIBER_STALE_AFTER_MS),
-        "recent",
-        "the boundary itself is still recent",
-    );
-    assert_eq!(
-        poll_state(Some(HOUR), HOUR + SUBSCRIBER_STALE_AFTER_MS + 1),
-        "stale",
-    );
-    // A clock that went backwards must not read as stale, or a fleet
-    // behind an NTP correction would all look silent at once.
-    assert_eq!(poll_state(Some(HOUR), HOUR - 1), "recent");
 }

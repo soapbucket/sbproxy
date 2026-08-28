@@ -385,83 +385,59 @@ pub struct BundleFetch<'a> {
     /// What the subscriber says it last **applied** (WOR-2464), as
     /// distinct from what it was last served.
     ///
+    /// Already parsed by [`parse_apply_report`], which is what the
+    /// listener calls: a partial or unrecognized report is `None` by the
+    /// time it reaches here rather than something this decision has to
+    /// re-validate.
+    ///
     /// `None` for a subscriber that sent none of the report headers: an
     /// older build, or one that has not completed a cycle yet. Handled
     /// as **unknown** rather than as an error, which is the acceptance
     /// line, and rendered as unknown rather than as applied, which is
     /// the point of the ticket.
-    pub apply_report: Option<ApplyReportHeaders<'a>>,
+    pub apply_report: Option<sbproxy_config::SubscriberApplyReport>,
     /// Peer address, used as the rate-limit key before a credential is
     /// known.
     pub peer: &'a str,
 }
 
-/// The raw apply-report header values one fetch carried (WOR-2464).
+/// Read the apply-report headers off one request head (WOR-2464).
 ///
-/// Borrowed rather than parsed at the frame reader, so the parsing rules
-/// (an unknown status, a revision that is not a number, a report that
-/// claims more than this authority has published) all live in one place
-/// next to the store that enforces them, and the listener stays a thin
-/// frame reader.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ApplyReportHeaders<'a> {
-    /// `x-sbproxy-config-status`.
-    pub status: Option<&'a str>,
-    /// `x-sbproxy-applied-revision`.
-    pub revision: Option<&'a str>,
-    /// `x-sbproxy-applied-hash`.
-    pub config_hash: Option<&'a str>,
-    /// `x-sbproxy-config-error`.
-    pub error: Option<&'a str>,
-    /// `x-sbproxy-soak-verdict`.
-    pub soak_verdict: Option<&'a str>,
-    /// `x-sbproxy-fallback-active`.
-    pub fallback_active: Option<&'a str>,
-}
-
-impl ApplyReportHeaders<'_> {
-    /// Whether any report header was present at all.
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.status.is_none()
-            && self.revision.is_none()
-            && self.config_hash.is_none()
-            && self.error.is_none()
-            && self.soak_verdict.is_none()
-            && self.fallback_active.is_none()
-    }
-
-    /// Parse into the stored shape, or `None` when the report is absent
-    /// or unusable.
-    ///
-    /// Strict on the two fields that carry meaning: an unrecognized
-    /// `status` and an unparseable `revision` both make the whole report
-    /// `None`. A partial report would be worse than none, because the
-    /// status page would render a status against a revision the node
-    /// never named. The free-text fields are permissive and bounded by
-    /// [`sbproxy_config::SubscriberApplyReport`] on the way in.
-    #[must_use]
-    pub fn parse(&self) -> Option<sbproxy_config::SubscriberApplyReport> {
-        let status = sbproxy_config::ApplyStatus::parse(self.status?.trim())?;
-        let revision: u64 = self.revision?.trim().parse().ok()?;
-        Some(sbproxy_config::SubscriberApplyReport {
-            status,
-            revision,
-            config_hash: self.config_hash.unwrap_or_default().trim().to_string(),
-            error: self
-                .error
-                .map(str::trim)
-                .filter(|error| !error.is_empty())
-                .map(str::to_string),
-            soak_verdict: self
-                .soak_verdict
-                .map(str::trim)
-                .filter(|verdict| !verdict.is_empty())
-                .map(str::to_string),
-            fallback_active: self.fallback_active.map(str::trim) == Some("true"),
-            reported_at_unix_ms: None,
-        })
-    }
+/// `None` when the report is absent or unusable. Strict on the two
+/// fields that carry meaning: an unrecognized status and an unparseable
+/// revision both make the whole report `None`. A partial report would be
+/// worse than none, because the status page would then render a status
+/// against a revision the node never named. The free-text fields are
+/// permissive and bounded again by
+/// [`sbproxy_config::SubscriberApplyReport`] on the way into the store.
+///
+/// Lives here rather than in the frame reader so the parsing rules sit
+/// next to [`ConfigAuthority::serve_bundle_at`], which is what acts on
+/// them, and so a test can drive a literal request head through the same
+/// function the listener uses.
+pub(crate) fn parse_apply_report(head: &str) -> Option<sbproxy_config::SubscriberApplyReport> {
+    let status = sbproxy_config::ApplyStatus::parse(
+        header_value(head, crate::config_subscriber::APPLY_STATUS_HEADER)?.trim(),
+    )?;
+    let revision: u64 = header_value(head, crate::config_subscriber::APPLIED_REVISION_HEADER)?
+        .trim()
+        .parse()
+        .ok()?;
+    let text = |name: &str| {
+        header_value(head, name)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    Some(sbproxy_config::SubscriberApplyReport {
+        status,
+        revision,
+        config_hash: text(crate::config_subscriber::APPLIED_HASH_HEADER).unwrap_or_default(),
+        error: text(crate::config_subscriber::APPLY_ERROR_HEADER),
+        soak_verdict: text(crate::config_subscriber::SOAK_VERDICT_HEADER),
+        fallback_active: text(crate::config_subscriber::FALLBACK_ACTIVE_HEADER).as_deref()
+            == Some("true"),
+        reported_at_unix_ms: None,
+    })
 }
 
 /// The answer to one bundle fetch.
@@ -511,15 +487,14 @@ impl BundleReply {
 /// subscriber's configured interval, and over-reporting staleness is
 /// the safe direction for a page an operator makes a rollback decision
 /// on.
-pub const SUBSCRIBER_STALE_AFTER_MS: u64 = 5 * 60 * 1_000;
+const SUBSCRIBER_STALE_AFTER_MS: u64 = 5 * 60 * 1_000;
 
 /// Whether a subscriber has been heard from recently (WOR-2464).
 ///
 /// Three states, not two. `unknown` is the honest answer after an
 /// authority restart, because fetch times are held in memory only; a
 /// restart must not make every subscriber look like it has gone silent.
-#[must_use]
-pub fn poll_state(last_seen_at_unix_ms: Option<u64>, now_unix_ms: u64) -> &'static str {
+fn poll_state(last_seen_at_unix_ms: Option<u64>, now_unix_ms: u64) -> &'static str {
     match last_seen_at_unix_ms {
         None => "unknown",
         Some(at) if now_unix_ms.saturating_sub(at) <= SUBSCRIBER_STALE_AFTER_MS => "recent",
@@ -961,11 +936,7 @@ impl ConfigAuthority {
             // what it was *served*. Under the same store lock and in the
             // same block, so a status page read between the two cannot
             // see a subscriber that fetched r42 and has no report at all.
-            if let Some(report) = fetch
-                .apply_report
-                .as_ref()
-                .and_then(ApplyReportHeaders::parse)
-            {
+            if let Some(report) = fetch.apply_report.clone() {
                 let high_water = store.high_water_revision();
                 if let Err(error) =
                     store.record_applied(&credential_id, report, high_water, now_unix_ms)
@@ -1872,20 +1843,7 @@ where
     // WOR-2464. Read here with the rest of the head; every value is
     // optional, so an older subscriber that sends none of them produces
     // an empty report and is handled as unknown rather than as an error.
-    let apply_status = header_value(&text, crate::config_subscriber::APPLY_STATUS_HEADER);
-    let applied_revision = header_value(&text, crate::config_subscriber::APPLIED_REVISION_HEADER);
-    let applied_hash = header_value(&text, crate::config_subscriber::APPLIED_HASH_HEADER);
-    let apply_error = header_value(&text, crate::config_subscriber::APPLY_ERROR_HEADER);
-    let soak_verdict = header_value(&text, crate::config_subscriber::SOAK_VERDICT_HEADER);
-    let fallback_active = header_value(&text, crate::config_subscriber::FALLBACK_ACTIVE_HEADER);
-    let apply_report = ApplyReportHeaders {
-        status: apply_status.as_deref(),
-        revision: applied_revision.as_deref(),
-        config_hash: applied_hash.as_deref(),
-        error: apply_error.as_deref(),
-        soak_verdict: soak_verdict.as_deref(),
-        fallback_active: fallback_active.as_deref(),
-    };
+    let apply_report = parse_apply_report(&text);
 
     let fetch = BundleFetch {
         path,
@@ -1894,7 +1852,7 @@ where
         subscriber_id: (!subscriber_id.is_empty()).then_some(subscriber_id.as_str()),
         if_none_match: if_none_match.as_deref(),
         peer: peer_ip,
-        apply_report: (!apply_report.is_empty()).then_some(apply_report),
+        apply_report,
     };
     let reply = authority.serve_bundle(&fetch);
     if reply.status >= 400 {
@@ -2089,6 +2047,97 @@ pub fn spawn(publish: Option<&ConfigAuthorityPublishConfig>) -> anyhow::Result<(
 
 #[cfg(test)]
 mod tests {
+    /// One request head carrying the apply-report headers, in the shape
+    /// the frame reader hands to `parse_apply_report`.
+    fn head_with(headers: &[(&str, &str)]) -> String {
+        let mut head =
+            "GET /config-authority/v1/bundle HTTP/1.1\r\nHost: authority.test\r\n".to_string();
+        for (name, value) in headers {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
+        head
+    }
+
+    /// WOR-2464. A partial or unrecognized report is dropped whole rather
+    /// than stored half-parsed: a status page rendering a status against
+    /// a revision the node never named would be worse than one saying
+    /// nothing. Driven through the same function the listener calls, on
+    /// a literal request head, so a header rename fails here.
+    #[test]
+    fn a_partial_or_unrecognized_apply_report_is_dropped_rather_than_half_stored() {
+        assert!(
+            parse_apply_report(&head_with(&[
+                ("x-sbproxy-config-status", "teleported"),
+                ("x-sbproxy-applied-revision", "4"),
+            ]))
+            .is_none(),
+            "an unrecognized status drops the whole report",
+        );
+        assert!(
+            parse_apply_report(&head_with(&[("x-sbproxy-config-status", "applied")])).is_none(),
+            "a status with no revision names nothing",
+        );
+        assert!(
+            parse_apply_report(&head_with(&[
+                ("x-sbproxy-config-status", "applied"),
+                ("x-sbproxy-applied-revision", "soon"),
+            ]))
+            .is_none(),
+            "and a revision that is not a number is not a revision",
+        );
+        assert!(
+            parse_apply_report(&head_with(&[])).is_none(),
+            "an older subscriber sends none of these and is handled without error",
+        );
+
+        let parsed = parse_apply_report(&head_with(&[
+            ("x-sbproxy-config-status", "applied_degraded"),
+            ("x-sbproxy-applied-revision", "4"),
+            ("x-sbproxy-applied-hash", "sha"),
+            ("x-sbproxy-config-error", "  "),
+            ("x-sbproxy-soak-verdict", "inconclusive"),
+            ("x-sbproxy-fallback-active", "true"),
+        ]))
+        .expect("a complete report parses");
+        assert_eq!(parsed.status.as_str(), "applied_degraded");
+        assert_eq!(parsed.revision, 4);
+        assert_eq!(parsed.config_hash, "sha");
+        assert_eq!(
+            parsed.error, None,
+            "a whitespace-only error is an absent one, not an empty string on the status page",
+        );
+        assert_eq!(parsed.soak_verdict.as_deref(), Some("inconclusive"));
+        assert!(parsed.fallback_active);
+        assert!(
+            parsed.reported_at_unix_ms.is_none(),
+            "the arrival time is the authority's to stamp, never the subscriber's to claim",
+        );
+    }
+
+    /// WOR-2464: "The status page distinguishes 'has not polled recently'
+    /// from 'polled and failed'." Three states, because after an authority
+    /// restart the honest answer is neither: fetch times are held in memory
+    /// only, and a restart must not make every node look like it went
+    /// silent.
+    #[test]
+    fn the_poll_state_separates_silence_from_failure() {
+        const HOUR: u64 = 60 * 60 * 1_000;
+        assert_eq!(poll_state(None, HOUR), "unknown");
+        assert_eq!(poll_state(Some(HOUR), HOUR), "recent");
+        assert_eq!(
+            poll_state(Some(HOUR), HOUR + SUBSCRIBER_STALE_AFTER_MS),
+            "recent",
+            "the boundary itself is still recent",
+        );
+        assert_eq!(
+            poll_state(Some(HOUR), HOUR + SUBSCRIBER_STALE_AFTER_MS + 1),
+            "stale",
+        );
+        // A clock that went backwards must not read as stale, or a fleet
+        // behind an NTP correction would all look silent at once.
+        assert_eq!(poll_state(Some(HOUR), HOUR - 1), "recent");
+    }
+
     use super::*;
 
     /// WOR-2433. The publish gate screens values, not just paths.
