@@ -11,7 +11,7 @@ script's header says otherwise.
 | Script | What it does | CI workflow |
 |---|---|---|
 | `check.sh` | Local CLAUDE.md gate. Mirrors the lanes in `ci.yml`, `docs-ci.yml`, and `doc-drift.yml`, cheapest phase first; requires cargo-nextest; guards that the working tree still matches HEAD at the end. | local |
-| `check-fast.sh` | Every gate check that needs no workspace build, run in parallel, in about 38 seconds. What to run before a push and after every merge from main. Prints a NOT COVERED block naming the checks that need a compiler and the lane that catches each. | local |
+| `check-fast.sh` | Every gate check that needs no workspace build and no network, run in parallel, in about 40 seconds. What to run before a push and after every merge from main. Prints a NOT COVERED block naming the checks that need a compiler and the lane that catches each. | local |
 | `gate-scope.py` | The diff-to-phase classifier behind `check.sh --scope-to-diff` and `--explain`. An unrecognized path runs everything. `--self-test` carries a corpus of real CI failures. | local + `.github/workflows/ci.yml` (lint) |
 | `post-merge-rederive.sh` | Re-derive every generated artifact after a merge from main and print what moved: schemas, generated docs, the examples catalog, the tape corpus, llms-full when the branch carries it, and the seven ratchet baselines. Baselines only fall; a rise is refused. `--check` reports without writing. | local |
 | `cleanup-build-artifacts.sh` | Prune generated docs, nextest output, incremental dirs, and transient logs without deleting dependency build outputs. | local + CI |
@@ -37,7 +37,7 @@ need to include the full e2e package locally.
 
 The settlement feature union runs by default. No other phase compiles it,
 because no payment feature is in any default set, and CI requires the
-matching `payments` lane. It was opt-in until an
+matching `payments` lane. It was opt-in until a
 `clippy::items_after_test_module` failure landed on main from a lane no
 local run had ever executed, which is what an env var everyone forgets
 buys you. `SBPROXY_CHECK_PAYMENTS=0` still skips it, and the run reprints

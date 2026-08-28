@@ -316,8 +316,24 @@ run_code() {
 
   local work
   work="$(mktemp -d "${TMPDIR:-/tmp}/docs-ci-code.XXXXXX")"
-  # No trap: this function is called from the driver in the top-level
-  # shell, and a trap here would replace one the caller may rely on.
+  # Save and restore the caller's EXIT trap rather than replacing it. This
+  # function runs in the top-level shell, so a bare `trap ... EXIT` here
+  # would silently drop whatever the caller had installed; without any trap
+  # at all, a signal during the pass leaked a docs-ci-code.* directory
+  # under $TMPDIR every time.
+  local previous_exit_trap
+  previous_exit_trap="$(trap -p EXIT)"
+  # INT and TERM as well as EXIT: bash runs an EXIT trap when the shell
+  # exits, but a default-disposition signal kills it without one, so
+  # Ctrl-C during a 500-block pass left the directory behind. The handler
+  # re-raises with the default disposition so the exit status still says
+  # what killed it.
+  # shellcheck disable=SC2064
+  trap "rm -rf '$work'" EXIT
+  # shellcheck disable=SC2064
+  trap "rm -rf '$work'; trap - INT; kill -INT \$\$" INT
+  # shellcheck disable=SC2064
+  trap "rm -rf '$work'; trap - TERM; kill -TERM \$\$" TERM
 
   local -a files=() results=()
   local tree md
@@ -332,6 +348,18 @@ run_code() {
       files+=("$md")
     done
   done
+
+  # `set -u` plus bash 3.2 aborts on "${files[@]}" when the array is
+  # empty, which is the same class of portability bug as the declare -A
+  # this branch already had to fix. An empty tree is not an error: there is
+  # nothing to check and nothing to report.
+  if [ "${#files[@]}" -eq 0 ]; then
+    rm -rf "$work"
+    trap - INT TERM
+    eval "${previous_exit_trap:-trap - EXIT}"
+    echo "[docs-ci] code-block check: checked=0 skipped=0 rc=0 jobs=$jobs (no markdown files)"
+    return 0
+  fi
 
   local index=0 running=0 slot
   for md in "${files[@]}"; do
@@ -365,6 +393,8 @@ run_code() {
   done
 
   rm -rf "$work"
+  trap - INT TERM
+  eval "${previous_exit_trap:-trap - EXIT}"
   echo "[docs-ci] code-block check: checked=$checked skipped=$skipped rc=$rc jobs=$jobs"
   return $rc
 }

@@ -134,6 +134,7 @@ fi
 # the safe default structural rather than conditional: a name that is not
 # in the list runs, and the empty list runs everything.
 GATE_PHASES_OFF=''
+GATE_PHASES_ON=''
 SCOPE_REASON=''
 if [ "$SCOPE_TO_DIFF" = "1" ]; then
   SCOPE_OUTPUT="$(python3 "$ROOT/scripts/gate-scope.py" --base "$SCOPE_BASE" || true)"
@@ -143,6 +144,8 @@ if [ "$SCOPE_TO_DIFF" = "1" ]; then
         GATE_PHASE_*)
           if [ "$value" = "0" ]; then
             GATE_PHASES_OFF="$GATE_PHASES_OFF ${key#GATE_PHASE_}"
+          else
+            GATE_PHASES_ON="$GATE_PHASES_ON ${key#GATE_PHASE_}"
           fi
           ;;
         GATE_SCOPE_REASON) SCOPE_REASON="$value" ;;
@@ -205,13 +208,25 @@ note_skip() {
 # in the same SKIPPED PHASES block as everything else: a run that skipped
 # half the gate must say so in the same place and the same words as a run
 # that was missing promtool.
+#
+# $1 is the classifier's own phase token and $2 the human label. The token
+# is printed so the log can be diffed against `check.sh --explain`, which
+# speaks in tokens; without it the two outputs shared no vocabulary and a
+# reader had to map step labels back to phase names by hand.
 scope_skip() {
-  note_skip "$1 (--scope-to-diff: nothing in this diff can reach it; run 'bash scripts/check.sh' with no arguments for the full gate)"
+  note_skip "$1: $2 (--scope-to-diff: nothing in this diff can reach it; run 'bash scripts/check.sh' with no arguments for the full gate)"
 }
 
 if [ "$SCOPE_TO_DIFF" = "1" ]; then
   printf '\n\033[1;34m==>\033[0m diff-scoped against %s\n' "$SCOPE_BASE"
-  printf '    %s\n' "$SCOPE_REASON"
+  printf '    reason:  %s\n' "$SCOPE_REASON"
+  # The reason line is `diff-scoped` on the only path where scoping
+  # actually happens (the classifier only writes a sentence there when it
+  # is running everything), so the phase lists are what carry the
+  # information. Same tokens --explain prints, in the same order.
+  printf '    running: %s\n' "${GATE_PHASES_ON# }"
+  printf '    skipped: %s\n' "${GATE_PHASES_OFF# }"
+  printf '    Plus the cheap read-only tier, which always runs.\n'
   printf '    scripts/check.sh --explain shows the decision per changed path.\n'
 fi
 
@@ -604,7 +619,7 @@ python3 "$ROOT/scripts/gate-scope.py" --self-test
 # classes had no local equivalent at all. Invoked through make so the
 # Makefile stays the one definition of what the check is.
 if ! phase_wanted TAPES; then
-  scope_skip "generated tapes and GIF wiring (make tapes-check)"
+  scope_skip TAPES "generated tapes and GIF wiring (make tapes-check)"
 else
 step "generated tapes and GIF wiring are current"
 if ! command -v make >/dev/null 2>&1; then
@@ -683,7 +698,7 @@ run_batch "generator --check drift scans" \
 # Needs rustc and lychee; a `rust` block that cannot compile standalone
 # is tagged `rust,no_run` at the source rather than skipped here.
 if ! phase_wanted DOCSCI; then
-  scope_skip "docs-ci (rust code blocks and offline anchor resolution)"
+  scope_skip DOCSCI "docs-ci (rust code blocks and offline anchor resolution)"
 elif ! command -v lychee >/dev/null 2>&1; then
   note_skip "docs-ci link half (lychee not on PATH; docs anchors and cross-page links are unchecked locally). Install with 'cargo install lychee --locked' or 'brew install lychee'."
   step "docs code blocks compile"
@@ -806,7 +821,7 @@ fi
 
 # CI: ci.yml ui lane.
 if ! phase_wanted UI; then
-  scope_skip "ui typecheck and test (npm)"
+  scope_skip UI "ui typecheck and test (npm)"
 else
 step "ui typecheck and test"
 if ! command -v npm >/dev/null 2>&1; then
@@ -973,14 +988,14 @@ fi
 # lockfile drift was auto-repaired rather than reported, and with no
 # working-tree guard nobody was ever told.
 if ! phase_wanted BUILD; then
-  scope_skip "cargo build"
+  scope_skip BUILD "cargo build"
 else
   step "cargo build"
   cargo build "${test_package_args[@]}"
 fi
 
 if ! phase_wanted TEST; then
-  scope_skip "cargo test (the workspace nextest lane)"
+  scope_skip TEST "cargo test (the workspace nextest lane)"
 else
 step "cargo test"
 if cargo nextest --version >/dev/null 2>&1; then
@@ -1018,14 +1033,14 @@ fi
 
 # nextest does not execute doctests, so they need their own pass.
 if ! phase_wanted DOCTEST; then
-  scope_skip "cargo doctest"
+  scope_skip DOCTEST "cargo doctest"
 else
   step "cargo doctest"
   cargo test "${test_package_args[@]}" --doc
 fi
 
 if ! phase_wanted CLIPPY; then
-  scope_skip "cargo clippy"
+  scope_skip CLIPPY "cargo clippy"
 else
   step "cargo clippy"
   cargo clippy --workspace --all-targets -- -D warnings
@@ -1042,7 +1057,7 @@ fi
 # report. The private-items pass is available below, on its own, behind
 # an env var.
 if ! phase_wanted DOC; then
-  scope_skip "cargo doc (rustdoc, -D missing_docs, and the intra-doc link check)"
+  scope_skip DOC "cargo doc (rustdoc, -D missing_docs, and the intra-doc link check)"
 else
   step "cargo doc"
   RUSTDOCFLAGS="-D warnings -D missing_docs" cargo doc --workspace --no-deps --locked
@@ -1063,7 +1078,7 @@ fi
 . "$ROOT/scripts/lib/workspace-bin.sh"
 
 if ! phase_wanted GENERATED; then
-  scope_skip "config schema, reader coverage, metrics stability, decision contract, and model-host capabilities (all exec built binaries)"
+  scope_skip GENERATED "config schema, reader coverage, metrics stability, decision contract, and model-host capabilities (all exec built binaries)"
 else
   step "config schema and reader coverage"
   run_generated_artifact_checks \
@@ -1103,7 +1118,7 @@ fi
 # missed. `--scope-to-diff` skips it too when no Rust file changed, which is
 # the case that made it expensive for no reason.
 if ! phase_wanted PAYMENTS; then
-  scope_skip "payment settlement features (clippy + test)"
+  scope_skip PAYMENTS "payment settlement features (clippy + test)"
 elif [ "${SBPROXY_CHECK_PAYMENTS:-1}" != "1" ]; then
   note_skip "payment settlement features (SBPROXY_CHECK_PAYMENTS=0 was set explicitly). No other phase in this gate compiles crates/sbproxy-billing's runtime, sbproxy-core's settlement gate, or the ~217 tests inside them, so all of it stayed unbuilt. CI's 'payments' and 'payments clippy (settlement features)' lanes both require it, and they are where clippy::items_after_test_module surfaces."
 else

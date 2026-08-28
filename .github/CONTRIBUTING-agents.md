@@ -58,16 +58,22 @@ settled are not reopened.
 Two commands cover nearly all of it.
 
 ```
-bash scripts/check-fast.sh          # 38s. Every check that needs no build, in parallel.
-bash scripts/check.sh               # the full gate, ~45 minutes. Before you push.
+bash scripts/check-fast.sh          # ~40s. Every check needing no build or network.
+bash scripts/check.sh               # the full gate. Before you push.
 ```
 
+The gate was about 45 minutes before the settlement feature union started running by
+default, and that union recompiles the dependency graph under its own feature fingerprint
+rather than reusing anything above it, so budget more. `--scope-to-diff` below is what buys
+it back on a diff that cannot reach the Rust tier.
+
 `check-fast.sh` is the one to run constantly: after every merge from main, after a docs edit,
-before you go looking for why CI is red. It runs twenty-five checks and catches six of the
-nine failures that cost a CI round trip on 2026-08-27, including the two that no local runner
-covered at all (the `rust` code blocks in `docs/*.md`, and every in-tree anchor). It prints a
-NOT COVERED block naming the three that need a compiler and the lane that catches each, so a
-green run cannot be mistaken for a green gate.
+before you go looking for why CI is red. It runs thirty checks and catches six of the ten
+failures that cost a CI round trip on 2026-08-27, including the two that no local runner
+covered at all (the `rust` code blocks in `docs/*.md`, and every in-tree anchor). It prints
+two NOT COVERED blocks: the four that need a compiler, and the two that need the network,
+each naming the lane that catches it. A green run there is not a green gate, and the
+difference is written down rather than assumed.
 
 ### Scoping the gate to your diff
 
@@ -117,11 +123,16 @@ last word.
 
 ### Docs, examples, or dashboards only
 
-`bash scripts/check-fast.sh` covers this whole case. It is the same set the docs lane checks,
-plus the catalog, config, capture, and fragment scans, and it needs no workspace build. Two
-traps live here: a `rust` code block in `docs/` must compile standalone or carry `rust,no_run`,
-and renaming a heading needs a repo-wide grep for its anchor, because another page is linking
-to it.
+`bash scripts/check-fast.sh` covers this case, with one exception worth knowing: it does not
+run the generated-artifact checks, because those exec built binaries. If your diff touches
+`docs/metrics-stability.md`, `docs/decision-records.md`, `docs/model-host-capabilities.md`,
+or anything under `schemas/`, you are editing generator output rather than prose, and
+`--scope-to-diff` will select `GENERATED` for exactly that reason. Fix the generator, not the
+file.
+
+Two traps live here: a `rust` code block in `docs/` must compile standalone or carry
+`rust,no_run`, and renaming a heading needs a repo-wide grep for its anchor, because another
+page is linking to it.
 
 If the diff contains no `.rs` file, no `Cargo.toml`, no `Cargo.lock`, and no `build.rs`, there
 is nothing for a cargo command to find. `bash scripts/check.sh --scope-to-diff` reaches the
@@ -186,7 +197,7 @@ Follow `.github/PULL_REQUEST_TEMPLATE.md`. The `## Adversarial review` section i
 count line, and one item per finding in this shape:
 
 ```
-- Major - crates/sbproxy-core/src/server/proxy_http.rs:5334 - claim. Fixed in a1b2c3d4.
+- Major - `crates/sbproxy-core/src/server/proxy_http.rs:5334` - claim. Fixed in `a1b2c3d4`.
 ```
 
 with backticks around the path and the hash. A declined item reads `Declined: <reason>` in
