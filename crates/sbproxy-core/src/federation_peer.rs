@@ -342,15 +342,15 @@ impl FederationPeerVerifier {
             }
             Ok(inner) => match inner {
                 Ok(chain) => chain,
-            // The error names the peer URL, the resolved address, or
-            // the transport failure, all of which are answers to a
-            // probe the caller chose the question for. The crate
-            // already logged the detail on its own decision event.
-            //
-            // What is safe to say, and worth saying, is what the walk
-            // spent: an operator watching refusals needs to tell a peer
-            // that is simply unreachable from one that is exhausting
-            // the budget, because the second is someone probing.
+                // The error names the peer URL, the resolved address, or
+                // the transport failure, all of which are answers to a
+                // probe the caller chose the question for. The crate
+                // already logged the detail on its own decision event.
+                //
+                // What is safe to say, and worth saying, is what the walk
+                // spent: an operator watching refusals needs to tell a peer
+                // that is simply unreachable from one that is exhausting
+                // the budget, because the second is someone probing.
                 Err(_) => {
                     tracing::warn!(
                         target: "sbproxy_federation::decision",
@@ -717,5 +717,4 @@ mod tests {
             "the walk must end on its own budget rather than on a per-fetch timeout; took {elapsed:?}"
         );
     }
-
 }

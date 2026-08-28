@@ -1920,5 +1920,4 @@ mod tests {
             "an origin that is neither the broker's nor the configured page's must be refused"
         );
     }
-
 }

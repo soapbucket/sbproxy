@@ -70,7 +70,7 @@ resource-server demo on `:8090`. See
 [`examples/standalone_broker.rs`](../crates/sbproxy-mcp-gateway/examples/standalone_broker.rs)
 for the full source; the interesting part is short:
 
-```rust
+```rust,no_run
 let app = router_full_with_par(
     config,
     session_store,
@@ -90,7 +90,7 @@ in-process collaborators for the features enabled by the config.
 shared or custom stores. A minimal config includes the broker's public
 origin and its registered upstream callback:
 
-```rust
+```rust,no_run
 McpGatewayConfig {
     base_path: "/mcp/oauth".to_string(),
     external_base_url: "https://mcp.example.com".to_string(),
@@ -149,7 +149,7 @@ came from (`oauth_introspection`, tracked as an independent ticket).
 JWKS mode is the spec-recommended default and needs nothing from that
 sibling ticket, so it is what ships here.
 
-```rust
+```rust,no_run
 let provider = McpResourceServerProvider::new(McpResourceServerConfig {
     resource_uri: "https://mcp.example.com".to_string(),
     authorization_servers: vec!["https://idp.example.com".to_string()],
