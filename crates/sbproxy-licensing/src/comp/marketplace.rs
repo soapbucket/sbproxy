@@ -35,6 +35,28 @@ use super::types::{
 /// Maximum quote validity window. One hour.
 pub const COMP_QUOTE_VALIDITY_SECS: u64 = 3600;
 
+/// Rows the issued-quote ledger holds before it starts refusing.
+///
+/// `POST /quote` is unauthenticated, and on the proxy it answers and
+/// returns before bot detection, threat protection, authentication, and
+/// the policy chain where an origin's own rate limits live. So the
+/// origin's limits never see it and this map is the only thing standing
+/// between one looping client and an OOM that takes every other origin
+/// on the process with it.
+///
+/// Fifty thousand rows is roughly ten megabytes at about 200 bytes per
+/// row (a 26-character ULID key, a 71-character `sha256:` hash, two
+/// integers, a bool, and map overhead), which is a bound a proxy can
+/// hold without thinking about it and far past any real publisher's
+/// concurrent outstanding quotes.
+///
+/// Refusing rather than evicting the oldest row is deliberate: eviction
+/// would let a flood push a paying buyer's quote out of the ledger,
+/// turning a denial-of-service into a denial-of-purchase. Refusing
+/// costs new quotes during a flood and leaves every issued one
+/// redeemable.
+pub const COMP_QUOTE_LEDGER_CAPACITY: usize = 50_000;
+
 /// How far ahead of this bridge's clock a buyer's `accepted_at` may
 /// sit before the acceptance is refused.
 ///
@@ -52,7 +74,7 @@ pub const COMP_ACCEPTANCE_SKEW_SECS: u64 = 300;
 #[async_trait]
 pub trait BuyerKeyRegistry: Send + Sync {
     /// Resolve `kid` to a buyer verifying key. Returns
-    /// [`LicensingError::UnknownKey`] for an unrecognised kid.
+    /// [`LicensingError::UnknownKey`] for an unrecognized kid.
     async fn resolve(&self, kid: &str) -> Result<VerifyingKey, LicensingError>;
 }
 
@@ -180,6 +202,9 @@ pub struct CompMarketplace {
     /// fabrication risk than the restart refusals sets this true; see
     /// `origins.<host>.comp.allow_unknown_quotes`.
     allow_unknown_quotes: bool,
+    /// Row cap for [`Self::issued_quotes`]. See
+    /// [`COMP_QUOTE_LEDGER_CAPACITY`] for why one exists.
+    quote_ledger_capacity: usize,
 }
 
 /// How long an expired quote stays in the ledger as a tombstone.
@@ -194,6 +219,12 @@ const QUOTE_TOMBSTONE_SECS: u64 = 24 * 60 * 60;
 /// One issued quote, as the ledger remembers it.
 #[derive(Clone, Debug)]
 struct IssuedQuote {
+    /// Whether this quote has already been redeemed.
+    ///
+    /// A quote is single-use. Set under the same guard that reads the
+    /// row, before any minting, so two concurrent redeems of one quote
+    /// cannot both pass the check.
+    redeemed: bool,
     /// Unix seconds the quote stops being redeemable.
     valid_until: u64,
     /// `sha256:<hex>` over the canonical signing bytes of the quote
@@ -245,6 +276,32 @@ impl CompMarketplace {
             buyer_keys,
             issued_quotes: std::sync::Mutex::new(HashMap::new()),
             allow_unknown_quotes: false,
+            quote_ledger_capacity: COMP_QUOTE_LEDGER_CAPACITY,
+        }
+    }
+
+    /// Override the issued-quote ledger's row cap.
+    ///
+    /// [`COMP_QUOTE_LEDGER_CAPACITY`] is the default and the number to
+    /// read for why a cap exists at all. A host with an unusual quote
+    /// volume and its own memory budget can move it; a host that does
+    /// not know it needs to should not.
+    #[must_use]
+    pub fn with_quote_ledger_capacity(mut self, capacity: usize) -> Self {
+        self.quote_ledger_capacity = capacity.max(1);
+        self
+    }
+
+    /// Move every ledger row this many seconds into the past, so a test
+    /// can reach the tombstone sweep without sleeping.
+    #[cfg(test)]
+    fn age_ledger_for_test(&self, seconds: u64) {
+        let mut ledger = self
+            .issued_quotes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for issued in ledger.values_mut() {
+            issued.valid_until = issued.valid_until.saturating_sub(seconds);
         }
     }
 
@@ -352,9 +409,22 @@ impl CompMarketplace {
             // close to zero.
             ledger
                 .retain(|_, issued| issued.valid_until.saturating_add(QUOTE_TOMBSTONE_SECS) > now);
+            // WOR-2673 review B1. The sweep above is what makes this a
+            // live-row cap rather than a lifetime one, so a bridge that
+            // has been up for a month is not permanently refusing. Past
+            // the cap the quote is refused before the row is written:
+            // returning a signed quote this bridge did not record would
+            // be worse than refusing, because the redeem for it would
+            // then hit the unknown-quote branch.
+            if ledger.len() >= self.quote_ledger_capacity {
+                return Err(LicensingError::QuoteLedgerFull {
+                    capacity: self.quote_ledger_capacity,
+                });
+            }
             ledger.insert(
                 quote_id,
                 IssuedQuote {
+                    redeemed: false,
                     valid_until: valid_until_unix,
                     quote_hash: quote_hash(&signing_input),
                 },
@@ -428,36 +498,59 @@ impl CompMarketplace {
             });
         }
 
-        let issued = self
-            .issued_quotes
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&request.quote_id)
-            .cloned();
-        match issued {
-            Some(issued) => {
-                if issued.valid_until <= now {
-                    return Err(LicensingError::Expired {
-                        exp: issued.valid_until,
-                        now,
-                    });
+        // Check and consume under one guard (WOR-2673 review M1). A
+        // quote is single-use, and the buyer signature covers the body
+        // with its own value cleared, so a replay is a resend of
+        // identical bytes and costs the buyer nothing. Marking the row
+        // here rather than after the mint is what makes two concurrent
+        // redeems of one quote mint once: the guard is the only thing
+        // both of them have to pass through.
+        //
+        // Consuming before the mint means a quote is spent even if the
+        // signing that follows fails. That is the fail-closed
+        // direction: the alternative leaves a window in which a buyer
+        // who can make minting fail keeps redeeming.
+        {
+            let mut ledger = self
+                .issued_quotes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            match ledger.get_mut(&request.quote_id) {
+                Some(issued) => {
+                    if issued.redeemed {
+                        return Err(LicensingError::AlreadyRedeemed(request.quote_id.clone()));
+                    }
+                    if issued.valid_until <= now {
+                        return Err(LicensingError::Expired {
+                            exp: issued.valid_until,
+                            now,
+                        });
+                    }
+                    // Bind the redeem to the quote. Without this the
+                    // whole request reduces to a syntactically valid
+                    // body with a fabricated quote_id and a fabricated
+                    // hash, redeemable on a loop by any onboarded buyer
+                    // key.
+                    if request.buyer_acceptance.accepted_quote_hash != issued.quote_hash {
+                        return Err(LicensingError::Malformed(
+                            "buyer_acceptance.accepted_quote_hash does not match the quote this \
+                             publisher issued for that quote_id"
+                                .to_string(),
+                        ));
+                    }
+                    issued.redeemed = true;
                 }
-                // Bind the redeem to the quote. Without this the whole
-                // request reduces to a syntactically valid body with a
-                // fabricated quote_id and a fabricated hash, redeemable
-                // on a loop by any onboarded buyer key.
-                if request.buyer_acceptance.accepted_quote_hash != issued.quote_hash {
-                    return Err(LicensingError::Malformed(
-                        "buyer_acceptance.accepted_quote_hash does not match the quote this \
-                         publisher issued for that quote_id"
-                            .to_string(),
-                    ));
+                // No row, and the operator has not opted out. Refused
+                // for the reason on `allow_unknown_quotes`.
+                None if !self.allow_unknown_quotes => {
+                    return Err(LicensingError::UnknownQuote(request.quote_id.clone()));
                 }
+                // The opt-out. Note what it also gives up: with no row
+                // there is nothing to mark, so single-use protection
+                // does not apply to a quote this process does not hold.
+                // `docs/comp-marketplace.md` says so.
+                None => {}
             }
-            None if !self.allow_unknown_quotes => {
-                return Err(LicensingError::UnknownQuote(request.quote_id.clone()));
-            }
-            None => {}
         }
 
         verify_payment_proof(&request.payment_proof)?;
@@ -492,19 +585,40 @@ impl CompMarketplace {
             .ok_or_else(|| LicensingError::UnknownTier(tier_id.to_string()))
     }
 
+    /// Resolve the tier a redeem mints for.
+    ///
+    /// Nothing in a redeem request names a tier: the buyer sends a
+    /// `quote_id`, and this bridge keeps no durable quote-to-tier
+    /// mapping (that store is separate scope). So the manifest has to
+    /// carry exactly one redeemable tier for the answer to be
+    /// unambiguous, and it does: `validate_comp_marketplace` refuses a
+    /// catalog with zero or with two.
+    ///
+    /// This function re-checks that rather than trusting it, because
+    /// the compiler is not the only way a `CompMarketplace` is built.
+    /// A host constructing one in memory gets the same refusal instead
+    /// of silently minting the wrong tier's license (WOR-2673 review
+    /// B2).
     fn tier_for_acceptance(
         &self,
         _acceptance: &CompAcceptance,
     ) -> Result<&CompTier, LicensingError> {
-        // v1: redeem runs against a single-tier manifest in the
-        // common case; pick the first OLP-authorised tier. A
-        // production composer keys on quote_id once a quote-to-tier
-        // store lands as separate scope.
-        self.manifest
+        let mut olp = self
+            .manifest
             .tiers
             .iter()
-            .find(|t| matches!(t.authorization, super::types::CompAuthorization::Olp))
-            .ok_or_else(|| LicensingError::Encode("no OLP-authorised tier in manifest".into()))
+            .filter(|t| matches!(t.authorization, super::types::CompAuthorization::Olp));
+        let first = olp
+            .next()
+            .ok_or_else(|| LicensingError::Encode("no OLP-authorized tier in manifest".into()))?;
+        if let Some(second) = olp.next() {
+            return Err(LicensingError::Encode(format!(
+                "manifest carries more than one OLP-authorized tier ('{}' and '{}'); a redeem \
+                 names no tier, so it cannot tell them apart",
+                first.id, second.id
+            )));
+        }
+        Ok(first)
     }
 }
 
@@ -583,7 +697,7 @@ fn canonical_redeem_signing_input(req: &CompRedeemRequest) -> Result<Vec<u8>, Li
 
 fn verify_payment_proof(proof: &super::types::CompPaymentProof) -> Result<(), LicensingError> {
     // v1: per-rail integration is deferred; this accepts any proof
-    // whose rail is recognised and whose receipt fields are
+    // whose rail is recognized and whose receipt fields are
     // populated. Real verification (x402 facilitator query, MPP
     // receipt resolution, Stripe payment_intent lookup) is separate
     // scope, tracked against the workspace's existing payment rails
@@ -854,6 +968,24 @@ mod tests {
         (mp, buyer_keys, buyer_signing)
     }
 
+    /// The same marketplace with a small ledger cap, so the bound is
+    /// testable without issuing fifty thousand quotes.
+    fn build_marketplace_with_ledger_capacity(
+        capacity: usize,
+    ) -> (
+        Arc<CompMarketplace>,
+        Arc<InMemoryBuyerKeyRegistry>,
+        SigningKey,
+    ) {
+        let (mp, keys, signer) = build_marketplace();
+        let mp = Arc::new(
+            Arc::try_unwrap(mp)
+                .unwrap_or_else(|_| panic!("the fixture holds the only reference"))
+                .with_quote_ledger_capacity(capacity),
+        );
+        (mp, keys, signer)
+    }
+
     /// The same marketplace with the restart-survival opt-out on.
     fn build_marketplace_allowing_unknown_quotes() -> (
         Arc<CompMarketplace>,
@@ -947,6 +1079,86 @@ mod tests {
         let sig = signer.sign(&signing_input);
         req.buyer_signature.value = B64URL.encode(sig.to_bytes());
         req
+    }
+
+    /// WOR-2673 review B1: the quote ledger is bounded.
+    ///
+    /// `POST /quote` is unauthenticated and returns from the request
+    /// path before bot detection, threat protection, auth, and the
+    /// policy chain where rate limits live, so the origin's own limits
+    /// never see it. Every accepted quote writes a row that survives
+    /// its own expiry by a 24-hour tombstone. Without a cap, one client
+    /// looping the endpoint grows the map until the process is
+    /// OOM-killed, taking every other origin on the proxy with it.
+    #[test]
+    fn the_quote_ledger_refuses_rather_than_growing_without_bound() {
+        let (mp, _, _) = build_marketplace_with_ledger_capacity(4);
+        for index in 0..4 {
+            mp.quote(quote_request())
+                .unwrap_or_else(|error| panic!("quote {index} must be issued: {error}"));
+        }
+        let error = mp
+            .quote(quote_request())
+            .expect_err("the fifth quote must be refused rather than grow the ledger");
+        assert!(
+            matches!(error, LicensingError::QuoteLedgerFull { .. }),
+            "got {error:?}"
+        );
+    }
+
+    /// The cap is a live-row cap, not a lifetime one: rows that have
+    /// aged past their tombstone are swept on the way in, so a bridge
+    /// that has been up for a month is not permanently refusing.
+    #[test]
+    fn a_swept_ledger_accepts_quotes_again() {
+        let (mp, _, _) = build_marketplace_with_ledger_capacity(2);
+        mp.quote(quote_request()).expect("first quote");
+        mp.quote(quote_request()).expect("second quote");
+        assert!(mp.quote(quote_request()).is_err(), "the cap holds");
+        // Age every row past its expiry plus the tombstone window.
+        mp.age_ledger_for_test(COMP_QUOTE_VALIDITY_SECS + QUOTE_TOMBSTONE_SECS + 1);
+        mp.quote(quote_request())
+            .expect("a swept ledger has room again");
+    }
+
+    /// WOR-2673 review M1: a redeem is single-use.
+    ///
+    /// The buyer signature covers the body with `buyer_signature.value`
+    /// cleared, so replaying costs nothing: resend the identical bytes.
+    /// Without consumption one purchase mints a fresh 24-hour license
+    /// token per call for the whole quote validity window, and the
+    /// publisher's reconciliation shows one quote for N licenses.
+    #[tokio::test]
+    async fn a_quote_redeems_once_and_the_replay_is_refused() {
+        let (mp, _, signer) = build_marketplace();
+        let quote = mp.quote(quote_request()).unwrap();
+        let redeem = build_redeem_for(&quote, &signer);
+
+        mp.redeem(redeem.clone())
+            .await
+            .expect("the first redeem mints");
+        let error = mp
+            .redeem(redeem)
+            .await
+            .expect_err("the identical body must not mint a second token");
+        assert!(
+            matches!(error, LicensingError::AlreadyRedeemed(ref id) if *id == quote.quote_id),
+            "got {error:?}"
+        );
+    }
+
+    /// Consumption happens under the same guard that reads the row, so
+    /// two concurrent redeems of one quote cannot both pass the check
+    /// and both mint.
+    #[tokio::test]
+    async fn two_concurrent_redeems_of_one_quote_mint_once() {
+        let (mp, _, signer) = build_marketplace();
+        let quote = mp.quote(quote_request()).unwrap();
+        let redeem = build_redeem_for(&quote, &signer);
+
+        let (first, second) = tokio::join!(mp.redeem(redeem.clone()), mp.redeem(redeem));
+        let minted = usize::from(first.is_ok()) + usize::from(second.is_ok());
+        assert_eq!(minted, 1, "exactly one of two concurrent redeems may mint");
     }
 
     /// WOR-2673 fail-closed: an acceptance stamped in the future.
@@ -1159,6 +1371,7 @@ mod tests {
         mp.issued_quotes.lock().unwrap().insert(
             quote.quote_id.clone(),
             IssuedQuote {
+                redeemed: false,
                 valid_until: unix_now().saturating_sub(1),
                 quote_hash: hash,
             },
@@ -1181,6 +1394,7 @@ mod tests {
         mp.issued_quotes.lock().unwrap().insert(
             first.quote_id.clone(),
             IssuedQuote {
+                redeemed: false,
                 valid_until: unix_now().saturating_sub(1),
                 quote_hash: hash,
             },

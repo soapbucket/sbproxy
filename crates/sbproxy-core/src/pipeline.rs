@@ -5940,15 +5940,6 @@ mod object_store_reserve_tests {
         assert!(admission.is_some());
     }
 
-    /// WOR-2673: the `backend` label names the provider, not the
-    /// abstraction in front of it.
-    ///
-    /// Two backends briefly shipped for object storage, so the label
-    /// had to say which code path was running and `object_store` was
-    /// the honest value. With one path left, an operator reading
-    /// `sbproxy_cache_reserve_degraded{backend="object_store"}` cannot
-    /// tell an S3 reserve from an Azure one, and the four providers
-    /// fail for entirely different reasons.
     /// WOR-2673: carried over from the retired AWS-SDK backend, whose
     /// `S3Reserve::new` refused an empty bucket, region, or key id.
     ///
@@ -6001,6 +5992,15 @@ mod object_store_reserve_tests {
         );
     }
 
+    /// WOR-2673: the `backend` label names the provider, not the
+    /// abstraction in front of it.
+    ///
+    /// Two backends briefly shipped for object storage, so the label
+    /// had to say which code path was running and `object_store` was
+    /// the honest value. With one path left, an operator reading
+    /// `sbproxy_cache_reserve_degraded{backend="object_store"}` cannot
+    /// tell an S3 reserve from an Azure one, and the four providers
+    /// fail for entirely different reasons.
     #[test]
     fn the_backend_label_names_the_provider_not_the_abstraction() {
         let dir = tempfile::TempDir::new().expect("temp dir");

@@ -173,7 +173,8 @@ no enabled `olp:` block, an empty `master_key` or `rotation_id`, an
 empty `tiers` list, a duplicate tier id, an `authorization` /
 `shape` / `pricing.model` outside its vocabulary, a `per_request` tier
 with no `amount_micros` or a `flat_rate` tier with no `amount`, a
-currency that is not three letters, an empty `buyer_keys` list, a
+currency that is not three letters, zero tiers with
+`authorization: olp` **or more than one**, an empty `buyer_keys` list, a
 duplicate kid, and a `public_key` that is not 32 base64url bytes.
 
 ## What the default refuses
@@ -194,6 +195,33 @@ shows no quote for the revenue.
 `allow_unknown_quotes: true` restores the older behavior. A deployment
 that sets it should also be running a shared revocation denylist, since
 that check is then the only durable one left.
+
+**A quote redeems once.** The buyer signature covers the request body
+with its own value cleared, so replaying costs a buyer nothing: resend
+the identical bytes. Without consumption one purchase would mint a fresh
+license token, with a fresh TTL, per call for the whole hour the quote
+is valid, and the publisher's reconciliation would show one quote for N
+licenses. The row is marked under the same lock that reads it, before
+any minting, so two concurrent redeems of one quote mint once. A second
+redeem is `403 {"error":"already_redeemed"}`.
+
+Consuming before the mint means a quote is spent even if the signing
+that follows fails. That is the fail-closed direction; the alternative
+leaves a window in which a buyer who can make minting fail keeps
+redeeming. Note also that `allow_unknown_quotes: true` gives this up
+along with everything else: with no ledger row there is nothing to mark.
+
+**The quote ledger is bounded.** `POST /quote` is unauthenticated, and
+on the proxy it answers and returns before bot detection, threat
+protection, authentication, and the policy chain where an origin's own
+rate limits live. So those limits never see it, and the ledger is the
+only thing between one looping client and an out-of-memory kill that
+takes every other origin on the process with it. Past 50,000 live rows a
+quote request is refused with `429 {"error":"quote_ledger_full"}`,
+counted under the same `rejected` label as every other refusal.
+Refusing rather than evicting the oldest row is deliberate: eviction
+would let a flood push a paying buyer's quote out of the ledger, turning
+a denial of service into a denial of purchase.
 
 Two more refusals bound the request in time, both on the buyer's own
 `accepted_at`:
@@ -260,10 +288,15 @@ the standalone router call, so the counters move on either surface.
 | `sbproxy_comp_marketplace_manifest_serves_total` | counter | `outcome` (`ok`, `error`) | Every `GET /.well-known/iab-comp/manifest.json` the handler answered. |
 | `sbproxy_comp_marketplace_quote_requests_total` | counter | `outcome` (`ok`, `rejected`) | Every `POST /.well-known/iab-comp/quote` call. |
 | `sbproxy_comp_marketplace_redeem_requests_total` | counter | `outcome` (`ok`, `rejected`) | Every `POST /.well-known/iab-comp/redeem` call. |
+| `sbproxy_olp_decisions_total` | counter | `endpoint` (`token`, `key`, `introspect`, `revoke`), `outcome` (`ok`, `rejected`, `error`) | The OLP issuer this bridge mints through. Written by the proxy request path for an origin with an `olp:` block. |
+
+`rejected` on the two POST families includes the oversize-body refusal:
+a client looping 100 KiB bodies moves the same counter as one sending
+malformed JSON, rather than being indistinguishable from no traffic.
 
 [dashboards/grafana/sbproxy-comp-marketplace.json](../dashboards/grafana/sbproxy-comp-marketplace.json)
-draws all three plus a redeem rejection-rate stat; see
-[dashboards/README.md](../dashboards/README.md).
+draws all four plus a redeem rejection-rate stat and an OLP token
+rejection-rate stat; see [dashboards/README.md](../dashboards/README.md).
 
 ## Structured logging (decision events)
 
@@ -274,6 +307,12 @@ Every quote and redeem call emits a structured `tracing::info!` event
 resulting `quote_id` / `license` / `agent_id` on success or a `reason`
 string (the `LicensingError`'s `Display` output) on rejection. Grep for
 the `event` field rather than parsing prose.
+
+The OLP issuer emits its own `olp_decision` event (module target
+`sbproxy_core::olp`) on every issuance, JWK serve, introspection, and
+revocation, with `endpoint` and `outcome` matching the counter's labels.
+Issuance carries the `sub` it bound the token to, the license URN, and
+the signing kid, and never the token.
 
 No license token appears in any of them, and none can be added by
 accident: `CompRedeemResponse`'s `Debug` prints `[REDACTED]` in place
@@ -330,11 +369,15 @@ Unauthenticated by design there, matching the manifest route itself.
   in
   [`comp/marketplace.rs`](../crates/sbproxy-licensing/src/comp/marketplace.rs)
   emit. Moving to JCS is a wire break and is separate scope.
-- **Redeem always picks the first OLP-authorized tier.** `quote_id`
-  does not yet carry a durable pointer back to the exact tier it was
-  quoted against; a manifest with more than one `Olp`-authorized tier
-  redeems against whichever comes first in `CompManifest::tiers`.
-  Fixing this needs a quote-to-tier store, tracked as separate scope.
+- **A catalog carries exactly one redeemable tier.** `quote_id` does
+  not carry a durable pointer back to the tier it was quoted against, so
+  a manifest with two `authorization: olp` tiers would mint whichever
+  the manifest lists first for a buyer who quoted the other. Rather than
+  disclose that and let an operator configure their way into it, config
+  load refuses a second one and names both tiers. Advertise the others
+  as `authorization: cap` or `public`, which are not redeemable and are
+  not ambiguous, or split them across origins. Lifting the restriction
+  needs a quote-to-tier store, tracked as separate scope.
 - **Payment-proof verification is shape-only.** `redeem` checks that
   a proof's required fields are non-empty for its declared rail
   (`x402`, `mpp`, `stripe`); it does not call an x402 facilitator,

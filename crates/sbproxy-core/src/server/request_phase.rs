@@ -2888,14 +2888,24 @@ pub(super) async fn request_filter(
                             return Ok(true);
                         }
                         let is_revoke = req_path == introspect_cfg.revoke_path;
-                        return handle_olp_introspect_or_revoke(
+                        let endpoint = if is_revoke { "revoke" } else { "introspect" };
+                        let outcome = handle_olp_introspect_or_revoke(
                             session,
                             cfg,
                             introspect_cfg,
                             is_revoke,
                         )
-                        .await
-                        .map(|_| true);
+                        .await?;
+                        sbproxy_observe::metrics::record_olp_decision(endpoint, outcome);
+                        info!(
+                            target: "sbproxy_core::olp",
+                            event = "olp_decision",
+                            endpoint = %endpoint,
+                            outcome = %outcome,
+                            kid = %cfg.key_id,
+                            "olp.introspect_or_revoke"
+                        );
+                        return Ok(true);
                     }
                 }
             }
@@ -2908,6 +2918,22 @@ pub(super) async fn request_filter(
                         }
                         match build_olp_jwk_set(cfg) {
                             Ok(body) => {
+                                // WOR-2673 review M5. The OLP endpoints
+                                // mint and publish the keys for bearer
+                                // license tokens; before this they had
+                                // no counter and no decision event,
+                                // while the CoMP bridge on the same
+                                // proxy emitted both for the identical
+                                // token shape.
+                                sbproxy_observe::metrics::record_olp_decision("key", "ok");
+                                info!(
+                                    target: "sbproxy_core::olp",
+                                    event = "olp_decision",
+                                    endpoint = "key",
+                                    outcome = "ok",
+                                    kid = %cfg.key_id,
+                                    "olp.key.served"
+                                );
                                 send_response(
                                     session,
                                     200,
@@ -2918,6 +2944,15 @@ pub(super) async fn request_filter(
                             }
                             Err(e) => {
                                 warn!(error = %e, "olp: failed to build JWK set");
+                                sbproxy_observe::metrics::record_olp_decision("key", "error");
+                                info!(
+                                    target: "sbproxy_core::olp",
+                                    event = "olp_decision",
+                                    endpoint = "key",
+                                    outcome = "error",
+                                    reason = "jwk_set_unavailable",
+                                    "olp.key.failed"
+                                );
                                 send_error(session, 500, "olp key unavailable").await?;
                             }
                         }
@@ -2968,6 +3003,22 @@ pub(super) async fn request_filter(
                         match parse_olp_token_form(form_body) {
                             Ok(req) => req.client_id,
                             Err(err) => {
+                                // The failure mode this counter exists
+                                // for: a crawler with a misconfigured
+                                // `client_id` 400s here on every token
+                                // request, and `debug!` detail is
+                                // compiled out of release builds, so
+                                // the operator's first signal used to
+                                // be a support ticket.
+                                sbproxy_observe::metrics::record_olp_decision("token", "rejected");
+                                info!(
+                                    target: "sbproxy_core::olp",
+                                    event = "olp_decision",
+                                    endpoint = "token",
+                                    outcome = "rejected",
+                                    reason = %err.code,
+                                    "olp.token.rejected"
+                                );
                                 // RFC 6749 §5.2 error response shape.
                                 let body = serde_json::json!({
                                     "error": err.code,
@@ -2998,11 +3049,37 @@ pub(super) async fn request_filter(
                             });
                     match issue_olp_token(cfg, hostname, &license_urn, &sub) {
                         Ok(body) => {
+                            sbproxy_observe::metrics::record_olp_decision("token", "ok");
+                            // No token in the line. It is a bearer
+                            // credential, and the same rule the CoMP
+                            // redeem decision follows applies here:
+                            // `sub`, the license URN, and the kid are
+                            // what an operator reconciles against, and
+                            // none of them authorizes anything.
+                            info!(
+                                target: "sbproxy_core::olp",
+                                event = "olp_decision",
+                                endpoint = "token",
+                                outcome = "ok",
+                                sub = %sbproxy_security::log_safe::log_safe(&sub),
+                                license = %license_urn,
+                                kid = %cfg.key_id,
+                                "olp.token.issued"
+                            );
                             send_response(session, 200, "application/json", body.as_bytes())
                                 .await?;
                         }
                         Err(e) => {
                             warn!(error = %e, "olp: failed to issue token");
+                            sbproxy_observe::metrics::record_olp_decision("token", "error");
+                            info!(
+                                target: "sbproxy_core::olp",
+                                event = "olp_decision",
+                                endpoint = "token",
+                                outcome = "error",
+                                reason = "issuance_failed",
+                                "olp.token.failed"
+                            );
                             send_error(session, 500, "olp issuance failed").await?;
                         }
                     }
@@ -3088,14 +3165,30 @@ pub(super) async fn request_filter(
                         buffer.extend_from_slice(&chunk);
                     }
                     if oversize {
-                        send_response(
+                        // The crate's own refusal body, so the counter
+                        // and the decision event come from the same
+                        // place every other CoMP refusal writes them
+                        // (WOR-2673 review M2). Hand-rolling this
+                        // response is what made an oversize flood look
+                        // like no traffic at all.
+                        let endpoint = if req_path == crate::pipeline::COMP_QUOTE_PATH {
+                            sbproxy_licensing::comp::CompEndpoint::Quote
+                        } else {
+                            sbproxy_licensing::comp::CompEndpoint::Redeem
+                        };
+                        let refused = sbproxy_licensing::comp::oversize(endpoint);
+                        send_response_with_headers(
                             session,
-                            413,
-                            "application/json",
-                            br#"{"error":"body_too_large"}"#,
+                            refused.status,
+                            refused.content_type,
+                            &refused.body,
+                            &[(
+                                "cache-control".to_string(),
+                                refused.cache_control.to_string(),
+                            )],
                         )
                         .await?;
-                        ctx.response_status = Some(413);
+                        ctx.response_status = Some(refused.status);
                         return Ok(true);
                     }
                     if req_path == crate::pipeline::COMP_QUOTE_PATH {
@@ -6019,12 +6112,20 @@ pub(super) fn client_cert_x5t_s256(
 /// parsing are shared; the `is_revoke` flag flips the terminal
 /// behaviour. Returns Ok on every wire-shaped outcome; the caller
 /// has already returned `true` to the pipeline.
+/// Returns the bounded outcome label for this request, so the single
+/// call site writes the counter and the decision event once (WOR-2673
+/// review M5).
+///
+/// Returning the label rather than recording it at each of the ten
+/// exits is what keeps the counter as wide as the handler: a new exit
+/// added later has to name an outcome to compile, where a scattered set
+/// of `record_*` calls would simply be missing one.
 async fn handle_olp_introspect_or_revoke(
     session: &mut pingora_proxy::Session,
     olp: &sbproxy_config::OlpConfig,
     introspect_cfg: &sbproxy_config::OlpIntrospectConfig,
     is_revoke: bool,
-) -> Result<()> {
+) -> Result<&'static str> {
     // --- read body ---
     let mut body_buf: Vec<u8> = Vec::new();
     while let Some(chunk) = session.read_request_body().await? {
@@ -6058,7 +6159,7 @@ async fn handle_olp_introspect_or_revoke(
             })
             .to_string();
             send_response(session, 400, "application/json", body.as_bytes()).await?;
-            return Ok(());
+            return Ok("rejected");
         }
     };
 
@@ -6083,7 +6184,7 @@ async fn handle_olp_introspect_or_revoke(
                 &headers,
             )
             .await?;
-            return Ok(());
+            return Ok("rejected");
         }
     }
 
@@ -6093,7 +6194,7 @@ async fn handle_olp_introspect_or_revoke(
         Err(e) => {
             warn!(error = %e, "olp introspect: signing key invalid");
             send_error(session, 500, "olp key invalid").await?;
-            return Ok(());
+            return Ok("error");
         }
     };
     let signer = sbproxy_modules::olp::OlpTokenSigner::from_seed_bytes(seed, &olp.key_id);
@@ -6105,7 +6206,7 @@ async fn handle_olp_introspect_or_revoke(
             warn!("olp introspect: revocation store unavailable");
             let body = br#"{"error":"temporarily_unavailable"}"#;
             send_response(session, 503, "application/json", body).await?;
-            return Ok(());
+            return Ok("error");
         }
     };
     use sbproxy_modules::olp::RevocationStore as _;
@@ -6124,8 +6225,11 @@ async fn handle_olp_introspect_or_revoke(
             // RFC 7009 §2.2: invalid tokens get a 200 anyway (so a
             // caller cannot enumerate which tokens were valid).
             Err(_) => {
+                // Counted `ok`: RFC 7009 s2.2 makes this the correct
+                // answer for an unverifiable token, so it is not a
+                // refusal an operator should be alerted on.
                 send_response(session, 200, "application/json", b"{}").await?;
-                return Ok(());
+                return Ok("ok");
             }
         };
         let now = std::time::SystemTime::now()
@@ -6142,10 +6246,10 @@ async fn handle_olp_introspect_or_revoke(
                 br#"{"error":"temporarily_unavailable"}"#,
             )
             .await?;
-            return Ok(());
+            return Ok("error");
         }
         send_response(session, 200, "application/json", b"{}").await?;
-        return Ok(());
+        return Ok("ok");
     }
 
     // --- /introspect branch ---
@@ -6173,7 +6277,7 @@ async fn handle_olp_introspect_or_revoke(
                 br#"{"error":"temporarily_unavailable"}"#,
             )
             .await?;
-            return Ok(());
+            return Ok("error");
         }
     };
     // WOR-808 PR10: rate-limit `active:false` responses per source
@@ -6193,13 +6297,13 @@ async fn handle_olp_introspect_or_revoke(
                     br#"{"error":"too_many_requests","error_description":"introspect inactive-response rate limit"}"#,
                 )
                 .await?;
-                return Ok(());
+                return Ok("rejected");
             }
         }
     }
     let body = serde_json::to_vec(&response).unwrap_or_else(|_| br#"{"active":false}"#.to_vec());
     send_response(session, 200, "application/json", &body).await?;
-    Ok(())
+    Ok("ok")
 }
 
 /// Result of the caller-authentication check on the introspect /

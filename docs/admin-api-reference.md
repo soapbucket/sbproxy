@@ -3357,9 +3357,11 @@ console epic; the JSON here is the operator surface today. See
 
 ### `GET /admin/licensing`
 
-CoMP marketplace bridges. Returns `{"enabled": false, "origins": []}`
-when no origin sets `comp`, so a poll can tell "off" from a typo in the
-path. Both `admin` and `read_only` operators may call it.
+Content licensing: the CoMP marketplace bridge and the RSL Open
+Licensing Protocol issuer, per origin. Returns
+`{"enabled": false, "origins": []}` when no origin sets `comp` or `olp`,
+so a poll can tell "off" from a typo in the path. Both `admin` and
+`read_only` operators may call it.
 
 ```json
 {
@@ -3367,6 +3369,20 @@ path. Both `admin` and `read_only` operators may call it.
   "origins": [
     {
       "hostname": "api.example.com",
+      "olp": {
+        "enabled": true,
+        "signing_kid": "2026-q3",
+        "issuer": "https://api.example.com",
+        "default_scope": "ai-input",
+        "default_ttl_secs": 86400,
+        "content_key_configured": false,
+        "introspect": {
+          "enabled": true,
+          "introspect_path": "/.well-known/olp/introspect",
+          "revoke_path": "/.well-known/olp/revoke",
+          "revocation_store": "redis"
+        }
+      },
       "publisher_domain": "api.example.com",
       "publisher_name": "Example Publishing Co.",
       "tier_count": 3,
@@ -3385,8 +3401,21 @@ path. Both `admin` and `read_only` operators may call it.
 }
 ```
 
-Two fields are worth polling. `active_signing_kid` is `null` until a
-rotation has been activated, and every quote request fails closed until
+The `olp` object is the issuer half. It answers the questions an
+operator otherwise had to mint a token and decode it to ask: which kid
+is signing, what issuer the tokens claim, how long they live, and
+whether the RFC 7662 / RFC 7009 pair is mounted at all. An origin with
+an OLP issuer and no CoMP bridge appears with `"comp": {"enabled":
+false}`; an origin with neither is not listed.
+
+`revocation_store` is the variant name only (`memory`, `redb`, or
+`redis`), never the redb path or the Redis URL, which routinely carries
+a password in its userinfo. It is the field to check when a revocation
+did not take on the replica you are looking at: `memory` is per-process
+and lost on restart.
+
+Two more fields are worth polling. `active_signing_kid` is `null` until
+a rotation has been activated, and every quote request fails closed until
 it is, so a null here explains an endpoint answering nothing but
 rejections. `olp_tier_count` is how many of `tier_count` a buyer can
 actually redeem for a license token: the difference is the `cap` and
@@ -3398,6 +3427,13 @@ once you know eleven of them were never redeemable.
 the manifest, so they move on a config reload and not otherwise. No key
 material appears here, and no token this bridge has minted is retained
 anywhere this route can read.
+
+The traffic counterpart is `sbproxy_olp_decisions_total` (by `endpoint`
+and `outcome`) and the three `sbproxy_comp_marketplace_*` families, all
+drawn by `dashboards/grafana/sbproxy-comp-marketplace.json`. Every
+issuance, introspection, and revocation also emits an `olp_decision`
+structured event, and every quote and redeem a `comp_quote_decision` or
+`comp_redeem_decision` one. No bearer token appears in any of them.
 
 Behind operator auth for the same reason
 [`GET /admin/federation`](#get-adminfederation) is: sbproxy serves the

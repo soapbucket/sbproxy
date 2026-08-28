@@ -2223,6 +2223,17 @@ pub const METRICS: &[MetricCapability] = &[
         ),
     },
     MetricCapability {
+        name: "sbproxy_olp_decisions_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_olp_decision"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Proxy,
+        labels: &["endpoint", "outcome"],
+        description: "RSL Open Licensing Protocol endpoint outcomes by endpoint (`token`, `key`, `introspect`, `revoke`) and outcome (`ok`, `rejected`, `error`). Written by the proxy request path for an origin with an `olp:` block; empty on a deployment that configures none.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_comp_marketplace_manifest_serves_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("MANIFEST_SERVES_TOTAL"),
@@ -2230,7 +2241,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["outcome"],
-        description: "IAB CoMP marketplace manifest serves, by outcome. Written by the `sbproxy-licensing` router; empty on a deployment that does not mount it.",
+        description: "IAB CoMP marketplace manifest serves, by outcome. Written by `sbproxy_licensing::comp::serve`, which the proxy request path calls for an origin with a `comp:` block and the crate's own axum router calls for a standalone host; empty on a deployment with neither.",
         dead_reason: None,
     },
     MetricCapability {
@@ -2241,7 +2252,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["outcome"],
-        description: "IAB CoMP marketplace quote outcomes. Written by the `sbproxy-licensing` router; empty on a deployment that does not mount it.",
+        description: "IAB CoMP marketplace quote outcomes, including the oversize-body refusal. Written by `sbproxy_licensing::comp::serve`, which the proxy request path calls for an origin with a `comp:` block and the crate's own axum router calls for a standalone host; empty on a deployment with neither.",
         dead_reason: None,
     },
     MetricCapability {
@@ -2252,7 +2263,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["outcome"],
-        description: "IAB CoMP marketplace redeem outcomes. Written by the `sbproxy-licensing` router; empty on a deployment that does not mount it.",
+        description: "IAB CoMP marketplace redeem outcomes, including the oversize-body refusal. Written by `sbproxy_licensing::comp::serve`, which the proxy request path calls for an origin with a `comp:` block and the crate's own axum router calls for a standalone host; empty on a deployment with neither.",
         dead_reason: None,
     },
     MetricCapability {

@@ -1319,14 +1319,36 @@ fn validate_comp_marketplace(
             );
         }
     }
-    // `redeem` only mints for OLP-authorized tiers. A catalog of `cap`
-    // and `public` tiers behind a bridge whose whole job is minting is
-    // an endpoint that refuses every request it is given.
-    if !comp.tiers.iter().any(|tier| tier.authorization == "olp") {
-        anyhow::bail!(
+    // `redeem` only mints for OLP-authorized tiers, and it mints for
+    // exactly one. Nothing in a redeem request names a tier: the buyer
+    // sends a `quote_id`, and this bridge keeps no durable
+    // quote-to-tier mapping. So zero redeemable tiers is an endpoint
+    // that refuses everything, and two is an endpoint that hands a
+    // buyer whichever one the manifest lists first.
+    //
+    // The second half is the same hazard as the duplicate-tier-id
+    // refusal above, and it is refused here for the same reason: a
+    // documented limit an operator can configure their way into is an
+    // invariant held by prose (WOR-2673 review B2).
+    let olp_tiers: Vec<&str> = comp
+        .tiers
+        .iter()
+        .filter(|tier| tier.authorization == "olp")
+        .map(|tier| tier.id.as_str())
+        .collect();
+    match olp_tiers.as_slice() {
+        [] => anyhow::bail!(
             "config compile: comp.tiers has no tier with authorization: olp, and redeem can \
              only mint a license token for an OLP tier"
-        );
+        ),
+        [_one] => {}
+        [first, second, ..] => anyhow::bail!(
+            "config compile: comp.tiers carries more than one tier with authorization: olp \
+             ('{first}' and '{second}'). A redeem request names a quote_id and no tier, and \
+             this bridge keeps no quote-to-tier store, so it would mint '{first}' for a buyer \
+             who quoted '{second}'. Advertise the others as authorization: cap or public, or \
+             split them across origins"
+        ),
     }
     if comp.buyer_keys.is_empty() {
         anyhow::bail!(

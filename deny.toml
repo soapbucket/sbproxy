@@ -49,29 +49,27 @@ ignore = [
   # Cargo.lock; CI will then enforce automatically.
 
   # --- AWS SDK: transitive rustls 0.21 -> rustls-webpki 0.101.7 ---
-  # Historical. `rustls-webpki 0.101.7` is no longer in the lockfile at all
-  # (one copy remains, the patched 0.103.13), so nothing below matches any
-  # more. Kept as the record of why the entries existed and when they went.
-  # The three advisories below flagged the unpatched `rustls-webpki 0.101.7`,
-  # which the `aws-smithy-http-client 1.1.13` HTTP client pinned through
-  # `rustls 0.21`.
-  # The upstream AWS SDK has not yet bumped the smithy http client to the
-  # rustls 0.23 line. None of the three advisories applies to the
+  # Historical, kept as the record of what was ignored here and why it
+  # stopped being needed. No entries remain.
+  #
+  # Three advisories (RUSTSEC-2026-0098, -0099, -0104) flagged the unpatched
+  # `rustls-webpki 0.101.7`, which `aws-smithy-http-client 1.1.13` pinned
+  # through `rustls 0.21`. None of the three applied to the
   # `aws-sdk-secretsmanager` / `aws-sdk-sts` use case: we connect to
   # AWS-issued certificates over standard TLS chains and do not parse CA
   # certs with name constraints, do not consume Certificate Revocation
   # Lists, and do not verify wildcard DNS-name SANs against permitted
-  # subtree constraints. Resolves when the AWS SDK bumps smithy-http-client
-  # to a rustls 0.23 base; CI re-gates automatically once Cargo.lock updates.
+  # subtree constraints. `sbproxy-mesh` peer-mTLS also uses rustls-webpki
+  # but pinned the patched 0.103.13 throughout, so that path was never
+  # affected.
   #
-  # sbproxy-mesh peer-mTLS (peer_auth.rs) also uses rustls-webpki, but pins the
-  # patched 0.103.13 (ISC-licensed), which is not vulnerable to any of these
-  # three advisories, so the mesh path is clean regardless of these ignores.
-  #
-  # The three rustls-webpki advisories this block described (RUSTSEC-2026-0098,
-  # -0099, -0104) are gone: cargo-deny reports "no crate matched advisory
-  # criteria" for all three, so the AWS SDK has since moved to a patched base
-  # exactly as the note above predicted. Entries removed 2026-08-07.
+  # Removed 2026-08-07, when cargo-deny began reporting "no crate matched
+  # advisory criteria" for all three: the AWS SDK had moved to a patched
+  # base, exactly as the note predicted. WOR-2673 then dropped the last
+  # consumer of the legacy stack (`sbproxy-cache`'s AWS-SDK reserve
+  # backend), so the lockfile now carries one `rustls-webpki` (0.103.13),
+  # one `h2` (0.4.16), and one `hyper` (1.9.0). Nothing here can match
+  # again without that stack coming back.
 
   # --- WOR-616: unmaintained transitive crates -----------------------------
   # The following six advisories are all `unmaintained`-class warnings (not

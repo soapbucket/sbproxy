@@ -36,6 +36,11 @@ const BUYER_SEED: [u8; 32] = [0x5Au8; 32];
 /// origin's OLP surface.
 const OLP_SEED_HEX: &str = "1122334455667788990011223344556677889900112233445566778899001122";
 
+/// Admin credential for the fixture's loopback admin listener. The
+/// route under test is behind operator auth, so the test has to
+/// present one, which is also what proves the gate is in front of it.
+const ADMIN_PASSWORD: &str = "process-test-admin-password";
+
 /// The CoMP quote-signing master key. Any value of 32 bytes or more;
 /// HKDF expands it per rotation label.
 const COMP_MASTER_KEY: &str = "comp-master-key-for-the-process-test-0123456789";
@@ -73,6 +78,37 @@ fn request(port: u16, method: &str, path: &str, body: Option<&[u8]>) -> Option<V
     if let Some(body) = body {
         stream.write_all(body).ok()?;
     }
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).ok()?;
+    Some(response)
+}
+
+/// One HTTP/1.1 GET carrying HTTP Basic credentials.
+fn admin_get(port: u16, path: &str) -> Option<Vec<u8>> {
+    let credential =
+        base64::engine::general_purpose::STANDARD.encode(format!("admin:{ADMIN_PASSWORD}"));
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Basic {credential}\r\n\
+         Connection: close\r\n\r\n"
+    )
+    .ok()?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).ok()?;
+    Some(response)
+}
+
+/// The same request with no credential, to prove the gate is real.
+fn admin_get_unauthenticated(port: u16, path: &str) -> Option<Vec<u8>> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+    )
+    .ok()?;
     let mut response = Vec::new();
     stream.read_to_end(&mut response).ok()?;
     Some(response)
@@ -204,6 +240,9 @@ fn security_boundary_a_configured_origin_sells_licenses_and_refuses_the_rest() {
     let reserved = TcpListener::bind("127.0.0.1:0").expect("reserve ephemeral port");
     let port = reserved.local_addr().expect("reserved address").port();
     drop(reserved);
+    let reserved = TcpListener::bind("127.0.0.1:0").expect("reserve ephemeral admin port");
+    let admin_port = reserved.local_addr().expect("reserved address").port();
+    drop(reserved);
     let config = root.join("sb.yml");
     std::fs::write(
         &config,
@@ -211,6 +250,12 @@ fn security_boundary_a_configured_origin_sells_licenses_and_refuses_the_rest() {
             r#"proxy:
   http_bind_port: {port}
   bind_address: 127.0.0.1
+  admin:
+    enabled: true
+    bind: 127.0.0.1
+    port: {admin_port}
+    username: admin
+    password: {ADMIN_PASSWORD}
 origins:
   "marketplace.test":
     action:
@@ -414,6 +459,45 @@ origins:
     let (head, _) =
         split(&request(port, "GET", "/.well-known/iab-comp/redeem", None).expect("resp"));
     assert!(head.starts_with("HTTP/1.1 405"), "{head}");
+
+    // --- 8. The operator surface, on a process that has a bridge ---
+    //
+    // WOR-2673 review M4 and m8. The example documents this curl, and
+    // only the empty branch of the route had a test: an
+    // `enabled: false` answer would have satisfied both. This is the
+    // populated branch, over the wire, on a running proxy, behind the
+    // auth gate the route is documented to sit behind.
+    let (head, body) =
+        split(&admin_get(admin_port, "/admin/licensing").expect("admin licensing response"));
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}\n{body}");
+    let admin: serde_json::Value = serde_json::from_str(&body).expect("admin body is JSON");
+    assert_eq!(admin["enabled"], true, "{body}");
+    let origin = &admin["origins"][0];
+    assert_eq!(origin["hostname"], "marketplace.test", "{body}");
+    assert_eq!(origin["publisher_name"], "Example Publishing Co.", "{body}");
+    assert_eq!(origin["tier_count"], 1, "{body}");
+    assert_eq!(origin["olp_tier_count"], 1, "{body}");
+    // Not `null`: a null here means no rotation was activated and every
+    // quote request fails closed, which is the field's whole job.
+    assert_eq!(origin["active_signing_kid"], "comp-2026-q3-001", "{body}");
+    assert_eq!(origin["trusted_kid_count"], 1, "{body}");
+    assert_eq!(origin["manifest_hash"], hash, "{body}");
+    assert_eq!(
+        origin["endpoints"]["redeem"], "https://marketplace.test/.well-known/iab-comp/redeem",
+        "{body}"
+    );
+    // No secret and no minted token reaches the operator surface.
+    assert!(!body.contains(COMP_MASTER_KEY), "{body}");
+    assert!(!body.contains(OLP_SEED_HEX), "{body}");
+    assert!(!body.contains(token), "{body}");
+
+    // The gate itself: the same route with no credential.
+    let (head, _) =
+        split(&admin_get_unauthenticated(admin_port, "/admin/licensing").expect("unauthenticated"));
+    assert!(
+        head.starts_with("HTTP/1.1 401"),
+        "the licensing route must sit behind operator auth: {head}"
+    );
 
     let _ = child.kill();
     let _ = child.wait();

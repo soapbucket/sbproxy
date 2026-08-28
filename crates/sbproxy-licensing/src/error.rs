@@ -32,7 +32,7 @@ pub enum LicensingError {
     UnsupportedAlg(String),
 
     /// A message declared a protocol version, or a JWS `typ`, this
-    /// crate does not recognise.
+    /// crate does not recognize.
     #[error("unsupported type: {0}")]
     UnsupportedType(String),
 
@@ -49,6 +49,29 @@ pub enum LicensingError {
     /// 404 into a 500.
     #[error("unknown tier_id: {0}")]
     UnknownTier(String),
+
+    /// A quote was requested while the issued-quote ledger was full.
+    ///
+    /// The ledger is bounded because `POST /quote` is unauthenticated
+    /// and, on the proxy, returns before the policy chain where rate
+    /// limits live: an unbounded map there is an OOM one client can
+    /// drive. Its own variant rather than [`Self::Encode`] so the HTTP
+    /// layer can answer 429 and an operator can tell "we are being
+    /// flooded" from "something broke".
+    #[error("quote ledger is full (capacity {capacity})")]
+    QuoteLedgerFull {
+        /// Row cap the ledger was configured with.
+        capacity: usize,
+    },
+
+    /// A redeem named a `quote_id` that was already redeemed.
+    ///
+    /// A quote is single-use. The buyer signature covers the request
+    /// body with its own value cleared, so replaying costs a buyer
+    /// nothing; without this the same purchase mints a fresh license
+    /// token per call for the whole quote validity window.
+    #[error("quote already redeemed: {0}")]
+    AlreadyRedeemed(String),
 
     /// A redeem named a `quote_id` this process never issued.
     ///

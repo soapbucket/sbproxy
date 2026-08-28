@@ -19,7 +19,7 @@
 //! `examples/standalone_marketplace.rs`.
 
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -33,8 +33,20 @@ use super::serve::{self, CompResponse};
 pub fn comp_router(marketplace: Arc<CompMarketplace>) -> Router {
     Router::new()
         .route("/.well-known/iab-comp/manifest.json", get(manifest))
-        .route("/.well-known/iab-comp/quote", post(quote))
-        .route("/.well-known/iab-comp/redeem", post(redeem))
+        // `DefaultBodyLimit` refuses past the cap inside axum's own
+        // extractor, before the bytes are buffered (WOR-2673 review
+        // m3). Checking `body.len()` in the handler, which is what this
+        // did, only runs after axum has already collected the whole
+        // body into memory, so the cap bounded what the handler saw and
+        // not what the process allocated.
+        .route(
+            "/.well-known/iab-comp/quote",
+            post(quote).layer(DefaultBodyLimit::max(COMP_REQUEST_BODY_LIMIT)),
+        )
+        .route(
+            "/.well-known/iab-comp/redeem",
+            post(redeem).layer(DefaultBodyLimit::max(COMP_REQUEST_BODY_LIMIT)),
+        )
         .with_state(marketplace)
 }
 
@@ -54,15 +66,18 @@ async fn manifest(State(marketplace): State<Arc<CompMarketplace>>) -> Response {
 }
 
 async fn quote(State(marketplace): State<Arc<CompMarketplace>>, body: Bytes) -> Response {
+    // Belt as well as braces. `DefaultBodyLimit` above is what bounds
+    // the allocation; this catches a caller that mounted these handlers
+    // without the layer.
     if body.len() > COMP_REQUEST_BODY_LIMIT {
-        return oversize();
+        return into_response(serve::oversize(serve::CompEndpoint::Quote));
     }
     into_response(serve::serve_quote(&marketplace, &body))
 }
 
 async fn redeem(State(marketplace): State<Arc<CompMarketplace>>, body: Bytes) -> Response {
     if body.len() > COMP_REQUEST_BODY_LIMIT {
-        return oversize();
+        return into_response(serve::oversize(serve::CompEndpoint::Redeem));
     }
     into_response(serve::serve_redeem(&marketplace, &body).await)
 }
@@ -86,15 +101,4 @@ fn into_response(rendered: CompResponse) -> Response {
         headers.insert("x-comp-version", HeaderValue::from_static(version));
     }
     response
-}
-
-/// The refusal for a body past [`COMP_REQUEST_BODY_LIMIT`].
-fn oversize() -> Response {
-    into_response(CompResponse {
-        status: 413,
-        content_type: "application/json",
-        cache_control: super::types::COMP_NO_STORE_CACHE_CONTROL,
-        comp_version: None,
-        body: br#"{"error":"body_too_large"}"#.to_vec(),
-    })
 }

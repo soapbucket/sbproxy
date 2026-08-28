@@ -159,7 +159,7 @@ pub struct CompPricing {
     pub amount_micros: Option<u64>,
 }
 
-/// Per-tier rate ceiling for CAP-authorised tiers.
+/// Per-tier rate ceiling for CAP-authorized tiers.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CompRateCaps {
     /// Maximum requests per second.
@@ -227,7 +227,7 @@ pub struct CompQuoteRequest {
 pub struct CompBuyer {
     /// Stable agent identifier.
     pub agent_id: String,
-    /// Buyer organisation name.
+    /// Buyer organization name.
     pub organization: String,
 }
 
@@ -454,7 +454,7 @@ mod tests {
         let s = serde_json::to_string(&manifest).unwrap();
         let back: CompManifest = serde_json::from_str(&s).unwrap();
         assert_eq!(manifest, back);
-        // Authorization serialises lowercase per the spec.
+        // Authorization serializes lowercase per the spec.
         assert!(s.contains("\"authorization\":\"cap\""));
         // Pricing model is snake_case (here `free`).
         assert!(s.contains("\"model\":\"free\""));

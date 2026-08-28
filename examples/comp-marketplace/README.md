@@ -146,8 +146,12 @@ carries a token.
 ### 5. The operator view
 
 ```bash
-curl -s http://127.0.0.1:9090/admin/licensing | jq
+curl -s -u admin:"${SB_ADMIN_PASSWORD:-demo-change-me}" \
+  http://127.0.0.1:9090/admin/licensing | jq
 ```
+
+The listener is the `proxy.admin` block in `sb.yml`, bound to loopback
+with a demo password. Change both before any other bind.
 
 `active_signing_kid` is the one worth watching: `null` means no
 rotation has been activated and every quote request fails closed until

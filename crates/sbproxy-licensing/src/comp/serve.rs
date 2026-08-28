@@ -88,6 +88,56 @@ pub(crate) fn log_safe(value: &str) -> String {
     out
 }
 
+/// Which POST endpoint a refusal belongs to.
+///
+/// Exists so [`oversize`] moves the right counter and writes the right
+/// decision event without either transport passing a string that could
+/// drift from the label vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompEndpoint {
+    /// `POST /.well-known/iab-comp/quote`.
+    Quote,
+    /// `POST /.well-known/iab-comp/redeem`.
+    Redeem,
+}
+
+/// The refusal for a request body past a transport's size cap.
+///
+/// Lives here rather than in each transport (WOR-2673 review M2). Both
+/// of them hand-rolled this response, and neither wrote the counter or
+/// the decision event that every other refusal in this feature writes,
+/// so a client looping oversize bodies was indistinguishable from no
+/// traffic at all: the panel flat, the family still, nothing in the
+/// SIEM feed. That is the exact drift the module doc above says one
+/// shared body exists to prevent, and the 413 was the one response that
+/// escaped it in both directions.
+pub fn oversize(endpoint: CompEndpoint) -> CompResponse {
+    // No caller-supplied field is available or wanted here: the body
+    // was refused before parsing, so there is no `tier_id` or
+    // `quote_id` to log, and the size itself is the whole finding.
+    match endpoint {
+        CompEndpoint::Quote => {
+            tracing::info!(
+                event = "comp_quote_decision",
+                outcome = "rejected",
+                reason = "body_too_large",
+                "comp.quote.rejected"
+            );
+            metrics::record_quote("rejected");
+        }
+        CompEndpoint::Redeem => {
+            tracing::info!(
+                event = "comp_redeem_decision",
+                outcome = "rejected",
+                reason = "body_too_large",
+                "comp.redeem.rejected"
+            );
+            metrics::record_redeem("rejected");
+        }
+    }
+    CompResponse::error(413, "body_too_large")
+}
+
 /// `GET /.well-known/iab-comp/manifest.json`.
 pub fn serve_manifest(marketplace: &CompMarketplace) -> CompResponse {
     match serde_json::to_vec(&*marketplace.manifest()) {
@@ -241,6 +291,11 @@ fn map_error(error: LicensingError) -> CompResponse {
         LicensingError::Expired { .. } => (403, "expired"),
         LicensingError::Revoked(_) => (403, "revoked"),
         LicensingError::UnknownQuote(_) => (403, "unknown_quote"),
+        LicensingError::AlreadyRedeemed(_) => (403, "already_redeemed"),
+        // 429 rather than 503: the condition is caller-driven volume,
+        // and a client reading the status should back off rather than
+        // conclude the publisher is down.
+        LicensingError::QuoteLedgerFull { .. } => (429, "quote_ledger_full"),
         LicensingError::RevocationBackend(_) => (500, "revocation_backend"),
         LicensingError::UnknownTier(_) => (404, "unknown_tier"),
         LicensingError::Encode(_) => (500, "encode_error"),
@@ -480,19 +535,24 @@ mod tests {
     fn serving_moves_the_metric_family_the_dashboard_reads() {
         let marketplace = marketplace();
 
+        // `>=` rather than `==`: these families live in the
+        // process-wide Prometheus registry, and sibling tests in this
+        // binary move the same label values concurrently. The property
+        // is that serving moves the family at all, which is what was
+        // not true while the crate was unlinked from every binary; an
+        // exact delta would additionally assert that nothing else ran,
+        // which is not true and not the point.
         let before = counter(&metrics::MANIFEST_SERVES_TOTAL, "ok");
         serve_manifest(&marketplace);
-        assert_eq!(
-            counter(&metrics::MANIFEST_SERVES_TOTAL, "ok"),
-            before + 1,
+        assert!(
+            counter(&metrics::MANIFEST_SERVES_TOTAL, "ok") > before,
             "a manifest serve must move sbproxy_comp_marketplace_manifest_serves_total"
         );
 
         let before = counter(&metrics::QUOTE_REQUESTS_TOTAL, "rejected");
         serve_quote(&marketplace, b"{not json");
-        assert_eq!(
-            counter(&metrics::QUOTE_REQUESTS_TOTAL, "rejected"),
-            before + 1,
+        assert!(
+            counter(&metrics::QUOTE_REQUESTS_TOTAL, "rejected") > before,
             "a refused quote must move the quote family under `rejected`"
         );
     }
@@ -569,6 +629,32 @@ mod tests {
             !log.contains(&minted.license_token),
             "the minted bearer token must never reach a log line: {log}"
         );
+    }
+
+    /// WOR-2673 review M2: the oversize refusal is a refusal like any
+    /// other, and refusals are counted and logged.
+    ///
+    /// It was hand-rolled in both transports outside this module and
+    /// wrote neither. A client looping 100 KiB bodies was then
+    /// indistinguishable from no traffic at all: the panel flat, the
+    /// counter still, and nothing in the SIEM feed.
+    #[test]
+    fn an_oversize_body_is_counted_and_logged_like_every_other_refusal() {
+        let before = counter(&metrics::QUOTE_REQUESTS_TOTAL, "rejected");
+        let response = oversize(CompEndpoint::Quote);
+        assert_eq!(response.status, 413);
+        assert!(
+            counter(&metrics::QUOTE_REQUESTS_TOTAL, "rejected") > before,
+            "an oversize quote must move the same family every other refusal moves"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.body).expect("the refusal body is JSON");
+        assert_eq!(body["error"], "body_too_large");
+        assert_eq!(response.cache_control, COMP_NO_STORE_CACHE_CONTROL);
+
+        let before = counter(&metrics::REDEEM_REQUESTS_TOTAL, "rejected");
+        assert_eq!(oversize(CompEndpoint::Redeem).status, 413);
+        assert!(counter(&metrics::REDEEM_REQUESTS_TOTAL, "rejected") > before);
     }
 
     /// Log-forging defense, on the field that reaches `tracing` from an

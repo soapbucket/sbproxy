@@ -52,11 +52,24 @@
 #     http://127.0.0.1:8080/.well-known/iab-comp/quote | jq   # unknown_tier, 404
 #
 #   # 5. What the operator sees, behind admin auth:
-#   curl -s http://127.0.0.1:9090/admin/licensing | jq
+#   curl -s -u admin:"${SB_ADMIN_PASSWORD:-demo-change-me}" \
+#     http://127.0.0.1:9090/admin/licensing | jq
 
 # sbproxy-docs:begin
 proxy:
   http_bind_port: 8080
+
+  # Step 5 of the walkthrough reads GET /admin/licensing, which lives on
+  # the admin listener. Without this block the listener never starts and
+  # that curl gets connection refused, which reads like a broken route
+  # rather than a missing block.
+  admin:
+    enabled: true
+    bind: 127.0.0.1
+    port: 9090
+    username: admin
+    # Demo password for a loopback bind. Change before any other bind.
+    password: ${SB_ADMIN_PASSWORD:-demo-change-me}
 
   # Only because the demo upstream runs on this machine: the SSRF guard
   # refuses private upstream addresses unless allowlisted. A production

@@ -671,6 +671,15 @@ pub struct ProxyMetrics {
     /// with no counter and no log line, and `admission_for` reads a
     /// missing score as "admit".
     pub anomaly_key_budget_spent: Option<IntCounter>,
+    /// WOR-2673: counter `sbproxy_olp_decisions_total` of RSL Open
+    /// Licensing Protocol endpoint outcomes, by endpoint and outcome.
+    ///
+    /// The OLP endpoints mint bearer license tokens on the request
+    /// path. Before this family the entire record of a failed issuance
+    /// was one `warn!` and the record of a successful one was nothing,
+    /// while the CoMP bridge on the same proxy emitted a counter and a
+    /// decision event for every mint of the identical token shape.
+    pub olp_decisions: Option<IntCounterVec>,
     /// WOR-2673: counter `sbproxy_cache_reserve_errors_total` of reserve
     /// operations the backend refused, by operation.
     ///
@@ -1261,6 +1270,13 @@ impl ProxyMetrics {
             "Requests that arrived for an agent class the detector had no tracking slot for",
         );
 
+        let olp_decisions = registered_counter_vec(
+            &registry,
+            "sbproxy_olp_decisions_total",
+            "RSL OLP endpoint outcomes, by endpoint and outcome",
+            &["endpoint", "outcome"],
+        );
+
         let cache_reserve_errors = registered_counter_vec(
             &registry,
             "sbproxy_cache_reserve_errors_total",
@@ -1543,6 +1559,7 @@ impl ProxyMetrics {
             cache_reserve_hits,
             cache_reserve_misses,
             cache_reserve_writes,
+            olp_decisions,
             cache_reserve_errors,
             anomaly_detected,
             agent_reputation_score,
@@ -1940,6 +1957,22 @@ pub fn set_agent_reputation_score(tenant_id: &str, agent_class: &str, score: f64
         gauge
             .with_label_values(&[tenant_id.as_str(), agent_class.as_str()])
             .set(score);
+    }
+}
+
+/// Record one RSL OLP endpoint outcome (WOR-2673).
+///
+/// `endpoint` is the closed set `token` / `key` / `introspect` /
+/// `revoke`, naming the well-known route. `outcome` is the closed set
+/// `ok` / `rejected` / `error`: `rejected` is a caller mistake the
+/// endpoint answered 4xx for, `error` is a failure on this side.
+///
+/// Both labels are `&'static str` so no caller-supplied value can reach
+/// a label, matching the `sbproxy_comp_marketplace_*` families the CoMP
+/// bridge writes for the same token shape.
+pub fn record_olp_decision(endpoint: &'static str, outcome: &'static str) {
+    if let Some(counter) = metrics().olp_decisions.as_ref() {
+        counter.with_label_values(&[endpoint, outcome]).inc();
     }
 }
 

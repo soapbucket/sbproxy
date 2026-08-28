@@ -24,7 +24,7 @@ pub use marketplace::{
 };
 pub use olp_bridge::{OlpBridgeClaims, OlpBridgeSigner, OLP_JWS_TYP};
 pub use router::{comp_router, COMP_REQUEST_BODY_LIMIT};
-pub use serve::{serve_manifest, serve_quote, serve_redeem, CompResponse};
+pub use serve::{oversize, serve_manifest, serve_quote, serve_redeem, CompEndpoint, CompResponse};
 pub use types::{
     compute_manifest_hash, CompAcceptance, CompAcquisition, CompAuthorization, CompBuyer,
     CompEndpoints, CompManifest, CompPaymentProof, CompPricing, CompPricingModel, CompPublisher,

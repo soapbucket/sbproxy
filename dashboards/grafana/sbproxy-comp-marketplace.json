@@ -39,7 +39,12 @@
   "uid": "sbproxy-comp-marketplace",
   "title": "SBProxy CoMP Marketplace",
   "description": "The sbproxy-licensing crate (crates/sbproxy-licensing, docs/comp-marketplace.md): IAB Content Authorization Marketplace Protocol manifest serves, quote outcomes, redeem outcomes, and a redeem rejection-rate stat. Only populated on a deployment that mounts this crate's router and scrapes its own /metrics endpoint.",
-  "tags": ["sbproxy", "licensing", "comp", "marketplace"],
+  "tags": [
+    "sbproxy",
+    "licensing",
+    "comp",
+    "marketplace"
+  ],
   "style": "dark",
   "timezone": "browser",
   "editable": true,
@@ -56,18 +61,35 @@
       "id": 1,
       "title": "Manifest Serves by Outcome",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "reqps",
-          "custom": { "drawStyle": "line", "fillOpacity": 10, "stacking": { "mode": "normal" } }
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "normal"
+            }
+          }
         },
         "overrides": []
       },
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
           "expr": "sum by (outcome) (rate(sbproxy_comp_marketplace_manifest_serves_total[5m]))",
           "legendFormat": "{{outcome}}",
           "refId": "A"
@@ -78,18 +100,35 @@
       "id": 2,
       "title": "Quote Requests by Outcome",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "reqps",
-          "custom": { "drawStyle": "line", "fillOpacity": 10, "stacking": { "mode": "normal" } }
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "normal"
+            }
+          }
         },
         "overrides": []
       },
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
           "expr": "sum by (outcome) (rate(sbproxy_comp_marketplace_quote_requests_total[5m]))",
           "legendFormat": "{{outcome}}",
           "refId": "A"
@@ -100,18 +139,35 @@
       "id": 3,
       "title": "Redeem Requests by Outcome",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "reqps",
-          "custom": { "drawStyle": "line", "fillOpacity": 10, "stacking": { "mode": "normal" } }
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "normal"
+            }
+          }
         },
         "overrides": []
       },
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
           "expr": "sum by (outcome) (rate(sbproxy_comp_marketplace_redeem_requests_total[5m]))",
           "legendFormat": "{{outcome}}",
           "refId": "A"
@@ -122,8 +178,16 @@
       "id": 4,
       "title": "Redeem Rejection Rate",
       "type": "stat",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "percentunit",
@@ -131,16 +195,31 @@
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null },
-              { "color": "orange", "value": 0.2 },
-              { "color": "red", "value": 0.5 }
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.2
+              },
+              {
+                "color": "red",
+                "value": 0.5
+              }
             ]
           }
         },
         "overrides": []
       },
       "options": {
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
         "textMode": "auto",
         "colorMode": "value",
         "graphMode": "area",
@@ -148,9 +227,103 @@
       },
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
           "expr": "sum(rate(sbproxy_comp_marketplace_redeem_requests_total{outcome=\"rejected\"}[15m])) / sum(rate(sbproxy_comp_marketplace_redeem_requests_total[15m]))",
           "legendFormat": "rejection rate",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "OLP Endpoint Outcomes",
+      "description": "RSL Open Licensing Protocol endpoints on the request path: token issuance, JWK publication, RFC 7662 introspection, and RFC 7009 revocation. The CoMP redeem endpoint above hands back a token of this same shape signed with the same key, so read the two together.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum by (endpoint, outcome) (rate(sbproxy_olp_decisions_total[5m]))",
+          "legendFormat": "{{endpoint}} {{outcome}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "OLP Token Rejection Rate",
+      "description": "Share of POST /.well-known/olp/token calls refused. A sustained non-zero rate with no successful issuance is usually one crawler with a malformed client_credentials body: every request 400s, and the debug detail is compiled out of release builds.",
+      "type": "stat",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "Not reported until POST /.well-known/olp/token has been called at least once.",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.2
+              },
+              {
+                "color": "red",
+                "value": 0.5
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(sbproxy_olp_decisions_total{endpoint=\"token\",outcome=\"rejected\"}[5m])) / clamp_min(sum(rate(sbproxy_olp_decisions_total{endpoint=\"token\"}[5m])), 1e-9)",
+          "legendFormat": "rejected",
           "refId": "A"
         }
       ]

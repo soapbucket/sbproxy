@@ -1,5 +1,5 @@
 # Cache Reserve
-*Last modified: 2026-08-27*
+*Last modified: 2026-08-28*
 
 Cache Reserve is a long-tail cold tier sitting under the per-origin response cache. Items evicted from the hot cache are admitted into the reserve subject to a sample rate and size threshold; on a hot miss the proxy consults the reserve before falling through to origin and promotes the entry back into the hot tier on hit.
 
