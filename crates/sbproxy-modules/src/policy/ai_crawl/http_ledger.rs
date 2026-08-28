@@ -26,7 +26,7 @@ use super::{Ledger, LedgerError, RedeemResult};
 type HmacSha256 = Hmac<Sha256>;
 
 /// Configuration for `HttpLedger`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HttpLedgerConfig {
     /// Base URL, e.g. `https://ledger.internal`. The client appends
     /// `/v1/ledger/redeem` (and other verb paths in later waves).
@@ -61,6 +61,37 @@ pub struct HttpLedgerConfig {
     pub breaker_success_threshold: u32,
     /// Duration the breaker stays open before allowing a probe.
     pub breaker_open_duration: Duration,
+}
+
+/// Redacted `Debug` (WOR-2640). `key` is the raw HMAC key bytes the
+/// ledger validates signatures with, loaded from
+/// `SBPROXY_LEDGER_HMAC_KEY_FILE`. An attacker who reads it signs
+/// redemptions this proxy's ledger accepts. `key_id` stays and is the
+/// useful half: it names *which* key was in play, which is the
+/// question a rejected signature raises, and it authenticates nothing.
+///
+/// The length is kept rather than hidden. A key of the wrong length is
+/// a real and common misconfiguration (a file with a trailing newline,
+/// a hex string never decoded), it is what an operator needs to see to
+/// spot it, and it discloses nothing an attacker cannot infer from the
+/// algorithm.
+impl std::fmt::Debug for HttpLedgerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpLedgerConfig")
+            .field("endpoint", &self.endpoint)
+            .field("key_id", &self.key_id)
+            .field("key", &format_args!("[REDACTED; {} bytes]", self.key.len()))
+            .field("workspace_id", &self.workspace_id)
+            .field("agent_id", &self.agent_id)
+            .field("agent_vendor", &self.agent_vendor)
+            .field("per_attempt_timeout", &self.per_attempt_timeout)
+            .field("total_timeout", &self.total_timeout)
+            .field("max_attempts", &self.max_attempts)
+            .field("breaker_failure_threshold", &self.breaker_failure_threshold)
+            .field("breaker_success_threshold", &self.breaker_success_threshold)
+            .field("breaker_open_duration", &self.breaker_open_duration)
+            .finish()
+    }
 }
 
 impl HttpLedgerConfig {
@@ -631,4 +662,45 @@ fn rfc3339_millis_now() -> String {
     let datetime = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, millis * 1_000_000)
         .unwrap_or_default();
     datetime.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    /// WOR-2640: the ledger HMAC key signs redemptions the ledger
+    /// accepts, so anything that reads it forges them. The key id
+    /// stays, because "which key" is the question a rejected signature
+    /// raises.
+    #[test]
+    fn debug_never_renders_the_ledger_hmac_key() {
+        let config = HttpLedgerConfig {
+            endpoint: "https://ledger.internal".to_string(),
+            key_id: "ledger-key-2026-08".to_string(),
+            key: b"SENTINEL-SECRET-9f3a".to_vec(),
+            workspace_id: "default".to_string(),
+            agent_id: "agent-1".to_string(),
+            agent_vendor: "vendor-1".to_string(),
+            per_attempt_timeout: Duration::from_millis(500),
+            total_timeout: Duration::from_secs(2),
+            max_attempts: 3,
+            breaker_failure_threshold: 5,
+            breaker_success_threshold: 2,
+            breaker_open_duration: Duration::from_secs(30),
+        };
+        let rendered = format!("{config:?}");
+        assert!(
+            !rendered.contains("SENTINEL-SECRET-9f3a"),
+            "the ledger HMAC key reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("ledger-key-2026-08"),
+            "the key id must survive so a rejected signature is diagnosable: {rendered}"
+        );
+        assert!(
+            rendered.contains("20 bytes"),
+            "the key length must survive: a wrong-length key is the common \
+             misconfiguration and discloses nothing: {rendered}"
+        );
+    }
 }

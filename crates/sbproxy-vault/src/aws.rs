@@ -86,7 +86,7 @@ pub struct AwsSecretsManagerConfig {
 }
 
 /// Operator-facing auth method.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum AwsAuth {
     /// Static access keys. Operator resolves them from the config's
     /// secret reference, such as `${ENV_VAR}` or `file:`.
@@ -114,6 +114,45 @@ pub enum AwsAuth {
         /// Session name (defaults to `sbproxy`).
         session_name: Option<String>,
     },
+}
+
+/// Redacted `Debug` (WOR-2640). `secret_access_key` and `session_token`
+/// are reusable AWS credentials, and a derived `Debug` puts them into
+/// any `{:?}` a construction error, an `anyhow` chain, or a support
+/// bundle takes. The key id and the role ARN stay: they are the
+/// identifiers an operator needs to tell one misconfigured backend from
+/// another, and neither authenticates anything on its own.
+impl std::fmt::Debug for AwsAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StaticKeys {
+                access_key_id,
+                session_token,
+                ..
+            } => f
+                .debug_struct("StaticKeys")
+                .field("access_key_id", access_key_id)
+                .field("secret_access_key", &"[REDACTED]")
+                // Presence, not value: whether a session token was
+                // supplied is the part that explains a 403.
+                .field(
+                    "session_token",
+                    &session_token.as_ref().map(|_| "[REDACTED]"),
+                )
+                .finish(),
+            Self::DefaultChain => f.write_str("DefaultChain"),
+            Self::AssumedRole {
+                role_arn,
+                external_id,
+                session_name,
+            } => f
+                .debug_struct("AssumedRole")
+                .field("role_arn", role_arn)
+                .field("external_id", external_id)
+                .field("session_name", session_name)
+                .finish(),
+        }
+    }
 }
 
 impl AwsSecretsManagerBackend {
@@ -588,5 +627,53 @@ mod tests {
             error_chain_detail(&Err1),
             "service error: ResourceNotFoundException: can't find the specified secret"
         );
+    }
+
+    /// WOR-2640: a `{:?}` of the auth block is one `anyhow` chain away
+    /// from a log line, so the AWS secret key and session token must not
+    /// be in it. The access key id and the role ARN must still be, or
+    /// the redaction has cost the operator the ability to tell which
+    /// backend failed.
+    #[test]
+    fn debug_never_renders_the_aws_secret_key() {
+        let auth = AwsAuth::StaticKeys {
+            access_key_id: "AKIAEXAMPLE".to_string(),
+            secret_access_key: "SENTINEL-SECRET-9f3a".to_string(),
+            session_token: Some("SENTINEL-SECRET-9f3a-session".to_string()),
+        };
+        let rendered = format!("{auth:?}");
+        assert!(
+            !rendered.contains("SENTINEL-SECRET-9f3a"),
+            "AWS credentials reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("AKIAEXAMPLE"),
+            "lost the key id: {rendered}"
+        );
+        assert!(
+            rendered.contains("[REDACTED]"),
+            "the redaction is not visible: {rendered}"
+        );
+
+        // The same config nested in the struct an operator actually
+        // holds, because that is the value a construction error formats.
+        let cfg = AwsSecretsManagerConfig {
+            region: "us-east-1".to_string(),
+            auth,
+            mount_prefix: "prod/".to_string(),
+            cache_ttl: None,
+        };
+        assert!(
+            !format!("{cfg:?}").contains("SENTINEL-SECRET-9f3a"),
+            "the containing config leaked it: {cfg:?}"
+        );
+
+        // A variant with nothing to hide still renders its identifiers.
+        let assumed = AwsAuth::AssumedRole {
+            role_arn: "arn:aws:iam::1:role/r".to_string(),
+            external_id: None,
+            session_name: None,
+        };
+        assert!(format!("{assumed:?}").contains("arn:aws:iam::1:role/r"));
     }
 }

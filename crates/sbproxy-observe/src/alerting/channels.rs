@@ -35,7 +35,7 @@ const WEBHOOK_DROP_KIND: &str = "alert_webhook";
 // --- Data types ---
 
 /// Configuration for a single alert notification channel.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct AlertChannelConfig {
     /// Channel type: `"webhook"`, `"slack"`, `"pagerduty"`, or `"log"`.
     #[serde(rename = "type")]
@@ -55,6 +55,39 @@ pub struct AlertChannelConfig {
     /// `channel_type == "pagerduty"`).
     #[serde(default)]
     pub routing_key: Option<String>,
+}
+
+/// Redacted `Debug` (WOR-2606). Two carriers, and the second is the one
+/// that is easy to miss. `secret` is the HMAC key the webhook receiver
+/// verifies, so reading it forges an alert feed the operator's
+/// downstream trusts; `routing_key` is the PagerDuty integration key,
+/// which is a credential in its own right. `headers` is
+/// operator-authored and is where an `Authorization:` value goes when a
+/// channel needs one, so only the *names* print: which headers are
+/// configured is the useful half of that map for a diagnostic.
+///
+/// The runtime twin of `sbproxy_config::AlertChannelConfig`, redacted
+/// in the same round.
+impl std::fmt::Debug for AlertChannelConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AlertChannelConfig")
+            .field("channel_type", &self.channel_type)
+            .field("url", &self.url)
+            .field(
+                "headers",
+                &self
+                    .headers
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .field("secret", &self.secret.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "routing_key",
+                &self.routing_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 /// A fired alert payload sent to notification channels.
@@ -1196,5 +1229,38 @@ mod tests {
         assert_eq!(v["labels"]["origin"], "api.example.com");
         assert_eq!(v["labels"]["region"], "us-east-1");
         assert_eq!(v["labels"]["env"], "production");
+    }
+
+    /// The alert channel credentials, pinned (WOR-2606).
+    ///
+    /// Two carriers and one map. The webhook HMAC secret forges an alert
+    /// feed; the PagerDuty routing key pages on the operator's account;
+    /// `headers` is where an `Authorization:` value goes.
+    #[test]
+    fn debug_never_renders_an_alert_channel_credential() {
+        const SENTINEL: &str = "SENTINEL-ALERT-5f28";
+
+        let channel = AlertChannelConfig {
+            channel_type: "webhook".to_string(),
+            url: Some("https://alerts.example.test/hook".to_string()),
+            headers: vec![("Authorization".to_string(), SENTINEL.to_string())],
+            secret: Some(SENTINEL.to_string()),
+            routing_key: Some(SENTINEL.to_string()),
+        };
+        let rendered = format!("{channel:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "an alert channel credential reached Debug through secret, routing_key \
+             or a header value: {rendered}"
+        );
+        assert!(
+            rendered.contains("Authorization"),
+            "the header names must survive: which headers are configured is the \
+             useful half of that map: {rendered}"
+        );
+        assert!(
+            rendered.contains("alerts.example.test"),
+            "the destination must survive: it names which channel failed: {rendered}"
+        );
     }
 }

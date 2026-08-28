@@ -454,6 +454,117 @@ Two of the three have a better alternative than hand-generation:
 * **Virtual keys:** the dynamic key-management admin API mints keys server-side (`POST /admin/keys`) with the right shape and entropy, and returns the plaintext token exactly once. Prefer minting over inventing a static key; see [key-management.md](key-management.md). A hand-generated static key is fine for local walkthroughs, but replace placeholder values like `sk-your-virtual-key` before anything reachable beyond localhost.
 * **`pepper` and `master_key`:** if you leave them unset, sbproxy generates an ephemeral value at boot and warns. That is a fallback so a first run works, not a recommendation. Stored key hashes and encrypted credentials do not survive a restart without stable values, so set both before minting any key you intend to keep.
 
+## What a diagnostic can print
+
+A backend's auth block holds a working credential: an AWS secret access
+key, an Entra client secret, an inline GCP service-account key, a Vault
+client token or AppRole `secret_id`. Those fields are never printed.
+Formatting the config for a startup error, an `anyhow` chain, or a
+support bundle renders them as `[REDACTED]`, and so does formatting any
+struct that contains one.
+
+What still prints is everything that identifies which backend is
+misconfigured without authenticating to it: the region, the vault URL,
+the AWS access key id, the Entra tenant and client ids, the Vault role
+id, the mount prefix, and the path to a key file. An error that names
+none of those is not worth reading, so the line is drawn at reusability
+rather than at sensitivity.
+
+The same rule covers the credentials the proxy issues rather than
+consumes. A minted virtual key's plaintext token is returned by the
+admin API once and never rendered again, and a plaintext credential
+posted to `POST /admin/credentials` does not appear in the admin log if
+the request is rejected. Peppered hashes still print: they are what
+correlates a mint with the record it produced, and they are not
+credentials.
+
+It reaches past the ones a secret backend supplies. The same redaction
+applies to the keys a caller presents inbound (API keys, bearer tokens,
+Basic and Digest passwords, the JWT HMAC secret, and the token the
+inbound sweep lifts out of a request header), to the credentials SBproxy
+presents upstream (an AI provider's API key, an embedding or vector
+store key, an OAuth client secret, a vault-resolved bearer token, a
+usage sink's write key, a Stripe secret key, a Consul ACL token), to the
+session material the proxy issues itself (the OIDC client and cookie
+secrets, a stored refresh token, the admin session signing key, the
+admin Basic-auth password), and to the keys whose disclosure forges what
+they sign (the CSRF token key, the crawl ledger's HMAC key, a mesh
+enrollment token, the usage ledger's signing seed, the event and alert
+webhook HMAC keys, the Web Bot Auth directory seed, the OLP signing key
+and content-key seed).
+
+Config types are covered alongside their runtime twins, in both
+directions. A twin protected on one side only is not protected: the same
+value is redacted where it is used and printed where it is loaded, and a
+config-load diagnostic is the likelier of the two to reach a log. Four
+config types were derived while their runtime halves were redacted, and
+five runtime types were derived while their config halves were; both
+sets are closed.
+
+What this is *not* is a claim that no credential-bearing type anywhere
+in the tree is still derived. That claim would need something that
+derives the list from the code, and nothing does, for the reason the
+next paragraph gives. What is true is that every type on the registry is
+enforced, and that adding a type means adding its line.
+
+Two shapes are deliberate rather than incidental. An `Option` field
+renders as present-but-redacted or as absent, because "no credential
+configured" and "wrong credential configured" produce the same 401 and
+are different things to fix. And a key's *length* is printed where the
+key is raw bytes: a key of the wrong length is a common
+misconfiguration, a trailing newline in a key file being the usual
+cause, and the length discloses nothing an attacker cannot infer from
+the algorithm.
+
+The set is enforced rather than remembered.
+`scripts/secret-debug-registry.txt` lists every protected type, and a
+CI guard refuses a tree where one of them has regained a derived
+`Debug`, lost its redacting implementation, or lost the test that
+pushes a sentinel through it.
+
+What the guard cannot see, worth knowing rather than assuming, is three
+things. A *new* credential-bearing type that never gets a registry
+line: nothing derives the list from the code, because "this field holds
+a credential" is a judgment about meaning rather than a pattern, and a
+scan that flags `max_tokens` alongside `api_key` stops being read.
+Whether an implementation still redacts, as opposed to still existing:
+that is what the pinning test is for, which is why the guard demands one
+and why the test asserts a sentinel is absent rather than asserting a
+type name. And whether that test still asserts anything, since the guard
+checks the function exists rather than what it does. The script's own
+header says all three in the same words.
+
+### Why the policy is one rule and not one type
+
+The rule is single: on a registered type, the credential does not print,
+the identifier that names what failed does, an `Option` renders presence
+rather than a flat marker, and raw key bytes render their length. One
+registry states it, one guard enforces it, and there are no exemptions.
+
+The *mechanism* is a hand-written `Debug` per type rather than one
+wrapper type used everywhere, and `sbproxy_vault::SecretString` is that
+wrapper going unused. Two constraints, both checkable rather than
+asserted, are why.
+
+`SecretString` implements `Debug`, `Display`, `Clone` and a
+constant-time `PartialEq`, and nothing else. It has no `Deserialize`, no
+`Serialize`, and no `JsonSchema`, so it cannot be the type of a config
+field at all: a config struct that held one would neither parse nor
+appear in `schemas/sb-config.schema.json`. Adding `Serialize` to it is
+not a small change but a contradiction, because most of the config types
+here derive `Serialize` and round-tripping them means writing the
+plaintext back out, which is the disclosure the type exists to prevent.
+
+And `sbproxy-vault` depends on `sbproxy-observe`. Every protected type
+that lives in `sbproxy-observe` (the event sink target, the alert
+channel) therefore cannot reach `SecretString` without a dependency
+cycle, whatever the serde question.
+
+The honest summary is that the redacted-string type is the right shape
+for a value held in memory at runtime and the wrong shape for a value
+parsed out of a config document, and most of what this rule protects is
+the second kind.
+
 ## Related Reading
 
 * `docs/configuration.md` for the `proxy.secrets` block and reference URI grammar.

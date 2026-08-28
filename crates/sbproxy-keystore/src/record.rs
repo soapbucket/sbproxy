@@ -358,7 +358,7 @@ impl KeyRecord {
 }
 
 /// How an upstream credential's secret is held at rest.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CredentialMaterial {
     /// A secret reference resolved by `sbproxy-vault` at use time (`vault://`,
@@ -379,6 +379,31 @@ pub enum CredentialMaterial {
         /// The raw secret.
         value: String,
     },
+}
+
+/// Redacted `Debug` (WOR-2640). Only [`Self::Plaintext`] holds a
+/// reusable secret: a `VaultRef` is a reference an operator has to be
+/// able to read to fix a typo in it, and an `Envelope` is already
+/// sealed. Redacting the one that matters keeps every container of this
+/// type, [`CredentialRecord`] included, safe to format without each of
+/// them needing an impl of its own.
+impl std::fmt::Debug for CredentialMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::VaultRef { reference } => f
+                .debug_struct("VaultRef")
+                .field("reference", reference)
+                .finish(),
+            Self::Envelope { envelope } => f
+                .debug_struct("Envelope")
+                .field("envelope", envelope)
+                .finish(),
+            Self::Plaintext { .. } => f
+                .debug_struct("Plaintext")
+                .field("value", &"[REDACTED]")
+                .finish(),
+        }
+    }
 }
 
 impl CredentialMaterial {
@@ -759,5 +784,28 @@ mod tests {
         assert!(json.contains("\"kind\":\"vault_ref\""), "{json}");
         let back: CredentialRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(r, back);
+    }
+
+    /// WOR-2640: `Plaintext` is the only material variant that holds a
+    /// reusable secret, and redacting it there is what keeps every
+    /// container of it safe without an impl per container.
+    #[test]
+    fn debug_never_renders_plaintext_credential_material() {
+        let material = CredentialMaterial::Plaintext {
+            value: "SENTINEL-SECRET-9f3a".to_string(),
+        };
+        let rendered = format!("{material:?}");
+        assert!(
+            !rendered.contains("SENTINEL-SECRET-9f3a"),
+            "plaintext credential material reached Debug: {rendered}"
+        );
+        assert!(rendered.contains("[REDACTED]"));
+
+        // A reference is not a secret: an operator has to be able to
+        // read it to fix a typo in it.
+        let by_ref = CredentialMaterial::VaultRef {
+            reference: "vault://prod/openai".to_string(),
+        };
+        assert!(format!("{by_ref:?}").contains("vault://prod/openai"));
     }
 }
