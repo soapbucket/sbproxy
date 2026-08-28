@@ -482,6 +482,13 @@ impl OpenAiFixture {
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // The listener is non-blocking, and on BSD and macOS an accepted
+                        // socket inherits that flag, which makes the read timeout
+                        // below a no-op: `read` returns `WouldBlock` at once and the
+                        // reader gives up on a partial request. Clear it, the way
+                        // every other non-blocking-listener fixture in this
+                        // workspace does.
+                        let _ = stream.set_nonblocking(false);
                         let _ = stream.set_read_timeout(Some(FIXTURE_IO_TIMEOUT));
                         let request = read_bounded_http_request(&mut stream).unwrap_or_default();
                         thread_observation.requests.fetch_add(1, Ordering::AcqRel);
@@ -1532,6 +1539,12 @@ fn c0_harness_bounds_child_output_readiness_and_real_ai_post_response() {
                 }
             }
         };
+        // An accepted socket inherits the listener's non-blocking flag on
+        // BSD and macOS, which turns the read timeout below into a no-op and
+        // makes the completeness check fail on a request that was merely slow.
+        stream
+            .set_nonblocking(false)
+            .map_err(|error| format!("clear oversized fixture non-blocking: {error}"))?;
         stream
             .set_read_timeout(Some(FIXTURE_IO_TIMEOUT))
             .map_err(|error| format!("bound oversized fixture request read: {error}"))?;
@@ -1626,6 +1639,8 @@ fn c0_harness_bounds_child_output_readiness_and_real_ai_post_response() {
         };
         if let Some(stream) = stream.as_mut() {
             server_accepted.store(true, Ordering::Release);
+            // Same inherited non-blocking flag as the two fixtures above.
+            let _ = stream.set_nonblocking(false);
             let _ = stream.set_read_timeout(Some(FIXTURE_IO_TIMEOUT));
             let mut request = [0_u8; 256];
             let _ = stream.read(&mut request);

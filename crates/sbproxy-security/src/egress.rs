@@ -98,6 +98,9 @@ pub enum EgressPurpose {
     ClassifierHook,
     /// Federated MCP upstream.
     McpUpstream,
+    /// OpenID Federation entity configuration and subordinate statement
+    /// fetches (`crates/sbproxy-federation`).
+    Federation,
     /// OpenAPI tool HTTP call.
     OpenApiTool,
     /// OAuth/OIDC token exchange.
@@ -131,6 +134,7 @@ impl EgressPurpose {
             Self::AgentOrchestration => "agent_orchestration",
             Self::ClassifierHook => "classifier_hook",
             Self::McpUpstream => "mcp_upstream",
+            Self::Federation => "federation",
             Self::OpenApiTool => "openapi_tool",
             Self::TokenExchange => "token_exchange",
             Self::Webhook => "webhook",

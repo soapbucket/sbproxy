@@ -96,6 +96,10 @@ pub enum DecisionEvent {
     /// Whether a response is worth storing depends on status, size,
     /// content, and cost, none of which exist at request time.
     CacheAdmit,
+    /// Cache Reserve backend health changed between healthy and degraded.
+    ///
+    /// Emitted only on state transitions, not once per reserve operation.
+    CacheReserveHealth,
     /// Routing chose a candidate plan.
     RouteDecide,
     /// An AI guardrail inspected the prompt.
@@ -220,6 +224,7 @@ impl DecisionEvent {
             Self::Waf => "waf",
             Self::CacheKey => "cache.key",
             Self::CacheAdmit => "cache.admit",
+            Self::CacheReserveHealth => "cache.reserve.health",
             Self::RouteDecide => "route.decide",
             Self::AiGuardrailInput => "ai.guardrail.input",
             Self::AiGuardrailOutput => "ai.guardrail.output",
@@ -247,6 +252,7 @@ impl DecisionEvent {
         Self::Waf,
         Self::CacheKey,
         Self::CacheAdmit,
+        Self::CacheReserveHealth,
         Self::RouteDecide,
         Self::AiGuardrailInput,
         Self::AiGuardrailOutput,
@@ -324,7 +330,14 @@ impl DecisionEvent {
             // every one of the fourteen auth call sites goes through.
             // ai.guardrail.*: ai_dispatch.rs, the input and output
             // guardrail funnels.
-            // mcp.tool: action_dispatch.rs `emit_mcp_tool_attribution`.
+            // mcp.tool: action_dispatch.rs `emit_mcp_tool_attribution`
+            // for a dispatched tool call, and
+            // `record_mcp_scope_decision` for the per-operation OAuth
+            // scope refusal that stops one before dispatch.
+            // cache.reserve.health: pipeline.rs
+            // `CacheReserveHealthState::observe_transition`, on the
+            // healthy-to-degraded and degraded-to-healthy edges only,
+            // not once per reserve operation.
             // ai.tool_call: ai_dispatch.rs `handle_verdicts`, one record
             // per judged streamed tool call. Bounded by tool calls
             // rather than chunks, which is what separates it from
@@ -368,6 +381,7 @@ impl DecisionEvent {
             // warning while the feed still missed decisions (WOR-2446).
             Self::CacheAdmit
             | Self::CacheKey
+            | Self::CacheReserveHealth
             | Self::RouteDecide
             | Self::Auth
             | Self::AiGuardrailInput
@@ -1096,6 +1110,21 @@ pub struct DecisionDetails {
     /// read out of the body.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub surface: Option<String>,
+    /// Cache Reserve backend kind (`memory`, `filesystem`, `redis`, or
+    /// `s3`) for a health transition.
+    ///
+    /// This is selected by the compiler, never copied from a backend
+    /// error, so it stays inside the event's closed cardinality budget.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    /// Cache Reserve health after a transition (`healthy` or
+    /// `degraded`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// Stable, bounded classification for a Cache Reserve health
+    /// transition; never the backend's error text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
 }
 
 impl DecisionDetails {
@@ -1278,6 +1307,20 @@ impl DecisionDetails {
         }
     }
 
+    /// Detail for a Cache Reserve health transition.
+    ///
+    /// All three inputs come from closed vocabularies in the reserve
+    /// observer. Raw SDK, filesystem, and configuration errors belong
+    /// only in the scrubbed-and-bounded human reason.
+    pub fn cache_reserve_health(backend: &str, state: &str, reason_code: &str) -> Self {
+        Self {
+            backend: (!backend.is_empty()).then(|| backend.to_owned()),
+            state: (!state.is_empty()).then(|| state.to_owned()),
+            reason_code: (!reason_code.is_empty()).then(|| reason_code.to_owned()),
+            ..Self::default()
+        }
+    }
+
     /// Detail for an upstream AI provider failure (WOR-2486).
     ///
     /// Reuses the routing and policy fields rather than adding a new
@@ -1372,6 +1415,9 @@ impl DecisionDetails {
             verdict,
             decision_latency_ms,
             surface,
+            backend,
+            state,
+            reason_code,
             anomaly_kind,
             reputation_bucket,
             identity_source,
@@ -1398,6 +1444,9 @@ impl DecisionDetails {
             && verdict.is_none()
             && decision_latency_ms.is_none()
             && surface.is_none()
+            && backend.is_none()
+            && state.is_none()
+            && reason_code.is_none()
             && anomaly_kind.is_none()
             && reputation_bucket.is_none()
             && identity_source.is_none()
@@ -1878,6 +1927,7 @@ mod tests {
                 "auth",
                 "cache.key",
                 "cache.admit",
+                "cache.reserve.health",
                 "route.decide",
                 "ai.guardrail.input",
                 "ai.guardrail.output",

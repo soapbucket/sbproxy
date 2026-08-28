@@ -4032,11 +4032,28 @@ mod tests {
                 "{round}: list must return the registered tenant"
             );
 
-            assert_eq!(
-                probe.live_bytes(),
-                PUBLIC_IN_FLIGHT_FRAME_BYTES,
-                "{round}: the public listener may hold its share and no more, so the admin reserve is still whole"
-            );
+            // Settled, not sampled. The admin `list` frame's lease is
+            // released at the end of the server's connection loop, after the
+            // response the client above has already read, so reading the
+            // total the instant `wire_exchange` returns catches that frame
+            // still resident and lands 147 bytes over. Waiting costs the
+            // assertion nothing: the pinned public leases are held for the
+            // whole round, so the total never falls below the share, and
+            // equality with it is therefore reachable only when the public
+            // listener stopped at its share and no admin frame is left. A
+            // listener that reached past the reserve holds more than this
+            // forever and the wait fails.
+            probe
+                .wait_for_live_bytes(Duration::from_secs(3), |live| {
+                    live == PUBLIC_IN_FLIGHT_FRAME_BYTES
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{round}: the public listener may hold its share and no more, so the \
+                         admin reserve is still whole: {error}"
+                    )
+                });
 
             drop(register_stream);
             drop(list_stream);
@@ -4155,15 +4172,17 @@ mod tests {
             .expect("plus-one frame header write is bounded")
             .unwrap();
             assert_socket_refused_without_response(plus_one, name).await;
-            before.assert_exact_terminal_delta(
-                OutcomeExpectation::failure(
-                    transport,
-                    MetricCommand::Decode,
-                    Stage::Admission,
-                    Reason::ResourceLimit,
-                ),
-                name,
-            );
+            before
+                .assert_exact_terminal_delta(
+                    OutcomeExpectation::failure(
+                        transport,
+                        MetricCommand::Decode,
+                        Stage::Admission,
+                        Reason::ResourceLimit,
+                    ),
+                    name,
+                )
+                .await;
         }
         probe
             .wait_for_declared_frames(FRAME_SLOTS + 2, Duration::from_secs(3))
@@ -4312,10 +4331,12 @@ mod tests {
         assert_eq!(response.name, SERVER_NAME);
         assert_eq!(response.version, SERVER_VERSION);
         fault.assert_consumed_exactly_once();
-        before.assert_exact_terminal_delta(
-            OutcomeExpectation::success(Transport::Tcp, MetricCommand::Version),
-            "response completed before connection-child panic",
-        );
+        before
+            .assert_exact_terminal_delta(
+                OutcomeExpectation::success(Transport::Tcp, MetricCommand::Version),
+                "response completed before connection-child panic",
+            )
+            .await;
         drop(client);
 
         pair.expect_connection_child_panic_before(TransportMode::Public, deadline)
@@ -5717,15 +5738,17 @@ mod tests {
             .await
             .expect("the frame deadline must release the budget lease");
         assert_eq!(live_after, 0);
-        before.assert_exact_terminal_delta(
-            OutcomeExpectation::failure(
-                Transport::Tcp,
-                MetricCommand::Decode,
-                Stage::Read,
-                Reason::Deadline,
-            ),
-            "trickled frame deadline",
-        );
+        before
+            .assert_exact_terminal_delta(
+                OutcomeExpectation::failure(
+                    Transport::Tcp,
+                    MetricCommand::Decode,
+                    Stage::Read,
+                    Reason::Deadline,
+                ),
+                "trickled frame deadline",
+            )
+            .await;
         trickle.abort();
         let _ = trickle.await;
         pair.stop().await;
@@ -5890,15 +5913,17 @@ mod tests {
                 rmp_serde::from_slice(&wire_exchange(&mut stream, &request).await)
                     .unwrap_or_else(|error| panic!("{case} must answer with a refusal: {error}"));
             assert!(!response.ok, "{case} must be refused");
-            before.assert_exact_terminal_delta(
-                OutcomeExpectation::failure(
-                    Transport::Tcp,
-                    command,
-                    Stage::Limit,
-                    Reason::ResourceLimit,
-                ),
-                case,
-            );
+            before
+                .assert_exact_terminal_delta(
+                    OutcomeExpectation::failure(
+                        Transport::Tcp,
+                        command,
+                        Stage::Limit,
+                        Reason::ResourceLimit,
+                    ),
+                    case,
+                )
+                .await;
         }
         pair.stop().await;
     }
@@ -5975,15 +6000,17 @@ mod tests {
                 rmp_serde::from_slice(&wire_exchange(&mut second, &request).await)
                     .unwrap_or_else(|error| panic!("{case} must answer a refusal: {error}"));
             assert!(!refusal.ok, "{case} must be refused while the slot is held");
-            before.assert_exact_terminal_delta(
-                OutcomeExpectation::failure(
-                    Transport::Tcp,
-                    command,
-                    Stage::Admission,
-                    Reason::QueueFull,
-                ),
-                case,
-            );
+            before
+                .assert_exact_terminal_delta(
+                    OutcomeExpectation::failure(
+                        Transport::Tcp,
+                        command,
+                        Stage::Admission,
+                        Reason::QueueFull,
+                    ),
+                    case,
+                )
+                .await;
 
             barrier.release();
             tokio::time::timeout(Duration::from_secs(3), held)
@@ -6038,15 +6065,17 @@ mod tests {
         let response: AdminResponse =
             rmp_serde::from_slice(&wire_exchange(&mut stream, &request).await).unwrap();
         assert!(!response.ok);
-        before.assert_exact_terminal_delta(
-            OutcomeExpectation::failure(
-                Transport::AdminTcp,
-                MetricCommand::Register,
-                Stage::Handler,
-                Reason::InvalidConfig,
-            ),
-            "invalid register",
-        );
+        before
+            .assert_exact_terminal_delta(
+                OutcomeExpectation::failure(
+                    Transport::AdminTcp,
+                    MetricCommand::Register,
+                    Stage::Handler,
+                    Reason::InvalidConfig,
+                ),
+                "invalid register",
+            )
+            .await;
         assert_eq!(
             crate::metrics::error_count(TRANSPORT, "register", "invalid_config"),
             public_errors_before,
@@ -6128,15 +6157,17 @@ mod tests {
                 .unwrap()
                 .ok
         );
-        deadline_before.assert_exact_terminal_delta(
-            OutcomeExpectation::failure(
-                Transport::Tcp,
-                MetricCommand::Classify,
-                Stage::Worker,
-                Reason::Deadline,
-            ),
-            "public classify deadline",
-        );
+        deadline_before
+            .assert_exact_terminal_delta(
+                OutcomeExpectation::failure(
+                    Transport::Tcp,
+                    MetricCommand::Classify,
+                    Stage::Worker,
+                    Reason::Deadline,
+                ),
+                "public classify deadline",
+            )
+            .await;
         assert_eq!(worker_probe.running(), 1);
 
         let refusal_before = outcomes.snapshot();
@@ -6146,15 +6177,17 @@ mod tests {
             rmp_serde::from_slice(&wire_exchange(&mut replacement, &request).await).unwrap();
         assert!(!replacement_response.ok);
         assert_eq!(worker_probe.total_worker_starts(), 1);
-        refusal_before.assert_exact_terminal_delta(
-            OutcomeExpectation::failure(
-                Transport::Tcp,
-                MetricCommand::Classify,
-                Stage::Admission,
-                Reason::QueueFull,
-            ),
-            "public classify worker saturation",
-        );
+        refusal_before
+            .assert_exact_terminal_delta(
+                OutcomeExpectation::failure(
+                    Transport::Tcp,
+                    MetricCommand::Classify,
+                    Stage::Admission,
+                    Reason::QueueFull,
+                ),
+                "public classify worker saturation",
+            )
+            .await;
 
         release_worker.release();
         worker_probe
@@ -6166,10 +6199,12 @@ mod tests {
         let recovery_response: ClassifyResponse =
             rmp_serde::from_slice(&wire_exchange(&mut recovery, &request).await).unwrap();
         assert_eq!(recovery_response.labels[0].label, "greeting");
-        recovery_before.assert_exact_terminal_delta(
-            OutcomeExpectation::success(Transport::Tcp, MetricCommand::Classify),
-            "public classify worker recovery",
-        );
+        recovery_before
+            .assert_exact_terminal_delta(
+                OutcomeExpectation::success(Transport::Tcp, MetricCommand::Classify),
+                "public classify worker recovery",
+            )
+            .await;
         pair.stop().await;
     }
 
@@ -6219,7 +6254,7 @@ mod tests {
                         .unwrap();
                 let bytes = wire_exchange(&mut stream, &$message).await;
                 ($check)(&bytes);
-                before.assert_exact_terminal_delta($expected, $name);
+                before.assert_exact_terminal_delta($expected, $name).await;
                 let mode = if $address == pair.public_address {
                     TransportMode::Public
                 } else {
@@ -6265,100 +6300,114 @@ mod tests {
             let before = outcomes.snapshot();
             raw_exchange_until_close(address, &[0, 0], true).await;
             wait_mode_idle!(mode, format!("{name} partial length prefix"));
-            before.assert_exact_terminal_delta(
-                OutcomeExpectation::failure(
-                    transport,
-                    MetricCommand::Decode,
-                    Stage::Read,
-                    Reason::MalformedFrame,
-                ),
-                &format!("{name} partial length prefix"),
-            );
+            before
+                .assert_exact_terminal_delta(
+                    OutcomeExpectation::failure(
+                        transport,
+                        MetricCommand::Decode,
+                        Stage::Read,
+                        Reason::MalformedFrame,
+                    ),
+                    &format!("{name} partial length prefix"),
+                )
+                .await;
 
             let before = outcomes.snapshot();
             raw_exchange_until_close(address, &[], false).await;
             wait_mode_idle!(mode, format!("{name} header deadline"));
-            before.assert_exact_terminal_delta(
-                OutcomeExpectation::failure(
-                    transport,
-                    MetricCommand::Decode,
-                    Stage::Read,
-                    Reason::Deadline,
-                ),
-                &format!("{name} header deadline"),
-            );
+            before
+                .assert_exact_terminal_delta(
+                    OutcomeExpectation::failure(
+                        transport,
+                        MetricCommand::Decode,
+                        Stage::Read,
+                        Reason::Deadline,
+                    ),
+                    &format!("{name} header deadline"),
+                )
+                .await;
 
             let before = outcomes.snapshot();
             raw_exchange_until_close(address, &4u32.to_be_bytes(), false).await;
             wait_mode_idle!(mode, format!("{name} payload deadline"));
-            before.assert_exact_terminal_delta(
-                OutcomeExpectation::failure(
-                    transport,
-                    MetricCommand::Decode,
-                    Stage::Read,
-                    Reason::Deadline,
-                ),
-                &format!("{name} payload deadline"),
-            );
+            before
+                .assert_exact_terminal_delta(
+                    OutcomeExpectation::failure(
+                        transport,
+                        MetricCommand::Decode,
+                        Stage::Read,
+                        Reason::Deadline,
+                    ),
+                    &format!("{name} payload deadline"),
+                )
+                .await;
 
             let before = outcomes.snapshot();
             raw_exchange_until_close(address, &((MAX_FRAME_BYTES + 1) as u32).to_be_bytes(), true)
                 .await;
             wait_mode_idle!(mode, format!("{name} oversized frame"));
-            before.assert_exact_terminal_delta(
-                OutcomeExpectation::failure(
-                    transport,
-                    MetricCommand::Decode,
-                    Stage::Limit,
-                    Reason::ResourceLimit,
-                ),
-                &format!("{name} oversized frame"),
-            );
+            before
+                .assert_exact_terminal_delta(
+                    OutcomeExpectation::failure(
+                        transport,
+                        MetricCommand::Decode,
+                        Stage::Limit,
+                        Reason::ResourceLimit,
+                    ),
+                    &format!("{name} oversized frame"),
+                )
+                .await;
 
             let mut malformed = 3u32.to_be_bytes().to_vec();
             malformed.extend_from_slice(&[0xc1, 0xc1, 0xc1]);
             let before = outcomes.snapshot();
             raw_exchange_until_close(address, &malformed, true).await;
             wait_mode_idle!(mode, format!("{name} malformed MessagePack"));
-            before.assert_exact_terminal_delta(
-                OutcomeExpectation::failure(
-                    transport,
-                    MetricCommand::Decode,
-                    Stage::Decode,
-                    Reason::MalformedFrame,
-                ),
-                &format!("{name} malformed MessagePack"),
-            );
+            before
+                .assert_exact_terminal_delta(
+                    OutcomeExpectation::failure(
+                        transport,
+                        MetricCommand::Decode,
+                        Stage::Decode,
+                        Reason::MalformedFrame,
+                    ),
+                    &format!("{name} malformed MessagePack"),
+                )
+                .await;
 
             let length_fault = controls.arm_next(mode, TcpFault::LengthReadIo);
             let before = outcomes.snapshot();
             raw_exchange_until_close(address, &[0], false).await;
             wait_mode_idle!(mode, format!("{name} length read I/O"));
             length_fault.assert_consumed_exactly_once();
-            before.assert_exact_terminal_delta(
-                OutcomeExpectation::failure(
-                    transport,
-                    MetricCommand::Decode,
-                    Stage::Read,
-                    Reason::Io,
-                ),
-                &format!("{name} length read I/O"),
-            );
+            before
+                .assert_exact_terminal_delta(
+                    OutcomeExpectation::failure(
+                        transport,
+                        MetricCommand::Decode,
+                        Stage::Read,
+                        Reason::Io,
+                    ),
+                    &format!("{name} length read I/O"),
+                )
+                .await;
 
             let payload_fault = controls.arm_next(mode, TcpFault::PayloadReadIo);
             let before = outcomes.snapshot();
             raw_exchange_until_close(address, &4u32.to_be_bytes(), false).await;
             wait_mode_idle!(mode, format!("{name} payload read I/O"));
             payload_fault.assert_consumed_exactly_once();
-            before.assert_exact_terminal_delta(
-                OutcomeExpectation::failure(
-                    transport,
-                    MetricCommand::Decode,
-                    Stage::Read,
-                    Reason::Io,
-                ),
-                &format!("{name} payload read I/O"),
-            );
+            before
+                .assert_exact_terminal_delta(
+                    OutcomeExpectation::failure(
+                        transport,
+                        MetricCommand::Decode,
+                        Stage::Read,
+                        Reason::Io,
+                    ),
+                    &format!("{name} payload read I/O"),
+                )
+                .await;
 
             let mut occupying = bounded_tcp_connect(address, "TCP matrix slot holder").await;
             controls
@@ -6371,15 +6420,17 @@ mod tests {
                 .wait_for_connection_refusals(mode, 1, Duration::from_secs(3))
                 .await
                 .expect("plus-one TCP connection refusal is observed by the owner");
-            before.assert_exact_terminal_delta(
-                OutcomeExpectation::failure(
-                    transport,
-                    MetricCommand::Unknown,
-                    Stage::Admission,
-                    Reason::ResourceLimit,
-                ),
-                &format!("{name} connection slot"),
-            );
+            before
+                .assert_exact_terminal_delta(
+                    OutcomeExpectation::failure(
+                        transport,
+                        MetricCommand::Unknown,
+                        Stage::Admission,
+                        Reason::ResourceLimit,
+                    ),
+                    &format!("{name} connection slot"),
+                )
+                .await;
             assert_socket_refused_without_response(refused, &format!("{name} connection plus one"))
                 .await;
             tokio::time::timeout(Duration::from_secs(3), occupying.shutdown())
@@ -6448,21 +6499,25 @@ mod tests {
             let bytes = wire_exchange(&mut persistent, &request).await;
             if succeeds {
                 assert!(!bytes.is_empty());
-                before.assert_exact_terminal_delta(
-                    OutcomeExpectation::success(Transport::Tcp, command),
-                    name,
-                );
+                before
+                    .assert_exact_terminal_delta(
+                        OutcomeExpectation::success(Transport::Tcp, command),
+                        name,
+                    )
+                    .await;
             } else {
                 assert!(!rmp_serde::from_slice::<AdminResponse>(&bytes).unwrap().ok);
-                before.assert_exact_terminal_delta(
-                    OutcomeExpectation::failure(
-                        Transport::Tcp,
-                        command,
-                        Stage::Handler,
-                        Reason::TenantNotFound,
-                    ),
-                    name,
-                );
+                before
+                    .assert_exact_terminal_delta(
+                        OutcomeExpectation::failure(
+                            Transport::Tcp,
+                            command,
+                            Stage::Handler,
+                            Reason::TenantNotFound,
+                        ),
+                        name,
+                    )
+                    .await;
             }
             assert_eq!(
                 controls.active_connections(TransportMode::Public),
@@ -6514,10 +6569,12 @@ mod tests {
             let mut stream =
                 bounded_tcp_connect(pair.public_address, "public success matrix case").await;
             assert!(!wire_exchange(&mut stream, &message).await.is_empty());
-            before.assert_exact_terminal_delta(
-                OutcomeExpectation::success(Transport::Tcp, command),
-                name,
-            );
+            before
+                .assert_exact_terminal_delta(
+                    OutcomeExpectation::success(Transport::Tcp, command),
+                    name,
+                )
+                .await;
             drop(stream);
             controls
                 .wait_for_active_connections(TransportMode::Public, 0, Duration::from_secs(3))
@@ -6614,15 +6671,17 @@ mod tests {
             let response: AdminResponse =
                 rmp_serde::from_slice(&wire_exchange(&mut stream, &request).await).unwrap();
             assert!(!response.ok);
-            before.assert_exact_terminal_delta(
-                OutcomeExpectation::failure(
-                    Transport::AdminTcp,
-                    MetricCommand::Register,
-                    Stage::Authorize,
-                    reason,
-                ),
-                name,
-            );
+            before
+                .assert_exact_terminal_delta(
+                    OutcomeExpectation::failure(
+                        Transport::AdminTcp,
+                        MetricCommand::Register,
+                        Stage::Authorize,
+                        reason,
+                    ),
+                    name,
+                )
+                .await;
             drop(stream);
             controls
                 .wait_for_active_connections(TransportMode::Admin, 0, Duration::from_secs(3))
@@ -6700,10 +6759,17 @@ mod tests {
             let response: AdminResponse =
                 rmp_serde::from_slice(&wire_exchange(&mut stream, &request).await).unwrap();
             assert!(!response.ok, "{name}");
-            before.assert_exact_terminal_delta(
-                OutcomeExpectation::failure(Transport::AdminTcp, command, Stage::Handler, reason),
-                name,
-            );
+            before
+                .assert_exact_terminal_delta(
+                    OutcomeExpectation::failure(
+                        Transport::AdminTcp,
+                        command,
+                        Stage::Handler,
+                        reason,
+                    ),
+                    name,
+                )
+                .await;
             drop(stream);
             controls
                 .wait_for_active_connections(TransportMode::Admin, 0, Duration::from_secs(3))
@@ -6739,10 +6805,17 @@ mod tests {
             wait_mode_idle!(mode, name);
             assert!(response.is_empty(), "{name}");
             armed.assert_consumed_exactly_once();
-            before.assert_exact_terminal_delta(
-                OutcomeExpectation::failure(transport, command, Stage::Handler, Reason::Internal),
-                name,
-            );
+            before
+                .assert_exact_terminal_delta(
+                    OutcomeExpectation::failure(
+                        transport,
+                        command,
+                        Stage::Handler,
+                        Reason::Internal,
+                    ),
+                    name,
+                )
+                .await;
         }
 
         let mut list_for_faults = msg("list");
@@ -6843,10 +6916,12 @@ mod tests {
             wait_mode_idle!(mode, name);
             assert!(response.is_empty(), "{name}");
             armed.assert_consumed_exactly_once();
-            before.assert_exact_terminal_delta(
-                OutcomeExpectation::failure(transport, command, stage, reason),
-                name,
-            );
+            before
+                .assert_exact_terminal_delta(
+                    OutcomeExpectation::failure(transport, command, stage, reason),
+                    name,
+                )
+                .await;
         }
 
         let mut delete = msg("delete");

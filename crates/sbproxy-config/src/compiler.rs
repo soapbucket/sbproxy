@@ -2293,6 +2293,136 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
     // WOR-2199: a bind address the operator cannot express is a bind
     // address they cannot restrict, and one they misspell must not fall
     // back to every interface.
+    if let Some(federation) = config_file
+        .proxy
+        .federation
+        .as_ref()
+        .filter(|cfg| cfg.enabled)
+    {
+        if !federation.entity_id.starts_with("https://") {
+            anyhow::bail!("config compile: proxy.federation.entity_id must use https");
+        }
+        if federation.signing_key.pem_file.trim().is_empty()
+            || federation.signing_key.kid.trim().is_empty()
+        {
+            anyhow::bail!(
+                "config compile: proxy.federation.signing_key pem_file and kid must not be empty"
+            );
+        }
+        if !matches!(
+            federation.signing_key.algorithm.as_str(),
+            "ES256" | "ES384" | "RS256" | "RS384" | "RS512" | "PS256" | "PS384" | "PS512" | "EdDSA"
+        ) {
+            anyhow::bail!("config compile: proxy.federation.signing_key.algorithm is not allowed");
+        }
+        if federation
+            .published_jwks
+            .get("keys")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(Vec::is_empty)
+        {
+            anyhow::bail!("config compile: proxy.federation.published_jwks.keys must not be empty");
+        }
+        if federation.lifetime_secs == 0
+            || federation.refresh_margin_secs >= federation.lifetime_secs
+        {
+            anyhow::bail!(
+                "config compile: proxy.federation.refresh_margin_secs must be less than lifetime_secs"
+            );
+        }
+        for hint in &federation.authority_hints {
+            if !hint.starts_with("https://") {
+                anyhow::bail!(
+                    "config compile: proxy.federation.authority_hints entries must use https"
+                );
+            }
+        }
+        if let Some(peer_trust) = federation.peer_trust.as_ref() {
+            if peer_trust.trust_anchors.is_empty() {
+                anyhow::bail!(
+                    "config compile: proxy.federation.peer_trust.trust_anchors must not be empty; \
+                     a peer chain verified against no pinned anchor verifies nothing"
+                );
+            }
+            for anchor in &peer_trust.trust_anchors {
+                if !anchor.entity_id.starts_with("https://") {
+                    anyhow::bail!(
+                        "config compile: proxy.federation.peer_trust.trust_anchors[].entity_id must use https"
+                    );
+                }
+                if anchor
+                    .jwks
+                    .get("keys")
+                    .and_then(serde_json::Value::as_array)
+                    .is_none_or(Vec::is_empty)
+                {
+                    anyhow::bail!(
+                        "config compile: proxy.federation.peer_trust.trust_anchors[].jwks.keys must not be empty"
+                    );
+                }
+            }
+            if peer_trust.header.trim().is_empty()
+                || peer_trust
+                    .header
+                    .bytes()
+                    .any(|byte| !byte.is_ascii_graphic() || byte == b':')
+            {
+                anyhow::bail!(
+                    "config compile: proxy.federation.peer_trust.header must be a header name"
+                );
+            }
+            if peer_trust.max_chain_depth == 0 {
+                anyhow::bail!(
+                    "config compile: proxy.federation.peer_trust.max_chain_depth must be greater than zero"
+                );
+            }
+            if peer_trust.max_chain_fetches == 0 {
+                anyhow::bail!(
+                    "config compile: proxy.federation.peer_trust.max_chain_fetches must be \
+                     greater than zero; a walk with no fetch budget is the unbounded walk \
+                     this key exists to stop"
+                );
+            }
+            if peer_trust.max_chain_bytes == 0 {
+                anyhow::bail!(
+                    "config compile: proxy.federation.peer_trust.max_chain_bytes must be greater than zero"
+                );
+            }
+            if peer_trust.max_chain_duration_ms == 0 {
+                anyhow::bail!(
+                    "config compile: proxy.federation.peer_trust.max_chain_duration_ms must be greater than zero"
+                );
+            }
+            if peer_trust.max_authority_hints == 0 {
+                anyhow::bail!(
+                    "config compile: proxy.federation.peer_trust.max_authority_hints must be greater than zero"
+                );
+            }
+            if peer_trust.walks_per_minute == 0 {
+                anyhow::bail!(
+                    "config compile: proxy.federation.peer_trust.walks_per_minute must be \
+                     greater than zero; the per-source rate limit is what stops a caller \
+                     that rotates the entity id it claims from driving one chain walk per request"
+                );
+            }
+            if peer_trust.cache_ttl_secs == 0 {
+                anyhow::bail!(
+                    "config compile: proxy.federation.peer_trust.cache_ttl_secs must be greater than zero"
+                );
+            }
+            if peer_trust.required && federation.authority_hints.is_empty() {
+                // Not fatal to the peer check itself, but it means this
+                // proxy demands a chain from every caller while
+                // publishing a statement no caller can chain. Refusing
+                // is cheaper than the asymmetry.
+                anyhow::bail!(
+                    "config compile: proxy.federation.peer_trust.required needs \
+                     proxy.federation.authority_hints, or peers cannot chain this entity back"
+                );
+            }
+        }
+    }
+
     config_file.proxy.validate_bind_address()?;
 
     config_file
@@ -2765,6 +2895,11 @@ fn compile_egress_gates(cfg: Option<&EgressTopLevelConfig>) -> Result<CompiledEg
             &[EgressPurpose::TokenExchange],
             cfg.token_exchange.as_ref(),
             "token_exchange",
+        )?,
+        federation: compile_egress_purpose(
+            &[EgressPurpose::Federation],
+            cfg.federation.as_ref(),
+            "federation",
         )?,
         telemetry: compile_egress_purpose(
             &[EgressPurpose::Telemetry],

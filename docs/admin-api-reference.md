@@ -1743,7 +1743,7 @@ gateway has reached (or attempted to reach) since process start, with its
 most recent authorization outcome. Both `admin` and `read_only` operators
 may call the route.
 
-Every one of the thirteen wired egress purposes below goes through the
+Every one of the fourteen wired egress purposes below goes through the
 same authorizer and lands in the same inventory and, on denial, the same
 event:
 
@@ -1803,27 +1803,29 @@ stops being tracked while every already-tracked one keeps updating. Every
 wired egress purpose writes here: AI providers, the dual-LLM quarantine
 judge, agent endpoints invoked by AI toolkit workflows, stock classifier
 hooks, OpenAPI-backed MCP tools, token exchange, webhooks, usage sinks,
-model and engine artifact downloads, extension bundle hooks, and the OTLP
-telemetry exporters. `mcp_upstream` covers the base MCP connect for a
-plain `type: mcp` federated server, gated and DNS-pinned at the dial.
+model and engine artifact downloads, extension bundle hooks, OpenID
+Federation peer fetches, and the OTLP telemetry exporters.
+`mcp_upstream` covers the base MCP connect for a plain `type: mcp`
+federated server, gated and DNS-pinned at the dial.
 
-The thirteen purpose labels, exactly as they appear in
+The fourteen purpose labels, exactly as they appear in
 `endpoints[].purpose`, in `sbproxy_egress_refused_total{purpose}`, and in
 the `egress_refused` event, are `ai_provider`, `ai_judge`,
 `agent_orchestration`, `classifier_hook`, `mcp_upstream`, `openapi_tool`,
 `token_exchange`, `webhook`, `usage_sink`, `model_artifact`,
-`engine_artifact`, `bundle_hook`, and `telemetry`.
+`engine_artifact`, `bundle_hook`, `federation`, and `telemetry`.
 
 The top-level `egress:` section (see
-[Egress allowlists](configuration.md#egress-allowlists)) arms eight of
-the purposes above through seven sub-blocks: `ai_providers` (AI
+[Egress allowlists](configuration.md#egress-allowlists)) arms nine of
+the purposes above through eight sub-blocks: `ai_providers` (AI
 providers), `agent_orchestration` (agent endpoints invoked by configured
 AI toolkit workflows), `classifier_hooks` (stock intent and
 provider-quality classifier RPCs), `usage_sinks` (usage sinks and
 webhooks, one allowlist for both, including the `events:` webhook sink),
 `model_artifacts`, `token_exchange` (both the non-MCP
 outbound-credential resolver and the MCP run-as-user token exchange),
-and `telemetry`. Until a sub-block sets `mode: deny_by_default`, its
+`federation` (the OpenID Federation entity-configuration and
+subordinate-statement fetches), and `telemetry`. Until a sub-block sets `mode: deny_by_default`, its
 purpose stays `ungated`: reached, but nothing was ever denied because
 nothing was armed. `agent_orchestration` is the exception in the other
 direction: a configured agent fails closed unless that sub-block arms it
@@ -1845,20 +1847,25 @@ No purpose lets its HTTP client follow a redirect on its own. Each `3xx`
 fresh DNS pins; a chain longer than ten hops is refused with
 `too_many_redirects`.
 
-Two purposes go further and dial only the addresses that authorization
+Three purposes go further and dial only the addresses that authorization
 resolved, on the first request and on every hop after it: the
-`token_exchange` calls the MCP run-as-user exchange makes, and the
-`webhook` deliveries the `events:` sink makes. Those are the two whose
-request body is itself a credential. The others, `ai_provider`,
-`usage_sink`, and `model_artifact`, re-authorize each hop against the
-allowlist and then let the client resolve the host again at dial time,
-so the allowlist and the hop bound apply and the DNS pin does not yet.
+`token_exchange` calls the MCP run-as-user exchange makes, the
+`webhook` deliveries the `events:` sink makes, and every `federation`
+fetch. The first two are the ones whose request body is itself a
+credential. `federation` is pinned for a different reason: the peer URL
+arrives signed by another entity in the trust chain rather than from
+this operator's config, so it is also the one purpose that refuses a
+private, loopback, or link-local destination whether or not
+`egress.federation` is armed. The others, `ai_provider`, `usage_sink`,
+and `model_artifact`, re-authorize each hop against the allowlist and
+then let the client resolve the host again at dial time, so the
+allowlist and the hop bound apply and the DNS pin does not yet.
 
 Every hop shows up in this inventory under its own host, so a redirect
 chain is visible here as the several destinations it actually is rather
 than as the one URL an operator configured.
 
-On the two pinned purposes, a hop that changes scheme, host, or port
+On the pinned purposes, a hop that changes scheme, host, or port
 drops `Authorization`, `Proxy-Authorization`, `Cookie`, and any
 signature header before it is replayed. A request carrying a body does
 not make that hop at all: it is refused with
@@ -3387,17 +3394,155 @@ model-host artifact cache above:
 | POST | `/admin/cache/purge` | Evict response-cache entries: by exact key, by prefix, or all. |
 | POST | `/admin/cache/key-policy/evict` | Drop one (or all) cached key policies so the next request re-reads the keystore. |
 | GET | `/admin/cache/semantic` | Recent semantic (embedding) cache lookup decisions per AI origin. |
+| GET | `/admin/federation` | OpenID Federation identity this proxy publishes, and what it requires of a peer. |
+| GET | `/admin/mcp-oauth` | Every colocated MCP OAuth broker this proxy runs, and what each has wired in. |
 
 ### `GET /admin/cache`
 
 ```json
-{"enabled": true, "backend": "redis", "prefix_purge_supported": true}
+{
+  "enabled": true,
+  "backend": "redis",
+  "prefix_purge_supported": true,
+  "reserve": {
+    "configured": true,
+    "active": true,
+    "backend": "s3",
+    "state": "degraded",
+    "since": "2026-08-27T03:04:11Z",
+    "recovered_at": null,
+    "last_operation": "put",
+    "reason_code": "backend_unavailable",
+    "last_error": "reserve put failed"
+  }
+}
 ```
 
-`{"enabled": false}` when no origin turned on response caching.
+When no origin turned on response caching the two cache fields collapse
+and the `reserve` object is still present:
+
+```json
+{"enabled": false, "reserve": {"configured": false, "active": false, "backend": "none", "state": "inactive", "since": "2026-08-27T03:00:00Z", "recovered_at": null, "last_operation": null, "reason_code": null, "last_error": null}}
+```
+
 `prefix_purge_supported` is true only for `memory` and `redis`
 backends (`file` hashes keys into filenames and cannot scan by
 prefix; `memcached` has no scan primitive).
+
+The `reserve` object is the Cache Reserve tier's health, and it is what
+the "Cache Reserve Backend State" tile in
+[`dashboards/grafana/sbproxy-mesh-storage.json`](../dashboards/grafana/sbproxy-mesh-storage.json)
+sends an operator here for:
+
+| Field | Meaning |
+|---|---|
+| `configured` | An operator wrote a `cache_reserve:` block. |
+| `active` | The reserve is wired into the pipeline and serving. |
+| `backend` | `memory`, `filesystem`, `redis`, `s3`, or `none`. |
+| `state` | `healthy`, `degraded`, or `inactive`. |
+| `since` | When the current state began, RFC 3339. |
+| `recovered_at` | When the last degraded-to-healthy transition happened, or `null`. |
+| `last_operation` | The reserve operation that last set the state: `initialize`, `get`, `put`, `delete`, or `evict`. |
+| `reason_code` | Bounded reason for a degraded state, or `null` when healthy. |
+| `last_error` | Bounded error string for a degraded state, or `null`. |
+
+`reason_code` and `last_error` are both bounded, operator-facing
+constants rather than pass-through backend text, so a monitoring script
+can match on them.
+
+### `GET /admin/federation`
+
+OpenID Federation identity and peer trust. Returns `{"enabled": false}`
+when `proxy.federation` is absent or disabled, so a poll can tell "off"
+from a typo in the path. Both `admin` and `read_only` operators may call
+it.
+
+```json
+{
+  "enabled": true,
+  "entity_id": "https://gateway.acme.example",
+  "signing_algorithm": "ES256",
+  "signing_kid": "fed-2026q3",
+  "published_keys": 1,
+  "authority_hints": 1,
+  "trust_marks": 0,
+  "metadata_policy_configured": false,
+  "lifetime_secs": 86400,
+  "refresh_margin_secs": 7800,
+  "cache_remaining_secs": 79211,
+  "peer_trust": {
+    "configured": true,
+    "required": false,
+    "header": "x-federation-entity-id",
+    "pinned_anchors": 1,
+    "cached_peer_decisions": 3
+  }
+}
+```
+
+`cache_remaining_secs` is `null` when the signing key cannot produce a
+statement, which is the same failure
+`GET /.well-known/openid-federation` answers 503 for; the rest of the
+response still comes back so an operator can check the configuration
+while it is broken. `peer_trust` is `{"configured": false}` when no
+`proxy.federation.peer_trust` block is set.
+
+This route is the federation crate's own `GET /admin/status` surface,
+served under the proxy's authenticated admin API because sbproxy serves
+the well-known route from the request path and never mounts that crate's
+router. An admin console page for it is separate scope, under the admin
+console epic; the JSON here is the operator surface today. See
+[federation.md](federation.md).
+
+### `GET /admin/mcp-oauth`
+
+Colocated MCP OAuth brokers. Returns `{"enabled": false}` when no `mcp`
+action configures `oauth.broker`, so a poll can tell "off" from a typo
+in the path. Both `admin` and `read_only` operators may call it.
+
+```json
+{
+  "enabled": true,
+  "brokers": [
+    {
+      "base_path": "/mcp/oauth",
+      "resource_server_configured": true,
+      "features": {
+        "as_metadata_cache": true,
+        "cimd": true,
+        "cimd_to_dcr_translation": false,
+        "dpop_replay_cache": true,
+        "dpop_nonce_issuer": true,
+        "device_code_grant": true,
+        "pushed_authorization_requests": false,
+        "revocation": false,
+        "introspection": false,
+        "token_exchange": false,
+        "broker_signing_key": true
+      }
+    }
+  ]
+}
+```
+
+One entry per `mcp` action carrying an `oauth.broker` block.
+`resource_server_configured` is the question worth polling: a broker
+with no verifier mints tokens nothing on this proxy checks.
+`pushed_authorization_requests` is always `false` on a colocated broker
+because the in-process constructor does not build a PAR store; the
+standalone embedding is where that route is available.
+
+This route exists because the broker's own
+`GET {base_path}/admin/status` is deliberately **not** mounted in
+process. The broker's whole route tree is dispatched on the public MCP
+origin ahead of the resource-server check, and the OAuth routes have to
+stay unauthenticated for the flow to work, so a route answering "which
+security controls are off" would be world-readable there. Same JSON,
+behind operator auth, like
+[`GET /admin/federation`](#get-adminfederation). An admin console page
+for it is separate scope, under the admin console epic; the JSON here
+is the operator surface today. See [mcp.md](mcp.md) and
+[mcp-oauth-gateway.md](mcp-oauth-gateway.md).
 
 ### `POST /admin/cache/purge`
 

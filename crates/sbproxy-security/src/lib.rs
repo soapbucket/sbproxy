@@ -14,6 +14,7 @@ pub mod governed_egress;
 pub mod headless_detect;
 pub mod hostfilter;
 pub mod ip;
+pub mod log_safe;
 pub mod pii;
 pub mod sealed_record;
 pub mod span;

@@ -1009,13 +1009,30 @@ impl OutcomeProbeSnapshot {
         true
     }
 
-    pub(crate) fn assert_exact_terminal_delta(
+    /// How long a terminal-outcome assertion waits for the server to
+    /// finish booking the exchange the client has already seen answered.
+    ///
+    /// A response reaching the client is not a happens-before edge for the
+    /// bookkeeping behind it: the transport records the terminal outcome
+    /// after the flush, so a test that captures the counters the instant
+    /// `wire_exchange` returns is reading them from the wrong side of a
+    /// race. Under CI load that is a real failure, not a slow test, which
+    /// is how it showed up: `left: 0, right: 1` on a completion the server
+    /// had not written yet.
+    ///
+    /// So every assertion here settles first. It is not a sleep: the wait
+    /// ends the moment the counters match, and the exactness is unchanged
+    /// because a delta that overshoots never matches and the deadline
+    /// still ends in the same assertion, with the same message.
+    const TERMINAL_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
+
+    pub(crate) async fn assert_exact_terminal_delta(
         &self,
         expected: OutcomeExpectation,
         case_name: &str,
     ) {
-        let after = Self::capture();
-        self.assert_exact_terminal_multiset_delta_with_after(&after, &[(expected, 1)], case_name);
+        self.wait_for_exact_terminal_delta(expected, case_name, Self::TERMINAL_SETTLE)
+            .await;
     }
 
     pub(crate) async fn wait_for_exact_terminal_delta(
@@ -1024,36 +1041,46 @@ impl OutcomeProbeSnapshot {
         case_name: &str,
         timeout: std::time::Duration,
     ) {
+        self.wait_for_exact_terminal_multiset_delta(&[(expected, 1)], case_name, timeout)
+            .await;
+    }
+
+    pub(crate) async fn assert_exact_terminal_multiset_delta(
+        &self,
+        expected: &[(OutcomeExpectation, u64)],
+        case_name: &str,
+    ) {
+        self.wait_for_exact_terminal_multiset_delta(expected, case_name, Self::TERMINAL_SETTLE)
+            .await;
+    }
+
+    async fn wait_for_exact_terminal_multiset_delta(
+        &self,
+        expected: &[(OutcomeExpectation, u64)],
+        case_name: &str,
+        timeout: std::time::Duration,
+    ) {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let after = Self::capture();
-            let expected_once = [(expected, 1)];
-            if self.matches_exact_terminal_multiset_delta(&after, &expected_once) {
+            if self.matches_exact_terminal_multiset_delta(&after, expected) {
                 return;
             }
             if tokio::time::Instant::now() >= deadline {
-                self.assert_exact_terminal_multiset_delta_with_after(
-                    &after,
-                    &expected_once,
-                    case_name,
-                );
+                self.assert_exact_terminal_multiset_delta_with_after(&after, expected, case_name);
                 unreachable!("terminal delta assertion panicked");
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
 
-    pub(crate) fn assert_exact_terminal_multiset_delta(
-        &self,
-        expected: &[(OutcomeExpectation, u64)],
-        case_name: &str,
-    ) {
-        let after = Self::capture();
-        self.assert_exact_terminal_multiset_delta_with_after(&after, expected, case_name);
-    }
-
+    /// Deliberately immediate, unlike its siblings above: this asserts
+    /// that nothing was booked, and settling for an absence would only
+    /// give a late outcome time to arrive and turn a pass into a failure
+    /// that is about timing rather than about the transport.
     pub(crate) fn assert_no_terminal_delta(&self, case_name: &str) {
-        self.assert_exact_terminal_multiset_delta(&[], case_name);
+        let after = Self::capture();
+        self.assert_exact_terminal_multiset_delta_with_after(&after, &[], case_name);
     }
 }
 

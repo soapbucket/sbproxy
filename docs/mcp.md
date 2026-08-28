@@ -1,6 +1,6 @@
 # MCP gateway
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-27*
 
 SBproxy ships an MCP (Model Context Protocol) gateway that speaks
 JSON-RPC 2.0 over HTTP POST. Configure the `mcp` action on an origin
@@ -555,10 +555,123 @@ oauth:
   scopes_supported: ["mcp.read", "mcp.call"]
 ```
 
-Token validation itself stays in the generic auth layer; this block
-only drives discovery and the challenge. A request that already
-carries an `Authorization` header is never re-challenged. See
-[`examples/mcp-oauth-discovery`](../examples/mcp-oauth-discovery).
+The discovery-only form above is still supported. Add `broker` and
+`resource_server` when this MCP action should own the OAuth flow and
+validate its tokens in the same sbproxy process:
+
+```yaml
+oauth:
+  authorization_servers: ["https://mcp.example.com/mcp/oauth"]
+  scopes_supported: ["mcp.read", "mcp.call"]
+  broker:
+    base_path: /mcp/oauth
+    external_base_url: https://mcp.example.com
+    upstream_authorization_server_url: https://idp.example.com/authorize
+    upstream_metadata_url: https://idp.example.com/.well-known/oauth-authorization-server
+    upstream_token_endpoint_url: https://idp.example.com/token
+    upstream_redirect_uri: https://mcp.example.com/mcp/oauth/callback
+    resource_uri: https://mcp.example.com/
+    allowed_redirect_uris: ["https://client.example.com/callback"]
+    session_ttl_secs: 600
+    broker_signing_key:
+      pem: "${MCP_BROKER_SIGNING_KEY_PEM}"
+      alg: ES256
+      kid: broker-2026-08
+      # The public half of the same key, with the same kid and alg.
+      # Required: without it `/.well-known/jwks.json` serves an empty
+      # key set while AS metadata advertises that URL as where the key
+      # is, and every verifier that follows discovery rejects every
+      # token this broker mints. Startup refuses the combination.
+      public_jwk:
+        kty: EC
+        crv: P-256
+        kid: broker-2026-08
+        alg: ES256
+        use: sig
+        x: "${MCP_BROKER_SIGNING_KEY_X}"
+        y: "${MCP_BROKER_SIGNING_KEY_Y}"
+  resource_server:
+    resource_uri: https://mcp.example.com/
+    authorization_servers: ["https://mcp.example.com/mcp/oauth"]
+    jwks_url: https://mcp.example.com/mcp/oauth/.well-known/jwks.json
+    audience: https://mcp.example.com/
+    issuer: https://mcp.example.com/mcp/oauth
+    scopes_supported: ["mcp.read", "mcp.call"]
+```
+
+The action compiler requires the discovery and verifier authorization
+servers/scopes to match. It also requires the broker and verifier to
+use the same RFC 8707 resource URI. Protected MCP requests reach the
+verifier before the catalog, request body, or upstream federation.
+The device verification route receives user identity only from
+sbproxy's completed authentication phase, and mTLS bindings receive a
+certificate thumbprint only from the verified TLS connection.
+
+When `resource_server.jwks_url` is the colocated broker's own
+`/.well-known/jwks.json`, as above, the verifier takes the key set from
+the broker in process and makes no HTTP request for it. That matters in
+a cluster: `mcp.example.com` resolves inside a pod to a private address
+or to a load-balancer VIP the pod cannot hairpin, and the OAuth egress
+policy refuses both, so a network fetch of the proxy's own JWKS URL
+would 401 every MCP request.
+
+**One replica per broker.** The colocated broker holds its authorization
+sessions, device codes, and PAR entries in the process that started
+them, and `oauth.broker` has no key to point them at a shared store. A
+second replica behind a load balancer receives the `/callback` for a
+session replica one holds and rejects it, so roughly two logins in three
+fail on three replicas. Run the broker-bearing action on one replica, or
+embed the broker standalone against `sbproxy_storage::RedisStore` per
+[mcp-oauth-gateway.md](mcp-oauth-gateway.md#storage-in-process-by-default-redis-for-multiple-replicas).
+A multi-replica store selector under `oauth.broker` is not shipped.
+
+[`GET /admin/mcp-oauth`](admin-api-reference.md#get-adminmcp-oauth) on
+the proxy's admin listener reports every colocated broker and what each
+has wired in, including whether a resource server is configured to
+check the tokens it mints. The broker's own
+`GET {base_path}/admin/status` is not mounted in process, because these
+routes sit on the public MCP origin ahead of the verifier.
+
+Every refusal this surface makes is visible: the resource server's 401,
+the per-operation scope refusal, and each broker endpoint's 4xx write
+`sbproxy_mcp_gateway_decisions_total{surface,decision}`, one
+`mcp_gateway::decision` log line, and a typed decision-audit record
+(`auth` for the broker and the verifier, `mcp.tool` for the scope
+refusal). See [events.md](events.md).
+
+With a `resource_server`, the verified token's scopes are also checked
+per operation. `tools/call` needs `mcp.call`; every other method needs
+`mcp.read`. A request whose token carries neither gets a JSON-RPC
+`invalid_params` naming the scope it lacks, before the catalog, tool
+policy, or upstream federation is touched.
+
+The mapping is sbproxy's convention rather than something RFC 9728
+fixes, so it applies only to the scope names above and only when
+`scopes_supported` advertises them. Advertise a vocabulary of your own
+and sbproxy does not enforce a per-operation mapping over it; the
+authorization server owns that decision instead. Audience, issuer,
+expiry, DPoP, and mTLS binding are checked either way.
+
+That is a fail-open, and it is counted as one: every request the check
+does not apply to increments
+`sbproxy_mcp_gateway_decisions_total{surface="scope",decision="admitted_unadvertised"}`
+and logs one line naming the scope that went unchecked. Watch it if you
+publish a partial vocabulary. Advertising `["mcp.read"]` alone on an
+action you meant to keep read-only admits every `tools/call`, because
+`mcp.call` is not in the list for the check to enforce.
+
+See [`examples/mcp-oauth-discovery`](../examples/mcp-oauth-discovery)
+for the discovery-only shape and
+[`examples/mcp-oauth-broker`](../examples/mcp-oauth-broker) for the
+colocated broker plus resource server above, as a runnable `sb.yml`.
+The full broker behavior and standalone
+embedding API are documented in
+[mcp-oauth-gateway.md](mcp-oauth-gateway.md).
+
+For an MCP server that is not itself proxied through `sbproxy`, see
+[mcp-oauth-gateway.md](mcp-oauth-gateway.md): a standalone OAuth 2.1
+broker plus a resource-server companion, usable without running the
+rest of `sbproxy` at all.
 
 ## Discovery manifest
 

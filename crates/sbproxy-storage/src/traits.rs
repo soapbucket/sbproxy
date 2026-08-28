@@ -94,6 +94,26 @@ pub trait EphemeralKv: Send + Sync {
     async fn exists(&self, key: &str) -> Result<bool, StorageError> {
         Ok(self.get(key).await?.is_some())
     }
+
+    /// Atomically replace or delete `key` only when its current value
+    /// exactly matches `expected` (`None` means the key must be absent).
+    /// Returns `Ok(true)` when the mutation happened and `Ok(false)` on a
+    /// comparison miss.
+    ///
+    /// Security state machines use this operation for transitions that
+    /// must have one winner across replicas. Backends that do not provide
+    /// native CAS semantics fail closed instead of emulating a racy
+    /// get-then-put sequence.
+    async fn compare_exchange(
+        &self,
+        _key: &str,
+        _expected: Option<Bytes>,
+        _replacement: Option<(Bytes, Duration)>,
+    ) -> Result<bool, StorageError> {
+        Err(StorageError::InvalidConfig(
+            "ephemeral compare_exchange is not supported by this backend".to_string(),
+        ))
+    }
 }
 
 /// Durable key/value storage with prefix listing.
@@ -117,6 +137,22 @@ pub trait PersistentKv: Send + Sync {
     /// Return every key whose name begins with `prefix`. Order is
     /// implementation-defined; callers that need ordering must sort.
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, StorageError>;
+
+    /// Atomically replace or delete `key` only when its current value
+    /// exactly matches `expected` (`None` means the key must be absent).
+    /// Returns `Ok(true)` on mutation and `Ok(false)` on a comparison
+    /// miss. Durable caches use this to update a bounded index without
+    /// races between replicas.
+    async fn compare_exchange(
+        &self,
+        _key: &str,
+        _expected: Option<Bytes>,
+        _replacement: Option<Bytes>,
+    ) -> Result<bool, StorageError> {
+        Err(StorageError::InvalidConfig(
+            "persistent compare_exchange is not supported by this backend".to_string(),
+        ))
+    }
 }
 
 /// Broadcast / pub-sub channel for fan-out notifications.
