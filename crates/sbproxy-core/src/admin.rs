@@ -3193,6 +3193,249 @@ fn config_write_redirect(layers: &crate::config_effective::ConfigLayers) -> Stri
     }
 }
 
+/// Read this node's own config file and assemble the document it is
+/// actually running, or the response that says why not.
+///
+/// Shared by `GET /admin/config/effective` and
+/// `GET /admin/origin-composition`, which need the same three steps and
+/// the same three failures. They were written out twice, which meant two
+/// copies of the hand-rolled JSON error bodies and two places for the
+/// "config path not wired" contract to drift.
+fn effective_document(state: &AdminState) -> Result<EffectiveDocument, AdminResponse> {
+    let Some(path) = state.config_path.as_ref() else {
+        return Err((
+            503,
+            "application/json",
+            r#"{"error":"config path not wired"}"#.to_string(),
+        ));
+    };
+    let local = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) => {
+            let message = sanitise_path_in_error(&error.to_string(), path);
+            return Err((
+                500,
+                "application/json",
+                serde_json::json!({"error": format!("read config: {message}")}).to_string(),
+            ));
+        }
+    };
+    let layers = crate::config_effective::current_layers(&local);
+    match crate::config_effective::effective_config(&layers) {
+        Ok(effective) => Ok(EffectiveDocument { layers, effective }),
+        Err(error) => {
+            // A merge that fails here failed for the running node too, so
+            // the node is serving whatever it last applied. Say so rather
+            // than reporting a document that was never assembled.
+            tracing::warn!(%error, "admin: effective config merge failed");
+            Err((
+                500,
+                "application/json",
+                serde_json::json!({
+                    "error": format!("could not assemble the effective config: {error}"),
+                    "code": "effective_config_unavailable",
+                    "layers": config_layers_json(&layers),
+                })
+                .to_string(),
+            ))
+        }
+    }
+}
+
+/// The layers in play and the document they merged to.
+struct EffectiveDocument {
+    layers: crate::config_effective::ConfigLayers,
+    effective: crate::config_effective::EffectiveConfig,
+}
+
+/// `GET /admin/origin-composition`: which project repositories this
+/// node's configuration pulls, what hosts each one claims, and the
+/// platform floor every composed origin starts from (WOR-2436).
+///
+/// Read-only, and answerable with nothing fetched. `origin_sources`
+/// names the hosts itself, so the collision check and the pin state are
+/// both properties of the document rather than of a clone. A node never
+/// composes (composition runs in one aggregator, WOR-2437), so what an
+/// operator wants here is the declaration and its posture, which is
+/// exactly what this returns.
+///
+/// Read off the **effective** config rather than the node's own file,
+/// for the same reason `/admin/config/effective` exists: on a
+/// git-sourced node the local file is only the pointer that selected the
+/// repository. `origin_sources` is on `AUTHORITY_DENIED_PATHS`, so an
+/// authority never contributes to what this reports, and seeing it here
+/// is how an operator confirms that.
+///
+/// Nothing secret-shaped is emitted. A repository URL is
+/// credential-stripped, an entry credential is reported as present or
+/// absent and never by value, and an input is reported by name only,
+/// because an input value is exactly where a secret reference lands.
+///
+/// A console page is deferred to WOR-2574. Until it lands this route is
+/// the operator surface, and the console will read the same JSON.
+fn handle_origin_composition(state: &AdminState) -> (u16, &'static str, String) {
+    let Some(path) = state.config_path.as_ref() else {
+        return (
+            503,
+            "application/json",
+            r#"{"error":"config path not wired"}"#.to_string(),
+        );
+    };
+    let local = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) => {
+            let message = sanitise_path_in_error(&error.to_string(), path);
+            return (
+                500,
+                "application/json",
+                format!(
+                    r#"{{"error":"read config: {}"}}"#,
+                    message.replace('"', "'")
+                ),
+            );
+        }
+    };
+    let layers = crate::config_effective::current_layers(&local);
+    let yaml = match crate::config_effective::effective_config(&layers) {
+        Ok(effective) => effective.yaml,
+        Err(error) => {
+            tracing::warn!(%error, "admin origin composition: merge failed");
+            return (
+                500,
+                "application/json",
+                serde_json::json!({
+                    "error": format!("could not assemble the effective config: {error}"),
+                    "code": "effective_config_unavailable",
+                })
+                .to_string(),
+            );
+        }
+    };
+    let config: sbproxy_config::ConfigFile = match serde_yaml::from_str(&yaml) {
+        Ok(config) => config,
+        Err(error) => {
+            return (
+                500,
+                "application/json",
+                serde_json::json!({
+                    "error": format!("effective config does not parse: {error}"),
+                    "code": "effective_config_unparseable",
+                })
+                .to_string(),
+            )
+        }
+    };
+    (
+        200,
+        "application/json",
+        origin_composition_json(&config).to_string(),
+    )
+}
+
+/// The body of `GET /admin/origin-composition`, as a pure function of
+/// the parsed config so it can be asserted on without a listener.
+fn origin_composition_json(config: &sbproxy_config::ConfigFile) -> serde_json::Value {
+    let Some(sources) = config.origin_sources.as_ref() else {
+        return serde_json::json!({
+            "declared": false,
+            "note": "no `origin_sources:` block; every origin on this node is hand written",
+            "origin_defaults": origin_defaults_json(config),
+        });
+    };
+    let entries: Vec<serde_json::Value> = sources
+        .entries
+        .iter()
+        .map(|entry| {
+            let mut input_names: Vec<&str> = entry.inputs.keys().map(String::as_str).collect();
+            input_names.sort_unstable();
+            serde_json::json!({
+                "name": entry.name,
+                "repo": sbproxy_config::redact_repo(&entry.repo),
+                "revision": entry.revision,
+                "pinned": entry
+                    .revision
+                    .as_deref()
+                    .is_some_and(sbproxy_config::revision_is_immutable),
+                "path": entry.path,
+                "environment": entry.environment,
+                "verify_signature": entry.verify_signature,
+                "timeout_secs": entry.timeout_secs,
+                "credential": if entry.credential.is_some() { "reference" } else { "none" },
+                "hosts": entry.hosts,
+                "inputs": input_names,
+                "has_overrides": entry.overrides.is_some(),
+            })
+        })
+        .collect();
+    let hand_written: std::collections::BTreeSet<String> = config.origins.keys().cloned().collect();
+    let (claims, collision) = match sbproxy_config::claimed_hosts(&sources.entries, &hand_written) {
+        Ok(claims) => (
+            claims
+                .iter()
+                .map(|claim| {
+                    serde_json::json!({
+                        "host": claim.host,
+                        "entry": claim.entry,
+                        "profile_origin": claim.profile_origin,
+                        "repo": claim.repo,
+                    })
+                })
+                .collect::<Vec<_>>(),
+            serde_json::Value::Null,
+        ),
+        Err(error) => (Vec::new(), serde_json::json!(error.to_string())),
+    };
+    serde_json::json!({
+        "declared": true,
+        "tier": sources.tier.as_str(),
+        "entries": entries,
+        "claimed_hosts": claims,
+        "collision": collision,
+        "hand_written_origins": hand_written,
+        "origin_defaults": origin_defaults_json(config),
+        "note": "composition runs in the aggregator, not on this node; these are the \
+                 declarations this node's effective config carries",
+    })
+}
+
+/// The platform floor, summarized by the names a project can address and
+/// which of them are locked against override.
+fn origin_defaults_json(config: &sbproxy_config::ConfigFile) -> serde_json::Value {
+    let Some(defaults) = config.origin_defaults.as_ref() else {
+        return serde_json::json!({"present": false});
+    };
+    let mut lists = serde_json::Map::new();
+    for list in sbproxy_config::PROFILE_LIST_MERGE_KEYS {
+        let Some(items) = defaults.get(*list).and_then(serde_yaml::Value::as_sequence) else {
+            continue;
+        };
+        let named: Vec<serde_json::Value> = items
+            .iter()
+            .map(|item| {
+                serde_json::json!({
+                    "name": item
+                        .get("name")
+                        .and_then(serde_yaml::Value::as_str)
+                        .unwrap_or("(unnamed)"),
+                    "locked": item
+                        .get("locked")
+                        .and_then(serde_yaml::Value::as_bool)
+                        .unwrap_or(false),
+                })
+            })
+            .collect();
+        lists.insert((*list).to_string(), serde_json::Value::Array(named));
+    }
+    serde_json::json!({
+        "present": true,
+        "keys": defaults
+            .keys()
+            .filter_map(serde_yaml::Value::as_str)
+            .collect::<Vec<_>>(),
+        "addressable": lists,
+    })
+}
+
 /// `GET /admin/config/effective`: the configuration this node is actually
 /// running, plus which layer owns each leaf of it.
 ///
@@ -3207,46 +3450,9 @@ fn config_write_redirect(layers: &crate::config_effective::ConfigLayers) -> Stri
 /// file or an authority layer inlined, so the sibling endpoint must not
 /// return what the primary one redacts.
 fn handle_config_effective(state: &AdminState) -> (u16, &'static str, String) {
-    let path = match state.config_path.as_ref() {
-        Some(p) => p,
-        None => {
-            return (
-                503,
-                "application/json",
-                r#"{"error":"config path not wired"}"#.to_string(),
-            );
-        }
-    };
-    let local = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => {
-            let msg = sanitise_path_in_error(&e.to_string(), path);
-            return (
-                500,
-                "application/json",
-                format!(r#"{{"error":"read config: {}"}}"#, msg.replace('"', "'")),
-            );
-        }
-    };
-    let layers = crate::config_effective::current_layers(&local);
-    let effective = match crate::config_effective::effective_config(&layers) {
-        Ok(effective) => effective,
-        Err(error) => {
-            // A merge that fails here failed for the running node too, so
-            // the node is serving whatever it last applied. Say so rather
-            // than reporting a document that was never assembled.
-            tracing::warn!(%error, "admin effective config: merge failed");
-            return (
-                500,
-                "application/json",
-                serde_json::json!({
-                    "error": format!("could not assemble the effective config: {error}"),
-                    "code": "effective_config_unavailable",
-                    "layers": config_layers_json(&layers),
-                })
-                .to_string(),
-            );
-        }
+    let EffectiveDocument { layers, effective } = match effective_document(state) {
+        Ok(document) => document,
+        Err(response) => return response,
     };
     let locally_owned = effective
         .provenance
@@ -5927,6 +6133,19 @@ pub fn handle_admin_request(
     if path_only == "/admin/ai-data-posture" {
         if method.eq_ignore_ascii_case("GET") {
             return handle_ai_data_posture();
+        }
+        return (
+            405,
+            "application/json",
+            r#"{"error":"method not allowed"}"#.to_string(),
+        );
+    }
+    // WOR-2436: which project repositories this node's configuration
+    // pulls and what hosts each one claims. Read-only; same operator-auth
+    // gate as every route past this point.
+    if path_only == "/admin/origin-composition" {
+        if method.eq_ignore_ascii_case("GET") {
+            return handle_origin_composition(state);
         }
         return (
             405,
@@ -11248,6 +11467,143 @@ mod tests {
         }
     }
 
+    /// WOR-2436: the operator surface for the two composition blocks.
+    ///
+    /// The assertion that matters is the negative one. Three
+    /// secret-shaped values go in (a repository URL with an embedded
+    /// token, an entry credential reference, and a bound input) and none
+    /// of them comes out.
+    #[test]
+    fn origin_composition_reports_the_declaration_and_never_a_secret() {
+        let config: sbproxy_config::ConfigFile = serde_yaml::from_str(
+            r#"
+origins: {}
+origin_defaults:
+  policies:
+    - name: waf
+      type: waf
+      locked: true
+    - name: rate_limit
+      type: rate_limit
+origin_sources:
+  tier: production
+  entries:
+    - name: checkout
+      repo: https://octocat:ghp_TOKENVALUE@git.test/acme/checkout
+      revision: refs/tags/v1.4.2
+      path: sbproxy/origin.yaml
+      credential: "secret://ci/github-token"
+      verify_signature: true
+      timeout_secs: 30
+      hosts:
+        api: ["checkout.acme.test"]
+      inputs:
+        upstream_key: "secret://prod/checkout-key"
+"#,
+        )
+        .expect("fixture parses");
+        let body = origin_composition_json(&config);
+        let text = body.to_string();
+        for secret in [
+            "ghp_TOKENVALUE",
+            "secret://ci/github-token",
+            "secret://prod/checkout-key",
+        ] {
+            assert!(!text.contains(secret), "`{secret}` leaked into {text}");
+        }
+        assert_eq!(body["declared"], true);
+        assert_eq!(body["tier"], "production");
+        assert_eq!(body["entries"][0]["pinned"], true);
+        assert_eq!(body["entries"][0]["credential"], "reference");
+        assert_eq!(body["entries"][0]["verify_signature"], true);
+        assert_eq!(body["entries"][0]["timeout_secs"], 30);
+        assert_eq!(body["entries"][0]["inputs"][0], "upstream_key");
+        assert_eq!(body["claimed_hosts"][0]["host"], "checkout.acme.test");
+        assert_eq!(body["claimed_hosts"][0]["profile_origin"], "api");
+        assert_eq!(
+            body["origin_defaults"]["addressable"]["policies"][0]["locked"],
+            true
+        );
+        assert_eq!(
+            body["origin_defaults"]["addressable"]["policies"][1]["locked"],
+            false
+        );
+        assert!(body["collision"].is_null());
+    }
+
+    /// A contested map key is named on the route rather than left for an
+    /// aggregation run to discover.
+    #[test]
+    fn origin_composition_names_a_host_collision() {
+        let config: sbproxy_config::ConfigFile = serde_yaml::from_str(
+            r#"
+origins:
+  "checkout.acme.test":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: local
+origin_sources:
+  entries:
+    - name: checkout
+      repo: https://git.test/acme/checkout
+      path: sbproxy/origin.yaml
+      hosts:
+        api: ["checkout.acme.test"]
+"#,
+        )
+        .expect("fixture parses");
+        let body = origin_composition_json(&config);
+        let collision = body["collision"].as_str().expect("a collision is reported");
+        assert!(collision.contains("checkout.acme.test"), "{collision}");
+        assert!(collision.contains("already declares"), "{collision}");
+    }
+
+    /// A config with neither block says so rather than returning an
+    /// empty structure that reads like a failure.
+    #[test]
+    fn origin_composition_says_so_when_nothing_is_declared() {
+        let config: sbproxy_config::ConfigFile =
+            serde_yaml::from_str("origins: {}\n").expect("fixture parses");
+        let body = origin_composition_json(&config);
+        assert_eq!(body["declared"], false);
+        assert_eq!(body["origin_defaults"]["present"], false);
+    }
+
+    /// The route's authentication is the gate every route past a certain
+    /// point in the dispatcher sits behind, which is a property of where
+    /// 400 lines of `if` put it rather than of anything the route itself
+    /// says. Assert it, the way its neighbours do: the surface reports
+    /// which project repositories a fleet pulls and what hosts they
+    /// claim, and an unauthenticated read of that is reconnaissance.
+    #[test]
+    fn origin_composition_requires_auth() {
+        let state = make_state();
+        let (status, _, _) =
+            handle_admin_request("GET", "/admin/origin-composition", &state, None, None);
+        assert_eq!(status, 401);
+    }
+
+    #[test]
+    fn origin_composition_only_answers_get_and_needs_a_config_path() {
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        for method in ["PUT", "POST", "DELETE"] {
+            let (status, _, _) = handle_admin_request(
+                method,
+                "/admin/origin-composition",
+                &state,
+                Some(&auth),
+                None,
+            );
+            assert_eq!(status, 405, "{method} should not be accepted");
+        }
+        // `make_state` wires no config path, so the read is refused with
+        // the same 503 every config route uses rather than a panic.
+        assert_eq!(handle_origin_composition(&state).0, 503);
+    }
+
     // --- GET /api/audit/chain (WOR-2579) ---
 
     /// The four-channel viewer route serves entries from every installed
@@ -13826,6 +14182,7 @@ origins:
         host_map.insert(CompactString::new("alpha.example"), 0);
         host_map.insert(CompactString::new("beta.example"), 1);
         let cfg = sbproxy_config::CompiledConfig {
+            origin_source_entries: Default::default(),
             extension_bundles: Default::default(),
             origins: vec![
                 make_origin("alpha.example", "kid-alpha"),

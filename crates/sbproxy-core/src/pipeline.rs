@@ -6552,6 +6552,7 @@ origins:
         let mut host_map = HashMap::new();
         host_map.insert(CompactString::new(hostname), 0);
         CompiledConfig {
+            origin_source_entries: Default::default(),
             extension_bundles: Default::default(),
             origins: vec![sbproxy_config::CompiledOrigin {
                 hostname: CompactString::new(hostname),
@@ -7530,6 +7531,7 @@ origins:
         let mut host_map = HashMap::new();
         host_map.insert(CompactString::new(hostname), 0);
         CompiledConfig {
+            origin_source_entries: Default::default(),
             extension_bundles: Default::default(),
             origins: vec![sbproxy_config::CompiledOrigin {
                 hostname: CompactString::new(hostname),

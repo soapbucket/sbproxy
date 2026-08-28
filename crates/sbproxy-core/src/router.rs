@@ -198,6 +198,7 @@ mod tests {
             });
         }
         CompiledConfig {
+            origin_source_entries: Default::default(),
             extension_bundles: Default::default(),
             origins,
             host_map,

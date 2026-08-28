@@ -1025,6 +1025,14 @@ main's 1473, because main's anomaly and auth-provider work gave out-of-file
 consumers to two items this branch had left file-local; neither parent's
 figure describes the merged tree, so neither was taken.
 
+2026-08-28 (WOR-2432 aggregation foundations): tests-only 324 -> 323,
+unreferenced 1520 -> 1518. Two items gained production callers in the same
+round. `origin_source_entry_counts` moved off `compile_config` and onto
+`CompiledConfig`, where `reload::load_pipeline` reads it, because compile
+also runs on candidate documents and publishing a gauge there zeroed the
+live series on every authority publish. And the read-and-merge prologue the
+two config admin routes had duplicated became one `effective_document`
+helper, which took a symbol out of the wider count.
 2026-08-28 (WOR-2673, cache-reserve consolidation): tests-only 324 -> 323.
 `S3ReserveConfig` and the `S3Reserve` surface around it went with the
 AWS-SDK cache-reserve backend, which the object-storage backend replaces.
@@ -1050,3 +1058,14 @@ nested config struct in `types.rs` sits in this same bucket for the same
 reason. `COMP_ACCEPTANCE_SKEW_SECS` is not among them: it is re-exported
 from `comp/mod.rs` beside `COMP_QUOTE_VALIDITY_SECS`, which is where an
 operator reading the five-minute window in the docs would look for it.
+
+2026-08-28 (WOR-2673 merged with main at 454e0abfc): recounted against the
+merged tree rather than carried from either parent, because neither
+parent's figure describes it. Tests-only 321, unreferenced 1521. This
+branch alone read 322 / 1523 and main alone 323 / 1518; the merge is
+below both on the first count and between them on the second, because
+main's origin-profile work gave out-of-file consumers to items this
+branch had left file-local while this branch's licensing wiring did the
+same for main's. Lowered at the merge rather than after it, so the
+ground both sides gained is held.
+
