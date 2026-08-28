@@ -141,6 +141,22 @@ pub enum DecisionEvent {
     McpTool,
     /// A payment moved through its lifecycle.
     PaymentLifecycle,
+    /// The behavioral anomaly detector flagged something, or a
+    /// reputation threshold decided admission (WOR-2666).
+    ///
+    /// Two decisions on one event because they are two halves of one
+    /// mechanism: a verdict is what moves the score, and the score is
+    /// what admission reads. An analyst asking "why was this caller
+    /// refused" needs both on the same feed, and splitting them would
+    /// mean joining two labels to answer it.
+    ///
+    /// The record carries the reputation band and the resolver source,
+    /// never the raw signal, and that holds for the `reason` as well as
+    /// for the fields. A JA4 or a client address on a SIEM feed is
+    /// caller data on a record that ships unredacted, and neither is
+    /// something a rule can usefully select on; the value that fired
+    /// stays on the local log line.
+    Anomaly,
 }
 
 /// Whether a decision event's records reach the audit bus.
@@ -222,6 +238,7 @@ impl DecisionEvent {
             Self::LogCustomField => "log.custom_field",
             Self::McpTool => "mcp.tool",
             Self::PaymentLifecycle => "payment.lifecycle",
+            Self::Anomaly => "anomaly",
         }
     }
 
@@ -249,6 +266,7 @@ impl DecisionEvent {
         Self::LogCustomField,
         Self::McpTool,
         Self::PaymentLifecycle,
+        Self::Anomaly,
     ];
 
     /// Resolve a label back to its event. Used by config parsing, where
@@ -371,7 +389,11 @@ impl DecisionEvent {
             | Self::AiFailure
             | Self::AiAdmission
             | Self::AiClose
-            | Self::McpTool => EventCoverage::Emitted,
+            | Self::McpTool
+            // anomaly: `sbproxy-core`'s `anomaly` module, from the
+            // response-phase verdict funnel and from the request-phase
+            // reputation gate. One funnel each.
+            | Self::Anomaly => EventCoverage::Emitted,
             // Published as `policy` records already; see the doc above.
             Self::Waf | Self::RateLimit => EventCoverage::SupersededByPolicy,
             // Money is recorded by the durable settlement store, not
@@ -1050,6 +1072,34 @@ pub struct DecisionDetails {
     /// self-contained when an analyst is looking at a single decision.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decision_latency_ms: Option<u32>,
+    /// The anomaly kind a detection decision flagged (WOR-2666).
+    ///
+    /// The closed set `sbproxy_anomaly_detected_total` is labelled by
+    /// (`ja4_outlier`, `ml_inconsistency`, `headless_library`,
+    /// `request_rate_spike`), so a rule can join a record to the
+    /// counter that alerted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anomaly_kind: Option<String>,
+    /// The reputation band a decision read, never the raw score
+    /// (WOR-2666).
+    ///
+    /// A band (`clean`, `watch`, `suspect`, `bad`, `floored`) because a
+    /// float that moves on every request is not a term anyone can
+    /// select on, and the number itself is on the gauge for anyone who
+    /// wants the trend.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reputation_bucket: Option<String>,
+    /// Which resolver produced the identity the decision was keyed on
+    /// (WOR-2666).
+    ///
+    /// The closed `AgentIdSource` set (`bot_auth`, `kya`, `rdns`,
+    /// `user_agent`, `anonymous_bot_auth`, `tls_fingerprint`,
+    /// `fallback`, `ml_override`). Carried because reputation is keyed
+    /// on a *claimed* class unless the source was a verified one, and
+    /// a rule written after the fact has to be able to tell those
+    /// apart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_source: Option<String>,
     /// Which inbound AI surface the decision was taken on.
     ///
     /// The same closed vocabulary
@@ -1088,6 +1138,39 @@ impl DecisionDetails {
     pub fn auth(auth_type: &str) -> Self {
         Self {
             auth_type: (!auth_type.is_empty()).then(|| auth_type.to_owned()),
+            ..Self::default()
+        }
+    }
+
+    /// Detail for one behavioral anomaly verdict (WOR-2666).
+    ///
+    /// `verdict` carries the severity rather than the record's outcome:
+    /// a verdict is an observation, and the request proceeds whatever
+    /// it says. The outcome of a detection record is always an allow.
+    pub fn anomaly(kind: &str, severity: &str, identity_source: Option<&str>) -> Self {
+        Self {
+            anomaly_kind: (!kind.is_empty()).then(|| kind.to_owned()),
+            verdict: (!severity.is_empty()).then(|| severity.to_owned()),
+            identity_source: identity_source
+                .filter(|source| !source.is_empty())
+                .map(str::to_owned),
+            ..Self::default()
+        }
+    }
+
+    /// Detail for a reputation admission decision (WOR-2666).
+    ///
+    /// The band and the resolver source, and nothing else. Neither the
+    /// score nor any of the signals that produced it: a JA4 or a client
+    /// address on this half of the record ships unredacted, and a rule
+    /// cannot select on either.
+    pub fn reputation(bucket: &str, action: &str, identity_source: Option<&str>) -> Self {
+        Self {
+            reputation_bucket: (!bucket.is_empty()).then(|| bucket.to_owned()),
+            verdict: (!action.is_empty()).then(|| action.to_owned()),
+            identity_source: identity_source
+                .filter(|source| !source.is_empty())
+                .map(str::to_owned),
             ..Self::default()
         }
     }
@@ -1335,6 +1418,9 @@ impl DecisionDetails {
             backend,
             state,
             reason_code,
+            anomaly_kind,
+            reputation_bucket,
+            identity_source,
         } = self;
         requested_model.is_none()
             && selected_model.is_none()
@@ -1361,6 +1447,9 @@ impl DecisionDetails {
             && backend.is_none()
             && state.is_none()
             && reason_code.is_none()
+            && anomaly_kind.is_none()
+            && reputation_bucket.is_none()
+            && identity_source.is_none()
     }
 
     /// Whether the decision moved the request off what it asked for, or
@@ -1846,9 +1935,44 @@ mod tests {
                 "ai.close",
                 "ai.failure",
                 "ai.admission",
-                "mcp.tool"
+                "mcp.tool",
+                "anomaly"
             ],
             "the wired set changed; update has_emitter and the docs that state coverage"
+        );
+    }
+
+    /// WOR-2666 ruling 6. Both halves of the anomaly surface publish a
+    /// typed record, and neither carries a raw signal: not the JA4, not
+    /// the client address, not the score itself.
+    #[test]
+    fn the_anomaly_record_carries_bands_and_not_raw_signals() {
+        let detection = DecisionDetails::anomaly("ja4_outlier", "critical", Some("user_agent"));
+        let rendered = serde_json::to_string(&detection).expect("serializes");
+        assert!(
+            rendered.contains("\"anomaly_kind\":\"ja4_outlier\""),
+            "{rendered}"
+        );
+        assert!(rendered.contains("\"verdict\":\"critical\""), "{rendered}");
+        assert!(
+            rendered.contains("\"identity_source\":\"user_agent\""),
+            "{rendered}"
+        );
+
+        let admission = DecisionDetails::reputation("suspect", "deny", Some("bot_auth"));
+        let rendered = serde_json::to_string(&admission).expect("serializes");
+        assert!(
+            rendered.contains("\"reputation_bucket\":\"suspect\""),
+            "{rendered}"
+        );
+        assert!(rendered.contains("\"verdict\":\"deny\""), "{rendered}");
+        assert!(
+            !rendered.contains("0."),
+            "the raw score must not ride the record: {rendered}"
+        );
+        assert!(
+            DecisionEvent::Anomaly.has_emitter(),
+            "both halves publish, so the label must not tell an operator to wait for an emitter"
         );
     }
 

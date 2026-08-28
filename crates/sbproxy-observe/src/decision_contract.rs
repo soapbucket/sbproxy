@@ -82,6 +82,25 @@ pub const FIELD_CONTRACTS: &[FieldContract] = &[
                outcome is `error`.",
     },
     FieldContract {
+        event: DecisionEvent::Anomaly,
+        fields: &[
+            "anomaly_kind",
+            "reputation_bucket",
+            "verdict",
+            "identity_source",
+        ],
+        note: "Two decisions on one event. A detection record carries `anomaly_kind` and a \
+               `verdict` holding the severity, and its outcome is always an allow, because a \
+               verdict is an observation and the request proceeds. An admission record \
+               carries `reputation_bucket` and a `verdict` holding the action, and its \
+               outcome is a deny. `identity_source` is on both, because the class the score \
+               is keyed on is a claim unless that source is a verified one. Neither the \
+               fields nor the `reason` carry the raw score, the TLS fingerprint, or the \
+               client address: those are caller-chosen values on a record that ships \
+               unredacted, and none of them is a term a rule can select on. The fingerprint \
+               that fired stays on the local log line.",
+    },
+    FieldContract {
         event: DecisionEvent::Auth,
         fields: &["auth_type"],
         note: "The method, never the subject. Details ship unredacted, and a resolved \
@@ -399,6 +418,9 @@ mod tests {
             guardrail_spans: vec![sbproxy_security::span::DetectionSpan::new("a", 0, 1)],
             guardrail_spans_dropped: Some(0),
             surface: Some("a".into()),
+            anomaly_kind: Some("a".into()),
+            reputation_bucket: Some("a".into()),
+            identity_source: Some("a".into()),
         };
         let wire = serde_json::to_value(&populated).expect("serializes");
         let object = wire.as_object().expect("detail is an object");

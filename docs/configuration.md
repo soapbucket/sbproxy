@@ -447,7 +447,8 @@ proxy:
 | `config_authority` | object | unset | Subscribe to or publish signed configuration bundles. |
 | `key_management` | object | unset | Mutable key store, policy cache, encryption, claim mapping, and declarative seed. |
 | `l2_cache_settings` | object | | Optional shared-state backend. Alias: `l2_cache`. |
-| `cache_reserve` | object | unset | Optional cold-tier response cache backed by memory, filesystem, Redis, or S3. See [cache-reserve.md](cache-reserve.md). |
+| `anomaly` | object | unset | Behavioral anomaly detection over the TLS fingerprint, resolver source, headless-library signal, and per-address rate, plus the per-agent-class reputation score it feeds and the optional admission thresholds that read it. Disabled by default. See [anomaly-detection.md](anomaly-detection.md). |
+| `cache_reserve` | object | unset | Optional cold-tier response cache backed by memory, filesystem, Redis, object storage (S3, GCS, Azure Blob, or a local directory) with optional at-rest sealing, or S3 with AWS KMS envelope encryption. See [cache-reserve.md](cache-reserve.md). |
 | `compression_state` | object | unset | Process-owned Local AI summary-state path. See [compression_state](#compression_state). |
 | `config_history` | object | unset | Durable local ring of every applied config revision, kept for inspection and future rollback. Disabled by default. See [config_history](#config_history). |
 | `response_cache_store` | object | unset | Picks the backing store for the shared response cache and optionally encrypts entries at rest. See [Choosing the backing store](#choosing-the-backing-store). When unset, the store is Redis if `l2_cache_settings` is configured and an in-process map otherwise. |
@@ -1844,6 +1845,7 @@ origins:
 | `ai_policy` | object | | One sandboxed CEL expression over the AI decision pipeline (`expression`, `on_error`). See [ai-policy-cel.md](ai-policy-cel.md). |
 | `cache_affinity` | object | unset | Prefer the provider that already holds a caller's warm prompt cache. Sits beside `routing:`, not inside it, because it layers over whatever strategy is configured rather than replacing one (except `fallback_chain`, `cascade`, `cost_quality`, and `routing_policy`, which own their ordering and are left alone). Fields: `ttl_secs` (default `300`) and `max_keys_per_provider` (default `1024`); both are refused at zero. Keys on the caller's `prompt_cache_key`, or `user` when that is absent, scoped to the tenant, credential, origin, and API surface. A preference, never a pin: an ineligible holder or a changed resolved model leaves the strategy's pick in place. Process-local and bounded. See [ai-gateway.md](ai-gateway.md#prompt-cache-affinity). |
 | `usage_sinks` | list | `[]` | Destinations for completed-call usage records. The `ledger` sink (`path`, optional `signing_seed_hex`) writes a hash-chained, signable record. See [ai-usage-ledger.md](ai-usage-ledger.md). |
+| `stream_include_usage` | bool | `false` | Ask an OpenAI-compatible provider to end a stream with a usage frame, by adding `stream_options.include_usage: true` to the outbound body. Off by default because it changes what callers receive: the provider appends one terminal chunk whose `choices` is `[]`, and a client that indexes `choices[0]` unconditionally throws on it. Added only for providers whose wire format is OpenAI's, on streaming chat completions, and only when the caller sent no `stream_options` of its own; Anthropic, Vertex, Bedrock, Cohere and Ollama have no such field, and some OpenAI-compatible servers answer 400 to an unknown body key. With it off, a stream carrying no usage frame is priced from a tokenizer estimate instead. See [ai-gateway.md](ai-gateway.md#asking-the-provider-for-a-usage-frame). |
 
 Routing strategies: `round_robin`, `weighted`, `fallback_chain`, `random`, `lowest_latency`, `least_connections`, `cost_optimized`, `least_token_usage`, `prefix_affinity`, `peak_ewma`, `sticky` (accepted, behaves as `round_robin`; see [ai-gateway.md](ai-gateway.md#sticky)), `race`, `headroom`, `reset_aware`, `cascade`, `cost_quality`, `outcome_aware`, `semantic_route`. See [ai-gateway.md](ai-gateway.md#routing-strategies) for each; `outcome_aware` has its own page in [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md). `cascade`, `cost_quality`, and `semantic_route` carry required settings, so each needs the object form; `semantic_route` written as a flat string is refused with an error naming the `routes:` and embedding-source keys it needs, and its exemplars are capped at config load: 64 routes, 64 exemplars per route, and 256 exemplar texts across every route combined, since each one is an embedding call on the request that builds the index. `token_rate` is refused at config load: it scores headroom against a per-provider token limit that no field declares, which makes it `least_token_usage` under another name. See [ai-gateway.md#token_rate-refused](ai-gateway.md#token_rate-refused).
 
@@ -2608,7 +2610,7 @@ origins:
 
 ## Authentication
 
-The `authentication` block is a sibling of `action`, not nested inside it. It controls who can access the origin. SBproxy ships twelve built-in auth providers: `api_key`, `basic_auth`, `bearer`, `jwt`, `digest`, `hmac_auth`, `ldap_auth`, `forward_auth`, `bot_auth`, `cap`, `oidc`, and `noop`.
+The `authentication` block is a sibling of `action`, not nested inside it. It controls who can access the origin. SBproxy ships fifteen built-in auth providers: `api_key`, `basic_auth`, `bearer`, `jwt`, `digest`, `hmac_auth`, `ldap_auth`, `forward_auth`, `ext_authz`, `oauth_introspection`, `kya`, `bot_auth`, `cap`, `oidc`, and `noop`.
 
 `bot_auth` verifies cryptographically-signed AI agents per RFC 9421 + the IETF Web Bot Auth draft. Full reference: [web-bot-auth.md](web-bot-auth.md).
 
@@ -2616,7 +2618,7 @@ Anything else falls through to the inventory-based auth plugin registry, so a li
 
 ### Unknown keys are refused
 
-Every one of the eleven configurable built-in providers refuses a key it
+Every one of the fourteen configurable built-in providers refuses a key it
 does not recognize, at `serve`, `validate`, and hot reload. The error names
 the key you wrote and lists the ones the provider accepts:
 
@@ -3193,6 +3195,147 @@ least 32 bytes after secret resolution. Optional fields include `scope`,
 logout settings. See [auth-oidc.md](auth-oidc.md) for the full field table and
 browser flow.
 
+### ext_authz
+
+Ask an authorization service you run whether to admit each request. The proxy POSTs a JSON check document carrying the request's method, its path and query, and an allowlisted subset of its headers; the service answers `{"allowed": true}` or a refusal it shapes itself. The wire shape is the one Envoy's `ext_authz` HTTP service filter and the OpenPolicyAgent Envoy plugin speak, so a service written for either answers this provider unchanged.
+
+```yaml
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://backend.internal:8080
+    authentication:
+      type: ext_authz
+      url: http://authz.internal:9002/check
+      timeout_ms: 250
+      headers_to_forward: [authorization, x-tenant]
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `type` | string | required | Must be `ext_authz` |
+| `url` | string | required | Check endpoint. Must be `http://` or `https://` |
+| `timeout_ms` | int | 250 | Deadline for one check, in milliseconds. `0` is refused, because reqwest reads it as no timeout |
+| `failure_mode_allow` | bool | `false` | Admit the request when the check fails instead of refusing it |
+| `headers_to_forward` | list | `[]` | Request headers copied into the check document. Empty forwards none |
+
+The check document and the answer:
+
+```json
+{"method": "GET", "path": "/orders/42?full=1", "headers": {"x-tenant": "acme"}}
+```
+
+```json
+{"allowed": false, "status": 402, "body": "quota exhausted",
+ "headers": {"x-quota-reset": "3600"}}
+```
+
+`allowed` is the only field the service has to return. On a refusal, `status` (any 4xx; anything else is clamped to `403`) and `body` shape what the client sees, and `headers` are attached to that response, which is how a service returns its own `WWW-Authenticate` challenge or a `Retry-After`. On an allow, the service can name the authenticated caller in `subject`, or stamp any of `X-Forwarded-User`, `X-Auth-Request-User`, `X-Auth-User`, `X-User`, or `Remote-User`, and that name becomes the request's principal.
+
+Four behaviors are worth knowing before you point this at a service:
+
+- **`headers_to_forward` is an allowlist and it starts empty.** Nothing from the request reaches the service until you name it. That is deliberate: a default that forwarded everything would ship `Authorization` and `Cookie` to the authorization service on the first request after you set the URL. If you are moving a config off a build that linked the enterprise auth crate, that build read an empty list as "forward everything"; see [config-stability.md](config-stability.md#ext_authzheaders_to_forward--forwards-nothing-not-everything).
+- **Failure is closed.** A service that times out, refuses the connection, or answers something that is not a check document refuses the request with a `503`. `failure_mode_allow: true` inverts that, and every request it admits is counted on `sbproxy_ext_authz_decisions_total{outcome="fail_open"}` rather than folded into the allow count, because a request that proceeded without the decision being made is the event worth alerting on.
+- **Headers on an allow are not copied upstream.** The service can name a subject, and that lands on the principal, but arbitrary header injection into the upstream request is `forward_auth`'s `trust_headers`, not this provider.
+- **Like `ldap_auth` and `forward_auth`, this dials out on the request path.** Authentication runs before an origin's `policies:`, so the origin's own `rate_limit` cannot cap what this provider dials. Budget `timeout_ms` for a service sitting next to the proxy.
+
+Unlike `forward_auth`, this provider composes inside an `authentication:` list. It also evaluates on the HTTP/3 dispatch path, which is not a reason to pick it today: [HTTP/3 is not served by this build](#http3-fields).
+
+See [examples/auth-ext-authz/](../examples/auth-ext-authz/) for a runnable setup with a stub authorization service.
+
+### oauth_introspection
+
+Validate an opaque bearer token by asking the authorization server that issued it (RFC 7662). The proxy POSTs the token to the introspection endpoint, authenticating itself with the configured client credentials, and reads back `{"active": true, ...}`.
+
+Reach for this instead of [`jwt`](#jwt) when your tokens are opaque reference tokens rather than JWTs, or when a revoked token has to stop working immediately rather than at its expiry. The cost is a network round trip on the request path, which the verdict cache amortizes.
+
+```yaml
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://backend.internal:8080
+    authentication:
+      type: oauth_introspection
+      introspection_url: https://idp.example.com/oauth2/introspect
+      client_id: sbproxy-gateway
+      client_secret: ${INTROSPECTION_CLIENT_SECRET}
+      required_scopes: [api.read]
+      cache_ttl: 60
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `type` | string | required | Must be `oauth_introspection` |
+| `introspection_url` | string | required | RFC 7662 introspection endpoint |
+| `client_id` | string | required | Client id the proxy authenticates to the endpoint with |
+| `client_secret` | string | none | Client secret. Omit for a public client. Takes the usual secret reference forms (`${VAR}`, `env:`, `file:`, `vault://`) |
+| `token_type_hint` | string | none | RFC 7662 `token_type_hint` sent with the request |
+| `cache_ttl` | int | 60 | Seconds a verdict is cached. `0` reaches the authorization server on every request |
+| `timeout_secs` | int | 5 | Deadline for one introspection call |
+| `required_scopes` | list | `[]` | Scopes the token must carry. Empty admits any active token |
+
+What the caller sees: an active token with every required scope is admitted, and the response's `sub` (or `username`, which Auth0 and Okta return for resource-owner flows) becomes the principal. An inactive token gets `401` with `WWW-Authenticate: Bearer error="invalid_token"`, or a bare `Bearer` challenge when no token was presented at all. An active token missing a scope gets `403` with `error="insufficient_scope"` naming the scope. An introspection endpoint that cannot be reached gets `503`, per RFC 7662 section 2.3: the caller's credential is not what is in question.
+
+The verdict cache is keyed on the SHA-256 of the token, so it never holds a plaintext credential, and it is capped at 10,000 entries so a flood of invented tokens evicts itself rather than growing the map. It shortens a token's life and never lengthens it: when the introspection response carries `exp`, the entry expires at whichever of `exp` and `cache_ttl` comes first. Transport failures are never cached, so an outage does not pin a refusal in place after the server recovers. Set `cache_ttl: 0` when a revocation has to take effect on the very next request.
+
+See [examples/auth-oauth-introspection/](../examples/auth-oauth-introspection/) for a runnable setup with a stub introspection endpoint.
+
+### kya
+
+Verify a Know Your Agent token: an issuer-signed identity an AI agent presents in the `X-Skyfire-KYA` header, carrying who the agent is, who operates it, and optionally how much it can spend.
+
+This is the provider for admitting agent traffic by identity rather than by credential. A verified token establishes an agent id, a vendor, an agent class, and an advisory spend balance, and every one of those is readable from policy as `request.kya.*`, from the token's own claims rather than from the User-Agent-derived resolver.
+
+```yaml
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://backend.internal:8080
+    authentication:
+      type: kya
+      issuers:
+        - url: https://api.skyfire.example
+          jwks_refresh_interval_secs: 3600
+          stale_grace_secs: 86400
+      min_kyab_balance: 1000
+      min_kyab_currency: USD
+      fail_open: false
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `type` | string | required | Must be `kya` |
+| `issuers` | list | required | Trusted issuers. At least one entry |
+| `issuers[].url` | string | required | Issuer URL, matched verbatim against the token's `iss`. Must be `https://` |
+| `issuers[].jwks_refresh_interval_secs` | int | 3600 | How long a fetched JWKS and denylist stay fresh. Clamped to 300 to 86400 |
+| `issuers[].stale_grace_secs` | int | 86400 | How long past the refresh interval a cached copy still serves while the issuer is unreachable |
+| `min_kyab_balance` | int | none | Spend floor in the smallest unit of `min_kyab_currency`. A verified token below it is refused with `402` |
+| `min_kyab_currency` | string | `USD` | Currency the floor is denominated in. A balance in another currency counts as zero |
+| `fail_open` | bool | `false` | Admit the request when the issuer's directory cannot be reached |
+
+Verification is the eight steps the KYA profile defines, in order: decode the header, pin `alg` to ES256 or RS256, check `iss` against the allowlist before any network fetch, resolve the signing key from the issuer's `/.well-known/jwks.json`, verify the signature, verify `exp` and `iat` with two seconds of skew, check that `aud` names this gateway's hostname or the literal `*`, and check the token's `jti` against the issuer's `/.well-known/kya-denylist.json`. A `404` on the denylist is an empty denylist, not an outage: an issuer that has revoked nothing does not have to publish the document.
+
+A token carrying no `jti` cannot be revoked, so it is refused when the issuer publishes a non-empty denylist. Admitting it would make "revocation is checked on every verification" false for a whole class of token while the fetch still succeeds and logs nothing. An issuer with nothing to revoke has made no promise this breaks, so a token with no `jti` still verifies against an empty denylist.
+
+What the caller sees: a verified token is admitted, and its `sub` becomes the principal. A missing token gets `401`, and so does an expired, revoked, or otherwise invalid one. A verified token below `min_kyab_balance` gets `402 Payment Required`, which is a status a paying client can act on, rather than the `401` that would tell it to fetch a credential it already has. An issuer whose JWKS or denylist could not be fetched, with no cached copy still inside its stale-grace window, gets `503` unless `fail_open: true`.
+
+Three ways a balance is worth nothing against the floor, and each is a refusal rather than a guess: it names a currency other than `min_kyab_currency`, its `expires_at` has passed, or its `expires_at` does not parse. The currency rule matters more than it looks: 5000 JPY is about 32 dollars and 5000 COP is about a dollar twenty, so a floor of `1000` meaning ten dollars is cleared by both if the comparison is numeric. The proxy holds no exchange rate and will not invent one.
+
+Leave `min_kyab_balance` unset and the balance gates nothing; it is still carried to policy as `request.kya.kyab_balance.amount`, alongside `request.kya.kyab_balance.currency`. Both, because the amount alone is not comparable for the same reason the floor is denominated: a policy writing its own comparison needs to know what the number is in.
+
+Verdicts are not cached. The JWKS and the denylist are, per issuer, but a token is verified on every request, because a cached verdict is a revocation the proxy has decided not to see.
+
+Every verdict, including the refusing ones, is published on `sbproxy_kya_verdicts_total{verdict}`. The verdict also feeds the [trust tier](trust-tiers.md): a verified token earns `strong`, a presented-and-rejected one drops the request to `suspicious`, and an unreachable directory stays neutral, because a fetch failure is not evidence about the caller.
+
+Two verdicts reach `request.kya.verdict`, and only two, because only two continue into the policy chain: `verified`, and `directory_unavailable` when `fail_open: true` admitted the request anyway. Every other verdict refuses, so no policy runs to read it. A policy that tightens behavior while an issuer is down is therefore written against `directory_unavailable` and works; one written against `revoked` never fires, because a revoked token never gets that far.
+
+A verified token also populates `request.kya.agent_id`, `request.kya.agent_class`, `request.kya.vendor`, and `request.kya.kya_version` from the token's own claims. `request.kya.agent_id` is deliberately not `request.agent_id`: the latter is what the agent-class resolver worked out from the User-Agent and the operator catalog, and pinning an identity on it is pinning something the caller chose. Pin `request.kya.agent_id` when you mean the identity the issuer signed.
+
+See [examples/auth-kya/](../examples/auth-kya/) for a runnable setup with a local issuer fixture.
+
 ### noop
 
 The no-op auth provider accepts every request without checking credentials. Set this explicitly to mark an origin as unauthenticated, so the intent is obvious in the config.
@@ -3299,7 +3442,7 @@ authentication:
     team: platform
 ```
 
-The access log records the matched principal's source under the `principal_kind` column (`bearer`, `api_key`, `basic_auth`, `jwt`, `oidc`, `virtual_key`, `bot_auth`, `cap`, `forward_auth`, `ldap_auth`, `plugin`, or `none` when no provider is configured). See [access-log.md](access-log.md) for the full column reference.
+The access log records the matched principal's source under the `principal_kind` column (`bearer`, `api_key`, `basic_auth`, `jwt`, `oidc`, `virtual_key`, `bot_auth`, `cap`, `forward_auth`, `ldap_auth`, `ext_authz`, `oauth_introspection`, `kya`, `plugin`, or `none` when no provider is configured). See [access-log.md](access-log.md) for the full column reference.
 
 ---
 

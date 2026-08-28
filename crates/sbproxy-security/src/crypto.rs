@@ -66,6 +66,13 @@ pub enum HkdfPurpose {
     /// seals under whichever the operator selected. See that type's
     /// module docs for the rollout.
     MeshWire,
+    /// WOR-2673: AES-256-GCM key material for cache-reserve entries at
+    /// rest. Distinct from [`Self::ResponseCacheAtRest`] for the same
+    /// reason [`Self::PromptPersistenceAtRest`] is: the hot cache and
+    /// the reserve may be configured from one operator secret, and
+    /// purpose separation is what keeps a key derived for one from
+    /// opening the other's entries.
+    CacheReserveAtRest,
     /// AES-256-GCM key material for persisted prompt-overlay records at
     /// rest. Deliberately distinct from [`Self::ResponseCacheAtRest`]:
     /// the two surfaces may be configured from the same operator secret,
@@ -117,6 +124,7 @@ impl HkdfPurpose {
             HkdfPurpose::KeyEnvelope => b"sbproxy.hkdf.key-envelope.v1",
             HkdfPurpose::MeshWire => b"sbproxy.hkdf.mesh-wire.v1",
             HkdfPurpose::ResponseCacheAtRest => b"sbproxy.hkdf.response-cache-at-rest.v1",
+            HkdfPurpose::CacheReserveAtRest => b"sbproxy.hkdf.cache-reserve-at-rest.v1",
             HkdfPurpose::PromptPersistenceAtRest => b"sbproxy.hkdf.prompt-persistence-at-rest.v1",
             HkdfPurpose::BundleSecretVarFingerprint => {
                 b"sbproxy.hkdf.bundle-secret-var-fingerprint.v1"

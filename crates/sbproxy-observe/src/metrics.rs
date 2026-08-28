@@ -3,8 +3,8 @@ use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
 use prometheus::{
-    CounterVec, Encoder, GaugeVec, Histogram, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec,
-    Opts, Registry, TextEncoder,
+    CounterVec, Encoder, GaugeVec, Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    IntGaugeVec, Opts, Registry, TextEncoder,
 };
 
 use crate::agent_labels::AgentLabels;
@@ -568,6 +568,34 @@ pub struct ProxyMetrics {
     pub bytes_total: CounterVec,
     /// Auth check results with origin, auth_type, and result labels.
     pub auth_results: CounterVec,
+    /// WOR-2667: `ext_authz` callout outcomes, by outcome
+    /// (`allow`, `deny`, `unavailable`, `fail_open`).
+    ///
+    /// Separate from `auth_results` because that family answers "was
+    /// the request admitted"; this one answers "did the authorization
+    /// service decide". A `fail_open` is an admitted request whose
+    /// decision was never made, and folding the two together hides
+    /// exactly the event an operator alerts on. Break down per origin
+    /// by joining against `sbproxy_auth_results_total{auth_type="ext_authz"}`.
+    pub ext_authz_decisions: Option<IntCounterVec>,
+    /// WOR-2667: RFC 7662 token-introspection results, by result
+    /// (`active`, `inactive`, `insufficient_scope`, `cached`,
+    /// `no_token`, `unavailable`).
+    ///
+    /// Two of those are not verdicts. `cached` counts the requests a
+    /// verdict cache answered without reaching the authorization
+    /// server, which is what tells an operator whether `cache_ttl` is
+    /// doing anything; `no_token` counts requests that presented no
+    /// bearer token, so nothing was asked.
+    pub oauth_introspection_results: Option<IntCounterVec>,
+    /// WOR-2667: Know Your Agent token verdicts, by verdict
+    /// (`verified`, `missing`, `expired`, `revoked`, `invalid`,
+    /// `insufficient_balance`, `directory_unavailable`).
+    ///
+    /// The issuer URL is deliberately not a label: an operator's
+    /// issuer allowlist is small but the value is operator-supplied
+    /// config, and the verdict is what an alert fires on.
+    pub kya_verdicts: Option<IntCounterVec>,
     /// Policy enforcement results with origin, policy_type, and action labels.
     pub policy_triggers: CounterVec,
     /// Cache hit/miss with origin and result labels.
@@ -613,6 +641,45 @@ pub struct ProxyMetrics {
     /// Counter `sbproxy_cache_reserve_misses_total` of reserve misses
     /// (hot cache and reserve both empty), labelled by origin.
     pub cache_reserve_misses: IntCounterVec,
+    /// WOR-2666: counter `sbproxy_anomaly_detected_total` of behavioral
+    /// anomalies flagged, by kind and severity.
+    ///
+    /// `AnomalyDetectorHook`'s own documentation has promised this
+    /// family since the trait shipped; nothing emitted it until an
+    /// implementation existed to emit it for.
+    pub anomaly_detected: Option<IntCounterVec>,
+    /// WOR-2666: gauge `sbproxy_agent_reputation_score` in `[0.0, 1.0]`
+    /// per tenant and agent class, where 1.0 is a class that has
+    /// produced no anomalies inside the rolling window.
+    pub agent_reputation_score: Option<GaugeVec>,
+    /// WOR-2666: gauge `sbproxy_anomaly_tracked_keys` of
+    /// `(tenant, agent class)` pairs the detector currently holds a
+    /// window for.
+    ///
+    /// The detector's resident set is this number times the per-key
+    /// window, so it is the one figure that turns "the caps are
+    /// bounded" into a size an operator can plan against. It is also
+    /// how the budget below becomes visible before it starts evicting.
+    pub anomaly_tracked_keys: Option<IntGauge>,
+    /// WOR-2666: counter `sbproxy_anomaly_key_budget_spent_total` of
+    /// requests that arrived for a key the detector had no slot for.
+    ///
+    /// Every increment is a key that displaced another key's window, or
+    /// a request the detector declined to judge. Either way the
+    /// baseline an operator's `deny_below` reads is being churned, and
+    /// silence here used to be the only signal: the budget was spent
+    /// with no counter and no log line, and `admission_for` reads a
+    /// missing score as "admit".
+    pub anomaly_key_budget_spent: Option<IntCounter>,
+    /// WOR-2673: counter `sbproxy_cache_reserve_errors_total` of reserve
+    /// operations the backend refused, by operation.
+    ///
+    /// The reserve is best-effort, so every call site swallows its
+    /// error and serves the request anyway. That is the right behavior
+    /// and it is also why this family exists: without it, a reserve
+    /// whose bucket credentials expired reads as a cache with a poor
+    /// hit rate rather than as a tier that is failing every write.
+    pub cache_reserve_errors: Option<IntCounterVec>,
     /// Counter `sbproxy_cache_reserve_writes_total` of entries written
     /// into the reserve, labelled by origin.
     pub cache_reserve_writes: IntCounterVec,
@@ -690,6 +757,99 @@ pub struct ProxyMetrics {
     /// field; dashboards use it to size how much chrome the strip pass
     /// removes per origin.
     pub boilerplate_stripped_bytes: IntCounterVec,
+}
+
+/// Build a labeled counter and register it, without a panic on either
+/// step.
+///
+/// `IntCounterVec::new` rejects an invalid metric name or label set, and
+/// `Registry::register` rejects a duplicate. Both inputs here are
+/// compile-time constants, so neither can happen in a build that ran its
+/// tests once. The helper exists because the alternative is an
+/// `.unwrap()` on a startup path, and a proxy that refuses to boot over
+/// a metric it could have skipped is a worse failure than a metric that
+/// is missing. A refusal logs the family name and yields `None`; the
+/// recorders below are no-ops against `None`, so the only consequence is
+/// a series that does not appear.
+/// [`registered_counter_vec`] for a gauge. Same contract, same reason.
+fn registered_gauge_vec(
+    registry: &Registry,
+    name: &'static str,
+    help: &'static str,
+    labels: &[&str],
+) -> Option<GaugeVec> {
+    let gauge = match GaugeVec::new(Opts::new(name, help), labels) {
+        Ok(gauge) => gauge,
+        Err(error) => {
+            tracing::error!(metric = name, %error, "metric family could not be built");
+            return None;
+        }
+    };
+    if let Err(error) = registry.register(Box::new(gauge.clone())) {
+        tracing::error!(metric = name, %error, "metric family could not be registered");
+        return None;
+    }
+    Some(gauge)
+}
+
+/// [`registered_counter_vec`] for an unlabeled gauge.
+fn registered_int_gauge(
+    registry: &Registry,
+    name: &'static str,
+    help: &'static str,
+) -> Option<IntGauge> {
+    let gauge = match IntGauge::new(name, help) {
+        Ok(gauge) => gauge,
+        Err(error) => {
+            tracing::error!(metric = name, %error, "metric family could not be built");
+            return None;
+        }
+    };
+    if let Err(error) = registry.register(Box::new(gauge.clone())) {
+        tracing::error!(metric = name, %error, "metric family could not be registered");
+        return None;
+    }
+    Some(gauge)
+}
+
+/// [`registered_counter_vec`] for an unlabeled counter.
+fn registered_int_counter(
+    registry: &Registry,
+    name: &'static str,
+    help: &'static str,
+) -> Option<IntCounter> {
+    let counter = match IntCounter::new(name, help) {
+        Ok(counter) => counter,
+        Err(error) => {
+            tracing::error!(metric = name, %error, "metric family could not be built");
+            return None;
+        }
+    };
+    if let Err(error) = registry.register(Box::new(counter.clone())) {
+        tracing::error!(metric = name, %error, "metric family could not be registered");
+        return None;
+    }
+    Some(counter)
+}
+
+fn registered_counter_vec(
+    registry: &Registry,
+    name: &'static str,
+    help: &'static str,
+    labels: &[&str],
+) -> Option<IntCounterVec> {
+    let counter = match IntCounterVec::new(Opts::new(name, help), labels) {
+        Ok(counter) => counter,
+        Err(error) => {
+            tracing::error!(metric = name, %error, "metric family could not be built");
+            return None;
+        }
+    };
+    if let Err(error) = registry.register(Box::new(counter.clone())) {
+        tracing::error!(metric = name, %error, "metric family could not be registered");
+        return None;
+    }
+    Some(counter)
 }
 
 impl ProxyMetrics {
@@ -935,6 +1095,33 @@ impl ProxyMetrics {
         )
         .unwrap();
 
+        // WOR-2667: built and registered through the panic-free helper
+        // rather than the `.unwrap()` every family above uses. The
+        // construction cannot fail for a name and label set that are
+        // compile-time constants, but "cannot fail" is exactly the
+        // claim a `.unwrap()` in a proxy makes right up until it is
+        // wrong, and this workspace's unwrap ratchet is the record of
+        // that judgment. A refusal here loses one metric family and
+        // says so; it does not take the process with it.
+        let ext_authz_decisions = registered_counter_vec(
+            &registry,
+            "sbproxy_ext_authz_decisions_total",
+            "External-authorization callout outcomes, by outcome",
+            &["outcome"],
+        );
+        let oauth_introspection_results = registered_counter_vec(
+            &registry,
+            "sbproxy_oauth_introspection_results_total",
+            "RFC 7662 token-introspection results, by result",
+            &["result"],
+        );
+        let kya_verdicts = registered_counter_vec(
+            &registry,
+            "sbproxy_kya_verdicts_total",
+            "Know Your Agent token verification verdicts, by verdict",
+            &["verdict"],
+        );
+
         let policy_triggers = CounterVec::new(
             Opts::new(
                 "sbproxy_policy_triggers_total",
@@ -1047,6 +1234,39 @@ impl ProxyMetrics {
             &["origin"],
         )
         .unwrap();
+
+        let anomaly_detected = registered_counter_vec(
+            &registry,
+            "sbproxy_anomaly_detected_total",
+            "Behavioral anomalies flagged, by kind and severity",
+            &["kind", "severity"],
+        );
+
+        let agent_reputation_score = registered_gauge_vec(
+            &registry,
+            "sbproxy_agent_reputation_score",
+            "Agent-class reputation in [0.0, 1.0]; 1.0 is a class with no anomalies in the window",
+            &["tenant_id", "agent_class"],
+        );
+
+        let anomaly_tracked_keys = registered_int_gauge(
+            &registry,
+            "sbproxy_anomaly_tracked_keys",
+            "(tenant, agent class) pairs the anomaly detector currently holds a window for",
+        );
+
+        let anomaly_key_budget_spent = registered_int_counter(
+            &registry,
+            "sbproxy_anomaly_key_budget_spent_total",
+            "Requests that arrived for an agent class the detector had no tracking slot for",
+        );
+
+        let cache_reserve_errors = registered_counter_vec(
+            &registry,
+            "sbproxy_cache_reserve_errors_total",
+            "Cache Reserve operations the backend refused, by operation",
+            &["origin", "operation"],
+        );
 
         let cache_reserve_evictions = IntCounterVec::new(
             Opts::new(
@@ -1309,6 +1529,9 @@ impl ProxyMetrics {
             per_origin_active_connections,
             bytes_total,
             auth_results,
+            ext_authz_decisions,
+            oauth_introspection_results,
+            kya_verdicts,
             policy_triggers,
             cache_results,
             decision_event_total,
@@ -1320,6 +1543,11 @@ impl ProxyMetrics {
             cache_reserve_hits,
             cache_reserve_misses,
             cache_reserve_writes,
+            cache_reserve_errors,
+            anomaly_detected,
+            agent_reputation_score,
+            anomaly_tracked_keys,
+            anomaly_key_budget_spent,
             cache_reserve_evictions,
             cache_reserve_degraded,
             cache_reserve_health_transitions,
@@ -1648,6 +1876,129 @@ pub fn record_auth(origin: &str, auth_type: &str, allowed: bool) {
         .auth_results
         .with_label_values(&[origin.as_str(), auth_type, result])
         .inc();
+}
+
+/// Record one flagged behavioral anomaly (WOR-2666).
+///
+/// `kind` and `severity` are the closed label sets
+/// [`sbproxy_plugin::AnomalyVerdict`] documents. Both come from the
+/// hook rather than from a request, so neither is attacker-controlled.
+pub fn record_anomaly_detected(kind: &str, severity: &str) {
+    if let Some(counter) = metrics().anomaly_detected.as_ref() {
+        counter.with_label_values(&[kind, severity]).inc();
+    }
+}
+
+/// Publish how many `(tenant, agent class)` windows the detector holds
+/// (WOR-2666).
+///
+/// The detector's resident set is this number times the per-key window,
+/// so this is the figure that turns "the per-request cost is bounded"
+/// into a memory size an operator can plan against. Without it, the cap
+/// was reachable and invisible.
+pub fn set_anomaly_tracked_keys(count: usize) {
+    if let Some(gauge) = metrics().anomaly_tracked_keys.as_ref() {
+        gauge.set(count as i64);
+    }
+}
+
+/// Count one request that arrived for an agent class the detector had
+/// no tracking slot for (WOR-2666).
+///
+/// Non-zero means the key budget is spent and windows are being
+/// displaced, which churns the baseline an operator's `deny_below`
+/// reads. The failure it makes visible is a quiet one: a key with no
+/// slot has no score, and no score reads as "admit".
+pub fn record_anomaly_key_budget_spent() {
+    if let Some(counter) = metrics().anomaly_key_budget_spent.as_ref() {
+        counter.inc();
+    }
+}
+
+/// Publish one tenant's agent-class reputation score (WOR-2666).
+///
+/// `agent_class` goes through the cardinality limiter's **budget**
+/// door, the one that knows `agent_class` is capped at 8 and counts an
+/// overflow on `sbproxy_label_cardinality_overflow_total`.
+///
+/// The plain `sanitize_label` door this used is a 1,000-value cap, and
+/// it writes into a set keyed by label name alone. So a gauge admitting
+/// 40 classes through the wide door did not only widen itself: it
+/// raised the effective `agent_class` cardinality of
+/// `sbproxy_requests_total` from 8 to whatever it had admitted, with no
+/// overflow counter to show it had happened. Every other `agent_class`
+/// writer uses the budget form, and now so does this one.
+///
+/// `tenant_id` is a label because reputation is an input a policy can
+/// act on: without it, one tenant's noisy crawler decides what another
+/// tenant's admission threshold sees.
+pub fn set_agent_reputation_score(tenant_id: &str, agent_class: &str, score: f64) {
+    const METRIC: &str = "sbproxy_agent_reputation_score";
+    let tenant_id = sanitize_label_budget(METRIC, "tenant_id", tenant_id);
+    let agent_class = sanitize_label_budget_tenant(METRIC, "agent_class", agent_class, &tenant_id);
+    if let Some(gauge) = metrics().agent_reputation_score.as_ref() {
+        gauge
+            .with_label_values(&[tenant_id.as_str(), agent_class.as_str()])
+            .set(score);
+    }
+}
+
+/// Record one cache-reserve operation the backend refused (WOR-2673).
+///
+/// `operation` is the closed set `put` / `get` / `delete` / `sweep` /
+/// `init`, naming the trait method that failed. `origin` is the
+/// config-bounded origin id, matching the other
+/// `sbproxy_cache_reserve_*` families, or one of two proxy-wide
+/// sentinels: `__init__` for a reserve that never got built and
+/// `__sweep__` for the expiry sweep, neither of which belongs to an
+/// origin.
+///
+/// `init` is the one an operator most needs. A reserve whose backend
+/// failed to construct is *absent*, so no call site runs and every
+/// other family reads flat zero, which is byte-for-byte identical to
+/// "no reserve configured". Without this series the most likely
+/// real-world failure of the feature, a wrong region or an expired
+/// instance profile, is invisible on every dashboard.
+pub fn record_cache_reserve_error(origin: &str, operation: &'static str) {
+    if let Some(counter) = metrics().cache_reserve_errors.as_ref() {
+        let origin = sanitize_label("origin", origin);
+        counter
+            .with_label_values(&[origin.as_str(), operation])
+            .inc();
+    }
+}
+
+/// Record one `ext_authz` callout outcome (WOR-2667).
+///
+/// `outcome` is the closed set `allow` / `deny` / `unavailable` /
+/// `fail_open`, produced by
+/// `sbproxy_modules::auth::ext_authz::ExtAuthzOutcome::metric_label`, so
+/// the label vocabulary cannot drift from the outcomes the provider can
+/// actually reach.
+pub fn record_ext_authz_decision(outcome: &'static str) {
+    if let Some(counter) = metrics().ext_authz_decisions.as_ref() {
+        counter.with_label_values(&[outcome]).inc();
+    }
+}
+
+/// Record one RFC 7662 introspection result (WOR-2667).
+///
+/// `result` is the closed set `active` / `inactive` /
+/// `insufficient_scope` / `cached` / `no_token` / `unavailable`.
+pub fn record_oauth_introspection_result(result: &'static str) {
+    if let Some(counter) = metrics().oauth_introspection_results.as_ref() {
+        counter.with_label_values(&[result]).inc();
+    }
+}
+
+/// Record one Know Your Agent verification verdict (WOR-2667).
+///
+/// `verdict` is the closed set produced by
+/// `sbproxy_modules::auth::kya::KyaVerdict::metric_label`.
+pub fn record_kya_verdict(verdict: &'static str) {
+    if let Some(counter) = metrics().kya_verdicts.as_ref() {
+        counter.with_label_values(&[verdict]).inc();
+    }
 }
 
 /// Observe one phase-duration sample on `sbproxy_phase_duration_seconds`.
@@ -2477,7 +2828,7 @@ pub fn record_budget_share_fail_open(op: &str) {
     let counter = C.get_or_init(|| {
         register_int_counter_vec!(
             "sbproxy_budget_share_fail_open_total",
-            "Shared budget store operations that failed and fell open to per-instance enforcement, by operation",
+            "Shared budget store operations that failed and fell open to per-instance enforcement, by operation (`read`, `write`, `mirror_dropped`)",
             &["op"],
         )
         .ok()
@@ -6748,22 +7099,23 @@ pub fn record_ai_cost_usd_micros(
 /// token debit against the budget. A sustained miss rate per provider
 /// is an operability signal (an upstream wrapper stripping usage, or a
 /// surface the estimator does not yet cover) and can be alerted on.
-pub fn record_ai_usage_parse_miss(provider: &str, surface: &str) {
+pub fn record_ai_usage_parse_miss(provider: &str, surface: &str, usage_source: &str) {
     use prometheus::{register_int_counter_vec, IntCounterVec};
     use std::sync::OnceLock;
     static C: OnceLock<IntCounterVec> = OnceLock::new();
     let counter = C.get_or_init(|| {
         register_int_counter_vec!(
             "sbproxy_ai_usage_parse_miss_total",
-            "2xx AI responses on a token surface that carried no parseable usage block (budget debited from an estimate)",
-            &["provider", "surface"],
+            "2xx AI responses on a token surface that carried no parseable usage block, by what was billed instead: `estimated` (this gateway's own tokenizer count) or `absent` (nothing could be counted, so nothing was billed)",
+            &["provider", "surface", "usage_source"],
         )
         .expect("ai usage parse miss counter registers")
     });
     let provider = sanitize_label("provider", provider);
     let surface = sanitize_label("surface", surface);
+    let usage_source = sanitize_label("usage_source", usage_source);
     counter
-        .with_label_values(&[provider.as_str(), surface.as_str()])
+        .with_label_values(&[provider.as_str(), surface.as_str(), usage_source.as_str()])
         .inc();
 }
 

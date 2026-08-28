@@ -4319,6 +4319,7 @@ async fn anomaly_hook_registry_iterates_registered_hooks() {
         calls: calls.clone(),
     }));
     let view = sbproxy_plugin::RequestContextView {
+        tenant_id: "__default__",
         hostname: "test.example.com",
         method: "GET",
         path: "/",

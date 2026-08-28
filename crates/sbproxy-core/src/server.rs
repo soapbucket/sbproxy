@@ -1845,6 +1845,7 @@ fn maybe_admit_to_reserve(
                     .inc();
             }
             Err(e) => {
+                sbproxy_observe::metrics::record_cache_reserve_error(origin_id.as_str(), "put");
                 tracing::warn!(error = %e, "cache reserve put failed");
             }
         }
@@ -3020,6 +3021,17 @@ enum AuthTrustOutcome {
     Challenge,
     InvalidProof,
     BackendFailure,
+    /// WOR-2667: the request proceeded without the decision being made,
+    /// because the provider's backend failed and the operator asked it
+    /// to fail open.
+    ///
+    /// Distinct from [`Self::Allowed`] because the per-request evidence
+    /// feed has to say so. `sbproxy_ext_authz_decisions_total` already
+    /// counts fail-opens in aggregate; an analyst reconstructing *which*
+    /// requests were admitted without an authorization decision needs
+    /// the record, not the counter. Trust-wise it behaves as `Allowed`:
+    /// nothing about the caller is in question.
+    FailedOpen,
 }
 
 impl AuthTrustOutcome {
@@ -3034,7 +3046,7 @@ impl AuthTrustOutcome {
     /// because a success short-circuits the loop.
     fn severity(self) -> u8 {
         match self {
-            Self::Allowed => 0,
+            Self::Allowed | Self::FailedOpen => 0,
             Self::Missing => 1,
             Self::Challenge => 2,
             Self::BackendFailure => 3,
@@ -3909,6 +3921,258 @@ async fn check_auth_with_tls_outcome(
                 }
             }
         }
+        // WOR-2667: Envoy-style external authorization. Like
+        // `ldap_auth`, this is an outbound call on the inbound path
+        // that needs nothing the H1/H2 pipeline has and the H3
+        // dispatch lacks, so it dispatches here rather than in a
+        // dedicated branch the way `forward_auth` has to.
+        Auth::ExtAuthz(provider) => {
+            use sbproxy_modules::auth::ExtAuthzOutcome;
+            // The service authorizes the request line it would see, so
+            // the query rides along with the path; a service gating on
+            // `?admin=1` cannot do that from the path alone.
+            let target = match query {
+                Some(query) if !query.is_empty() => format!("{path}?{query}"),
+                _ => path.to_string(),
+            };
+            match provider.authorize(method, &target, headers).await {
+                ExtAuthzOutcome::Allowed { subject } => {
+                    let principal = match subject.as_deref() {
+                        Some(subject) => sbproxy_plugin::Principal {
+                            tenant_id: tenant_id.clone(),
+                            sub: subject.to_string(),
+                            source: sbproxy_plugin::PrincipalSource::ExtAuthz,
+                            virtual_key: None,
+                            attrs: sbproxy_plugin::PrincipalAttrs::default(),
+                        },
+                        None => sbproxy_plugin::Principal::anonymous_for(tenant_id.clone()),
+                    };
+                    (
+                        AuthResult::Allow {
+                            sub: subject,
+                            source: Some(sbproxy_plugin::AuthSubjectSource::ForwardAuth),
+                        },
+                        Some(principal),
+                        AuthTrustOutcome::Allowed,
+                    )
+                }
+                ExtAuthzOutcome::Denied {
+                    status,
+                    message,
+                    headers: response_headers,
+                } => (
+                    AuthResult::DenyWithHeaders(status, message, response_headers),
+                    None,
+                    // The service refused a request it was able to
+                    // judge. That is a decision about authorization,
+                    // not evidence that the caller forged a
+                    // credential, so it stays off the suspicious tier.
+                    AuthTrustOutcome::Challenge,
+                ),
+                ExtAuthzOutcome::Unavailable => (
+                    AuthResult::Deny(503, "authorization service unavailable".to_string()),
+                    None,
+                    AuthTrustOutcome::BackendFailure,
+                ),
+                ExtAuthzOutcome::FailedOpen => (
+                    AuthResult::allow_anonymous(),
+                    Some(sbproxy_plugin::Principal::anonymous_for(tenant_id.clone())),
+                    // The request proceeds, and the record says why.
+                    // Folded into `Allowed` this was an
+                    // `Auth`/`Allow`/`credential accepted` audit record
+                    // identical to a real admission, which is the one
+                    // thing an analyst reconstructing an outage cannot
+                    // work around.
+                    AuthTrustOutcome::FailedOpen,
+                ),
+            }
+        }
+        // WOR-2667: RFC 7662 token introspection.
+        Auth::OauthIntrospection(provider) => {
+            use sbproxy_modules::auth::IntrospectionOutcome;
+            use sbproxy_modules::auth::OauthIntrospectionProvider;
+            let token_offered = OauthIntrospectionProvider::extract_token(headers).is_some();
+            match provider.authenticate(headers).await {
+                IntrospectionOutcome::Active { subject } => {
+                    let principal = match subject.as_deref() {
+                        Some(subject) => sbproxy_plugin::Principal {
+                            tenant_id: tenant_id.clone(),
+                            sub: subject.to_string(),
+                            source: sbproxy_plugin::PrincipalSource::OauthIntrospection,
+                            virtual_key: None,
+                            attrs: sbproxy_plugin::PrincipalAttrs::default(),
+                        },
+                        // A client-credentials token often carries no
+                        // `sub`. It is still an authenticated caller.
+                        None => sbproxy_plugin::Principal::anonymous_for(tenant_id.clone()),
+                    };
+                    (
+                        AuthResult::Allow {
+                            sub: subject,
+                            source: Some(sbproxy_plugin::AuthSubjectSource::Jwt),
+                        },
+                        Some(principal),
+                        AuthTrustOutcome::Allowed,
+                    )
+                }
+                IntrospectionOutcome::Inactive => {
+                    // RFC 6750 section 3: a bare `Bearer` challenge
+                    // when nothing was offered, and `invalid_token`
+                    // when something was and the server rejected it.
+                    // The split is what tells a client whether to go
+                    // get a credential or to refresh the one it holds.
+                    let (challenge, trust_outcome) = if token_offered {
+                        (
+                            "Bearer error=\"invalid_token\"".to_string(),
+                            AuthTrustOutcome::InvalidProof,
+                        )
+                    } else {
+                        ("Bearer".to_string(), AuthTrustOutcome::Missing)
+                    };
+                    (
+                        AuthResult::DenyWithHeaders(
+                            401,
+                            "unauthorized".to_string(),
+                            vec![("WWW-Authenticate".to_string(), challenge)],
+                        ),
+                        None,
+                        trust_outcome,
+                    )
+                }
+                IntrospectionOutcome::InsufficientScope { missing } => (
+                    AuthResult::DenyWithHeaders(
+                        403,
+                        "insufficient scope".to_string(),
+                        vec![(
+                            "WWW-Authenticate".to_string(),
+                            format!("Bearer error=\"insufficient_scope\", scope=\"{missing}\""),
+                        )],
+                    ),
+                    None,
+                    // The token verified; it just does not carry the
+                    // grant this origin needs.
+                    AuthTrustOutcome::Challenge,
+                ),
+                IntrospectionOutcome::Unavailable => (
+                    AuthResult::Deny(503, "token introspection unavailable".to_string()),
+                    None,
+                    AuthTrustOutcome::BackendFailure,
+                ),
+            }
+        }
+        // WOR-2667: Know Your Agent token verification.
+        Auth::Kya(verifier) => {
+            use sbproxy_modules::auth::KyaVerdict;
+            let hostname = headers
+                .get(http::header::HOST)
+                .and_then(|value| value.to_str().ok())
+                .map(crate::dispatch::strip_port)
+                .unwrap_or("");
+            match verifier.verify(headers, hostname).await {
+                KyaVerdict::Verified(agent) => {
+                    let mut attrs = sbproxy_plugin::PrincipalAttrs::default();
+                    // The agent metadata rides on the principal so the
+                    // access log, policy scripts, and the request
+                    // context all read one carrier rather than
+                    // re-deriving it from the token.
+                    attrs
+                        .metadata
+                        .insert("kya_verdict".to_string(), "verified".to_string());
+                    if !agent.vendor.is_empty() {
+                        attrs
+                            .metadata
+                            .insert("kya_vendor".to_string(), agent.vendor.clone());
+                    }
+                    if !agent.kya_version.is_empty() {
+                        attrs
+                            .metadata
+                            .insert("kya_version".to_string(), agent.kya_version.clone());
+                    }
+                    if !agent.agent_class.is_empty() {
+                        attrs
+                            .metadata
+                            .insert("kya_agent_class".to_string(), agent.agent_class.clone());
+                    }
+                    if !agent.agent_id.is_empty() {
+                        attrs
+                            .metadata
+                            .insert("kya_agent_id".to_string(), agent.agent_id.clone());
+                    }
+                    if let Some(balance) = agent.kyab_balance.as_ref() {
+                        attrs
+                            .metadata
+                            .insert("kya_kyab_balance".to_string(), balance.amount.to_string());
+                        // The amount alone is not comparable, which is
+                        // the whole reason the provider's own floor
+                        // became denominated. A policy writing its own
+                        // comparison needs the same thing.
+                        if !balance.currency.is_empty() {
+                            attrs
+                                .metadata
+                                .insert("kya_kyab_currency".to_string(), balance.currency.clone());
+                        }
+                    }
+                    let sub = agent.sub.clone();
+                    let principal = sbproxy_plugin::Principal {
+                        tenant_id: tenant_id.clone(),
+                        sub: sub.clone(),
+                        source: sbproxy_plugin::PrincipalSource::Kya,
+                        virtual_key: None,
+                        attrs,
+                    };
+                    (
+                        AuthResult::Allow {
+                            sub: (!sub.is_empty()).then_some(sub),
+                            source: Some(sbproxy_plugin::AuthSubjectSource::Jwt),
+                        },
+                        Some(principal),
+                        AuthTrustOutcome::Allowed,
+                    )
+                }
+                KyaVerdict::Missing => (
+                    AuthResult::Deny(401, "kya: agent token required".to_string()),
+                    None,
+                    AuthTrustOutcome::Missing,
+                ),
+                verdict @ (KyaVerdict::Invalid { .. }
+                | KyaVerdict::Expired
+                | KyaVerdict::Revoked) => {
+                    // The reason is log-safe by construction: it is a
+                    // closed label, never any part of the token.
+                    tracing::warn!(reason = verdict.reason(), "kya: agent token rejected");
+                    (
+                        AuthResult::Deny(401, "kya: agent token rejected".to_string()),
+                        None,
+                        AuthTrustOutcome::InvalidProof,
+                    )
+                }
+                KyaVerdict::InsufficientBalance { required, currency } => (
+                    AuthResult::Deny(
+                        402,
+                        format!("kya: agent balance below the required {required} {currency}"),
+                    ),
+                    None,
+                    // The token verified. The agent cannot pay, which
+                    // is a state it can fix, not a forged credential.
+                    AuthTrustOutcome::Challenge,
+                ),
+                KyaVerdict::DirectoryUnavailable => {
+                    if verifier.fail_open {
+                        (
+                            AuthResult::allow_anonymous(),
+                            Some(sbproxy_plugin::Principal::anonymous_for(tenant_id.clone())),
+                            AuthTrustOutcome::FailedOpen,
+                        )
+                    } else {
+                        (
+                            AuthResult::Deny(503, "kya: issuer directory unavailable".to_string()),
+                            None,
+                            AuthTrustOutcome::BackendFailure,
+                        )
+                    }
+                }
+            }
+        }
         Auth::Noop => (
             AuthResult::allow_anonymous(),
             Some(sbproxy_plugin::Principal::anonymous_for(tenant_id.clone())),
@@ -4589,6 +4853,199 @@ pub(crate) fn record_auth_decision(
         &ctx.tenant_id,
         reason,
         sbproxy_observe::decision::DecisionDetails::auth(auth_type),
+    );
+}
+
+/// Publish one behavioral-anomaly verdict onto the decision feed
+/// (WOR-2666).
+///
+/// The counter and the log line already existed. What did not was a
+/// record on the typed feed, which is where every other decision
+/// surface in this workspace publishes and where an operator's SIEM
+/// rules live. A counter carrying `kind` and `severity` cannot answer
+/// "which requests, on which origin, for which caller", and the log
+/// line is not the audit trail.
+///
+/// The outcome is always `Allow`: a verdict is an observation, and the
+/// request proceeds whatever it says. What refuses is the reputation
+/// gate, and that publishes its own record through
+/// [`record_reputation_decision`].
+pub(crate) fn record_anomaly_decision(
+    ctx: &RequestContext,
+    verdict: &sbproxy_plugin::AnomalyVerdict,
+    identity_source: Option<&str>,
+) {
+    use sbproxy_observe::decision::{DecisionEngine, DecisionEvent, DecisionOutcome};
+
+    let origin_id = ctx
+        .origin_idx
+        .and_then(|idx| ctx.pipeline.config.origins.get(idx))
+        .map(|origin| origin.origin_id.to_string());
+    sbproxy_observe::decision::record_decision(
+        DecisionEvent::Anomaly,
+        DecisionEngine::BuiltIn,
+        DecisionOutcome::Allow,
+        origin_id.as_deref().unwrap_or(DEFAULT_ORIGIN_LABEL),
+        &ctx.tenant_id,
+    );
+
+    let Some(origin_id) = origin_id else {
+        return;
+    };
+    if !crate::server::proxy_http::audit_publishes(
+        &ctx.pipeline,
+        DecisionEvent::Anomaly,
+        Some(&ctx.tenant_id),
+        Some(&origin_id),
+    ) {
+        return;
+    }
+    crate::policy_bus::emit_decision_audit_detailed(
+        DecisionEvent::Anomaly,
+        DecisionEngine::BuiltIn,
+        DecisionOutcome::Allow,
+        &ctx.request_id,
+        &origin_id,
+        &origin_id,
+        &ctx.tenant_id,
+        &anomaly_audit_reason(verdict, identity_source),
+        sbproxy_observe::decision::DecisionDetails::anomaly(
+            verdict.kind,
+            verdict.severity,
+            identity_source,
+        ),
+    );
+}
+
+/// The reason a detection record carries, which is not the verdict's own
+/// reason string.
+///
+/// WOR-2666 re-review N9. `AnomalyVerdict::reason` names the value that
+/// was flagged, and for `ja4_outlier` that value is the caller's TLS
+/// fingerprint, computed from a ClientHello the caller chose. The field
+/// contract for this event says the record never carries the raw score,
+/// the fingerprint, or the client address, and the admission half
+/// honored that while the detection half published the fingerprint in
+/// prose.
+///
+/// The value stays on the log line, which is local and already carries
+/// the hostname. What ships to a SIEM is what a rule can select on: the
+/// dimension that fired, how strong it was, and which resolver produced
+/// the identity it was keyed on. All three are also structured fields
+/// on the same record, so the reason is a sentence rather than the only
+/// copy.
+fn anomaly_audit_reason(
+    verdict: &sbproxy_plugin::AnomalyVerdict,
+    identity_source: Option<&str>,
+) -> String {
+    match identity_source {
+        Some(source) => format!(
+            "{} at {} for an identity resolved by {source}",
+            verdict.kind, verdict.severity
+        ),
+        None => format!(
+            "{} at {} for an unresolved identity",
+            verdict.kind, verdict.severity
+        ),
+    }
+}
+
+#[cfg(test)]
+mod anomaly_audit_reason_tests {
+    use sbproxy_plugin::AnomalyVerdict;
+
+    /// WOR-2666 re-review N9, red first. The detection record used to
+    /// publish `verdict.reason` verbatim, and for `ja4_outlier` that
+    /// string is the caller's TLS fingerprint, which the same event's
+    /// field contract promises never ships.
+    #[test]
+    fn a_detection_record_does_not_carry_the_fingerprint_that_fired() {
+        let verdict = AnomalyVerdict {
+            kind: "ja4_outlier",
+            severity: "critical",
+            reason: "t13d1516h2_8daaf6152771_b186095e22b6 is in the long tail for agent class \
+                     gptbot"
+                .to_string(),
+        };
+        let audit = super::anomaly_audit_reason(&verdict, Some("user_agent"));
+        assert!(
+            !audit.contains("t13d1516h2"),
+            "the fingerprint must not reach a record that ships unredacted: {audit}"
+        );
+        assert!(audit.contains("ja4_outlier"), "{audit}");
+        assert!(audit.contains("critical"), "{audit}");
+        assert!(
+            audit.contains("user_agent"),
+            "the resolver source is what tells a rule whether the class was verified: {audit}"
+        );
+    }
+
+    #[test]
+    fn an_unresolved_identity_says_so_rather_than_going_silent() {
+        let verdict = AnomalyVerdict {
+            kind: "request_rate_spike",
+            severity: "warn",
+            reason: "one address is at 900 requests today".to_string(),
+        };
+        let audit = super::anomaly_audit_reason(&verdict, None);
+        assert!(audit.contains("unresolved identity"), "{audit}");
+    }
+}
+
+/// Publish one reputation admission decision onto the decision feed
+/// (WOR-2666).
+///
+/// The record carries the band and the resolver source and nothing
+/// else. Not the score, which moves on every request and is on the
+/// gauge for anyone who wants the trend, and not the signals behind it:
+/// a JA4 or a client address on this half of the record ships
+/// unredacted.
+pub(crate) fn record_reputation_decision(
+    ctx: &RequestContext,
+    action: crate::anomaly::ReputationAction,
+    bucket: &str,
+    identity_source: Option<&str>,
+    reason: &str,
+) {
+    use sbproxy_observe::decision::{DecisionEngine, DecisionEvent, DecisionOutcome};
+
+    let origin_id = ctx
+        .origin_idx
+        .and_then(|idx| ctx.pipeline.config.origins.get(idx))
+        .map(|origin| origin.origin_id.to_string());
+    sbproxy_observe::decision::record_decision(
+        DecisionEvent::Anomaly,
+        DecisionEngine::BuiltIn,
+        DecisionOutcome::Deny,
+        origin_id.as_deref().unwrap_or(DEFAULT_ORIGIN_LABEL),
+        &ctx.tenant_id,
+    );
+
+    let Some(origin_id) = origin_id else {
+        return;
+    };
+    if !crate::server::proxy_http::audit_publishes(
+        &ctx.pipeline,
+        DecisionEvent::Anomaly,
+        Some(&ctx.tenant_id),
+        Some(&origin_id),
+    ) {
+        return;
+    }
+    crate::policy_bus::emit_decision_audit_detailed(
+        DecisionEvent::Anomaly,
+        DecisionEngine::BuiltIn,
+        DecisionOutcome::Deny,
+        &ctx.request_id,
+        &origin_id,
+        &origin_id,
+        &ctx.tenant_id,
+        reason,
+        sbproxy_observe::decision::DecisionDetails::reputation(
+            bucket,
+            action.as_label(),
+            identity_source,
+        ),
     );
 }
 

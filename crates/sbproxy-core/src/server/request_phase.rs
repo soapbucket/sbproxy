@@ -3674,6 +3674,18 @@ pub(super) async fn request_filter(
             if let Some(principal) = principal_opt {
                 ctx.principal = principal;
             }
+            // WOR-2667: the `kya` provider resolves an agent identity,
+            // not just an admission. Copy what it learned off the
+            // principal and onto the request context so `request.kya.*`
+            // is addressable from CEL, Lua, JavaScript, and WASM the
+            // same way it is when an out-of-tree `IdentityResolverHook`
+            // populates it.
+            #[cfg(feature = "agent-class")]
+            stamp_kya_context(
+                ctx,
+                &decided_auth_type,
+                matches!(trust_outcome, AuthTrustOutcome::FailedOpen),
+            );
             // Phase-timing capture: snapshot the moment the auth
             // provider returned (success, deny, or challenge). The
             // access-log + `sbproxy_phase_duration_seconds{phase="auth"}`
@@ -3733,13 +3745,34 @@ pub(super) async fn request_filter(
             match auth_result {
                 AuthResult::Allow { sub, source } => {
                     ctx.auth_result = Some(sbproxy_plugin::AuthDecision::Allow { sub, source });
+                    // WOR-2667: a fail-open is admitted and recorded as
+                    // what it is. The reason is what an analyst
+                    // reconstructing an outage reads, and the shared
+                    // `sbproxy_decision_event_fail_open_total` family is
+                    // what a dashboard alerts on; folding both into a
+                    // plain allow made 40,000 unauthorized admissions
+                    // indistinguishable from 40,000 real ones.
+                    let failed_open = matches!(trust_outcome, AuthTrustOutcome::FailedOpen);
+                    let reason = auth_allow_reason(failed_open);
                     crate::server::record_auth_decision(
                         ctx,
                         &origin_label,
                         &decided_auth_type,
                         true,
-                        "credential accepted",
+                        reason,
                     );
+                    if failed_open {
+                        let origin_for_family = ctx
+                            .origin_idx
+                            .and_then(|idx| ctx.pipeline.config.origins.get(idx))
+                            .map(|origin| origin.origin_id.to_string());
+                        sbproxy_observe::decision::record_decision_fail_open(
+                            sbproxy_observe::decision::DecisionEvent::Auth,
+                            sbproxy_observe::decision::DecisionEngine::BuiltIn,
+                            origin_for_family.as_deref().unwrap_or("__unmatched__"),
+                            &ctx.tenant_id,
+                        );
+                    }
                 }
                 AuthResult::RateLimited(info) => {
                     ctx.auth_result = Some(sbproxy_plugin::AuthDecision::allow_anonymous());
@@ -3894,6 +3927,29 @@ pub(super) async fn request_filter(
     // have now run. Compute once so every downstream policy sees the same
     // conservative tier and the distribution metric has a live writer.
     crate::trust_tier::finalize(ctx, false);
+
+    // WOR-2666: the reputation score's request-time consumer.
+    //
+    // Off unless an operator set `proxy.anomaly.reputation.deny_below`
+    // or `challenge_below`, which is the whole posture: the score is
+    // published whether or not anything acts on it, and it becomes an
+    // admission decision only when someone names a number.
+    //
+    // Here, and not earlier. The first version ran this right after the
+    // origin resolved, to spare a floored class the cost of an issuer
+    // dial, and that read the wrong key on two dimensions:
+    // `ctx.tenant_id` is stamped from the matched origin further down,
+    // and the agent class at that point is whatever the rule-based
+    // resolver worked out from the User-Agent. `bot_auth` restamps the
+    // class only after it has verified a signature and `kya` stamps its
+    // identity later still, so the gate could never see a verified
+    // source, and the histogram, which `response_filter` fills, keys on
+    // the restamped class. Gate and histogram disagreeing about which
+    // class a caller belongs to is worse than an authentication round
+    // trip a refused caller did not need.
+    if reputation_admission(session, ctx).await? {
+        return Ok(true);
+    }
 
     // --- P0 edge capture ---
     //
@@ -4831,6 +4887,10 @@ pub(super) async fn request_filter(
                                     .inc();
                             }
                             Err(e) => {
+                                sbproxy_observe::metrics::record_cache_reserve_error(
+                                    invalidate_origin.as_str(),
+                                    "delete",
+                                );
                                 tracing::warn!(
                                     error = %e,
                                     "cache reserve delete failed on mutation"
@@ -5259,8 +5319,26 @@ pub(super) async fn request_filter(
                                         return Ok(true);
                                     }
                                     // Expired metadata; drop and
-                                    // fall through.
-                                    let _ = reserve.delete(&lookup_key).await;
+                                    // fall through. The delete is
+                                    // counted (WOR-2673 review F5):
+                                    // a bucket whose write credentials
+                                    // expired but whose reads still
+                                    // work pays a full object GET and
+                                    // a decode on every request for
+                                    // this key, forever, and the
+                                    // swallowed error was the only
+                                    // trace.
+                                    if let Err(error) = reserve.delete(&lookup_key).await {
+                                        tracing::warn!(
+                                            origin = %lookup_origin,
+                                            error = %error,
+                                            "cache reserve could not delete an expired entry"
+                                        );
+                                        sbproxy_observe::metrics::record_cache_reserve_error(
+                                            lookup_origin.as_str(),
+                                            "delete",
+                                        );
+                                    }
                                     sbproxy_observe::metrics()
                                         .cache_reserve_misses
                                         .with_label_values(&[lookup_origin.as_str()])
@@ -5273,6 +5351,16 @@ pub(super) async fn request_filter(
                                         .inc();
                                 }
                                 Err(e) => {
+                                    // WOR-2673: counted as well as
+                                    // logged. The request proceeds
+                                    // either way, so without a counter
+                                    // a reserve failing every read
+                                    // reads as a cold cache rather than
+                                    // as a broken tier.
+                                    sbproxy_observe::metrics::record_cache_reserve_error(
+                                        lookup_origin.as_str(),
+                                        "get",
+                                    );
                                     warn!(
                                         error = %e,
                                         "cache reserve lookup failed; bypassing reserve"
@@ -8047,6 +8135,824 @@ origins:
         assert!(
             response.contains("buffered policy denied"),
             "response: {response}"
+        );
+    }
+}
+
+/// The audit reason an admitted request's decision record carries.
+///
+/// Its own function so the two strings can be asserted without driving
+/// the whole auth stage. WOR-2667's review found a fail-open recorded
+/// as `Auth`/`Allow`/`credential accepted`, byte-identical to a real
+/// admission: an analyst reconstructing a twenty-minute authorization
+/// outage had 40,000 records saying a credential was checked, for
+/// requests where none was. The counter said `fail_open` and the
+/// evidence feed said otherwise, and only one of those is the audit
+/// trail.
+pub(crate) fn auth_allow_reason(failed_open: bool) -> &'static str {
+    if failed_open {
+        "admitted without a decision: the provider's backend failed and it is configured to \
+         fail open"
+    } else {
+        "credential accepted"
+    }
+}
+
+/// Refuse a caller whose agent class sits under an operator-set
+/// reputation floor (WOR-2666).
+///
+/// Returns `Ok(true)` when the response has been written and the
+/// request is finished.
+///
+/// # Why this exists and why it is off by default
+///
+/// The anomaly detector has published `sbproxy_agent_reputation_score`
+/// since it shipped, and nothing read it: the score was a dashboard
+/// panel and no more. That is a real position while nobody has decided
+/// what a request should do when its class scores 0.4, and it stops
+/// being one the moment an operator has decided. `deny_below` and
+/// `challenge_below` are where they say so. Unset, this function
+/// returns before it touches the detector.
+///
+/// The shape is Cloudflare's threat score into a WAF rule: the gateway
+/// computes the number always, and a rule the operator writes decides
+/// what it means. What that shape asks of the number, and what
+/// `docs/anomaly-detection.md` says before an operator picks one, is
+/// that the score is keyed on a *claimed* class unless the resolver
+/// source was a verified one. The decision record carries the source so
+/// a rule written after the fact can tell those apart.
+///
+/// A class with no history is admitted. Refusing on the absence of
+/// evidence would refuse every caller for the first `min_observations`
+/// requests after every restart.
+async fn reputation_admission(session: &mut Session, ctx: &mut RequestContext) -> Result<bool> {
+    let Some(detector) = crate::anomaly::detector() else {
+        return Ok(false);
+    };
+    // `unknown` is the same fallback `AnomalyDetector::analyze_on` uses
+    // for a request the resolver did not classify, so the gate and the
+    // histogram agree on which key they are talking about.
+    #[cfg(feature = "agent-class")]
+    let agent_class: String = ctx
+        .agent_id
+        .as_ref()
+        .map_or_else(|| "unknown".to_string(), |id| id.as_str().to_string());
+    #[cfg(not(feature = "agent-class"))]
+    let agent_class: String = "unknown".to_string();
+
+    let today = chrono::Utc::now().date_naive();
+    // Rolls the window before it reads it, which is what lets a floored
+    // class recover: see `AnomalyDetector::refresh_reputation`.
+    let Some((action, score)) = detector.admission_for(&ctx.tenant_id, &agent_class, today) else {
+        return Ok(false);
+    };
+
+    // WOR-2666 re-review N1. A refused request never reaches
+    // `response_filter`, so without this the detector would learn
+    // nothing from the traffic it is refusing: the class's window would
+    // hold only the flood that floored it, and every later observation
+    // would be lost. Feeding the refusal keeps the population honest
+    // and keeps the day buckets moving.
+    let verdicts = detector.analyze_on(&anomaly_view(ctx, session, &agent_class), today);
+    for entry in &verdicts {
+        crate::anomaly::record_verdict(ctx.hostname.as_str(), entry);
+    }
+
+    #[cfg(feature = "agent-class")]
+    let identity_source = ctx.agent_id_source.map(|source| source.as_str());
+    #[cfg(not(feature = "agent-class"))]
+    let identity_source: Option<&str> = None;
+    for entry in &verdicts {
+        crate::server::record_anomaly_decision(ctx, entry, identity_source);
+    }
+
+    let bucket = crate::anomaly::reputation_bucket(score);
+    let status = action.status();
+    // The band, the class, and the resolver source reach the log line
+    // and the decision record. They do not reach the caller: the body
+    // below is generic, because a hostile caller reading its own band
+    // back learns which class the gateway resolved it into and how
+    // close it is to the floor, and the class is a claim it controls.
+    let reason = format!(
+        "agent class {agent_class} reputation is {bucket}, under the configured {} floor",
+        action.as_label()
+    );
+    tracing::warn!(
+        hostname = %ctx.hostname,
+        agent_class = %agent_class,
+        reputation = %bucket,
+        action = action.as_label(),
+        "reputation admission refused a request"
+    );
+    crate::server::record_reputation_decision(ctx, action, bucket, identity_source, &reason);
+
+    let origin = ctx
+        .origin_idx
+        .and_then(|idx| ctx.pipeline.config.origins.get(idx));
+    let path = session.req_header().uri.path().to_string();
+    send_error_with_pages(
+        session,
+        status,
+        action.client_message(),
+        origin.and_then(|o| o.error_pages.as_deref()),
+        origin.and_then(|o| o.problem_details.as_ref()),
+        &path,
+        &[],
+    )
+    .await?;
+    ctx.response_status = Some(status);
+    Ok(true)
+}
+
+/// The view the anomaly detector reads, built from the request phase.
+///
+/// The same fields `response_filter` builds it from, so the gate and
+/// the response-phase dispatch judge the same request the same way.
+fn anomaly_view<'a>(
+    ctx: &'a RequestContext,
+    session: &'a Session,
+    agent_class: &'a str,
+) -> sbproxy_plugin::RequestContextView<'a> {
+    let request = session.req_header();
+    #[cfg(feature = "agent-class")]
+    let agent_id_source = ctx.agent_id_source.map(|source| source.as_str());
+    #[cfg(not(feature = "agent-class"))]
+    let agent_id_source: Option<&str> = None;
+    #[cfg(feature = "tls-fingerprint")]
+    let (ja4_fingerprint, ja4_trustworthy, headless_library) = {
+        let ja4 = ctx
+            .tls_fingerprint
+            .as_ref()
+            .and_then(|fingerprint| fingerprint.ja4.as_deref());
+        let trustworthy = ctx
+            .tls_fingerprint
+            .as_ref()
+            .is_some_and(|fingerprint| fingerprint.trustworthy);
+        let library = match ctx.headless_signal.as_ref() {
+            Some(crate::context::HeadlessSignal::Detected { library, .. }) => {
+                Some(library.as_str())
+            }
+            _ => None,
+        };
+        (ja4, trustworthy, library)
+    };
+    #[cfg(not(feature = "tls-fingerprint"))]
+    let (ja4_fingerprint, ja4_trustworthy, headless_library): (
+        Option<&str>,
+        bool,
+        Option<&str>,
+    ) = (None, false, None);
+    sbproxy_plugin::RequestContextView {
+        tenant_id: ctx.tenant_id.as_str(),
+        hostname: ctx.hostname.as_str(),
+        method: request.method.as_str(),
+        path: request.uri.path(),
+        query: request.uri.query().unwrap_or(""),
+        agent_id: Some(agent_class),
+        agent_id_source,
+        ja4_fingerprint,
+        ja4_trustworthy,
+        headless_library,
+        client_ip: ctx.client_ip,
+    }
+}
+
+/// WOR-2667: mirror a verified `kya` principal's metadata onto the
+/// request context's `request.kya.*` fields.
+///
+/// The provider stamps what it learned onto
+/// `Principal::attrs::metadata` because that is the carrier every
+/// provider already writes and the access log already reads. The
+/// scripting layers read the typed context fields instead, and
+/// `trust_tier` reads `kya_verdict`, so the two have to agree. This is
+/// the one place that copy happens.
+///
+/// Keyed on the *deciding* provider rather than on the configured
+/// `Auth` variant, so a `kya` slot that wins inside an `any_of`
+/// composition is stamped too. Matching the variant would skip it
+/// there and leave `request.kya.verdict` unset for a request a KYA
+/// token actually authenticated.
+#[cfg(feature = "agent-class")]
+pub(crate) fn stamp_kya_context(
+    ctx: &mut RequestContext,
+    decided_auth_type: &str,
+    failed_open: bool,
+) {
+    if decided_auth_type != "kya" {
+        return;
+    }
+    let metadata = &ctx.principal.attrs.metadata;
+    if metadata.get("kya_verdict").is_none() {
+        // The fail-open admission is the one path that reaches a policy
+        // chain with no kya metadata on the principal: `fail_open: true`
+        // turns `directory_unavailable` into an anonymous allow.
+        // Inferring the verdict there is what makes the documented
+        // `request.kya.verdict == "directory_unavailable"` policy fire.
+        //
+        // Only there. The first version of this inferred it whenever the
+        // metadata was absent, and `stamp_kya_context` is called on every
+        // outcome including the refusing ones, so a missing, expired,
+        // revoked, invalid, or under-balance token stamped
+        // `directory_unavailable` too. That is an affirmatively false
+        // value in a field the same round documented as carrying exactly
+        // two: a policy branching on "the issuer is down" would fire for
+        // a revoked token, which is the opposite of what the operator
+        // wrote. `failed_open` is the trust outcome the auth stage
+        // already computed, so the caller knows and this does not have to
+        // guess.
+        if failed_open {
+            ctx.kya_verdict = Some("directory_unavailable");
+        }
+        return;
+    }
+    // The label set is the closed one `KyaVerdict::metric_label`
+    // produces; anything else means the provider and this mapping
+    // disagree, and an unknown label is dropped rather than widened
+    // into the `&'static str` the context field holds.
+    let verdict = metadata
+        .get("kya_verdict")
+        .and_then(|value| match value.as_str() {
+            "verified" => Some("verified"),
+            "missing" => Some("missing"),
+            "expired" => Some("expired"),
+            "revoked" => Some("revoked"),
+            "invalid" => Some("invalid"),
+            "insufficient_balance" => Some("insufficient_balance"),
+            "directory_unavailable" => Some("directory_unavailable"),
+            _ => None,
+        });
+    if verdict.is_none() {
+        return;
+    }
+    ctx.kya_verdict = verdict;
+    ctx.kya_vendor = metadata.get("kya_vendor").cloned();
+    ctx.kya_version = metadata.get("kya_version").cloned();
+    // The token's own claims, kept apart from `ctx.agent_id`, which the
+    // resolver fills from the User-Agent. `request.kya.agent_id` is
+    // documented as verified identity and has to be one.
+    ctx.kya_agent_id = metadata.get("kya_agent_id").cloned();
+    ctx.kya_agent_class = metadata.get("kya_agent_class").cloned();
+    ctx.kya_kyab_balance = metadata
+        .get("kya_kyab_balance")
+        .and_then(|amount| amount.parse::<u64>().ok());
+    ctx.kya_kyab_currency = metadata.get("kya_kyab_currency").cloned();
+}
+
+/// WOR-2667 re-review N4: the fail-open evidence record, at the seam.
+#[cfg(test)]
+mod fail_open_reason_tests {
+    /// A fail-open and a real admission must not produce the same audit
+    /// record. Folded together, an operator reconstructing which
+    /// requests were admitted without an authorization decision has no
+    /// way to do it: every one is an `Auth`/`Allow`/`credential
+    /// accepted` record identical to a genuine one.
+    #[test]
+    fn a_fail_open_admission_does_not_read_as_an_accepted_credential() {
+        let admitted = super::auth_allow_reason(false);
+        let failed_open = super::auth_allow_reason(true);
+        assert_eq!(admitted, "credential accepted");
+        assert_ne!(
+            admitted, failed_open,
+            "the two admissions have to be distinguishable in the evidence feed"
+        );
+        assert!(
+            failed_open.contains("without a decision"),
+            "the reason is what an analyst reads: {failed_open}"
+        );
+        assert!(
+            failed_open.contains("fail open"),
+            "and it has to name the setting that caused it: {failed_open}"
+        );
+    }
+
+    /// The alertable half. `record_decision_fail_open` writes its own
+    /// family rather than an `outcome` label on the shared one, so a
+    /// dashboard can page on it; this pins that the family exists and
+    /// takes the `auth` event, which is what the request path passes.
+    #[test]
+    fn the_fail_open_family_counts_the_auth_event() {
+        use sbproxy_observe::decision::{DecisionEngine, DecisionEvent};
+
+        let family = &sbproxy_observe::metrics::metrics().decision_event_fail_open;
+        let labels = [
+            DecisionEvent::Auth.as_label(),
+            DecisionEngine::BuiltIn.as_label(),
+            "n4-origin",
+            "n4-tenant",
+        ];
+        let before = family.with_label_values(&labels).get();
+        sbproxy_observe::decision::record_decision_fail_open(
+            DecisionEvent::Auth,
+            DecisionEngine::BuiltIn,
+            "n4-origin",
+            "n4-tenant",
+        );
+        assert_eq!(
+            family.with_label_values(&labels).get(),
+            before + 1,
+            "an auth fail-open has to move its own family, not only the reason string"
+        );
+    }
+}
+
+/// WOR-2666: where the reputation gate sits in `request_filter`.
+///
+/// **A text search, and narrower than the thing it guards.** It sees
+/// the order of three strings in this file's source. It cannot see that
+/// the gate runs, that a refusal reaches the wire, or that moving the
+/// gate would actually change a verdict; `reputation_gate_wire_tests`
+/// covers that half, and covers the tenant dimension for real because
+/// its fixture origin stamps one.
+///
+/// It exists because the wire fixture is blind to the *other* dimension
+/// of the same move. The fixture has no agent-class catalog and no
+/// verifying auth provider, so the class resolves to `unknown` on
+/// either side of the auth arms and a gate hoisted above them passes
+/// every test in the workspace. The failure would be silent and it is
+/// the exact one the round-two move was made to fix: `bot_auth`
+/// restamps the class only after it has verified a signature and `kya`
+/// stamps its identity later still, so a gate above the auth arms can
+/// never see a verified source, while `analyze_on` in the response
+/// phase keys on the restamped class. Gate and histogram would key on
+/// different classes for the same caller.
+///
+/// The round-one version of this guard asserted the opposite ordering
+/// and was deleted when the gate moved. Deleting it rather than
+/// inverting it is what left the placement unpinned, and the
+/// replacement's rustdoc claimed to be a superset of it, which it was
+/// not. Both live here now, each saying what it does not cover.
+#[cfg(test)]
+mod reputation_gate_placement_tests {
+    /// This file's own source, read at compile time so the guard cannot
+    /// drift from what shipped.
+    const SOURCE: &str = include_str!("request_phase.rs");
+
+    #[test]
+    fn the_gate_runs_after_the_tenant_stamp_and_after_authentication() {
+        // Built rather than written out, so the needle does not match
+        // this test's own text.
+        let needle = format!("if {}(session, ctx).await? {{", "reputation_admission");
+        let calls: Vec<usize> = SOURCE.match_indices(&needle).map(|(at, _)| at).collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "the reputation gate must have exactly one call site in the request path: a second \
+             one would mean two refusal paths and a double `analyze_on` to reason about"
+        );
+        let call = calls[0];
+
+        let filter_at = SOURCE
+            .find("pub(super) async fn request_filter(")
+            .expect("request_filter is in this file");
+        let definition_at = SOURCE
+            .find("async fn reputation_admission(")
+            .expect("the gate is in this file");
+        assert!(
+            call > filter_at && call < definition_at,
+            "the call has to be inside request_filter, not in the gate's own body"
+        );
+
+        // After the tenant stamp. `ctx.tenant_id` starts at
+        // `__default__` and is overwritten from the matched origin, and
+        // the histogram is keyed by tenant, so a gate above this reads
+        // a key the detector has never seen and admits everyone.
+        let tenant_stamp_at = SOURCE
+            .find("ctx.tenant_id = pipeline_guard.config.origins[origin_idx].tenant_id.clone();")
+            .expect("the tenant stamp is in this file");
+        assert!(
+            call > tenant_stamp_at,
+            "the gate must run after the origin's tenant is stamped"
+        );
+
+        // After authentication. The class is what the resolver
+        // produced, and the verifying providers restamp it only once
+        // they have verified something.
+        let auth_at = SOURCE
+            .find("crate::server::record_auth_decision(")
+            .expect("the auth decision seam is in this file");
+        assert!(
+            call > auth_at,
+            "the gate must run after authentication, or it can never see a verified agent class \
+             and will key on a different one than the detector does"
+        );
+    }
+}
+
+/// WOR-2666: the reputation gate, driven through `request_filter` over
+/// a real socket.
+///
+/// The round-one version of this was a source-text guard whose rustdoc
+/// justified itself with "there is no `Session` fake in this
+/// workspace", which was false: the harness below is a copy of
+/// `empty_body_buffered_policy_tests`, in this file, and it binds a
+/// listener, builds a `Session`, and reads the bytes the gateway wrote.
+///
+/// **What this covers and what it does not.** It covers the behavior
+/// the guard could not see: that `send_error_with_pages` is reached,
+/// that the caller gets the status on the wire, that the origin did not
+/// serve it, that the body carries no class or band, and that a class
+/// whose weight has rolled out of the window is admitted again. It also
+/// covers one dimension of the gate's *placement*, because the fixture
+/// origin declares a real `tenant_id`: a gate above the stamp at
+/// `ctx.tenant_id = ...` reads `__default__`, finds no score, and
+/// admits, so the refusal leg goes red.
+///
+/// It does not cover ordering against the auth stage. The fixture has
+/// no agent-class catalog and no verifying auth provider, so the class
+/// resolves to `unknown` on either side of the auth arms and a gate
+/// moved above them behaves identically here.
+/// `reputation_gate_placement_tests` is the guard for that half, and it
+/// is a text search, which is why both exist rather than one claiming
+/// to be a superset of the other. That claim is what the first
+/// replacement got wrong.
+///
+/// **Process-global state.** This is the third test in the crate that
+/// writes `anomaly::DETECTOR`, alongside the two in `anomaly.rs` whose
+/// note asks that any further one carry this paragraph. It lives here
+/// rather than beside them because it needs this file's `Session`
+/// harness, and it is the one with a blast radius: it installs a
+/// detector with `deny_below: 0.5` and a floored class, so under
+/// `cargo test`, which does not fork per test, a neighboring test
+/// driving `request_filter` could start getting refusals from a
+/// detector it never installed. Nextest runs a process per test, which
+/// is what makes it safe. It narrows the exposure anyway by flooring
+/// under [`FIXTURE_TENANT`] rather than `__default__`, which is the
+/// tenant every other `request_filter` test in this file resolves to,
+/// including `empty_body_buffered_policy_tests`.
+#[cfg(test)]
+mod reputation_gate_wire_tests {
+    use std::time::Duration;
+
+    use chrono::NaiveDate;
+    use pingora_core::protocols::l4::stream::Stream;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
+    use crate::anomaly::{AnomalyDetector, AnomalySettings};
+
+    /// The tenant the fixture origin stamps.
+    ///
+    /// Deliberately not `__default__`. `ctx.tenant_id` starts at the
+    /// default and is overwritten from the matched origin partway
+    /// through `request_filter`, so a gate placed before that stamp
+    /// looks up a key the detector has never seen, gets `None`, and
+    /// admits. Flooring the detector under this name is what makes the
+    /// refusal leg fail if the gate moves back above the stamp.
+    const FIXTURE_TENANT: &str = "reputation-fixture-tenant";
+
+    /// A pipeline whose only origin answers 200, so anything other than
+    /// 200 on the wire came from the gate.
+    fn pipeline_with_reputation_floor() -> crate::pipeline::CompiledPipeline {
+        let config = sbproxy_config::compile_config(
+            r#"
+proxy:
+  tenants:
+    - id: reputation-fixture-tenant
+  anomaly:
+    enabled: true
+    min_observations: 5
+    reputation:
+      deny_below: 0.5
+origins:
+  "reputation.test":
+    tenant_id: reputation-fixture-tenant
+    authentication:
+      type: noop
+    action:
+      type: static
+      status: 200
+      content_type: text/plain
+      body: "origin answered"
+"#,
+        )
+        .expect("fixture config");
+        crate::pipeline::CompiledPipeline::from_config(config).expect("fixture pipeline")
+    }
+
+    fn settings() -> AnomalySettings {
+        AnomalySettings {
+            min_observations: 5,
+            outlier_frequency: 0.01,
+            rate_spike_multiplier: 10.0,
+            rate_spike_min_mean: 5.0,
+            deny_below: Some(0.5),
+            challenge_below: None,
+        }
+    }
+
+    fn view<'a>(ja4: &'a str) -> sbproxy_plugin::RequestContextView<'a> {
+        sbproxy_plugin::RequestContextView {
+            tenant_id: FIXTURE_TENANT,
+            hostname: "reputation.test",
+            method: "GET",
+            path: "/",
+            query: "",
+            // No agent-class catalog in the fixture config, so the
+            // request path resolves nothing and the gate keys on
+            // `unknown`, which is what this has to match.
+            agent_id: Some("unknown"),
+            agent_id_source: None,
+            ja4_fingerprint: Some(ja4),
+            ja4_trustworthy: true,
+            headless_library: None,
+            client_ip: None,
+        }
+    }
+
+    /// Floor the `unknown` class on `day` by flooding it with novel
+    /// fingerprints, each of which is a critical verdict worth 5 of the
+    /// 100 that saturate the score.
+    fn floored_detector(day: NaiveDate) -> std::sync::Arc<AnomalyDetector> {
+        let detector = std::sync::Arc::new(AnomalyDetector::new(settings()));
+        for _ in 0..20 {
+            detector.analyze_on(&view("t13d_USUAL"), day);
+        }
+        for index in 0..20 {
+            let ja4 = format!("t13d_NOVEL_{index}");
+            detector.analyze_on(&view(&ja4), day);
+        }
+        assert_eq!(
+            detector.reputation(FIXTURE_TENANT, "unknown"),
+            Some(0.0),
+            "the fixture has to actually floor the class"
+        );
+        assert_eq!(
+            detector.reputation("__default__", "unknown"),
+            None,
+            "and it must floor it under the origin's tenant only, so a gate reading the \
+             pre-stamp default finds nothing and admits"
+        );
+        detector
+    }
+
+    async fn drive(pipeline: crate::pipeline::CompiledPipeline) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind downstream fixture");
+        let address = listener.local_addr().expect("downstream address");
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect downstream fixture");
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: reputation.test\r\nconnection: close\r\n\r\n")
+                .await
+                .expect("write request");
+            stream.shutdown().await.expect("half-close request");
+            let mut response = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                match stream.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(read) => response.extend_from_slice(&chunk[..read]),
+                    Err(_) => break,
+                }
+            }
+            response
+        });
+        let (stream, _) = listener.accept().await.expect("accept downstream");
+        let mut session = Session::new_h1(Box::new(Stream::from(stream)));
+        session
+            .as_downstream_mut()
+            .read_request()
+            .await
+            .expect("parse downstream request");
+        let mut ctx = crate::context::RequestContext::new();
+        ctx.pipeline = std::sync::Arc::new(pipeline);
+        let handled = request_filter(&mut session, &mut ctx)
+            .await
+            .expect("the filter terminates");
+        assert!(
+            handled,
+            "both legs of this test short-circuit: a refusal writes the response, and a static \
+             origin serves it"
+        );
+        drop(session);
+        let wire = tokio::time::timeout(Duration::from_secs(2), client)
+            .await
+            .expect("downstream response timeout")
+            .expect("downstream client task");
+        String::from_utf8(wire).expect("HTTP response is UTF-8")
+    }
+
+    /// WOR-2666 re-review N2 and N1, red first, both legs.
+    ///
+    /// The first leg is what the source guard could not see: a floored
+    /// class gets `403` on the wire instead of the origin's body.
+    ///
+    /// The second is the Blocker. `rotate_to` used to run only from
+    /// `analyze_on`, which runs only from `response_filter`, which a
+    /// refused request never reaches: the window froze at its worst
+    /// value and the refusal was permanent for the life of the process,
+    /// on a class any caller can join by sending a User-Agent. Here the
+    /// same detector is floored on a day outside the window and the
+    /// same request is admitted, because the gate rolls the window
+    /// before it reads it.
+    #[tokio::test]
+    async fn a_floored_class_is_refused_and_then_recovers_when_the_window_rolls() {
+        let today = chrono::Utc::now().date_naive();
+
+        crate::anomaly::install_detector(Some(floored_detector(today)));
+        let refused = drive(pipeline_with_reputation_floor()).await;
+        assert!(
+            refused.starts_with("HTTP/1.1 403"),
+            "a floored class must be refused on the wire: {refused}"
+        );
+        assert!(
+            !refused.contains("origin answered"),
+            "and the origin must not have served it: {refused}"
+        );
+        assert!(
+            !refused.contains("unknown") && !refused.contains("floored"),
+            "the body must not hand the caller its own class and band back: {refused}"
+        );
+
+        // Floored on a day that has since rolled out of the window.
+        let stale = today - chrono::Duration::days(WINDOW_DAYS_FOR_TEST + 1);
+        crate::anomaly::install_detector(Some(floored_detector(stale)));
+        let admitted = drive(pipeline_with_reputation_floor()).await;
+        assert!(
+            admitted.starts_with("HTTP/1.1 200"),
+            "a class whose weight has rolled out of the window must be admitted again, or a \
+             single flood is a permanent ban: {admitted}"
+        );
+        assert!(admitted.contains("origin answered"), "{admitted}");
+
+        crate::anomaly::install_detector(None);
+    }
+
+    /// The window the recovery leg above rolls past. Kept here rather
+    /// than exported from `anomaly` so the test states the number it
+    /// depends on.
+    const WINDOW_DAYS_FOR_TEST: i64 = 28;
+}
+
+/// WOR-2667: the `kya` provider's context stamping, tested at the seam
+/// rather than through the provider.
+#[cfg(all(test, feature = "agent-class"))]
+mod kya_context_tests {
+    use super::*;
+
+    fn ctx_with_kya_metadata(pairs: &[(&str, &str)]) -> crate::context::RequestContext {
+        let mut ctx = crate::context::RequestContext::new();
+        for (key, value) in pairs {
+            ctx.principal
+                .attrs
+                .metadata
+                .insert((*key).to_string(), (*value).to_string());
+        }
+        ctx
+    }
+
+    #[test]
+    fn a_verified_kya_principal_populates_the_scripting_fields() {
+        let mut ctx = ctx_with_kya_metadata(&[
+            ("kya_verdict", "verified"),
+            ("kya_vendor", "skyfire"),
+            ("kya_version", "1.0"),
+            ("kya_kyab_balance", "2500"),
+            ("kya_agent_id", "acme-research-bot"),
+            ("kya_agent_class", "assistant"),
+        ]);
+        stamp_kya_context(&mut ctx, "kya", false);
+        assert_eq!(ctx.kya_verdict, Some("verified"));
+        assert_eq!(ctx.kya_vendor.as_deref(), Some("skyfire"));
+        assert_eq!(ctx.kya_version.as_deref(), Some("1.0"));
+        assert_eq!(ctx.kya_kyab_balance, Some(2500));
+        assert_eq!(ctx.kya_agent_id.as_deref(), Some("acme-research-bot"));
+        assert_eq!(ctx.kya_agent_class.as_deref(), Some("assistant"));
+    }
+
+    /// WOR-2667 review B1. `request.kya.agent_id` is the token's claim.
+    /// It used to be served from `ctx.agent_id`, which the agent-class
+    /// resolver fills from the User-Agent, so an identity pin was
+    /// clearable by anyone who sent the right one.
+    #[test]
+    fn the_token_agent_id_is_not_the_resolver_agent_id() {
+        let mut ctx =
+            ctx_with_kya_metadata(&[("kya_verdict", "verified"), ("kya_agent_id", "agt_01H8XYZ")]);
+        ctx.agent_id = Some(sbproxy_classifiers::AgentId("openai-gptbot".to_string()));
+        stamp_kya_context(&mut ctx, "kya", false);
+        assert_eq!(ctx.kya_agent_id.as_deref(), Some("agt_01H8XYZ"));
+        assert_eq!(
+            ctx.agent_id.as_ref().map(|id| id.as_str()),
+            Some("openai-gptbot"),
+            "the resolver's verdict is untouched; the two are different claims"
+        );
+
+        let views = crate::builtin_enforcers::expression::decision_views(&ctx);
+        let kya = views.kya.expect("the kya view is built");
+        assert_eq!(
+            kya.agent_id,
+            Some("agt_01H8XYZ"),
+            "the CEL namespace must serve the token's claim, not the resolver's"
+        );
+    }
+
+    /// WOR-2667 review M7. The fail-open path is the only non-verified
+    /// verdict whose request continues into the policy chain, and the
+    /// documented `request.kya.verdict == "directory_unavailable"`
+    /// policy has to be able to fire on it.
+    #[test]
+    fn a_fail_open_admission_is_readable_as_directory_unavailable() {
+        let mut ctx = crate::context::RequestContext::new();
+        stamp_kya_context(&mut ctx, "kya", true);
+        assert_eq!(ctx.kya_verdict, Some("directory_unavailable"));
+        assert_eq!(ctx.kya_agent_id, None, "nothing was verified");
+    }
+
+    /// WOR-2667 re-review N1, red first. `stamp_kya_context` runs on
+    /// every kya outcome, including the refusing ones, and the first
+    /// version inferred `directory_unavailable` from absent metadata
+    /// alone. A revoked token therefore stamped "the issuer is down",
+    /// which is not merely unset but affirmatively false in a field the
+    /// same round documented as carrying exactly two values.
+    #[test]
+    fn a_refusal_that_is_not_a_fail_open_stamps_no_verdict() {
+        let mut ctx = crate::context::RequestContext::new();
+        stamp_kya_context(&mut ctx, "kya", false);
+        assert_eq!(
+            ctx.kya_verdict, None,
+            "a refused token must not read as an unreachable issuer"
+        );
+    }
+
+    /// A `kya` slot that wins inside an `any_of` composition is still
+    /// the deciding provider, and stamping keyed on the configured
+    /// `Auth` variant rather than on the decision would skip it.
+    #[test]
+    fn a_provider_that_did_not_decide_stamps_nothing() {
+        let mut ctx = ctx_with_kya_metadata(&[("kya_verdict", "verified")]);
+        stamp_kya_context(&mut ctx, "bearer", false);
+        assert_eq!(ctx.kya_verdict, None);
+        assert_eq!(ctx.kya_agent_id, None);
+    }
+
+    /// The context field holds a `&'static str` from a closed set. A
+    /// label the provider never produces is dropped rather than
+    /// widening that set.
+    #[test]
+    fn an_unrecognized_verdict_label_is_dropped() {
+        let mut ctx = ctx_with_kya_metadata(&[
+            ("kya_verdict", "definitely-fine"),
+            ("kya_vendor", "skyfire"),
+        ]);
+        stamp_kya_context(&mut ctx, "kya", false);
+        assert_eq!(ctx.kya_verdict, None);
+        assert_eq!(
+            ctx.kya_vendor, None,
+            "an unrecognized verdict must not stamp the fields around it"
+        );
+    }
+
+    /// Every label `KyaVerdict::metric_label` can return has to survive
+    /// the mapping, or a policy branching on one of them reads `None`
+    /// for a verdict that really happened.
+    #[test]
+    fn every_verdict_label_the_provider_produces_round_trips() {
+        use sbproxy_modules::auth::kya::VerifiedAgent;
+        use sbproxy_modules::auth::KyaVerdict;
+
+        // Built from the enum rather than from a hand-copied list, so a
+        // provider that gains or renames a verdict fails here instead
+        // of silently leaving `request.kya.verdict` unset for it.
+        let every_verdict = [
+            KyaVerdict::Verified(Box::new(VerifiedAgent {
+                agent_id: "agent".to_string(),
+                vendor: "skyfire".to_string(),
+                agent_class: "assistant".to_string(),
+                kya_version: "1.0".to_string(),
+                sub: "sub".to_string(),
+                kyab_balance: None,
+            })),
+            KyaVerdict::Missing,
+            KyaVerdict::Invalid {
+                reason: "signature_invalid",
+            },
+            KyaVerdict::Expired,
+            KyaVerdict::Revoked,
+            KyaVerdict::InsufficientBalance {
+                required: 1,
+                currency: "USD".to_string(),
+            },
+            KyaVerdict::DirectoryUnavailable,
+        ];
+        for label in every_verdict.iter().map(KyaVerdict::metric_label) {
+            let mut ctx = ctx_with_kya_metadata(&[("kya_verdict", label)]);
+            stamp_kya_context(&mut ctx, "kya", false);
+            assert_eq!(ctx.kya_verdict, Some(label), "label {label} was dropped");
+        }
+    }
+
+    #[test]
+    fn a_balance_that_is_not_a_number_is_dropped_rather_than_defaulted() {
+        let mut ctx =
+            ctx_with_kya_metadata(&[("kya_verdict", "verified"), ("kya_kyab_balance", "lots")]);
+        stamp_kya_context(&mut ctx, "kya", false);
+        assert_eq!(
+            ctx.kya_kyab_balance, None,
+            "an unparseable balance must not read as zero, which a \
+             `min_balance` script would treat as a real answer"
         );
     }
 }

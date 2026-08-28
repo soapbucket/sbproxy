@@ -58,7 +58,7 @@
     "to": "now"
   },
   "refresh": "10s",
-  "version": 1,
+  "version": 2,
   "schemaVersion": 39,
   "panels": [
     {
@@ -475,6 +475,141 @@
         }
       ],
       "description": "Measures Bandwidth In / Out. Runbook: docs/operator-runbook.md#inbound-traffic. When red, inspect the matching component, confirm healthy range, and follow the rollback guidance if the spike follows a config change."
+    },
+    {
+      "id": 7,
+      "title": "Cache Reserve Traffic",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(sbproxy_cache_reserve_hits_total[5m]))",
+          "legendFormat": "hits",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(sbproxy_cache_reserve_misses_total[5m]))",
+          "legendFormat": "misses",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(sbproxy_cache_reserve_writes_total[5m]))",
+          "legendFormat": "writes",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "D",
+          "expr": "sum(rate(sbproxy_cache_reserve_evictions_total[5m]))",
+          "legendFormat": "evictions",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "The cold tier under the response cache. A hit here is a request the origin did not serve after the hot cache had already missed, which is what the reserve is for; writes are entries the sample rate admitted. All four are absent until `cache_reserve.enabled` is true."
+    },
+    {
+      "id": 8,
+      "title": "Cache Reserve Errors",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (operation) (rate(sbproxy_cache_reserve_errors_total[5m]))",
+          "legendFormat": "{{operation}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Reserve operations the backend refused, by trait method. The reserve is best-effort: every one of these was swallowed and the request served anyway, so this is the only place a failing cold tier shows up. A sustained non-zero `put` rate with a healthy `get` rate usually means expired write credentials or a bucket policy change; a non-zero rate on all three means the store is unreachable. Reads flat zero on a healthy reserve."
     }
   ],
   "templating": {

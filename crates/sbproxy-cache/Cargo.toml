@@ -43,6 +43,14 @@ aws-config = { version = "1", default-features = false, features = ["rt-tokio", 
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
 aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
 
+# WOR-2673: the object-storage reserve backend. Already a workspace
+# dependency driving the storage action, the ACME cert store, and the AI
+# usage sink, so this adds no new external crate; it buys S3, GCS, Azure
+# Blob, and a local directory behind one trait.
+object_store = { workspace = true }
+# Streams the object listing the eviction sweep walks.
+futures = { workspace = true }
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

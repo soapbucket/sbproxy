@@ -1517,7 +1517,7 @@ fn now_unix_secs() -> i64 {
 /// Naming the two cases at the call site is deliberate. An `Option<u64>` whose
 /// `None` means "work it out yourself" is how the estimate went missing in the
 /// first place.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TokenDebit {
     /// Debit the tokens the event's own measured usage carries.
     Measured,
@@ -1525,7 +1525,21 @@ pub enum TokenDebit {
     ///
     /// The estimate never enters the [`AiBillingEvent`], which is serialized
     /// onto the observability bus and into spend reports.
-    Estimated(u64),
+    Estimated {
+        /// Tokens to debit against the token caps.
+        tokens: u64,
+        /// Dollars to debit against the spend caps, priced from the model
+        /// catalog for the same estimate.
+        ///
+        /// WOR-2622: a usage-less response is reported as
+        /// [`AiUsage::PerCall`], whose catalog price is `0.0` by
+        /// construction, so before this the token caps moved on an
+        /// estimate and an origin whose only cap was `max_usd` got no
+        /// enforcement from the fallback at all. Enforcement is the only
+        /// consumer: the event's own `cost_usd` is untouched, so no
+        /// invented dollar reaches a spend report or an invoice.
+        cost_usd: f64,
+    },
 }
 
 /// Apply an [`AiBillingEvent`] to a [`BudgetTracker`].
@@ -1541,17 +1555,21 @@ pub enum TokenDebit {
 /// every request spent its budget twice, and passing the amount in preserves
 /// that rather than reintroducing a second writer.
 pub fn record_billing_event(tracker: &BudgetTracker, event: &AiBillingEvent, debit: TokenDebit) {
-    let token_total: u64 = match debit {
-        TokenDebit::Estimated(tokens) => tokens,
-        TokenDebit::Measured => match &event.usage {
-            // `input` is the true total prompt (cached/creation are subsets),
-            // so total tokens is still input + output (WOR-1708).
-            AiUsage::Tokens { input, output, .. } => input.saturating_add(*output),
-            _ => 0,
-        },
+    let (token_total, cost_usd): (u64, f64) = match debit {
+        TokenDebit::Estimated { tokens, cost_usd } => (tokens, cost_usd),
+        TokenDebit::Measured => (
+            match &event.usage {
+                // `input` is the true total prompt (cached/creation are
+                // subsets), so total tokens is still input + output
+                // (WOR-1708).
+                AiUsage::Tokens { input, output, .. } => input.saturating_add(*output),
+                _ => 0,
+            },
+            event.cost_usd,
+        ),
     };
     for key in &event.scope_keys {
-        tracker.record_usage(key, token_total, event.cost_usd);
+        tracker.record_usage(key, token_total, cost_usd);
     }
 }
 
@@ -2799,17 +2817,36 @@ mod tests {
         .with_cost(0.0)
         .with_scope_keys(vec!["ws:acme".to_string()]);
 
-        record_billing_event(&tracker, &event, TokenDebit::Estimated(1_020));
+        record_billing_event(
+            &tracker,
+            &event,
+            TokenDebit::Estimated {
+                tokens: 1_020,
+                cost_usd: 0.75,
+            },
+        );
 
         assert_eq!(
             tracker.get_usage("ws:acme").tokens,
             1_020,
             "an estimated debit must reach the tracker"
         );
+        // WOR-2622: the same for the dollar side. `PerCall` prices at
+        // zero by construction, so an origin whose only cap is `max_usd`
+        // saw nothing move while the token caps moved on every
+        // usage-less response.
+        assert!(
+            (tracker.get_usage("ws:acme").cost_usd - 0.75).abs() < f64::EPSILON,
+            "an estimated debit must move the spend cap too"
+        );
         assert_eq!(
             event.usage,
             AiUsage::PerCall,
             "the event must keep reporting what was measured, not the estimate"
+        );
+        assert!(
+            (event.cost_usd - 0.0).abs() < f64::EPSILON,
+            "the event must not report a cost the provider never priced"
         );
     }
 
@@ -2829,7 +2866,14 @@ mod tests {
         .with_cost(0.0)
         .with_scope_keys(vec!["ws:acme".to_string(), "model:gpt-4o".to_string()]);
 
-        record_billing_event(&tracker, &event, TokenDebit::Estimated(50));
+        record_billing_event(
+            &tracker,
+            &event,
+            TokenDebit::Estimated {
+                tokens: 50,
+                cost_usd: 0.0,
+            },
+        );
 
         for key in ["ws:acme", "model:gpt-4o"] {
             let usage = tracker.get_usage(key);

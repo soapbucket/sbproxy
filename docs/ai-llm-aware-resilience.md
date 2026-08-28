@@ -229,20 +229,37 @@ rather than failing over.
 Those endings used to be invisible unless the origin had a budget
 recorder wired. They now tick
 `sbproxy_ai_stream_post_commit_failures_total{provider, cause}`, whatever
-else is configured. `cause` is one of three:
+else is configured. `cause` is one of six:
 
 | `cause` | What happened | What to do about it |
 |---|---|---|
 | `upstream_timeout` | Reading the next chunk hit a transport timeout, so `timeout_ms` or the 30-second client default cut a generation that was still running | Raise `timeout_ms` on that provider, or accept truncated long completions |
 | `upstream_error` | The provider's stream ended in a reset or a truncated body | Provider-side fault; correlate with `sbproxy_ai_provider_errors_total` |
 | `guardrail` | An output guardrail or a stream-safety verdict ended the stream | Working as configured. Read it against `sbproxy_ai_stream_guardrail_violations_total` |
+| `client_disconnected` | The caller hung up and the relay's next write to it failed | Nothing, usually. The provider stream is dropped at that point and the request settles on a `client_disconnected` receipt |
+| `gateway_error` | The proxy's own relay failed: a stream-safety session that could not start and failed closed, or a response header it could not build | Yours, not the provider's. Correlates with nothing in `sbproxy_ai_provider_errors_total` by design |
+| `abandoned` | The request was dropped before the relay reached any ending of its own: a shutdown that abandoned in-flight streams, an outer task timeout, or a panic in the relay | Check for a restart or a deploy at that timestamp. The stream still settles what it delivered |
 
-The counter cannot see a caller that disconnects mid-stream: the failed
-downstream write ends the relay before the counter is reached, so a
-client cancel is counted nowhere in this family rather than being
-guessed at as one of the three above. It also does not fire for an
-extension `close` hook that blocks after the upstream stream already
-finished, since it keys on the upstream stream not reaching its end.
+An upstream read failure takes precedence over every other cause. A
+provider that resets and then leaves the relay's close-out write failing
+reports `upstream_error` here while the request's receipt still reads
+`client_disconnected`: the two answer different questions, one about what
+ended the stream and one about who was still on the line.
+
+A caller that disconnects mid-stream used to be invisible here: the
+failed downstream write ended the relay before the counter was reached,
+so a client cancel was counted nowhere in this family. It now settles
+through the same finalizer as every other ending and carries its own
+`cause`, so an operator can tell a provider fault from a caller that
+left without guessing between the rest. The counter still does
+not fire for an extension `close` hook that blocks after the upstream
+stream already finished, since it keys on the upstream stream not
+reaching its end.
+
+What that disconnect is billed is on the AI gateway page, under
+[what a stream is billed](ai-gateway.md#what-a-stream-is-billed): the
+upstream body is dropped at the failed write, and the request settles
+from the usage it received before it.
 
 Read the two counters together. A rising
 `sbproxy_ai_failovers_total{reason="pre_header_timeout"}` means a

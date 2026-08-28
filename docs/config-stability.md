@@ -335,6 +335,43 @@ when a code path that was supposed to read it starts reading it. Nothing here
 is a schema change: the same file compiles before and after. What changes is
 which traffic the value you already wrote now refuses.
 
+### `ext_authz.headers_to_forward: []` forwards nothing, not everything
+
+**Who this reaches.** Anyone moving an `ext_authz` block off a build that
+linked the enterprise auth crate. The key, the type name, and the wire
+protocol are identical, so the config compiles unchanged and the change is
+invisible until traffic hits it.
+
+**What changed.** The enterprise provider read an empty (or absent)
+`headers_to_forward` as "forward every request header". SBproxy reads it as
+what it says: an allowlist, and an empty allowlist forwards nothing. The
+first request after an operator set only `url` used to ship `Authorization`,
+`Cookie`, and every internal trust header to the authorization service; now
+it ships the method and the path.
+
+**Why.** A boundary in this workspace is an allowlist. A default that
+forwards the caller's credentials and session cookie to a service the
+operator has just named, before anyone has decided that service should see
+them, is the wrong direction to fail in. Envoy's own `ext_authz` HTTP
+service filter treats `allowed_headers` the same way.
+
+**What you will see if you skip this.** The authorization service stops
+seeing the header it decides on, refuses everything, and every request to
+the origin gets the service's own refusal status. The gateway logs nothing
+unusual, because from its side the callout succeeded and the answer was
+`allowed: false`.
+
+**What to do.** Name the headers the service reads:
+
+```yaml
+authentication:
+  type: ext_authz
+  url: http://authz.internal:9002/check
+  headers_to_forward: [authorization, cookie, x-tenant]
+```
+
+Name only what it reads. The list is what leaves your proxy.
+
 ### `egress.usage_sinks` now gates the `events:` webhook sink
 
 **Who this reaches.** Any config that has both `egress.usage_sinks` set to
@@ -366,6 +403,71 @@ no surface carries the URL.
 **What to do before upgrading.** Read `GET /api/egress` on the running proxy,
 find the `webhook` row for your collector, and add that host (and its port, if
 it is not 80 or 443) to `egress.usage_sinks.hosts`.
+
+### An AI response with no provider usage frame now moves your spend caps
+
+**Who this reaches.** Any origin with `action.type: ai_proxy` and a
+`budget:` block, whatever `usage_parser` is set to, `none` included.
+Streaming and non-streaming requests both, for different halves of this:
+the estimate itself is new on streams, and pricing an estimate against
+`max_usd` is new on both.
+
+**What changed.** Two things, and they compound.
+
+A stream whose provider sent no `usage` frame used to settle at zero: no
+cap moved, every reservation was refunded, and a caller could stream
+indefinitely against a `max_tokens` cap that never budged. It is now
+priced from this gateway's own tokenizer count of the assistant text the
+stream delivered, plus the request-path prompt estimate, and marked
+`estimated`.
+
+Separately, an estimated debit now carries a dollar figure priced from
+the model catalog, on the **buffered** relay as well as the streaming
+one. A usage-less non-streaming 2xx has debited the token caps from an
+estimate since WOR-1146, but it reported that spend as `PerCall`, which
+the catalog prices at zero, so `max_usd` saw nothing move. It does now.
+
+**What that changes for you.** Token caps on streaming origins and
+`max_usd` caps on every AI origin start moving where they did not before,
+so a cap that never fired may now fire. If your only cap is `max_usd` and
+your provider omits usage, this is the change to size against. The estimate is enforcement only: the payment bridge, the
+usage sinks, the verifiable ledger and the `AiBillingEvent` skip a
+request marked `estimated`, so nothing you invoice changes. The access
+log gains a `usage_source` field (`measured`, `estimated`, `absent`) and
+`sbproxy_ai_usage_parse_miss_total` gains a matching `usage_source`
+label, which is how you see how much of an origin's traffic this is.
+
+`usage_parser: none` is the case worth naming twice: it still disables
+reading the provider's frame, but it no longer means the origin is billed
+nothing.
+
+The estimate is enforcement only on both relays. The billing event still
+reports what the provider reported, so nothing you invoice changes.
+
+**What to do.** Nothing, if your caps were sized against measured
+traffic. If an origin's caps were effectively unenforced because its
+provider omits usage, check its headroom before upgrading, or set
+[`stream_include_usage: true`](configuration.md) so the provider reports
+its own numbers and the estimate is not used at all.
+
+### A mid-stream client disconnect now settles as `client_disconnected`
+
+**Who this reaches.** Deployments with `proxy.attestation` and a
+`billable:` outcome table, serving AI traffic.
+
+**What changed.** A caller that hung up while a response was being
+written used to produce a receipt reading `delivered` (when the 2xx
+header had already committed) or `origin_5xx` (when it had not). Both
+are now `client_disconnected`, for streamed and buffered AI responses
+alike.
+
+**What that changes for you.** Whatever your table says for
+`client_disconnected` now applies to that traffic. For a mid-stream
+disconnect the units are non-zero, so `partial` and `yes` are different
+answers and the row you wrote decides real money; see
+[metering.md](metering.md#billable-the-outcome-table). Origin error-rate
+dashboards built on `origin_5xx` will drop by the disconnect volume,
+which is the correction, not a regression.
 
 ### The usage ledger now `fsync`s every entry
 

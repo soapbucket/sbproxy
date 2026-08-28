@@ -1,0 +1,92 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Know Your Agent: admit AI agents by identity, and by what they can pay.
+#
+# An agent presents an issuer-signed token in `X-Skyfire-KYA`. The proxy
+# verifies it against the issuer's published key set and revocation
+# list, and what it learns is not just "allowed" but who the caller is:
+# the agent's id, the vendor operating it, the class it claims, and its
+# spend balance.
+#
+# `min_kyab_balance` is the half worth configuring. A verified agent
+# whose balance is below the floor is refused with 402 Payment
+# Required, before the request reaches an upstream that would bill for
+# it. 402 rather than 401 on purpose: the credential is fine, the
+# account is empty, and those call for different client behavior.
+#
+# Leave `min_kyab_balance` out and the balance gates nothing. It is
+# still carried to policy as `request.kya.kyab_balance.amount`, so a
+# CEL or Lua policy can price its own routes.
+#
+# Every verdict feeds the trust tier: a verified token earns `strong`,
+# a presented-and-rejected one drops the request to `suspicious`. Two
+# of them reach `request.kya.verdict`, and only two, because only two
+# continue into the policy chain: `verified`, and
+# `directory_unavailable` when `fail_open: true` admitted anyway.
+# Everything else refuses, so no policy runs to read it.
+#
+# This example needs an issuer publishing /.well-known/jwks.json at
+# `issuers[].url`; the README has one. Without it every request answers
+# 503, which is the fail-closed default.
+#
+# Run:
+#   make run CONFIG=examples/auth-kya/sb.yml
+#
+# Test (with an issuer reachable; see README):
+#   # 200 - the token verifies and the balance clears the floor
+#   curl -i -H 'Host: agents.local' -H "X-Skyfire-KYA: $TOKEN" \
+#        http://127.0.0.1:8080/get
+#
+#   # 402 - verified agent, balance below min_kyab_balance
+#   curl -i -H 'Host: agents.local' -H "X-Skyfire-KYA: $BROKE_TOKEN" \
+#        http://127.0.0.1:8080/get
+#
+#   # 401 - no token at all
+#   curl -i -H 'Host: agents.local' http://127.0.0.1:8080/get
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "agents.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    authentication:
+      type: kya
+      issuers:
+        # Matched verbatim against the token's `iss` claim, and checked
+        # before any network fetch: a token naming an issuer that is
+        # not on this list is refused without the proxy dialing the URL
+        # the token asked it to. Must be https://, because the key set
+        # fetched from here is the root of trust for every token this
+        # issuer signs.
+        - url: https://issuer.test.sbproxy.dev
+          # Clamped to 300..86400. Below that the gateway is polling
+          # the issuer rather than caching it.
+          jwks_refresh_interval_secs: 3600
+          # How long the last good key set keeps verifying while the
+          # issuer is unreachable. Same window the Web Bot Auth
+          # directory cache uses, on purpose.
+          stale_grace_secs: 86400
+      # Smallest unit of `min_kyab_currency`, so 1000 is $10.00.
+      min_kyab_balance: 1000
+      # The floor is denominated. A balance in another currency counts
+      # as zero rather than being compared numerically: 5000 COP is
+      # about a dollar twenty, and the proxy holds no exchange rate.
+      min_kyab_currency: USD
+      # Leave false unless you have decided that serving unverified
+      # agent traffic beats refusing it while an issuer is down.
+      fail_open: false
+
+    policies:
+      # What the verified token carried is addressable from policy, so
+      # one origin can price its own routes. An `expression` policy
+      # states the ALLOW condition: everything outside /expensive
+      # passes, and /expensive additionally needs a balance of 5000.
+      - type: expression
+        expression: >-
+          !request.path.startsWith("/expensive") ||
+          request.kya.kyab_balance.amount >= 5000
+        deny_status: 402
+        deny_message: "this route needs a KYAB balance of at least 5000"

@@ -141,6 +141,13 @@ pub const KNOWN_AUTH_TYPES: &[&str] = &[
     "web_bot_auth",
     "cap",
     "oidc",
+    // WOR-2667: ported out of the enterprise tree into built-in arms.
+    // Until they landed here, a bundle could claim these three names
+    // and `sbproxy validate` warned that a config using one would fail
+    // at runtime.
+    "ext_authz",
+    "oauth_introspection",
+    "kya",
     "noop",
 ];
 
