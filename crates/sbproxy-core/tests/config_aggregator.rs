@@ -1929,8 +1929,8 @@ fn a_bounded_run_drains_a_window_the_debounce_left_open() {
         "a".repeat(40).as_str(),
         &[("sbproxy/origin.yaml", CHECKOUT_PROFILE)],
     ));
+    // The fixture already polls every second; the window is what moves.
     let document = one_entry()
-        .replace("poll_interval_secs: 1", "poll_interval_secs: 1")
         .replace("debounce_secs: 0", "debounce_secs: 600")
         .replace("max_deferral_secs: 1", "max_deferral_secs: 600");
     let mut aggregator = aggregator(&document, &git);
