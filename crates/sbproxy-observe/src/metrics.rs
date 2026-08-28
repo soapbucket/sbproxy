@@ -3660,6 +3660,106 @@ pub fn set_config_history_entries(count: i64) {
     gauge.set(count);
 }
 
+/// Set `sbproxy_config_lkg_revision` to the revision the config ring's
+/// last-known-good pointer names, or `-1` when it names none (WOR-2458).
+///
+/// `-1` rather than an absent series: "this node has no rollback target"
+/// is the answer an operator most needs during an incident, and an
+/// absent series answers it with silence. Every real revision is
+/// positive, so the sentinel cannot collide with one.
+pub fn set_config_lkg_revision(revision: i64) {
+    use prometheus::{register_int_gauge, IntGauge};
+    use std::sync::OnceLock;
+    static G: OnceLock<IntGauge> = OnceLock::new();
+    let gauge = G.get_or_init(|| {
+        register_int_gauge!(
+            "sbproxy_config_lkg_revision",
+            "Config ring revision the last-known-good pointer names, or -1 when it names none",
+        )
+        .expect("config lkg revision gauge registers")
+    });
+    gauge.set(revision);
+}
+
+/// Count one soak signal's contribution to a verdict on
+/// `sbproxy_config_soak_verdict_total{verdict,signal}` (WOR-2458).
+///
+/// `verdict` is a closed string:
+///
+/// | Verdict | Meaning |
+/// |---|---|
+/// | `passed` | The signal reported a pass, or the window closed passing |
+/// | `failed` | The signal reported a failure, or the window closed failing |
+/// | `abstain` | The signal had too little information to report anything |
+/// | `inconclusive` | Every signal abstained, so the window reached no verdict |
+///
+/// `abstain` and `inconclusive` are both first class on purpose. A soak
+/// that never measures anything is a configuration problem worth
+/// surfacing, not something to hide behind a green promotion.
+///
+/// `signal` is `degraded_subsystems`, `upstream_health`,
+/// `request_outcome`, `operator_probe`, or `window` for the aggregate
+/// verdict the window itself reached.
+pub fn record_config_soak_verdict(verdict: &str, signal: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_config_soak_verdict_total",
+            "Config soak outcomes, by verdict and reporting signal",
+            &["verdict", "signal"],
+        )
+        .expect("config soak verdict counter registers")
+    });
+    counter.with_label_values(&[verdict, signal]).inc();
+}
+
+/// Count one refused config candidate on
+/// `sbproxy_config_rejected_total{reason}` (WOR-2462).
+///
+/// `reason` is a closed string matching
+/// `sbproxy_config::RejectionReason`: `verify_failed`,
+/// `compile_failed`, `denied_path`, or `confinement_refused`. A skipped
+/// cycle (`reload_busy`) is a deferral rather than a refusal and is
+/// deliberately not counted here.
+pub fn record_config_rejection(reason: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_config_rejected_total",
+            "Config candidates refused before applying, by reason",
+            &["reason"],
+        )
+        .expect("config rejected counter registers")
+    });
+    counter.with_label_values(&[reason]).inc();
+}
+
+/// Set `sbproxy_config_fallback_active` to 1 while this node is serving
+/// a config its boot fallback rescued from the ring, 0 otherwise
+/// (WOR-2459).
+///
+/// A node quietly serving a config nobody wrote is worse than one that
+/// is down, because nobody goes looking for it. This gauge, a WARN at
+/// startup, and the admin surface's degraded report are the three places
+/// that say so.
+pub fn set_config_fallback_active(active: bool) {
+    use prometheus::{register_int_gauge, IntGauge};
+    use std::sync::OnceLock;
+    static G: OnceLock<IntGauge> = OnceLock::new();
+    let gauge = G.get_or_init(|| {
+        register_int_gauge!(
+            "sbproxy_config_fallback_active",
+            "1 while this node serves a config its boot fallback restored from the revision ring",
+        )
+        .expect("config fallback active gauge registers")
+    });
+    gauge.set(i64::from(active));
+}
+
 /// Count one config-revision announcement on
 /// `sbproxy_config_authority_announce_total{result}`.
 ///

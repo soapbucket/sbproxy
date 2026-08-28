@@ -3472,8 +3472,105 @@ fn handle_config_history_list() -> (u16, &'static str, String) {
         "lineage": recorder.lineage(),
         "lkg_revision": recorder.lkg().map(|entry| entry.revision),
         "entries": entries,
+        // Additive: `entries` keeps its existing shape and meaning, and
+        // `timeline` interleaves the refused candidates among them for a
+        // panel that wants the whole story in one list (WOR-2462).
+        "timeline": config_history_timeline(&recorder),
     });
     (200, "application/json", body.to_string())
+}
+
+/// `GET /admin/config/rejected`: every candidate config this node
+/// refused, newest first, with the reason it was refused (WOR-2462).
+///
+/// The node already knows exactly why it refused a candidate: the
+/// subscriber's failure table enumerates the cases, and every one of
+/// them produced a counter and a log line that were gone by the time
+/// anybody went looking. This is where they survive. Envoy's config dump
+/// retains the last rejected config alongside the accepted one with the
+/// rejection reason attached, and it is one of the more useful things it
+/// does.
+///
+/// `404`/`503` per [`config_history_open_recorder`] when the slot is not
+/// open, the same as its applied-history siblings: refused candidates
+/// live in the same ring directory and are bounded by the same block's
+/// `keep_rejected`.
+///
+/// `document` is redacted for display exactly the way
+/// [`handle_config_history_detail`] redacts a stored revision, and for
+/// the same reason: pre-resolution storage guarantees a `${VAR}` /
+/// `vault://` / `secret://` reference is never resolved into the ring,
+/// and says nothing about a literal secret an operator typed straight
+/// into the YAML. The file on disk keeps the original bytes; only this
+/// response is redacted.
+fn handle_config_rejected_list() -> (u16, &'static str, String) {
+    let recorder = match config_history_open_recorder() {
+        Ok(recorder) => recorder,
+        Err(response) => return response,
+    };
+    let mut stored = recorder.rejections();
+    // The ring stores oldest refusal first; the response contract is
+    // newest first, matching what an operator asking "why is my config
+    // not updating" wants at the top.
+    stored.reverse();
+    let entries: Vec<serde_json::Value> = stored.iter().map(config_rejected_entry_json).collect();
+    let body = serde_json::json!({
+        "lineage": recorder.lineage(),
+        "entries": entries,
+    });
+    (200, "application/json", body.to_string())
+}
+
+/// One refused candidate, in the shape `docs/admin-api-reference.md`
+/// documents.
+fn config_rejected_entry_json(entry: &sbproxy_config::RejectedCandidate) -> serde_json::Value {
+    serde_json::json!({
+        "digest": entry.digest,
+        "reason": entry.reason.as_str(),
+        "stage": entry.stage,
+        "detail": sbproxy_observe::redact::redact_secrets(&entry.detail),
+        "provenance": config_history_provenance_label(&entry.provenance),
+        "first_seen_at": config_history_rfc3339(entry.first_seen_at),
+        "last_seen_at": config_history_rfc3339(entry.last_seen_at),
+        "count": entry.count,
+        "document": sbproxy_observe::redact::redact_secrets(&entry.document),
+    })
+}
+
+/// The applied entries and the refused candidates in one list, newest
+/// first (WOR-2462).
+///
+/// A rejection has to appear in the timeline in its correct place rather
+/// than being invisible: "the config stopped updating three hours ago"
+/// and "a candidate has been refused every poll cycle for three hours"
+/// are the same incident, and a timeline that shows only the first half
+/// of it sends an operator to the wrong place.
+///
+/// Sorted by the instant each row happened: `applied_at` for an applied
+/// revision, `last_seen_at` for a refusal, which is the refusal an
+/// operator is currently living with rather than the first one.
+///
+/// **The Vue History panel does not render this yet.** The data is here
+/// and tested; drawing it belongs with the rest of the console work in
+/// WOR-2574, which owns `ui/src/views/ConfigView.vue`.
+fn config_history_timeline(
+    recorder: &crate::config_history::ConfigHistoryRecorder,
+) -> Vec<serde_json::Value> {
+    let mut rows: Vec<(u64, serde_json::Value)> = Vec::new();
+    for entry in recorder.entries() {
+        let mut row = config_history_entry_json(&entry);
+        row["kind"] = serde_json::Value::String("applied".to_string());
+        row["at"] = serde_json::Value::String(config_history_rfc3339(entry.applied_at));
+        rows.push((entry.applied_at, row));
+    }
+    for entry in recorder.rejections() {
+        let mut row = config_rejected_entry_json(&entry);
+        row["kind"] = serde_json::Value::String("rejected".to_string());
+        row["at"] = serde_json::Value::String(config_history_rfc3339(entry.last_seen_at));
+        rows.push((entry.last_seen_at, row));
+    }
+    rows.sort_by(|left, right| right.0.cmp(&left.0));
+    rows.into_iter().map(|(_, row)| row).collect()
 }
 
 /// `GET /admin/config/history/{digest}`: the stored pre-resolution
@@ -5938,6 +6035,18 @@ pub fn handle_admin_request(
     if path_only == "/admin/config/history" {
         if method.eq_ignore_ascii_case("GET") {
             return handle_config_history_list();
+        }
+        return (
+            405,
+            "application/json",
+            r#"{"error":"method not allowed"}"#.to_string(),
+        );
+    }
+    // WOR-2462: the refused candidates, in the same ring and behind the
+    // same opt-in as the applied ones.
+    if path_only == "/admin/config/rejected" {
+        if method.eq_ignore_ascii_case("GET") {
+            return handle_config_rejected_list();
         }
         return (
             405,
@@ -11772,6 +11881,131 @@ mod tests {
         }
     }
 
+    fn history_rejection(
+        reason: sbproxy_config::RejectionReason,
+        at: u64,
+    ) -> sbproxy_config::RejectionMetadata {
+        sbproxy_config::RejectionMetadata {
+            reason,
+            stage: "config_authority".to_string(),
+            detail: "refused for the test".to_string(),
+            provenance: BaseOrigin::Local,
+            rejected_at: at,
+        }
+    }
+
+    /// WOR-2462. The refused candidates are behind the same auth as
+    /// everything else on the admin surface.
+    #[test]
+    fn config_rejected_route_requires_auth_and_only_answers_get() {
+        crate::config_history::clear_config_history_recorder();
+        let state = make_state();
+        let (status, _, _) =
+            handle_admin_request("GET", "/admin/config/rejected", &state, None, None);
+        assert_eq!(status, 401);
+
+        let auth = basic_auth("admin", "secret");
+        for method in ["PUT", "POST", "DELETE"] {
+            let (status, _, _) =
+                handle_admin_request(method, "/admin/config/rejected", &state, Some(&auth), None);
+            assert_eq!(status, 405, "{method} should not be accepted");
+        }
+        // Opt-in, same as its applied-history siblings.
+        let (status, _, body) =
+            handle_admin_request("GET", "/admin/config/rejected", &state, Some(&auth), None);
+        assert_eq!(status, 404);
+        assert_eq!(body, r#"{"error":"config history is not enabled"}"#);
+    }
+
+    /// WOR-2462. Newest first, one row per refused candidate, with the
+    /// reason and the count an operator reads first.
+    #[test]
+    fn config_rejected_list_is_newest_first_with_reason_and_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = install_test_history_recorder(dir.path());
+        recorder.record_rejection(
+            b"a: 1\n",
+            history_rejection(
+                sbproxy_config::RejectionReason::VerifyFailed,
+                1_700_000_001_000,
+            ),
+        );
+        recorder.record_rejection(
+            b"a: 2\n",
+            history_rejection(
+                sbproxy_config::RejectionReason::DeniedPath,
+                1_700_000_002_000,
+            ),
+        );
+        recorder.record_rejection(
+            b"a: 2\n",
+            history_rejection(
+                sbproxy_config::RejectionReason::DeniedPath,
+                1_700_000_003_000,
+            ),
+        );
+
+        let (status, _, body) = handle_config_rejected_list();
+        crate::config_history::clear_config_history_recorder();
+        assert_eq!(status, 200);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        let entries = parsed["entries"].as_array().expect("entries array");
+        assert_eq!(entries.len(), 2, "the repeat updated a row, not added one");
+        assert_eq!(entries[0]["reason"], "denied_path");
+        assert_eq!(entries[0]["count"], 2);
+        assert_eq!(entries[1]["reason"], "verify_failed");
+        assert_eq!(entries[1]["count"], 1);
+        assert_eq!(entries[0]["stage"], "config_authority");
+        assert!(entries[0]["last_seen_at"]
+            .as_str()
+            .is_some_and(|when| when.starts_with("2023-")));
+    }
+
+    /// WOR-2462. A rejection appears in the timeline in its correct
+    /// place rather than being invisible: the incident an operator is
+    /// investigating is one sequence, not two lists.
+    #[test]
+    fn config_history_timeline_interleaves_rejections_with_applied_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = install_test_history_recorder(dir.path());
+        recorder.record(
+            b"origins: {}\n# one\n",
+            sbproxy_config::AppendMetadata {
+                applied_at: 1_000,
+                ..history_metadata("first")
+            },
+        );
+        recorder.record_rejection(
+            b"broken: yes\n",
+            history_rejection(sbproxy_config::RejectionReason::CompileFailed, 2_000),
+        );
+        recorder.record(
+            b"origins: {}\n# two\n",
+            sbproxy_config::AppendMetadata {
+                applied_at: 3_000,
+                ..history_metadata("second")
+            },
+        );
+
+        let (status, _, body) = handle_config_history_list();
+        crate::config_history::clear_config_history_recorder();
+        assert_eq!(status, 200);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        let timeline = parsed["timeline"].as_array().expect("timeline array");
+        let shape: Vec<&str> = timeline
+            .iter()
+            .map(|row| row["kind"].as_str().expect("kind"))
+            .collect();
+        assert_eq!(
+            shape,
+            vec!["applied", "rejected", "applied"],
+            "newest first, with the refusal in its own place: {timeline:?}",
+        );
+        assert_eq!(timeline[0]["revision"], 2);
+        assert_eq!(timeline[1]["reason"], "compile_failed");
+        assert_eq!(timeline[2]["revision"], 1);
+    }
+
     #[test]
     fn config_history_routes_require_auth() {
         let state = make_state();
@@ -11849,7 +12083,9 @@ mod tests {
             .collect();
         assert_eq!(
             top,
-            ["lineage", "lkg_revision", "entries"].into_iter().collect(),
+            ["lineage", "lkg_revision", "entries", "timeline"]
+                .into_iter()
+                .collect(),
         );
         assert_eq!(parsed["lkg_revision"], serde_json::Value::Null);
         assert!(parsed["lineage"].as_str().is_some_and(|s| !s.is_empty()));

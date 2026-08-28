@@ -70,11 +70,6 @@ use sbproxy_config::{
 /// store's own contract permits.
 pub struct ConfigHistoryRecorder {
     store: Mutex<RevisionStore>,
-    /// `proxy.config_history.keep_rejected`. Nothing in this crate
-    /// writes to the store's `rejected/` directory yet, so this field
-    /// has no reader other than carrying the value forward for the
-    /// rejected-candidate retention writer to come.
-    keep_rejected: usize,
 }
 
 impl ConfigHistoryRecorder {
@@ -104,13 +99,14 @@ impl ConfigHistoryRecorder {
         if !history.enabled {
             return Ok(None);
         }
-        let store = RevisionStore::open(&history.dir, history.keep, None).map_err(|error| {
-            anyhow::anyhow!("open config history store '{}': {error}", history.dir)
-        })?;
+        let store = RevisionStore::open(&history.dir, history.keep, None)
+            .map_err(|error| {
+                anyhow::anyhow!("open config history store '{}': {error}", history.dir)
+            })?
+            .with_keep_rejected(history.keep_rejected);
         Self::publish_metrics(&store);
         Ok(Some(Self {
             store: Mutex::new(store),
-            keep_rejected: history.keep_rejected,
         }))
     }
 
@@ -176,6 +172,14 @@ impl ConfigHistoryRecorder {
                 provenance_label(&last.provenance),
             );
         }
+        // Published unconditionally, with `-1` standing in for "this ring
+        // has no last-known-good entry yet". A ring whose pointer has
+        // never moved is exactly the state an operator asking "can this
+        // node roll back?" needs to see, and leaving the series absent
+        // would answer that question with silence.
+        sbproxy_observe::metrics::set_config_lkg_revision(store.lkg().map_or(-1, |entry| {
+            i64::try_from(entry.revision).unwrap_or(i64::MAX)
+        }));
     }
 
     /// Every ring entry, oldest first.
@@ -231,13 +235,6 @@ impl ConfigHistoryRecorder {
         store.read_blob(digest)
     }
 
-    /// `proxy.config_history.keep_rejected`, carried forward for the
-    /// rejected-candidate writer to come. See the field's own doc.
-    #[must_use]
-    pub const fn keep_rejected(&self) -> usize {
-        self.keep_rejected
-    }
-
     /// Blast radius of `content` against this ring's most recent entry,
     /// via [`sbproxy_config::plan()`].
     ///
@@ -262,6 +259,148 @@ impl ConfigHistoryRecorder {
         let content_text = std::str::from_utf8(content).ok()?;
         let proposed = serde_yaml::from_str::<sbproxy_config::ConfigFile>(content_text).ok()?;
         Some(sbproxy_config::plan(&baseline, &proposed).max_blast_radius)
+    }
+
+    /// Record one refused candidate into the ring's `rejected/`
+    /// directory (WOR-2462).
+    ///
+    /// Logs and swallows a write failure for the same reason
+    /// [`Self::record`] does: keeping refused candidates is a diagnostic
+    /// aid, and a full disk here must not turn a rejection this node
+    /// already survived into a second failure.
+    pub fn record_rejection(&self, content: &[u8], metadata: sbproxy_config::RejectionMetadata) {
+        let reason = metadata.reason;
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match store.record_rejection(content, metadata) {
+            Ok(candidate) => {
+                sbproxy_observe::metrics::record_config_rejection(reason.as_str());
+                tracing::debug!(
+                    digest = %candidate.digest,
+                    reason = reason.as_str(),
+                    count = candidate.count,
+                    "config history: recorded a refused config candidate"
+                );
+            }
+            Err(error) => tracing::error!(
+                error = %error,
+                reason = reason.as_str(),
+                "config history: failed to record a refused config candidate"
+            ),
+        }
+    }
+
+    /// Every stored rejected candidate, oldest refusal first.
+    ///
+    /// Empty, rather than an error, when the directory cannot be read:
+    /// the admin surface that calls this would rather show the applied
+    /// history with no rejections than fail the whole response over
+    /// them.
+    #[must_use]
+    pub fn rejections(&self) -> Vec<sbproxy_config::RejectedCandidate> {
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.rejections().unwrap_or_else(|error| {
+            tracing::error!(
+                error = %error,
+                "config history: failed to read stored rejected candidates"
+            );
+            Vec::new()
+        })
+    }
+
+    /// Record one soak verdict against `revision`, moving the
+    /// last-known-good pointer if, and only if, the verdict is
+    /// [`sbproxy_config::SoakVerdict::Successful`] (WOR-2458).
+    ///
+    /// The rule itself lives in
+    /// [`sbproxy_config::RevisionStore::record_soak_verdict`]; this
+    /// forwards to it, publishes the resulting pointer onto
+    /// `sbproxy_config_lkg_revision`, and swallows a write failure the
+    /// way every other write on this type does.
+    pub fn record_soak_verdict(&self, revision: u64, verdict: sbproxy_config::SoakVerdict) {
+        let mut store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(error) = store.record_soak_verdict(revision, verdict) {
+            tracing::error!(
+                error = %error,
+                revision,
+                "config history: failed to record a soak verdict"
+            );
+            return;
+        }
+        if let Some(lkg) = store.lkg() {
+            sbproxy_observe::metrics::set_config_lkg_revision(
+                i64::try_from(lkg.revision).unwrap_or(i64::MAX),
+            );
+        }
+    }
+
+    /// Entries a boot fallback may try, in the order it should try them
+    /// (WOR-2459). See
+    /// [`sbproxy_config::RevisionStore::boot_candidates`].
+    #[must_use]
+    pub fn boot_candidates(&self) -> Vec<RevisionEntry> {
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.boot_candidates()
+    }
+
+    /// Increment and persist one entry's boot counter before the attempt
+    /// (WOR-2459), returning the new count.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as
+    /// [`sbproxy_config::RevisionStore::begin_boot_attempt`]. Unlike the
+    /// other writes on this type this one is *not* swallowed: a boot
+    /// walk that cannot persist its counter would retry the same dead
+    /// entry forever, so the caller has to see the failure.
+    pub fn begin_boot_attempt(&self, revision: u64) -> Result<u32, RevisionStoreError> {
+        let mut store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.begin_boot_attempt(revision)
+    }
+
+    /// Clear one entry's boot counter: it booted and served long enough
+    /// to count as working (WOR-2459).
+    pub fn confirm_boot_success(&self, revision: u64) {
+        let mut store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(error) = store.confirm_boot_success(revision) {
+            tracing::error!(
+                error = %error,
+                revision,
+                "config history: failed to clear a boot attempt counter"
+            );
+        }
+    }
+
+    /// Retire one entry from the boot walk (WOR-2459).
+    pub fn retire_unbootable(&self, revision: u64) {
+        let mut store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(error) = store.retire_unbootable(revision) {
+            tracing::error!(
+                error = %error,
+                revision,
+                "config history: failed to retire an unbootable revision"
+            );
+        }
     }
 }
 
@@ -362,6 +501,49 @@ pub fn current_config_history_recorder() -> Option<Arc<ConfigHistoryRecorder>> {
     }
 }
 
+/// Record one refused config candidate into the process-wide ring
+/// (WOR-2462).
+///
+/// A no-op when no ring is open, exactly like the applied-revision path:
+/// keeping refused candidates is opt-in with the rest of
+/// `proxy.config_history`.
+///
+/// `content` must be the candidate's **pre-resolution** bytes, the same
+/// discipline the applied ring keeps. For a config-authority refusal
+/// that is the bundle's own document; for a local-file refusal it is the
+/// file as read.
+pub fn record_rejected_candidate(content: &[u8], metadata: sbproxy_config::RejectionMetadata) {
+    let Some(recorder) = current_config_history_recorder() else {
+        return;
+    };
+    recorder.record_rejection(content, metadata);
+}
+
+/// Build the metadata for one refusal, stamping it with the host wall
+/// clock.
+///
+/// A helper rather than five call sites repeating the same struct
+/// literal, and the one place the `detail` a refusing stage logged is
+/// carried into the ring.
+#[must_use]
+pub fn rejection_metadata(
+    reason: sbproxy_config::RejectionReason,
+    stage: &str,
+    detail: &str,
+    provenance: sbproxy_config::BaseOrigin,
+) -> sbproxy_config::RejectionMetadata {
+    sbproxy_config::RejectionMetadata {
+        reason,
+        stage: stage.to_string(),
+        detail: detail.to_string(),
+        provenance,
+        rejected_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0),
+    }
+}
+
 /// Drop the process-wide recorder, resetting the slot to `Disabled`.
 /// Used by tests that must not leak state into the next case.
 #[cfg(test)]
@@ -399,12 +581,31 @@ mod tests {
             dir: temp.path().to_string_lossy().to_string(),
             keep: 5,
             keep_rejected: 3,
+            ..ConfigHistoryConfig::default()
         };
         let recorder = ConfigHistoryRecorder::from_config(Some(&history))
             .expect("no error")
             .expect("an enabled block opens a recorder");
-        assert_eq!(recorder.keep_rejected(), 3);
         assert!(recorder.entries().is_empty());
+        // `keep_rejected` reaches the store rather than being parked on
+        // the recorder: four refusals against a bound of three leave
+        // three files (WOR-2462).
+        for index in 0..4u64 {
+            recorder.record_rejection(
+                format!("a: {index}\n").as_bytes(),
+                rejection_metadata(
+                    sbproxy_config::RejectionReason::CompileFailed,
+                    "file_watcher",
+                    "test",
+                    BaseOrigin::Local,
+                ),
+            );
+        }
+        assert_eq!(
+            recorder.rejections().len(),
+            3,
+            "the configured keep_rejected bounds the directory",
+        );
     }
 
     #[test]

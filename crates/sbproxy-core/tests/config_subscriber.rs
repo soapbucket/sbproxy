@@ -546,6 +546,73 @@ async fn boot_uses_the_cache_when_the_authority_is_unreachable() {
     assert_eq!(subscriber.revision(), 9, "the cursor must not move");
 }
 
+/// A config revision ring installed into the process-wide slot for the
+/// duration of one test (WOR-2462).
+///
+/// Installed rather than mocked: the recording site under test reaches
+/// the ring through that slot, so a test that swapped in something else
+/// would prove only that the something else works. Restores the slot on
+/// drop, so the next test does not inherit a ring pointed at a temporary
+/// directory this one is about to delete.
+struct HistoryRing {
+    dir: PathBuf,
+}
+
+impl HistoryRing {
+    /// Open a ring under `dir/config-history` and publish it.
+    fn install(dir: &Path) -> Self {
+        let ring = dir.join("config-history");
+        let history = sbproxy_config::ConfigHistoryConfig {
+            enabled: true,
+            dir: ring.to_string_lossy().into_owned(),
+            keep: 8,
+            keep_rejected: 8,
+            ..sbproxy_config::ConfigHistoryConfig::default()
+        };
+        let recorder =
+            sbproxy_core::config_history::ConfigHistoryRecorder::from_config(Some(&history))
+                .expect("ring opens")
+                .expect("an enabled block yields a recorder");
+        sbproxy_core::config_history::install_config_history_recorder(Arc::new(recorder));
+        Self { dir: ring }
+    }
+
+    /// Every stored rejected candidate, read straight off disk rather
+    /// than through the recorder: the point of the ticket is that an
+    /// operator can read these files, so the test reads them the same
+    /// way.
+    fn rejections(&self) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        let Ok(listing) = std::fs::read_dir(self.dir.join("rejected")) else {
+            return out;
+        };
+        for entry in listing.flatten() {
+            if entry.path().extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let bytes = std::fs::read(entry.path()).expect("read rejection");
+            out.push(serde_json::from_slice(&bytes).expect("decode rejection"));
+        }
+        out
+    }
+
+    /// The one stored rejection, asserting there is exactly one.
+    fn only_rejection(&self) -> serde_json::Value {
+        let stored = self.rejections();
+        assert_eq!(stored.len(), 1, "exactly one stored rejection: {stored:?}");
+        stored.into_iter().next().expect("one")
+    }
+}
+
+impl Drop for HistoryRing {
+    fn drop(&mut self) {
+        // The slot has no public "clear"; moving it to the failed state
+        // is what makes `current_config_history_recorder` return `None`
+        // again for whatever runs next.
+        sbproxy_core::config_history::install_config_history_failure("test teardown");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_forged_signature_is_refused_and_the_previous_pipeline_keeps_serving() {
     let _serial = SERIAL.lock().await;
@@ -555,6 +622,7 @@ async fn a_forged_signature_is_refused_and_the_previous_pipeline_keeps_serving()
         applied_baseline(dir, "forged-local.test", "forged-authority.test").await;
     let identity_before = pipeline_identity();
     let verify_failed_before = fetch_total("verify_failed");
+    let ring = HistoryRing::install(dir);
 
     let mut forged = sign(
         6,
@@ -573,6 +641,27 @@ async fn a_forged_signature_is_refused_and_the_previous_pipeline_keeps_serving()
     );
     assert!(serves("forged-authority.test"), "revision 5 keeps serving");
     assert_eq!(subscriber.revision(), 5, "the cursor must not move");
+
+    // WOR-2462: the node knew exactly why it refused this; the ring is
+    // where that survives the log rotation.
+    let stored = ring.only_rejection();
+    assert_eq!(stored["reason"], "verify_failed");
+    assert_eq!(stored["stage"], "config_authority");
+    assert_eq!(stored["count"], 1);
+    assert!(
+        stored["detail"]
+            .as_str()
+            .expect("detail")
+            .contains("verification failed"),
+        "the refusing check's own message is kept: {stored:?}",
+    );
+    assert!(
+        stored["document"]
+            .as_str()
+            .expect("document")
+            .contains("forged-candidate.test"),
+        "the refused document is kept so an operator can read it",
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -584,6 +673,7 @@ async fn a_bundle_that_does_not_compile_is_refused_and_the_previous_pipeline_kee
         applied_baseline(dir, "broken-local.test", "broken-authority.test").await;
     let identity_before = pipeline_identity();
     let compile_failed_before = fetch_total("compile_failed");
+    let ring = HistoryRing::install(dir);
 
     // A misspelled nested key. The compiler refuses these rather than
     // silently taking the default, which is exactly the shape of change
@@ -599,6 +689,17 @@ async fn a_bundle_that_does_not_compile_is_refused_and_the_previous_pipeline_kee
     assert_eq!(pipeline_identity(), identity_before, "no reload may happen");
     assert!(serves("broken-authority.test"), "revision 5 keeps serving");
     assert_eq!(subscriber.revision(), 5, "the cursor must not move");
+
+    // WOR-2462.
+    let stored = ring.only_rejection();
+    assert_eq!(stored["reason"], "compile_failed");
+    assert!(
+        stored["document"]
+            .as_str()
+            .expect("document")
+            .contains("http2_cleartextt"),
+        "the misspelling an operator has to find is in the stored document",
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -617,6 +718,7 @@ async fn a_bundle_reading_this_nodes_environment_is_refused() {
         applied_baseline(dir, "envref-local.test", "envref-authority.test").await;
     let identity_before = pipeline_identity();
     let refused_before = fetch_total("confinement_refused");
+    let ring = HistoryRing::install(dir);
 
     stub.serve(
         sign(
@@ -649,6 +751,17 @@ origins:
     assert_eq!(pipeline_identity(), identity_before, "no reload may happen");
     assert!(serves("envref-authority.test"), "revision 5 keeps serving");
     assert_eq!(subscriber.revision(), 5, "the cursor must not move");
+
+    // WOR-2462.
+    let stored = ring.only_rejection();
+    assert_eq!(stored["reason"], "confinement_refused");
+    assert!(
+        stored["detail"]
+            .as_str()
+            .expect("detail")
+            .contains("host resource"),
+        "the confinement refusal explains itself: {stored:?}",
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -744,6 +857,7 @@ async fn a_bundle_claiming_a_subscriber_owned_path_is_refused() {
         applied_baseline(dir, "denied-local.test", "denied-authority.test").await;
     let identity_before = pipeline_identity();
     let denied_before = fetch_total("denied_path");
+    let ring = HistoryRing::install(dir);
 
     // `proxy.admin` is how an operator reaches the box when the fleet is
     // misbehaving, so the fleet does not get to configure it.
@@ -762,6 +876,17 @@ async fn a_bundle_claiming_a_subscriber_owned_path_is_refused() {
     assert_eq!(pipeline_identity(), identity_before, "no reload may happen");
     assert!(serves("denied-authority.test"), "revision 5 keeps serving");
     assert_eq!(subscriber.revision(), 5, "the cursor must not move");
+
+    // WOR-2462.
+    let stored = ring.only_rejection();
+    assert_eq!(stored["reason"], "denied_path");
+    assert!(
+        stored["detail"]
+            .as_str()
+            .expect("detail")
+            .contains("proxy.admin"),
+        "the denied path is named, which is the whole answer: {stored:?}",
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -984,7 +1109,8 @@ async fn a_bundle_declaring_the_other_mode_is_refused() {
     assert_eq!(
         subscriber
             .evaluate(&signed, &local, now_unix_ms())
-            .expect_err("a replace bundle must not apply as an overlay"),
+            .expect_err("a replace bundle must not apply as an overlay")
+            .result,
         CycleResult::VerifyFailed,
     );
 
@@ -1111,6 +1237,7 @@ fn a_cycle_that_finds_a_reload_in_flight_is_skipped_and_retried() {
 
     let identity_before = pipeline_identity();
     let busy_before = fetch_total("reload_busy");
+    let ring = HistoryRing::install(dir);
 
     // Another reload holds the lock for the whole prepare-and-publish
     // body; a poller must not wait behind it.
@@ -1135,6 +1262,15 @@ fn a_cycle_that_finds_a_reload_in_flight_is_skipped_and_retried() {
         "a skipped cycle must not apply anything",
     );
 
+    // WOR-2462: a skipped cycle is a deferral, not a refusal. Recording
+    // it would put a row in `rejected/` on every poll interval of a
+    // perfectly healthy node and bury the real refusals under it.
+    assert!(
+        ring.rejections().is_empty(),
+        "a reload_busy skip must not be stored as a rejection: {:?}",
+        ring.rejections(),
+    );
+
     // The next interval retries against whatever the authority is serving
     // by then, with the lock free.
     assert_eq!(
@@ -1143,4 +1279,11 @@ fn a_cycle_that_finds_a_reload_in_flight_is_skipped_and_retried() {
     );
     assert!(serves("busy-authority.test"));
     assert_eq!(subscriber.revision(), 5);
+
+    // ... and the applied cycle did not put one there either.
+    assert!(
+        ring.rejections().is_empty(),
+        "an applied cycle refuses nothing: {:?}",
+        ring.rejections(),
+    );
 }

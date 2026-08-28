@@ -1404,7 +1404,35 @@ pub(crate) fn reload_from_config_yaml(
     // `yaml` is read straight off the local file and may itself carry a
     // `source:` block, which `reload_from_config_yaml_locked` resolves
     // the ordinary way.
-    reload_from_config_yaml_locked(config_path, yaml, "file_watcher", None)
+    let result = reload_from_config_yaml_locked(config_path, yaml, "file_watcher", None);
+    // WOR-2462: a local file that does not apply is a refused candidate
+    // like any other, and the one an operator is most likely to be
+    // staring at. Recorded here rather than in `reload_from_config_path`
+    // and `reload_from_config_text` separately, for the same reason the
+    // audit entry above is shared: this is where both triggers converge
+    // and where the candidate bytes are in hand. A failure that never
+    // reached this function (an unreadable file) has no candidate to
+    // record, which is why the read error in
+    // `reload_from_config_path_inner` is not funnelled through here.
+    if let Err(error) = &result {
+        crate::config_subscriber::record_refusal(
+            yaml,
+            &crate::config_subscriber::CycleRefusal::new(
+                crate::config_subscriber::CycleResult::CompileFailed,
+                crate::path_redact::sanitise_path_in_error(
+                    &format!("{error:#}"),
+                    std::path::Path::new(config_path),
+                ),
+            ),
+            "file_watcher",
+            // The stored document is this node's own file, whatever a
+            // `source:` block inside it points at: pre-resolution bytes
+            // only, so the pointer is what was refused and the pointer is
+            // what is kept.
+            sbproxy_config::BaseOrigin::Local,
+        );
+    }
+    result
 }
 
 /// As [`reload_from_config_yaml`], for a caller that already resolved
@@ -8162,6 +8190,48 @@ egress:
         let recorder = std::sync::Arc::new(recorder);
         crate::config_history::install_config_history_recorder(recorder.clone());
         recorder
+    }
+
+    /// WOR-2462. A local file that does not compile is a refused
+    /// candidate too, and this is the one an operator is most likely to
+    /// be looking at. Driven through `reload_from_config_yaml`, the
+    /// function both the file watcher and SIGHUP reach the reload
+    /// transaction through (see its own doc comment for why the two
+    /// triggers share one label), so this covers both paths.
+    #[test]
+    fn a_local_file_that_does_not_compile_is_stored_as_a_rejection() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let recorder = install_history_recorder_for_test(temp.path());
+        let config_path = temp.path().join("sb.yml");
+
+        // A misspelled nested key: the compiler refuses it rather than
+        // silently taking the default.
+        let broken = "proxy:\n  http2_cleartextt: true\n";
+        std::fs::write(&config_path, broken).expect("write");
+        let error = reload_from_config_yaml(config_path.to_str().expect("utf-8"), broken)
+            .expect_err("a misspelled key must not apply");
+        assert!(
+            format!("{error:#}").contains("http2_cleartextt"),
+            "{error:#}"
+        );
+
+        let stored = recorder.rejections();
+        assert_eq!(stored.len(), 1, "one stored rejection: {stored:?}");
+        assert_eq!(
+            stored[0].reason,
+            sbproxy_config::RejectionReason::CompileFailed
+        );
+        assert_eq!(stored[0].stage, "file_watcher");
+        assert_eq!(stored[0].provenance, sbproxy_config::BaseOrigin::Local);
+        assert_eq!(
+            stored[0].document, broken,
+            "the refused document is kept as written",
+        );
+        assert!(
+            recorder.entries().is_empty(),
+            "a refused candidate is not an applied revision",
+        );
+        crate::config_history::clear_config_history_recorder();
     }
 
     #[test]
