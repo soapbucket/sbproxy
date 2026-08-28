@@ -282,11 +282,61 @@ check_bash_block() {
   return 0
 }
 
-run_code() {
-  local rc=0
-  local checked=0
-  local skipped=0
+# One markdown file's worth of code-block checking, as a standalone unit
+# so the driver below can run several at once. Writes `rc checked skipped`
+# to $1 and every diagnostic to $1.log, because a parallel pool cannot
+# accumulate through namerefs and interleaved stderr is unreadable.
+run_code_one() {
+  local result="$1" md="$2"
+  local rc=0 checked=0 skipped=0
+  # `set +e` is load bearing. This body runs inside a backgrounded
+  # subshell that inherited `set -e`, and a checker returning non-zero
+  # would kill it before the result line is written, which the driver
+  # would then read as a missing file. The failure has to be recorded,
+  # not thrown.
+  set +e
+  {
+    run_lang_pass "$md" rust check_rust_block rc checked skipped
+    run_lang_pass "$md" bash check_bash_block rc checked skipped
+  } >"$result.log" 2>&1
+  printf '%s %s %s\n' "$rc" "$checked" "$skipped" >"$result"
+}
 
+# Each block is an independent `rustc --emit=metadata` or `bash -n`, so
+# the pass is embarrassingly parallel and was running one at a time. On
+# the reference machine that was 29.1s at 65% CPU for 519 blocks. The
+# pool defaults to the core count; DOCS_CI_JOBS=1 restores the serial
+# order when a failure needs to be read in sequence.
+run_code() {
+  local rc=0 checked=0 skipped=0
+  local jobs="${DOCS_CI_JOBS:-0}"
+  if [ "$jobs" -le 0 ] 2>/dev/null || [ -z "$jobs" ]; then
+    jobs="$( (getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) )"
+  fi
+
+  local work
+  work="$(mktemp -d "${TMPDIR:-/tmp}/docs-ci-code.XXXXXX")"
+  # Save and restore the caller's EXIT trap rather than replacing it. This
+  # function runs in the top-level shell, so a bare `trap ... EXIT` here
+  # would silently drop whatever the caller had installed; without any trap
+  # at all, a signal during the pass leaked a docs-ci-code.* directory
+  # under $TMPDIR every time.
+  local previous_exit_trap
+  previous_exit_trap="$(trap -p EXIT)"
+  # INT and TERM as well as EXIT: bash runs an EXIT trap when the shell
+  # exits, but a default-disposition signal kills it without one, so
+  # Ctrl-C during a 500-block pass left the directory behind. The handler
+  # re-raises with the default disposition so the exit status still says
+  # what killed it.
+  # shellcheck disable=SC2064
+  trap "rm -rf '$work'" EXIT
+  # shellcheck disable=SC2064
+  trap "rm -rf '$work'; trap - INT; kill -INT \$\$" INT
+  # shellcheck disable=SC2064
+  trap "rm -rf '$work'; trap - TERM; kill -TERM \$\$" TERM
+
+  local -a files=() results=()
+  local tree md
   for tree in "${TREES[@]}"; do
     # Public documentation is flat at docs/*.md, which is also the source
     # boundary used by regen-llms-full.sh. Nested docs/superpowers files are
@@ -295,13 +345,57 @@ run_code() {
     # user documentation.
     for md in "$tree"/*.md; do
       [ -f "$md" ] || continue
-      [ "${DOCS_CI_QUIET:-0}" = "1" ] || echo "[docs-ci] code blocks: $md"
-      run_lang_pass "$md" rust check_rust_block rc checked skipped
-      run_lang_pass "$md" bash check_bash_block rc checked skipped
+      files+=("$md")
     done
   done
 
-  echo "[docs-ci] code-block check: checked=$checked skipped=$skipped rc=$rc"
+  # `set -u` plus bash 3.2 aborts on "${files[@]}" when the array is
+  # empty, which is the same class of portability bug as the declare -A
+  # this branch already had to fix. An empty tree is not an error: there is
+  # nothing to check and nothing to report.
+  if [ "${#files[@]}" -eq 0 ]; then
+    rm -rf "$work"
+    trap - INT TERM
+    eval "${previous_exit_trap:-trap - EXIT}"
+    echo "[docs-ci] code-block check: checked=0 skipped=0 rc=0 jobs=$jobs (no markdown files)"
+    return 0
+  fi
+
+  local index=0 running=0 slot
+  for md in "${files[@]}"; do
+    slot="$work/$index"
+    results+=("$slot")
+    run_code_one "$slot" "$md" &
+    index=$((index + 1))
+    running=$((running + 1))
+    if [ "$running" -ge "$jobs" ]; then
+      wait -n 2>/dev/null || wait
+      running=$((running - 1))
+    fi
+  done
+  wait
+
+  local i line one_rc one_checked one_skipped
+  for i in "${!files[@]}"; do
+    slot="${results[$i]}"
+    [ "${DOCS_CI_QUIET:-0}" = "1" ] || echo "[docs-ci] code blocks: ${files[$i]}"
+    # An `&&` here would be the last command of the loop body on the
+    # common path where the log is empty, and `set -e` would end the
+    # function with the remaining files unreported.
+    if [ -s "$slot.log" ]; then
+      cat "$slot.log" >&2
+    fi
+    line="$(cat "$slot" 2>/dev/null || echo '1 0 0')"
+    read -r one_rc one_checked one_skipped <<<"$line"
+    [ "${one_rc:-1}" = "0" ] || rc=1
+    checked=$((checked + ${one_checked:-0}))
+    skipped=$((skipped + ${one_skipped:-0}))
+  done
+
+  rm -rf "$work"
+  trap - INT TERM
+  eval "${previous_exit_trap:-trap - EXIT}"
+  echo "[docs-ci] code-block check: checked=$checked skipped=$skipped rc=$rc jobs=$jobs"
   return $rc
 }
 
