@@ -105,7 +105,20 @@ fn readme_and_workflow_cover_reproducibility_and_external_data_boundaries() {
     // Every job must carry a bounded timeout. The values themselves move
     // with cache policy (35 warm, 60 cold since the caches went
     // restore-only), so pin the property, not the number.
-    assert!(workflow.matches("timeout-minutes:").count() >= 2);
+    //
+    // Count against the jobs actually present rather than a literal.
+    // This read `>= 2` while the workflow had two jobs, and broke when
+    // the request-path smoke job moved to its own unfiltered workflow
+    // (WOR-2699), which is the failure mode the comment above was
+    // already warning about: a hardcoded count is not the property.
+    // `runs-on:` appears exactly once per job.
+    let jobs = workflow.matches("runs-on:").count();
+    assert!(jobs >= 1, "the workflow has to define at least one job");
+    assert_eq!(
+        workflow.matches("timeout-minutes:").count(),
+        jobs,
+        "every job in context-compression-eval.yml needs a bounded timeout"
+    );
     assert!(!workflow.contains("--input-budget-tokens"));
     assert!(!workflow.contains("--completion-reserve-tokens"));
     assert!(workflow.contains(" check"));
