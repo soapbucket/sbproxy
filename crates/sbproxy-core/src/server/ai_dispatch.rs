@@ -14096,7 +14096,7 @@ pub(super) async fn handle_ai_proxy(
                     config_providers: &config.providers,
                     provider_name: last_provider_name.as_str(),
                 };
-                return relay_ai_response_with_cache(
+                return Box::pin(relay_ai_response_with_cache(
                     session,
                     resp,
                     last_format,
@@ -14117,7 +14117,7 @@ pub(super) async fn handle_ai_proxy(
                         .filter(|pipeline| pipeline.has_output()),
                     output_external,
                     ai_extensions,
-                )
+                ))
                 .await;
             }
             // Streaming with idempotency engaged: drop the capture
@@ -14200,7 +14200,7 @@ pub(super) async fn handle_ai_proxy(
             // cheap.
             let stream_reversible_pairs: Vec<(String, String, String)> =
                 ctx.ai_reversible_redactions.clone();
-            relay_ai_stream(
+            Box::pin(relay_ai_stream(
                 session,
                 resp,
                 pipeline,
@@ -14245,7 +14245,7 @@ pub(super) async fn handle_ai_proxy(
                 // blocks.
                 Some(ctx),
                 ai_extensions,
-            )
+            ))
             .await
         } else {
             // Non-streaming: relay plus the semantic write on miss. When a
@@ -14275,7 +14275,7 @@ pub(super) async fn handle_ai_proxy(
                 config_providers: &config.providers,
                 provider_name: last_provider_name.as_str(),
             };
-            relay_ai_response_with_cache(
+            Box::pin(relay_ai_response_with_cache(
                 session,
                 resp,
                 last_format,
@@ -14305,7 +14305,7 @@ pub(super) async fn handle_ai_proxy(
                 // guardrail has a complete response to inspect.
                 output_external,
                 ai_extensions,
-            )
+            ))
             .await
         }
     } else if let Some(reason) = ctx.managed_fallback_reason {
@@ -23236,6 +23236,67 @@ mod external_guardrail_context_tests {
                 estimated,
                 Some("estimated"),
                 "a buffered response billed from an estimate has to say so"
+            );
+        }
+
+        /// The whole `handle_ai_proxy` state machine sits on a pingora
+        /// worker's 2 MiB stack while it is polled, and it is not alone
+        /// there: the compression pipeline, the CEL policy plane and the
+        /// provider client each add their own frames on top of it.
+        ///
+        /// WOR-2622: this path had roughly a kilobyte of headroom and
+        /// nothing measured it. Adding the settle guard pushed the
+        /// future from 26,080 bytes to 27,568, and the debug-profile
+        /// proxy then died with
+        /// `thread 'Pingora HTTP Proxy Service' has overflowed its
+        /// stack` on the one e2e origin that runs compression and an
+        /// `ai_policy` expression together
+        /// (`e2e/tests/governed_key_policy.rs`'s
+        /// `compression-cel.localhost`). Boxing the two relay futures
+        /// took it to 24,464. The sibling guards
+        /// (`a_streaming_dispatch_fits_a_pingora_worker_stack`,
+        /// `a_non_streaming_dispatch_fits_a_pingora_worker_stack`) ran a
+        /// real dispatch on a worker-sized thread and still passed,
+        /// because their fixtures wire no compression, no policy plane
+        /// and no TLS: they measure a floor, not this ceiling.
+        ///
+        /// So this measures the number itself. The budget is deliberately
+        /// below where the failure was observed rather than at it, and a
+        /// change that needs more than this needs to box something, not
+        /// to raise the line.
+        #[tokio::test]
+        async fn the_dispatch_future_stays_inside_its_stack_budget() {
+            const BUDGET_BYTES: usize = 25 * 1024;
+
+            let (url, upstream) = streaming_upstream_fixture(vec![sse("[DONE]")], 1, 0).await;
+            let config = stream_probe_config(&url);
+            let pipeline = crate::pipeline::CompiledPipeline::default();
+            let (mut session, close, client) =
+                streaming_downstream_session(stream_probe_request()).await;
+            let mut context = crate::context::RequestContext::new();
+
+            // Built and never polled: the size is a property of the type.
+            let dispatch = super::super::handle_ai_proxy(
+                &mut session,
+                &config,
+                &pipeline,
+                "ai.test",
+                &mut context,
+                None,
+            );
+            let size = std::mem::size_of_val(&dispatch);
+            drop(dispatch);
+
+            drop(session);
+            drop(close);
+            drop(client);
+            upstream.outcome.abort();
+
+            assert!(
+                size <= BUDGET_BYTES,
+                "the AI dispatch future is {size} bytes, over its {BUDGET_BYTES}-byte budget. \
+                 It is polled on a 2 MiB pingora worker stack under the compression pipeline \
+                 and the policy plane; box the deepest new future rather than raising this."
             );
         }
 
