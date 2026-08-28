@@ -1032,7 +1032,8 @@ async fn refuse_olp_token_over_budget(
 /// rather than an inline block in `request_filter` (WOR-2673). Inline,
 /// every local this body holds and every future it awaits, including
 /// `serve_redeem`'s, became part of `request_filter`'s own state
-/// machine, which Pingora polls on a 2 MiB worker stack and which CI's
+/// machine, which Pingora polls on an 8 MiB worker stack (WOR-2699
+/// raised it from tokio's 2 MiB default) and which CI's
 /// request-path smoke lane overflowed three times on this branch while
 /// `origin/main` stayed green. Boxed, the whole thing is one pointer in
 /// the parent and is allocated only on the three paths that reach it.

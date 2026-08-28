@@ -2943,7 +2943,8 @@ pub(super) fn evaluate_cache_admit_for(
 /// added await is known to be dangerous: `response_filter` inlines every
 /// response stage the proxy has and is the largest future on the path,
 /// and this workspace has already had a single added await grow a
-/// request-path future past the 2 MiB Pingora worker stack and kill every
+/// request-path future past the Pingora worker stack, 8 MiB since
+/// WOR-2699, and kill every
 /// AI request while 13006 unit tests stayed green. `upstream_response_decision`
 /// is the hook next door, it runs once per upstream response before any
 /// byte reaches the client, it already awaits `maybe_retry_upstream_status`,
@@ -10658,7 +10659,8 @@ origins:
     /// inside `response_filter`. That hook inlines every response stage
     /// the proxy has and is the largest future on the request path, and
     /// this workspace has already had one added await grow a
-    /// request-path future past the 2 MiB Pingora worker stack and kill
+    /// request-path future past the Pingora worker stack, 8 MiB since
+    /// WOR-2699, and kill
     /// every AI request in production while 13006 unit tests stayed
     /// green. Nothing in the gate, in CI, or in `cargo test` can see that
     /// happen, so the constraint is pinned as a property of the source

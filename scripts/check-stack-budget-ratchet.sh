@@ -137,20 +137,66 @@ current="$(read_count "$(cat "$BASELINE_FILE")" "$BASELINE_REL")"
 
 # The merge base, not `origin/main`. A branch is answerable for what it
 # changed, not for a number that moved under it while it was open.
-base_ref=""
-for candidate in origin/main main; do
-  if git rev-parse --verify --quiet "$candidate" >/dev/null; then
-    if base_ref="$(git merge-base HEAD "$candidate" 2>/dev/null)"; then
-      break
-    fi
-  fi
-  base_ref=""
-done
+# Resolve the base this branch is answerable to, and fail if it cannot
+# be resolved.
+#
+# The first version of this skipped instead, printing "no merge base
+# against main" and exiting 0. It was wired into ci.yml's lint job, whose
+# checkout has no `fetch-depth`, so on a `pull_request` event neither
+# `origin/main` nor `main` resolved and the guard did nothing on every
+# pull request while reporting success. It shipped inside the change
+# whose whole subject is guards that cannot fail. That is why this now
+# fails closed, and why the step lives in the `guards` job, whose
+# checkout is full depth for exactly this reason.
+#
+# `STACK_BUDGET_BASE_REF` mirrors CHANGELOG_BASE_REF next door: CI passes
+# the pull request's base commit, and the merge base of that ref with
+# HEAD is taken here rather than trusting the ref itself, so a base gone
+# stale behind a direct push to main cannot attribute main's commits to
+# this branch. A bad override is an error, never a skip.
+resolve_base() {
+  local override="${STACK_BUDGET_BASE_REF:-}"
+  local resolved merge_base
 
-if [ -z "$base_ref" ]; then
-  echo "no merge base against main; checking the baseline format only" >&2
-  echo "stack budget: $current bytes" >&2
-  exit 0
+  if [ -n "$override" ]; then
+    if ! resolved="$(git rev-parse --verify --quiet "${override}^{commit}")"; then
+      echo "STACK_BUDGET_BASE_REF=$override does not resolve to a commit" >&2
+      return 1
+    fi
+    if merge_base="$(git merge-base "$resolved" HEAD 2>/dev/null)"; then
+      printf '%s' "$merge_base"
+      return 0
+    fi
+    # Shallow checkout with an override: the ref itself is the best
+    # answer available, and it is a real commit.
+    printf '%s' "$resolved"
+    return 0
+  fi
+
+  for candidate in origin/main main; do
+    if resolved="$(git rev-parse --verify --quiet "${candidate}^{commit}")"; then
+      if merge_base="$(git merge-base "$resolved" HEAD 2>/dev/null)"; then
+        printf '%s' "$merge_base"
+        return 0
+      fi
+    fi
+  done
+
+  echo "cannot resolve a base to ratchet against" >&2
+  echo >&2
+  echo "This check compares scripts/stack-budget-baseline.count against the" >&2
+  echo "same file at the merge base, so without a base it has nothing to" >&2
+  echo "say and must not pretend otherwise. It used to exit 0 here, which" >&2
+  echo "is how it ran on every pull request and checked nothing." >&2
+  echo >&2
+  echo "In CI: run this in a job whose checkout sets fetch-depth: 0, and" >&2
+  echo "pass STACK_BUDGET_BASE_REF (the pull request base commit)." >&2
+  echo "On a laptop: git fetch origin main" >&2
+  return 1
+}
+
+if ! base_ref="$(resolve_base)"; then
+  exit 1
 fi
 
 if ! previous_raw="$(git show "$base_ref:$BASELINE_REL" 2>/dev/null)"; then

@@ -18193,12 +18193,25 @@ impl RelayBodyHoldback {
 /// `scripts/check-stack-budget-ratchet.sh` refuses to let it
 /// rise.
 ///
-/// It is half of `pingora_runtime::DEFAULT_THREAD_STACK_SIZE`.
-/// The invariant is "the request path fits in half a worker's
-/// stack", which stays meaningful if the worker stack is ever
-/// changed again, and which leaves the other half for the TLS,
-/// guardrail, translator and holdback frames this fixture does
-/// not wire.
+/// Set from a measurement, not from a fraction of the stack. An
+/// earlier version used half of
+/// `pingora_runtime::DEFAULT_THREAD_STACK_SIZE`, which sounds
+/// principled and is not a ratchet: at 4,194,304 against a measured
+/// 1,600,952 it had 2.6x of slack, and the commit that broke `main`
+/// moved the depth 31,152 bytes, 0.7% of it. Fifty such commits
+/// would not have tripped it. That is the same false comfort this
+/// branch exists to remove, in a new place.
+///
+/// The number is the measured high water rounded up to the next
+/// 256 KiB, plus 512 KiB of growth margin. The margin for frames
+/// this fixture does not wire, TLS and guardrails and translators,
+/// lives in the worker stack and not here: the stack is 8 MiB and
+/// this is a fraction of it.
+///
+/// Re-derive it by reading `STACK_HIGH_WATER_BYTES` out of the
+/// `production request-path smoke` lane, which prints it on Linux
+/// on every pull request, and lowering this to match. It only
+/// falls.
 #[cfg(test)]
 const STACK_BUDGET: usize = parse_budget(include_str!(
     "../../../../scripts/stack-budget-baseline.count"
@@ -23398,22 +23411,28 @@ mod external_guardrail_context_tests {
         ///
         /// # What this measures instead
         ///
-        /// The request runs on a real Pingora runtime worker with a
-        /// production-sized stack. Pingora's runtime records where each
-        /// worker's stack starts, the request path takes the address of
-        /// a local at its deepest point, and the difference is bytes
-        /// actually in use. Two things are checked:
+        /// The request runs on a real Pingora runtime worker whose stack
+        /// is [`pingora_runtime::DEFAULT_THREAD_STACK_SIZE`], the size
+        /// production gives a worker. Pingora's runtime records where
+        /// each worker's stack starts, the request path takes the
+        /// address of a local at its deepest point, and the difference
+        /// is bytes actually in use. Three things are checked, and the
+        /// two numbers involved are different tiers:
         ///
-        /// 1. The measured depth is inside [`STACK_BUDGET`]. This is an
-        ///    assertion and not an overflow on purpose: a stack overflow
-        ///    aborts, and an abort has no number and no message, which
-        ///    is the wrong failure for the check that exists to explain
-        ///    this class of bug. The abort is still there underneath,
-        ///    for a path that outgrows the whole production stack, and
-        ///    that one covers the entire call chain including every
-        ///    frame below the probes: reqwest, hyper, the TLS stack,
-        ///    serde.
-        /// 2. The probe reported a non-zero depth. Without this the
+        /// 1. The measured depth is inside [`STACK_BUDGET`], which is a
+        ///    fraction of that stack and the thing that only falls.
+        ///    This is an assertion and not an overflow on purpose: an
+        ///    overflow aborts, and an abort has no number and no
+        ///    message, which is the wrong failure for the check that
+        ///    exists to explain this class of bug. Sizing the worker to
+        ///    the budget instead would make this assertion unreachable,
+        ///    and would also abort on a path production serves fine.
+        /// 2. The request completes at all. A path that outgrows the
+        ///    production stack overflows and aborts, which under
+        ///    nextest is this test and nothing else, and that covers the
+        ///    entire call chain including every frame below the probes:
+        ///    reqwest, hyper, the TLS stack, serde.
+        /// 3. The probe reported a non-zero depth. Without this the
         ///    measurement could quietly stop working, the budget check
         ///    would pass vacuously, and we would be back to a guard that
         ///    cannot fail.
@@ -23441,8 +23460,27 @@ mod external_guardrail_context_tests {
         /// belongs in a commit that says so.
         #[test]
         fn the_ai_dispatch_path_stays_inside_its_stack_budget() {
+            // The worker gets the *production* stack, not the budget.
+            //
+            // Sizing it to the budget makes the assertion below dead
+            // code: the thread's stack would be the budget, so `used`
+            // could not exceed it without the process having already
+            // aborted. The first version of this did exactly that while
+            // its doc claimed the opposite, which is the third guard
+            // over this property in two days that could not fail.
+            //
+            // Two distinct numbers, and they are not the same tier:
+            //
+            //   the stack   what production gives a worker, 8 MiB. An
+            //               overflow here is a real overflow and aborts,
+            //               which is the honest answer to a path that
+            //               outgrows what production serves it on.
+            //   the budget  what the request path is allowed to use of
+            //               that, and the thing that only falls. Passing
+            //               it is an assertion failure with the
+            //               measurement in hand, long before the cliff.
             let runtime = pingora_runtime::RuntimeBuilder::new(1, "stack-budget")
-                .thread_stack_size(super::super::STACK_BUDGET)
+                .thread_stack_size(pingora_runtime::DEFAULT_THREAD_STACK_SIZE)
                 .build();
             // Await the task from here rather than blocking on a
             // channel, so a panic inside it surfaces as a panic instead
@@ -23456,14 +23494,17 @@ mod external_guardrail_context_tests {
                 .expect("current-thread runtime to await the worker");
             let used = waiter
                 .block_on(task)
-                .expect("the request completes on a budget-sized worker stack");
+                .expect("the request completes on a production-sized worker stack");
 
             // Printed on every run, not only on failure, and in one
             // grep-able line: the number is the point. CI reads it out
             // of a log and a reviewer comparing two branches wants it
             // without editing the test.
             let budget = super::super::STACK_BUDGET;
-            println!("STACK_HIGH_WATER_BYTES={used} BUDGET_BYTES={budget}");
+            let stack = pingora_runtime::DEFAULT_THREAD_STACK_SIZE;
+            println!(
+                "STACK_HIGH_WATER_BYTES={used} BUDGET_BYTES={budget} WORKER_STACK_BYTES={stack}"
+            );
             assert!(
                 used > 0,
                 "the stack probe reported nothing. Either the worker stopped recording its \
@@ -23728,8 +23769,8 @@ mod external_guardrail_context_tests {
         }
 
         /// The whole `handle_ai_proxy` state machine sits on a pingora
-        /// worker's 2 MiB stack while it is polled, and it is not alone
-        /// there: the compression pipeline, the CEL policy plane and the
+        /// worker's stack while it is polled, 8 MiB since WOR-2699, and
+        /// it is not alone there: the compression pipeline, the CEL policy plane and the
         /// provider client each add their own frames on top of it.
         ///
         /// WOR-2622: this path had roughly a kilobyte of headroom and
@@ -23789,7 +23830,7 @@ mod external_guardrail_context_tests {
             assert!(
                 size <= BUDGET_BYTES,
                 "the AI dispatch future is {size} bytes, over its {BUDGET_BYTES}-byte budget. \
-                 It is polled on a 2 MiB pingora worker stack under the compression pipeline \
+                 It is polled on an 8 MiB pingora worker stack under the compression pipeline \
                  and the policy plane; box the deepest new future rather than raising this."
             );
         }
@@ -24101,6 +24142,87 @@ mod external_guardrail_context_tests {
                 "cancel_on_half_close": cancel_on_half_close
             }))
             .expect("single-provider disconnect fixture config")
+        }
+
+        /// The buffered twin of
+        /// `the_ai_dispatch_path_stays_inside_its_stack_budget`.
+        ///
+        /// Deleting `a_non_streaming_dispatch_fits_a_pingora_worker_stack`
+        /// left the non-streaming relay with no stack coverage at all,
+        /// and left the probe in `relay_ai_response_with_cache`
+        /// unreached by any test, which means it could stop working and
+        /// nothing would notice. The two relays are different functions
+        /// with different frames; measuring one says nothing about the
+        /// other.
+        ///
+        /// Same shape as the streaming budget test: entered through
+        /// `request_phase::request_filter`, run on a worker with a
+        /// production-sized stack, measured against the same budget.
+        ///
+        /// A connected client, deliberately not `downstream_session`,
+        /// which half-closes the instant the request is written. That
+        /// FIN would settle the disconnect watch on its first poll and
+        /// let the `select!` resolve immediately, so every later poll of
+        /// the provider future, including the one that decodes the
+        /// response header, would run at the bare `.await` outside the
+        /// `select!`. The deeper frame is the one this measures, so the
+        /// sender is held and never fired.
+        #[test]
+        fn the_buffered_ai_dispatch_path_stays_inside_its_stack_budget() {
+            let runtime = pingora_runtime::RuntimeBuilder::new(1, "stack-budget-buffered")
+                .thread_stack_size(pingora_runtime::DEFAULT_THREAD_STACK_SIZE)
+                .build();
+            let task = runtime.get_handle().spawn(async {
+                let (upstream_url, upstream) =
+                    slow_upstream_fixture(Duration::from_millis(50)).await;
+                let (mut session, _close, client) = downstream_session_closing_on_demand(
+                    disconnect_probe_request(),
+                    DownstreamClose::Reset,
+                )
+                .await;
+                let mut context = super::super::ai_request_context(&upstream_url);
+
+                let served =
+                    crate::server::request_phase::request_filter(&mut session, &mut context)
+                        .await
+                        .expect("the request completes on a production-sized worker stack");
+                assert!(served, "request_filter has to serve the AI request itself");
+                assert!(
+                    !context.ai_upstream_cancelled_on_client_disconnect,
+                    "the budget must measure a served dispatch, not a cancelled one"
+                );
+                drop(session);
+                let response = live_downstream_body(client).await;
+                assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+                let _ = upstream.outcome.await;
+                crate::server::stack_probe::thread_high_water_bytes()
+            });
+            let waiter = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread runtime to await the worker");
+            let used = waiter
+                .block_on(task)
+                .expect("the request completes on a production-sized worker stack");
+
+            let budget = super::super::STACK_BUDGET;
+            let stack = pingora_runtime::DEFAULT_THREAD_STACK_SIZE;
+            println!(
+                "BUFFERED_STACK_HIGH_WATER_BYTES={used} BUDGET_BYTES={budget} \
+                 WORKER_STACK_BYTES={stack}"
+            );
+            assert!(
+                used > 0,
+                "the stack probe reported nothing on the buffered path. Either the worker \
+                 stopped recording its stack base or the probe in \
+                 `relay_ai_response_with_cache` stopped being reached, and either way this \
+                 check has been passing vacuously."
+            );
+            assert!(
+                used <= budget,
+                "the buffered AI request path used {used} bytes of worker stack, past its \
+                 {budget}-byte budget"
+            );
         }
 
         fn disconnect_probe_request() -> serde_json::Value {

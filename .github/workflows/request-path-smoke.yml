@@ -22,7 +22,12 @@
 name: request-path-smoke
 
 on:
+  # No `paths:` filter, deliberately: see the header. Branches are named
+  # so a fork's pull request against a release branch does not silently
+  # skip the one lane that catches a stack overflow.
   pull_request:
+    branches:
+      - main
   push:
     branches:
       - main
@@ -65,11 +70,25 @@ jobs:
       # the point; a reviewer comparing two branches reads it out of the
       # log rather than editing the test. Linux frames are the ones that
       # matter here: macOS numbers rank candidates and nothing else.
+      # `cargo test` exits 0 when a filter matches nothing, so a
+      # renamed test turns this step into a no-op that reports success.
+      # That already happened once on this branch, with `--exact` and a
+      # bare test name selecting none of 2857 tests and passing. Count
+      # the tests that ran and fail if it is not the two expected.
       - name: request-path stack budget
-        run: >-
-          cargo test -p sbproxy-core --locked --lib
-          the_ai_dispatch_path_stays_inside_its_stack_budget
-          -- --nocapture
+        run: |
+          set -euo pipefail
+          cargo test -p sbproxy-core --locked --lib \
+            dispatch_path_stays_inside_its_stack_budget -- --nocapture 2>&1 \
+            | tee /tmp/stack-budget.log
+          ran="$(sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' /tmp/stack-budget.log \
+            | head -1)"
+          if [ "${ran:-0}" -ne 2 ]; then
+            echo "::error::expected 2 stack budget tests, ran ${ran:-0}. A renamed or removed"
+            echo "::error::test makes this step pass while checking nothing."
+            exit 1
+          fi
+          grep -E 'STACK_HIGH_WATER_BYTES' /tmp/stack-budget.log
 
       - name: build sbproxy binary
         run: cargo build -p sbproxy --locked
