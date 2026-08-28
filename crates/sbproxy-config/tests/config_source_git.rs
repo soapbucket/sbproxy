@@ -984,3 +984,69 @@ fn a_fully_qualified_ref_that_does_not_exist_is_refused() {
         "the refusal names the revision that is missing: {message}"
     );
 }
+
+/// The `source:` path reads a checkout through the same guard the
+/// aggregator does, and both halves of it are watched.
+///
+/// `read_file_within` is one function for two call sites: the
+/// aggregator's `origin_sources` profile and this crate's `source.path`.
+/// Only the aggregator's leaf-link case had a test, so the
+/// canonicalize-and-compare branch that catches a linked *directory*
+/// component, and this call site's guard at all, had never been watched
+/// go red (WOR-2432 re-review, Minor 9).
+#[cfg(unix)]
+#[test]
+fn a_checkout_read_refuses_a_linked_leaf_and_a_linked_directory() {
+    let checkout = tempfile::tempdir().expect("tempdir");
+    let outside = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        outside.path().join("origin.yaml"),
+        "name: stolen\nspec: {}\n",
+    )
+    .expect("write the target outside the checkout");
+
+    // A committed file that is a link to somewhere else on the host.
+    std::fs::create_dir_all(checkout.path().join("leaf")).expect("mkdir");
+    std::os::unix::fs::symlink(
+        outside.path().join("origin.yaml"),
+        checkout.path().join("leaf/origin.yaml"),
+    )
+    .expect("link the leaf");
+    let leaf = sbproxy_config::source::read_file_within(
+        checkout.path(),
+        "leaf/origin.yaml",
+        sbproxy_config::source::MAX_CHECKOUT_FILE_BYTES,
+        "profile",
+    )
+    .expect_err("a linked leaf is refused");
+    assert!(
+        leaf.to_string().contains("symbolic link"),
+        "the leaf refusal names what it refused: {leaf}"
+    );
+    assert!(
+        !leaf.to_string().contains("stolen"),
+        "and never carries the target's contents: {leaf}"
+    );
+
+    // A committed *directory* that is a link, with a real file inside
+    // it. `symlink_metadata` on the leaf follows the parent, so this is
+    // the case only the canonicalize-and-compare branch catches.
+    std::os::unix::fs::symlink(outside.path(), checkout.path().join("dir")).expect("link the dir");
+    let directory = sbproxy_config::source::read_file_within(
+        checkout.path(),
+        "dir/origin.yaml",
+        sbproxy_config::source::MAX_CHECKOUT_FILE_BYTES,
+        "profile",
+    )
+    .expect_err("a path that resolves outside the checkout is refused");
+    assert!(
+        directory
+            .to_string()
+            .contains("resolves outside the checkout"),
+        "the directory refusal names what it refused: {directory}"
+    );
+    assert!(
+        !directory.to_string().contains("stolen"),
+        "and never carries the target's contents: {directory}"
+    );
+}

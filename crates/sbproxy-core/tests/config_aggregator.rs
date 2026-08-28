@@ -56,6 +56,11 @@ struct FixtureGit {
     polls: AtomicUsize,
     /// Repositories that refuse to fetch, by URL.
     unreachable: Mutex<Vec<String>>,
+    /// Repositories whose fetch fails while their poll still answers.
+    /// A push the aggregator saw and could not read is a different state
+    /// from a repository that is down, and it is the one that leaves an
+    /// entry owed.
+    fetch_unreachable: Mutex<Vec<String>>,
     /// Extra wall-clock every fetch takes, for the deadline tests.
     fetch_delay: Mutex<Duration>,
     /// Fetches seen so far, in order, for the concurrency assertions.
@@ -110,6 +115,20 @@ impl FixtureGit {
             .push(repo.to_string());
     }
 
+    fn break_fetch(&self, repo: &str) {
+        self.fetch_unreachable
+            .lock()
+            .expect("fetch unreachable")
+            .push(repo.to_string());
+    }
+
+    fn unbreak_fetch(&self, repo: &str) {
+        self.fetch_unreachable
+            .lock()
+            .expect("fetch unreachable")
+            .retain(|entry| entry != repo);
+    }
+
     fn fetch_count(&self) -> usize {
         self.fetches.load(Ordering::SeqCst)
     }
@@ -156,11 +175,19 @@ impl Cloner for SharedGit {
             .push(request.repo.to_string());
         let now = self.0.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
         self.0.peak_in_flight.fetch_max(now, Ordering::SeqCst);
+        // A refusal is immediate and a slow repository is slow. Sleeping
+        // first would make "this host said no" indistinguishable from
+        // "this host ran out of the round's budget", and the two are
+        // counted differently.
+        let refused = self.refusal(request.repo);
         let delay = *self.0.fetch_delay.lock().expect("delay");
-        if !delay.is_zero() {
+        if refused.is_none() && !delay.is_zero() {
             std::thread::sleep(delay);
         }
-        let outcome = self.materialize(request);
+        let outcome = match refused {
+            Some(error) => Err(error),
+            None => self.materialize(request),
+        };
         self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
         outcome
     }
@@ -201,6 +228,25 @@ impl Cloner for SharedGit {
 }
 
 impl SharedGit {
+    /// Why this repository refuses to be fetched, if it does.
+    fn refusal(&self, repo: &str) -> Option<ConfigSourceError> {
+        let unreachable = self
+            .0
+            .unreachable
+            .lock()
+            .expect("unreachable")
+            .iter()
+            .chain(
+                self.0
+                    .fetch_unreachable
+                    .lock()
+                    .expect("fetch unreachable")
+                    .iter(),
+            )
+            .any(|entry| entry == repo);
+        unreachable.then(|| ConfigSourceError::Clone(format!("fixture: {repo} is unreachable")))
+    }
+
     fn materialize(
         &self,
         request: &FetchRequest<'_>,
@@ -211,6 +257,13 @@ impl SharedGit {
             .lock()
             .expect("unreachable")
             .iter()
+            .chain(
+                self.0
+                    .fetch_unreachable
+                    .lock()
+                    .expect("fetch unreachable")
+                    .iter(),
+            )
             .any(|repo| repo == request.repo)
         {
             return Err(ConfigSourceError::Clone(format!(
@@ -1707,6 +1760,14 @@ fn a_profile_committed_as_a_symlink_is_refused_rather_than_followed() {
         !message.contains("stolen"),
         "and never carries the target's contents: {message}"
     );
+    // A dropped `\` continuation renders as a run of spaces in the
+    // middle of a sentence an operator reads (WOR-2432 re-review,
+    // Minor 5). `cargo fmt` cannot see it, because rustfmt does not
+    // reformat string literals without `format_strings`.
+    assert!(
+        !message.contains("  "),
+        "the refusal reads as one sentence, with no dropped line continuation: {message:?}"
+    );
 }
 
 /// A profile past the read cap is refused before it is allocated.
@@ -1975,5 +2036,344 @@ fn a_profile_that_is_there_but_not_utf8_is_reported_as_such() {
     assert!(
         !message.contains("is not in the repository"),
         "and does not claim the file is absent when it is there: {message}"
+    );
+}
+
+/// The poll `compose()` takes before a fetch runs under the round's pool
+/// and its deadline too.
+///
+/// `poll()` was put under the bounded pool and `compose()` was not: for
+/// every group it was about to fetch it called `poll_one` in order,
+/// bounded only by that entry's own `timeout_secs`, default 60. Ten
+/// blackholing repositories then cost ten minutes inside one `compose()`
+/// before the first fetch started, and by then the round deadline had
+/// passed and every group was reported outstanding. That is the failure
+/// the round set out to remove, moved one function over, and the suite
+/// could not see it because every compose test set `fetch_delay` only
+/// (WOR-2432 re-review, Major 1).
+#[test]
+fn the_pre_fetch_poll_runs_under_the_round_pool_and_deadline() {
+    let git = Arc::new(FixtureGit::default());
+    let mut entries = String::new();
+    for index in 0..6 {
+        let repo = format!("https://example.test/slowcompose{index}.git");
+        git.set(
+            &repo,
+            &format!("{index}{}", "a".repeat(39)),
+            &[("sbproxy/origin.yaml", BILLING_PROFILE)],
+        );
+        entries.push_str(&format!(
+            "    - name: slowcompose{index}\n      repo: {repo}\n      path: \
+             sbproxy/origin.yaml\n      timeout_secs: 60\n      hosts:\n        \
+             api: [slowcompose{index}.acme.test]\n"
+        ));
+    }
+    *git.poll_delay.lock().expect("poll delay") = Duration::from_millis(150);
+    let document = runtime(&entries).replace("concurrency: 4", "concurrency: 3");
+    let mut aggregator = aggregator(&document, &git);
+    let started = Instant::now();
+    let outcome = aggregator.compose().expect("composes");
+    let elapsed = started.elapsed();
+    assert_eq!(outcome.resolved.len(), 6, "every entry resolves");
+    assert!(
+        git.peak_poll_concurrency() > 1,
+        "the pre-fetch polls must overlap; peak was {}",
+        git.peak_poll_concurrency()
+    );
+    assert!(
+        git.peak_poll_concurrency() <= 3,
+        "and stay under `concurrency`; peak was {}",
+        git.peak_poll_concurrency()
+    );
+    assert!(
+        elapsed < Duration::from_millis(6 * 150),
+        "six serial pre-fetch polls would take {}ms; this took {}ms",
+        6 * 150,
+        elapsed.as_millis()
+    );
+}
+
+/// An edit that moves no repository still reaches the fleet.
+///
+/// The loop re-read the document and then threw the answer away: the
+/// only thing that opened a coalescing window was `poll()` reporting
+/// repository movement. So raising a floor in `origin_defaults`, or
+/// changing an entry's `hosts:`, `inputs:`, `environment:` or `path:`,
+/// composed nothing and published nothing, and the operator's signal was
+/// that the reload appeared to succeed and the fleet did not change
+/// (WOR-2432 re-review, Major 2).
+#[test]
+fn an_edit_that_moves_no_repository_still_reaches_the_fleet() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("sb.yml");
+    let git = Arc::new(FixtureGit::with(
+        "https://example.test/checkout.git",
+        "a".repeat(40).as_str(),
+        &[("sbproxy/origin.yaml", CHECKOUT_PROFILE)],
+    ));
+    std::fs::write(&path, one_entry()).expect("write the runtime document");
+
+    let mut aggregator =
+        Aggregator::from_path(&path, context(&git)).expect("the aggregator reads the file");
+    let publisher = RecordingPublisher::default();
+    aggregation_loop(&mut aggregator, &publisher, Some(1));
+    {
+        let published = publisher.published.lock().expect("published");
+        assert_eq!(published.len(), 1, "the first cycle publishes");
+        assert!(!published[0].contains("second.acme.test"));
+    }
+
+    // The platform engineer binds the same profile to a second host.
+    // No repository moved: same repo, same revision, same commit.
+    let with_two_hosts = one_entry().replace(
+        "        api: [api.acme.test]\n",
+        "        api: [api.acme.test, second.acme.test]\n",
+    );
+    assert_ne!(with_two_hosts, one_entry(), "the fixture edit has to apply");
+    std::fs::write(&path, &with_two_hosts).expect("rewrite the runtime document");
+
+    aggregation_loop(&mut aggregator, &publisher, Some(1));
+    let published = publisher.published.lock().expect("published");
+    assert_eq!(
+        published.len(),
+        2,
+        "a document-only edit is a new composition, so it publishes"
+    );
+    assert!(
+        published[1].contains("second.acme.test"),
+        "and the new binding reaches the fleet: {}",
+        published[1]
+    );
+    assert_eq!(
+        git.fetch_count(),
+        1,
+        "composing for a document edit costs no fetch: the profile is cached"
+    );
+}
+
+/// A fetch that failed stays owed after the document is edited.
+///
+/// `refresh_document` cleared `dirty` and left `observed` holding the
+/// new sha, so the next poll compared equal and never re-reported the
+/// movement. An entry whose fetch had failed then composed from its
+/// cached profile forever, reported as a healthy round, and no later
+/// poll could re-detect the push (WOR-2432 re-review, Major 3).
+#[test]
+fn a_failed_fetch_is_still_owed_after_the_document_is_edited() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("sb.yml");
+    let git = Arc::new(FixtureGit::with(
+        "https://example.test/checkout.git",
+        "a".repeat(40).as_str(),
+        &[("sbproxy/origin.yaml", CHECKOUT_PROFILE)],
+    ));
+    std::fs::write(&path, one_entry()).expect("write the runtime document");
+    let mut aggregator =
+        Aggregator::from_path(&path, context(&git)).expect("the aggregator reads the file");
+    let publisher = RecordingPublisher::default();
+    aggregation_loop(&mut aggregator, &publisher, Some(1));
+
+    // The project pushes a rewritten profile and the repository goes
+    // unreachable before the aggregator can read it. The same profile
+    // with one number changed, so the entry's `inputs:` binding still
+    // matches what the profile declares and the only thing under test is
+    // whether the push was read at all.
+    let rewritten =
+        CHECKOUT_PROFILE.replace("requests_per_minute: 6000", "requests_per_minute: 7000");
+    git.set(
+        "https://example.test/checkout.git",
+        "b".repeat(40).as_str(),
+        &[("sbproxy/origin.yaml", rewritten.as_str())],
+    );
+    // The poll answers with the new sha; the fetch is what fails, so the
+    // aggregator has recorded the movement and has not read the tree.
+    git.break_fetch("https://example.test/checkout.git");
+    aggregation_loop(&mut aggregator, &publisher, Some(1));
+
+    // The platform engineer edits the document for an unrelated reason,
+    // and the repository comes back.
+    let edited = one_entry().replace(
+        "        api: [api.acme.test]\n",
+        "        api: [api.acme.test, third.acme.test]\n",
+    );
+    std::fs::write(&path, &edited).expect("rewrite the runtime document");
+    git.unbreak_fetch("https://example.test/checkout.git");
+
+    aggregation_loop(&mut aggregator, &publisher, Some(1));
+    let published = publisher.published.lock().expect("published");
+    let last = published.last().expect("something published");
+    assert!(
+        last.contains("7000"),
+        "the push the failed fetch owed has to be re-read, not dropped: {last}"
+    );
+}
+
+/// A hand-written origin that reaches a host file is refused where it
+/// composes, not where it publishes.
+///
+/// The payload carries the aggregator node's own `origins:` and each
+/// entry's `overrides:`, and `validate_publish_payload` runs
+/// `check_confined_document` over the whole thing. `spec_file`,
+/// `rego_module_path`, `module_path` and `sha1_file` are all legal
+/// inside an origin and all on `HOST_FILE_KEYS`, so a node whose own
+/// `origins:` validates against an OpenAPI document on disk had every
+/// round refused with `Confinement`, which is the Blocker's failure
+/// shape on a narrower configuration. `--out` and `--dry-run` saw
+/// nothing at all (WOR-2432 re-review, Major 4).
+#[test]
+fn a_hand_written_origin_reaching_a_host_file_is_refused_at_compose() {
+    let git = Arc::new(FixtureGit::with(
+        "https://example.test/checkout.git",
+        "a".repeat(40).as_str(),
+        &[("sbproxy/origin.yaml", CHECKOUT_PROFILE)],
+    ));
+    let document = one_entry().replace(
+        "      body: ok\n",
+        "      body: ok\n    policies:\n      - name: contract\n        type: \
+         openapi_validation\n        spec_file: /etc/sbproxy/openapi.yaml\n",
+    );
+    assert!(
+        document.contains("spec_file"),
+        "the fixture edit has to apply"
+    );
+    let mut aggregator = aggregator(&document, &git);
+    let error = aggregator
+        .compose()
+        .expect_err("a payload the authority would refuse is refused here");
+    let message = error.to_string();
+    assert!(
+        message.contains("spec_file"),
+        "the refusal names the key an operator has to change: {message}"
+    );
+}
+
+/// A group whose fetch failed is counted as failed on the deadline path.
+///
+/// The "finished" set was `unchanged || fetched.contains_key(...)`, and
+/// `fetch_groups` inserts a failure into that map as `Err(_)`, so a
+/// group that failed fast counted as resolved and only the entries that
+/// never got a turn reached `failed`. That is the same "reads as
+/// evidence of absence" the gauge fix was about, one degree smaller
+/// (WOR-2432 re-review, Minor 7).
+#[test]
+fn a_failed_group_counts_as_failed_when_the_round_times_out() {
+    let git = Arc::new(FixtureGit::default());
+    let mut entries = String::new();
+    for index in 0..4 {
+        let repo = format!("https://example.test/mixed{index}.git");
+        git.set(
+            &repo,
+            &format!("{index}{}", "a".repeat(39)),
+            &[("sbproxy/origin.yaml", BILLING_PROFILE)],
+        );
+        entries.push_str(&format!(
+            "    - name: mixed{index}\n      repo: {repo}\n      path: sbproxy/origin.yaml\n \
+             \x20    hosts:\n        api: [mixed{index}.acme.test]\n"
+        ));
+    }
+    // `mixed0` refuses immediately. `mixed1` takes longer than the whole
+    // round, so it finishes past the deadline and the last two never get
+    // a turn. One worker, so the order is the group order.
+    git.break_repo("https://example.test/mixed0.git");
+    *git.fetch_delay.lock().expect("delay") = Duration::from_millis(1_200);
+    let document = runtime(&entries)
+        .replace("concurrency: 4", "concurrency: 1")
+        .replace("deadline_secs: 30", "deadline_secs: 1");
+    let mut aggregator = aggregator(&document, &git);
+    let error = aggregator.compose().expect_err("the deadline passes");
+    assert!(
+        matches!(error, AggregateError::Deadline { .. }),
+        "the round ends on the deadline: {error}"
+    );
+    assert_eq!(
+        gauge_value("failed"),
+        3,
+        "the refusal and the two entries that never got a turn are all failures"
+    );
+    assert_eq!(
+        gauge_value("resolved"),
+        1,
+        "and only the entry that really fetched is a resolution"
+    );
+}
+
+/// A file that differs only in its trailing newline is a change.
+///
+/// `line_diff` works on `str::lines()`, which drops the trailing
+/// newline and any `\r`, so two texts that differ only there produced an
+/// empty diff. `report_aggregate_dry_run` reads the diff's emptiness as
+/// the changed decision, so `--dry-run` printed "already holds this
+/// composition" and exited 0 while `--out` would have rewritten the file
+/// (WOR-2432 re-review, Minor 6).
+#[test]
+fn a_difference_only_in_line_endings_is_still_reported_as_a_change() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("composed.yml");
+    let git = Arc::new(FixtureGit::with(
+        "https://example.test/checkout.git",
+        "a".repeat(40).as_str(),
+        &[("sbproxy/origin.yaml", CHECKOUT_PROFILE)],
+    ));
+    let mut aggregator = aggregator(&one_entry_single_node(), &git);
+    let composed = aggregator.compose().expect("composes");
+    Aggregator::write_composed(&composed, &out).expect("writes");
+
+    let written = std::fs::read_to_string(&out).expect("read back");
+    // CRLF, which is what a checkout on Windows or a normalizing CI step
+    // produces. `str::lines()` strips the `\r`, so the line vectors are
+    // identical while the bytes are not.
+    let crlf = written.replace('\n', "\r\n");
+    assert_ne!(crlf, written, "the fixture edit has to change the bytes");
+    assert_eq!(
+        crlf.lines().collect::<Vec<_>>(),
+        written.lines().collect::<Vec<_>>(),
+        "and has to be invisible to a line diff, or this test proves nothing"
+    );
+    std::fs::write(&out, &crlf).expect("rewrite with CRLF");
+    let diff = Aggregator::diff_against(&composed, &out)
+        .expect("diffs")
+        .expect("the file exists");
+    assert!(
+        !diff.is_empty(),
+        "a file whose bytes differ is a change, whatever `lines()` makes of it"
+    );
+}
+
+/// A symlinked directory component cannot walk the read out of the
+/// checkout.
+///
+/// The leaf-link case had a test and the canonicalize-and-compare branch
+/// did not, so the half of the guard that catches `sbproxy` linked at
+/// `/etc` had never been watched go red (WOR-2432 re-review, Minor 9).
+#[cfg(unix)]
+#[test]
+fn a_symlinked_directory_component_is_refused_rather_than_followed() {
+    let outside = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        outside.path().join("origin.yaml"),
+        "name: stolen\nspec: {}\n",
+    )
+    .expect("write the target");
+    let git = Arc::new(FixtureGit::with(
+        "https://example.test/checkout.git",
+        "a".repeat(40).as_str(),
+        // The directory itself is the committed entry, so the checkout
+        // materializes `sbproxy` as a link and `sbproxy/origin.yaml`
+        // resolves through it.
+        &[("sbproxy", "")],
+    ));
+    git.link("sbproxy", outside.path().to_path_buf());
+    let mut aggregator = aggregator(&one_entry(), &git);
+    let error = aggregator
+        .compose()
+        .expect_err("a path that resolves outside the checkout is refused");
+    let message = error.to_string();
+    assert!(
+        message.contains("resolves outside the checkout"),
+        "the refusal names what it refused: {message}"
+    );
+    assert!(
+        !message.contains("stolen"),
+        "and never carries the target's contents: {message}"
     );
 }

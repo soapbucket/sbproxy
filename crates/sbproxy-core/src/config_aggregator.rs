@@ -143,6 +143,15 @@ pub enum AggregateError {
         /// reason about a fleet's headroom with.
         bytes_per_origin: usize,
     },
+    /// The composed payload names a host file or a host-backed secret
+    /// reference, so the publish screen would refuse it.
+    #[error(
+        "aggregate: the composed payload would be refused by the publish screen: {0}. A \
+         hand-written `origins:` entry and an `origin_sources` entry's `overrides:` both travel \
+         to every subscriber, so neither may name a file on this host or a host-backed secret \
+         reference"
+    )]
+    Confinement(String),
     /// Reading or writing a file failed.
     #[error("aggregate: {0}")]
     Io(String),
@@ -453,10 +462,17 @@ impl Aggregator {
                 self.config = config;
                 self.sources = sources;
                 self.hand_written_origins = hand_written;
-                // Everything is re-examined against the new document,
-                // rather than trusting a dirty set computed against the
-                // old one.
-                self.dirty.clear();
+                // `dirty` is deliberately *not* cleared. It is the only
+                // record that a group moved and has not been read yet,
+                // and `observed` already holds the sha that movement was
+                // detected against, so the next poll compares equal and
+                // can never re-report it. Clearing here dropped a failed
+                // fetch's retry and any movement seen inside an open
+                // debounce window, permanently, and the entry then
+                // composed from its cache forever as a healthy round.
+                // The set is keyed by repository and revision rather
+                // than by position, so a key whose entry the edit
+                // deleted simply never matches a group again.
                 true
             }
             Err(error) => {
@@ -469,6 +485,18 @@ impl Aggregator {
                 false
             }
         }
+    }
+
+    /// Every entry the current document declares, in its order.
+    ///
+    /// The loop's answer to "what moved" when the movement was the
+    /// document itself rather than a repository.
+    fn entry_names(&self) -> Vec<String> {
+        self.sources
+            .entries
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect()
     }
 
     /// Record a resolved credential for one repository, so a private
@@ -618,8 +646,10 @@ impl Aggregator {
     /// Returns [`AggregateError::Deadline`] when the round ran out of
     /// budget, [`AggregateError::Unresolvable`] when an entry failed
     /// with no last-known-good, [`AggregateError::Compose`] when the
-    /// composition itself was refused, and [`AggregateError::TooLarge`]
-    /// when the result is past what a bundle may carry.
+    /// composition itself was refused, [`AggregateError::Confinement`]
+    /// when the payload names a file on this host or a host-backed
+    /// secret reference, and [`AggregateError::TooLarge`] when the
+    /// result is past what a bundle may carry.
     pub fn compose(&mut self) -> Result<CompositionOutcome, AggregateError> {
         let started = Instant::now();
         let deadline_secs = self.sources.aggregator.deadline_secs;
@@ -648,22 +678,34 @@ impl Aggregator {
                 unchanged.extend(indices.iter().copied());
                 continue;
             }
-            // About to fetch this group anyway, so one cheap poll here
-            // is free relative to the clone, and it is what the next
-            // poll compares against. Deliberately taken *before* the
-            // fetch: a push landing between the two then makes the next
-            // round re-fetch, which is the safe direction. Taken after,
-            // this would record a sha newer than the tree that was read
-            // and the change would be missed entirely.
-            if let Some(entry) = indices
-                .first()
-                .and_then(|index| self.sources.entries.get(*index))
-            {
-                if let Some(sha) = poll_one(&self.fetch, entry) {
-                    polled.insert(key.clone(), sha);
-                }
-            }
             needed.push((key, indices));
+        }
+
+        // About to fetch these groups anyway, so one cheap poll each is
+        // free relative to the clone, and it is what the next poll
+        // compares against. Deliberately taken *before* the fetch: a
+        // push landing between the two then makes the next round
+        // re-fetch, which is the safe direction. Taken after, this would
+        // record a sha newer than the tree that was read and the change
+        // would be missed entirely.
+        //
+        // Through the same pool and the same round deadline the fetch
+        // below uses. Taken one at a time, each bounded only by its own
+        // entry's `timeout_secs` (60 by default), ten blackholing
+        // repositories cost ten minutes here before the first fetch
+        // started, and the deadline had passed by the time one did. That
+        // is the failure `poll()` was fixed for, one function over.
+        let needed_keys: Vec<FetchKey> = needed.iter().map(|(key, _)| key.clone()).collect();
+        for (key, answer) in poll_groups(
+            &self.fetch,
+            &self.sources.entries,
+            &needed_keys,
+            concurrency,
+            deadline,
+        ) {
+            if let Some(sha) = answer {
+                polled.insert(key, sha);
+            }
         }
 
         let fetched = fetch_groups(
@@ -693,13 +735,22 @@ impl Aggregator {
             // entries here, not the previous round's zeroes. `resolved`
             // and `unchanged` are the entries that really did finish,
             // which for a deadline is usually few and sometimes none.
+            // `is_ok`, not `contains_key`: `fetch_groups` records a
+            // group that refused as an `Err` in the same map, so asking
+            // whether the key is present counts a repository that said
+            // no as a resolution and leaves `failed` counting only the
+            // entries that never got a turn. That is the same "reads as
+            // evidence of absence" this gauge exists to prevent.
             let finished: Vec<ResolvedEntry> = self
                 .sources
                 .entries
                 .iter()
                 .enumerate()
                 .filter(|(index, entry)| {
-                    unchanged.contains(index) || fetched.contains_key(&fetch_key(entry))
+                    unchanged.contains(index)
+                        || fetched
+                            .get(&fetch_key(entry))
+                            .is_some_and(std::result::Result::is_ok)
                 })
                 .map(|(index, entry)| ResolvedEntry {
                     entry: entry.name.clone(),
@@ -710,13 +761,21 @@ impl Aggregator {
                     unchanged: unchanged.contains(&index),
                 })
                 .collect();
-            let timed_out: Vec<EntryFailure> = outstanding
+            let timed_out: Vec<EntryFailure> = self
+                .sources
+                .entries
                 .iter()
-                .map(|name| EntryFailure {
-                    entry: name.clone(),
-                    repo: String::new(),
-                    reason: "the round's deadline passed before this repository was read"
-                        .to_string(),
+                .enumerate()
+                .filter(|(index, entry)| {
+                    !unchanged.contains(index)
+                        && !fetched
+                            .get(&fetch_key(entry))
+                            .is_some_and(std::result::Result::is_ok)
+                })
+                .map(|(_, entry)| EntryFailure {
+                    entry: entry.name.clone(),
+                    repo: sbproxy_config::redact_repo(&entry.repo),
+                    reason: reason_or_deadline(fetched.get(&fetch_key(entry))),
                     reused_commit: None,
                 })
                 .collect();
@@ -888,8 +947,8 @@ impl Aggregator {
     ///
     /// # Errors
     ///
-    /// Returns [`AggregateError::Compose`] and
-    /// [`AggregateError::TooLarge`].
+    /// Returns [`AggregateError::Compose`],
+    /// [`AggregateError::Confinement`] and [`AggregateError::TooLarge`].
     fn compose_documents(
         &self,
         documents: &BTreeMap<String, (String, String)>,
@@ -921,6 +980,25 @@ impl Aggregator {
             &self.hand_written_origins,
             &resolution.composed,
         )?;
+        // The publish screen, run where the composition happens rather
+        // than only where it publishes. The payload carries this node's
+        // own hand-written `origins:` and every entry's `overrides:`,
+        // and `validate_publish_payload` runs this same check with this
+        // same policy: `HOST_FILE_KEYS` (`spec_file`, `module_path`,
+        // `rego_module_path`, `sha1_file` and the rest) and every
+        // `env:` / `file:` / `vault://env/` value are refused anywhere
+        // in a document that travels. All of those are legal inside an
+        // origin on a node that owns its own files, so an aggregator
+        // whose `origins:` validates against an OpenAPI document on disk
+        // had every round refused with no way to see it coming. Here,
+        // `--out` and `--dry-run` see it too, and the message names the
+        // key rather than the round.
+        sbproxy_config::check_confined_document(
+            "the composed payload",
+            &payload,
+            &sbproxy_config::ConfinementPolicy::remote_document(),
+        )
+        .map_err(|error| AggregateError::Confinement(error.to_string()))?;
         let origins = resolution.origins.len();
         // The payload rather than the whole document, because the limit
         // is the size a signed bundle may carry and the payload is what
@@ -960,8 +1038,6 @@ impl Aggregator {
         self.last_published_digest.as_deref() != Some(outcome.content_digest.as_str())
     }
 
-    /// Record that a composition was published, so the next identical
-    /// one publishes nothing.
     /// Seed the change detector from a digest published earlier.
     ///
     /// Called at [`spawn`] with whatever the authority is already
@@ -973,6 +1049,8 @@ impl Aggregator {
         self.last_published_digest = Some(digest.into());
     }
 
+    /// Record that a composition was published, so the next identical
+    /// one publishes nothing.
     fn mark_published(&mut self, outcome: &CompositionOutcome) {
         self.last_published_digest = Some(outcome.content_digest.clone());
     }
@@ -1023,6 +1101,13 @@ impl Aggregator {
     /// `--dry-run` that answered "already holds this composition" there
     /// would defeat the acceptance line that a CI diff is meaningful.
     ///
+    /// The two answers are made to agree rather than left to. A caller
+    /// reading the returned vector's emptiness as "unchanged" is right,
+    /// because [`line_diff`] never returns an empty vector: `str::lines()`
+    /// drops the trailing newline and any `\r`, so a text that differs
+    /// only there gets a line saying so instead of nothing. A guard
+    /// narrower than the claim above it is worse than none.
+    ///
     /// # Errors
     ///
     /// Returns [`AggregateError::Io`] when the existing file cannot be
@@ -1072,19 +1157,19 @@ struct FetchedTree {
     refusals: BTreeMap<String, String>,
 }
 
-/// Ask one repository which commit its revision points at.
+/// Ask one repository which commit its revision points at, with the
+/// round's remaining budget clamping the entry's own timeout.
 ///
 /// `None` means "could not answer cheaply", which the callers turn into
 /// "assume it moved". A full commit sha answers itself without a round
 /// trip, so a pinned entry is polled exactly once, in the round that
 /// first records it.
-fn poll_one(fetch: &FetchContext, entry: &OriginSourceEntry) -> Option<String> {
-    poll_one_bounded(fetch, entry, Duration::from_secs(entry.timeout_secs.max(1)))
-}
-
-/// [`poll_one`] with the round's remaining budget clamping the entry's
-/// own timeout, so one blackholing host cannot hold a poll cycle open
-/// past the round it belongs to.
+///
+/// Every caller reaches this through [`poll_groups`], so no poll
+/// anywhere runs outside the round it belongs to. The unbounded form
+/// this used to have is gone: its one caller was the pre-fetch poll
+/// inside [`Aggregator::compose`], and a blackholing host held that open
+/// for the entry's own `timeout_secs` with nothing watching the clock.
 fn poll_one_bounded(
     fetch: &FetchContext,
     entry: &OriginSourceEntry,
@@ -1333,6 +1418,17 @@ fn line_diff(existing: &str, proposed: &str) -> Vec<String> {
             "... and {} more changed line(s)",
             total - lines.len()
         ));
+    }
+    if lines.is_empty() {
+        // The caller only reaches here for texts that differ, and
+        // `str::lines()` drops the trailing newline and any `\r`, so a
+        // difference that lives only there is invisible to a line diff.
+        // Reporting nothing would make "the diff is empty" a narrower
+        // claim than "the file already holds this composition", which is
+        // what the caller reads it as.
+        lines.push(
+            "! the two documents differ only in line endings or the trailing newline".to_string(),
+        );
     }
     lines
 }
@@ -1985,9 +2081,26 @@ pub fn aggregation_loop(
             }
             // Before the poll, so an entry added to the document this
             // cycle is polled this cycle rather than next.
-            aggregator.refresh_document();
+            let refreshed = aggregator.refresh_document();
             coalescer.retune(aggregator.timings());
-            let moved = aggregator.poll();
+            let mut moved = aggregator.poll();
+            if refreshed {
+                // A document edit is movement in its own right, and the
+                // answer used to be thrown away. Only `poll()` opened a
+                // window, so raising a floor in `origin_defaults`, or
+                // changing an entry's `hosts:`, `inputs:`, `environment:`
+                // or `path:`, composed nothing and published nothing:
+                // the reload appeared to succeed and the fleet did not
+                // change. Naming every entry costs no fetch, because a
+                // group that is cached and not dirty composes from its
+                // cache, and it costs no publish either, because the
+                // content digest is what decides that.
+                for name in aggregator.entry_names() {
+                    if !moved.contains(&name) {
+                        moved.push(name);
+                    }
+                }
+            }
             polled = polled.saturating_add(1);
             coalescer.observe(&moved, now);
             // Bound rather than chained so the config-reader registry

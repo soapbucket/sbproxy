@@ -3515,11 +3515,12 @@ pub fn run_with_fallback(
     // offline `sbproxy aggregate --out`, which is an operator's decision
     // rather than something to start behind one.
     //
-    // `Overlay` because a composed document is a whole runtime document,
-    // and a subscriber that took it as `Replace` would discard the
-    // base keys it owns rather than layering over them. The one-shot
-    // `sbproxy aggregate` takes `--mode` for the deployment that wants
-    // the other one.
+    // `Overlay` because what travels is an origins overlay: `origins:`
+    // plus `origin_defaults`, and nothing else. A subscriber that took
+    // that as `Replace` would replace its whole document with those two
+    // keys, losing its listeners, its TLS, its admin surface and its
+    // secrets in one publish. The one-shot `sbproxy aggregate` takes
+    // `--mode` for the deployment that wants the other one.
     crate::config_aggregator::spawn(config_path, sbproxy_config::BundleMode::Overlay)?;
 
     // --- Wave 5 day-6 Item 4: SIGHUP re-bootstrap handler ---

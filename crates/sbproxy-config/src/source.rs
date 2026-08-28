@@ -362,7 +362,7 @@ impl std::fmt::Debug for FetchRequest<'_> {
 /// install a fake that copies a fixture directory into the destination;
 /// the loader logic stays identical.
 pub trait Cloner: Send + Sync {
-    /// Materialise `request.repo` at `request.revision` into
+    /// Materialize `request.repo` at `request.revision` into
     /// `request.dest` and report the commit it resolved to.
     ///
     /// The directory at `dest` exists and is empty when the cloner is
@@ -920,7 +920,7 @@ fn resolved_ls_remote_sha(stdout: &str) -> Option<String> {
 }
 
 impl GitBinaryCloner {
-    /// Materialise one exact revision: a full commit sha, or a
+    /// Materialize one exact revision: a full commit sha, or a
     /// fully-qualified ref such as `refs/tags/v1.4.2`.
     ///
     /// Two things `git clone` cannot do, and one path that does both.
@@ -1681,7 +1681,8 @@ pub fn read_file_within(
             .any(|part| part == ".." || part == "." || part.is_empty())
     {
         return Err(ConfigSourceError::Invalid(format!(
-            "{label} '{relative}' must be a relative path inside the repository, with no `..`              or `.` components"
+            "{label} '{relative}' must be a relative path inside the repository, with no `..` \
+             or `.` components"
         )));
     }
     let full = root.join(candidate);
@@ -1693,7 +1694,9 @@ pub fn read_file_within(
     })?;
     if metadata.file_type().is_symlink() {
         return Err(ConfigSourceError::Read(format!(
-            "{label} '{relative}' is a symbolic link. A repository this proxy does not own can              point a link anywhere the reading process can reach, so a link is refused rather              than followed; commit the file itself"
+            "{label} '{relative}' is a symbolic link. A repository this proxy does not own can \
+             point a link anywhere the reading process can reach, so a link is refused rather \
+             than followed; commit the file itself"
         )));
     }
     if !metadata.is_file() {
@@ -1703,7 +1706,8 @@ pub fn read_file_within(
     }
     if metadata.len() > max_bytes {
         return Err(ConfigSourceError::Read(format!(
-            "{label} '{relative}' is {} bytes, past the {max_bytes}-byte limit for a file read              out of a repository this proxy does not own",
+            "{label} '{relative}' is {} bytes, past the {max_bytes}-byte limit for a file read \
+             out of a repository this proxy does not own",
             metadata.len()
         )));
     }
@@ -1728,7 +1732,8 @@ pub fn read_file_within(
         .read_to_string(&mut text)
         .map_err(|error| {
             ConfigSourceError::Read(format!(
-                "{label} '{relative}' is there but could not be read (it may not be UTF-8):                  {error}"
+                "{label} '{relative}' is there but could not be read (it may not be UTF-8): \
+                 {error}"
             ))
         })?;
     Ok(text)
