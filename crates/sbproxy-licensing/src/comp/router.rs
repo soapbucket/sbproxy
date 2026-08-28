@@ -116,6 +116,10 @@ async fn redeem(State(marketplace): State<Arc<CompMarketplace>>, body: Body) -> 
 ///
 /// Reading one extra byte is what the cap already tolerated: the
 /// previous shape buffered the whole body and then measured it.
+// An axum `Response` is over `result_large_err`'s threshold, and boxing it
+// would buy nothing: the `Err` here is the response both callers return
+// unchanged, so a box would be unwrapped at each of them and dropped.
+#[allow(clippy::result_large_err)]
 async fn read_capped(body: Body, endpoint: serve::CompEndpoint) -> Result<Bytes, Response> {
     match to_bytes(body, COMP_REQUEST_BODY_LIMIT + 1).await {
         Ok(body) if body.len() > COMP_REQUEST_BODY_LIMIT => {
