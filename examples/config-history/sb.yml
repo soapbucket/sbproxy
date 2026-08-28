@@ -24,6 +24,8 @@
 #
 # Test (in another terminal):
 #   curl -s -u admin:demo-change-me http://127.0.0.1:9090/admin/config/history | jq .
+#   curl -s -u admin:demo-change-me http://127.0.0.1:9090/admin/config/rejected | jq .
+#   curl -s -u admin:demo-change-me -X POST http://127.0.0.1:9090/admin/config/confirm | jq .
 #   sbproxy config history --password demo-change-me
 #
 # The full walkthrough, including the trivial edit + reload that
@@ -50,6 +52,29 @@ proxy:
     # up; production deployments default to 20.
     keep: 5
     keep_rejected: 3
+
+    # A newly applied revision is not promoted to last known good until
+    # it survives this window. Short on purpose so a demo session sees a
+    # verdict without waiting two minutes; production defaults to 120s.
+    soak:
+      window_secs: 15
+      min_requests: 5
+      # The operator probe. On a demo box with no organic traffic the
+      # request-outcome signal abstains, and without something else
+      # reporting the verdict would be `inconclusive` forever. This is
+      # what gives the window real evidence to work with.
+      probe:
+        url: http://127.0.0.1:9090/healthz
+        expect_status: 200
+        interval_secs: 5
+
+    # Boot on the ring when the config file does not work. Off by
+    # default in production; on here so the walkthrough can break the
+    # file and watch the node rescue itself.
+    boot:
+      fallback: last_known_good
+      max_attempts: 3
+      success_secs: 10
 
 origins:
   "api.local":

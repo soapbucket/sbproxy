@@ -1,0 +1,861 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Soap Bucket LLC
+
+//! Booting on the last known good config when the one this node was
+//! told to boot on does not work (WOR-2459).
+//!
+//! # The defect
+//!
+//! `sbproxy run` read the file, resolved `source:`, compiled, and bound,
+//! and any failure was `exit(1)`. That is correct on a first boot: a
+//! node with no working config has nothing to serve. It is wrong on the
+//! thousandth, when the node served fine for six months, someone pushed
+//! a typo, and there is a perfectly good config sitting in the revision
+//! ring.
+//!
+//! # Off by default, and the flag beats the file
+//!
+//! `--config-fallback <off|last-known-good>` (env `SB_CONFIG_FALLBACK`)
+//! overrides `proxy.config_history.boot.fallback`, and deliberately
+//! wins: a rescue boot must not depend on the file being right, and the
+//! file is what is broken.
+//!
+//! # Booting on the fallback is loud
+//!
+//! A node quietly serving a config nobody wrote is worse than one that
+//! is down, because nobody goes looking for it. So a fallback boot
+//! warns at startup, sets `sbproxy_config_fallback_active` to 1, and
+//! keeps saying so on the admin surface until an operator clears the pin
+//! with `DELETE /admin/config/fallback`.
+//!
+//! # The watcher has to stop, or this ships nothing
+//!
+//! `start_config_watcher` watches the config's *directory* and re-reads
+//! the config path on any event in it. Boot from the ring with that
+//! watcher live and the first filesystem event in that directory
+//! re-applies the broken file, looping straight back into the state the
+//! fallback just rescued the node from. So while the pin is in place,
+//! the file watcher and the SIGHUP path are inert (both converge on
+//! `reload_from_config_yaml`, which is where the single guard lives) and
+//! so is the `source:` refresh poller.
+//!
+//! Authority polling stays live, deliberately. A fleet-wide fix pushed
+//! from the control plane is how this should end, and refusing it would
+//! leave the node pinned until somebody SSHes in.
+//!
+//! # The double fault
+//!
+//! An entry that was good in October need not construct after an upgrade
+//! that tightened validation. Borrowing systemd-boot's boot counting,
+//! `boot_attempts` on the entry being tried is incremented **on disk
+//! before** the attempt and cleared once the process has served for
+//! `boot.success_secs`. `boot.max_attempts` failures retire that entry
+//! and the walk continues down the ring. The ring is finite and each
+//! exhausted candidate leaves it permanently, so the walk terminates.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+use sbproxy_config::{BootFallbackMode, ConfigHistoryConfig, RevisionStore};
+
+/// Process exit code used when the fallback walked the whole ring and
+/// nothing booted.
+///
+/// `78` is `EX_CONFIG` from `sysexits.h`: "something was found in an
+/// unconfigured or misconfigured state". Distinct from the plain `1`
+/// every other fatal boot failure uses, so an init system or a
+/// deployment pipeline can tell "this node's config is broken and its
+/// history could not rescue it" apart from every other reason a process
+/// died, without parsing a log line.
+pub const EXIT_CONFIG_RING_EXHAUSTED: i32 = 78;
+
+/// The phrase [`BootWalkFailure::Exhausted`] renders, and the one
+/// `crates/sbproxy/src/main.rs` matches on to choose
+/// [`EXIT_CONFIG_RING_EXHAUSTED`] over the plain `1`.
+///
+/// A named constant rather than the same sentence typed in two places:
+/// `run` returns `anyhow::Error`, so the binary has a string and not a
+/// type to dispatch on, and a reworded message would otherwise silently
+/// drop the distinct exit code with nothing going red.
+/// `an_exhausted_ring_names_every_revision_tried_and_why` asserts the
+/// rendered message still carries it.
+pub const RING_EXHAUSTED_MARKER: &str = "the config revision ring was exhausted";
+
+/// Whether this process is serving a config its boot fallback restored.
+static ON_FALLBACK: AtomicBool = AtomicBool::new(false);
+
+/// Which revision the pin names, for the admin surface.
+static PINNED: OnceLock<Mutex<Option<PinnedRevision>>> = OnceLock::new();
+
+fn pinned() -> &'static Mutex<Option<PinnedRevision>> {
+    PINNED.get_or_init(|| Mutex::new(None))
+}
+
+/// The ring entry a fallback boot is serving.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedRevision {
+    /// Ring revision this process booted on.
+    pub revision: u64,
+    /// Its content digest.
+    pub digest: String,
+}
+
+/// One candidate the walk tried and why it did not boot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedCandidate {
+    /// Ring revision tried.
+    pub revision: u64,
+    /// Its content digest.
+    pub digest: String,
+    /// Why it did not boot, or why it was skipped.
+    pub reason: String,
+}
+
+/// Why a fallback boot could not produce a document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootWalkFailure {
+    /// The ring held no candidate at all. A first boot: the node exits
+    /// exactly the way `fallback: off` does, and says the ring was empty
+    /// rather than pretending a fallback was attempted.
+    RingEmpty,
+    /// Every candidate in the ring was tried and none booted. Names each
+    /// one and why.
+    Exhausted(Vec<FailedCandidate>),
+    /// The ring itself could not be opened, so no fallback is possible.
+    StoreUnavailable(String),
+}
+
+impl std::fmt::Display for BootWalkFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RingEmpty => write!(
+                formatter,
+                "the config revision ring is empty, so there is no last known good \
+                 configuration to fall back to"
+            ),
+            Self::StoreUnavailable(error) => write!(
+                formatter,
+                "the config revision ring could not be opened, so no fallback is possible: \
+                 {error}"
+            ),
+            Self::Exhausted(tried) => {
+                write!(
+                    formatter,
+                    "{RING_EXHAUSTED_MARKER}; {} candidate(s) were tried and none booted:",
+                    tried.len()
+                )?;
+                for candidate in tried {
+                    write!(
+                        formatter,
+                        "\n  revision {} ({}): {}",
+                        candidate.revision, candidate.digest, candidate.reason
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// The document a fallback boot resolved, and which ring entry it came
+/// from.
+#[derive(Debug, Clone)]
+pub struct FallbackDocument {
+    /// Pre-resolution bytes of the rescued revision, as they were
+    /// stored.
+    pub yaml: String,
+    /// Which entry this is.
+    pub pinned: PinnedRevision,
+}
+
+/// Resolve which fallback mode the command line or the environment
+/// names, or `None` when neither does and the config file's own
+/// `boot.fallback` decides.
+///
+/// The command line beats the environment, which beats the config file.
+/// A rescue boot must not depend on the file being right, and the file
+/// is what is broken; the environment sits between the two because a
+/// systemd drop-in is how an operator makes a rescue survive a restart
+/// without editing the config they are trying to replace.
+///
+/// Split out so the caller can answer "is a fallback even wanted" before
+/// parsing the config file for the block that names the ring. On a node
+/// that never asked for a fallback, which is every node by default, that
+/// keeps the boot path byte-identical to the release before this one:
+/// one read, one `source:` resolve, one compile, and the same error
+/// (WOR-2459 fix round, Major 6).
+///
+/// `SB_CONFIG_FALLBACK` is read here rather than by clap. Letting clap
+/// own the variable put it in the `flag` slot, which made this branch
+/// unreachable in production and turned an unparseable value into
+/// `exit(2)` instead of the documented warn-and-fall-through
+/// (WOR-2459 fix round, Major 11).
+#[must_use]
+pub fn mode_from_flag_or_env(
+    flag: Option<BootFallbackMode>,
+    environment: Option<&str>,
+) -> Option<BootFallbackMode> {
+    if let Some(mode) = flag {
+        return Some(mode);
+    }
+    let raw = environment?;
+    if let Some(mode) = BootFallbackMode::parse(raw) {
+        return Some(mode);
+    }
+    tracing::warn!(
+        value = %raw,
+        "SB_CONFIG_FALLBACK is not one of off | last-known-good; ignoring it and using the \
+         configured boot fallback mode",
+    );
+    None
+}
+
+/// Recover `proxy.config_history` from a document that did not compile.
+///
+/// The chicken-and-egg problem this solves: the ring's directory is
+/// named by the very config that is broken. A lenient partial parse gets
+/// the block out of a document whose *other* half is what failed, which
+/// is the common case (a typo in an origin, a misspelled key, an
+/// unresolvable `${VAR}`). When even that fails, the defaults are used,
+/// with `enabled` forced on: an operator who typed
+/// `--config-fallback=last-known-good` has asked for the ring to be
+/// read, and refusing because the broken file does not say `enabled:
+/// true` would answer the wrong question.
+#[must_use]
+pub fn history_config_from_broken_document(yaml: &str) -> ConfigHistoryConfig {
+    #[derive(serde::Deserialize)]
+    struct ProxyOnly {
+        proxy: Option<ProxyBlock>,
+    }
+    #[derive(serde::Deserialize)]
+    struct ProxyBlock {
+        config_history: Option<ConfigHistoryConfig>,
+    }
+    let recovered = serde_yaml::from_str::<ProxyOnly>(yaml)
+        .ok()
+        .and_then(|document| document.proxy)
+        .and_then(|proxy| proxy.config_history);
+    match recovered {
+        Some(mut history) => {
+            history.enabled = true;
+            history
+        }
+        // No warning here: this runs on the mode-resolution path too,
+        // which every boot takes, and a node whose config simply has no
+        // `proxy.config_history` block must not warn about it once per
+        // start. The walk logs the directory it settled on instead.
+        None => ConfigHistoryConfig {
+            enabled: true,
+            ..ConfigHistoryConfig::default()
+        },
+    }
+}
+
+/// Walk the ring for a revision that compiles, incrementing each
+/// candidate's durable boot counter before it is tried.
+///
+/// `compiles` is the caller's "does this construct" test, kept as a
+/// parameter so this walk is testable without a proxy and so the real
+/// boot path can use exactly the same compile step it would have used on
+/// the primary document.
+///
+/// The counter is incremented **before** the attempt and left
+/// incremented on failure. That ordering is the whole point: the failure
+/// this counter exists to survive is a boot that dies partway through,
+/// taking any in-memory count with it.
+///
+/// # Errors
+///
+/// Returns [`BootWalkFailure`] when the ring cannot be opened, holds no
+/// candidate, or holds only candidates that do not boot.
+pub fn walk_for_bootable(
+    history: &ConfigHistoryConfig,
+    max_attempts: u32,
+    mut compiles: impl FnMut(&str) -> Result<(), String>,
+) -> Result<FallbackDocument, BootWalkFailure> {
+    tracing::warn!(
+        dir = %history.dir,
+        "reading the config revision ring for a bootable configuration",
+    );
+    let mut store = RevisionStore::open(&history.dir, history.keep, None)
+        .map_err(|error| BootWalkFailure::StoreUnavailable(error.to_string()))?;
+    // Asked of the store rather than re-derived here: it reads the same
+    // layout constants the writer uses, so a rename moves both together
+    // (re-review, new Major 1).
+    store
+        .refuse_shared_files()
+        .map_err(|error| BootWalkFailure::StoreUnavailable(error.to_string()))?;
+    let candidates = store.boot_candidates();
+    if candidates.is_empty() {
+        return Err(BootWalkFailure::RingEmpty);
+    }
+
+    let mut tried = Vec::new();
+    for candidate in candidates {
+        if candidate.boot_attempts >= max_attempts {
+            // Already spent its budget on an earlier boot that died
+            // before it could clear the counter.
+            retire(&mut store, candidate.revision);
+            tried.push(FailedCandidate {
+                revision: candidate.revision,
+                digest: candidate.digest.clone(),
+                reason: format!(
+                    "already failed {} boot attempt(s), at or past the max_attempts of \
+                     {max_attempts}; retired",
+                    candidate.boot_attempts
+                ),
+            });
+            continue;
+        }
+        let attempts = match store.begin_boot_attempt(candidate.revision) {
+            Ok(attempts) => attempts,
+            Err(error) => {
+                // A counter that cannot be persisted would let this walk
+                // retry the same dead entry forever, so the candidate is
+                // skipped rather than tried.
+                tried.push(FailedCandidate {
+                    revision: candidate.revision,
+                    digest: candidate.digest.clone(),
+                    reason: format!("its boot attempt counter could not be persisted: {error}"),
+                });
+                continue;
+            }
+        };
+        let yaml = match store.read_blob(&candidate.digest) {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(yaml) => yaml,
+                Err(error) => {
+                    tried.push(FailedCandidate {
+                        revision: candidate.revision,
+                        digest: candidate.digest.clone(),
+                        reason: format!("its stored document is not UTF-8: {error}"),
+                    });
+                    continue;
+                }
+            },
+            Err(error) => {
+                tried.push(FailedCandidate {
+                    revision: candidate.revision,
+                    digest: candidate.digest.clone(),
+                    reason: format!("its stored document could not be read: {error}"),
+                });
+                continue;
+            }
+        };
+        match compiles(&yaml) {
+            Ok(()) => {
+                return Ok(FallbackDocument {
+                    yaml,
+                    pinned: PinnedRevision {
+                        revision: candidate.revision,
+                        digest: candidate.digest,
+                    },
+                })
+            }
+            Err(reason) => {
+                if attempts >= max_attempts {
+                    retire(&mut store, candidate.revision);
+                }
+                tried.push(FailedCandidate {
+                    revision: candidate.revision,
+                    digest: candidate.digest.clone(),
+                    reason: format!("attempt {attempts} of {max_attempts}: {reason}"),
+                });
+            }
+        }
+    }
+    Err(BootWalkFailure::Exhausted(tried))
+}
+
+/// Retire one entry, logging rather than failing: a walk that cannot
+/// persist a retirement still has to finish.
+fn retire(store: &mut RevisionStore, revision: u64) {
+    if let Err(error) = store.retire_unbootable(revision) {
+        tracing::error!(
+            error = %error,
+            revision,
+            "could not retire an unbootable config revision; the next boot will try it again",
+        );
+    }
+}
+
+/// Pin this process to a revision the fallback rescued, loudly.
+pub fn mark_on_fallback(pin: PinnedRevision) {
+    ON_FALLBACK.store(true, Ordering::SeqCst);
+    *pinned()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pin.clone());
+    sbproxy_observe::metrics::set_config_fallback_active(true);
+    tracing::warn!(
+        revision = pin.revision,
+        digest = %pin.digest,
+        "this node booted on a configuration restored from its revision ring, not on the \
+         config file it was pointed at. the file watcher, SIGHUP, and the source: refresh \
+         poller are suspended until an operator clears the pin with DELETE \
+         /admin/config/fallback. config-authority polling stays live, so a fleet-wide fix \
+         still reaches this node",
+    );
+}
+
+/// Whether this process is serving a config its boot fallback restored.
+#[must_use]
+pub fn on_fallback() -> bool {
+    ON_FALLBACK.load(Ordering::SeqCst)
+}
+
+/// The revision the pin names, when one is in place.
+#[must_use]
+pub fn pinned_revision() -> Option<PinnedRevision> {
+    pinned()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Clear the pin: the `DELETE /admin/config/fallback` path.
+///
+/// Returns what was pinned, or `None` when nothing was. Clearing is all
+/// it takes to resume the suspended paths: each of them checks
+/// [`reload_suspended`] on every cycle rather than being torn down at
+/// boot, precisely so an operator can bring them back without a restart.
+pub fn clear_fallback() -> Option<PinnedRevision> {
+    let previous = pinned()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    ON_FALLBACK.store(false, Ordering::SeqCst);
+    sbproxy_observe::metrics::set_config_fallback_active(false);
+    if let Some(pin) = &previous {
+        tracing::warn!(
+            revision = pin.revision,
+            "an operator cleared the config fallback pin; the file watcher, SIGHUP, and the \
+             source: refresh poller are live again",
+        );
+    }
+    previous
+}
+
+/// Whether `trigger` must not reload right now.
+///
+/// The three suspended triggers are named explicitly rather than
+/// inverted from the one that stays live, so adding a fourth reload
+/// trigger later means deciding about it here rather than inheriting an
+/// answer by accident.
+///
+/// | Trigger | While pinned |
+/// | -- | -- |
+/// | `file_watcher` (and SIGHUP, which shares it) | Suspended |
+/// | `config_refresh_poller` | Suspended |
+/// | `config_authority` | **Live**: a fleet-wide fix is how this ends |
+/// | `api` (`POST /admin/reload`) | Live: an operator asking explicitly |
+#[must_use]
+pub fn reload_suspended(trigger: &str) -> bool {
+    if !on_fallback() {
+        return false;
+    }
+    matches!(trigger, "file_watcher" | "config_refresh_poller")
+}
+
+/// Clear the boot counter on the pinned revision once this process has
+/// served for `success_secs`.
+///
+/// Spawned as a plain thread rather than a tokio task: it runs once,
+/// sleeps, and exits, and the boot path that calls it has no runtime of
+/// its own. A process that dies before the timer fires leaves the
+/// counter incremented, which is exactly the point: three of those and
+/// the entry is retired.
+pub fn spawn_boot_success_timer(revision: u64, success_secs: u64) {
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(success_secs));
+        confirm_boot_success_now(revision);
+    });
+}
+
+/// Clear the boot counter on `revision` through the **process-owned**
+/// ring handle.
+///
+/// [`RevisionStore`] documents itself single-owner: every mutator clones
+/// the handle's in-memory index, edits the clone, and writes the whole
+/// thing back. A second handle opened on the same directory therefore
+/// does not merge, it overwrites, and the loser is whichever handle
+/// writes last. Opening one here meant the recorder's very next write,
+/// an ordinary `append` or `record_soak_verdict`, restored the counter
+/// this had just cleared from its own older snapshot. A node that booted
+/// on the fallback and kept applying configs never cleared the counter,
+/// and three such boots retired its only rescue target while it had
+/// booted and served correctly every time (WOR-2459 fix round,
+/// Blocker 2).
+///
+/// A no-op when no ring is open, which is the same condition under which
+/// nothing could have incremented the counter in the first place.
+pub(crate) fn confirm_boot_success_now(revision: u64) {
+    let Some(recorder) = crate::config_history::current_config_history_recorder() else {
+        tracing::warn!(
+            revision,
+            "no config history ring is open, so the boot attempt counter for the revision this \
+             node booted on cannot be cleared",
+        );
+        return;
+    };
+    recorder.confirm_boot_success(revision);
+    tracing::info!(
+        revision,
+        "the fallback boot has served long enough to count as successful; its boot attempt \
+         counter is cleared",
+    );
+}
+
+/// Reset the module's process state. Tests only: the pin is process
+/// global and one test must not leak into the next.
+#[cfg(test)]
+pub(crate) fn reset_for_test() {
+    let _ = clear_fallback();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sbproxy_config::{AppendMetadata, BaseOrigin};
+
+    fn history(dir: &std::path::Path) -> ConfigHistoryConfig {
+        ConfigHistoryConfig {
+            enabled: true,
+            dir: dir.to_string_lossy().into_owned(),
+            keep: 8,
+            ..ConfigHistoryConfig::default()
+        }
+    }
+
+    fn metadata(applied_at: u64) -> AppendMetadata {
+        AppendMetadata {
+            provenance: BaseOrigin::Local,
+            blast_radius: None,
+            secrets_fingerprint: None,
+            actor: Some("test".to_string()),
+            applied_at,
+            degraded: Vec::new(),
+        }
+    }
+
+    /// The flag beats the environment, which beats the file. A rescue
+    /// boot must not depend on the file being right.
+    #[test]
+    fn the_command_line_flag_beats_the_environment_and_the_file() {
+        assert_eq!(
+            mode_from_flag_or_env(Some(BootFallbackMode::LastKnownGood), Some("off")),
+            Some(BootFallbackMode::LastKnownGood),
+        );
+        assert_eq!(
+            mode_from_flag_or_env(None, Some("last-known-good")),
+            Some(BootFallbackMode::LastKnownGood),
+        );
+        // Neither decided, so the caller falls back to the file's own
+        // `boot.fallback`.
+        assert_eq!(mode_from_flag_or_env(None, None), None);
+        // An unparseable environment value falls through to the file
+        // rather than silently enabling or disabling the fallback. This
+        // branch is only reachable because `SB_CONFIG_FALLBACK` is read
+        // here rather than declared on the clap argument: while clap
+        // owned it, the variable landed in the `flag` slot and a typo
+        // exited the process instead (WOR-2459 fix round, Major 11).
+        assert_eq!(mode_from_flag_or_env(None, Some("maybe")), None);
+    }
+
+    /// A first boot with an empty ring exits the way `off` does, and
+    /// says the ring was empty rather than pretending a fallback was
+    /// attempted.
+    #[test]
+    fn an_empty_ring_says_so_rather_than_pretending() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let failure = walk_for_bootable(&history(temp.path()), 3, |_| Ok(()))
+            .expect_err("an empty ring cannot rescue a boot");
+        assert_eq!(failure, BootWalkFailure::RingEmpty);
+        assert!(format!("{failure}").contains("empty"), "{failure}");
+    }
+
+    /// Verification residual R5. The control was covered and its wiring
+    /// was not: every assertion drove `refuse_shared_files` directly, so
+    /// deleting the call from `walk_for_bootable` left the suite green.
+    /// A covered function is not a wired one.
+    #[cfg(unix)]
+    #[test]
+    fn the_walk_refuses_a_ring_whose_index_anyone_can_read() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let history = history(temp.path());
+        {
+            let mut store = RevisionStore::open(temp.path(), history.keep, None).expect("open");
+            store
+                .append(b"rescued: yes\n", metadata(1))
+                .expect("append");
+        }
+
+        // An ordinary ring boots, so the guard is not a blanket refusal.
+        walk_for_bootable(&history, 3, |_| Ok(())).expect("a 0600 ring boots");
+
+        // Widen the index, and the walk itself must refuse before it
+        // offers a single candidate.
+        let index = temp.path().join("index.json");
+        std::fs::set_permissions(&index, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let failure = walk_for_bootable(&history, 3, |_| {
+            panic!("no candidate may be compiled from a ring this walk should have refused")
+        })
+        .expect_err("the walk refuses a shared ring");
+        let BootWalkFailure::StoreUnavailable(reason) = &failure else {
+            panic!("expected StoreUnavailable, got {failure:?}");
+        };
+        assert!(reason.contains("index.json"), "{reason}");
+        assert!(reason.contains("644"), "the mode is named: {reason}");
+    }
+
+    /// The walk boots the last known good entry first.
+    #[test]
+    fn the_walk_boots_the_last_known_good_entry_first() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let history = history(temp.path());
+        let good_revision = {
+            let mut store = RevisionStore::open(temp.path(), 8, None).expect("open");
+            store.append(b"a: 1\n", metadata(1)).expect("append");
+            let good = store.append(b"a: 2\n", metadata(2)).expect("append");
+            store.append(b"a: 3\n", metadata(3)).expect("append");
+            store
+                .record_soak_verdict(good.revision, sbproxy_config::SoakVerdict::Successful)
+                .expect("promote");
+            good.revision
+        };
+
+        let document = walk_for_bootable(&history, 3, |_| Ok(())).expect("a candidate boots");
+        assert_eq!(document.pinned.revision, good_revision);
+        assert_eq!(document.yaml, "a: 2\n");
+    }
+
+    /// An entry that fails to boot `max_attempts` times is retired and
+    /// the walk moves to the next candidate.
+    #[test]
+    fn an_entry_that_fails_max_attempts_is_retired_and_the_walk_continues() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let history = history(temp.path());
+        let (bad, good) = {
+            let mut store = RevisionStore::open(temp.path(), 8, None).expect("open");
+            let good = store.append(b"good: yes\n", metadata(1)).expect("append");
+            let bad = store.append(b"bad: yes\n", metadata(2)).expect("append");
+            (bad.revision, good.revision)
+        };
+
+        // Two boots that both die on the newest entry. `max_attempts` of
+        // 2 means the second one retires it.
+        for _ in 0..2 {
+            let document = walk_for_bootable(&history, 2, |yaml| {
+                if yaml.starts_with("bad") {
+                    Err("this one does not construct".to_string())
+                } else {
+                    Ok(())
+                }
+            })
+            .expect("the older entry boots");
+            assert_eq!(document.pinned.revision, good);
+        }
+
+        let store = RevisionStore::open(temp.path(), 8, None).expect("reopen");
+        let retired = store
+            .entries()
+            .iter()
+            .find(|entry| entry.revision == bad)
+            .expect("the entry survives retirement");
+        assert!(
+            retired.boot_retired,
+            "an entry that spent its attempt budget leaves the walk",
+        );
+        assert!(
+            !store
+                .boot_candidates()
+                .iter()
+                .any(|entry| entry.revision == bad),
+            "and the next boot does not offer it again",
+        );
+    }
+
+    /// An exhausted ring names every revision it tried and why, because
+    /// that message is the whole of what an operator has to work with at
+    /// 3am.
+    #[test]
+    fn an_exhausted_ring_names_every_revision_tried_and_why() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let history = history(temp.path());
+        {
+            let mut store = RevisionStore::open(temp.path(), 8, None).expect("open");
+            store.append(b"one: 1\n", metadata(1)).expect("append");
+            store.append(b"two: 2\n", metadata(2)).expect("append");
+        }
+
+        let failure = walk_for_bootable(&history, 3, |_| Err("nothing constructs".to_string()))
+            .expect_err("nothing booted");
+        let BootWalkFailure::Exhausted(tried) = &failure else {
+            panic!("expected an exhausted ring, got {failure:?}");
+        };
+        assert_eq!(tried.len(), 2, "both candidates were tried: {tried:?}");
+        let rendered = format!("{failure}");
+        for candidate in tried {
+            assert!(
+                rendered.contains(&candidate.revision.to_string()),
+                "revision {} is named: {rendered}",
+                candidate.revision,
+            );
+        }
+        assert!(rendered.contains("nothing constructs"), "{rendered}");
+        assert!(
+            rendered.contains(RING_EXHAUSTED_MARKER),
+            "the binary dispatches the distinct exit code off this phrase: {rendered}",
+        );
+    }
+
+    /// The boot counter is left incremented on a failed attempt, so a
+    /// process that dies partway through still spends an attempt.
+    #[test]
+    fn a_failed_attempt_leaves_the_counter_incremented_on_disk() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let history = history(temp.path());
+        let revision = {
+            let mut store = RevisionStore::open(temp.path(), 8, None).expect("open");
+            store
+                .append(b"one: 1\n", metadata(1))
+                .expect("append")
+                .revision
+        };
+
+        let _ = walk_for_bootable(&history, 5, |_| Err("no".to_string()));
+        let store = RevisionStore::open(temp.path(), 8, None).expect("reopen");
+        assert_eq!(
+            store
+                .entries()
+                .iter()
+                .find(|entry| entry.revision == revision)
+                .expect("entry")
+                .boot_attempts,
+            1,
+            "the counter is on disk, not in the process that just died",
+        );
+    }
+
+    /// B2 red-first. `RevisionStore` is documented single-owner: every
+    /// mutator rewrites the whole index from the handle's own snapshot.
+    /// A boot-success timer that opened a second handle on a directory
+    /// the process recorder already owns had its cleared counter
+    /// deterministically reverted by the recorder's next write, so a node
+    /// that booted on the fallback and kept applying configs never
+    /// actually cleared the counter, and three such boots retired its
+    /// only rescue target.
+    #[test]
+    fn clearing_the_boot_counter_survives_the_recorders_next_write() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let history = ConfigHistoryConfig {
+            enabled: true,
+            dir: temp.path().to_string_lossy().into_owned(),
+            ..ConfigHistoryConfig::default()
+        };
+
+        // The boot walk's own handle, exactly as `walk_for_bootable`
+        // leaves it: one attempt recorded, handle dropped.
+        let rescued = {
+            let mut store = RevisionStore::open(temp.path(), history.keep, None).expect("open");
+            let entry = store
+                .append(b"rescued: yes\n", metadata(1))
+                .expect("append");
+            store
+                .begin_boot_attempt(entry.revision)
+                .expect("attempt persists");
+            entry.revision
+        };
+
+        // The process recorder opens next and holds its own snapshot,
+        // which reads `boot_attempts = 1`.
+        crate::config_history::clear_config_history_recorder();
+        let recorder = std::sync::Arc::new(
+            crate::config_history::ConfigHistoryRecorder::from_config(Some(&history))
+                .expect("opens")
+                .expect("enabled"),
+        );
+        crate::config_history::install_config_history_recorder(recorder.clone());
+
+        // The success timer fires.
+        confirm_boot_success_now(rescued);
+
+        // ... and then the node keeps working: a later revision applies
+        // and its soak closes, both of which rewrite the index.
+        let later = recorder
+            .record(b"later: yes\n", metadata(2))
+            .expect("a second revision");
+        recorder.record_soak_verdict(later.revision, sbproxy_config::SoakVerdict::Successful);
+
+        let store = RevisionStore::open(temp.path(), history.keep, None).expect("reopen");
+        let attempts = store
+            .entries()
+            .iter()
+            .find(|entry| entry.revision == rescued)
+            .expect("the rescued entry survives")
+            .boot_attempts;
+        crate::config_history::clear_config_history_recorder();
+        assert_eq!(
+            attempts, 0,
+            "the recorder's next write must not resurrect a boot counter the timer cleared",
+        );
+    }
+
+    /// The three suspended triggers, and the one that deliberately is
+    /// not.
+    #[test]
+    fn the_pin_suspends_the_local_triggers_and_leaves_authority_polling_live() {
+        reset_for_test();
+        assert!(
+            !reload_suspended("file_watcher"),
+            "nothing is suspended before a fallback boot",
+        );
+
+        mark_on_fallback(PinnedRevision {
+            revision: 4,
+            digest: "abc".to_string(),
+        });
+        assert!(on_fallback());
+        assert!(reload_suspended("file_watcher"));
+        assert!(reload_suspended("config_refresh_poller"));
+        assert!(
+            !reload_suspended("config_authority"),
+            "a fleet-wide fix pushed from the control plane is how this ends",
+        );
+        assert!(
+            !reload_suspended("api"),
+            "an operator asking explicitly is not the loop this guards against",
+        );
+
+        let cleared = clear_fallback().expect("something was pinned");
+        assert_eq!(cleared.revision, 4);
+        assert!(!on_fallback());
+        assert!(
+            !reload_suspended("file_watcher"),
+            "clearing the pin resumes every suspended path",
+        );
+        assert!(clear_fallback().is_none(), "clearing twice pins nothing");
+        reset_for_test();
+    }
+
+    /// The ring directory is named by the very config that is broken, so
+    /// the block is recovered from the broken document when it can be.
+    #[test]
+    fn the_history_block_is_recovered_from_a_document_that_did_not_compile() {
+        let broken = "proxy:\n  config_history:\n    dir: /srv/ring\n    keep: 4\n  \
+                      http2_cleartextt: true\n";
+        let history = history_config_from_broken_document(broken);
+        assert_eq!(history.dir, "/srv/ring");
+        assert_eq!(history.keep, 4);
+        assert!(
+            history.enabled,
+            "an operator who asked for the fallback on the command line has asked for the \
+             ring to be read",
+        );
+
+        // Not even parseable as YAML: the defaults, still enabled.
+        let history = history_config_from_broken_document("\t: [unbalanced\n");
+        assert_eq!(history.dir, "/var/lib/sbproxy/config-history");
+        assert!(history.enabled);
+    }
+}

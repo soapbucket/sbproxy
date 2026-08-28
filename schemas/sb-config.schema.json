@@ -6958,9 +6958,177 @@
           "type": "integer",
           "format": "uint",
           "minimum": 0.0
+        },
+        "soak": {
+          "description": "The soak window a newly applied revision must survive before it is promoted to last known good (WOR-2458). Defaults to a soak that is on; see the `soak` block's own documentation for why an opt-in block defaults its soak on.",
+          "default": {
+            "enabled": true,
+            "window_secs": 120,
+            "min_requests": 50,
+            "max_error_rate_delta": 0.05,
+            "require_no_degraded_subsystems": true,
+            "require_upstream_health": true,
+            "probe": null
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/ConfigSoakConfig"
+            }
+          ]
+        },
+        "boot": {
+          "description": "What this node does when the config it was told to boot on does not work (WOR-2459). Defaults to today's behavior: exit.",
+          "default": {
+            "fallback": "off",
+            "max_attempts": 3,
+            "success_secs": 30
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/ConfigBootConfig"
+            }
+          ]
         }
       },
       "additionalProperties": false
+    },
+    "ConfigSoakConfig": {
+      "description": "The soak window a newly applied revision must survive before it is promoted to last known good (WOR-2458).\n\nCompiling is not evidence that a config works. A dead upstream URL, a rate limit of 10 that should have been 10000, an auth block that rejects the caller carrying most of the traffic, and a WAF rule that matches everything all compile cleanly. So a committed reload arms a window, four signals report into it, and only a window that closes on a passing verdict promotes the revision to last known good.\n\n# The verdict is three-way\n\nModeled on Argo Rollouts' analysis runs, which complete `Successful`, `Failed`, or `Inconclusive`, with `Inconclusive` pausing a rollout rather than promoting or aborting it. A node that took four requests overnight and 500'd one of them has a 25% error rate and no information: the request-outcome signal abstains below `min_requests` rather than reporting a failure. One abstaining signal never fails a soak, but a window where *every* signal abstained is `Inconclusive` and does not promote, because promoting on a soak that measured nothing is promote-on-apply wearing a timer.\n\n# Enabled by default once history is\n\n`proxy.config_history` is itself opt-in and disabled by default. A node that opted into the ring but not into the soak would record revisions whose `lkg` pointer never moves, which leaves the boot fallback (`proxy.config_history.boot`) with nothing to boot from. So this block defaults on inside a block that defaults off.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Master switch. On by default; see the type's own documentation for why an opt-in block defaults its soak on.",
+          "default": true,
+          "type": "boolean"
+        },
+        "window_secs": {
+          "description": "How long a newly applied revision must survive before the window closes and a verdict is reached. Defaults to 120 seconds.\n\n`POST /admin/config/confirm` short-circuits it, which is the Junos `commit confirmed` ergonomic: a deployment pipeline that ran its own smoke test calls that instead of sleeping out the window.",
+          "default": 120,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "min_requests": {
+          "description": "Fewest requests the window must observe before the request-outcome signal reports anything but `abstain`. Defaults to 50.",
+          "default": 50,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "max_error_rate_delta": {
+          "description": "How much the error rate may rise, as a fraction between 0 and 1, against the rate measured when the window armed, before the request-outcome signal fails. Defaults to 0.05.",
+          "default": 0.05,
+          "type": "number",
+          "format": "double"
+        },
+        "require_no_degraded_subsystems": {
+          "description": "Whether a reload that published while any subsystem stayed on prior state fails its soak. On by default, and when it fails it fails immediately rather than waiting the window out: the evidence is already in hand and no traffic is needed to confirm it.",
+          "default": true,
+          "type": "boolean"
+        },
+        "require_upstream_health": {
+          "description": "Whether an unhealthy upstream, an open circuit breaker, or an ejected outlier fails the soak. On by default. This is the signal that catches a config which repointed an origin at a dead address on a node with almost no traffic.",
+          "default": true,
+          "type": "boolean"
+        },
+        "probe": {
+          "description": "An optional operator-declared probe. Absent by default: the other three signals need no configuration, and this one is for whatever the operator knows and the proxy does not.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ConfigSoakProbeConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ConfigSoakProbeConfig": {
+      "description": "An operator-declared HTTP probe the soak window runs alongside its other three signals (WOR-2458).\n\n# This dials whatever URL you name, with no allowlist\n\nThe probe client is a plain HTTP client. It does **not** route through the egress guard that screens the proxy's other outbound dials, so `url` is a config-reachable fetch to any address this host can reach, loopback and link-local included. What keeps that bounded is that `proxy.config_history` sits on `AUTHORITY_DENIED_PATHS`: a config-authority document cannot set this key, so the only writer is an operator with write access to the node's own configuration file, who can already point an origin anywhere. Treat it the way you treat an origin URL, and prefer a loopback health endpoint on this node.\n\nDeliberately separate from `proxy.synthetic_probe`, which the soak also reads. The synthetic driver fires an in-process request through the compiled handler chain against a non-network origin, so a passing run proves the chain executes and proves nothing about whether any upstream is reachable. An operator who wants a real upstream exercised declares this instead, and both can be on at once.",
+      "type": "object",
+      "required": [
+        "url"
+      ],
+      "properties": {
+        "url": {
+          "description": "URL to `GET` on each probe tick.",
+          "type": "string"
+        },
+        "expect_status": {
+          "description": "Status the response must carry. Defaults to 200.",
+          "default": 200,
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "interval_secs": {
+          "description": "Seconds between probe ticks. Defaults to 10.",
+          "default": 10,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "timeout_ms": {
+          "description": "Per-request timeout in milliseconds. Defaults to 2000. A probe that times out fails the soak; it does not abstain.",
+          "default": 2000,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "ConfigBootConfig": {
+      "description": "How a node boots when its own config file does not work (WOR-2459).\n\n# Why a boot counter\n\nAn entry that was good in October need not construct after an upgrade that tightened validation. Borrowed from systemd-boot's boot counting: `boot_attempts` on the entry being tried is incremented on disk *before* the attempt and cleared once the process has bound its listeners and served for `success_secs`. An entry that fails `max_attempts` times is retired as unbootable and the walk continues down the ring. The ring is finite, so the walk terminates.",
+      "type": "object",
+      "properties": {
+        "fallback": {
+          "description": "What to do when the configured document does not boot. Defaults to `off`, so today's behavior is unchanged unless asked for. `--config-fallback` and `SB_CONFIG_FALLBACK` override this, and deliberately win: a rescue boot must not depend on the file being right.",
+          "default": "off",
+          "allOf": [
+            {
+              "$ref": "#/definitions/BootFallbackMode"
+            }
+          ]
+        },
+        "max_attempts": {
+          "description": "How many times one ring entry may be tried before it is retired as unbootable. Defaults to 3.",
+          "default": 3,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "success_secs": {
+          "description": "How long a booted process must serve before its entry's boot counter is cleared. Defaults to 30 seconds.",
+          "default": 30,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "BootFallbackMode": {
+      "description": "What a node does when the config it was told to boot on does not work (WOR-2459).",
+      "oneOf": [
+        {
+          "description": "Exit, the way every release before this one did. The default, so enabling the ring does not silently change how a broken config behaves.",
+          "type": "string",
+          "enum": [
+            "off"
+          ]
+        },
+        {
+          "description": "Walk the ring for a revision that boots, starting from the entry the last-known-good pointer names.",
+          "type": "string",
+          "enum": [
+            "last_known_good"
+          ]
+        }
+      ]
     },
     "MessengerSettings": {
       "description": "Shape of the `proxy.messenger_settings` block, retained only so the compiler can refuse it with an explanation (WOR-2166).\n\nNo value of this type is ever turned into a running bus. `compile_config` rejects the config the moment the block is present, whatever the driver says, because this build has no runtime consumer for a message bus: no production code subscribes to a topic and none publishes on one. The driver string is read for the diagnostic and nothing else.",

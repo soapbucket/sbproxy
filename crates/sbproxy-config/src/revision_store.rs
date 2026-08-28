@@ -132,6 +132,12 @@ const REJECTED_DIR: &str = "rejected";
 /// Suffix appended to a digest to name its blob file.
 const BLOB_SUFFIX: &str = ".yaml.zst";
 
+/// How many refused candidates `rejected/` retains when a caller never
+/// calls [`RevisionStore::with_keep_rejected`]. Matches
+/// `proxy.config_history.keep_rejected`'s own default, so a store opened
+/// without the builder behaves like one opened with the shipped config.
+pub const DEFAULT_KEEP_REJECTED: usize = 10;
+
 /// zstd compression level for stored blobs. The default level: these are
 /// short-lived config documents measured in kilobytes, not a bulk data
 /// path where a higher level's extra ratio would be worth its extra CPU.
@@ -261,6 +267,17 @@ pub struct RevisionEntry {
     /// distinct [`RevisionState`].
     #[serde(default)]
     pub degraded: Vec<String>,
+    /// Whether a boot fallback has given up on this entry.
+    ///
+    /// Set by [`RevisionStore::retire_unbootable`] once `boot_attempts`
+    /// reaches the configured ceiling, and never cleared. Distinct from
+    /// [`RevisionState::Failed`], which is a soak verdict about how the
+    /// revision behaved under traffic: an entry can soak perfectly and
+    /// still fail to construct months later, after an upgrade tightened
+    /// validation, and an operator reading the two together needs to see
+    /// which of the two happened.
+    #[serde(default)]
+    pub boot_retired: bool,
 }
 
 /// Why a store operation failed.
@@ -343,6 +360,10 @@ impl RevisionIndex {
 pub struct RevisionStore {
     directory: PathBuf,
     keep: usize,
+    /// How many refused candidates `rejected/` retains. Set through
+    /// [`RevisionStore::with_keep_rejected`]; see that method for why it
+    /// is a builder rather than an `open` parameter.
+    keep_rejected: usize,
     index: RevisionIndex,
 }
 
@@ -428,6 +449,7 @@ impl RevisionStore {
         let store = Self {
             directory,
             keep,
+            keep_rejected: DEFAULT_KEEP_REJECTED,
             index,
         };
         if changed {
@@ -483,6 +505,7 @@ impl RevisionStore {
             soak_verdict: None,
             boot_attempts: 0,
             degraded: metadata.degraded,
+            boot_retired: false,
         };
 
         let mut next = self.index.clone();
@@ -834,6 +857,541 @@ fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(path)
+}
+
+/// Current on-disk schema version for one `rejected/<digest>.json`.
+const REJECTED_SCHEMA_VERSION: u32 = 1;
+
+/// Suffix appended to a digest to name one rejected-candidate file.
+const REJECTED_SUFFIX: &str = ".json";
+
+/// Largest accepted `rejected/<digest>.json`, in bytes. The document it
+/// carries is bounded by [`MAX_CONFIG_YAML_BYTES`] before it is written;
+/// the headroom covers JSON escaping of that text plus the metadata
+/// around it.
+const MAX_REJECTED_FILE_BYTES: u64 = (MAX_CONFIG_YAML_BYTES as u64) * 2 + 65_536;
+
+/// Why a candidate document was refused before it could apply.
+///
+/// One variant per refusal in the config subscriber's failure table
+/// (`sbproxy_core::config_subscriber`'s module documentation), with one
+/// deliberate absence: a `reload_busy` cycle has no variant here and
+/// cannot be constructed. A busy cycle is a deferral, not a refusal, and
+/// nothing was even examined; recording it as a rejection would bury the
+/// real ones under a row that repeats every poll interval on a healthy
+/// node. Leaving it unrepresentable is stronger than a `continue` in the
+/// caller, because a caller cannot record one by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RejectionReason {
+    /// Signature, schema, digest, expiry, declared-mode, or replay
+    /// refusal.
+    VerifyFailed,
+    /// The document did not compile, could not be merged, or carried an
+    /// unresolved `${VAR}` reference.
+    CompileFailed,
+    /// The candidate named a config path this node owns outright.
+    DeniedPath,
+    /// The candidate reached for a host resource this node owns: an
+    /// environment variable, a secret, or a file path.
+    ConfinementRefused,
+}
+
+impl RejectionReason {
+    /// Stable wire and metric label. Never changes for a given variant.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::VerifyFailed => "verify_failed",
+            Self::CompileFailed => "compile_failed",
+            Self::DeniedPath => "denied_path",
+            Self::ConfinementRefused => "confinement_refused",
+        }
+    }
+}
+
+/// Everything a caller supplies about one refusal.
+#[derive(Debug, Clone)]
+pub struct RejectionMetadata {
+    /// Which refusal in the failure table this was.
+    pub reason: RejectionReason,
+    /// Which stage refused it. Two values are written today:
+    ///
+    /// * `"config_authority"`, for a bundle the subscriber refused;
+    /// * `"file_watcher"`, for a local document that did not apply. The
+    ///   SIGHUP path shares this label because both triggers converge on
+    ///   one reload function and one audit label, which WOR-2486 already
+    ///   settled.
+    ///
+    /// Two refusal paths are **not** covered yet and so never appear
+    /// here: the `source:` refresh poller's own `CompileFailed` branch,
+    /// and `POST /admin/reload`, which keeps its own audit entry with an
+    /// actor this ring does not carry.
+    pub stage: String,
+    /// Human-readable detail, as the refusing stage logged it. Bounded
+    /// by [`RevisionStore::record_rejection`] before it is stored.
+    pub detail: String,
+    /// Where the refused document came from.
+    pub provenance: BaseOrigin,
+    /// When the refusal happened, in unix milliseconds.
+    pub rejected_at: u64,
+}
+
+/// One refused candidate, as persisted to `rejected/<digest>.json`.
+///
+/// Content addressed by the same digest scheme the ring's blobs use, so
+/// a candidate refused on every poll cycle is one file whose `count`
+/// climbs rather than one file per cycle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RejectedCandidate {
+    /// On-disk schema version.
+    pub schema_version: u32,
+    /// Content-addressed digest (lowercase hex SHA-256) of the refused
+    /// pre-resolution document bytes.
+    pub digest: String,
+    /// Which refusal this was.
+    pub reason: RejectionReason,
+    /// Which stage refused it, as of the most recent refusal.
+    pub stage: String,
+    /// Detail from the most recent refusal, bounded to
+    /// [`MAX_REJECTION_DETAIL_CHARS`] characters.
+    pub detail: String,
+    /// Where the refused document came from.
+    pub provenance: BaseOrigin,
+    /// The refused document, exactly as it was read, with `${VAR}` /
+    /// `vault://` / `secret://` references unresolved. The same
+    /// pre-resolution discipline the ring's blobs keep, and for the same
+    /// reason: a resolved snapshot would write live credentials into a
+    /// file kept for as long as the refusal matters.
+    pub document: String,
+    /// Unix milliseconds of the first refusal of this content.
+    pub first_seen_at: u64,
+    /// Unix milliseconds of the most recent refusal of this content.
+    pub last_seen_at: u64,
+    /// How many times this exact content has been refused.
+    pub count: u64,
+}
+
+/// Longest `detail` string one stored rejection keeps.
+///
+/// A refusal message is produced by a compiler or a verifier and can
+/// carry an arbitrarily long span of the offending document; bounding it
+/// keeps one pathological candidate from filling the directory the
+/// `keep_rejected` bound is supposed to hold.
+pub const MAX_REJECTION_DETAIL_CHARS: usize = 512;
+
+impl RevisionStore {
+    /// Set how many refused candidates `rejected/` retains.
+    ///
+    /// A builder rather than a fourth [`Self::open`] parameter: the
+    /// rejected directory is bounded independently of the applied ring
+    /// (`proxy.config_history.keep_rejected` against
+    /// `proxy.config_history.keep`), and a caller that never records a
+    /// rejection should not have to name a bound for one. Defaults to
+    /// [`DEFAULT_KEEP_REJECTED`].
+    #[must_use]
+    pub fn with_keep_rejected(mut self, keep_rejected: usize) -> Self {
+        self.keep_rejected = keep_rejected;
+        self
+    }
+
+    /// Record one soak verdict against `revision`, and move the `lkg`
+    /// pointer if, and only if, the verdict is
+    /// [`SoakVerdict::Successful`].
+    ///
+    /// This is where the epic's root defect is fixed, so the rule lives
+    /// here rather than in a caller that could get it wrong:
+    ///
+    /// | Verdict | Entry state | `lkg` pointer |
+    /// | -- | -- | -- |
+    /// | [`SoakVerdict::Successful`] | [`RevisionState::Good`] | Advances to this entry |
+    /// | [`SoakVerdict::Failed`] | [`RevisionState::Failed`] | Unchanged |
+    /// | [`SoakVerdict::Inconclusive`] | Unchanged (stays [`RevisionState::Applied`]) | Unchanged |
+    ///
+    /// Inconclusive deliberately does not mark the entry failed. Every
+    /// signal abstaining means the soak measured nothing, which is a
+    /// configuration problem worth surfacing, not evidence against the
+    /// revision. It also deliberately does not promote: promoting on a
+    /// soak that measured nothing is promote-on-apply wearing a timer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RevisionStoreError::Invalid`] when no live entry holds
+    /// `revision` (it was evicted, or the caller has the wrong number),
+    /// and [`RevisionStoreError::Io`] or [`RevisionStoreError::Json`]
+    /// when the index cannot be persisted.
+    pub fn record_soak_verdict(
+        &mut self,
+        revision: u64,
+        verdict: SoakVerdict,
+    ) -> Result<(), RevisionStoreError> {
+        let mut next = self.index.clone();
+        let entry = find_entry_mut(&mut next, revision)?;
+        entry.soak_verdict = Some(verdict);
+        match verdict {
+            SoakVerdict::Successful => {
+                entry.state = RevisionState::Good;
+                let digest = entry.digest.clone();
+                next.lkg = Some(digest);
+            }
+            SoakVerdict::Failed => entry.state = RevisionState::Failed,
+            SoakVerdict::Inconclusive => {}
+        }
+        self.save_index(&next)?;
+        self.index = next;
+        Ok(())
+    }
+
+    /// Increment and persist `boot_attempts` on `revision`, returning
+    /// the new count.
+    ///
+    /// Called *before* the attempt, never after, and persisted before it
+    /// returns: the failure this counter exists to survive is a boot
+    /// that dies partway through, taking any in-memory count with it.
+    /// Borrowed from systemd-boot's boot counting, which renames the
+    /// entry file on disk before handing control to it for exactly this
+    /// reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RevisionStoreError::Invalid`] when no live entry holds
+    /// `revision`, and [`RevisionStoreError::Io`] or
+    /// [`RevisionStoreError::Json`] when the index cannot be persisted.
+    pub fn begin_boot_attempt(&mut self, revision: u64) -> Result<u32, RevisionStoreError> {
+        let mut next = self.index.clone();
+        let entry = find_entry_mut(&mut next, revision)?;
+        entry.boot_attempts = entry.boot_attempts.saturating_add(1);
+        let attempts = entry.boot_attempts;
+        self.save_index(&next)?;
+        self.index = next;
+        Ok(attempts)
+    }
+
+    /// Clear `boot_attempts` on `revision`: this entry booted and served
+    /// long enough to count as working.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RevisionStoreError::Invalid`] when no live entry holds
+    /// `revision`, and [`RevisionStoreError::Io`] or
+    /// [`RevisionStoreError::Json`] when the index cannot be persisted.
+    pub fn confirm_boot_success(&mut self, revision: u64) -> Result<(), RevisionStoreError> {
+        let mut next = self.index.clone();
+        let entry = find_entry_mut(&mut next, revision)?;
+        entry.boot_attempts = 0;
+        self.save_index(&next)?;
+        self.index = next;
+        Ok(())
+    }
+
+    /// Retire `revision` from the boot walk: it has failed to boot too
+    /// many times to keep trying.
+    ///
+    /// Recorded on the entry rather than by deleting it. The entry is
+    /// still history an operator wants to see, and still a document the
+    /// admin surface can show; what changes is only that
+    /// [`Self::boot_candidates`] stops offering it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RevisionStoreError::Invalid`] when no live entry holds
+    /// `revision`, and [`RevisionStoreError::Io`] or
+    /// [`RevisionStoreError::Json`] when the index cannot be persisted.
+    pub fn retire_unbootable(&mut self, revision: u64) -> Result<(), RevisionStoreError> {
+        let mut next = self.index.clone();
+        let entry = find_entry_mut(&mut next, revision)?;
+        entry.boot_retired = true;
+        self.save_index(&next)?;
+        self.index = next;
+        Ok(())
+    }
+
+    /// Entries a boot fallback may try, in the order it should try them:
+    /// the entry the `lkg` pointer names first, then every other live
+    /// entry newest-first.
+    ///
+    /// Retired entries ([`Self::retire_unbootable`]) are excluded, which
+    /// is what makes the walk terminate: the ring is finite and each
+    /// exhausted candidate leaves it permanently.
+    ///
+    /// The order, and why:
+    ///
+    /// 1. the entry the `lkg` pointer names, because it is the only one
+    ///    a soak window ever judged against real traffic;
+    /// 2. every other entry that is not [`RevisionState::Failed`],
+    ///    newest first, because a more recent applied revision is closer
+    ///    to what the operator meant than an older one;
+    /// 3. the entries a soak measured as bad, newest first, last.
+    ///
+    /// Step 3 is the part worth reading twice. A `Failed` entry is one a
+    /// soak window watched under real traffic and judged bad; the epic's
+    /// whole success criterion is that a config which compiles cleanly
+    /// and breaks traffic does not become the boot config. Offering one
+    /// ahead of an older healthy entry inverted that. They are kept in
+    /// the walk rather than dropped from it because an exhausted ring
+    /// exits the process, and a revision that broke traffic is still a
+    /// better outcome than no configuration at all: it is the last
+    /// resort, not the first.
+    #[must_use]
+    pub fn boot_candidates(&self) -> Vec<RevisionEntry> {
+        let lkg = self.index.lkg.clone();
+        let mut candidates = Vec::new();
+        if let Some(digest) = lkg.as_deref() {
+            if let Some(entry) = self
+                .index
+                .entries
+                .iter()
+                .find(|entry| entry.digest == digest && !entry.boot_retired)
+            {
+                candidates.push(entry.clone());
+            }
+        }
+        let mut measured_bad = Vec::new();
+        for entry in self.index.entries.iter().rev() {
+            if entry.boot_retired {
+                continue;
+            }
+            if candidates
+                .iter()
+                .any(|chosen| chosen.revision == entry.revision)
+            {
+                continue;
+            }
+            if entry.state == RevisionState::Failed {
+                measured_bad.push(entry.clone());
+            } else {
+                candidates.push(entry.clone());
+            }
+        }
+        candidates.extend(measured_bad);
+        candidates
+    }
+
+    /// Record one refused candidate under `rejected/<digest>.json`,
+    /// returning what was stored.
+    ///
+    /// Content addressed: a byte-identical candidate refused again
+    /// updates the existing file's `count`, `last_seen_at`, `reason`,
+    /// `stage`, and `detail` rather than writing a second file. An
+    /// authority serving a broken bundle every poll interval otherwise
+    /// evicts every other rejection within minutes, which is exactly
+    /// when an operator needs the others.
+    ///
+    /// Takes `&self`, not `&mut self`: nothing here touches the ring
+    /// index, so recording a refusal cannot disturb the applied history
+    /// or the `lkg` pointer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RevisionStoreError::Invalid`] when `content` exceeds
+    /// [`MAX_CONFIG_YAML_BYTES`] or is not UTF-8, and
+    /// [`RevisionStoreError::Io`] or [`RevisionStoreError::Json`] when
+    /// the file cannot be written.
+    pub fn record_rejection(
+        &self,
+        content: &[u8],
+        metadata: RejectionMetadata,
+    ) -> Result<RejectedCandidate, RevisionStoreError> {
+        if content.len() > MAX_CONFIG_YAML_BYTES {
+            return Err(RevisionStoreError::invalid(format!(
+                "rejected candidate is {} bytes, over the {MAX_CONFIG_YAML_BYTES} byte limit",
+                content.len()
+            )));
+        }
+        let document = std::str::from_utf8(content)
+            .map_err(|error| {
+                RevisionStoreError::invalid(format!("rejected candidate is not UTF-8: {error}"))
+            })?
+            .to_string();
+        let digest = sha256_hex(content);
+        let path = rejected_path(&self.directory, &digest);
+        let existing = read_rejection(&path).ok().flatten();
+        let candidate = RejectedCandidate {
+            schema_version: REJECTED_SCHEMA_VERSION,
+            digest,
+            reason: metadata.reason,
+            stage: metadata.stage,
+            detail: metadata
+                .detail
+                .chars()
+                .take(MAX_REJECTION_DETAIL_CHARS)
+                .collect(),
+            provenance: metadata.provenance,
+            document,
+            first_seen_at: existing
+                .as_ref()
+                .map_or(metadata.rejected_at, |prior| prior.first_seen_at),
+            last_seen_at: metadata.rejected_at,
+            count: existing.as_ref().map_or(0, |prior| prior.count) + 1,
+        };
+        let mut body = serde_json::to_vec_pretty(&candidate)
+            .map_err(|source| RevisionStoreError::json("encode rejected candidate", source))?;
+        body.push(b'\n');
+        write_atomically(&path, &body)?;
+        self.evict_rejections();
+        Ok(candidate)
+    }
+
+    /// Refuse this ring when any file in it is readable or writable by
+    /// anyone but its owner.
+    ///
+    /// The boot fallback is the first thing in the process that turns
+    /// ring content into *executing* configuration, and the ring is
+    /// trusted purely by filesystem location: the blobs are unsigned and
+    /// `index.json` is unauthenticated. Two properties carry that trust.
+    ///
+    /// **Ownership.** [`Self::open`] runs `create_private_dir_all`,
+    /// which `chmod`s the directory to `0700`. On every Unix only the
+    /// file's owner or root may `chmod` it, so an open that succeeded has
+    /// already proved the process owns the directory. That is why there
+    /// is no `geteuid` here and why only the permission half is left.
+    ///
+    /// **Exclusivity.** Any group or other bit on `index.json`, its
+    /// backup, or a blob means somebody else could have written the
+    /// document this node is about to boot on. This store never creates
+    /// a file that way (`create_private_file` opens at `0600`), so a
+    /// bit set here was set from outside, and refusing is the only safe
+    /// reading of it.
+    ///
+    /// Lives on the store rather than in the caller so it reads the same
+    /// `INDEX_FILE`, `INDEX_BACKUP_FILE`, and `BLOBS_DIR` constants the
+    /// writer uses: a layout rename moves both together instead of
+    /// quietly turning the guard into a no-op. Non-Unix targets have no
+    /// mode to inspect and this is a no-op there, stated rather than
+    /// silently true.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RevisionStoreError::Corrupt`] naming the offending file
+    /// and its mode.
+    #[cfg(unix)]
+    pub fn refuse_shared_files(&self) -> Result<(), RevisionStoreError> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mut checked = vec![
+            self.directory.join(INDEX_FILE),
+            self.directory.join(INDEX_BACKUP_FILE),
+        ];
+        if let Ok(listing) = std::fs::read_dir(self.directory.join(BLOBS_DIR)) {
+            checked.extend(listing.flatten().map(|entry| entry.path()));
+        }
+        for path in checked {
+            let Ok(metadata) = std::fs::metadata(&path) else {
+                continue;
+            };
+            let mode = metadata.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                return Err(RevisionStoreError::Corrupt(format!(
+                    "{} is mode {mode:o}; a ring a node is about to boot from must be \
+                     readable and writable by its owner only, and this one is not, so its \
+                     contents cannot be trusted as configuration",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// No mode to inspect on a non-Unix target. See the Unix version for
+    /// what this checks and why.
+    #[cfg(not(unix))]
+    pub fn refuse_shared_files(&self) -> Result<(), RevisionStoreError> {
+        Ok(())
+    }
+
+    /// Every stored rejected candidate, oldest refusal first.
+    ///
+    /// Ordered by `last_seen_at`, the same key eviction uses: a
+    /// candidate an authority is still serving, and this node is still
+    /// refusing every poll interval, is the one an operator is looking
+    /// for right now. A file that fails to parse is skipped rather than
+    /// failing the whole read: one unreadable rejection must not hide
+    /// the others during the incident they were kept for.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RevisionStoreError::Io`] when the directory cannot be
+    /// listed.
+    pub fn rejections(&self) -> Result<Vec<RejectedCandidate>, RevisionStoreError> {
+        let mut out = Vec::new();
+        let directory = self.directory.join(REJECTED_DIR);
+        let listing = match std::fs::read_dir(&directory) {
+            Ok(listing) => listing,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(error) => return Err(error.into()),
+        };
+        for entry in listing.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(Some(candidate)) = read_rejection(&path) {
+                out.push(candidate);
+            }
+        }
+        out.sort_by(|left, right| {
+            left.last_seen_at
+                .cmp(&right.last_seen_at)
+                .then_with(|| left.digest.cmp(&right.digest))
+        });
+        Ok(out)
+    }
+
+    /// Unlink the oldest stored rejections until at most
+    /// `keep_rejected` remain.
+    ///
+    /// Ordered by `last_seen_at`, not `first_seen_at`: a candidate an
+    /// authority is still serving, and this node is still refusing every
+    /// poll interval, is the one an operator is looking for right now,
+    /// and evicting it because its first refusal was a while ago would
+    /// delete exactly the live incident. For a candidate refused once
+    /// the two timestamps are equal, so this is plain oldest-first.
+    ///
+    /// Best effort: a failed unlink leaves one extra file behind, which
+    /// [`Self::rejections`] reads like any other.
+    fn evict_rejections(&self) {
+        let Ok(stored) = self.rejections() else {
+            return;
+        };
+        let Some(excess) = stored.len().checked_sub(self.keep_rejected) else {
+            return;
+        };
+        for candidate in stored.iter().take(excess) {
+            let _ = std::fs::remove_file(rejected_path(&self.directory, &candidate.digest));
+        }
+    }
+}
+
+/// Find one live entry by revision, or say which revision was missing.
+fn find_entry_mut(
+    index: &mut RevisionIndex,
+    revision: u64,
+) -> Result<&mut RevisionEntry, RevisionStoreError> {
+    index
+        .entries
+        .iter_mut()
+        .find(|entry| entry.revision == revision)
+        .ok_or_else(|| {
+            RevisionStoreError::invalid(format!("no ring entry holds revision {revision}"))
+        })
+}
+
+/// Path of one rejected-candidate file for `digest`.
+fn rejected_path(directory: &Path, digest: &str) -> PathBuf {
+    directory
+        .join(REJECTED_DIR)
+        .join(format!("{digest}{REJECTED_SUFFIX}"))
+}
+
+/// Read one rejected-candidate file. `Ok(None)` when it does not exist.
+fn read_rejection(path: &Path) -> Result<Option<RejectedCandidate>, RevisionStoreError> {
+    let Some(bytes) = read_bounded(path, MAX_REJECTED_FILE_BYTES)? else {
+        return Ok(None);
+    };
+    let candidate = serde_json::from_slice::<RejectedCandidate>(&bytes)
+        .map_err(|source| RevisionStoreError::json("decode rejected candidate", source))?;
+    Ok(Some(candidate))
 }
 
 #[cfg(test)]
@@ -1294,6 +1852,7 @@ mod tests {
             soak_verdict: None,
             boot_attempts: 0,
             degraded: Vec::new(),
+            boot_retired: false,
         });
         let orphaned = evict_entries(store.keep, &mut next);
         assert_eq!(
@@ -1429,5 +1988,457 @@ mod tests {
             2,
             "prior entries stay readable across a lineage remint",
         );
+    }
+
+    // --- WOR-2458 / WOR-2459 / WOR-2462 ---
+
+    fn rejection(reason: RejectionReason, stage: &str, at: u64) -> RejectionMetadata {
+        RejectionMetadata {
+            reason,
+            stage: stage.to_string(),
+            detail: "refused for the test".to_string(),
+            provenance: BaseOrigin::Local,
+            rejected_at: at,
+        }
+    }
+
+    /// WOR-2458. The promotion rule lives in the store, not in a caller:
+    /// only a `Successful` verdict may move the `lkg` pointer.
+    #[test]
+    fn a_successful_soak_verdict_advances_the_lkg_pointer_once() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let mut store = RevisionStore::open(temp.path(), 8, None).expect("open");
+        let entry = store.append(b"a: 1\n", metadata(1)).expect("append");
+        assert!(store.lkg().is_none(), "appending never promotes");
+
+        store
+            .record_soak_verdict(entry.revision, SoakVerdict::Successful)
+            .expect("verdict");
+
+        let lkg = store.lkg().expect("a successful soak promotes").clone();
+        assert_eq!(lkg.revision, entry.revision);
+        assert_eq!(lkg.state, RevisionState::Good);
+        assert_eq!(lkg.soak_verdict, Some(SoakVerdict::Successful));
+    }
+
+    /// WOR-2458. A failed soak records the verdict and marks the entry
+    /// failed, and the pointer stays exactly where it was.
+    #[test]
+    fn a_failed_soak_verdict_never_moves_the_lkg_pointer() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let mut store = RevisionStore::open(temp.path(), 8, None).expect("open");
+        let good = store.append(b"a: 1\n", metadata(1)).expect("append");
+        store
+            .record_soak_verdict(good.revision, SoakVerdict::Successful)
+            .expect("verdict");
+        let bad = store.append(b"a: 2\n", metadata(2)).expect("append");
+
+        store
+            .record_soak_verdict(bad.revision, SoakVerdict::Failed)
+            .expect("verdict");
+
+        assert_eq!(
+            store.lkg().expect("still the first entry").revision,
+            good.revision,
+            "a failed soak must not advance the pointer"
+        );
+        let failed = store
+            .entries()
+            .iter()
+            .find(|entry| entry.revision == bad.revision)
+            .expect("entry survives");
+        assert_eq!(failed.state, RevisionState::Failed);
+        assert_eq!(failed.soak_verdict, Some(SoakVerdict::Failed));
+    }
+
+    /// WOR-2458. Inconclusive is the third state, and it is neither a
+    /// promotion nor a failure: the entry stays `applied` and the
+    /// pointer does not move.
+    #[test]
+    fn an_inconclusive_soak_verdict_leaves_the_entry_applied() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let mut store = RevisionStore::open(temp.path(), 8, None).expect("open");
+        let entry = store.append(b"a: 1\n", metadata(1)).expect("append");
+
+        store
+            .record_soak_verdict(entry.revision, SoakVerdict::Inconclusive)
+            .expect("verdict");
+
+        assert!(store.lkg().is_none(), "inconclusive never promotes");
+        let stored = store.entries().last().expect("entry");
+        assert_eq!(stored.state, RevisionState::Applied);
+        assert_eq!(stored.soak_verdict, Some(SoakVerdict::Inconclusive));
+    }
+
+    /// WOR-2458. A verdict for a revision the ring no longer holds is a
+    /// caller bug, not a silent no-op.
+    #[test]
+    fn a_soak_verdict_for_an_unknown_revision_is_refused() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let mut store = RevisionStore::open(temp.path(), 8, None).expect("open");
+        let error = store
+            .record_soak_verdict(99, SoakVerdict::Successful)
+            .expect_err("unknown revision");
+        assert!(format!("{error}").contains("99"), "{error}");
+    }
+
+    /// WOR-2459. `boot_attempts` is on disk, not in memory: a hard kill
+    /// between the increment and the crash must not lose the count.
+    #[test]
+    fn boot_attempts_survive_a_reopen() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let revision = {
+            let mut store = RevisionStore::open(temp.path(), 8, None).expect("open");
+            let entry = store.append(b"a: 1\n", metadata(1)).expect("append");
+            assert_eq!(
+                store.begin_boot_attempt(entry.revision).expect("attempt"),
+                1
+            );
+            assert_eq!(
+                store.begin_boot_attempt(entry.revision).expect("attempt"),
+                2
+            );
+            entry.revision
+        };
+
+        let mut store = RevisionStore::open(temp.path(), 8, None).expect("reopen");
+        assert_eq!(
+            store
+                .entries()
+                .iter()
+                .find(|entry| entry.revision == revision)
+                .expect("entry")
+                .boot_attempts,
+            2,
+            "the counter is durable, not process-local"
+        );
+        assert_eq!(
+            store.begin_boot_attempt(revision).expect("attempt"),
+            3,
+            "a reopen continues the count rather than restarting it"
+        );
+        store.confirm_boot_success(revision).expect("confirm");
+        assert_eq!(
+            store
+                .entries()
+                .iter()
+                .find(|entry| entry.revision == revision)
+                .expect("entry")
+                .boot_attempts,
+            0,
+            "serving for the success window clears the counter"
+        );
+    }
+
+    /// WOR-2459 fix round, Major 10. A revision a soak measured as bad
+    /// under real traffic must not be offered ahead of an older healthy
+    /// one: "a config that compiles cleanly and breaks traffic does not
+    /// become the boot config" is the epic's success criterion.
+    #[test]
+    fn a_soak_failed_revision_sinks_below_every_healthy_one_in_the_boot_walk() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let mut store = RevisionStore::open(temp.path(), 8, None).expect("open");
+        let old_healthy = store.append(b"a: 1\n", metadata(1)).expect("append");
+        let newer_broken = store.append(b"a: 2\n", metadata(2)).expect("append");
+        store
+            .record_soak_verdict(newer_broken.revision, SoakVerdict::Failed)
+            .expect("verdict");
+
+        let order: Vec<u64> = store
+            .boot_candidates()
+            .iter()
+            .map(|entry| entry.revision)
+            .collect();
+        assert_eq!(
+            order,
+            vec![old_healthy.revision, newer_broken.revision],
+            "the measured-bad revision is the last resort, not the first",
+        );
+
+        // It stays in the walk rather than being dropped: an exhausted
+        // ring exits the process, and a revision that broke traffic
+        // still beats no configuration at all.
+        assert!(
+            store
+                .boot_candidates()
+                .iter()
+                .any(|entry| entry.revision == newer_broken.revision),
+            "a failed revision is demoted, not deleted",
+        );
+    }
+
+    /// Re-review, new Major 1. The Major-12 security control shipped with
+    /// no test on its refusal path: nothing had ever watched it fire. It
+    /// also hard-coded this module's file names across a crate boundary,
+    /// where a layout rename would have turned it into a silent no-op.
+    /// It lives here now, beside the constants it reads.
+    #[cfg(unix)]
+    #[test]
+    fn a_ring_whose_index_anyone_can_read_is_refused_as_untrusted() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let mut store = RevisionStore::open(temp.path(), 8, None).expect("open");
+        store.append(b"a: 1\n", metadata(1)).expect("append");
+
+        // An ordinary ring, exactly as this store writes it, boots.
+        store
+            .refuse_shared_files()
+            .expect("a 0600/0700 ring is the shape this store creates");
+
+        // Someone widened the index. The store never creates a file that
+        // way, so the bit was set from outside and the contents cannot be
+        // trusted as configuration.
+        let index = temp.path().join(INDEX_FILE);
+        std::fs::set_permissions(&index, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let error = store
+            .refuse_shared_files()
+            .expect_err("a world-readable index must refuse the walk");
+        let rendered = format!("{error}");
+        assert!(rendered.contains(INDEX_FILE), "{rendered}");
+        assert!(rendered.contains("644"), "the mode is named: {rendered}");
+        std::fs::set_permissions(&index, std::fs::Permissions::from_mode(0o600)).expect("restore");
+        store.refuse_shared_files().expect("restored");
+
+        // The same for the backup copy...
+        let backup = temp.path().join(INDEX_BACKUP_FILE);
+        std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o640)).expect("chmod");
+        let error = store
+            .refuse_shared_files()
+            .expect_err("a group-readable backup must refuse the walk");
+        assert!(format!("{error}").contains(INDEX_BACKUP_FILE), "{error}");
+        std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o600)).expect("restore");
+
+        // ... and for a blob, which is the document that would actually
+        // be compiled and served.
+        let digest = store.entries()[0].digest.clone();
+        let blob = blob_path(temp.path(), &digest);
+        std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o666)).expect("chmod");
+        let error = store
+            .refuse_shared_files()
+            .expect_err("a world-writable blob must refuse the walk");
+        assert!(format!("{error}").contains(&digest), "{error}");
+    }
+
+    /// WOR-2459. A retired entry drops out of the boot walk, and the
+    /// walk continues to the next candidate rather than stopping.
+    #[test]
+    fn boot_candidates_put_the_lkg_first_and_skip_retired_entries() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let mut store = RevisionStore::open(temp.path(), 8, None).expect("open");
+        let first = store.append(b"a: 1\n", metadata(1)).expect("append");
+        let second = store.append(b"a: 2\n", metadata(2)).expect("append");
+        let third = store.append(b"a: 3\n", metadata(3)).expect("append");
+        store
+            .record_soak_verdict(second.revision, SoakVerdict::Successful)
+            .expect("verdict");
+
+        let order: Vec<u64> = store
+            .boot_candidates()
+            .iter()
+            .map(|entry| entry.revision)
+            .collect();
+        assert_eq!(
+            order,
+            vec![second.revision, third.revision, first.revision],
+            "the last known good is tried first, then the rest newest-first"
+        );
+
+        store.retire_unbootable(second.revision).expect("retire");
+        let order: Vec<u64> = store
+            .boot_candidates()
+            .iter()
+            .map(|entry| entry.revision)
+            .collect();
+        assert_eq!(
+            order,
+            vec![third.revision, first.revision],
+            "a retired entry leaves the walk and the walk continues"
+        );
+        assert!(
+            store
+                .entries()
+                .iter()
+                .find(|entry| entry.revision == second.revision)
+                .expect("entry survives")
+                .boot_retired,
+            "retirement is recorded on the entry, not by deleting it"
+        );
+    }
+
+    /// WOR-2459. Retirement is durable for the same reason the counter
+    /// is: the next boot must not re-try an entry this one proved dead.
+    #[test]
+    fn retirement_survives_a_reopen() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let revision = {
+            let mut store = RevisionStore::open(temp.path(), 8, None).expect("open");
+            let entry = store.append(b"a: 1\n", metadata(1)).expect("append");
+            store.retire_unbootable(entry.revision).expect("retire");
+            entry.revision
+        };
+        let store = RevisionStore::open(temp.path(), 8, None).expect("reopen");
+        assert!(
+            store.boot_candidates().is_empty(),
+            "an exhausted ring stays exhausted across a restart"
+        );
+        assert!(store
+            .entries()
+            .iter()
+            .any(|entry| entry.revision == revision && entry.boot_retired));
+    }
+
+    /// WOR-2462. Every reason in the subscriber's failure table lands as
+    /// its own stored entry, named by that reason.
+    #[test]
+    fn each_refusal_reason_is_stored_under_its_own_name() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let store = RevisionStore::open(temp.path(), 8, None)
+            .expect("open")
+            .with_keep_rejected(10);
+
+        for (index, reason) in [
+            RejectionReason::VerifyFailed,
+            RejectionReason::CompileFailed,
+            RejectionReason::DeniedPath,
+            RejectionReason::ConfinementRefused,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let document = format!("a: {index}\n");
+            store
+                .record_rejection(
+                    document.as_bytes(),
+                    rejection(reason, "config_authority", 100 + index as u64),
+                )
+                .expect("record");
+        }
+
+        let stored = store.rejections().expect("read back");
+        assert_eq!(stored.len(), 4, "one entry per reason: {stored:?}");
+        let reasons: Vec<RejectionReason> = stored.iter().map(|entry| entry.reason).collect();
+        assert!(reasons.contains(&RejectionReason::VerifyFailed));
+        assert!(reasons.contains(&RejectionReason::CompileFailed));
+        assert!(reasons.contains(&RejectionReason::DeniedPath));
+        assert!(reasons.contains(&RejectionReason::ConfinementRefused));
+        for entry in &stored {
+            assert_eq!(entry.stage, "config_authority");
+            assert_eq!(entry.count, 1);
+        }
+    }
+
+    /// WOR-2462. A repeat refusal of byte-identical content updates the
+    /// one entry rather than filling the directory with copies.
+    #[test]
+    fn a_repeated_refusal_updates_the_count_and_last_seen() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let store = RevisionStore::open(temp.path(), 8, None)
+            .expect("open")
+            .with_keep_rejected(10);
+        let document = b"a: 1\n";
+
+        store
+            .record_rejection(
+                document,
+                rejection(RejectionReason::CompileFailed, "file_watcher", 100),
+            )
+            .expect("record");
+        store
+            .record_rejection(
+                document,
+                rejection(RejectionReason::CompileFailed, "sighup", 250),
+            )
+            .expect("record");
+
+        let stored = store.rejections().expect("read back");
+        assert_eq!(stored.len(), 1, "one entry, not two: {stored:?}");
+        assert_eq!(stored[0].count, 2);
+        assert_eq!(stored[0].first_seen_at, 100);
+        assert_eq!(stored[0].last_seen_at, 250);
+        assert_eq!(
+            stored[0].stage, "sighup",
+            "the most recent refusal names the stage that refused it"
+        );
+    }
+
+    /// WOR-2462. `keep_rejected` bounds the directory and eviction is
+    /// oldest-first.
+    #[test]
+    fn keep_rejected_bounds_the_directory_oldest_first() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let store = RevisionStore::open(temp.path(), 8, None)
+            .expect("open")
+            .with_keep_rejected(3);
+
+        for index in 0..6u64 {
+            let document = format!("a: {index}\n");
+            store
+                .record_rejection(
+                    document.as_bytes(),
+                    rejection(RejectionReason::CompileFailed, "file_watcher", 100 + index),
+                )
+                .expect("record");
+        }
+
+        let stored = store.rejections().expect("read back");
+        assert_eq!(stored.len(), 3, "bounded to keep_rejected: {stored:?}");
+        let seen: Vec<u64> = stored.iter().map(|entry| entry.last_seen_at).collect();
+        assert_eq!(
+            seen,
+            vec![103, 104, 105],
+            "the three oldest were evicted, oldest first"
+        );
+        let on_disk = std::fs::read_dir(temp.path().join(REJECTED_DIR))
+            .expect("read dir")
+            .count();
+        assert_eq!(on_disk, 3, "eviction unlinks the files, not just the view");
+    }
+
+    /// WOR-2462. The stored candidate keeps the document as written, so
+    /// an operator can see what was refused.
+    #[test]
+    fn a_stored_rejection_keeps_the_pre_resolution_document() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let store = RevisionStore::open(temp.path(), 8, None)
+            .expect("open")
+            .with_keep_rejected(4);
+        let document = "api_key: ${OPENAI_API_KEY}\n";
+
+        store
+            .record_rejection(
+                document.as_bytes(),
+                rejection(RejectionReason::CompileFailed, "file_watcher", 7),
+            )
+            .expect("record");
+
+        let stored = store.rejections().expect("read back");
+        assert_eq!(stored[0].document, document);
+        assert!(
+            stored[0].document.contains("${OPENAI_API_KEY}"),
+            "the reference is kept unresolved, exactly as the ring's blobs are"
+        );
+    }
+
+    /// WOR-2462. Owner-only, like every other file this store writes.
+    #[cfg(unix)]
+    #[test]
+    fn a_stored_rejection_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let store = RevisionStore::open(temp.path(), 8, None)
+            .expect("open")
+            .with_keep_rejected(4);
+        let candidate = store
+            .record_rejection(
+                b"a: 1\n",
+                rejection(RejectionReason::VerifyFailed, "config_authority", 1),
+            )
+            .expect("record");
+        let path = temp
+            .path()
+            .join(REJECTED_DIR)
+            .join(format!("{}.json", candidate.digest));
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{path:?} is {mode:o}");
     }
 }

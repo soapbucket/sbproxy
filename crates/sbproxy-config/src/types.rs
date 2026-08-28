@@ -1361,6 +1361,345 @@ const fn default_config_history_keep_rejected() -> usize {
     10
 }
 
+/// Default soak window, in seconds. See [`ConfigSoakConfig::window_secs`].
+const fn default_soak_window_secs() -> u64 {
+    120
+}
+
+/// Default minimum request sample. See [`ConfigSoakConfig::min_requests`].
+const fn default_soak_min_requests() -> u64 {
+    50
+}
+
+/// Default tolerated error-rate increase. See
+/// [`ConfigSoakConfig::max_error_rate_delta`].
+const fn default_soak_max_error_rate_delta() -> f64 {
+    0.05
+}
+
+/// Default for the soak's three boolean switches, all of which are on: a
+/// subsystem that stayed on prior state, or an upstream that stopped
+/// answering, are exactly the failures the soak exists to catch.
+const fn default_soak_flag() -> bool {
+    true
+}
+
+/// Default operator-probe cadence, in seconds. See
+/// [`ConfigSoakProbeConfig::interval_secs`].
+const fn default_soak_probe_interval_secs() -> u64 {
+    10
+}
+
+/// Default operator-probe per-request timeout, in milliseconds.
+const fn default_soak_probe_timeout_ms() -> u64 {
+    2_000
+}
+
+/// Default status the operator probe must observe.
+const fn default_soak_probe_expect_status() -> u16 {
+    200
+}
+
+/// The soak window a newly applied revision must survive before it is
+/// promoted to last known good (WOR-2458).
+///
+/// Compiling is not evidence that a config works. A dead upstream URL, a
+/// rate limit of 10 that should have been 10000, an auth block that
+/// rejects the caller carrying most of the traffic, and a WAF rule that
+/// matches everything all compile cleanly. So a committed reload arms a
+/// window, four signals report into it, and only a window that closes on
+/// a passing verdict promotes the revision to last known good.
+///
+/// # The verdict is three-way
+///
+/// Modeled on Argo Rollouts' analysis runs, which complete
+/// `Successful`, `Failed`, or `Inconclusive`, with `Inconclusive`
+/// pausing a rollout rather than promoting or aborting it. A node that
+/// took four requests overnight and 500'd one of them has a 25% error
+/// rate and no information: the request-outcome signal abstains below
+/// `min_requests` rather than reporting a failure. One
+/// abstaining signal never fails a soak, but a window where *every*
+/// signal abstained is `Inconclusive` and does not promote, because
+/// promoting on a soak that measured nothing is promote-on-apply
+/// wearing a timer.
+///
+/// # Enabled by default once history is
+///
+/// `proxy.config_history` is itself opt-in and disabled by default. A
+/// node that opted into the ring but not into the soak would record
+/// revisions whose `lkg` pointer never moves, which leaves the boot
+/// fallback (`proxy.config_history.boot`) with nothing to boot from. So
+/// this block defaults on inside a block that defaults off.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigSoakConfig {
+    /// Master switch. On by default; see the type's own documentation
+    /// for why an opt-in block defaults its soak on.
+    #[serde(default = "default_soak_flag")]
+    pub enabled: bool,
+    /// How long a newly applied revision must survive before the window
+    /// closes and a verdict is reached. Defaults to 120 seconds.
+    ///
+    /// `POST /admin/config/confirm` short-circuits it, which is the
+    /// Junos `commit confirmed` ergonomic: a deployment pipeline that
+    /// ran its own smoke test calls that instead of sleeping out the
+    /// window.
+    #[serde(default = "default_soak_window_secs")]
+    pub window_secs: u64,
+    /// Fewest requests the window must observe before the
+    /// request-outcome signal reports anything but `abstain`. Defaults
+    /// to 50.
+    #[serde(default = "default_soak_min_requests")]
+    pub min_requests: u64,
+    /// How much the error rate may rise, as a fraction between 0 and 1,
+    /// against the rate measured when the window armed, before the
+    /// request-outcome signal fails. Defaults to 0.05.
+    #[serde(default = "default_soak_max_error_rate_delta")]
+    pub max_error_rate_delta: f64,
+    /// Whether a reload that published while any subsystem stayed on
+    /// prior state fails its soak. On by default, and when it fails it
+    /// fails immediately rather than waiting the window out: the
+    /// evidence is already in hand and no traffic is needed to confirm
+    /// it.
+    #[serde(default = "default_soak_flag")]
+    pub require_no_degraded_subsystems: bool,
+    /// Whether an unhealthy upstream, an open circuit breaker, or an
+    /// ejected outlier fails the soak. On by default. This is the signal
+    /// that catches a config which repointed an origin at a dead
+    /// address on a node with almost no traffic.
+    #[serde(default = "default_soak_flag")]
+    pub require_upstream_health: bool,
+    /// An optional operator-declared probe. Absent by default: the
+    /// other three signals need no configuration, and this one is for
+    /// whatever the operator knows and the proxy does not.
+    #[serde(default)]
+    pub probe: Option<ConfigSoakProbeConfig>,
+}
+
+impl Default for ConfigSoakConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            window_secs: default_soak_window_secs(),
+            min_requests: default_soak_min_requests(),
+            max_error_rate_delta: default_soak_max_error_rate_delta(),
+            require_no_degraded_subsystems: true,
+            require_upstream_health: true,
+            probe: None,
+        }
+    }
+}
+
+impl ConfigSoakConfig {
+    /// Rejects a zero window and an error-rate delta outside 0..=1.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable message naming the offending field.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.enabled && self.window_secs == 0 {
+            return Err(
+                "proxy.config_history.soak.window_secs must be at least 1 when the soak is \
+                 enabled; a zero window would promote on apply, which is the defect the soak \
+                 exists to fix"
+                    .to_string(),
+            );
+        }
+        if !(0.0..=1.0).contains(&self.max_error_rate_delta) {
+            return Err(format!(
+                "proxy.config_history.soak.max_error_rate_delta must be between 0 and 1, got {}",
+                self.max_error_rate_delta
+            ));
+        }
+        if let Some(probe) = &self.probe {
+            probe.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// An operator-declared HTTP probe the soak window runs alongside its
+/// other three signals (WOR-2458).
+///
+/// # This dials whatever URL you name, with no allowlist
+///
+/// The probe client is a plain HTTP client. It does **not** route
+/// through the egress guard that screens the proxy's other outbound
+/// dials, so `url` is a config-reachable fetch to any address this host
+/// can reach, loopback and link-local included. What keeps that bounded
+/// is that `proxy.config_history` sits on
+/// `AUTHORITY_DENIED_PATHS`: a config-authority
+/// document cannot set this key, so the only writer is an operator with
+/// write access to the node's own configuration file, who can already
+/// point an origin anywhere. Treat it the way you treat an origin URL,
+/// and prefer a loopback health endpoint on this node.
+///
+/// Deliberately separate from `proxy.synthetic_probe`, which the soak
+/// also reads. The synthetic
+/// driver fires an in-process request through the compiled handler chain
+/// against a non-network origin, so a passing run proves the chain
+/// executes and proves nothing about whether any upstream is reachable.
+/// An operator who wants a real upstream exercised declares this
+/// instead, and both can be on at once.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigSoakProbeConfig {
+    /// URL to `GET` on each probe tick.
+    pub url: String,
+    /// Status the response must carry. Defaults to 200.
+    #[serde(default = "default_soak_probe_expect_status")]
+    pub expect_status: u16,
+    /// Seconds between probe ticks. Defaults to 10.
+    #[serde(default = "default_soak_probe_interval_secs")]
+    pub interval_secs: u64,
+    /// Per-request timeout in milliseconds. Defaults to 2000. A probe
+    /// that times out fails the soak; it does not abstain.
+    #[serde(default = "default_soak_probe_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl ConfigSoakProbeConfig {
+    /// Rejects an empty URL and a zero interval.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable message naming the offending field.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.url.trim().is_empty() {
+            return Err("proxy.config_history.soak.probe.url must not be empty".to_string());
+        }
+        if self.interval_secs == 0 {
+            return Err(
+                "proxy.config_history.soak.probe.interval_secs must be at least 1".to_string(),
+            );
+        }
+        if self.timeout_ms == 0 {
+            // reqwest treats a zero timeout as "already expired", so
+            // every tick would fail, the operator-probe signal would
+            // fail every soak, and the last-known-good pointer would
+            // never advance again.
+            return Err(
+                "proxy.config_history.soak.probe.timeout_ms must be at least 1".to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// What a node does when the config it was told to boot on does not
+/// work (WOR-2459).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BootFallbackMode {
+    /// Exit, the way every release before this one did. The default, so
+    /// enabling the ring does not silently change how a broken config
+    /// behaves.
+    Off,
+    /// Walk the ring for a revision that boots, starting from the entry
+    /// the last-known-good pointer names.
+    LastKnownGood,
+}
+
+impl BootFallbackMode {
+    /// Stable wire name, matching what the CLI flag and the environment
+    /// variable accept.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::LastKnownGood => "last-known-good",
+        }
+    }
+
+    /// Parse a CLI flag or environment-variable value.
+    ///
+    /// Accepts both spellings of the enabled mode (`last-known-good` and
+    /// `last_known_good`) because the flag is typed by hand at 3am and
+    /// the config file spells it with an underscore.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "false" => Some(Self::Off),
+            "last-known-good" | "last_known_good" | "lkg" => Some(Self::LastKnownGood),
+            _ => None,
+        }
+    }
+}
+
+/// Default boot attempts before an entry is retired as unbootable.
+const fn default_boot_max_attempts() -> u32 {
+    3
+}
+
+/// Default seconds a boot must serve before it counts as successful.
+const fn default_boot_success_secs() -> u64 {
+    30
+}
+
+/// How a node boots when its own config file does not work (WOR-2459).
+///
+/// # Why a boot counter
+///
+/// An entry that was good in October need not construct after an upgrade
+/// that tightened validation. Borrowed from systemd-boot's boot
+/// counting: `boot_attempts` on the entry being tried is incremented on
+/// disk *before* the attempt and cleared once the process has bound its
+/// listeners and served for `success_secs`. An entry that fails
+/// `max_attempts` times is retired as unbootable and the walk
+/// continues down the ring. The ring is finite, so the walk terminates.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigBootConfig {
+    /// What to do when the configured document does not boot. Defaults
+    /// to `off`, so today's behavior is unchanged
+    /// unless asked for. `--config-fallback` and `SB_CONFIG_FALLBACK`
+    /// override this, and deliberately win: a rescue boot must not
+    /// depend on the file being right.
+    #[serde(default = "default_boot_fallback")]
+    pub fallback: BootFallbackMode,
+    /// How many times one ring entry may be tried before it is retired
+    /// as unbootable. Defaults to 3.
+    #[serde(default = "default_boot_max_attempts")]
+    pub max_attempts: u32,
+    /// How long a booted process must serve before its entry's boot
+    /// counter is cleared. Defaults to 30 seconds.
+    #[serde(default = "default_boot_success_secs")]
+    pub success_secs: u64,
+}
+
+/// Default boot fallback mode. See [`ConfigBootConfig::fallback`].
+const fn default_boot_fallback() -> BootFallbackMode {
+    BootFallbackMode::Off
+}
+
+impl Default for ConfigBootConfig {
+    fn default() -> Self {
+        Self {
+            fallback: BootFallbackMode::Off,
+            max_attempts: default_boot_max_attempts(),
+            success_secs: default_boot_success_secs(),
+        }
+    }
+}
+
+impl ConfigBootConfig {
+    /// Rejects a zero attempt ceiling.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable message naming the offending field.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_attempts == 0 {
+            return Err(
+                "proxy.config_history.boot.max_attempts must be at least 1; zero would retire \
+                 every candidate without trying it"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Durable last-known-good config history (WOR-2456): every config this
 /// proxy applies is kept as a content-addressed entry on local disk, so a
 /// rollback can restore a prior revision without depending on git history
@@ -1403,6 +1742,16 @@ pub struct ConfigHistoryConfig {
     /// retains for operator inspection. Defaults to 10.
     #[serde(default = "default_config_history_keep_rejected")]
     pub keep_rejected: usize,
+    /// The soak window a newly applied revision must survive before it
+    /// is promoted to last known good (WOR-2458). Defaults to a soak
+    /// that is on; see the `soak` block's own documentation for why an
+    /// opt-in block defaults its soak on.
+    #[serde(default)]
+    pub soak: ConfigSoakConfig,
+    /// What this node does when the config it was told to boot on does
+    /// not work (WOR-2459). Defaults to today's behavior: exit.
+    #[serde(default)]
+    pub boot: ConfigBootConfig,
 }
 
 impl Default for ConfigHistoryConfig {
@@ -1412,6 +1761,8 @@ impl Default for ConfigHistoryConfig {
             dir: default_config_history_dir(),
             keep: default_config_history_keep(),
             keep_rejected: default_config_history_keep_rejected(),
+            soak: ConfigSoakConfig::default(),
+            boot: ConfigBootConfig::default(),
         }
     }
 }
@@ -1432,6 +1783,8 @@ impl ConfigHistoryConfig {
                 self.keep
             ));
         }
+        self.soak.validate()?;
+        self.boot.validate()?;
         Ok(())
     }
 }
@@ -1450,6 +1803,115 @@ mod config_history_tests {
         assert_eq!(cfg.dir, "/var/lib/sbproxy/config-history");
         assert_eq!(cfg.keep, 20);
         assert_eq!(cfg.keep_rejected, 10);
+    }
+
+    /// WOR-2458. The soak block is on inside a block that is off, so
+    /// enabling the ring gets a moving last-known-good pointer rather
+    /// than one that never advances.
+    #[test]
+    fn config_history_soak_defaults_are_the_ticket_values() {
+        let cfg = ConfigHistoryConfig::default();
+        assert!(cfg.soak.enabled, "an enabled ring soaks by default");
+        assert_eq!(cfg.soak.window_secs, 120);
+        assert_eq!(cfg.soak.min_requests, 50);
+        assert!((cfg.soak.max_error_rate_delta - 0.05).abs() < f64::EPSILON);
+        assert!(cfg.soak.require_no_degraded_subsystems);
+        assert!(cfg.soak.require_upstream_health);
+        assert!(cfg.soak.probe.is_none());
+    }
+
+    /// WOR-2459. `off` is the default, so a node that turns on the ring
+    /// does not silently change what a broken config does.
+    #[test]
+    fn config_history_boot_defaults_to_off() {
+        let cfg = ConfigHistoryConfig::default();
+        assert_eq!(cfg.boot.fallback, BootFallbackMode::Off);
+        assert_eq!(cfg.boot.max_attempts, 3);
+        assert_eq!(cfg.boot.success_secs, 30);
+    }
+
+    /// WOR-2459. The flag is typed by hand under pressure; both
+    /// spellings and the config-file spelling all resolve.
+    #[test]
+    fn boot_fallback_mode_parses_both_spellings_and_refuses_a_typo() {
+        assert_eq!(BootFallbackMode::parse("off"), Some(BootFallbackMode::Off));
+        assert_eq!(
+            BootFallbackMode::parse("last-known-good"),
+            Some(BootFallbackMode::LastKnownGood)
+        );
+        assert_eq!(
+            BootFallbackMode::parse("LAST_KNOWN_GOOD"),
+            Some(BootFallbackMode::LastKnownGood)
+        );
+        assert_eq!(BootFallbackMode::parse("last-known-goo"), None);
+        assert_eq!(BootFallbackMode::Off.as_str(), "off");
+        assert_eq!(BootFallbackMode::LastKnownGood.as_str(), "last-known-good");
+    }
+
+    /// `fallback: off` is what the documentation shows, so it has to
+    /// parse as the enum rather than as a YAML 1.1 boolean.
+    #[test]
+    fn boot_fallback_off_parses_from_bare_yaml_off() {
+        let cfg: ConfigHistoryConfig =
+            serde_yaml::from_str("enabled: true\nboot:\n  fallback: off\n")
+                .expect("bare off parses");
+        assert_eq!(cfg.boot.fallback, BootFallbackMode::Off);
+    }
+
+    /// The blocks parse from YAML with the keys the documentation names.
+    #[test]
+    fn config_history_parses_the_soak_and_boot_sub_blocks() {
+        let yaml = r#"
+enabled: true
+dir: /var/lib/sbproxy/config-history
+soak:
+  window_secs: 60
+  min_requests: 10
+  max_error_rate_delta: 0.02
+  require_no_degraded_subsystems: true
+  require_upstream_health: false
+  probe:
+    url: http://127.0.0.1:8080/healthz
+    expect_status: 204
+    interval_secs: 5
+boot:
+  fallback: last_known_good
+  max_attempts: 2
+  success_secs: 15
+"#;
+        let cfg: ConfigHistoryConfig = serde_yaml::from_str(yaml).expect("parses");
+        assert_eq!(cfg.soak.window_secs, 60);
+        assert_eq!(cfg.soak.min_requests, 10);
+        assert!(!cfg.soak.require_upstream_health);
+        let probe = cfg.soak.probe.clone().expect("probe block");
+        assert_eq!(probe.url, "http://127.0.0.1:8080/healthz");
+        assert_eq!(probe.expect_status, 204);
+        assert_eq!(probe.interval_secs, 5);
+        assert_eq!(probe.timeout_ms, 2_000, "the default carries through");
+        assert_eq!(cfg.boot.fallback, BootFallbackMode::LastKnownGood);
+        assert_eq!(cfg.boot.max_attempts, 2);
+        assert_eq!(cfg.boot.success_secs, 15);
+        cfg.validate().expect("valid");
+    }
+
+    /// A zero window would promote on apply, which is the defect the
+    /// soak exists to fix.
+    #[test]
+    fn config_history_validate_rejects_a_zero_soak_window() {
+        let mut cfg = ConfigHistoryConfig::default();
+        cfg.soak.window_secs = 0;
+        let error = cfg.validate().expect_err("zero window");
+        assert!(error.contains("soak.window_secs"), "{error}");
+    }
+
+    /// Zero attempts would retire every candidate without trying it,
+    /// which is an exhausted ring dressed as a fallback.
+    #[test]
+    fn config_history_validate_rejects_zero_boot_attempts() {
+        let mut cfg = ConfigHistoryConfig::default();
+        cfg.boot.max_attempts = 0;
+        let error = cfg.validate().expect_err("zero attempts");
+        assert!(error.contains("boot.max_attempts"), "{error}");
     }
 
     #[test]
