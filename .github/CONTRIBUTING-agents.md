@@ -155,6 +155,29 @@ bash scripts/check.sh
 The pinned toolchain is 1.98; Homebrew's 1.95 misses some lints, so CI on 1.98 is the
 authoritative lint and doc run.
 
+**Report a gate result by quoting its `GATE_EXIT` line, never by calling it green.** The
+last line of every run, success or failure, is one quotable line:
+
+```
+GATE_EXIT=0 tests=15489 failures=0 skipped_phases=0 elapsed=2413s
+GATE_EXIT=100 tests=15489 failures=1 failed_phase=cargo test skipped_phases=2 elapsed=1920s
+```
+
+"It was green" cannot tell those two apart, and it hides the `SKIPPED PHASES` block
+completely: a run that stopped at the first cargo phase and a run that finished everything
+both get described the same way. Quote the line, and quote the `SKIPPED PHASES` block with
+it if it is not empty. `tests=not-run` means the test phase never executed, which is a
+different thing from zero failures.
+
+**A run with `-p` is not a gate run.** Every cargo phase in `check.sh` is `--workspace`, and
+the payments phase says why in its own comment: narrow the tests, never the packages. A
+package selection changes the feature union, so a run scoped to one crate resolves different
+features, compiles different code, and reports a different lint set from the one CI runs. It
+is not this gate with less in it, it is a different check wearing its name. `check.sh` now
+refuses `-p`, `--package`, `--exclude`, `--features`, `--all-features`, and
+`--no-default-features` with that explanation and exit 2, so the mistake cannot be made
+quietly. Per-crate commands are for the iteration loop and are listed above.
+
 The payment settlement features run in that gate by default. They are the only place
 `clippy::items_after_test_module` and the feature-gated majority of `sbproxy-billing` compile
 at all, and they were opt-in until that cost a round trip. `SBPROXY_CHECK_PAYMENTS=0` still

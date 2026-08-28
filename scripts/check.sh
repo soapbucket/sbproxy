@@ -55,6 +55,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# Wall clock for the GATE_EXIT line the cleanup trap prints.
+GATE_STARTED="$(date +%s)"
+
 # --- Diff scoping -------------------------------------------------------
 #
 # `--scope-to-diff [<base>]` runs only the phases the diff can reach.
@@ -111,6 +114,23 @@ while [ "$#" -gt 0 ]; do
       printf '  --explain                 print that decision per changed path and\n'
       printf '                            run nothing.\n'
       exit 0
+      ;;
+    -p|--package|--exclude|--features|--all-features|--no-default-features)
+      # The one wrong argument worth its own message. Every cargo phase
+      # below is --workspace, and the payments phase says it in its own
+      # comment: narrow the tests, never the packages. A package
+      # selection changes the feature union, so a run scoped to one crate
+      # resolves different features, compiles different code, and reports
+      # a different lint set from the one CI runs. It is not this gate
+      # with less in it; it is a different check wearing its name.
+      printf 'check.sh takes no cargo package or feature selection (%s).\n\n' "$1" >&2
+      printf 'Every cargo phase in this gate is --workspace. Narrowing the\n' >&2
+      printf 'package selection changes the feature union, so the result is\n' >&2
+      printf 'not a smaller gate run, it is a different one. For the scoped\n' >&2
+      printf 'iteration loop use the per-crate commands in\n' >&2
+      printf '.github/CONTRIBUTING-agents.md, and run this with no arguments\n' >&2
+      printf 'before you push.\n' >&2
+      exit 2
       ;;
     *)
       printf 'unknown argument: %s\n\n' "$1" >&2
@@ -198,9 +218,11 @@ step() {
 # the very end. "All checks passed" must never be able to hide a lane
 # that never executed.
 SKIPPED=''
+SKIPPED_COUNT=0
 
 note_skip() {
   SKIPPED="${SKIPPED}  * $1"$'\n'
+  SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
   printf '\n\033[1;33m!!! SKIPPED:\033[0m %s\n' "$1"
 }
 
@@ -244,13 +266,53 @@ print_skip_summary() {
   printf '\033[1;33m========================================================\033[0m\n'
 }
 
+# Runs on every exit path, success or failure, and its last act is the
+# one line a gate result should ever be quoted as.
+#
+# "It was green" is not a result. It cannot distinguish a full run from
+# one that stopped at the first cargo phase, and it hides the SKIPPED
+# PHASES block entirely. GATE_EXIT carries the exit code, the test counts
+# the run actually produced, the phase it died in when it died, and how
+# many phases did not run. Quote that line.
+#
+# The counts come from the junit file nextest's ci profile writes, read
+# BEFORE cleanup-build-artifacts.sh prunes target/nextest, which is why
+# this is the first thing the function does. Every step here tolerates
+# its own failure: a cleanup trap that errors would mask the exit code it
+# exists to report.
 cleanup() {
+  local rc=$?
+  local junit tests failures head_bytes
+  junit="${CARGO_TARGET_DIR:-$ROOT/target}/nextest/ci/junit.xml"
+  tests='not-run'
+  failures='not-run'
+  if [ -f "$junit" ]; then
+    head_bytes="$(head -c 4000 "$junit" 2>/dev/null || true)"
+    tests="$(printf '%s' "$head_bytes" | tr ' ' '\n' \
+      | sed -n 's/^tests="\([0-9]*\)"$/\1/p' | head -1)"
+    failures="$(printf '%s' "$head_bytes" | tr ' ' '\n' \
+      | sed -n 's/^failures="\([0-9]*\)"$/\1/p' | head -1)"
+    tests="${tests:-unparsed}"
+    failures="${failures:-unparsed}"
+  fi
+
   if [ -n "${BATCH_DIR:-}" ]; then
     rm -rf "$BATCH_DIR"
   fi
   if [ "${SBPROXY_CLEAN_AFTER_BUILD:-1}" != "0" ]; then
-    "$ROOT/scripts/cleanup-build-artifacts.sh"
+    "$ROOT/scripts/cleanup-build-artifacts.sh" || true
   fi
+
+  if [ "$rc" = "0" ]; then
+    printf '\nGATE_EXIT=%s tests=%s failures=%s skipped_phases=%s elapsed=%ss\n' \
+      "$rc" "$tests" "$failures" "${SKIPPED_COUNT:-0}" \
+      "$(( $(date +%s) - GATE_STARTED ))"
+  else
+    printf '\nGATE_EXIT=%s tests=%s failures=%s failed_phase=%s skipped_phases=%s elapsed=%ss\n' \
+      "$rc" "$tests" "$failures" "${STEP_LABEL:-unknown}" "${SKIPPED_COUNT:-0}" \
+      "$(( $(date +%s) - GATE_STARTED ))"
+  fi
+  return "$rc"
 }
 trap cleanup EXIT
 
