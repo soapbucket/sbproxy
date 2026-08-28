@@ -3471,6 +3471,11 @@ fn handle_config_history_list() -> (u16, &'static str, String) {
     let body = serde_json::json!({
         "lineage": recorder.lineage(),
         "lkg_revision": recorder.lkg().map(|entry| entry.revision),
+        // Which revision is under judgement right now, if any. An
+        // operator looking at a ring whose `lkg_revision` has not moved
+        // needs to know whether that is because a window is still open
+        // or because the last one did not promote (WOR-2458).
+        "soak_revision": crate::config_soak::in_flight_revision(),
         "entries": entries,
         // Additive: `entries` keeps its existing shape and meaning, and
         // `timeline` interleaves the refused candidates among them for a
@@ -12377,9 +12382,15 @@ mod tests {
             .collect();
         assert_eq!(
             top,
-            ["lineage", "lkg_revision", "entries", "timeline"]
-                .into_iter()
-                .collect(),
+            [
+                "lineage",
+                "lkg_revision",
+                "soak_revision",
+                "entries",
+                "timeline"
+            ]
+            .into_iter()
+            .collect(),
         );
         assert_eq!(parsed["lkg_revision"], serde_json::Value::Null);
         assert!(parsed["lineage"].as_str().is_some_and(|s| !s.is_empty()));

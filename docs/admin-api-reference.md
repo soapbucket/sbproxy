@@ -2703,6 +2703,7 @@ on and the retention it applies.
 |---|---|---|
 | `lineage` | string | UUID minted the first time this ring was created. Stable across restarts and `source:` repoints. |
 | `lkg_revision` | number or null | Revision number of the entry marked last-known-good, or `null` when nothing has been marked yet. |
+| `soak_revision` | number or null | The revision under soak right now, or `null` when no window is in flight. A `lkg_revision` that has not moved means one of two different things, and this is what tells them apart: a window still open, or a window that closed without promoting. |
 | `entries` | array | Newest first. |
 | `entries[].revision` | number | Node-local, monotonic. Durable across restart, never reused. One repair exception: if both the ring's `index.json` and its backup copy are lost or corrupted, the ring reinitializes and numbering restarts at 1. |
 | `entries[].digest` | string | SHA-256 of the pre-resolution document, lowercase hex, no scheme prefix. |

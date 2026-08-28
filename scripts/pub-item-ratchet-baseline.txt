@@ -1024,3 +1024,30 @@ unreferenced number is two below this branch's 1522 and forty-seven above
 main's 1473, because main's anomaly and auth-provider work gave out-of-file
 consumers to two items this branch had left file-local; neither parent's
 figure describes the merged tree, so neither was taken.
+
+2026-08-28 (WOR-2455 config rollback core, merged with main at 304d6d53):
+tests-only unchanged at 324, unreferenced 1520 to 1523. Three additions,
+all of the kind this list already carries in bulk.
+
+`ConfigBootConfig` in `sbproxy-config/src/types.rs` is the `boot:` block
+under `proxy.config_history`, pub for the same reason every other node of
+the config tree is: serde constructs it, the schema generator walks it, and
+narrowing it breaks the derive on the pub parent. Production reads its
+three fields in `sbproxy-core/src/server/lifecycle.rs::boot_document`
+through the parent, so the field names appear and the type name does not.
+Its two siblings, `ConfigSoakConfig` and `ConfigSoakProbeConfig`, are not
+on the list because `sbproxy-core/src/config_soak.rs` names both.
+
+`FailedCandidate` and `FallbackDocument` in
+`sbproxy-core/src/config_boot.rs` are the error payload and the return of
+`walk_for_bootable`, so both have to be at least as visible as it is. The
+module itself is pub because `crates/sbproxy/src/main.rs` reads
+`EXIT_CONFIG_RING_EXHAUSTED` from it to choose the process exit code.
+
+Two avoidable items were narrowed before recording this rather than raising
+the number for them. `sbproxy-core/src/config_soak.rs` is a `pub(crate)`
+module with every item narrowed to match, since the reload transaction and
+the admin surface are its only consumers and both are in-crate;
+`config_subscriber::rejection_reason_for` is `pub(crate)` for the same
+reason. `config_soak::clear` is `#[cfg(test)]`: no production path drops a
+soak window without a verdict.

@@ -137,7 +137,14 @@ pub mod config_gossip;
 /// every config this process applies, recorded once by the shared
 /// reload transaction, and read back by the admin history surface.
 pub mod config_history;
-pub mod config_soak;
+/// The soak window that decides whether an applied config revision
+/// becomes this node's last known good (WOR-2458).
+///
+/// Crate-visible rather than public: every consumer is inside this
+/// crate (the reload transaction arms a window, the admin surface
+/// closes one), and nothing outside it has a reason to reach a soak
+/// verdict on this process's behalf.
+pub(crate) mod config_soak;
 /// Honouring `source:`: resolve the config document from a git
 /// repository (or an overlay chain over one), keep it fresh on a timer,
 /// and hand the result to the shared reload transaction.

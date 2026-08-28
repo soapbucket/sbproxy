@@ -480,7 +480,7 @@ impl CycleRefusal {
 /// non-refusals ([`CycleResult::Applied`], [`CycleResult::NotModified`],
 /// [`CycleResult::Unreachable`]) never had a candidate to refuse.
 #[must_use]
-pub fn rejection_reason_for(result: CycleResult) -> Option<sbproxy_config::RejectionReason> {
+pub(crate) fn rejection_reason_for(result: CycleResult) -> Option<sbproxy_config::RejectionReason> {
     use sbproxy_config::RejectionReason;
     match result {
         CycleResult::VerifyFailed => Some(RejectionReason::VerifyFailed),

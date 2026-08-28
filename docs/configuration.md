@@ -1321,8 +1321,8 @@ is a veto: it can fail a soak and it cannot pass one, for the same reason
 this block exists at all. Something that actually observed traffic, an
 upstream, or a probe has to be what promotes a revision.
 
-On a node with little organic traffic, turn on
-[`synthetic_probe`](#synthetic_probe). Flagger's field experience is the
+On a node with little organic traffic, turn on `proxy.synthetic_probe`.
+Flagger's field experience is the
 warning worth copying: a canary that receives no traffic fails its metric
 check with "no values found for metric request-success-rate" and eventually
 rolls back, and insufficient traffic is documented as the most common cause

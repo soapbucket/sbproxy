@@ -84,7 +84,7 @@ use sbproxy_config::{ConfigSoakConfig, ConfigSoakProbeConfig, SoakVerdict};
 
 /// One signal's report into a soak window.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SignalOutcome {
+pub(crate) enum SignalOutcome {
     /// The signal measured something and it was fine.
     Pass,
     /// The signal measured something and it was not fine. Carries what
@@ -100,7 +100,7 @@ pub enum SignalOutcome {
 impl SignalOutcome {
     /// Stable metric label for this outcome.
     #[must_use]
-    pub const fn as_str(&self) -> &'static str {
+    pub(crate) const fn as_str(&self) -> &'static str {
         match self {
             Self::Pass => "passed",
             Self::Fail(_) => "failed",
@@ -110,7 +110,7 @@ impl SignalOutcome {
 
     /// The explanation, when there is one.
     #[must_use]
-    pub fn detail(&self) -> Option<&str> {
+    pub(crate) fn detail(&self) -> Option<&str> {
         match self {
             Self::Pass => None,
             Self::Fail(detail) | Self::Abstain(detail) => Some(detail),
@@ -120,7 +120,7 @@ impl SignalOutcome {
 
 /// Which of the four signals reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SoakSignal {
+pub(crate) enum SoakSignal {
     /// Subsystems that stayed on prior state while the pipeline
     /// published.
     DegradedSubsystems,
@@ -137,7 +137,7 @@ pub enum SoakSignal {
 impl SoakSignal {
     /// Stable metric label. Never changes for a given variant.
     #[must_use]
-    pub const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::DegradedSubsystems => "degraded_subsystems",
             Self::UpstreamHealth => "upstream_health",
@@ -157,19 +157,19 @@ impl SoakSignal {
 /// config that repointed an origin somewhere slow shows up here even
 /// while the retries are still succeeding.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RequestCounts {
+pub(crate) struct RequestCounts {
     /// Requests completed since process start.
-    pub requests: u64,
+    pub(crate) requests: u64,
     /// Requests that finished at `400` or above, plus upstream status
     /// and timeout retries.
-    pub errors: u64,
+    pub(crate) errors: u64,
 }
 
 impl RequestCounts {
     /// Difference between a later sample and an earlier one, saturating
     /// at zero so a counter reset cannot produce a negative rate.
     #[must_use]
-    pub fn since(self, baseline: Self) -> Self {
+    pub(crate) fn since(self, baseline: Self) -> Self {
         Self {
             requests: self.requests.saturating_sub(baseline.requests),
             errors: self.errors.saturating_sub(baseline.errors),
@@ -178,7 +178,7 @@ impl RequestCounts {
 
     /// Error rate over this window, or `None` when it observed nothing.
     #[must_use]
-    pub fn error_rate(self) -> Option<f64> {
+    pub(crate) fn error_rate(self) -> Option<f64> {
         if self.requests == 0 {
             return None;
         }
@@ -194,7 +194,7 @@ impl RequestCounts {
 /// first, so a node that has served no traffic yet has no family to hold
 /// a handle to, and the absence is a zero rather than an error.
 #[must_use]
-pub fn observe_request_counts() -> RequestCounts {
+pub(crate) fn observe_request_counts() -> RequestCounts {
     let mut counts = RequestCounts::default();
     for family in prometheus::gather() {
         let name = family.name();
@@ -239,7 +239,7 @@ pub fn observe_request_counts() -> RequestCounts {
 /// why an armed window whose reload came up degraded never waits: the
 /// evidence is already in hand.
 #[must_use]
-pub fn degraded_signal(degraded: &[String], require_none: bool) -> SignalOutcome {
+pub(crate) fn degraded_signal(degraded: &[String], require_none: bool) -> SignalOutcome {
     if !require_none {
         return SignalOutcome::Abstain(
             "require_no_degraded_subsystems is off for this node".to_string(),
@@ -266,7 +266,7 @@ pub fn degraded_signal(degraded: &[String], require_none: bool) -> SignalOutcome
 /// upstream instrumentation promote on the strength of a signal that
 /// measured nothing.
 #[must_use]
-pub fn upstream_health_signal(
+pub(crate) fn upstream_health_signal(
     config: &ConfigSoakConfig,
     open_breakers: &[String],
     observed: usize,
@@ -297,7 +297,7 @@ pub fn upstream_health_signal(
 /// common cause of a spurious rollback in the systems that got this
 /// wrong before us.
 #[must_use]
-pub fn request_outcome_signal(
+pub(crate) fn request_outcome_signal(
     config: &ConfigSoakConfig,
     baseline: RequestCounts,
     current: RequestCounts,
@@ -333,7 +333,7 @@ pub fn request_outcome_signal(
 
 /// What one probe tick observed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProbeObservation {
+pub(crate) enum ProbeObservation {
     /// The probe ran and got what it expected.
     Ok,
     /// The probe ran and got something else. Carries what.
@@ -356,7 +356,7 @@ pub enum ProbeObservation {
 /// Absent both a declared probe and a running synthetic driver, this
 /// abstains: there is nothing to observe.
 #[must_use]
-pub fn probe_signal(observation: Option<&ProbeObservation>) -> SignalOutcome {
+pub(crate) fn probe_signal(observation: Option<&ProbeObservation>) -> SignalOutcome {
     match observation {
         None => SignalOutcome::Abstain(
             "no operator probe is declared and no synthetic driver is running".to_string(),
@@ -381,7 +381,7 @@ pub fn probe_signal(observation: Option<&ProbeObservation>) -> SignalOutcome {
 /// * an empty report set, or one where every signal abstained, is
 ///   [`SoakVerdict::Inconclusive`].
 #[must_use]
-pub fn aggregate(reports: &[(SoakSignal, SignalOutcome)]) -> SoakVerdict {
+pub(crate) fn aggregate(reports: &[(SoakSignal, SignalOutcome)]) -> SoakVerdict {
     if reports
         .iter()
         .any(|(_, outcome)| matches!(outcome, SignalOutcome::Fail(_)))
@@ -399,7 +399,7 @@ pub fn aggregate(reports: &[(SoakSignal, SignalOutcome)]) -> SoakVerdict {
 
 /// Stable metric label for a verdict.
 #[must_use]
-pub const fn verdict_label(verdict: SoakVerdict) -> &'static str {
+pub(crate) const fn verdict_label(verdict: SoakVerdict) -> &'static str {
     match verdict {
         SoakVerdict::Successful => "passed",
         SoakVerdict::Failed => "failed",
@@ -409,25 +409,25 @@ pub const fn verdict_label(verdict: SoakVerdict) -> &'static str {
 
 /// One soak window in flight.
 #[derive(Debug, Clone)]
-pub struct SoakWindow {
+pub(crate) struct SoakWindow {
     /// Ring revision this window is judging.
-    pub revision: u64,
+    pub(crate) revision: u64,
     /// Content digest of that revision, carried so a log line and a
     /// decision event can name it without another ring read.
-    pub digest: String,
+    pub(crate) digest: String,
     /// Unix milliseconds the window closes at.
-    pub closes_at_ms: u64,
+    pub(crate) closes_at_ms: u64,
     /// Request counters at the instant the window armed.
-    pub baseline: RequestCounts,
+    pub(crate) baseline: RequestCounts,
     /// Error rate this node was running at before the window armed,
     /// when it was running enough traffic to have one.
-    pub baseline_error_rate: Option<f64>,
+    pub(crate) baseline_error_rate: Option<f64>,
     /// Subsystems the reload published without.
-    pub degraded: Vec<String>,
+    pub(crate) degraded: Vec<String>,
     /// The soak block in force for this window.
-    pub config: ConfigSoakConfig,
+    pub(crate) config: ConfigSoakConfig,
     /// The most recent probe tick's observation, when a probe has run.
-    pub probe: Option<ProbeObservation>,
+    pub(crate) probe: Option<ProbeObservation>,
 }
 
 /// The process-wide slot holding the window in flight, if any.
@@ -457,7 +457,7 @@ fn now_ms() -> u64 {
 /// verdict, so it can never later promote a revision that is no longer
 /// running. The superseded revision's entry stays `applied`, which is
 /// the honest record of what happened to it.
-pub fn arm(
+pub(crate) fn arm(
     revision: u64,
     digest: &str,
     degraded: &[String],
@@ -517,7 +517,7 @@ pub fn arm(
 
 /// The revision the window in flight is judging, if any.
 #[must_use]
-pub fn in_flight_revision() -> Option<u64> {
+pub(crate) fn in_flight_revision() -> Option<u64> {
     in_flight()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -525,10 +525,15 @@ pub fn in_flight_revision() -> Option<u64> {
         .map(|window| window.revision)
 }
 
-/// Drop the window in flight without reaching a verdict. Used by tests
-/// and by the boot fallback, which must not inherit a window armed by
-/// the configuration it just replaced.
-pub fn clear() {
+/// Drop the window in flight without reaching a verdict.
+///
+/// Tests only. The soak slot is process-global, so one test's armed
+/// window would otherwise be judged by the next test's `confirm_now`.
+/// No production path drops a window without a verdict: the two ways
+/// one ends are the timer and an operator's confirmation, and a third
+/// reload supersedes it through [`arm`] rather than through this.
+#[cfg(test)]
+pub(crate) fn clear() {
     *in_flight()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
@@ -536,7 +541,7 @@ pub fn clear() {
 
 /// Record the most recent probe observation against the window in
 /// flight. A no-op when no window is armed.
-pub fn record_probe(observation: ProbeObservation) {
+pub(crate) fn record_probe(observation: ProbeObservation) {
     if let Some(window) = in_flight()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -552,7 +557,7 @@ pub fn record_probe(observation: ProbeObservation) {
 /// sampled inputs rather than a live pipeline, and so the aggregate and
 /// per-signal metrics are emitted in exactly one place.
 #[must_use]
-pub fn judge(
+pub(crate) fn judge(
     window: &SoakWindow,
     current: RequestCounts,
     open_breakers: &[String],
@@ -593,7 +598,7 @@ fn record_signal(signal: SoakSignal, outcome: &SignalOutcome) {
 /// the verdict it reached.
 ///
 /// `None` when no window is armed or the window has not closed yet.
-pub fn close_due() -> Option<(u64, SoakVerdict, Vec<(SoakSignal, SignalOutcome)>)> {
+pub(crate) fn close_due() -> Option<(u64, SoakVerdict, Vec<(SoakSignal, SignalOutcome)>)> {
     let window = {
         let mut slot = in_flight()
             .lock()
@@ -614,7 +619,7 @@ pub fn close_due() -> Option<(u64, SoakVerdict, Vec<(SoakSignal, SignalOutcome)>
 ///
 /// `None` when no window is in flight, which is what makes that route
 /// answer `409` rather than pretending to promote something.
-pub fn confirm_now() -> Option<(u64, SoakVerdict, Vec<(SoakSignal, SignalOutcome)>)> {
+pub(crate) fn confirm_now() -> Option<(u64, SoakVerdict, Vec<(SoakSignal, SignalOutcome)>)> {
     let window = in_flight()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -699,7 +704,7 @@ fn publish_soak_event(
 /// without installing a process-wide sink, which is set-once and so
 /// cannot be staged per test.
 #[must_use]
-pub fn soak_event(
+pub(crate) fn soak_event(
     window: &SoakWindow,
     verdict: SoakVerdict,
     reports: &[(SoakSignal, SignalOutcome)],
@@ -811,7 +816,7 @@ fn synthetic_observation() -> Option<ProbeObservation> {
 ///
 /// A no-op when no window is ever armed, which is every node that has
 /// not enabled `proxy.config_history`.
-pub fn spawn() {
+pub(crate) fn spawn() {
     let client = match reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
