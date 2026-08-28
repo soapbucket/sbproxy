@@ -4970,6 +4970,35 @@ mod governed_usage_attribution_tests {
         assert_ne!(event.key_id.as_deref(), Some("mutable display name"));
     }
 
+    /// WOR-2622: a stream priced from the gateway's own tokenizer count
+    /// reports zero to the usage sinks.
+    ///
+    /// The counts are on the context because the internal budgets and
+    /// the access log take them. A usage sink is an external spend
+    /// report with no provenance column of its own, so a report that
+    /// blended a provider's numbers with this gateway's would be worse
+    /// than one that reports nothing, and there would be no field on the
+    /// record to tell the two apart afterwards.
+    #[test]
+    fn an_estimated_stream_reports_no_tokens_to_the_usage_sinks() {
+        let mut ctx = crate::context::RequestContext::new();
+        ctx.response_status = Some(200);
+        ctx.ai_tokens_in = Some(11);
+        ctx.ai_tokens_out = Some(7);
+        ctx.ai_usage_source = Some("estimated");
+
+        let event = usage_event_from_context(&ctx, "openai".to_string());
+
+        assert_eq!(event.prompt_tokens, 0);
+        assert_eq!(event.completion_tokens, 0);
+        assert_eq!(event.total_tokens, 0);
+
+        ctx.ai_usage_source = Some("measured");
+        let event = usage_event_from_context(&ctx, "openai".to_string());
+        assert_eq!(event.prompt_tokens, 11);
+        assert_eq!(event.completion_tokens, 7);
+    }
+
     /// A value recorder over an in-memory ledger priced against
     /// `gpt-4o-mini` for the served model `qwen3-14b`, the shape
     /// `examples/use-case-local-first` configures.
