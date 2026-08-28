@@ -2980,7 +2980,7 @@ has the runnable form.
 | `restored_revision` | number | The ring revision whose document is now serving. |
 | `previous_revision` | number | The revision that was running, now marked `reverted`. |
 | `appended_revision` | number | The **new** entry this rollback appended. History is append-only, so a rollback is itself in the history. `null` when the restored document is byte identical to what was already running. |
-| `blast_radius` | string | `hitless`, `reload`, `restart`, or `breaking`, computed between the two stored documents. `null` when either failed to parse. |
+| `blast_radius` | string | `hitless`, `reload`, `restart`, or `breaking`, computed between the two stored documents. `null` in three cases: the ring holds no prior entry to compare against, the running revision's stored blob could not be read, or either document no longer parses. A `null` radius is treated as one that needs confirming, not as a safe one. |
 | `soaking` | bool | Whether a soak window is now open on the restored revision. |
 | `secrets_fingerprint_changed` | bool | The secret backends moved since the restored document applied, so a `${VAR}`, `vault://`, or `secret://` reference inside it may resolve to a different value now. |
 | `config_file_unchanged` | bool | Always `true`. This route applies a document; it does not rewrite the node's config file. |
@@ -2994,7 +2994,7 @@ Mutating, so a read-only operator is refused. Authenticated exactly like
 | `200` | The rollback applied. |
 | `400` | The body is not a JSON object, or names more than one target. |
 | `404` | `proxy.config_history` is absent or `enabled: false`; or no revision was ever promoted (`no_last_known_good`); or the named revision or digest is not in the ring (`unknown_revision`, `unknown_digest`, with `available_revisions` / `available_digests` naming what is). |
-| `409` | A precondition the caller can fix and retry: `stale_expected_current` (both revisions named), `lineage_mismatch` (both lineages named), `restart_not_confirmed` (the radius named). |
+| `409` | A precondition the caller can fix and retry: `stale_expected_current` (both revisions named), `lineage_mismatch` (both lineages named), `restart_not_confirmed` (the radius named), `unknown_radius_not_confirmed` (the radius could not be measured, so confirming is required rather than assumed unnecessary). |
 | `422` | `apply_failed`: the stored document no longer constructs on this build. The running configuration is untouched, and the refused candidate is kept under `rejected/` with `rollback` as its stage. |
 | `500` | The stored blob could not be read, or no config path is wired on this node. |
 | `503` | The block is enabled but the ring failed to open at boot. |
@@ -3005,6 +3005,16 @@ revisions. A success counts on
 `sbproxy_config_apply_total{outcome="applied"}` and a refusal on
 `{outcome="rejected"}`; an automatic revert counts `{outcome="reverted"}`,
 disjoint from the manual one.
+
+An armed node that decides **not** to revert also publishes a
+`config_rollback` event, with `outcome: "declined"` and a `reason` of
+`not_arc_swappable`, `radius_unknown`, `would_loop`,
+`already_on_last_known_good`, `no_last_known_good`, or
+`history_unavailable`, and counts `{outcome="declined"}`. Without it a
+change that failed its soak fleet-wide and reverted nowhere left the
+`reverted` counter flat, which reads the same as no soak having failed.
+A node running the default `auto_revert: false` does not count
+`declined`.
 
 ---
 

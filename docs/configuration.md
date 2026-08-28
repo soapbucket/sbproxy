@@ -1438,6 +1438,17 @@ A revert counts on `sbproxy_config_apply_total{outcome="reverted"}`, which
 is disjoint from the `applied` a manual rollback counts, so "did anything
 roll this fleet back without an operator" is one query.
 
+Every one of the refusals above counts too, on
+`{outcome="declined"}`, and publishes a `config_rollback` event with the
+reason. That matters more than it sounds: a change that fails its soak on
+every node and is declined on every node leaves the `reverted` counter
+flat, which reads exactly like no soak having failed. Alert on
+`declined` alongside `reverted`, and read the reason off the event. A
+node running the default `auto_revert: false` does not count `declined`,
+because it is the default and would drown the signal;
+`sbproxy_config_soak_verdict_total{verdict="failed"}` is where an unarmed
+node's failed soak shows up.
+
 #### rollback
 
 `POST /admin/config/rollback` re-applies a revision the ring already

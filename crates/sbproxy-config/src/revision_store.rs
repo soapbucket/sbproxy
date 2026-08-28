@@ -1067,9 +1067,16 @@ impl RevisionStore {
     /// ring top to bottom still tells the whole story in order.
     ///
     /// Distinct from [`RevisionState::Failed`], which is a soak verdict:
-    /// an operator can roll away from a revision that soaked perfectly
-    /// (a change that worked but was not wanted), and an auto-revert
-    /// sets both, in that order.
+    /// an operator can roll away from a revision that soaked perfectly,
+    /// a change that worked but was not wanted.
+    ///
+    /// An automatic revert reaches a revision that is already `Failed`,
+    /// and `state` is one field, so this **overwrites** that mark rather
+    /// than adding to it. The soak's own answer is not lost: it lives on
+    /// `soak_verdict`, which nothing here touches, and that is the field
+    /// [`Self::boot_candidates`] reads when it decides what may boot.
+    /// Anything else that needs to know whether a soak condemned a
+    /// revision must read `soak_verdict` too, for the same reason.
     ///
     /// # Errors
     ///
@@ -1161,10 +1168,20 @@ impl RevisionStore {
     ///
     /// 1. the entry the `lkg` pointer names, because it is the only one
     ///    a soak window ever judged against real traffic;
-    /// 2. every other entry that is not [`RevisionState::Failed`],
-    ///    newest first, because a more recent applied revision is closer
-    ///    to what the operator meant than an older one;
+    /// 2. every other entry no soak measured as bad, newest first,
+    ///    because a more recent applied revision is closer to what the
+    ///    operator meant than an older one;
     /// 3. the entries a soak measured as bad, newest first, last.
+    ///
+    /// The demotion keys on `soak_verdict`, **not** on
+    /// [`RevisionState::Failed`], and that distinction is load bearing.
+    /// There is one `state` field and two writers:
+    /// [`Self::record_soak_verdict`] writes `Failed` and
+    /// [`Self::mark_reverted`] writes `Reverted` over it. An automatic
+    /// revert is exactly the sequence that does both to one revision,
+    /// so reading `state` here let the revision a soak had just
+    /// measured as breaking traffic climb back out of this group.
+    /// `soak_verdict` survives both writes.
     ///
     /// Step 3 is the part worth reading twice. A `Failed` entry is one a
     /// soak window watched under real traffic and judged bad; the epic's
@@ -1200,7 +1217,7 @@ impl RevisionStore {
             {
                 continue;
             }
-            if entry.state == RevisionState::Failed {
+            if entry.soak_verdict == Some(SoakVerdict::Failed) {
                 measured_bad.push(entry.clone());
             } else {
                 candidates.push(entry.clone());
@@ -2254,6 +2271,61 @@ mod tests {
                 .iter()
                 .any(|entry| entry.revision == newer_broken.revision),
             "a failed revision is demoted, not deleted",
+        );
+    }
+
+    /// Review Major 3. The demotion above read `entry.state`, and
+    /// `mark_reverted` writes the same single field, so an automatic
+    /// revert overwrote `Failed` with `Reverted` and the revision a soak
+    /// measured as breaking traffic climbed back out of the last-resort
+    /// group. That is the epic's success criterion inverted by the
+    /// feature meant to uphold it: `auto_revert` is the only thing that
+    /// writes both marks to one revision.
+    ///
+    /// `soak_verdict` survives both writes, which is what the demotion
+    /// keys on now.
+    #[test]
+    fn a_soak_failed_revision_stays_last_resort_after_an_auto_revert_annotates_it() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let mut store = RevisionStore::open(temp.path(), 8, None).expect("open");
+        let old_healthy = store.append(b"a: 1\n", metadata(1)).expect("append");
+        let newer_broken = store.append(b"a: 2\n", metadata(2)).expect("append");
+        store
+            .record_soak_verdict(newer_broken.revision, SoakVerdict::Failed)
+            .expect("verdict");
+        // What an automatic revert does next, and the whole of the bug:
+        // one `state` field, two writers, second write wins.
+        store
+            .mark_reverted(newer_broken.revision)
+            .expect("annotate the revision reverted away from");
+
+        let entry = store
+            .entries()
+            .iter()
+            .find(|entry| entry.revision == newer_broken.revision)
+            .cloned()
+            .expect("the entry is still there");
+        assert_eq!(
+            entry.state,
+            RevisionState::Reverted,
+            "the annotation is the newer fact and still lands",
+        );
+        assert_eq!(
+            entry.soak_verdict,
+            Some(SoakVerdict::Failed),
+            "and the verdict survives it, which is what the boot walk has to read",
+        );
+
+        let order: Vec<u64> = store
+            .boot_candidates()
+            .iter()
+            .map(|entry| entry.revision)
+            .collect();
+        assert_eq!(
+            order,
+            vec![old_healthy.revision, newer_broken.revision],
+            "a revision a soak measured as bad stays the last resort after it is reverted \
+             away from, or an auto-revert turns the boot walk into a way back onto it",
         );
     }
 

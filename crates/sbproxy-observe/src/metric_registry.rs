@@ -2398,8 +2398,8 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &["outcome"],
         description: "Config rollback attempts, by outcome: applied for an operator rollback, \
-                      reverted for an automatic one after a failed soak, rejected for a \
-                      refusal.",
+                      reverted for an automatic one after a failed soak, declined for an \
+                      armed node that decided not to revert, rejected for a refusal.",
         dead_reason: None,
     },
     MetricCapability {

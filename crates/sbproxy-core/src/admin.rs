@@ -3908,23 +3908,27 @@ fn config_auto_revert_json(
         AutoRevertDecision::Disarmed => serde_json::json!({
             "acted": false,
             "reason": "disarmed",
-            "detail": "proxy.config_history.soak.auto_revert is off, which is the default;                        this node is still serving the revision that failed",
+            "detail": "proxy.config_history.soak.auto_revert is off, which is the default; this node is \
+                       still serving the revision that failed",
         }),
         AutoRevertDecision::NotArcSwappable(radius) => serde_json::json!({
             "acted": false,
             "reason": "not_arc_swappable",
             "blast_radius": crate::config_rollback::blast_radius_label(*radius),
-            "detail": "an in-process swap cannot undo a change of this class; use                        POST /admin/config/rollback and plan to restart",
+            "detail": "an in-process swap cannot undo a change of this class; use \
+                       POST /admin/config/rollback and plan to restart",
         }),
         AutoRevertDecision::RadiusUnknown => serde_json::json!({
             "acted": false,
             "reason": "radius_unknown",
-            "detail": "no blast radius is recorded for the failing revision, so this node                        cannot know an in-process swap would undo it",
+            "detail": "no blast radius is recorded for the failing revision, so this node cannot \
+                       know an in-process swap would undo it",
         }),
         AutoRevertDecision::WouldLoop => serde_json::json!({
             "acted": false,
             "reason": "would_loop",
-            "detail": "this is the revision an earlier automatic revert restored, and it has                        now failed its own soak; escalating rather than reverting to itself",
+            "detail": "this is the revision an earlier automatic revert restored, and it has now \
+                       failed its own soak; escalating rather than reverting to itself",
         }),
         AutoRevertDecision::AlreadyOnLastKnownGood => serde_json::json!({
             "acted": false,
@@ -3937,7 +3941,8 @@ fn config_auto_revert_json(
             "restored_revision": outcome.restored_revision,
             "restored_digest": outcome.restored_digest,
             "appended_revision": outcome.appended_revision,
-            "detail": "this node re-applied its last known good; the restored document soaks                        like any other candidate",
+            "detail": "this node re-applied its last known good; the restored document soaks like \
+                       any other candidate",
         }),
         AutoRevertDecision::Refused(refusal) => serde_json::json!({
             "acted": false,

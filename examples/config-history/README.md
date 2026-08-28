@@ -364,7 +364,9 @@ the same signals and a second swap does not fix that.
 
 ## What this ring does not do yet
 
-The console has no History panel. Everything above is the admin API and the CLI; the Vue app does not draw the ring, the soak verdict, or a Roll back button yet, and that page is tracked separately. The gating rule the button will use (a `restart` or `breaking` rollback needs the revision typed back) ships as a tested function in `ui/src/lib/config-history.ts` so the panel inherits it rather than reinventing it.
+The console's Config page already draws the ring: every revision with its state badge and blast radius, the lineage, which revision the last-known-good pointer names, and the stored document and plan for any row you click. What it has no control for is acting on one. Rolling back is the admin API and the CLI only, and the Roll back button is tracked separately.
+
+The gating rule that button will use (a `restart` or `breaking` rollback, or one whose radius could not be measured, needs the revision typed back) ships ahead of it as a tested function in `ui/src/lib/config-history.ts`, so the panel inherits the rule rather than reinventing it and the two cannot disagree about which revisions need typing. The server enforces the same rule regardless.
 
 ## Reference
 

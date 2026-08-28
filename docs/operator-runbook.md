@@ -1038,6 +1038,7 @@ change was one an in-process swap can undo. Watch these:
 | Reading | What happened |
 |---|---|
 | `sbproxy_config_apply_total{outcome="reverted"}` climbing | A node undid a change on its own. Disjoint from `applied`, which manual rollbacks count, so this query is only ever about automatic action. |
+| `sbproxy_config_apply_total{outcome="declined"}` climbing | An armed node failed a soak and decided **not** to revert. Alert on this beside `reverted`: a change that fails everywhere and is declined everywhere leaves `reverted` flat, which reads the same as nothing having failed. The `config_rollback` event carries the reason (`not_arc_swappable`, `radius_unknown`, `would_loop`, `already_on_last_known_good`, `no_last_known_good`, `history_unavailable`). |
 | WARN naming a `blast_radius` of `restart` or `breaking` | The soak failed and the node did **not** revert, because swapping back would leave listeners or the admin server in a state neither configuration describes. Boot fallback and a manual rollback are the answer. |
 | ERROR saying the revision an earlier revert restored has failed its own soak | Both the new config and the last known good are failing the same signals. Nothing is retried; this needs a person. |
 | ERROR saying an automatic revert was refused | The rescue target did not compile. The running pipeline is untouched and nothing loops. |

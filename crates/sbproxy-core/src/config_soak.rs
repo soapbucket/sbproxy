@@ -1254,8 +1254,10 @@ pub(crate) fn spawn(config_path: String) {
         Err(error) => {
             tracing::error!(
                 error = %error,
-                "config soak: could not build the probe HTTP client; the operator-probe \
-                 signal will abstain for the life of this process",
+                "config soak: could not build the probe HTTP client, so the soak supervisor \
+                 did not start. for the life of this process the operator-probe signal \
+                 abstains, no soak window is ever closed, no revision is promoted to last \
+                 known good, and proxy.config_history.soak.auto_revert cannot fire",
             );
             return;
         }

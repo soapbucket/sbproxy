@@ -68,6 +68,9 @@
 
 use sbproxy_config::{BlastRadius, RevisionEntry};
 
+/// Characters in a SHA-256 digest rendered as lowercase hex.
+const DIGEST_CHARS: usize = 64;
+
 /// Which stored revision to restore.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RollbackTarget {
@@ -87,11 +90,20 @@ pub(crate) enum RollbackTarget {
 
 impl RollbackTarget {
     /// How this target names itself in a response and a log line.
+    ///
+    /// The digest is truncated to the length of a real one. It is the
+    /// only caller-written field that reaches the `config_rollback`
+    /// event, where every other value is a closed label, a revision
+    /// number, or a digest the ring itself produced, and the admin
+    /// body cap is not a bound anyone reading the events feed can see.
     fn describe(&self) -> String {
         match self {
             Self::LastKnownGood => "last-known-good".to_string(),
             Self::Revision(revision) => format!("revision {revision}"),
-            Self::Digest(digest) => format!("digest {digest}"),
+            Self::Digest(digest) => {
+                let bounded: String = digest.chars().take(DIGEST_CHARS).collect();
+                format!("digest {bounded}")
+            }
         }
     }
 }
@@ -238,6 +250,14 @@ pub(crate) enum RollbackRefusal {
         /// The radius that made it need confirming.
         radius: BlastRadius,
     },
+    /// The blast radius between what is running and the target could not
+    /// be computed, and the caller did not confirm by naming the
+    /// revision back. Separate from [`Self::RestartNotConfirmed`] so the
+    /// reason label does not claim a restart nobody measured.
+    UnknownRadiusNotConfirmed {
+        /// The revision that needed confirming.
+        revision: u64,
+    },
     /// The stored blob could not be read back.
     ReadFailed(String),
     /// The stored document no longer applies on this binary. The
@@ -259,6 +279,7 @@ impl RollbackRefusal {
             Self::StaleExpectedCurrent { .. } => "stale_expected_current",
             Self::LineageMismatch { .. } => "lineage_mismatch",
             Self::RestartNotConfirmed { .. } => "restart_not_confirmed",
+            Self::UnknownRadiusNotConfirmed { .. } => "unknown_radius_not_confirmed",
             Self::ReadFailed(_) => "read_failed",
             Self::ApplyFailed(_) => "apply_failed",
             Self::NoConfigPath => "no_config_path",
@@ -279,7 +300,8 @@ impl RollbackRefusal {
             }
             Self::StaleExpectedCurrent { .. }
             | Self::LineageMismatch { .. }
-            | Self::RestartNotConfirmed { .. } => 409,
+            | Self::RestartNotConfirmed { .. }
+            | Self::UnknownRadiusNotConfirmed { .. } => 409,
             // The target existed and the document is what is wrong, so
             // this is the caller's request meeting a broken artifact
             // rather than a server fault. `422` says exactly that, and
@@ -339,6 +361,13 @@ impl std::fmt::Display for RollbackRefusal {
                  cannot fully apply; confirm it by naming the revision back in \
                  confirm_revision, and plan to restart this node",
                 blast_radius_label(*radius)
+            ),
+            Self::UnknownRadiusNotConfirmed { revision } => write!(
+                formatter,
+                "the blast radius of rolling back to revision {revision} could not be measured, \
+                 because the running revision's stored document could not be read or no longer \
+                 parses. an unmeasured radius is not a safe one, so confirm it by naming the \
+                 revision back in confirm_revision, and be ready to restart this node"
             ),
             Self::ReadFailed(detail) => {
                 write!(formatter, "read the stored revision: {detail}")
@@ -553,17 +582,53 @@ fn rollback_inner(
     // this is the same pair `ConfigHistoryRecorder::blast_radius_for`
     // diffs when it stamps a radius onto an entry, so the number here
     // and the number in the history listing are computed the same way.
-    let blast_radius = running
+    //
+    // The baseline side is kept separately from the result, because
+    // which side failed decides what an unmeasurable radius means.
+    let baseline = running
         .as_ref()
         .and_then(|running| recorder.read_blob(&running.digest).ok())
-        .and_then(|bytes| plan_radius(&String::from_utf8_lossy(&bytes), &document));
-    if let Some(radius) = blast_radius {
-        if !arc_swap_can_undo(radius) && request.confirm_revision != Some(target.revision) {
-            return Err(RollbackRefusal::RestartNotConfirmed {
-                revision: target.revision,
-                radius,
-            });
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+    let blast_radius = baseline
+        .as_deref()
+        .and_then(|baseline| plan_radius(baseline, &document));
+
+    // An unknown radius is not a safe radius, but only one of the two
+    // ways to get one is a hazard.
+    //
+    // If the **baseline** could not be established, this node cannot
+    // tell whether the change it is about to make is one an arc-swap
+    // can undo, and applying anyway is how a listener-port change gets
+    // half-applied. `arc_swap_can_undo`'s automatic caller already
+    // treats an unmeasurable radius as "not known to be undoable" and
+    // declines; this path used to treat it as undoable and apply, which
+    // put the caution on the wrong side of the two triggers.
+    //
+    // If the **target** is what will not parse, the apply below refuses
+    // it with the compile error, which is a better answer than a
+    // confirmation prompt: the acceptance line is that a target which no
+    // longer compiles is refused *with the compile error*, and nothing
+    // is applied either way. So that case deliberately falls through.
+    match blast_radius {
+        Some(radius) if !arc_swap_can_undo(radius) => {
+            if request.confirm_revision != Some(target.revision) {
+                return Err(RollbackRefusal::RestartNotConfirmed {
+                    revision: target.revision,
+                    radius,
+                });
+            }
         }
+        None if baseline
+            .as_deref()
+            .is_none_or(|text| !parses_as_config(text)) =>
+        {
+            if request.confirm_revision != Some(target.revision) {
+                return Err(RollbackRefusal::UnknownRadiusNotConfirmed {
+                    revision: target.revision,
+                });
+            }
+        }
+        None | Some(_) => {}
     }
 
     // Checked last of the preconditions, and deliberately: every gate
@@ -600,8 +665,17 @@ fn rollback_inner(
                 .is_none_or(|before| entry.revision != before.revision)
         })
         .map(|entry| entry.revision);
+    // Only when something was actually rolled away from. A rollback
+    // onto the document already running deduplicates in the ring and
+    // appends nothing, and annotating there would flip the entry that
+    // is still serving (and, for the documented `{}` shortest form,
+    // usually the last known good itself) to `reverted`, so the history
+    // panel would render the good revision as the one this node rolled
+    // away from.
     if let Some(before) = running.as_ref() {
-        recorder.mark_reverted(before.revision);
+        if appended.is_some() && before.revision != target.revision {
+            recorder.mark_reverted(before.revision);
+        }
     }
 
     let secrets_fingerprint_changed = match (
@@ -680,6 +754,34 @@ pub(crate) enum AutoRevertDecision {
     Refused(RollbackRefusal),
 }
 
+impl AutoRevertDecision {
+    /// The stable reason label for a decision that declined to revert,
+    /// or `None` for one that did not decline.
+    ///
+    /// [`Self::Disarmed`] returns `None` on purpose: `auto_revert` is
+    /// off by default, so counting it would fire on every failed soak
+    /// on almost every node and bury the answers that need acting on.
+    /// [`Self::Reverted`] is a success and counts under `reverted`.
+    ///
+    /// [`Self::Refused`] returns `None` **because it is already
+    /// reported**: every `Refused` that reaches a caller from
+    /// [`auto_revert_after_failed_soak`] came back from [`rollback`],
+    /// which counted `rejected` and published the refusal event on its
+    /// way out, except the two constructed before it is ever called,
+    /// which are named here.
+    pub(crate) const fn decline_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::NotArcSwappable(_) => Some("not_arc_swappable"),
+            Self::RadiusUnknown => Some("radius_unknown"),
+            Self::WouldLoop => Some("would_loop"),
+            Self::AlreadyOnLastKnownGood => Some("already_on_last_known_good"),
+            Self::Refused(RollbackRefusal::NoLastKnownGood) => Some("no_last_known_good"),
+            Self::Refused(RollbackRefusal::HistoryUnavailable) => Some("history_unavailable"),
+            Self::Disarmed | Self::Reverted(_) | Self::Refused(_) => None,
+        }
+    }
+}
+
 /// The digest the most recent auto-revert restored, if any.
 ///
 /// The whole of the no-loop rule, and it is deliberately a digest rather
@@ -727,7 +829,44 @@ pub(crate) fn clear_auto_revert_memory() {
 ///    a second swap fixes.
 /// 4. **Somewhere to go.** The last known good being what is already
 ///    running is not an error, it is a no-op said out loud.
+///
+/// # Every declining answer is reported, not just logged
+///
+/// The four gates all return before [`rollback`], which is where the
+/// counter and the `config_rollback` event live, so a declining node
+/// used to leave a `tracing::warn!` as the only record. On a fleet that
+/// declined everywhere, `sbproxy_config_apply_total{outcome="reverted"}`
+/// stayed flat, which reads identically to "no soak failed". Each
+/// decline now counts under `outcome="declined"` and publishes a
+/// `config_rollback` event carrying the reason, so "why did nothing
+/// revert" is answerable from the same two places every other decision
+/// in this module is.
+///
+/// [`AutoRevertDecision::Disarmed`] is deliberately **not** counted: it
+/// is the default on every node, and counting it would bury the four
+/// answers an operator actually has to act on.
 pub(crate) fn auto_revert_after_failed_soak(
+    config_path: Option<&str>,
+    failed_revision: u64,
+    failed_digest: &str,
+    armed: bool,
+) -> AutoRevertDecision {
+    let decision = auto_revert_inner(config_path, failed_revision, failed_digest, armed);
+    if decision.decline_reason().is_some() {
+        sbproxy_observe::metrics::record_config_apply("declined");
+        sbproxy_observe::publish_proxy_event(sbproxy_observe::EventType::ConfigRollback, || {
+            auto_revert_decline_event(failed_revision, failed_digest, &decision)
+        });
+    }
+    decision
+}
+
+/// The gates themselves, without the reporting.
+///
+/// Split the way [`rollback`] is split from [`rollback_inner`], and for
+/// the same reason: every declining early return is then counted and
+/// published at one place rather than at each of the six.
+fn auto_revert_inner(
     config_path: Option<&str>,
     failed_revision: u64,
     failed_digest: &str,
@@ -820,9 +959,26 @@ pub(crate) fn auto_revert_after_failed_soak(
     // is the arming decision, and the engine's own restart gate is the
     // backstop. Handing it a confirmation here would disable that
     // backstop for the one caller that has nobody watching.
+    //
+    // `expected_current` **is** set, and it is the whole of this
+    // caller's protection against acting on stale evidence. `arm`
+    // supersedes a failure still sitting in the pending slot, but that
+    // protection ends the moment the supervisor takes it: an operator's
+    // fix can win `CONFIG_RELOAD_LOCK` while this decision is being
+    // made, and without this the revert would publish a document older
+    // than the fix over the top of it. Because a rollback deliberately
+    // does not rewrite the config file, nothing would re-apply the fix
+    // until the next filesystem event, so the operator would watch
+    // their push land and the node keep serving the old document.
+    //
+    // It narrows the window rather than closing it: the check runs
+    // before `CONFIG_RELOAD_LOCK` is taken, so a reload landing inside
+    // that gap still wins. Narrowing it turns the common ordering from
+    // a silent wrong-config into a `StaleExpectedCurrent` refusal that
+    // names both revisions.
     let request = RollbackRequest {
         target: RollbackTarget::LastKnownGood,
-        expected_current: None,
+        expected_current: Some(failed_revision),
         expected_lineage: None,
         confirm_revision: None,
         force: false,
@@ -887,6 +1043,16 @@ fn resolve_target(
 /// document is refused a few lines later by the reload transaction with
 /// a message that names the actual problem, and turning it into "the
 /// blast radius is unknown" here would refuse it with the wrong reason.
+/// Whether one stored document still deserializes on this binary.
+///
+/// Used to tell the two unmeasurable-radius cases apart: a baseline that
+/// will not parse is a hazard, because nothing can then say what the
+/// change would do, while a target that will not parse is refused by the
+/// apply itself with a compile error worth more than a prompt.
+fn parses_as_config(text: &str) -> bool {
+    serde_yaml::from_str::<sbproxy_config::ConfigFile>(text).is_ok()
+}
+
 pub(crate) fn plan_radius(baseline: &str, proposed: &str) -> Option<BlastRadius> {
     let baseline = serde_yaml::from_str::<sbproxy_config::ConfigFile>(baseline).ok()?;
     let proposed = serde_yaml::from_str::<sbproxy_config::ConfigFile>(proposed).ok()?;
@@ -943,6 +1109,48 @@ pub(crate) fn rollback_event(
             "reason": refusal.as_str(),
         }),
     };
+    sbproxy_observe::ProxyEvent::new(
+        sbproxy_observe::EventType::ConfigRollback,
+        String::new(),
+        String::new(),
+        data,
+    )
+}
+
+/// Build the `config_rollback` event payload for an auto-revert that
+/// declined to act (WOR-2461).
+///
+/// The same event type the manual path publishes, with
+/// `outcome: "declined"` and the decision's stable reason, so one
+/// subscription answers "what did this fleet do about its failed soaks"
+/// without a second surface to wire up. Bounded metadata only: a
+/// revision number, a ring-produced digest, and two closed labels.
+///
+/// `blast_radius` is present only for
+/// [`AutoRevertDecision::NotArcSwappable`], which is the one decline
+/// that has one. The epic promises the History panel answers "why did
+/// it not revert" from the stored radius; that promise does not reach
+/// [`AutoRevertDecision::WouldLoop`], which carries no ring annotation
+/// at all, and this event is where that escalation becomes readable.
+pub(crate) fn auto_revert_decline_event(
+    failed_revision: u64,
+    failed_digest: &str,
+    decision: &AutoRevertDecision,
+) -> sbproxy_observe::ProxyEvent {
+    let radius = match decision {
+        AutoRevertDecision::NotArcSwappable(radius) => Some(blast_radius_label(*radius)),
+        _ => None,
+    };
+    let data = serde_json::json!({
+        "trigger": RollbackTrigger::AutoRevert.as_str(),
+        "actor": "",
+        "target": RollbackTarget::LastKnownGood.describe(),
+        "outcome": "declined",
+        "reason": decision.decline_reason().unwrap_or("none"),
+        "failed_revision": failed_revision,
+        "failed_digest": failed_digest.chars().take(DIGEST_CHARS).collect::<String>(),
+        "blast_radius": radius,
+    });
     sbproxy_observe::ProxyEvent::new(
         sbproxy_observe::EventType::ConfigRollback,
         String::new(),
@@ -1014,6 +1222,14 @@ mod tests {
             .expect("the fixture document publishes");
     }
 
+    /// Read one labelled counter out of the process-global Prometheus
+    /// registry.
+    ///
+    /// Every assertion against this must be a **delta** against a value
+    /// sampled at the start of the test. The registry is global and
+    /// never reset, so an absolute assertion passes only because
+    /// nextest runs each test in its own process, and would start
+    /// failing the day these run in one.
     fn counter(name: &str, label: &str, value: &str) -> f64 {
         for family in prometheus::gather() {
             if family.name() != name {
@@ -1050,6 +1266,7 @@ mod tests {
         let entries = recorder.entries();
         assert_eq!(entries.len(), 2, "two applies, two entries");
         recorder.record_soak_verdict(entries[0].revision, SoakVerdict::Successful);
+        let applied_before = counter("sbproxy_config_apply_total", "outcome", "applied");
 
         crate::config_soak::clear();
         let outcome = rollback(config_path.to_str(), &RollbackRequest::to_last_known_good())
@@ -1086,7 +1303,7 @@ mod tests {
             "a rollback is an ordinary candidate and soaks like one",
         );
         assert_eq!(
-            counter("sbproxy_config_apply_total", "outcome", "applied"),
+            counter("sbproxy_config_apply_total", "outcome", "applied") - applied_before,
             1.0
         );
         crate::config_soak::clear();
@@ -1278,13 +1495,14 @@ mod tests {
         recorder.record_soak_verdict(entries[0].revision, SoakVerdict::Successful);
         crate::config_soak::clear();
 
+        let rejected_before = counter("sbproxy_config_apply_total", "outcome", "rejected");
         let refusal = rollback(config_path.to_str(), &RollbackRequest::to_last_known_good())
             .expect_err("a restart-class rollback needs confirming");
         assert_eq!(refusal.as_str(), "restart_not_confirmed");
         assert_eq!(refusal.http_status(), 409);
         assert!(refusal.to_string().contains("restart"), "{refusal}");
         assert_eq!(
-            counter("sbproxy_config_apply_total", "outcome", "rejected"),
+            counter("sbproxy_config_apply_total", "outcome", "rejected") - rejected_before,
             1.0,
         );
 
@@ -1404,6 +1622,7 @@ mod tests {
         recorder.record_soak_verdict(entries[0].revision, SoakVerdict::Successful);
         crate::config_soak::clear();
         let serving = crate::reload::current_pipeline_full();
+        let reverted_before = counter("sbproxy_config_apply_total", "outcome", "reverted");
 
         let decision = auto_revert_after_failed_soak(
             config_path.to_str(),
@@ -1420,7 +1639,7 @@ mod tests {
             "off by default means the pipeline pointer is untouched",
         );
         assert_eq!(
-            counter("sbproxy_config_apply_total", "outcome", "reverted"),
+            counter("sbproxy_config_apply_total", "outcome", "reverted") - reverted_before,
             0.0,
         );
         crate::config_soak::clear();
@@ -1444,6 +1663,11 @@ mod tests {
         recorder.record_soak_verdict(entries[0].revision, SoakVerdict::Successful);
         crate::config_soak::clear();
         let serving = crate::reload::current_pipeline_full();
+        // Sampled rather than assumed zero: the Prometheus registry is
+        // process global, so an absolute assertion here passes only
+        // because nextest happens to run each test in its own process.
+        let reverted_before = counter("sbproxy_config_apply_total", "outcome", "reverted");
+        let applied_before = counter("sbproxy_config_apply_total", "outcome", "applied");
 
         let decision = auto_revert_after_failed_soak(
             config_path.to_str(),
@@ -1462,12 +1686,12 @@ mod tests {
         let after = recorder.entries();
         assert_eq!(after[1].state, RevisionState::Reverted);
         assert_eq!(
-            counter("sbproxy_config_apply_total", "outcome", "reverted"),
+            counter("sbproxy_config_apply_total", "outcome", "reverted") - reverted_before,
             1.0,
             "an automatic revert counts under its own label, disjoint from a manual one",
         );
         assert_eq!(
-            counter("sbproxy_config_apply_total", "outcome", "applied"),
+            counter("sbproxy_config_apply_total", "outcome", "applied") - applied_before,
             0.0,
         );
         crate::config_soak::clear();
@@ -1527,6 +1751,7 @@ mod tests {
             None,
             "the premise: there is no window for the supervisor to close",
         );
+        let reverted_before = counter("sbproxy_config_apply_total", "outcome", "reverted");
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1552,7 +1777,7 @@ mod tests {
         );
         assert_eq!(after[1].state, RevisionState::Reverted);
         assert_eq!(
-            counter("sbproxy_config_apply_total", "outcome", "reverted"),
+            counter("sbproxy_config_apply_total", "outcome", "reverted") - reverted_before,
             1.0,
         );
         crate::config_soak::clear();
@@ -1680,8 +1905,14 @@ mod tests {
             ],
             Some(0),
         );
+        // No third apply: the failing revision has to be the newest
+        // entry, or it is not what this node is serving and the revert
+        // is refused as stale before it ever reaches the broken target.
+        // That refusal is a different guard (see
+        // `an_auto_revert_does_not_apply_over_a_revision_that_landed_while_it_waited`),
+        // and letting it fire here would leave this test passing
+        // without ever exercising the one it is named for.
         let recorder = install_ring(&ring_dir);
-        apply(&config_path, "proxy: {}\n# what is serving\n");
         crate::config_soak::clear();
         let serving = crate::reload::current_pipeline_full();
         let failing = recorder.entries()[1].clone();
@@ -1803,5 +2034,247 @@ mod tests {
         let rendered = render_available(&many);
         assert!(rendered.contains("and 80 more"), "{rendered}");
         assert_eq!(render_available::<u64>(&[]), "the ring is empty");
+    }
+
+    /// Review Major 1. Supersession protects a verdict still sitting in
+    /// the pending slot; it ends the moment `take_pending_verdict`
+    /// returns. Between there and the apply, an operator's fix can win
+    /// the reload lock, and the revert would then publish a document
+    /// older than the fix over the top of it, with the config file left
+    /// naming the fix so nothing re-applies it until the next
+    /// filesystem event.
+    ///
+    /// The revert is the one caller that used to opt out of
+    /// `expected_current`, which is the machinery built for exactly
+    /// "somebody else moved this node between the read and the write".
+    #[test]
+    fn an_auto_revert_does_not_apply_over_a_revision_that_landed_while_it_waited() {
+        crate::config_soak::clear();
+        clear_auto_revert_memory();
+        let temp = tempfile::tempdir().expect("temp");
+        let ring_dir = temp.path().join("ring");
+        let config_path = temp.path().join("sb.yml");
+        let recorder = install_ring(&ring_dir);
+
+        apply(&config_path, "proxy: {}\n# the good one\n");
+        apply(&config_path, "proxy: {}\n# the one that fails its soak\n");
+        let entries = recorder.entries();
+        recorder.record_soak_verdict(entries[0].revision, SoakVerdict::Successful);
+
+        // The operator pushes the fix and the file watcher wins the
+        // reload lock while the failed verdict is in flight.
+        apply(&config_path, "proxy: {}\n# the operator's fix\n");
+        crate::config_soak::clear();
+        let serving = crate::reload::current_pipeline_full();
+        let fixed = recorder.entries();
+        assert_eq!(fixed.len(), 3, "the fix is what is running now");
+
+        let decision = auto_revert_after_failed_soak(
+            config_path.to_str(),
+            entries[1].revision,
+            &entries[1].digest,
+            true,
+        );
+
+        assert!(
+            matches!(
+                decision,
+                AutoRevertDecision::Refused(RollbackRefusal::StaleExpectedCurrent { .. })
+            ),
+            "a revert for a revision that stopped serving must be refused, not applied: \
+             {decision:?}",
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&serving, &crate::reload::current_pipeline_full()),
+            "and the operator's fix keeps serving",
+        );
+        assert_eq!(
+            recorder.entries().len(),
+            3,
+            "nothing was appended, so the ring still ends at the fix",
+        );
+        crate::config_soak::clear();
+        crate::config_history::clear_config_history_recorder();
+    }
+
+    /// Review Major 2. `record` returns `None` for a document
+    /// byte-identical to the newest entry, so a rollback onto what is
+    /// already running appends nothing. Annotating the entry rolled
+    /// away from is then annotating the entry that is still serving,
+    /// and when that entry is the last known good, the page whose job
+    /// is to say which revision is good renders the good one as rolled
+    /// away from.
+    ///
+    /// Driven with `{}`, the body the route's own rustdoc calls the
+    /// documented shortest form, because that is the one an operator
+    /// reaches for under pressure.
+    #[test]
+    fn a_rollback_to_what_is_already_running_does_not_mark_it_reverted() {
+        crate::config_soak::clear();
+        let temp = tempfile::tempdir().expect("temp");
+        let ring_dir = temp.path().join("ring");
+        let config_path = temp.path().join("sb.yml");
+        let recorder = install_ring(&ring_dir);
+
+        apply(&config_path, "proxy: {}\n# the only one\n");
+        let entries = recorder.entries();
+        assert_eq!(entries.len(), 1);
+        recorder.record_soak_verdict(entries[0].revision, SoakVerdict::Successful);
+        crate::config_soak::clear();
+        assert_eq!(
+            recorder.entries()[0].state,
+            RevisionState::Good,
+            "the premise: the running revision is this node's last known good",
+        );
+
+        let outcome = rollback(config_path.to_str(), &RollbackRequest::to_last_known_good())
+            .expect("rolling back onto what is running is a no-op, not a refusal");
+
+        assert_eq!(
+            outcome.appended_revision, None,
+            "a byte-identical document is deduplicated by the ring",
+        );
+        let after = recorder.entries();
+        assert_eq!(after.len(), 1, "so there is still one entry");
+        assert_eq!(
+            after[0].state,
+            RevisionState::Good,
+            "and it is still the last known good, not the revision this node rolled away from",
+        );
+        assert_eq!(
+            recorder.lkg().map(|entry| entry.revision),
+            Some(entries[0].revision),
+        );
+        crate::config_soak::clear();
+        crate::config_history::clear_config_history_recorder();
+    }
+
+    /// Review Major 4. The typed-confirmation gate sat inside
+    /// `if let Some(radius)`, so a radius that could not be computed
+    /// skipped it entirely. That is the inverse of where the caution
+    /// belongs: `arc_swap_can_undo`'s automatic caller treats an unknown
+    /// radius as not known to be undoable and declines, while the manual
+    /// path treated it as safe and applied.
+    ///
+    /// The radius is unknown whenever the running document's blob
+    /// cannot be read, which this reproduces by unlinking it the way a
+    /// full disk or a truncated write would.
+    #[test]
+    fn an_unknown_blast_radius_requires_the_typed_confirmation() {
+        crate::config_soak::clear();
+        let temp = tempfile::tempdir().expect("temp");
+        let ring_dir = temp.path().join("ring");
+        let config_path = temp.path().join("sb.yml");
+        let recorder = install_ring(&ring_dir);
+
+        apply(&config_path, "proxy: {}\n# the target\n");
+        apply(&config_path, "proxy:\n  http_bind_port: 8099\n");
+        let entries = recorder.entries();
+        recorder.record_soak_verdict(entries[0].revision, SoakVerdict::Successful);
+        crate::config_soak::clear();
+
+        // The running revision's blob is gone, so the two documents the
+        // radius is computed from cannot both be read.
+        std::fs::remove_file(
+            ring_dir
+                .join("blobs")
+                .join(format!("{}.yaml.zst", entries[1].digest)),
+        )
+        .expect("unlink the running blob");
+
+        let refusal = rollback(config_path.to_str(), &RollbackRequest::to_last_known_good())
+            .expect_err("an unknown radius is not a safe radius");
+        assert_eq!(
+            refusal.as_str(),
+            "unknown_radius_not_confirmed",
+            "and it says the radius is unknown rather than claiming a restart it did not \
+             measure: {refusal}",
+        );
+        assert_eq!(refusal.http_status(), 409);
+
+        // Naming the revision back gets through, the same way it does
+        // for a radius that is known to need it.
+        let confirmed = RollbackRequest {
+            confirm_revision: Some(entries[0].revision),
+            ..RollbackRequest::to_last_known_good()
+        };
+        rollback(config_path.to_str(), &confirmed).expect("the typed confirmation is accepted");
+        crate::config_soak::clear();
+        crate::config_history::clear_config_history_recorder();
+    }
+
+    /// Review Major 5. Every declining arm returned before `rollback()`,
+    /// which is where the counter and the event live, so a fleet that
+    /// declined on all thirty nodes was indistinguishable on the metric
+    /// from a fleet where no soak failed, and "why did nothing revert"
+    /// existed only as a WARN line on thirty hosts.
+    #[test]
+    fn a_declined_auto_revert_counts_and_publishes_rather_than_only_logging() {
+        crate::config_soak::clear();
+        clear_auto_revert_memory();
+        let temp = tempfile::tempdir().expect("temp");
+        let ring_dir = temp.path().join("ring");
+        let config_path = temp.path().join("sb.yml");
+        let recorder = install_ring(&ring_dir);
+        apply(&config_path, "proxy: {}\n# the good one\n");
+        apply(&config_path, "proxy:\n  http_bind_port: 8098\n");
+        let entries = recorder.entries();
+        recorder.record_soak_verdict(entries[0].revision, SoakVerdict::Successful);
+        crate::config_soak::clear();
+        let before = counter("sbproxy_config_apply_total", "outcome", "declined");
+
+        let decision = auto_revert_after_failed_soak(
+            config_path.to_str(),
+            entries[1].revision,
+            &entries[1].digest,
+            true,
+        );
+        assert!(
+            matches!(decision, AutoRevertDecision::NotArcSwappable(_)),
+            "the premise: a listener-port change is not one an arc-swap can undo: {decision:?}",
+        );
+        assert_eq!(
+            counter("sbproxy_config_apply_total", "outcome", "declined") - before,
+            1.0,
+            "a decline is countable, so a flat reverted counter is not the only reading",
+        );
+
+        let event = auto_revert_decline_event(entries[1].revision, &entries[1].digest, &decision);
+        assert_eq!(event.data["trigger"], "auto_revert");
+        assert_eq!(event.data["outcome"], "declined");
+        assert_eq!(event.data["reason"], "not_arc_swappable");
+        assert_eq!(event.data["failed_revision"], entries[1].revision);
+        assert_eq!(event.data["blast_radius"], "restart");
+
+        // The escalation the ticket names by name carries no ring
+        // annotation, so the event is the only place it can be read.
+        let looped = auto_revert_decline_event(7, "abc", &AutoRevertDecision::WouldLoop);
+        assert_eq!(looped.data["reason"], "would_loop");
+        assert!(looped.data["blast_radius"].is_null());
+
+        // Off by default is not a decline: it is the setting almost
+        // every node runs, and counting it would swamp the label.
+        assert!(AutoRevertDecision::Disarmed.decline_reason().is_none());
+        crate::config_soak::clear();
+        crate::config_history::clear_config_history_recorder();
+    }
+
+    /// Review Minor 11. Every other field in the payload is a closed
+    /// label, a revision number, or a digest the ring produced; the
+    /// target is the one field a caller writes.
+    #[test]
+    fn a_caller_supplied_digest_is_bounded_before_it_reaches_the_event() {
+        let long = "f".repeat(4096);
+        let request = RollbackRequest {
+            target: RollbackTarget::Digest(long),
+            ..RollbackRequest::to_last_known_good()
+        };
+        let event = rollback_event(&request, Err(&RollbackRefusal::NoLastKnownGood));
+        let target = event.data["target"].as_str().expect("a string");
+        assert!(
+            target.len() <= "digest ".len() + 64,
+            "a caller-supplied digest is truncated to a digest's length: {} chars",
+            target.len(),
+        );
     }
 }

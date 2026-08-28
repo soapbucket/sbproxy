@@ -542,6 +542,14 @@ pub(crate) fn reload_from_stored_revision(
         // rollback target that no longer constructs is a revision the
         // ring will keep offering and the node will keep refusing, and
         // the stored refusal is what says why without reproducing it.
+        //
+        // `CompileFailed` covers all three ways this can fail by its own
+        // definition ("did not compile, could not be constructed, or
+        // still carried an unresolved `${VAR}` reference"), and the
+        // three are not separable here anyway: the reload transaction
+        // returns one `anyhow::Error`. Which of them it was is in the
+        // stored `detail`, and `stage: "rollback"` already separates
+        // these from a subscriber cycle's refusals.
         crate::config_subscriber::record_refusal(
             yaml,
             &crate::config_subscriber::CycleRefusal::new(

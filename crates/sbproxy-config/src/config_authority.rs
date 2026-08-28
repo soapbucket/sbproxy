@@ -1079,7 +1079,9 @@ impl AuthorityStore {
     ) -> Result<(), AuthorityStoreError> {
         if report.revision > published_high_water {
             return Err(AuthorityStoreError::invalid(format!(
-                "subscriber reported applying revision {} but this authority has never                  published anything above revision {published_high_water}; the report is                  discarded",
+                "subscriber reported applying revision {} but this authority has never \
+                 published anything above revision {published_high_water}; the report \
+                 is discarded",
                 report.revision
             )));
         }

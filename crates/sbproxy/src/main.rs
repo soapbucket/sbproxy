@@ -9459,8 +9459,13 @@ fn report_admin_refusal(
         .get("code")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown");
-    eprintln!("{command}: the authority refused (HTTP {status}, {code}): {error}");
-    eprintln!("{command}: nothing changed on the authority.");
+    // "the admin API" rather than "the authority": most callers here
+    // (`config history`, `config show`, `config rollback`, `config diff`)
+    // talk to a proxy node's own admin API, and telling an operator
+    // mid-incident that "the authority refused" sends them to look at
+    // the wrong machine.
+    eprintln!("{command}: the admin API refused (HTTP {status}, {code}): {error}");
+    eprintln!("{command}: nothing changed.");
     4
 }
 
@@ -10796,13 +10801,18 @@ fn describe_diff_side(side: Option<&serde_json::Value>, when_absent: &str) -> St
 /// is refused by the route with a message naming both forms. This exists
 /// so a typo cannot smuggle an `&` into the next parameter.
 fn urlencoding_lite(value: &str) -> String {
+    // Over bytes, not chars: `character as u32 & 0xFF` truncated a
+    // non-ASCII scalar to its low byte, so `U+0100` encoded as `%00`
+    // and the server was handed a different string than the operator
+    // typed. Percent-encoding is defined on octets, and `as_bytes` on a
+    // `&str` is already UTF-8.
     value
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '~') {
-                character.to_string()
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                (byte as char).to_string()
             } else {
-                format!("%{:02X}", character as u32 & 0xFF)
+                format!("%{byte:02X}")
             }
         })
         .collect()
@@ -15451,6 +15461,11 @@ hooks:
         );
         assert_eq!(urlencoding_lite("a b"), "a%20b");
         assert_eq!(urlencoding_lite("../etc"), "..%2Fetc");
+        // Percent-encoding is defined on octets. A non-ASCII scalar
+        // encodes as its UTF-8 bytes, not as a truncated low byte,
+        // which `U+0100` would otherwise render as the NUL escape.
+        assert_eq!(urlencoding_lite("\u{0100}"), "%C4%80");
+        assert_eq!(urlencoding_lite("revisión"), "revisi%C3%B3n");
         assert_eq!(
             urlencoding_lite("7#frag"),
             "7%23frag",
