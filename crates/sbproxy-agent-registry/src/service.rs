@@ -18,7 +18,9 @@ use serde::Serialize;
 
 use sbproxy_platform::storage::{EphemeralKv, PersistentKv};
 
-use crate::catalog::{Catalog, CatalogStore};
+use sha2::{Digest, Sha256};
+
+use crate::catalog::{Catalog, CatalogApplied, CatalogStore};
 use crate::error::{RegistryError, Result};
 use crate::feed::{verify_feed, verify_key_directory, BootstrapKeys};
 use crate::metrics::{record_registry_op, set_registry_entries};
@@ -159,11 +161,24 @@ impl AgentRegistry {
     pub async fn refresh(&self, now: DateTime<Utc>) -> Result<usize> {
         let outcome = self.refresh_inner(now).await;
         match &outcome {
-            Ok(applied) => {
+            Ok(CatalogApplied::Replaced(applied)) => {
                 record_registry_op("feed_refresh", "applied");
                 tracing::info!(
                     entries = applied,
                     "agent registry applied a verified catalog feed"
+                );
+            }
+            // Counted apart from `applied` and logged at debug, because the
+            // refresh timer runs on the operator's staleness tolerance
+            // rather than on whether the publisher republished: on a
+            // healthy deployment this is almost every tick, and an info
+            // line per tick saying nothing happened is noise an operator
+            // learns to filter.
+            Ok(CatalogApplied::Unchanged(entries)) => {
+                record_registry_op("feed_refresh", "unchanged");
+                tracing::debug!(
+                    entries = entries,
+                    "the agent catalog feed has not changed since the last refresh"
                 );
             }
             Err(error) => {
@@ -177,13 +192,14 @@ impl AgentRegistry {
                 );
             }
         }
-        if outcome.is_ok() {
+        // Only a replacement can have moved the catalog gauge.
+        if matches!(outcome, Ok(CatalogApplied::Replaced(_))) {
             self.publish_gauges().await?;
         }
-        outcome
+        outcome.map(CatalogApplied::entries)
     }
 
-    async fn refresh_inner(&self, now: DateTime<Utc>) -> Result<usize> {
+    async fn refresh_inner(&self, now: DateTime<Utc>) -> Result<CatalogApplied> {
         let (Some(feed_path), Some(directory_path)) = (
             self.options.feed_path.as_ref(),
             self.options.key_directory_path.as_ref(),
@@ -210,7 +226,11 @@ impl AgentRegistry {
             ))
         })?;
         let feed = verify_feed(&feed_bytes, &directory, now, self.options.stale_grace)?;
-        self.catalog.apply(feed).await
+        // Over the verified bytes, not the parsed feed: the signature has
+        // already established that these bytes are the publisher's, so
+        // byte-equality is exactly "the publisher has not republished".
+        let digest = hex::encode(Sha256::digest(&feed_bytes));
+        self.catalog.apply(feed, &digest).await
     }
 
     /// Accept a submission into the queue.
@@ -253,7 +273,7 @@ impl AgentRegistry {
             .await
     }
 
-    /// Reject a pending registration, burning its slug.
+    /// Reject a pending registration, refusing that description for good.
     pub async fn reject(
         &self,
         scope: &TenantScope,
@@ -271,7 +291,7 @@ impl AgentRegistry {
             .await
     }
 
-    /// Revoke a registration, burning its slug.
+    /// Revoke a registration, refusing that description for good.
     pub async fn revoke(
         &self,
         scope: &TenantScope,

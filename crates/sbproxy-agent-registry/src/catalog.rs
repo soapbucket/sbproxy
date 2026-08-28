@@ -62,6 +62,33 @@ const ENVELOPE_IN_PROGRESS_KEY: &str = "swap_in_progress";
 struct CachedEnvelope {
     generated_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
+    /// Digest of the verified feed bytes this generation came from.
+    ///
+    /// What makes a refresh that finds an unchanged file free. `default`
+    /// rather than required so a store written before this field existed
+    /// restores rather than failing; the first refresh then fills it in.
+    #[serde(default)]
+    digest: Option<String>,
+}
+
+/// What a catalog apply did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CatalogApplied {
+    /// The feed was byte-identical to the one already applied, so nothing
+    /// was written. Carries the entry count still being served.
+    Unchanged(usize),
+    /// The catalog was replaced. Carries the new entry count.
+    Replaced(usize),
+}
+
+impl CatalogApplied {
+    /// How many entries the catalog holds either way.
+    pub fn entries(self) -> usize {
+        match self {
+            Self::Unchanged(count) | Self::Replaced(count) => count,
+        }
+    }
 }
 
 /// What a catalog reports to a readiness endpoint.
@@ -169,6 +196,13 @@ pub struct CatalogStore {
     store: Arc<dyn PersistentKv>,
     entries: KvNamespace,
     envelope: KvNamespace,
+    /// Digest of the feed the live catalog came from, so a refresh that
+    /// finds the same file costs a read and a verify rather than a full
+    /// rewrite of every entry.
+    ///
+    /// An `ArcSwapOption` for the same reason `live` is an `ArcSwap`: the
+    /// read is on every refresh and the write is once per generation.
+    applied_digest: arc_swap::ArcSwapOption<String>,
 }
 
 impl CatalogStore {
@@ -183,6 +217,7 @@ impl CatalogStore {
             store,
             entries: namespace(CATALOG_NAMESPACE)?,
             envelope: namespace(ENVELOPE_NAMESPACE)?,
+            applied_digest: arc_swap::ArcSwapOption::from(None),
         })
     }
 
@@ -236,6 +271,11 @@ impl CatalogStore {
         }
 
         let restored = entries.len();
+        // Adopt the stored digest too, so the first refresh after a restart
+        // is free when the publisher has not republished. A store written
+        // before the field existed restores `None` and pays one rewrite.
+        self.applied_digest
+            .store(envelope.digest.clone().map(Arc::new));
         self.live.store(Arc::new(Catalog {
             entries,
             generated_at: Some(envelope.generated_at),
@@ -252,7 +292,25 @@ impl CatalogStore {
     /// thing a revocation has to be able to undo. The enterprise Postgres
     /// adapter carried that exact caveat in a comment; this does not need
     /// one.
-    pub async fn apply(&self, feed: AgentFeed) -> Result<usize> {
+    ///
+    /// # Why the digest short-circuit exists
+    ///
+    /// A full replacement of a 10,000-entry catalog is 10,000 fsynced redb
+    /// transactions plus the deletes, the envelope, and the marker. The
+    /// refresh timer runs on the operator's staleness tolerance, not on
+    /// whether the publisher republished, so without this the proxy paid
+    /// that whole write every interval for a file that had not changed.
+    /// `digest` is over the verified feed bytes, so an unchanged file is a
+    /// read and a signature check and nothing else.
+    pub async fn apply(&self, feed: AgentFeed, digest: &str) -> Result<CatalogApplied> {
+        if self
+            .applied_digest
+            .load()
+            .as_deref()
+            .is_some_and(|applied| applied.as_str() == digest)
+        {
+            return Ok(CatalogApplied::Unchanged(self.live.load().len()));
+        }
         let catalog = Catalog::from_feed(feed);
 
         self.store
@@ -290,6 +348,7 @@ impl CatalogStore {
             let bytes = serde_json::to_vec(&CachedEnvelope {
                 generated_at,
                 expires_at,
+                digest: Some(digest.to_string()),
             })
             .map_err(|error| {
                 RegistryError::Backend(format!("could not encode feed envelope: {error}"))
@@ -307,7 +366,11 @@ impl CatalogStore {
 
         let applied = catalog.len();
         self.live.store(Arc::new(catalog));
-        Ok(applied)
+        // After the marker is cleared, so a crash mid-apply leaves the
+        // digest unset and the next refresh rewrites rather than skipping.
+        self.applied_digest
+            .store(Some(Arc::new(digest.to_string())));
+        Ok(CatalogApplied::Replaced(applied))
     }
 }
 
@@ -375,9 +438,10 @@ mod tests {
             assert_eq!(store.restore().await.expect("first boot"), 0);
             assert_eq!(
                 store
-                    .apply(feed(&["acme-1", "acme-2"]))
+                    .apply(feed(&["acme-1", "acme-2"]), "digest-a")
                     .await
-                    .expect("apply"),
+                    .expect("apply")
+                    .entries(),
                 2
             );
         }
@@ -406,10 +470,13 @@ mod tests {
         {
             let store = catalog_store(&path);
             store
-                .apply(feed(&["acme-1", "acme-2"]))
+                .apply(feed(&["acme-1", "acme-2"]), "digest-a")
                 .await
                 .expect("apply");
-            store.apply(feed(&["acme-1"])).await.expect("reapply");
+            store
+                .apply(feed(&["acme-1"]), "digest-b")
+                .await
+                .expect("reapply");
             assert!(store.snapshot().get("acme-2").is_none());
         }
 
@@ -433,7 +500,10 @@ mod tests {
         let path = temp_path();
         {
             let store = catalog_store(&path);
-            store.apply(feed(&["acme-1"])).await.expect("apply");
+            store
+                .apply(feed(&["acme-1"]), "digest-a")
+                .await
+                .expect("apply");
         }
 
         // Simulate the crash: the marker is present and the entries are a
@@ -456,12 +526,65 @@ mod tests {
 
         // A successful apply clears the marker, so the next restore works.
         store
-            .apply(feed(&["acme-1", "acme-2"]))
+            .apply(feed(&["acme-1", "acme-2"]), "digest-a")
             .await
             .expect("apply");
         drop(store);
         let store = catalog_store(&path);
         assert_eq!(store.restore().await.expect("restore"), 2);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The refresh timer runs on the operator's staleness tolerance, not
+    /// on whether the publisher republished, so on a healthy deployment
+    /// almost every tick finds the same file. Rewriting a 10,000-entry
+    /// catalog then costs 10,000 fsynced transactions plus the deletes,
+    /// the envelope, and the marker, every interval, for nothing.
+    #[tokio::test]
+    async fn an_unchanged_feed_is_not_rewritten() {
+        let path = temp_path();
+        let store = catalog_store(&path);
+
+        assert_eq!(
+            store
+                .apply(feed(&["acme-1", "acme-2"]), "digest-a")
+                .await
+                .expect("first apply"),
+            CatalogApplied::Replaced(2)
+        );
+
+        // Same digest, so nothing is written and the count still answers.
+        assert_eq!(
+            store
+                .apply(feed(&["acme-1", "acme-2"]), "digest-a")
+                .await
+                .expect("second apply"),
+            CatalogApplied::Unchanged(2)
+        );
+
+        // A republished feed is applied.
+        assert_eq!(
+            store
+                .apply(feed(&["acme-1"]), "digest-b")
+                .await
+                .expect("third apply"),
+            CatalogApplied::Replaced(1)
+        );
+        assert_eq!(store.snapshot().len(), 1);
+
+        // The digest is stored with the envelope, so a restart does not
+        // pay one rewrite before it can start skipping.
+        drop(store);
+        let reopened = catalog_store(&path);
+        assert_eq!(reopened.restore().await.expect("restore"), 1);
+        assert_eq!(
+            reopened
+                .apply(feed(&["acme-1"]), "digest-b")
+                .await
+                .expect("post-restart apply"),
+            CatalogApplied::Unchanged(1)
+        );
 
         std::fs::remove_file(&path).ok();
     }
@@ -490,7 +613,7 @@ mod tests {
         let path = temp_path();
         let store = catalog_store(&path);
         store
-            .apply(feed(&["zeta", "alpha", "mid"]))
+            .apply(feed(&["zeta", "alpha", "mid"]), "digest-a")
             .await
             .expect("apply");
         let snapshot = store.snapshot();

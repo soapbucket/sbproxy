@@ -954,7 +954,8 @@ larger than a duration the proxy can represent.
 The pending queue is bounded at 5,000 and there is no key for it. Past that
 the submission route answers `429` with a named reason; terminal records are
 the durable replay refusal and the audit trail and are not counted against
-the cap. See [agent-registry.md](agent-registry.md).
+the cap. The bound is deployment-wide rather than per tenant, so it is not a
+tenant isolation mechanism. See [agent-registry.md](agent-registry.md).
 
 ### Notification fields
 

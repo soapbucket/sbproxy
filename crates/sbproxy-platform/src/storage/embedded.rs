@@ -1249,16 +1249,64 @@ mod tests {
     /// A key the namespace refuses is counted the same way on both halves
     /// of the pair, so the family does not answer differently depending on
     /// which store the caller happened to hold.
+    ///
+    /// The assertion has to be on the counter. Asserting only that the
+    /// three calls error passes with or without the fix, because they
+    /// errored before it too: what changed is that the compose failure
+    /// moved inside the counted region.
     #[tokio::test]
     async fn a_refused_key_is_counted_on_the_ephemeral_half_too() {
-        let store = MemoryKv::new("test");
+        // A store name no other test in this binary uses, so the counter
+        // reads this test's writes and nothing else.
+        let store = MemoryKv::new("ephemeral_refusal_counting");
         let window = ns("dedup");
+
+        let before = |op: &str| kv_ops("ephemeral_refusal_counting", op, "error");
+        let (get, put, delete) = (before("get"), before("put"), before("delete"));
+
         assert!(store.get(&window, "").await.is_err());
         assert!(store
             .put_with_ttl(&window, "", b"v", Duration::from_secs(30))
             .await
             .is_err());
         assert!(store.remove(&window, "").await.is_err());
+
+        assert_eq!(
+            kv_ops("ephemeral_refusal_counting", "get", "error"),
+            get + 1,
+            "a refused key must be counted, not skipped"
+        );
+        assert_eq!(
+            kv_ops("ephemeral_refusal_counting", "put", "error"),
+            put + 1
+        );
+        assert_eq!(
+            kv_ops("ephemeral_refusal_counting", "delete", "error"),
+            delete + 1
+        );
+    }
+
+    /// One `sbproxy_embedded_store_operations_total` series off the default
+    /// registry. An absent series reads as zero, which is what a first
+    /// refusal of that shape looks like.
+    fn kv_ops(store: &str, op: &str, outcome: &str) -> u64 {
+        for family in prometheus::gather() {
+            if family.name() != "sbproxy_embedded_store_operations_total" {
+                continue;
+            }
+            for metric in family.get_metric() {
+                let labels = metric.get_label();
+                let has = |name: &str, want: &str| {
+                    labels
+                        .iter()
+                        .any(|pair| pair.name() == name && pair.value() == want)
+                };
+                if has("store", store) && has("op", op) && has("outcome", outcome) {
+                    return metric.get_counter().value() as u64;
+                }
+            }
+        }
+        0
     }
 
     #[tokio::test]

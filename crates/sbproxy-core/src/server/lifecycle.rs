@@ -3645,10 +3645,27 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
                         },
                     )));
             }
-            agent_registry_refresher = Some((
-                std::sync::Arc::clone(&registry),
-                agent_registry_refresh_interval(registry_cfg),
-            ));
+            // Only when there is something to refresh. The registry's
+            // approval queue is useful on its own and the branch's own
+            // example ships exactly that shape, so installing the loop
+            // unconditionally meant a queue-only deployment logged
+            // "refused a catalog feed" at warn and ticked
+            // `op="feed_refresh",outcome="invalid"` on boot and every
+            // interval forever. An operator alerting on refresh refusals,
+            // which the docs tell them to do, would page on a working
+            // config. This is the same condition `RegistrySummary`
+            // publishes as `feed_configured`.
+            if agent_registry_feed_configured(registry_cfg) {
+                agent_registry_refresher = Some((
+                    std::sync::Arc::clone(&registry),
+                    agent_registry_refresh_interval(registry_cfg),
+                ));
+            } else {
+                tracing::info!(
+                    "the agent registry is enabled with no feed configured; the approval \
+                     queue is live and no catalog refresh will run"
+                );
+            }
             admin_state_inner = admin_state_inner.with_agent_registry(registry);
         }
 
@@ -7228,6 +7245,38 @@ mod boot_only_block_tests {
         );
     }
 
+    /// The registry's approval queue is useful on its own, and
+    /// `examples/agent-registry/sb.yml` ships exactly that shape with the
+    /// catalog half commented out. Installing the refresh loop on
+    /// `enabled` alone meant that config logged "agent registry refused a
+    /// catalog feed" at warn and ticked
+    /// `op="feed_refresh",outcome="invalid"` on boot and every 300 seconds
+    /// forever, so an operator alerting on refresh refusals, which
+    /// `docs/agent-registry.md` tells them to do, paged on a working proxy.
+    #[test]
+    fn a_registry_with_no_feed_runs_no_refresh_loop() {
+        let queue_only = AgentRegistryConfig {
+            enabled: true,
+            store_path: "/tmp/a.redb".into(),
+            ..Default::default()
+        };
+        assert!(!agent_registry_feed_configured(&queue_only));
+
+        // Half a feed is not a feed. `validate` refuses this shape at
+        // startup, and the loop must not run for it either.
+        let half = AgentRegistryConfig {
+            feed_path: Some("/tmp/feed.json".into()),
+            ..queue_only.clone()
+        };
+        assert!(!agent_registry_feed_configured(&half));
+
+        let full = AgentRegistryConfig {
+            key_directory_path: Some("/tmp/keys.json".into()),
+            ..half
+        };
+        assert!(agent_registry_feed_configured(&full));
+    }
+
     /// The refresh loop's interval is derived rather than configured, so
     /// the derivation is what an operator plans against.
     #[test]
@@ -8544,6 +8593,18 @@ fn agent_catalog_component(
     }
 }
 
+/// Whether this registry has a catalog feed to refresh from.
+///
+/// The registry's approval queue is useful with no feed at all, and the
+/// example config ships that shape, so the refresh loop has to be
+/// conditional on this rather than on the block being enabled. Same
+/// condition `RegistrySummary::feed_configured` publishes, deliberately: an
+/// operator reading `feed_configured: false` in the summary and a refresh
+/// loop that is not running have to agree.
+fn agent_registry_feed_configured(cfg: &sbproxy_config::AgentRegistryConfig) -> bool {
+    cfg.feed_path.is_some() && cfg.key_directory_path.is_some()
+}
+
 /// Shortest and longest the catalog refresh loop may run at.
 ///
 /// The floor keeps a small `stale_grace_secs` from turning into a hot loop
@@ -8601,10 +8662,12 @@ fn registry_duration(field: &'static str, seconds: u64) -> anyhow::Result<chrono
 /// exclusively, so an unconditional open would make every reload of a config
 /// with an agent registry fail.
 ///
-/// The restore runs on a throwaway current-thread runtime. Every operation it
-/// performs is a synchronous redb transaction behind an `async fn`, so there
-/// is nothing for a driver to poll; this exists because `run` has no ambient
-/// runtime, not because the work is asynchronous.
+/// The restore runs on a throwaway current-thread runtime because `run` has
+/// no ambient one and the store's operations now need a runtime to be in:
+/// each is a synchronous redb transaction handed to `spawn_blocking`, so
+/// there is a `JoinHandle` for a driver to poll. This is the reason it must
+/// stay a real runtime rather than becoming a bare `block_on` on a future
+/// nobody drives.
 fn build_agent_registry(
     cfg: &sbproxy_config::AgentRegistryConfig,
 ) -> anyhow::Result<std::sync::Arc<sbproxy_agent_registry::AgentRegistry>> {

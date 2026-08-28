@@ -160,6 +160,14 @@ are not counted against the cap: they are the durable replay refusal and the
 audit trail, and evicting them would be evicting the refusal itself. A
 reviewer working the queue down makes room.
 
+**The cap is deployment-wide, not per tenant.** One tenant filling the queue
+refuses every other tenant's submissions until a reviewer works it down. A
+per-tenant cap would need a per-tenant pending count, which is a second
+index this store does not keep; on a multi-tenant deployment fronting the
+submission route, put a rate limit in front of it rather than relying on
+this bound to isolate tenants. `queue_full` on
+`sbproxy_agent_registry_operations_total{op="register"}` is the alert.
+
 ### Deciding
 
 ```bash
@@ -265,11 +273,14 @@ no tenant is deployment-wide: they see and act on every tenant, and their
 own submissions are recorded under `default`.
 
 A tenant-scoped operator sees and acts only inside their own tenant.
-Another tenant's registration answers `404` on read, on decide, and on
-rotate, and does not appear in a listing. The `404` is deliberate: a
-distinct `403` would make the route an oracle for which agent ids exist in
-other tenants, and there is nothing the caller can do differently either
-way.
+Another tenant's registration answers `404` on read and on decide, `401` on
+rotate, and does not appear in a listing. Neither status is a distinct
+`403`, deliberately: one would make the route an oracle for which agent ids
+exist in other tenants, and there is nothing the caller can do differently
+either way. Rotate answers `401` rather than `404` because it authenticates
+with the submitter's own registration access token, and a wrong token, a
+wrong id, and another tenant's id all have to look the same there for the
+same reason.
 
 The durable replay index is tenant-qualified too, so one tenant refusing a
 description does not refuse another tenant's identical one.
@@ -513,13 +524,27 @@ dashboard:
 | `sbproxy_agent_registry_entries` | `collection` | The catalog size and the four queue states. A configured registry publishes all five at zero on boot, so no data means the registry is not configured rather than that the queue is empty. Alert on `pending`: a registration nobody has decided is a question an operator has not seen. |
 | `sbproxy_agent_registry_operations_total` | `op`, `outcome` | Every operation and everything refused. `outcome="applied"` is success; the rest are the refusal vocabulary the API returns. |
 
-Refusal outcomes divide into three groups an operator reads differently.
+Refusal outcomes divide into four groups an operator reads differently.
 `bad_signature`, `unknown_key`, `expired`, and `unsupported_version` on
 `op="feed_refresh"` mean the catalog stopped updating. `burned`,
 `duplicate`, and `invalid_transition` on a queue operation are the state
 machine working as designed. `unauthorized` on `op="rotate"` or
 `op="verify"` is an agent presenting a credential that does not
 authenticate.
+
+The fourth group is capacity, and it is the one worth an alert.
+`queue_full` on `op="register"` means the pending queue has reached its
+5,000-record cap and every new submission is being refused until a reviewer
+works it down; nothing recovers on its own.  `dedup_window_full` is the
+softer sibling: the duplicate-detection window is at its cap, so an
+identical resubmission of a registration nobody has decided yet takes a
+fresh slot instead of being recognized as a retry. The durable index still
+refuses every decided description, so what is lost is only the undecided
+case.
+
+`op="feed_refresh"` also carries `outcome="unchanged"`, which is not a
+refusal: it is the refresh timer finding the same feed file it applied last
+time and skipping the rewrite. On a healthy deployment this is most ticks.
 
 The embedded store itself is counted separately on
 `sbproxy_embedded_store_operations_total{store="agent_registry"}`, drawn on

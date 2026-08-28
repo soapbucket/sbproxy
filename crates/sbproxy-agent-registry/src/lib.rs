@@ -65,7 +65,7 @@ pub mod metrics;
 pub mod registration;
 pub mod service;
 
-pub use catalog::{Catalog, CatalogHealth};
+pub use catalog::{Catalog, CatalogApplied, CatalogHealth};
 pub use error::{RegistryError, Result};
 pub use feed::{AgentFeed, BootstrapKeys, FeedEntry};
 pub use registration::{

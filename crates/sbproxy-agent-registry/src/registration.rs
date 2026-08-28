@@ -349,30 +349,23 @@ fn default_tenant() -> String {
     DEFAULT_TENANT.to_string()
 }
 
-/// Collapse a tenant name into something that cannot reshape a composed
-/// store key.
+/// The tenant half of a replay-index key: a fixed-length digest of the
+/// tenant name.
 ///
-/// Tenants come from `proxy.admin.operators[].tenant`, so this guards a
-/// config mistake rather than an attacker, but the key it composes is the
-/// boundary between two tenants' replay indexes and a `:` in a tenant name
-/// would move it.
-fn sanitize_tenant(tenant: &str) -> String {
-    let sanitized: String = tenant
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || character == '_' || character == '-' {
-                character
-            } else {
-                '_'
-            }
-        })
-        .take(128)
-        .collect();
-    if sanitized.is_empty() {
-        DEFAULT_TENANT.to_string()
-    } else {
-        sanitized
-    }
+/// A hash rather than a sanitized spelling, because sanitizing is
+/// many-to-one: collapsing everything outside `[A-Za-z0-9_-]` to `_` maps
+/// `acme.corp` and `acme corp` onto one key, and that key is the boundary
+/// between two tenants' replay indexes. One tenant's rejection would then
+/// refuse the other tenant's identical description, which is exactly the
+/// property the key exists to keep apart. The digest is injective in
+/// practice and fixed-length, so the `:` that separates it from the
+/// fingerprint is never ambiguous.
+///
+/// Not a security boundary and not secret: tenants come from
+/// `proxy.admin.operators[].tenant` and this is a key-composition
+/// question, not an authorization one.
+fn tenant_index_key(tenant: &str) -> String {
+    hex::encode(Sha256::digest(tenant.as_bytes()))
 }
 
 /// One decided metadata fingerprint, and what was decided about it.
@@ -797,11 +790,11 @@ impl RegistrationQueue {
     /// Compose the metadata index key.
     ///
     /// Tenant-qualified, so one tenant's rejection does not refuse another
-    /// tenant's identical description. The fingerprint is hex, so a `:`
-    /// cannot appear in it and the tenant is always the part before the
-    /// first one.
+    /// tenant's identical description. Both halves are hex, so a `:`
+    /// cannot appear in either and the tenant is always the part before
+    /// the first one.
     fn index_key(tenant: &str, fingerprint: &str) -> String {
-        format!("{}:{fingerprint}", sanitize_tenant(tenant))
+        format!("{}:{fingerprint}", tenant_index_key(tenant))
     }
 
     async fn index_decision(&self, record: &RegistrationRecord) -> Result<()> {
@@ -1174,10 +1167,12 @@ impl RegistrationQueue {
             Err(RegistryError::NotFound(_)) => return Err(RegistryError::Unauthorized),
             Err(other) => return Err(other),
         };
-        if !verify_credential(
-            registration_access_token,
-            &record.registration_access_token_hash,
-        )? {
+        if !verify_credential_off_thread(
+            registration_access_token.to_string(),
+            record.registration_access_token_hash.clone(),
+        )
+        .await?
+        {
             return Err(RegistryError::Unauthorized);
         }
         if record.state != ApprovalState::Approved {
@@ -1298,6 +1293,73 @@ mod tests {
             expected_keyids: vec!["ed25519:THUMBPRINT".into()],
             requested_scopes: vec![RequestedScope::CrawlPublic],
         }
+    }
+
+    /// Argon2id at these parameters is roughly 100 ms of CPU and 19 MiB of
+    /// allocation per call. Every one has to go to the blocking pool: run
+    /// inline on an `async fn` it holds an executor thread for that long,
+    /// and this crate's routes are on the admin connection task. The round
+    /// that moved the other four call sites left `rotate_secret`'s verify
+    /// behind while its commit message claimed all of them had moved, so
+    /// this reads the file rather than trusting the claim.
+    #[test]
+    fn every_argon2_call_goes_through_the_blocking_pool() {
+        // Split so this test's own source cannot match itself.
+        let hash = concat!("hash_", "credential(");
+        let verify = concat!("verify_", "credential(");
+        let mut inline = Vec::new();
+        for (offset, line) in include_str!("registration.rs").lines().enumerate() {
+            let trimmed = line.trim_start();
+            // The two definitions, and the two `spawn_blocking` wrappers
+            // that are the only legitimate callers of them.
+            if trimmed.starts_with("fn ")
+                || trimmed.starts_with("async fn ")
+                || trimmed.starts_with("tokio::task::spawn_blocking")
+            {
+                continue;
+            }
+            if (trimmed.contains(hash) || trimmed.contains(verify))
+                && !trimmed.contains("_off_thread")
+            {
+                inline.push(offset + 1);
+            }
+        }
+        assert!(
+            inline.is_empty(),
+            "registration.rs calls the synchronous Argon2 helpers on the executor at lines \
+             {inline:?}; use hash_credential_off_thread / verify_credential_off_thread"
+        );
+    }
+
+    /// The replay index's tenant half used to be a sanitized spelling,
+    /// which collapses everything outside `[A-Za-z0-9_-]` onto `_`. Two
+    /// tenant names one keystroke apart shared one index, so one tenant
+    /// rejecting a description refused the other tenant's identical one:
+    /// the exact property the tenant qualifier exists to provide.
+    #[test]
+    fn two_tenants_that_sanitize_alike_do_not_share_a_replay_index() {
+        let fingerprint = "abc123";
+        assert_ne!(
+            RegistrationQueue::index_key("acme.corp", fingerprint),
+            RegistrationQueue::index_key("acme corp", fingerprint)
+        );
+        assert_ne!(
+            RegistrationQueue::index_key("acme/corp", fingerprint),
+            RegistrationQueue::index_key("acme_corp", fingerprint)
+        );
+
+        // Same tenant, same key, every time.
+        assert_eq!(
+            RegistrationQueue::index_key("acme.corp", fingerprint),
+            RegistrationQueue::index_key("acme.corp", fingerprint)
+        );
+
+        // The separator stays unambiguous: both halves are hex.
+        let key = RegistrationQueue::index_key("acme.corp", fingerprint);
+        assert_eq!(key.matches(':').count(), 1);
+        let (tenant, tail) = key.split_once(':').expect("one separator");
+        assert!(tenant.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(tail, fingerprint);
     }
 
     /// The queue had no bound at all, and `docs/agent-registry.md` tells an
