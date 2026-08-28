@@ -1351,20 +1351,87 @@ spec:
     assert!(resolution.drops.is_empty());
 }
 
-/// The whole model runs on inputs the caller already holds. Nothing in
-/// this file names a repository directory, a temp dir, or a socket, and
-/// the composition below is driven entirely by two string constants.
+/// The whole model runs on inputs the caller already holds. The
+/// composition below is driven entirely by two string constants, and the
+/// entry names a repository that is never opened.
 #[test]
 fn the_resolver_composes_from_text_alone() {
     let resolution = compose(CHECKOUT_PROFILE, CHECKOUT_ENTRY, Some(FLOOR));
     assert_eq!(resolution.origins.len(), 1);
-    // The entry names a repository it never fetched, and the composition
-    // still produced the origin.
     assert_eq!(
         entry(CHECKOUT_ENTRY).repo,
         "https://git.test/acme/checkout",
         "the repository is a label here, not something opened"
     );
+}
+
+/// The resolver has no filesystem access and no network access anywhere,
+/// so a unit test of it runs on a machine with no `git`.
+///
+/// Asserted structurally rather than by unsetting `PATH`, for two
+/// reasons. A test that mutates the process environment is racy against
+/// every other test in the binary, and the repository guards env mutation
+/// for exactly that reason. And unsetting `PATH` would only prove that
+/// this one composition made no `exec`, while what the ticket asks is
+/// that no path through the module can. Reading the module's own source
+/// answers the second question.
+///
+/// The one exception is deliberate and narrow: the tests at the bottom of
+/// the module read the shipped schemas to run the field-classification
+/// ratchet, so the scan stops at the `#[cfg(test)]` boundary.
+#[test]
+fn nothing_in_the_resolver_opens_a_file_or_a_socket() {
+    let source = std::fs::read_to_string(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/origin_profile.rs"),
+    )
+    .expect("the module source is readable");
+    let production = source
+        .split_once("\n#[cfg(test)]\n")
+        .map_or(source.as_str(), |(before, _)| before);
+    assert!(
+        production.len() > 20_000,
+        "the split found no test module, so this scanned the wrong text"
+    );
+    for reach in [
+        "std::fs",
+        "std::process",
+        "std::net",
+        "std::env",
+        "tokio::",
+        "reqwest",
+        "fs::File",
+        "OpenOptions",
+        "read_to_string",
+        "Command::",
+        "TcpStream",
+    ] {
+        assert!(
+            !production.contains(reach),
+            "`{reach}` appears in the resolver; it is supposed to be a pure function of the \
+             documents its caller already holds"
+        );
+    }
+}
+
+/// A config with neither block behaves exactly as it did before they
+/// existed. The v1-compat fixture sweep covers the wider claim; this
+/// pins the narrow one next to the code that could break it.
+#[test]
+fn a_config_with_neither_block_is_unchanged() {
+    let yaml = "origins:\n  \"api.test\":\n    action:\n      type: static\n      \
+                status_code: 200\n      content_type: text/plain\n      body: ok\n";
+    let config: sbproxy_config::ConfigFile = serde_yaml::from_str(yaml).expect("parses");
+    assert!(config.origin_defaults.is_none());
+    assert!(config.origin_sources.is_none());
+    sbproxy_config::compile_config(yaml).expect("compiles exactly as before");
+    // And the serialized form gains no keys, so a round-trip through the
+    // authority's re-serialization does not invent an empty block.
+    let round_tripped = serde_yaml::to_string(&config).expect("serializes");
+    assert!(
+        !round_tripped.contains("origin_defaults"),
+        "{round_tripped}"
+    );
+    assert!(!round_tripped.contains("origin_sources"), "{round_tripped}");
 }
 
 // --- the shipped example ---------------------------------------------
