@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "A tool call held by an enforcing ai_tool_call hook is now released ahead of the stream terminator, so a streaming client that stops at data: [DONE] still receives the call (and any rewrite of it) instead of dropping it."
-}
