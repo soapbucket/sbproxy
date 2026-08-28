@@ -479,6 +479,16 @@ jobs:
       - name: durable sinks create files owner-only (WOR-2626)
         run: bash scripts/check-durable-file-modes.sh
 
+      # Every type in scripts/secret-debug-registry.txt keeps its
+      # redacting Debug (WOR-2640). Pure grep plus its own fixtures.
+      # A runtime test can prove one type redacts; only a registry can
+      # prove the whole set still does, because putting `Debug` back in
+      # a derive and deleting the impl beside it is a two-line change
+      # that compiles, lints clean, and reads like tidying. Shares one
+      # script with scripts/check.sh.
+      - name: secret-bearing types do not derive Debug (WOR-2640)
+        run: bash scripts/check-secret-debug-registry.sh
+
       # Apache 2.0 section 4(d): every Apache-2.0-only crate must be
       # named in NOTICE. Shares one script with scripts/check.sh.
       # cargo metadata does not compile and does not change this job's

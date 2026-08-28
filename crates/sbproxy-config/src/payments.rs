@@ -396,7 +396,7 @@ pub struct DirectPaymentIntentConfig {
 }
 
 /// Stripe settlement rail.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StripeRailConfig {
     /// Secret reference to the Stripe secret key. Never inline.
@@ -425,6 +425,22 @@ pub struct StripeRailConfig {
     /// Optional direct PaymentIntent mode.
     #[serde(default)]
     pub direct_payment_intent: Option<DirectPaymentIntentConfig>,
+}
+
+/// Redacted `Debug` (WOR-2606). A Stripe secret key charges cards on
+/// the operator's account. The API version, the account context and the
+/// business network id all stay: they are what identifies the
+/// integration a failed call belongs to and none of them authenticates.
+impl std::fmt::Debug for StripeRailConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StripeRailConfig")
+            .field("api_key", &"[REDACTED]")
+            .field("api_version", &self.api_version)
+            .field("account_context", &self.account_context)
+            .field("business_network_id", &self.business_network_id)
+            .field("quote_currency", &self.quote_currency)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Core Lightning rail, reached over its Unix-socket JSON-RPC.
@@ -3129,5 +3145,36 @@ usage_reporters:
             ),
             AmountConversionError::Inexact { .. }
         ));
+    }
+
+    /// The Stripe secret key, pinned (WOR-2606).
+    ///
+    /// It charges cards on the operator's account. The API version, the
+    /// account context and the business network id stay: none of them
+    /// authenticates and each names the integration a failed call
+    /// belongs to.
+    #[test]
+    fn debug_never_renders_the_stripe_secret_key() {
+        const SENTINEL: &str = "SENTINEL-STRIPE-6e10";
+
+        let stripe = StripeRailConfig {
+            api_key: SENTINEL.to_string(),
+            api_version: STRIPE_API_VERSION.to_string(),
+            account_context: "platform".to_string(),
+            business_network_id: "bn-1".to_string(),
+            quote_currency: "USD".to_string(),
+            currency_decimals: 2,
+            payment_method_types: vec!["card".to_string()],
+            direct_payment_intent: None,
+        };
+        let rendered = format!("{stripe:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the Stripe secret key reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("bn-1") && rendered.contains("platform"),
+            "the business network id and account context must survive: {rendered}"
+        );
     }
 }

@@ -8910,7 +8910,7 @@
           ]
         },
         "idempotency": {
-          "description": "RFC 8594-style idempotency-key middleware. Opt in per origin to have the proxy short-circuit retries of POST/PUT/PATCH (or any configured method) carrying a repeated `Idempotency-Key` header. See [`IdempotencyConfig`].",
+          "description": "`Idempotency-Key` middleware, per `draft-ietf-httpapi-idempotency-key-header`. Opt in per origin to have the proxy short-circuit retries of POST/PUT/PATCH (or any configured method) carrying a repeated `Idempotency-Key` header. See [`IdempotencyConfig`].",
           "default": null,
           "anyOf": [
             {
@@ -10808,7 +10808,7 @@
       "additionalProperties": false
     },
     "IdempotencyConfig": {
-      "description": "RFC 8594-style idempotency middleware configuration.\n\nWhen `enabled`, the proxy reads an idempotency key from the configured request header (default: `Idempotency-Key`), hashes the request body for conflict detection, and serves cached responses on retries. Workspace-isolated keys mean two workspaces using the same key never collide. The middleware engages only on the listed HTTP methods; defaults to POST, PUT, and PATCH.\n\nBacked by `sbproxy_middleware::idempotency` (the cache backend trait + memory / Redis impls). For Redis-backed clusters set `backend: redis`; the cache binds to the cluster L2 store at compile time. Single-instance deployments leave `backend: memory` (the default).",
+      "description": "`Idempotency-Key` middleware configuration, per `draft-ietf-httpapi-idempotency-key-header`.\n\nWhen `enabled`, the proxy reads an idempotency key from the configured request header (default: `Idempotency-Key`), hashes the request body for conflict detection, and serves cached responses on retries. Workspace-isolated keys mean two workspaces using the same key never collide. The middleware engages only on the listed HTTP methods; defaults to POST, PUT, and PATCH.\n\nBacked by `sbproxy_middleware::idempotency` (the cache backend trait + memory / Redis impls). For Redis-backed clusters set `backend: redis`; the cache binds to the cluster L2 store at compile time. Single-instance deployments leave `backend: memory` (the default).",
       "type": "object",
       "properties": {
         "enabled": {
@@ -10882,6 +10882,26 @@
             "null"
           ],
           "format": "uint",
+          "minimum": 0.0
+        },
+        "claim_lease_secs": {
+          "description": "How long the request that took an idempotency key holds it before another request may take it over, in seconds. Defaults to 60.\n\nThis is the bound on how long a request that died mid-flight can wedge one key, and nothing else. Raise it above the slowest response this origin produces: a lease that runs out while its owner is still working lets a retry through to the upstream, which is the duplicate call the middleware exists to prevent. An origin fronting an AI completion or a payment with a 3DS step-up wants a larger value. Lowering it makes a crashed request's key free sooner and makes duplicates more likely; a request that ends cleanly releases its key immediately either way, so the lease only governs the requests that did not.\n\nA response is stored under `ttl_secs`, which is hours, not under this. The two lifetimes are unrelated: an upstream slower than the lease still caches its response.\n\nZero is refused at config-validate time rather than silently normalized, because a zero lease expires the instant it is taken and would turn single-flight off without saying so.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "claim_wait_ms": {
+          "description": "How long an overlapping request waits for the key holder's response before answering 409 `ledger.idempotency_in_flight`, in milliseconds. Defaults to 3000.\n\nA retry that arrives while the original request is still running waits this long and then replays the original's response, so the client sees its answer rather than an error. Set it to 0 to answer 409 immediately, which is the floor `draft-ietf-httpapi-idempotency-key-header` describes. Raising it past the client's own timeout buys nothing: the client gives up first and the wait is abandoned.\n\nA waiting request holds a slot in a pool sized by `max_concurrent_buffers`, separate from the buffering pool, so a long wait cannot spend the slots other keys need.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
           "minimum": 0.0
         }
       },

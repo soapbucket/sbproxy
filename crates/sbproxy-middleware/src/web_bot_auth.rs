@@ -25,13 +25,32 @@ use ed25519_dalek::SigningKey;
 pub const DIRECTORY_CONTENT_TYPE: &str = "application/http-message-signatures-directory+json";
 
 /// One Ed25519 signing identity to publish in the directory.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct DirectoryIdentity<'a> {
     /// Advertised key id (the JWK `kid` and the RFC 9421 `keyid`).
     pub key_id: &'a str,
     /// The 32-byte Ed25519 private seed. Only the derived public key
     /// is published.
     pub seed: &'a [u8; 32],
+}
+
+/// Redacted `Debug` (WOR-2606). `seed` is a 32-byte Ed25519 *private*
+/// seed, borrowed rather than owned, which is what made it easy to miss
+/// behind a derive on a `Copy` type. Anything that reads it signs
+/// directory and agent card responses every Web Bot Auth verifier will
+/// accept as this operator's, which is the whole trust loop this module
+/// exists to close.
+///
+/// The key id stays: it is published on purpose and it is what names
+/// which identity a failed signature belongs to. The runtime twin of
+/// `sbproxy_config::WebBotAuthPublishConfig.signing_key_hex`.
+impl std::fmt::Debug for DirectoryIdentity<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DirectoryIdentity")
+            .field("key_id", &self.key_id)
+            .field("seed", &"[REDACTED; 32 bytes]")
+            .finish()
+    }
 }
 
 /// Build the OKP / Ed25519 JWK (as a `serde_json::Value`) for the
@@ -132,5 +151,34 @@ mod tests {
         recovered
             .verify(message, &sig)
             .expect("published key must verify the seed's signature");
+    }
+
+    /// The published identity's private seed, pinned (WOR-2606).
+    ///
+    /// A borrowed `&[u8; 32]` behind a derive on a `Copy` type is easy
+    /// to miss, and the value is the Ed25519 private half of the key the
+    /// directory publishes.
+    #[test]
+    fn debug_never_renders_the_directory_signing_seed() {
+        let seed = [7u8; 32];
+        let identity = DirectoryIdentity {
+            key_id: "kid-1",
+            seed: &seed,
+        };
+        let rendered = format!("{identity:?}");
+        assert!(
+            !rendered.contains("07070707") && !rendered.contains("[7, 7,"),
+            "the Ed25519 private seed reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("kid-1"),
+            "the key id must survive: it is published on purpose and names which \
+             identity a failed signature belongs to: {rendered}"
+        );
+        assert!(
+            rendered.contains("32 bytes"),
+            "the length must survive: a seed of the wrong length is the usual \
+             misconfiguration and the length discloses nothing: {rendered}"
+        );
     }
 }
