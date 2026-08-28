@@ -17015,6 +17015,49 @@ fn record_ai_tool_call_decision(
     );
 }
 
+/// Order one batch of hub chunks for the client stream, with any
+/// released tool-call frames ahead of the batch's stream terminator.
+///
+/// WOR-2430: in hold-back mode a tool-call frame leaves the batch when
+/// it is staged and comes back in `released` once its verdict lands.
+/// For a stream whose calls complete at the end, that verdict is
+/// `MessageStop`, and `MessageStop` is the chunk the emitter turns into
+/// the terminator (`data: {..finish_reason..}` plus `data: [DONE]` on
+/// OpenAI). Appending `released` after the whole batch therefore put
+/// the rewritten call *after* `[DONE]`, where a client that stops
+/// reading at the terminator never sees it: the mutation shipped on the
+/// wire and arrived nowhere.
+///
+/// So the terminator goes last. Everything else keeps its arrival
+/// order, and a batch that released nothing is not reordered at all,
+/// which keeps this inert on every stream without a held tool call.
+fn ordered_stream_batch<'a>(
+    batch: &'a [sbproxy_ai::format::HubChunk],
+    released: &'a [sbproxy_ai::format::HubChunk],
+    holds_tool_frames: bool,
+) -> Vec<&'a sbproxy_ai::format::HubChunk> {
+    use sbproxy_ai::format::HubChunk;
+
+    let retained = batch
+        .iter()
+        .filter(|hub| !(holds_tool_frames && matches!(hub, HubChunk::ToolCallDelta { .. })));
+    if released.is_empty() {
+        return retained.collect();
+    }
+    let mut ordered: Vec<&HubChunk> = Vec::with_capacity(batch.len() + released.len());
+    let mut terminal: Vec<&HubChunk> = Vec::new();
+    for hub in retained {
+        if matches!(hub, HubChunk::MessageStop { .. }) {
+            terminal.push(hub);
+        } else {
+            ordered.push(hub);
+        }
+    }
+    ordered.extend(released.iter());
+    ordered.extend(terminal);
+    ordered
+}
+
 /// WOR-1810: run one batch of decoded hub events through the guardrail
 /// session (`finish` additionally completes every pending tool call,
 /// for message stop / stream close). Returns the first block verdict
@@ -17552,6 +17595,64 @@ mod mutation_write_back_tests {
     fn stream_output_mutation_unknown_format_is_unrepresentable() {
         let held = [Bytes::from_static(b"data: {}\n\n")];
         assert!(apply_stream_output_mutation("clean", &held, Some("gemini")).is_none());
+    }
+
+    fn tool_delta(index: usize) -> HubChunk {
+        HubChunk::ToolCallDelta {
+            index,
+            delta: sbproxy_ai::format::HubToolCallDelta::default(),
+        }
+    }
+
+    #[test]
+    fn a_released_tool_frame_is_ordered_before_the_stream_terminator() {
+        // WOR-2430: `MessageStop` is the chunk the emitter turns into
+        // the terminator, and it is also the verdict that releases a
+        // held call. Emitting the batch and then the released frames
+        // put the call after `data: [DONE]`, where no client reads it.
+        let batch = [
+            tool_delta(0),
+            HubChunk::MessageStop {
+                finish_reason: sbproxy_ai::format::FinishReason::ToolCalls,
+            },
+        ];
+        let released = [tool_delta(0)];
+        let ordered = super::ordered_stream_batch(&batch, &released, true);
+        assert_eq!(ordered.len(), 2, "the held frame must not be emitted twice");
+        assert!(
+            matches!(ordered[0], HubChunk::ToolCallDelta { .. }),
+            "the released call must come first"
+        );
+        assert!(
+            matches!(ordered[1], HubChunk::MessageStop { .. }),
+            "the terminator must come last"
+        );
+    }
+
+    #[test]
+    fn a_batch_that_released_nothing_keeps_its_arrival_order() {
+        // The reordering is inert on every stream without a held call,
+        // which is what keeps this off the ordinary relay path.
+        let batch = [
+            HubChunk::ContentDelta {
+                index: 0,
+                delta: ContentPartDelta::Text("hello".to_string()),
+            },
+            HubChunk::MessageStop {
+                finish_reason: sbproxy_ai::format::FinishReason::Stop,
+            },
+        ];
+        let ordered = super::ordered_stream_batch(&batch, &[], false);
+        assert_eq!(ordered.len(), 2);
+        assert!(matches!(ordered[0], HubChunk::ContentDelta { .. }));
+        assert!(matches!(ordered[1], HubChunk::MessageStop { .. }));
+    }
+
+    #[test]
+    fn a_held_tool_frame_with_no_verdict_yet_stays_out_of_the_batch() {
+        let batch = [tool_delta(0)];
+        assert!(super::ordered_stream_batch(&batch, &[], true).is_empty());
+        assert_eq!(super::ordered_stream_batch(&batch, &[], false).len(), 1);
     }
 }
 
@@ -19044,13 +19145,11 @@ async fn relay_ai_stream_frames(
                     let mut translated = String::new();
                     // In hold-back mode, tool-call frames for calls
                     // still awaiting a verdict stay out of the client
-                    // stream; released frames (judged clean) append
-                    // after this chunk's regular content.
-                    let emit_now = hub_chunks.iter().filter(|hub| {
-                        !(holds_tool_frames
-                            && matches!(hub, sbproxy_ai::format::HubChunk::ToolCallDelta { .. }))
-                    });
-                    for hub in emit_now.chain(released_tool_chunks.iter()) {
+                    // stream; released frames (judged clean) rejoin
+                    // this chunk's content ahead of its terminator.
+                    let emit_now =
+                        ordered_stream_batch(hub_chunks, &released_tool_chunks, holds_tool_frames);
+                    for hub in emit_now {
                         match emitter.from_hub_stream(hub, &mut bridge_ctx) {
                             Ok(frames) => {
                                 for f in frames {
@@ -19310,12 +19409,10 @@ async fn relay_ai_stream_frames(
                     .as_ref()
                     .filter(|_| native_translator.is_some())
                 {
-                    let emit_now = tail_events.iter().filter(|hub| {
-                        !(holds_tool_frames
-                            && matches!(hub, sbproxy_ai::format::HubChunk::ToolCallDelta { .. }))
-                    });
+                    let emit_now =
+                        ordered_stream_batch(&tail_events, &close_released, holds_tool_frames);
                     let mut translated = String::new();
-                    for hub in emit_now.chain(close_released.iter()) {
+                    for hub in emit_now {
                         if let Ok(frames) = emitter.from_hub_stream(hub, &mut bridge_ctx) {
                             for f in frames {
                                 translated.push_str(&f);
@@ -27210,6 +27307,71 @@ origins:
             "the original arguments must not ship: {response}"
         );
         assert!(response.contains("dangerous_lookup"), "{response}");
+        // Reaching the wire is not reaching the client. The rewritten
+        // call is released on `MessageStop`, which is the same chunk
+        // the emitter turns into `data: [DONE]`, and an OpenAI client
+        // stops reading there. A frame written after the terminator is
+        // a mutation that shipped and arrived nowhere (WOR-2430).
+        let terminator = response
+            .find("data: [DONE]")
+            .unwrap_or_else(|| panic!("the stream must carry a terminator: {response}"));
+        let rewrite = response
+            .find("[SAFE]")
+            .unwrap_or_else(|| panic!("the rewrite must ship: {response}"));
+        assert!(
+            rewrite < terminator,
+            "the rewritten tool call must precede the stream terminator: {response}"
+        );
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_released_tool_call_ships_before_the_stream_terminator() {
+        // The wider case behind the same ordering rule: an enforcing
+        // `ai_tool_call` hook holds every tool frame whether or not it
+        // mutates, and a plain `release` verdict lands on the same
+        // `MessageStop` that frames `data: [DONE]`. The unmodified call
+        // has to reach the client too (WOR-2430).
+        let (upstream_url, upstream_hits) =
+            upstream_bytes_fixture(openai_tool_call_stream(), "text/event-stream").await;
+        let config = openai_proxy_config(&upstream_url);
+        let (_directory, pipeline) = pipeline_with_ai_javascript(
+            "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: tool-release\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nhooks:\n  - kind: ai_tool_call\n    type: release_tool\n    export: inspect\n",
+            r#"export function inspect() { return {version:"sbproxy-envelope/v1",decision:"release"}; }"#,
+        );
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("a released tool call is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response UTF-8");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let terminator = response
+            .find("data: [DONE]")
+            .unwrap_or_else(|| panic!("the stream must carry a terminator: {response}"));
+        let call = response
+            .find("dangerous_lookup")
+            .unwrap_or_else(|| panic!("the released call must ship: {response}"));
+        assert!(
+            call < terminator,
+            "a released tool call must precede the stream terminator: {response}"
+        );
         assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
     }
 
