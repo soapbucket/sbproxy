@@ -3054,8 +3054,11 @@ pub(super) async fn request_filter(
                     // buffer or a signature.
                     match olp_token_source_ip(session) {
                         Some(source)
-                            if !olp_token_rate_limiter()
-                                .check_and_consume(source, cfg.token_rate_limit_per_minute) =>
+                            if !olp_token_rate_limiter().check_and_consume(
+                                pipeline.config.origins[origin_idx].hostname.as_str(),
+                                source,
+                                cfg.token_rate_limit_per_minute,
+                            ) =>
                         {
                             sbproxy_observe::metrics::record_olp_decision("token", "rate_limited");
                             info!(
@@ -3074,6 +3077,18 @@ pub(super) async fn request_filter(
                             // would be worse than reusing the nearest
                             // registered spelling. 429 with
                             // `Retry-After` is what a client acts on.
+                            //
+                            // The hint is computed, not fixed: the
+                            // bucket refills at `budget / 60` tokens per
+                            // second, so one token is `60 / budget`
+                            // seconds away. A fixed `1` is right only at
+                            // the default of 60 and too short for every
+                            // value below it, which would have a
+                            // well-behaved client retry into the same
+                            // refusal.
+                            let retry_after = 60u32
+                                .div_ceil(cfg.token_rate_limit_per_minute.max(1))
+                                .max(1);
                             let body = serde_json::json!({
                                 "error": "slow_down",
                                 "error_description":
@@ -3085,7 +3100,7 @@ pub(super) async fn request_filter(
                                 429,
                                 "application/json",
                                 body.as_bytes(),
-                                &[("retry-after".to_string(), "1".to_string())],
+                                &[("retry-after".to_string(), retry_after.to_string())],
                             )
                             .await?;
                             ctx.response_status = Some(429);
@@ -3263,6 +3278,69 @@ pub(super) async fn request_filter(
                 .get(origin_idx)
                 .and_then(Option::as_ref)
             {
+                // WOR-2673 verification residual: the CoMP half carries
+                // the same per-source budget as the OLP half.
+                //
+                // These three endpoints answer from `request_filter`
+                // ahead of bot detection, threat protection, auth, and
+                // the policy chain, exactly like the token endpoint
+                // next to them in the same namespace, and until now
+                // only that one was budgeted. Memory here is bounded by
+                // the quote ledger's cap and a refusal is cheap because
+                // the cap is checked before the signature, but each
+                // refused request still costs a sweep over up to fifty
+                // thousand rows under a mutex and every manifest serve
+                // re-serializes the manifest.
+                //
+                // The budget is the origin's own
+                // `olp.token_rate_limit_per_minute` rather than a
+                // second key. The bridge already requires an enabled
+                // `olp:` block on the same origin (the config compiler
+                // refuses it otherwise) and mints through that issuer,
+                // so the two halves are one licensing surface and one
+                // number governs both. A second knob would be a second
+                // thing to get wrong for no capability.
+                if let Some(olp) = pipeline.config.origins[origin_idx]
+                    .olp
+                    .as_ref()
+                    .filter(|olp| olp.enabled)
+                {
+                    if let Some(source) = olp_token_source_ip(session) {
+                        if !olp_token_rate_limiter().check_and_consume(
+                            pipeline.config.origins[origin_idx].hostname.as_str(),
+                            source,
+                            olp.token_rate_limit_per_minute,
+                        ) {
+                            let endpoint = if req_path == crate::pipeline::COMP_QUOTE_PATH {
+                                sbproxy_licensing::comp::CompEndpoint::Quote
+                            } else if req_path == crate::pipeline::COMP_REDEEM_PATH {
+                                sbproxy_licensing::comp::CompEndpoint::Redeem
+                            } else {
+                                sbproxy_licensing::comp::CompEndpoint::Manifest
+                            };
+                            let refused = sbproxy_licensing::comp::rate_limited(endpoint);
+                            let retry_after = 60u32
+                                .div_ceil(olp.token_rate_limit_per_minute.max(1))
+                                .max(1);
+                            send_response_with_headers(
+                                session,
+                                refused.status,
+                                refused.content_type,
+                                &refused.body,
+                                &[
+                                    (
+                                        "cache-control".to_string(),
+                                        refused.cache_control.to_string(),
+                                    ),
+                                    ("retry-after".to_string(), retry_after.to_string()),
+                                ],
+                            )
+                            .await?;
+                            ctx.response_status = Some(refused.status);
+                            return Ok(true);
+                        }
+                    }
+                }
                 let method = session.req_header().method.clone();
                 let expected = if req_path == crate::pipeline::COMP_MANIFEST_PATH {
                     http::Method::GET
@@ -6162,8 +6240,17 @@ mod redis_revocation_store_tests {
 ///
 /// Bucket: 60 tokens, refill 60/minute (one per second). A scanner
 /// firing >60 inactive lookups per minute from one IP gets 429'd;
-/// burst up to 60 is allowed. Per-origin instance so multi-tenant
-/// deployments cannot cross-contaminate.
+/// burst up to 60 is allowed.
+///
+/// One process-global instance keyed on the address alone, so a source
+/// introspecting against two origins shares one budget across both.
+/// This doc used to claim a per-origin instance that prevented
+/// cross-contamination; it never had one (`introspect_rate_limiter()`
+/// is a `OnceLock` singleton). The budget here is a fixed constant
+/// rather than a per-origin config key, so sharing changes no
+/// operator-visible number, which is why this is stated rather than
+/// fixed. Its sibling [`OlpTokenRateLimiter`] does carry a per-origin
+/// budget and is keyed accordingly.
 /// Per-source token budget for `POST /.well-known/olp/token`
 /// (WOR-2673).
 ///
@@ -6185,7 +6272,20 @@ mod redis_revocation_store_tests {
 ///   anyone can reach is the same class of defect the CoMP quote
 ///   ledger's cap exists to close.
 struct OlpTokenRateLimiter {
-    buckets: std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, OlpTokenBucket>>,
+    /// Keyed on `(origin hostname, source ip)`, not on the address
+    /// alone.
+    ///
+    /// This is one process-global singleton, and the budget it enforces
+    /// is a per-origin config key. Keyed on the address alone, a source
+    /// alternating between an origin budgeted at 60 and one budgeted at
+    /// 3 would share a single bucket that `min(capacity)` clamps to 3,
+    /// so the tight origin would throttle the loose one and neither
+    /// would get the budget its config names. The direction was safe
+    /// (always tighter, never looser) but the numbers were not the ones
+    /// the operator wrote.
+    buckets: std::sync::Mutex<
+        std::collections::HashMap<(compact_str::CompactString, std::net::IpAddr), OlpTokenBucket>,
+    >,
 }
 
 /// One source's budget.
@@ -6224,7 +6324,7 @@ impl OlpTokenRateLimiter {
     /// holds that many tokens and refills at one sixtieth of it per
     /// second. Config load refuses zero, and the `max(1.0)` here is the
     /// belt for a caller that built the config in memory.
-    fn check_and_consume(&self, ip: std::net::IpAddr, per_minute: u32) -> bool {
+    fn check_and_consume(&self, origin: &str, ip: std::net::IpAddr, per_minute: u32) -> bool {
         let capacity = f64::from(per_minute).max(1.0);
         let refill_per_sec = capacity / 60.0;
         let now = std::time::Instant::now();
@@ -6232,7 +6332,8 @@ impl OlpTokenRateLimiter {
             .buckets
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !buckets.contains_key(&ip) && buckets.len() >= OLP_TOKEN_LIMITER_MAX_SOURCES {
+        let key = (compact_str::CompactString::from(origin), ip);
+        if !buckets.contains_key(&key) && buckets.len() >= OLP_TOKEN_LIMITER_MAX_SOURCES {
             // Drop every source that has refilled to full: those carry
             // no budget state, so forgetting them changes no decision.
             buckets.retain(|_, bucket| {
@@ -6243,7 +6344,7 @@ impl OlpTokenRateLimiter {
                 return false;
             }
         }
-        let bucket = buckets.entry(ip).or_insert(OlpTokenBucket {
+        let bucket = buckets.entry(key).or_insert(OlpTokenBucket {
             tokens: capacity,
             last_refill: now,
         });
@@ -9533,12 +9634,12 @@ mod olp_token_rate_limiter_tests {
         let budget = 5;
         for attempt in 1..=budget {
             assert!(
-                limiter.check_and_consume(ip(1), budget),
+                limiter.check_and_consume("a.test", ip(1), budget),
                 "mint {attempt} of {budget} is inside the budget"
             );
         }
         assert!(
-            !limiter.check_and_consume(ip(1), budget),
+            !limiter.check_and_consume("a.test", ip(1), budget),
             "the mint past the budget must be refused"
         );
     }
@@ -9549,11 +9650,11 @@ mod olp_token_rate_limiter_tests {
     fn one_exhausted_source_does_not_refuse_another() {
         let limiter = OlpTokenRateLimiter::new();
         for _ in 0..3 {
-            assert!(limiter.check_and_consume(ip(1), 3));
+            assert!(limiter.check_and_consume("a.test", ip(1), 3));
         }
-        assert!(!limiter.check_and_consume(ip(1), 3));
+        assert!(!limiter.check_and_consume("a.test", ip(1), 3));
         assert!(
-            limiter.check_and_consume(ip(2), 3),
+            limiter.check_and_consume("a.test", ip(2), 3),
             "a second source has its own budget"
         );
     }
@@ -9563,11 +9664,41 @@ mod olp_token_rate_limiter_tests {
     #[test]
     fn a_zero_budget_floors_at_one_rather_than_becoming_unlimited() {
         let limiter = OlpTokenRateLimiter::new();
-        assert!(limiter.check_and_consume(ip(1), 0), "the first is allowed");
         assert!(
-            !limiter.check_and_consume(ip(1), 0),
+            limiter.check_and_consume("a.test", ip(1), 0),
+            "the first is allowed"
+        );
+        assert!(
+            !limiter.check_and_consume("a.test", ip(1), 0),
             "a zero budget must not read as unlimited"
         );
+    }
+
+    /// WOR-2673 verification residual: the budget is per origin, so one
+    /// origin's exhausted source does not throttle another's.
+    ///
+    /// The map is a process-global singleton and the budget is a
+    /// per-origin config key. Keyed on the address alone, a source
+    /// alternating between an origin budgeted at 60 and one budgeted at
+    /// 3 shared one bucket that `min(capacity)` clamped to 3, so the
+    /// tight origin throttled the loose one and neither got the number
+    /// its config named.
+    #[test]
+    fn one_origins_exhausted_source_does_not_throttle_another_origin() {
+        let limiter = OlpTokenRateLimiter::new();
+        // Spend the tight origin's whole budget from one address.
+        assert!(limiter.check_and_consume("tight.test", ip(1), 1));
+        assert!(!limiter.check_and_consume("tight.test", ip(1), 1));
+        // The same address against a loosely budgeted origin is
+        // untouched, and gets that origin's number rather than the
+        // tight one's.
+        for attempt in 1..=5 {
+            assert!(
+                limiter.check_and_consume("loose.test", ip(1), 5),
+                "mint {attempt} against the loose origin must not see the tight budget"
+            );
+        }
+        assert!(!limiter.check_and_consume("loose.test", ip(1), 5));
     }
 
     /// The tracking map is bounded, which an unauthenticated path needs
@@ -9584,10 +9715,10 @@ mod olp_token_rate_limiter_tests {
             let source = IpAddr::V4(Ipv4Addr::new(10, octets[1], octets[2], octets[3]));
             // Budget of one, consumed, so the bucket is empty and the
             // sweep cannot drop it.
-            assert!(limiter.check_and_consume(source, 1));
+            assert!(limiter.check_and_consume("a.test", source, 1));
         }
         assert!(
-            !limiter.check_and_consume(ip(9), 1),
+            !limiter.check_and_consume("a.test", ip(9), 1),
             "a new source past the cap is refused rather than tracked"
         );
         assert_eq!(
@@ -9598,6 +9729,72 @@ mod olp_token_rate_limiter_tests {
                 .len(),
             OLP_TOKEN_LIMITER_MAX_SOURCES,
             "the map does not grow past its cap"
+        );
+    }
+}
+
+/// WOR-2673: the request path's own stack budget.
+///
+/// The AI dispatch guards next door measure `handle_ai_proxy`. Nothing
+/// measured `request_filter`, which is the function every request enters
+/// and the one this ticket grew: the CoMP well-known block and the OLP
+/// token budget both live in it. A DEBUG build gives a Rust async fn
+/// far larger frames than a release one, and Pingora runs its workers on
+/// a 2 MiB stack, so a request path that fits in release can overflow in
+/// the debug binary CI's request-path smoke lane builds.
+#[cfg(test)]
+mod request_filter_stack_tests {
+    /// Pingora's per-worker stack.
+    const PINGORA_WORKER_STACK: usize = 2 * 1024 * 1024;
+
+    /// Share of that stack one `request_filter` future may occupy.
+    ///
+    /// The future is state, not frames: it is held live for the whole
+    /// request while everything it calls runs *above* it. So the budget
+    /// has to leave room for the deepest thing it dispatches into, which
+    /// is the AI path. An eighth of the stack is the line drawn here,
+    /// deliberately far below what would actually overflow, because the
+    /// number that matters is the trend and a guard that only fires at
+    /// the cliff fires too late to say what pushed it over.
+    const BUDGET: usize = PINGORA_WORKER_STACK / 8;
+
+    /// The size of the future `request_filter` returns.
+    ///
+    /// Read off the type, never from a value: `size_of` needs only the
+    /// layout, and the closure below is passed by value and dropped
+    /// without being called, so no `Session` is ever built and nothing
+    /// is polled. That is what makes this cheap enough to run in every
+    /// suite and safe enough to need no `unsafe`.
+    fn future_size<F: core::future::Future>(_never_called: impl FnOnce() -> F) -> usize {
+        core::mem::size_of::<F>()
+    }
+
+    /// The measured size of `request_filter`'s state machine.
+    fn request_filter_future_size() -> usize {
+        future_size(|| {
+            // Unreachable by construction: `future_size` takes the
+            // closure and drops it. These exist only so the call
+            // type-checks and names the future's type.
+            let session: &mut pingora_proxy::Session = unreachable!();
+            let ctx: &mut crate::context::RequestContext = unreachable!();
+            super::request_filter(session, ctx)
+        })
+    }
+
+    #[test]
+    fn request_filter_fits_its_share_of_a_pingora_worker_stack() {
+        let size = request_filter_future_size();
+        // Printed on every run, not only on failure: the number is the
+        // point, and a reviewer comparing two branches wants to read it
+        // without editing the test.
+        println!("request_filter future: {size} bytes (budget {BUDGET})");
+        assert!(
+            size <= BUDGET,
+            "the `request_filter` future is {size} bytes, past the {BUDGET}-byte budget \
+             ({PINGORA_WORKER_STACK}-byte Pingora worker stack / 8). Every request holds this \
+             live while the phases it dispatches into run above it, so growth here comes \
+             straight off what the AI path has left. Box the new state or move it into its own \
+             `async fn` rather than raising this number."
         );
     }
 }

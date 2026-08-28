@@ -279,8 +279,8 @@
     },
     {
       "id": 6,
-      "title": "OLP Token Rejection Rate",
-      "description": "Share of POST /.well-known/olp/token calls refused. A sustained non-zero rate with no successful issuance is usually one crawler with a malformed client_credentials body: every request 400s, and the debug detail is compiled out of release builds.",
+      "title": "OLP Token Refusal Rate",
+      "description": "Share of POST /.well-known/olp/token calls refused, for any reason. A sustained non-zero rate with no successful issuance is usually one crawler with a malformed client_credentials body: every request 400s, and the debug detail is compiled out of release builds. A rate that rises with `rate_limited` in the panel beside this one is the per-source budget doing its job against a flood.",
       "type": "stat",
       "gridPos": {
         "h": 8,
@@ -322,8 +322,8 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum(rate(sbproxy_olp_decisions_total{endpoint=\"token\",outcome=\"rejected\"}[5m])) / clamp_min(sum(rate(sbproxy_olp_decisions_total{endpoint=\"token\"}[5m])), 1e-9)",
-          "legendFormat": "rejected",
+          "expr": "sum(rate(sbproxy_olp_decisions_total{endpoint=\"token\",outcome=~\"rejected|rate_limited\"}[5m])) / clamp_min(sum(rate(sbproxy_olp_decisions_total{endpoint=\"token\"}[5m])), 1e-9)",
+          "legendFormat": "refused",
           "refId": "A"
         }
       ]

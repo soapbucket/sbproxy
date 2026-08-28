@@ -21,7 +21,7 @@
 //! standalone marketplace process mounts; see
 //! `examples/standalone_marketplace.rs`.
 
-use axum::body::{to_bytes, Body};
+use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::State;
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -83,17 +83,62 @@ async fn manifest(State(marketplace): State<Arc<CompMarketplace>>) -> Response {
 }
 
 async fn quote(State(marketplace): State<Arc<CompMarketplace>>, body: Body) -> Response {
-    let Ok(body) = to_bytes(body, COMP_REQUEST_BODY_LIMIT).await else {
-        return into_response(serve::oversize(serve::CompEndpoint::Quote));
+    let body = match read_capped(body, serve::CompEndpoint::Quote).await {
+        Ok(body) => body,
+        Err(refused) => return refused,
     };
     into_response(serve::serve_quote(&marketplace, &body))
 }
 
 async fn redeem(State(marketplace): State<Arc<CompMarketplace>>, body: Body) -> Response {
-    let Ok(body) = to_bytes(body, COMP_REQUEST_BODY_LIMIT).await else {
-        return into_response(serve::oversize(serve::CompEndpoint::Redeem));
+    let body = match read_capped(body, serve::CompEndpoint::Redeem).await {
+        Ok(body) => body,
+        Err(refused) => return refused,
     };
     into_response(serve::serve_redeem(&marketplace, &body).await)
+}
+
+/// Read a request body, refusing past [`COMP_REQUEST_BODY_LIMIT`].
+///
+/// `to_bytes` fails for two unrelated reasons, and they must not be
+/// counted as one: a body past the cap, and a body the transport could
+/// not finish delivering (the client hung up mid-send, the connection
+/// reset). Mapping both to `oversize` wrote
+/// `reason = "body_too_large"` into the audit trail for a client that
+/// simply disconnected, which is a false record of what happened.
+///
+/// The two are told apart by reading one byte past the cap. A body that
+/// comes back longer than `COMP_REQUEST_BODY_LIMIT` tripped it; an
+/// `Err` at that limit could only have come from the transport, because
+/// the size ceiling has not been reached yet. Exact, and it needs
+/// neither a size hint (which a chunked body may not carry) nor an
+/// `http-body` dependency this crate does not otherwise have.
+///
+/// Reading one extra byte is what the cap already tolerated: the
+/// previous shape buffered the whole body and then measured it.
+async fn read_capped(body: Body, endpoint: serve::CompEndpoint) -> Result<Bytes, Response> {
+    match to_bytes(body, COMP_REQUEST_BODY_LIMIT + 1).await {
+        Ok(body) if body.len() > COMP_REQUEST_BODY_LIMIT => {
+            Err(into_response(serve::oversize(endpoint)))
+        }
+        Ok(body) => Ok(body),
+        Err(error) => {
+            // Not a refusal the marketplace made, so it moves no
+            // decision counter: nothing was decided. A truncated body is
+            // a transport event, and the one line says so.
+            tracing::debug!(
+                error = %error,
+                "comp.body.incomplete: the client did not finish sending"
+            );
+            Err(into_response(serve::CompResponse {
+                status: 400,
+                content_type: "application/json",
+                cache_control: super::types::COMP_NO_STORE_CACHE_CONTROL,
+                comp_version: None,
+                body: br#"{"error":"incomplete_body"}"#.to_vec(),
+            }))
+        }
+    }
 }
 
 async fn manifest_method_not_allowed() -> Response {

@@ -148,7 +148,11 @@ fn start_proxy(root: &Path, config: &Path, port: u16) -> Child {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        if request(port, "GET", "/.well-known/iab-comp/manifest.json", None).is_some() {
+        // Poll the origin's ordinary route, not a licensing endpoint.
+        // Both licensing halves now share one per-source budget, and a
+        // readiness loop that spent it would leave the walkthrough below
+        // testing an exhausted bucket rather than the flow.
+        if request(port, "GET", "/", None).is_some() {
             return child;
         }
         if Instant::now() >= deadline {
@@ -270,9 +274,11 @@ origins:
       issuer: https://marketplace.test
       default_scope: ai-input
       default_ttl_secs: 3600
-      # Small on purpose: step 10 walks past it in four requests
-      # instead of sixty-one.
-      token_rate_limit_per_minute: 3
+      # Small on purpose, so step 10 can walk past it. Not as small as
+      # the three requests it takes to demonstrate exhaustion: the CoMP
+      # half shares this budget, so the walkthrough above spends some of
+      # it first, and step 10 counts what is left rather than assuming.
+      token_rate_limit_per_minute: 20
     comp:
       enabled: true
       master_key: "{COMP_MASTER_KEY}"
@@ -458,10 +464,43 @@ origins:
     assert!(head.starts_with("HTTP/1.1 400"), "{head}\n{body}");
     assert!(body.contains("malformed"), "{body}");
 
-    // --- 7. The method contract ---
-    let (head, _) =
-        split(&request(port, "GET", "/.well-known/iab-comp/redeem", None).expect("resp"));
+    // --- 7. The method contract, in the shared shape ---
+    //
+    // WOR-2673 verification residual: asserting only the status left a
+    // revert to a silent `send_error` green on the shipped binary's
+    // transport, which is the shape N1 came from one transport over.
+    // The body and the cache directive are what prove the refusal came
+    // from `comp/serve.rs` and therefore moved a counter and wrote a
+    // decision event.
+    for path in [
+        "/.well-known/iab-comp/redeem",
+        "/.well-known/iab-comp/quote",
+    ] {
+        let (head, body) = split(&request(port, "GET", path, None).expect("resp"));
+        assert!(head.starts_with("HTTP/1.1 405"), "{path}: {head}");
+        let lowered = head.to_ascii_lowercase();
+        assert!(
+            lowered.contains("content-type: application/json"),
+            "{path} must be refused in the shared JSON shape: {head}"
+        );
+        assert!(
+            lowered.contains("cache-control: no-store"),
+            "{path}: {head}"
+        );
+        assert!(body.contains("method_not_allowed"), "{path}: {body}");
+    }
+    // The manifest route is the GET one, so POST is its wrong method.
+    let (head, body) = split(
+        &request(
+            port,
+            "POST",
+            "/.well-known/iab-comp/manifest.json",
+            Some(b"{}"),
+        )
+        .expect("resp"),
+    );
     assert!(head.starts_with("HTTP/1.1 405"), "{head}");
+    assert!(body.contains("method_not_allowed"), "{body}");
 
     // --- 8. The operator surface, on a process that has a bridge ---
     //
@@ -524,10 +563,17 @@ origins:
     // it holding over the wire from one source.
     let mut minted = 0usize;
     let mut refused = 0usize;
-    for _ in 0..4 {
+    // More attempts than the configured budget, so the bucket is
+    // guaranteed to run out inside the loop whatever the walkthrough
+    // above already spent.
+    for _ in 0..40 {
         let (head, body) =
             split(&request(port, "POST", "/.well-known/olp/token", Some(b"{}")).expect("resp"));
         if head.starts_with("HTTP/1.1 200") {
+            assert_eq!(
+                refused, 0,
+                "the budget must not let a mint through after it has started refusing: {head}"
+            );
             minted += 1;
             assert!(body.contains("access_token"), "{body}");
         } else {
@@ -544,8 +590,37 @@ origins:
             refused += 1;
         }
     }
-    assert_eq!(minted, 3, "the configured budget is what is minted");
-    assert_eq!(refused, 1, "the request past the budget is refused");
+    assert!(minted > 0, "a source inside its budget mints");
+    assert!(
+        refused > 0,
+        "a single source must not mint without bound: 40 attempts against a budget of 20 \
+         produced no refusal"
+    );
+    assert!(
+        minted <= 20,
+        "no more mints than the configured budget: {minted}"
+    );
+
+    // --- 11. The CoMP half carries the same budget as the OLP half ---
+    //
+    // WOR-2673 verification residual. These endpoints answer ahead of
+    // every stage that could rate-limit them, exactly like the token
+    // endpoint next to them, and until now only that one was budgeted.
+    // The budget is this origin's `olp.token_rate_limit_per_minute`,
+    // which step 10 has already spent, so the very next CoMP call is
+    // refused. That shared exhaustion is itself the point: one number
+    // governs both halves of one licensing surface.
+    let (head, body) =
+        split(&request(port, "GET", "/.well-known/iab-comp/manifest.json", None).expect("resp"));
+    assert!(
+        head.starts_with("HTTP/1.1 429"),
+        "the CoMP half must share the origin's budget: {head}\n{body}"
+    );
+    assert!(body.contains("rate_limited"), "{body}");
+    assert!(
+        head.to_ascii_lowercase().contains("retry-after:"),
+        "a 429 a client should back off from carries Retry-After: {head}"
+    );
 
     let _ = child.kill();
     let _ = child.wait();

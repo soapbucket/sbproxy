@@ -1075,6 +1075,7 @@ below this branch's 1523: this branch adds `ConfigBootConfig`,
 `FailedCandidate`, and `FallbackDocument` for the reasons recorded above,
 while main's `effective_document` and `origin_source_entry_counts` work
 removed two the branch had counted.
+
 2026-08-28 (WOR-2673, cache-reserve consolidation): tests-only 324 -> 323.
 `S3ReserveConfig` and the `S3Reserve` surface around it went with the
 AWS-SDK cache-reserve backend, which the object-storage backend replaces.

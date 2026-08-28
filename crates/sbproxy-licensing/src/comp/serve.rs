@@ -148,6 +148,53 @@ pub fn method_not_allowed(endpoint: CompEndpoint) -> CompResponse {
     CompResponse::error(405, "method_not_allowed")
 }
 
+/// The refusal for a request past its origin's per-source budget.
+///
+/// The CoMP endpoints answer ahead of every stage that could rate-limit
+/// them, exactly like the OLP token endpoint in the same well-known
+/// namespace, so they carry that origin's budget too (WOR-2673). Lives
+/// here with [`oversize`] and [`method_not_allowed`] for the same
+/// reason: a refusal that did not come from this module is a refusal
+/// with no counter and no decision event.
+///
+/// Counted under the same `rejected` label as every other refusal on
+/// the two POST families, and as `error` on the manifest's serve
+/// counter, which has no `rejected` value. The decision event carries
+/// `reason = "rate_limited"`, which is where an operator tells a flood
+/// apart from a broken client.
+pub fn rate_limited(endpoint: CompEndpoint) -> CompResponse {
+    match endpoint {
+        CompEndpoint::Manifest => {
+            tracing::info!(
+                event = "comp_manifest_decision",
+                outcome = "rejected",
+                reason = "rate_limited",
+                "comp.manifest.rejected"
+            );
+            metrics::record_manifest_serve("error");
+        }
+        CompEndpoint::Quote => {
+            tracing::info!(
+                event = "comp_quote_decision",
+                outcome = "rejected",
+                reason = "rate_limited",
+                "comp.quote.rejected"
+            );
+            metrics::record_quote("rejected");
+        }
+        CompEndpoint::Redeem => {
+            tracing::info!(
+                event = "comp_redeem_decision",
+                outcome = "rejected",
+                reason = "rate_limited",
+                "comp.redeem.rejected"
+            );
+            metrics::record_redeem("rejected");
+        }
+    }
+    CompResponse::error(429, "rate_limited")
+}
+
 /// The refusal for a request body past a transport's size cap.
 ///
 /// Lives here rather than in each transport (WOR-2673 review M2). Both

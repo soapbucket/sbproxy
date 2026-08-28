@@ -24031,6 +24031,58 @@ mod external_guardrail_context_tests {
         /// plaintext, so no TLS frames sit on this stack, and the release
         /// binary's own path is not exercised here.
         #[test]
+        /// The dispatch future's own size, pinned so a regression
+        /// fails here rather than in CI's request-path smoke lane.
+        ///
+        /// The two guards beside this one run the real future on a
+        /// 2 MiB stack, which catches an overflow but only after the
+        /// state machine has already grown enough to cause one, and
+        /// only on the platform running them. This reads the type's
+        /// layout instead: no runtime, no I/O, and it fails on the
+        /// growth rather than on the cliff.
+        ///
+        /// The number is the one `d3c28199` (WOR-2606) left behind
+        /// after boxing the two relay futures, measured again here on
+        /// `1cd47627` and unchanged. `BUDGET` leaves 8 KiB of room, so
+        /// ordinary churn does not trip it and a new inline `Vec` of
+        /// state does.
+        ///
+        /// When this fails: box the new state or move it into its own
+        /// `async fn`, the way `d3c28199` did. Raising the number is
+        /// the last resort, not the first, and CI's smoke lane builds a
+        /// debug binary whose frames are larger than these, so the
+        /// headroom here is not the headroom there.
+        #[test]
+        fn the_dispatch_future_has_not_grown() {
+            /// Measured on `1cd47627` and on WOR-2673's merge of it.
+            const MEASURED: usize = 24_464;
+            /// Room for churn before the guard fires.
+            const BUDGET: usize = MEASURED + 8 * 1024;
+
+            fn future_size<F: core::future::Future>(_never_called: impl FnOnce() -> F) -> usize {
+                core::mem::size_of::<F>()
+            }
+
+            // The closure is taken by value and dropped, never called,
+            // so nothing is constructed and nothing is polled.
+            let size = future_size(|| {
+                let session: &mut Session = unreachable!();
+                let config: &sbproxy_ai::AiHandlerConfig = unreachable!();
+                let pipeline: &crate::pipeline::CompiledPipeline = unreachable!();
+                let ctx: &mut crate::context::RequestContext = unreachable!();
+                super::super::handle_ai_proxy(session, config, pipeline, "ai.test", ctx, None)
+            });
+            println!("handle_ai_proxy future: {size} bytes (budget {BUDGET})");
+            assert!(
+                size <= BUDGET,
+                "the `handle_ai_proxy` future is {size} bytes, past the {BUDGET}-byte budget \
+                 ({MEASURED} measured on main plus 8 KiB). This future is polled on a 2 MiB \
+                 Pingora worker stack, and CI's request-path smoke lane runs a debug binary \
+                 whose frames are larger than these. Box the new state rather than raising the \
+                 number."
+            );
+        }
+
         fn a_non_streaming_dispatch_fits_a_pingora_worker_stack() {
             const PINGORA_WORKER_STACK: usize = 2 * 1024 * 1024;
 

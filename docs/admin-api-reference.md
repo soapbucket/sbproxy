@@ -3665,7 +3665,8 @@ did not take on the replica you are looking at: `memory` is per-process
 and lost on restart.
 
 Two more fields are worth polling, both under `comp`.
-`active_signing_kid` is `null` until a rotation has been activated, and every quote request fails closed until
+`active_signing_kid` is `null` until a rotation has been activated, and
+every quote request fails closed until
 it is, so a null here explains an endpoint answering nothing but
 rejections. `olp_tier_count` is how many of `tier_count` a buyer can
 actually redeem for a license token: the difference is the `cap` and
