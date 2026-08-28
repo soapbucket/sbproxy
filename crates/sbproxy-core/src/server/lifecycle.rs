@@ -3139,6 +3139,21 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
             .and_then(|authority| authority.publish.as_ref()),
     )?;
 
+    // Start the aggregation loop, when this node is the one that should
+    // run it (WOR-2437). A no-op unless the document declares
+    // `origin_sources` entries *and* this process installed a config
+    // authority above, because a node with entries and nowhere to
+    // publish has no runtime composition to do: its answer is the
+    // offline `sbproxy aggregate --out`, which is an operator's decision
+    // rather than something to start behind one.
+    //
+    // `Overlay` because a composed document is a whole runtime document,
+    // and a subscriber that took it as `Replace` would discard the
+    // base keys it owns rather than layering over them. The one-shot
+    // `sbproxy aggregate` takes `--mode` for the deployment that wants
+    // the other one.
+    crate::config_aggregator::spawn(config_path, sbproxy_config::BundleMode::Overlay)?;
+
     // --- Wave 5 day-6 Item 4: SIGHUP re-bootstrap handler ---
     //
     // Pingora's `Server::run_forever` owns its own tokio runtime, but

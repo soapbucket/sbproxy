@@ -116,6 +116,11 @@ pub mod compression_runtime;
 pub mod compression_store;
 /// Success-path bridge for prompt-free, per-lever AI compression value.
 pub mod compression_value;
+/// The aggregator: fetch every project repository an `origin_sources`
+/// block names, compose the `origins:` map from the platform floor and
+/// the project profiles, and publish the result through the config
+/// authority that already ships.
+pub mod config_aggregator;
 /// Config-authority publisher: validate a configuration the way boot
 /// does, sign it, store it under a monotonic revision, and serve it to
 /// subscribers on a listener of its own.

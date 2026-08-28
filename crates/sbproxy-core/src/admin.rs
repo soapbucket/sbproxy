@@ -3388,13 +3388,60 @@ fn origin_composition_json(config: &sbproxy_config::ConfigFile) -> serde_json::V
     serde_json::json!({
         "declared": true,
         "tier": sources.tier.as_str(),
+        "aggregator": {
+            "poll_interval_secs": sources.aggregator.poll_interval_secs,
+            "debounce_secs": sources.aggregator.debounce_secs,
+            "max_deferral_secs": sources.aggregator.max_deferral_secs,
+            "concurrency": sources.aggregator.concurrency,
+            "deadline_secs": sources.aggregator.deadline_secs,
+            "polls_per_hour_per_repo": 3600 / sources.aggregator.poll_interval_secs.max(1),
+        },
         "entries": entries,
         "claimed_hosts": claims,
         "collision": collision,
         "hand_written_origins": hand_written,
         "origin_defaults": origin_defaults_json(config),
-        "note": "composition runs in the aggregator, not on this node; these are the \
-                 declarations this node's effective config carries",
+        "last_round": last_round_json(),
+        "note": "the declarations this node's effective config carries. `last_round` is \
+                 present only on the node that runs the aggregator; every other node sees \
+                 the composed result as an ordinary signed bundle",
+    })
+}
+
+/// The last aggregation round this process ran, for the admin surface.
+///
+/// Null on every node that does not aggregate, which is every node but
+/// one: composition runs in a single place and the rest of the fleet
+/// receives its output as a signed bundle. Distinguishing "did not
+/// aggregate" from "aggregated and found nothing" matters, so the two
+/// are a null and a `decision` respectively rather than both being
+/// zeroes.
+///
+/// Provenance is summarized rather than emitted in full. Fifty composed
+/// origins carry thousands of leaves, and a route that returned all of
+/// them on every poll would be the most expensive thing on the admin
+/// listener. `sbproxy aggregate --explain <host>` renders one host's,
+/// which is the question anybody actually asks.
+///
+/// Nothing secret-shaped is emitted, and provenance could not carry a
+/// value even if this wanted it to: a `LeafOrigin` is a layer and a
+/// repository, never the leaf's value.
+fn last_round_json() -> serde_json::Value {
+    let Some(status) = crate::config_aggregator::last_round() else {
+        return serde_json::Value::Null;
+    };
+    serde_json::json!({
+        "at_unix_ms": status.at_unix_ms,
+        "decision": status.decision,
+        "revision": status.revision,
+        "content_digest": status.content_digest,
+        "duration_ms": status.duration_ms,
+        "origins": status.origins,
+        "resolved": status.resolved,
+        "failed": status.failed,
+        "drops": status.drops,
+        "provenance_hosts": status.provenance.keys().collect::<Vec<_>>(),
+        "reason": status.reason,
     })
 }
 

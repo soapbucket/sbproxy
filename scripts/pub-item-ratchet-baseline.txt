@@ -1033,3 +1033,33 @@ also runs on candidate documents and publishing a gauge there zeroed the
 live series on every authority publish. And the read-and-merge prologue the
 two config admin routes had duplicated became one `effective_document`
 helper, which took a symbol out of the wider count.
+
+2026-08-28 (WOR-2432 aggregation, the aggregator): tests-only 323 -> 324,
+unreferenced 1518 -> 1521. Five items landed that nothing outside their
+defining file names, and each was looked at before the number moved rather
+than after.
+
+Three cannot be narrowed at all. `ResolvedEntry` and `EntryFailure` are
+public fields of `CompositionOutcome` and `AggregationStatus`, and
+`AggregationStatus` is the return type of `config_aggregator::last_round`,
+which `admin.rs` calls. Narrowing any of the three is a private type in a
+public interface, which does not compile.
+
+Two are integration-test seams whose production callers are in the same
+file, which this scan cannot see. `Aggregator::with_fetch_context` is how
+`tests/config_aggregator.rs` installs a fixture cloner in place of `git`;
+its production caller is `Aggregator::from_document` and `spawn`, both in
+`config_aggregator.rs`. `AuthorityPublisher` is how the same file publishes
+through a real `ConfigAuthority` rather than through a fake, which is the
+claim those tests exist to make; its production caller is `spawn`, in the
+same file. An integration test links against the library's public API, so
+`pub` is the only visibility that compiles for either.
+
+Six other items in the same change were narrowed rather than counted:
+`Coalescer` and `CoalesceDecision` are `pub(crate)` with their two
+acceptance tests moved into the module, `CompositionOutcome::document_with_header`,
+`Aggregator::would_change`, `Aggregator::mark_published` and
+`config_aggregator::record_status` are private, and
+`CompositionLayer::is_project_authored` is `pub(crate)`. Two more,
+`Coalescer::pending` and `Aggregator::last_published_digest`, were deleted
+once narrowing showed nothing called them.
