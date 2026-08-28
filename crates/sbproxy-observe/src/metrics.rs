@@ -3466,9 +3466,20 @@ pub fn record_events_dropped(sink: &'static str, reason: &'static str) {
 }
 
 /// Count a config (hot) reload outcome on
-/// `sbproxy_config_reload_total{result}`. `result` is a closed string
-/// (`success` / `failure`). Operators alert on a non-zero `failure`
-/// rate or on a stalled `success` cadence (WOR-1101).
+/// `sbproxy_config_reload_total{result}`. `result` is a closed string:
+///
+/// | Result | Meaning |
+/// |---|---|
+/// | `success` | The reload published |
+/// | `failure` | The candidate was refused and the previous config keeps serving |
+/// | `suspended` | The node is pinned to a configuration its boot fallback restored, so local reloads are deliberately inert (WOR-2459) |
+///
+/// Operators alert on a non-zero `failure` rate or on a stalled
+/// `success` cadence (WOR-1101). `suspended` is deliberately its own
+/// value rather than folded into `failure`: a pinned node is the state
+/// the fallback is supposed to leave it in, and counting it as a failure
+/// made that indistinguishable from a broken config on the dashboard
+/// operators alert from.
 pub fn record_config_reload(result: &'static str) {
     use prometheus::{register_int_counter_vec, IntCounterVec};
     use std::sync::OnceLock;
@@ -3769,14 +3780,17 @@ pub fn set_config_history_entries(count: i64) {
 pub fn set_config_lkg_revision(revision: i64) {
     use prometheus::{register_int_gauge, IntGauge};
     use std::sync::OnceLock;
-    static G: OnceLock<IntGauge> = OnceLock::new();
+    static G: OnceLock<Option<IntGauge>> = OnceLock::new();
     let gauge = G.get_or_init(|| {
         register_int_gauge!(
             "sbproxy_config_lkg_revision",
             "Config ring revision the last-known-good pointer names, or -1 when it names none",
         )
-        .expect("config lkg revision gauge registers")
+        .ok()
     });
+    let Some(gauge) = gauge else {
+        return;
+    };
     gauge.set(revision);
 }
 
@@ -3791,6 +3805,7 @@ pub fn set_config_lkg_revision(revision: i64) {
 /// | `failed` | The signal reported a failure, or the window closed failing |
 /// | `abstain` | The signal had too little information to report anything |
 /// | `inconclusive` | Every signal abstained, so the window reached no verdict |
+/// | `superseded` | A newer revision applied mid-soak, so this window was dropped without ever reaching a verdict |
 ///
 /// `abstain` and `inconclusive` are both first class on purpose. A soak
 /// that never measures anything is a configuration problem worth
@@ -3802,39 +3817,45 @@ pub fn set_config_lkg_revision(revision: i64) {
 pub fn record_config_soak_verdict(verdict: &str, signal: &str) {
     use prometheus::{register_int_counter_vec, IntCounterVec};
     use std::sync::OnceLock;
-    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
     let counter = C.get_or_init(|| {
         register_int_counter_vec!(
             "sbproxy_config_soak_verdict_total",
             "Config soak outcomes, by verdict and reporting signal",
             &["verdict", "signal"],
         )
-        .expect("config soak verdict counter registers")
+        .ok()
     });
-    counter.with_label_values(&[verdict, signal]).inc();
+    if let Some(counter) = counter {
+        counter.with_label_values(&[verdict, signal]).inc();
+    }
 }
 
 /// Count one refused config candidate on
 /// `sbproxy_config_rejected_total{reason}` (WOR-2462).
 ///
-/// `reason` is a closed string matching
-/// `sbproxy_config::RejectionReason`: `verify_failed`,
-/// `compile_failed`, `denied_path`, or `confinement_refused`. A skipped
-/// cycle (`reload_busy`) is a deferral rather than a refusal and is
-/// deliberately not counted here.
+/// `reason` is a closed string: the four `sbproxy_config::RejectionReason`
+/// values (`verify_failed`, `compile_failed`, `denied_path`,
+/// `confinement_refused`), plus `ring_write_failed` for a candidate that
+/// applied fine but could not be recorded, which skips its soak and so
+/// holds the last-known-good pointer back exactly like a refusal does.
+/// A skipped cycle (`reload_busy`) is a deferral rather than a refusal
+/// and is deliberately not counted here.
 pub fn record_config_rejection(reason: &str) {
     use prometheus::{register_int_counter_vec, IntCounterVec};
     use std::sync::OnceLock;
-    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
     let counter = C.get_or_init(|| {
         register_int_counter_vec!(
             "sbproxy_config_rejected_total",
             "Config candidates refused before applying, by reason",
             &["reason"],
         )
-        .expect("config rejected counter registers")
+        .ok()
     });
-    counter.with_label_values(&[reason]).inc();
+    if let Some(counter) = counter {
+        counter.with_label_values(&[reason]).inc();
+    }
 }
 
 /// Set `sbproxy_config_fallback_active` to 1 while this node is serving
@@ -3848,14 +3869,17 @@ pub fn record_config_rejection(reason: &str) {
 pub fn set_config_fallback_active(active: bool) {
     use prometheus::{register_int_gauge, IntGauge};
     use std::sync::OnceLock;
-    static G: OnceLock<IntGauge> = OnceLock::new();
+    static G: OnceLock<Option<IntGauge>> = OnceLock::new();
     let gauge = G.get_or_init(|| {
         register_int_gauge!(
             "sbproxy_config_fallback_active",
             "1 while this node serves a config its boot fallback restored from the revision ring",
         )
-        .expect("config fallback active gauge registers")
+        .ok()
     });
+    let Some(gauge) = gauge else {
+        return;
+    };
     gauge.set(i64::from(active));
 }
 

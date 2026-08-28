@@ -183,7 +183,7 @@ curl -s -u admin:demo-change-me http://127.0.0.1:9090/metrics \
 ```
 
 ```
-sbproxy_config_lkg_revision -1
+sbproxy_config_lkg_revision 2
 sbproxy_config_soak_verdict_total{signal="operator_probe",verdict="passed"} 1
 sbproxy_config_soak_verdict_total{signal="request_outcome",verdict="abstain"} 1
 sbproxy_config_soak_verdict_total{signal="upstream_health",verdict="abstain"} 1
@@ -191,10 +191,11 @@ sbproxy_config_soak_verdict_total{signal="degraded_subsystems",verdict="abstain"
 sbproxy_config_soak_verdict_total{signal="window",verdict="passed"} 1
 ```
 
-Three signals abstained and one passed, so the window passed and `lkg_revision` moves off `-1` to the revision that just soaked. Two of those abstentions are worth reading:
+Three signals abstained and one passed, so the window passed and `lkg_revision` moves off `-1` to the revision that just soaked. Three of those abstentions are worth reading:
 
 - `request_outcome` abstains because a demo box serves no traffic. Below `min_requests` it reports nothing rather than calling four requests and one error a 25% failure rate. This is the mistake that produces spurious rollbacks in canary systems, and abstaining is the fix.
 - `degraded_subsystems` abstains on a *clean* reload. It is a veto, not a promoter: nothing came up degraded, which proves the config constructed and proves nothing about whether it works.
+- `upstream_health` abstains because this example's origin is a `type: proxy` with no `health_check:`, `circuit_breaker:`, or `outlier_detection:` block, so there is nothing for the soak to read. It will not report health it never looked for. That is also why this walkthrough declares a `probe:` rather than relying on `proxy.synthetic_probe`: the synthetic origin is a non-network action, and while `upstream_health` is blind a synthetic pass cannot promote on its own.
 
 Comment out the `probe:` block and reload again, and every signal abstains. The verdict is then `inconclusive`, `lkg_revision` stays where it was, and the entry stays `applied` rather than reaching `good`. That is deliberate. Promoting on a window that measured nothing would be promote-on-apply with fifteen extra seconds attached.
 
@@ -211,14 +212,14 @@ curl -s -u admin:demo-change-me -X POST http://127.0.0.1:9090/admin/config/confi
   "promoted": true,
   "signals": [
     {"signal": "degraded_subsystems", "outcome": "abstain", "detail": "no subsystem stayed on prior state, which is not by itself evidence that this config works"},
-    {"signal": "upstream_health", "outcome": "abstain", "detail": "the running config declares no circuit breakers to observe"},
+    {"signal": "upstream_health", "outcome": "abstain", "detail": "1 origin(s) expose no health signal, so this cannot say their upstreams are reachable: default/api.local. declare a health_check, a circuit_breaker, or an outlier detector on them, or a soak probe that exercises them"},
     {"signal": "request_outcome", "outcome": "abstain", "detail": "the window observed 0 request(s), under the min_requests of 5"},
     {"signal": "operator_probe", "outcome": "passed", "detail": ""}
   ]
 }
 ```
 
-That short-circuits the wait, not the judgement. Read `promoted` rather than assuming a `200` means the pointer moved.
+That short-circuits the wait, not the judgment. Read `promoted` rather than assuming a `200` means the pointer moved.
 
 ## Break the config on purpose
 

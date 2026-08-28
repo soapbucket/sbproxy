@@ -181,20 +181,42 @@ pub fn effective_mode(
     environment: Option<&str>,
     from_config: BootFallbackMode,
 ) -> BootFallbackMode {
+    mode_from_flag_or_env(flag, environment).unwrap_or(from_config)
+}
+
+/// The mode the command line or the environment names, or `None` when
+/// neither does and the config file's own `boot.fallback` decides.
+///
+/// Split out so the caller can answer "is a fallback even wanted" before
+/// parsing the config file for the block that names the ring. On a node
+/// that never asked for a fallback, which is every node by default, that
+/// keeps the boot path byte-identical to the release before this one:
+/// one read, one `source:` resolve, one compile, and the same error
+/// (WOR-2459 fix round, Major 6).
+///
+/// `SB_CONFIG_FALLBACK` is read here rather than by clap. Letting clap
+/// own the variable put it in the `flag` slot, which made this branch
+/// unreachable in production and turned an unparseable value into
+/// `exit(2)` instead of the documented warn-and-fall-through
+/// (WOR-2459 fix round, Major 11).
+#[must_use]
+pub fn mode_from_flag_or_env(
+    flag: Option<BootFallbackMode>,
+    environment: Option<&str>,
+) -> Option<BootFallbackMode> {
     if let Some(mode) = flag {
-        return mode;
+        return Some(mode);
     }
-    if let Some(raw) = environment {
-        if let Some(mode) = BootFallbackMode::parse(raw) {
-            return mode;
-        }
-        tracing::warn!(
-            value = %raw,
-            "SB_CONFIG_FALLBACK is not one of off | last-known-good; ignoring it and using \
-             the configured boot fallback mode",
-        );
+    let raw = environment?;
+    if let Some(mode) = BootFallbackMode::parse(raw) {
+        return Some(mode);
     }
-    from_config
+    tracing::warn!(
+        value = %raw,
+        "SB_CONFIG_FALLBACK is not one of off | last-known-good; ignoring it and using the \
+         configured boot fallback mode",
+    );
+    None
 }
 
 /// Recover `proxy.config_history` from a document that did not compile.
@@ -227,16 +249,14 @@ pub fn history_config_from_broken_document(yaml: &str) -> ConfigHistoryConfig {
             history.enabled = true;
             history
         }
-        None => {
-            tracing::warn!(
-                "could not read proxy.config_history out of the config that failed to boot; \
-                 looking for the revision ring in its default location",
-            );
-            ConfigHistoryConfig {
-                enabled: true,
-                ..ConfigHistoryConfig::default()
-            }
-        }
+        // No warning here: this runs on the mode-resolution path too,
+        // which every boot takes, and a node whose config simply has no
+        // `proxy.config_history` block must not warn about it once per
+        // start. The walk logs the directory it settled on instead.
+        None => ConfigHistoryConfig {
+            enabled: true,
+            ..ConfigHistoryConfig::default()
+        },
     }
 }
 
@@ -262,8 +282,13 @@ pub fn walk_for_bootable(
     max_attempts: u32,
     mut compiles: impl FnMut(&str) -> Result<(), String>,
 ) -> Result<FallbackDocument, BootWalkFailure> {
+    tracing::warn!(
+        dir = %history.dir,
+        "reading the config revision ring for a bootable configuration",
+    );
     let mut store = RevisionStore::open(&history.dir, history.keep, None)
         .map_err(|error| BootWalkFailure::StoreUnavailable(error.to_string()))?;
+    refuse_a_shared_ring(&history.dir)?;
     let candidates = store.boot_candidates();
     if candidates.is_empty() {
         return Err(BootWalkFailure::RingEmpty);
@@ -344,6 +369,66 @@ pub fn walk_for_bootable(
         }
     }
     Err(BootWalkFailure::Exhausted(tried))
+}
+
+/// Refuse a ring directory whose files anyone but the owner can read or
+/// write.
+///
+/// This branch is the first thing in the process that turns ring content
+/// into *executing* configuration, and the ring is trusted purely by
+/// filesystem location: the blobs are unsigned and `index.json` is
+/// unauthenticated. Two properties carry that trust, and both are
+/// checked here rather than assumed.
+///
+/// **Ownership.** [`RevisionStore::open`] runs `create_private_dir_all`,
+/// which `chmod`s the directory to `0700`. On every Unix only the file's
+/// owner or root may `chmod` it, so an open that got this far has
+/// already proved the process owns the directory. That is why there is
+/// no `geteuid` here, and why this function only has the permission half
+/// left to check.
+///
+/// **Exclusivity.** Any group or other bit on `index.json`, its backup,
+/// or a blob means somebody else could have written the document this
+/// node is about to boot on. The store never creates a file that way
+/// (`create_private_file` opens at `0600`), so a bit set here was set
+/// from outside, and refusing is the only safe reading of it.
+///
+/// Non-Unix targets have no mode to inspect and this is a no-op there,
+/// which is stated rather than silently true (WOR-2459 fix round,
+/// Major 12).
+#[cfg(unix)]
+fn refuse_a_shared_ring(directory: &str) -> Result<(), BootWalkFailure> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = std::path::Path::new(directory);
+    let mut checked = Vec::new();
+    checked.push(root.join("index.json"));
+    checked.push(root.join("index.json.bak"));
+    if let Ok(listing) = std::fs::read_dir(root.join("blobs")) {
+        checked.extend(listing.flatten().map(|entry| entry.path()));
+    }
+    for path in checked {
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            continue;
+        };
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(BootWalkFailure::StoreUnavailable(format!(
+                "{} is mode {mode:o}; a ring this node is about to boot from must be readable \
+                 and writable by its owner only, and this one is not, so its contents cannot \
+                 be trusted as configuration",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// No mode to inspect on a non-Unix target. See the Unix version for
+/// what this checks and why.
+#[cfg(not(unix))]
+fn refuse_a_shared_ring(_directory: &str) -> Result<(), BootWalkFailure> {
+    Ok(())
 }
 
 /// Retire one entry, logging rather than failing: a walk that cannot
@@ -443,34 +528,45 @@ pub fn reload_suspended(trigger: &str) -> bool {
 /// its own. A process that dies before the timer fires leaves the
 /// counter incremented, which is exactly the point: three of those and
 /// the entry is retired.
-pub fn spawn_boot_success_timer(history: ConfigHistoryConfig, revision: u64, success_secs: u64) {
+pub fn spawn_boot_success_timer(revision: u64, success_secs: u64) {
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(success_secs));
-        let mut store = match RevisionStore::open(&history.dir, history.keep, None) {
-            Ok(store) => store,
-            Err(error) => {
-                tracing::error!(
-                    error = %error,
-                    "could not reopen the config revision ring to clear the boot attempt \
-                     counter; this boot will still count as a failure against its revision",
-                );
-                return;
-            }
-        };
-        match store.confirm_boot_success(revision) {
-            Ok(()) => tracing::info!(
-                revision,
-                success_secs,
-                "the fallback boot has served long enough to count as successful; its boot \
-                 attempt counter is cleared",
-            ),
-            Err(error) => tracing::error!(
-                error = %error,
-                revision,
-                "could not clear the boot attempt counter for the revision this node booted on",
-            ),
-        }
+        confirm_boot_success_now(revision);
     });
+}
+
+/// Clear the boot counter on `revision` through the **process-owned**
+/// ring handle.
+///
+/// [`RevisionStore`] documents itself single-owner: every mutator clones
+/// the handle's in-memory index, edits the clone, and writes the whole
+/// thing back. A second handle opened on the same directory therefore
+/// does not merge, it overwrites, and the loser is whichever handle
+/// writes last. Opening one here meant the recorder's very next write,
+/// an ordinary `append` or `record_soak_verdict`, restored the counter
+/// this had just cleared from its own older snapshot. A node that booted
+/// on the fallback and kept applying configs never cleared the counter,
+/// and three such boots retired its only rescue target while it had
+/// booted and served correctly every time (WOR-2459 fix round,
+/// Blocker 2).
+///
+/// A no-op when no ring is open, which is the same condition under which
+/// nothing could have incremented the counter in the first place.
+pub fn confirm_boot_success_now(revision: u64) {
+    let Some(recorder) = crate::config_history::current_config_history_recorder() else {
+        tracing::warn!(
+            revision,
+            "no config history ring is open, so the boot attempt counter for the revision this \
+             node booted on cannot be cleared",
+        );
+        return;
+    };
+    recorder.confirm_boot_success(revision);
+    tracing::info!(
+        revision,
+        "the fallback boot has served long enough to count as successful; its boot attempt \
+         counter is cleared",
+    );
 }
 
 /// Reset the module's process state. Tests only: the pin is process
@@ -675,6 +771,70 @@ mod tests {
                 .boot_attempts,
             1,
             "the counter is on disk, not in the process that just died",
+        );
+    }
+
+    /// B2 red-first. `RevisionStore` is documented single-owner: every
+    /// mutator rewrites the whole index from the handle's own snapshot.
+    /// A boot-success timer that opened a second handle on a directory
+    /// the process recorder already owns had its cleared counter
+    /// deterministically reverted by the recorder's next write, so a node
+    /// that booted on the fallback and kept applying configs never
+    /// actually cleared the counter, and three such boots retired its
+    /// only rescue target.
+    #[test]
+    fn clearing_the_boot_counter_survives_the_recorders_next_write() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let history = ConfigHistoryConfig {
+            enabled: true,
+            dir: temp.path().to_string_lossy().into_owned(),
+            ..ConfigHistoryConfig::default()
+        };
+
+        // The boot walk's own handle, exactly as `walk_for_bootable`
+        // leaves it: one attempt recorded, handle dropped.
+        let rescued = {
+            let mut store = RevisionStore::open(temp.path(), history.keep, None).expect("open");
+            let entry = store
+                .append(b"rescued: yes\n", metadata(1))
+                .expect("append");
+            store
+                .begin_boot_attempt(entry.revision)
+                .expect("attempt persists");
+            entry.revision
+        };
+
+        // The process recorder opens next and holds its own snapshot,
+        // which reads `boot_attempts = 1`.
+        crate::config_history::clear_config_history_recorder();
+        let recorder = std::sync::Arc::new(
+            crate::config_history::ConfigHistoryRecorder::from_config(Some(&history))
+                .expect("opens")
+                .expect("enabled"),
+        );
+        crate::config_history::install_config_history_recorder(recorder.clone());
+
+        // The success timer fires.
+        confirm_boot_success_now(rescued);
+
+        // ... and then the node keeps working: a later revision applies
+        // and its soak closes, both of which rewrite the index.
+        let later = recorder
+            .record(b"later: yes\n", metadata(2))
+            .expect("a second revision");
+        recorder.record_soak_verdict(later.revision, sbproxy_config::SoakVerdict::Successful);
+
+        let store = RevisionStore::open(temp.path(), history.keep, None).expect("reopen");
+        let attempts = store
+            .entries()
+            .iter()
+            .find(|entry| entry.revision == rescued)
+            .expect("the rescued entry survives")
+            .boot_attempts;
+        crate::config_history::clear_config_history_recorder();
+        assert_eq!(
+            attempts, 0,
+            "the recorder's next write must not resurrect a boot counter the timer cleared",
         );
     }
 

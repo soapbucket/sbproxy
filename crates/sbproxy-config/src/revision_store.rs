@@ -915,8 +915,18 @@ impl RejectionReason {
 pub struct RejectionMetadata {
     /// Which refusal in the failure table this was.
     pub reason: RejectionReason,
-    /// Which stage refused it: `"config_authority"`, `"file_watcher"`,
-    /// `"sighup"`, `"admin_reload"`, `"config_refresh_poller"`.
+    /// Which stage refused it. Two values are written today:
+    ///
+    /// * `"config_authority"`, for a bundle the subscriber refused;
+    /// * `"file_watcher"`, for a local document that did not apply. The
+    ///   SIGHUP path shares this label because both triggers converge on
+    ///   one reload function and one audit label, which WOR-2486 already
+    ///   settled.
+    ///
+    /// Two refusal paths are **not** covered yet and so never appear
+    /// here: the `source:` refresh poller's own `CompileFailed` branch,
+    /// and `POST /admin/reload`, which keeps its own audit entry with an
+    /// actor this ring does not carry.
     pub stage: String,
     /// Human-readable detail, as the refusing stage logged it. Bounded
     /// by [`RevisionStore::record_rejection`] before it is stored.
@@ -1105,10 +1115,24 @@ impl RevisionStore {
     /// is what makes the walk terminate: the ring is finite and each
     /// exhausted candidate leaves it permanently.
     ///
-    /// The last-known-good entry leads because it is the only one a soak
-    /// window ever judged against real traffic. The rest follow
-    /// newest-first because a more recent applied revision is closer to
-    /// what the operator meant than an older one.
+    /// The order, and why:
+    ///
+    /// 1. the entry the `lkg` pointer names, because it is the only one
+    ///    a soak window ever judged against real traffic;
+    /// 2. every other entry that is not [`RevisionState::Failed`],
+    ///    newest first, because a more recent applied revision is closer
+    ///    to what the operator meant than an older one;
+    /// 3. the entries a soak measured as bad, newest first, last.
+    ///
+    /// Step 3 is the part worth reading twice. A `Failed` entry is one a
+    /// soak window watched under real traffic and judged bad; the epic's
+    /// whole success criterion is that a config which compiles cleanly
+    /// and breaks traffic does not become the boot config. Offering one
+    /// ahead of an older healthy entry inverted that. They are kept in
+    /// the walk rather than dropped from it because an exhausted ring
+    /// exits the process, and a revision that broke traffic is still a
+    /// better outcome than no configuration at all: it is the last
+    /// resort, not the first.
     #[must_use]
     pub fn boot_candidates(&self) -> Vec<RevisionEntry> {
         let lkg = self.index.lkg.clone();
@@ -1123,6 +1147,7 @@ impl RevisionStore {
                 candidates.push(entry.clone());
             }
         }
+        let mut measured_bad = Vec::new();
         for entry in self.index.entries.iter().rev() {
             if entry.boot_retired {
                 continue;
@@ -1133,8 +1158,13 @@ impl RevisionStore {
             {
                 continue;
             }
-            candidates.push(entry.clone());
+            if entry.state == RevisionState::Failed {
+                measured_bad.push(entry.clone());
+            } else {
+                candidates.push(entry.clone());
+            }
         }
+        candidates.extend(measured_bad);
         candidates
     }
 
@@ -2030,6 +2060,43 @@ mod tests {
                 .boot_attempts,
             0,
             "serving for the success window clears the counter"
+        );
+    }
+
+    /// WOR-2459 fix round, Major 10. A revision a soak measured as bad
+    /// under real traffic must not be offered ahead of an older healthy
+    /// one: "a config that compiles cleanly and breaks traffic does not
+    /// become the boot config" is the epic's success criterion.
+    #[test]
+    fn a_soak_failed_revision_sinks_below_every_healthy_one_in_the_boot_walk() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let mut store = RevisionStore::open(temp.path(), 8, None).expect("open");
+        let old_healthy = store.append(b"a: 1\n", metadata(1)).expect("append");
+        let newer_broken = store.append(b"a: 2\n", metadata(2)).expect("append");
+        store
+            .record_soak_verdict(newer_broken.revision, SoakVerdict::Failed)
+            .expect("verdict");
+
+        let order: Vec<u64> = store
+            .boot_candidates()
+            .iter()
+            .map(|entry| entry.revision)
+            .collect();
+        assert_eq!(
+            order,
+            vec![old_healthy.revision, newer_broken.revision],
+            "the measured-bad revision is the last resort, not the first",
+        );
+
+        // It stays in the walk rather than being dropped: an exhausted
+        // ring exits the process, and a revision that broke traffic
+        // still beats no configuration at all.
+        assert!(
+            store
+                .boot_candidates()
+                .iter()
+                .any(|entry| entry.revision == newer_broken.revision),
+            "a failed revision is demoted, not deleted",
         );
     }
 

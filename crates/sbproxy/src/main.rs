@@ -176,7 +176,15 @@ struct GlobalArgs {
     /// `sbproxy_config_fallback_active` as 1, and suspends its file
     /// watcher, SIGHUP, and `source:` poller until an operator clears
     /// the pin with `DELETE /admin/config/fallback`.
-    #[arg(long = "config-fallback", env = "SB_CONFIG_FALLBACK", global = true)]
+    ///
+    /// `SB_CONFIG_FALLBACK` is deliberately **not** declared here.
+    /// Letting clap consume it into this slot made the environment
+    /// indistinguishable from the flag, which turned an unparseable
+    /// value into `exit(2)` instead of the documented warn-and-fall-
+    /// through, and left the environment branch in
+    /// `sbproxy_core::config_boot::mode_from_flag_or_env` unreachable in
+    /// production. That function reads the variable instead.
+    #[arg(long = "config-fallback", global = true)]
     config_fallback: Option<String>,
 }
 
@@ -2066,7 +2074,8 @@ fn main() {
                     Some(mode) => Some(mode),
                     None => {
                         eprintln!(
-                            "Fatal: --config-fallback must be 'off' or 'last-known-good', got                              '{raw}'"
+                            "Fatal: --config-fallback must be 'off' or 'last-known-good', \
+                             got '{raw}'"
                         );
                         std::process::exit(2);
                     }

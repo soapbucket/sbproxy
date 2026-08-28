@@ -1402,7 +1402,10 @@ pub(crate) fn reload_from_config_yaml(
     // with the config-authority poller that is deliberately still live.
     if crate::config_boot::reload_suspended("file_watcher") {
         return Err(anyhow::anyhow!(
-            "this node is pinned to a configuration its boot fallback restored from the              revision ring; local config reloads (the file watcher and SIGHUP) are suspended              until an operator clears the pin with DELETE /admin/config/fallback"
+            "this node is pinned to a configuration its boot fallback restored from the \
+             revision ring; local config reloads (the file watcher and SIGHUP) are \
+             suspended until an operator clears the pin with \
+             DELETE /admin/config/fallback"
         ));
     }
     let _reload_guard = CONFIG_RELOAD_LOCK
@@ -2380,6 +2383,25 @@ pub(super) fn start_config_watcher(config_path: String, loaded_digest: [u8; 32])
                 }
             }
 
+            // WOR-2459 fix round, Major 7. Checked here, before the
+            // read, rather than only inside the reload transaction. The
+            // transaction's own guard returns `Err`, and every reload
+            // that reached it counted as
+            // `sbproxy_config_reload_total{result="failure"}` and logged
+            // `reload failed; serving prior pipeline` at ERROR, forever,
+            // because `loaded_digest` never advances while the pin
+            // holds. A pinned node is the state the feature is supposed
+            // to be in; it must not be indistinguishable from a fault.
+            if crate::config_boot::reload_suspended("file_watcher") {
+                sbproxy_observe::metrics::record_config_reload("suspended");
+                tracing::debug!(
+                    path = %config_path,
+                    "the config file changed, but this node is pinned to a configuration its \
+                     boot fallback restored; clear the pin with DELETE /admin/config/fallback \
+                     to apply it",
+                );
+                continue;
+            }
             let current = config_file_text_and_digest(&cfg_path);
             if let Some((digest, _)) = &current {
                 if Some(*digest) == loaded_digest {
@@ -2771,9 +2793,39 @@ fn boot_document(
     let read = std::fs::read_to_string(config_path)
         .map_err(|e| anyhow::anyhow!("failed to read config file '{}': {}", config_path, e));
 
-    // The primary document's own verdict, reached with the same two
-    // steps the walk applies to a candidate, so "works" means the same
-    // thing on both sides.
+    // Resolve the mode before touching the document, and hand an `off`
+    // node its bytes back untouched. Pre-checking first was a real cost:
+    // it ran `config_source::resolve` and `compile_config` on top of the
+    // pair `run` already runs twenty lines later, so a git-sourced node
+    // paid two fetches per boot, and it flattened the failure through
+    // `format!("{:#}")` and re-wrapped it, losing the anyhow chain that
+    // `run`'s own error carries. On the default `off` path there is now
+    // no pre-check at all and the behavior is byte-identical to the
+    // release before this one (WOR-2459 fix round, Major 6).
+    let mode = match crate::config_boot::mode_from_flag_or_env(
+        fallback,
+        std::env::var("SB_CONFIG_FALLBACK").ok().as_deref(),
+    ) {
+        Some(mode) => mode,
+        // Neither the flag nor the environment decided, so the file's
+        // own `boot.fallback` does, which costs one parse of a document
+        // that is about to be parsed anyway.
+        None => {
+            crate::config_boot::history_config_from_broken_document(
+                read.as_deref().unwrap_or_default(),
+            )
+            .boot
+            .fallback
+        }
+    };
+    if mode == sbproxy_config::BootFallbackMode::Off {
+        return read.map(|yaml| (yaml, None));
+    }
+
+    // Only a node that asked for a fallback pays the pre-check, and it
+    // has to: the walk cannot know the configured document failed
+    // without trying it, and it applies the same two steps to a
+    // candidate so "works" means the same thing on both sides.
     let primary = match &read {
         Ok(yaml) => match boot_candidate_compiles(yaml) {
             Ok(()) => return Ok((yaml.clone(), None)),
@@ -2784,18 +2836,9 @@ fn boot_document(
             Err(error) => error,
         },
     };
-
-    let raw = std::fs::read_to_string(config_path).unwrap_or_default();
-    let boot_config = crate::config_boot::history_config_from_broken_document(&raw);
-    let mode = crate::config_boot::effective_mode(
-        fallback,
-        std::env::var("SB_CONFIG_FALLBACK").ok().as_deref(),
-        boot_config.boot.fallback,
+    let boot_config = crate::config_boot::history_config_from_broken_document(
+        &std::fs::read_to_string(config_path).unwrap_or_default(),
     );
-    if mode == sbproxy_config::BootFallbackMode::Off {
-        // Byte identical to every release before this one.
-        return Err(primary);
-    }
 
     tracing::error!(
         error = %format!("{primary:#}"),
@@ -2810,7 +2853,6 @@ fn boot_document(
         Ok(document) => {
             crate::config_boot::mark_on_fallback(document.pinned.clone());
             crate::config_boot::spawn_boot_success_timer(
-                boot_config.clone(),
                 document.pinned.revision,
                 boot_config.boot.success_secs,
             );
@@ -4074,7 +4116,10 @@ pub fn run_with_fallback(
                     // soak's operator-probe signal (WOR-2458) can read
                     // the same outcome `/readyz` reads rather than
                     // introducing a second probe shape.
-                    crate::synthetic::install_process_synthetic_state(state.clone());
+                    crate::synthetic::install_process_synthetic_state(
+                        state.clone(),
+                        std::time::Duration::from_secs(synth_cfg.effective_stale_after_secs()),
+                    );
                     crate::synthetic::spawn_loop(synth_cfg, state);
                 }
                 // WOR-2458: the soak supervisor. One task, ticking the
@@ -8609,6 +8654,54 @@ egress:
         );
         assert!(!crate::config_boot::on_fallback());
         crate::config_boot::reset_for_test();
+    }
+
+    /// WOR-2458 fix round, Blocker 3, end to end. The signal claims it
+    /// catches an origin repointed at a dead address; a `type: proxy`
+    /// origin exposes no breaker, no health check, and no outlier
+    /// detector, so the sampler has to report it as unobserved rather
+    /// than skipping it. Driven against a really published pipeline
+    /// rather than a hand-built sample, because the bug was in the walk.
+    #[test]
+    fn a_proxy_origin_pointed_at_a_dead_address_is_reported_as_unobserved() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let config_path = temp.path().join("sb.yml");
+        // 203.0.113.1 is TEST-NET-3, reserved for documentation and
+        // guaranteed not to route, so nothing here dials anything.
+        let yaml = "proxy: {}\norigins:\n  \"dead.local\":\n    action:\n      type: proxy\n      \
+                    url: http://203.0.113.1:9\n";
+        reload_from_config_yaml(config_path.to_str().expect("utf-8"), yaml)
+            .expect("a proxy origin publishes");
+
+        let pipeline = crate::reload::current_pipeline();
+        let sample = crate::config_soak::sample_upstream_health_of(
+            &pipeline.actions,
+            &pipeline.config.origins,
+        );
+        assert!(
+            sample.unhealthy.is_empty(),
+            "nothing was dialled, so nothing is known to be unhealthy: {sample:?}",
+        );
+        assert_eq!(
+            sample.observed, 0,
+            "a proxy origin exposes no health signal at all: {sample:?}",
+        );
+        assert_eq!(
+            sample.unobserved.len(),
+            1,
+            "and it has to be counted rather than skipped: {sample:?}",
+        );
+
+        // Which is what keeps the signal from claiming health it never
+        // looked for.
+        let outcome = crate::config_soak::upstream_health_signal(
+            &sbproxy_config::ConfigSoakConfig::default(),
+            &sample,
+        );
+        assert!(
+            matches!(outcome, crate::config_soak::SignalOutcome::Abstain(_)),
+            "{outcome:?}",
+        );
     }
 
     /// WOR-2458. The reload transaction arms a soak window against the

@@ -3471,7 +3471,7 @@ fn handle_config_history_list() -> (u16, &'static str, String) {
     let body = serde_json::json!({
         "lineage": recorder.lineage(),
         "lkg_revision": recorder.lkg().map(|entry| entry.revision),
-        // Which revision is under judgement right now, if any. An
+        // Which revision is under judgment right now, if any. An
         // operator looking at a ring whose `lkg_revision` has not moved
         // needs to know whether that is because a window is still open
         // or because the last one did not promote (WOR-2458).
@@ -3522,23 +3522,58 @@ fn handle_config_fallback_status() -> (u16, &'static str, String) {
 /// `409` when nothing is pinned: clearing a pin that does not exist is a
 /// caller bug, and answering `200` would tell an operator their node is
 /// back on its config file when it was never off it.
-fn handle_config_fallback_clear() -> (u16, &'static str, String) {
-    match crate::config_boot::clear_fallback() {
-        Some(pin) => {
-            let body = serde_json::json!({
-                "cleared": true,
-                "revision": pin.revision,
-                "digest": pin.digest,
-                "resumed": ["file_watcher", "sighup", "config_refresh_poller"],
-            });
-            (200, "application/json", body.to_string())
-        }
-        None => (
+fn handle_config_fallback_clear(state: &AdminState) -> (u16, &'static str, String) {
+    let Some(pin) = crate::config_boot::clear_fallback() else {
+        return (
             409,
             "application/json",
             r#"{"error":"this node is not pinned to a fallback configuration"}"#.to_string(),
+        );
+    };
+    // Clearing the pin is only half of recovery, and leaving the other
+    // half to the operator was a trap: the watcher only fires on a
+    // *future* filesystem event, so a node whose file had already been
+    // fixed sat on the October config with
+    // `sbproxy_config_fallback_active` reading 0, which is the one
+    // reading that says everything is fine. So the clear applies the
+    // file itself, through the same path `POST /admin/reload` uses
+    // (WOR-2459 fix round, Major 9).
+    let reload = state
+        .config_path
+        .as_ref()
+        .map(|path| crate::server::reload_from_config_path(&path.to_string_lossy()));
+    let (reloaded, reload_error) = match reload {
+        Some(Ok(_)) => (true, None),
+        Some(Err(error)) => (
+            false,
+            Some(crate::path_redact::sanitise_path_in_error(
+                &format!("{error:#}"),
+                state
+                    .config_path
+                    .as_deref()
+                    .unwrap_or(std::path::Path::new("")),
+            )),
         ),
-    }
+        // No config path is wired into this admin state, which is the
+        // unit-test shape rather than a served one.
+        None => (
+            false,
+            Some("no config path is wired on this node".to_string()),
+        ),
+    };
+    let body = serde_json::json!({
+        "cleared": true,
+        "revision": pin.revision,
+        "digest": pin.digest,
+        "resumed": ["file_watcher", "sighup", "config_refresh_poller"],
+        "reloaded": reloaded,
+        "reload_error": reload_error,
+    });
+    // 200 either way: the pin *is* cleared, which is what was asked for
+    // and what the gauge now reports. A file that still does not compile
+    // is the operator's next problem, not a failure of this call, and
+    // `reloaded: false` plus the error is how they see it.
+    (200, "application/json", body.to_string())
 }
 
 /// `POST /admin/config/confirm`: promote the revision under soak
@@ -3554,7 +3589,7 @@ fn handle_config_fallback_clear() -> (u16, &'static str, String) {
 /// pipeline its config is now the rollback target when it is not.
 ///
 /// The confirmation runs the same signals a timed close runs, so it
-/// short-circuits the *wait*, not the *judgement*: a revision that is
+/// short-circuits the *wait*, not the *judgment*: a revision that is
 /// already failing its upstream-health signal is not promoted just
 /// because somebody confirmed it. Reporting the verdict back is what
 /// lets the pipeline fail its own step on it.
@@ -3579,7 +3614,19 @@ fn handle_config_confirm() -> (u16, &'static str, String) {
             serde_json::json!({
                 "signal": signal.as_str(),
                 "outcome": outcome.as_str(),
-                "detail": outcome.detail().unwrap_or_default(),
+                // Redacted for display, the same pass
+                // `config_rejected_entry_json` applies to a stored
+                // refusal. A signal detail is built from bounded,
+                // secret-free parts by construction (the probe's URL
+                // reaches it only through `redacted_url`), and this is
+                // the belt to that brace: an operator can put a literal
+                // credential into a config value the same way they can
+                // anywhere else, and a soak failure quoting one back to
+                // an admin-authenticated reader would be the leak this
+                // pass exists to stop (WOR-2458 fix round, Blocker 1).
+                "detail": sbproxy_observe::redact::redact_secrets(
+                    outcome.detail().unwrap_or_default(),
+                ),
             })
         })
         .collect();
@@ -6177,7 +6224,7 @@ pub fn handle_admin_request(
             return handle_config_fallback_status();
         }
         if method.eq_ignore_ascii_case("DELETE") {
-            return handle_config_fallback_clear();
+            return handle_config_fallback_clear(state);
         }
         return (
             405,
@@ -6186,7 +6233,7 @@ pub fn handle_admin_request(
         );
     }
     // WOR-2458: short-circuit the soak window for the revision under
-    // judgement. POST only: it is a state change.
+    // judgment. POST only: it is a state change.
     if path_only == "/admin/config/confirm" {
         if method.eq_ignore_ascii_case("POST") {
             return handle_config_confirm();
@@ -12076,7 +12123,7 @@ mod tests {
         assert_eq!(parsed["active"], false);
         assert_eq!(parsed["suspended"].as_array().expect("array").len(), 0);
 
-        let (status, _, body) = handle_config_fallback_clear();
+        let (status, _, body) = handle_config_fallback_clear(&state);
         assert_eq!(
             status, 409,
             "clearing a pin that does not exist is a caller bug"
@@ -12106,13 +12153,82 @@ mod tests {
             "config_authority is deliberately absent: a fleet-wide fix is how this ends",
         );
 
-        let (status, _, body) = handle_config_fallback_clear();
+        let (status, _, body) = handle_config_fallback_clear(&state);
         assert_eq!(status, 200);
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
         assert_eq!(parsed["cleared"], true);
         assert_eq!(parsed["revision"], 12);
         assert!(!crate::config_boot::on_fallback());
         crate::config_boot::reset_for_test();
+    }
+
+    /// WOR-2459 fix round, Major 9. Recovery has to finish in one call.
+    /// The watcher only fires on a *future* filesystem event, so a node
+    /// whose file had already been fixed before the pin was cleared sat
+    /// on the rescued config with `sbproxy_config_fallback_active`
+    /// reading 0, which is the reading that says everything is fine.
+    #[test]
+    fn clearing_the_pin_applies_the_config_file_rather_than_waiting_for_a_touch() {
+        crate::config_boot::reset_for_test();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config_path = dir.path().join("sb.yml");
+        std::fs::write(&config_path, "proxy: {}\n# the operator's fix\n").expect("write");
+        let state = make_state().with_config_path(&config_path);
+
+        crate::config_boot::mark_on_fallback(crate::config_boot::PinnedRevision {
+            revision: 7,
+            digest: "rescued".to_string(),
+        });
+        let before = crate::reload::current_pipeline_full();
+
+        let (status, _, body) = handle_config_fallback_clear(&state);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        let after = crate::reload::current_pipeline_full();
+        crate::config_boot::reset_for_test();
+
+        assert_eq!(status, 200);
+        assert_eq!(parsed["cleared"], true);
+        assert_eq!(
+            parsed["reloaded"], true,
+            "clearing the pin applies the file in the same call: {body}",
+        );
+        assert_eq!(parsed["reload_error"], serde_json::Value::Null);
+        assert!(
+            !std::sync::Arc::ptr_eq(&before, &after),
+            "and the running pipeline is the operator's fix, not the rescued revision",
+        );
+    }
+
+    /// A file that still does not compile is the operator's next
+    /// problem, not a failure of the clear: the pin is genuinely gone
+    /// and the gauge says so, and `reloaded: false` carries the reason.
+    #[test]
+    fn clearing_the_pin_still_succeeds_when_the_file_is_still_broken() {
+        crate::config_boot::reset_for_test();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config_path = dir.path().join("sb.yml");
+        std::fs::write(&config_path, "proxy:\n  http2_cleartextt: true\n").expect("write");
+        let state = make_state().with_config_path(&config_path);
+        crate::config_boot::mark_on_fallback(crate::config_boot::PinnedRevision {
+            revision: 7,
+            digest: "rescued".to_string(),
+        });
+
+        let (status, _, body) = handle_config_fallback_clear(&state);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        let pinned = crate::config_boot::on_fallback();
+        crate::config_boot::reset_for_test();
+
+        assert_eq!(status, 200);
+        assert_eq!(parsed["cleared"], true);
+        assert_eq!(parsed["reloaded"], false);
+        assert!(
+            parsed["reload_error"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("http2_cleartextt")),
+            "the operator is told why their file still does not apply: {body}",
+        );
+        assert!(!pinned, "the pin is gone either way");
     }
 
     /// WOR-2458. Confirming is a mutation, so it is POST only and
@@ -12155,7 +12271,7 @@ mod tests {
         assert_eq!(body, r#"{"error":"no config soak is in flight"}"#);
     }
 
-    /// WOR-2458. Confirming short-circuits the wait, not the judgement:
+    /// WOR-2458. Confirming short-circuits the wait, not the judgment:
     /// the same signals run, and the answer says whether the revision
     /// was actually promoted.
     #[test]

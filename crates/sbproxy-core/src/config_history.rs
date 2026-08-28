@@ -148,9 +148,18 @@ impl ConfigHistoryRecorder {
         let entry = match store.append(content, metadata) {
             Ok(entry) => entry,
             Err(error) => {
+                // Counted, not only logged. The caller cannot tell a
+                // failed write from a byte-identical repeat through the
+                // `None` either returns, and both skip the soak, so a
+                // full disk would otherwise stop every promotion on this
+                // node with nothing but an ERROR line to say so
+                // (WOR-2458 fix round, Minor 21).
+                sbproxy_observe::metrics::record_config_rejection("ring_write_failed");
                 tracing::error!(
                     error = %error,
-                    "config history: failed to record an applied config revision"
+                    "config history: failed to record an applied config revision; no soak \
+                     window will be armed for it and the last-known-good pointer cannot \
+                     advance past it"
                 );
                 return None;
             }
@@ -351,38 +360,17 @@ impl ConfigHistoryRecorder {
         }
     }
 
-    /// Entries a boot fallback may try, in the order it should try them
-    /// (WOR-2459). See
-    /// [`sbproxy_config::RevisionStore::boot_candidates`].
-    #[must_use]
-    pub fn boot_candidates(&self) -> Vec<RevisionEntry> {
-        let store = self
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        store.boot_candidates()
-    }
-
-    /// Increment and persist one entry's boot counter before the attempt
-    /// (WOR-2459), returning the new count.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error under the same conditions as
-    /// [`sbproxy_config::RevisionStore::begin_boot_attempt`]. Unlike the
-    /// other writes on this type this one is *not* swallowed: a boot
-    /// walk that cannot persist its counter would retry the same dead
-    /// entry forever, so the caller has to see the failure.
-    pub fn begin_boot_attempt(&self, revision: u64) -> Result<u32, RevisionStoreError> {
-        let mut store = self
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        store.begin_boot_attempt(revision)
-    }
-
     /// Clear one entry's boot counter: it booted and served long enough
     /// to count as working (WOR-2459).
+    ///
+    /// The **only** way a boot counter is cleared in this process.
+    /// `RevisionStore` is single-owner and every mutator rewrites the
+    /// whole index from the handle's own snapshot, so a second handle
+    /// opened on this directory does not merge with this one, it
+    /// overwrites it: a timer that cleared the counter through its own
+    /// store had that write reverted by the recorder's very next append
+    /// (WOR-2459 fix round, Blocker 2). `crate::config_boot`'s
+    /// `confirm_boot_success_now` is the caller.
     pub fn confirm_boot_success(&self, revision: u64) {
         let mut store = self
             .store
@@ -393,21 +381,6 @@ impl ConfigHistoryRecorder {
                 error = %error,
                 revision,
                 "config history: failed to clear a boot attempt counter"
-            );
-        }
-    }
-
-    /// Retire one entry from the boot walk (WOR-2459).
-    pub fn retire_unbootable(&self, revision: u64) {
-        let mut store = self
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Err(error) = store.retire_unbootable(revision) {
-            tracing::error!(
-                error = %error,
-                revision,
-                "config history: failed to retire an unbootable revision"
             );
         }
     }

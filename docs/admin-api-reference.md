@@ -2795,11 +2795,11 @@ Read-only operators may call this.
 
 ### `POST /admin/config/confirm`
 
-Close the soak window on the revision under judgement now, instead of
+Close the soak window on the revision under judgment now, instead of
 waiting out `proxy.config_history.soak.window_secs`. This is what a
 deployment pipeline calls after its own smoke test.
 
-It short-circuits the *wait*, not the *judgement*. The same four signals run,
+It short-circuits the *wait*, not the *judgment*. The same four signals run,
 and the response says what each of them found, so a revision already failing
 its upstream-health signal is not promoted just because somebody confirmed
 it, and the pipeline can fail its own step on the answer.
@@ -2823,7 +2823,7 @@ it, and the pipeline can fail its own step on the answer.
 | `revision` | number | The revision that was judged. |
 | `verdict` | string | `passed`, `failed`, or `inconclusive`. |
 | `promoted` | bool | Whether the last-known-good pointer moved. True only for `passed`. |
-| `signals[]` | array | One row per signal: its `outcome` (`passed`, `failed`, `abstain`) and the explanation it gave. |
+| `signals[]` | array | One row per signal: its `outcome` (`passed`, `failed`, `abstain`) and the explanation it gave, secret-redacted the same way `GET /admin/config/rejected` redacts a stored refusal. |
 
 Mutating, so a read-only operator is refused.
 
@@ -2858,17 +2858,33 @@ whether a feature is on.
 Config-authority polling is deliberately absent from that list: a fleet-wide
 fix pushed from the control plane is how a fallback boot should end.
 
-`DELETE` clears the pin, resumes all three paths without a restart, and
-returns `sbproxy_config_fallback_active` to 0.
+`DELETE` clears the pin, resumes all three paths without a restart, returns
+`sbproxy_config_fallback_active` to 0, and applies the config file in the
+same call. That last part matters: the watcher only fires on a *future*
+filesystem event, so a node whose file was already fixed would otherwise keep
+serving the rescued revision with the gauge reading 0.
 
 ```json
 {
   "cleared": true,
   "revision": 41,
   "digest": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a5",
-  "resumed": ["file_watcher", "sighup", "config_refresh_poller"]
+  "resumed": ["file_watcher", "sighup", "config_refresh_poller"],
+  "reloaded": true,
+  "reload_error": null
 }
 ```
+
+| Field | Type | Description |
+|---|---|---|
+| `cleared` | bool | Always `true` on a `200`. The pin is gone. |
+| `reloaded` | bool | Whether the config file applied. `false` when it still does not compile. |
+| `reload_error` | string or null | Why it did not apply, with local filesystem paths scrubbed. |
+
+A file that still does not compile answers `200` with `reloaded: false`
+rather than an error status. The pin genuinely is cleared, which is what was
+asked for and what the gauge now reports; the file is the operator's next
+problem and `reload_error` is how they see it.
 
 `DELETE` is mutating, so a read-only operator is refused.
 

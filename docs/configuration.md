@@ -1293,9 +1293,9 @@ The four signals, and what each of them catches:
 | Signal | Source | Catches |
 |---|---|---|
 | Degraded subsystems | The reload's own outcome | A pipeline that published while the key plane, a sink, or the model runtime stayed on prior state. Reports immediately, so a degraded reload fails without waiting the window out. |
-| Upstream health | The running config's circuit breakers | A config that repointed an origin at a dead address, on a node with almost no traffic. |
+| Upstream health | Per-target circuit breakers, active `health_check:` state, and outlier ejections, across every origin | A config that repointed an origin at a dead address, on a node with almost no traffic. It passes only when it could see every origin: an origin that declares none of the three exposes nothing, and this abstains rather than reporting health it never looked for. |
 | Request outcome | `sbproxy_requests_total` by status class, plus the upstream retry and timeout counters | A policy that denies everything, an auth block that rejects every caller, a transform that corrupts bodies. |
-| Operator probe | `probe:` above, and `proxy.synthetic_probe` when it is running | Whatever you know and the proxy does not. Both feed this one signal, and either of them failing fails it: a passing synthetic run never covers for an operator probe that is failing. |
+| Operator probe | `probe:` above, and `proxy.synthetic_probe` when it is running | Whatever you know and the proxy does not. Both feed this one signal, and either of them failing fails it: a passing synthetic run never covers for an operator probe that is failing. A driver that has not produced an outcome yet, or whose outcome is older than its own `stale_after_secs`, abstains rather than failing, because a driver that has said nothing is not evidence against your config. |
 
 The verdict has three states, not two. Argo Rollouts has the one people
 forget: an analysis run completes successful, failed, or **inconclusive**,
@@ -1310,6 +1310,10 @@ signal abstains.
 | At least one non-abstaining pass, no failures | passed | advances |
 | Every signal abstained | inconclusive | does not move; the entry stays `applied` |
 
+A fifth value appears on `sbproxy_config_soak_verdict_total`:
+`superseded`, counted when a newer revision applies mid-soak and the
+window in flight is dropped without ever reaching a verdict.
+
 One abstaining signal never blocks a promotion. Every signal abstaining is
 different, and promoting on it would be promote-on-apply with two extra
 minutes attached. That case gets its own `inconclusive` label on
@@ -1320,6 +1324,17 @@ A clean reload does not promote on its own. `require_no_degraded_subsystems`
 is a veto: it can fail a soak and it cannot pass one, for the same reason
 this block exists at all. Something that actually observed traffic, an
 upstream, or a probe has to be what promotes a revision.
+
+One thing the synthetic driver deliberately cannot do: promote a
+revision on a node whose upstreams this soak cannot see. The synthetic
+origin is a non-network action by construction, so a passing run proves
+the compiled handler chain executes and says nothing about whether any
+upstream is reachable. While the upstream-health signal is abstaining
+because an origin exposes no health signal, a synthetic pass is treated
+as an absence rather than as evidence, and the window reaches
+`inconclusive`. Declare a `probe:` that dials a real upstream, or give
+your origins a `health_check:`, a `circuit_breaker:`, or an
+`outlier_detection:` block, and the soak has something to promote on.
 
 On a node with little organic traffic, turn on `proxy.synthetic_probe`.
 Flagger's field experience is the
@@ -1352,7 +1367,11 @@ perfectly good config sitting in the ring.
 `--config-fallback <off|last-known-good>` and `SB_CONFIG_FALLBACK` override
 this field, in that order of precedence. The flag wins deliberately: a
 rescue boot must not depend on the file being right, and the file is what
-is broken.
+is broken. A `SB_CONFIG_FALLBACK` value that is neither `off` nor
+`last-known-good` is warned about and ignored, and this field decides; a
+`--config-fallback` value that is neither refuses to boot, because a flag
+typed by hand under pressure with the mode misspelled must not come up
+silently with the fallback off.
 
 A node that boots on the fallback says so. It warns at startup, reports
 `sbproxy_config_fallback_active` as 1, and answers `GET /admin/config/fallback`
@@ -1366,8 +1385,22 @@ live would re-apply the broken file on the next save in that directory and
 loop straight back into the state the fallback just rescued the node from.
 Config-authority polling stays live on purpose, because a fleet-wide fix
 pushed from the control plane is how this should end.
-`DELETE /admin/config/fallback` clears the pin and resumes all three
-without a restart.
+`DELETE /admin/config/fallback` clears the pin, resumes all three without
+a restart, and applies the config file in the same call, so a node whose
+file you fixed before clearing does not sit on the rescued revision
+waiting for a filesystem event that already happened. While the pin is in
+place a local reload is counted as
+`sbproxy_config_reload_total{result="suspended"}` and a skipped source
+poll as `sbproxy_config_source_fetch_total{result="suspended"}`, rather
+than as failures: a pinned node is the state the fallback is supposed to
+leave it in, and it must not read as a fault on the dashboard you alert
+from.
+
+The ring is trusted by filesystem location, so the boot walk checks that
+before it treats ring content as configuration: opening the store proves
+the process owns the directory (only an owner may `chmod` it to `0700`),
+and any group or other bit on `index.json`, its backup, or a blob refuses
+the walk outright.
 
 An entry that was good in October need not construct after an upgrade that
 tightened validation, so the walk counts. Borrowing systemd-boot's boot

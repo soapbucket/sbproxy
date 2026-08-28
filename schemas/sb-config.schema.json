@@ -6974,7 +6974,7 @@
       "additionalProperties": false
     },
     "ConfigSoakConfig": {
-      "description": "The soak window a newly applied revision must survive before it is promoted to last known good (WOR-2458).\n\nCompiling is not evidence that a config works. A dead upstream URL, a rate limit of 10 that should have been 10000, an auth block that rejects the caller carrying most of the traffic, and a WAF rule that matches everything all compile cleanly. So a committed reload arms a window, four signals report into it, and only a window that closes on a passing verdict moves the `lkg` pointer ([`crate::revision_store::RevisionStore::record_soak_verdict`]).\n\n# The verdict is three-way\n\nModelled on Argo Rollouts' analysis runs, which complete `Successful`, `Failed`, or `Inconclusive`, with `Inconclusive` pausing a rollout rather than promoting or aborting it. A node that took four requests overnight and 500'd one of them has a 25% error rate and no information: the request-outcome signal abstains below [`Self::min_requests`] rather than reporting a failure. One abstaining signal never fails a soak, but a window where *every* signal abstained is `Inconclusive` and does not promote, because promoting on a soak that measured nothing is promote-on-apply wearing a timer.\n\n# Enabled by default once history is\n\n`proxy.config_history` is itself opt-in and disabled by default. A node that opted into the ring but not into the soak would record revisions whose `lkg` pointer never moves, which leaves the boot fallback ([`ConfigBootConfig`]) with nothing to boot from. So this block defaults on inside a block that defaults off.",
+      "description": "The soak window a newly applied revision must survive before it is promoted to last known good (WOR-2458).\n\nCompiling is not evidence that a config works. A dead upstream URL, a rate limit of 10 that should have been 10000, an auth block that rejects the caller carrying most of the traffic, and a WAF rule that matches everything all compile cleanly. So a committed reload arms a window, four signals report into it, and only a window that closes on a passing verdict promotes the revision to last known good.\n\n# The verdict is three-way\n\nModeled on Argo Rollouts' analysis runs, which complete `Successful`, `Failed`, or `Inconclusive`, with `Inconclusive` pausing a rollout rather than promoting or aborting it. A node that took four requests overnight and 500'd one of them has a 25% error rate and no information: the request-outcome signal abstains below `min_requests` rather than reporting a failure. One abstaining signal never fails a soak, but a window where *every* signal abstained is `Inconclusive` and does not promote, because promoting on a soak that measured nothing is promote-on-apply wearing a timer.\n\n# Enabled by default once history is\n\n`proxy.config_history` is itself opt-in and disabled by default. A node that opted into the ring but not into the soak would record revisions whose `lkg` pointer never moves, which leaves the boot fallback (`proxy.config_history.boot`) with nothing to boot from. So this block defaults on inside a block that defaults off.",
       "type": "object",
       "properties": {
         "enabled": {
@@ -7028,7 +7028,7 @@
       "additionalProperties": false
     },
     "ConfigSoakProbeConfig": {
-      "description": "An operator-declared HTTP probe the soak window runs alongside its other three signals (WOR-2458).\n\nDeliberately separate from `proxy.synthetic_probe` ([`SyntheticProbeConfig`]), which the soak also reads. The synthetic driver fires an in-process request through the compiled handler chain against a non-network origin, so a passing run proves the chain executes and proves nothing about whether any upstream is reachable. An operator who wants a real upstream exercised declares this instead, and both can be on at once.",
+      "description": "An operator-declared HTTP probe the soak window runs alongside its other three signals (WOR-2458).\n\nDeliberately separate from `proxy.synthetic_probe` (`proxy.synthetic_probe`), which the soak also reads. The synthetic driver fires an in-process request through the compiled handler chain against a non-network origin, so a passing run proves the chain executes and proves nothing about whether any upstream is reachable. An operator who wants a real upstream exercised declares this instead, and both can be on at once.",
       "type": "object",
       "required": [
         "url"
@@ -7067,7 +7067,7 @@
       "type": "object",
       "properties": {
         "fallback": {
-          "description": "What to do when the configured document does not boot. Defaults to [`BootFallbackMode::Off`], so today's behavior is unchanged unless asked for. `--config-fallback` and `SB_CONFIG_FALLBACK` override this, and deliberately win: a rescue boot must not depend on the file being right.",
+          "description": "What to do when the configured document does not boot. Defaults to `off`, so today's behavior is unchanged unless asked for. `--config-fallback` and `SB_CONFIG_FALLBACK` override this, and deliberately win: a rescue boot must not depend on the file being right.",
           "default": "off",
           "allOf": [
             {

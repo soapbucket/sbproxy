@@ -120,9 +120,10 @@ pub mod compression_value;
 /// does, sign it, store it under a monotonic revision, and serve it to
 /// subscribers on a listener of its own.
 pub mod config_authority;
-/// Config-authority subscriber: pull signed configuration from an
-/// upstream authority, verify it, merge it over the base document, and
-/// apply it through the shared reload transaction.
+/// Booting on the last known good config when the document this node was
+/// told to boot on does not work: the ring walk, the durable boot
+/// counter, and the pin that suspends the local reload triggers while
+/// the node is serving a rescued configuration.
 pub mod config_boot;
 /// What configuration is actually running on this node, which layer owns
 /// each part of it, and whether a proposed write to the local file would
@@ -145,10 +146,13 @@ pub mod config_history;
 /// closes one), and nothing outside it has a reason to reach a soak
 /// verdict on this process's behalf.
 pub(crate) mod config_soak;
-/// Honouring `source:`: resolve the config document from a git
+/// Honoring `source:`: resolve the config document from a git
 /// repository (or an overlay chain over one), keep it fresh on a timer,
 /// and hand the result to the shared reload transaction.
 pub mod config_source;
+/// Config-authority subscriber: pull signed configuration from an
+/// upstream authority, verify it, merge it over the base document, and
+/// apply it through the shared reload transaction.
 pub mod config_subscriber;
 pub mod content_capture;
 pub mod context;
