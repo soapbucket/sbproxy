@@ -8039,6 +8039,98 @@ A repository URL is credential-stripped, an entry credential is reported as pres
 
 `sbproxy_origin_source_entries{tier,pinned}` carries the same two facts for alerting. The total dropping to zero means a fleet that should be composing project profiles has quietly stopped. A non-zero `pinned="false"` series under `tier="production"` means a node is running a document that predates the pinning rule, since config load refuses that combination outright.
 
+### `sbproxy aggregate`: running the composition
+
+```bash
+# Publish through the config authority this document configures.
+sbproxy aggregate -f /etc/sbproxy/sb.yml
+
+# Compose to a file instead, for a single node or a CI review step.
+sbproxy aggregate -f /etc/sbproxy/sb.yml --out composed.yml
+
+# Show what that file would change, and write nothing. Exit 2 on changes.
+sbproxy aggregate -f /etc/sbproxy/sb.yml --out composed.yml --dry-run
+
+# Why is this policy here.
+sbproxy aggregate -f /etc/sbproxy/sb.yml --explain checkout.example.com
+sbproxy plan -f /etc/sbproxy/sb.yml --explain-origin checkout.example.com
+
+# Keep running: poll, coalesce a burst into one publish, publish on change.
+sbproxy aggregate -f /etc/sbproxy/sb.yml --watch
+```
+
+One round fetches every entry, composes, and publishes only when the composed document differs from the last one published. A proxy that both declares `origin_sources` entries and publishes a config authority runs the same loop in process at boot, which is where the metrics below come from; a node with entries and no authority logs that it is not composing rather than doing it silently, because its answer is `--out` and that is an operator's decision.
+
+The composed document carries **neither** composition block. `origin_sources` is removed because a composed output is not a source of further composition and re-composing one would loop; `origin_defaults` is removed because the floor is already folded into every composed origin, and leaving it would let a node re-apply it over hand-written origins the aggregator never touched.
+
+A composed origin is materialized **once per host**, so a profile bound to ten hosts is ten origins, and the size a signed bundle may carry (`MAX_CONFIG_YAML_BYTES`, 4 MiB) is a ceiling on hosts rather than on projects. Measured against a realistic floor (a proxy action, three floor policies, one project policy, one response modifier) a composed origin is 435 bytes, so the ceiling is reached at roughly 9,600 hosts. Past it the composition is refused with a message naming the limit, how many origins materialized, and the mean bytes each; nothing is published.
+
+Two failure classes are kept apart, deliberately. A single entry that will not fetch falls back to its last successfully resolved profile, is named in the output and counted on `sbproxy_aggregate_entries{outcome="failed"}`, and the other entries are unaffected: one unreachable repository must not discard forty-nine other projects' last-known-good. An entry that fails its **first** fetch has nothing to fall back on, and there the whole round is refused, because composing without it would publish an `origins:` map silently missing that project's hosts. A composed document that does not compile, does not construct, or names a denied path is refused at the authority and never published at all.
+
+#### `origin_sources.aggregator`
+
+```yaml
+origin_sources:
+  tier: production
+  aggregator:
+    poll_interval_secs: 120
+    debounce_secs: 15
+    max_deferral_secs: 120
+    concurrency: 8
+    deadline_secs: 300
+  entries:
+    - name: checkout
+      # ...
+```
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `poll_interval_secs` | int | `120` | How often each unpinned entry is asked whether its revision moved. One `git ls-remote` per unpinned entry per interval, so `3600 / poll_interval_secs` requests per hour per repository: **30 per hour per repository** at the default. An entry pinned to a full commit sha is polled zero times. |
+| `debounce_secs` | int | `15` | How long a moved entry waits for others before the aggregator composes. Zero composes immediately. |
+| `max_deferral_secs` | int | `120` | Ceiling on that wait, measured from the first movement in the window. Without it a continuously-changing entry would reset the debounce forever and never publish. |
+| `concurrency` | int | `8` | How many repositories are fetched at once. |
+| `deadline_secs` | int | `300` | Hard deadline for all of one round's fetches. Distinct from a per-entry `timeout_secs`, which bounds one repository. |
+
+The defaults come from the state of the art rather than from taste. `poll_interval_secs: 120` is Argo CD's `--app-resync` default, which is the same job: the floor on how often a change is looked for. The debounce and its ceiling are the pair Argo CD reaches with its self-heal timeout, the floor on how often a change is acted on.
+
+Polling is cheap because it does not clone. `git ls-remote <repo> <ref>` returns the sha for a reference in one network round trip with no working tree, and a clone only happens when that sha moved. Argo CD's repo-server resolves an ambiguous revision the same way and keys its manifest cache on the resolved commit, so an unchanged sha never reaches a checkout. Three reductions fall out: an entry pinned to a full commit sha is never polled, because a sha cannot move; two entries naming the same repository at the same revision are one fetch, which is what a monorepo deploying several services wants; and a round where nothing moved composes nothing, publishes nothing, and leaves every subscriber on its `304`.
+
+Aggregation writes four metric families:
+
+| Metric | Labels | What it says |
+|---|---|---|
+| `sbproxy_aggregate_entries` | `outcome` | Entries by how the last round ended: `resolved`, `unchanged`, `failed`. Every outcome is written on every round including the zeroes. |
+| `sbproxy_aggregate_compose_duration_seconds` | none | Wall clock of one round, fetches included. |
+| `sbproxy_aggregate_published_revision` | none | The config-authority revision last published. Zero means nothing has been. |
+| `sbproxy_aggregate_rounds_total` | `outcome` | Rounds by decision: `published`, `unchanged`, `refused`. |
+
+The entry name is deliberately not a label. Fifty entries would be fifty series that churn as the block is edited, and the entry that failed is named in the structured log, in the CLI output, and on `GET /admin/origin-composition`.
+
+### Composition provenance
+
+Once an origin is the product of four layers and two repositories, "why is this WAF rule here" has four possible answers and they lead to different people. `sbproxy aggregate --explain <host>` and `sbproxy plan --explain-origin <host>` name the layer for every leaf:
+
+```
+checkout.example.com
+  action.url                         spec.base  entry checkout  https://git.example.com/acme/checkout@a1b2c3d4e5f6
+  policies[platform_waf].action_on_match  origin_defaults
+  policies[rate_limit].requests_per_minute  spec.environments[prod]  entry checkout  https://git.example.com/acme/checkout@a1b2c3d4e5f6
+  policies[rate_limit].burst         origin_sources.entries[].overrides  entry checkout
+  dropped policies[legacy_cap]  spec.base dropped a default introduced by origin_defaults  entry checkout
+```
+
+Four things about that output are deliberate.
+
+The merged lists are keyed by `name:` rather than by index, because an index moves whenever an earlier entry is dropped or a project appends one, and an audit trail that renumbered itself between two composes would be worse than none.
+
+A field-level override reports per field. The floor set `requests_per_minute` and `burst`; the project rewrote one and the runtime rewrote the other, and the field nobody touched still names the floor. Reporting per policy would credit one layer with all three and lose exactly the fact somebody needs.
+
+A drop is recorded with both layers. `disabled: true` removing a default is precisely the thing somebody asks about later, and an absence explains nothing on its own, so the record names the layer that dropped it and the layer that had introduced it.
+
+Nothing carries a value. Provenance says which layer set a leaf and which repository that layer came from; the leaf's value is in the composed document, which is the thing under access control. A composed leaf can be a `secret://backend/name` reference an entry bound, so carrying values here would put a reference into every surface that renders provenance, including a `plan` output somebody pastes into a ticket.
+
+Kustomize is the closest published analogue and it stops one level short: `buildMetadata: [originAnnotations, transformerAnnotations]` writes `config.kubernetes.io/origin` (with `path`, `repo`, `ref`) and an `alpha.config.kubernetes.io/transformations` chain onto each resource, so it answers which file and which transformers produced a resource. It does not answer which layer set a field. A composed origin is one resource made of four layers, so per-resource attribution would collapse to a single answer, which is why the grain here is the leaf.
+
 ---
 
 ## Validation

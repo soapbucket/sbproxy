@@ -1,6 +1,6 @@
 # SBproxy Runtime Manual
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-28*
 
 Vendor: Soap Bucket LLC - [www.soapbucket.com](https://www.soapbucket.com)
 
@@ -156,6 +156,11 @@ sbproxy validate <path> [--format text|json] [--no-fetch]
 sbproxy --config <path> --check
 sbproxy --config <path> --locked
 sbproxy plan -f <yaml> [--against <yaml>] [--format json|text] [--out <plan-file>] [--no-fetch]
+sbproxy plan -f <yaml> --explain-origin <host> [--format json|text]
+sbproxy aggregate [<path>] [--out <file>] [--dry-run] [--explain <host>]
+                        [--watch] [--polls <n>] [--mode overlay|replace]
+                        [--admin-url <url>] [--username <u>] [--password <p>]
+                        [--format text|json]
 sbproxy apply -f <yaml> [--admin-url <url>] [--username <u>] [--password <p>]
                         [--validate-only]
 sbproxy apply -p <plan-file> [--admin-url <url>] [--validate-only]
@@ -348,6 +353,52 @@ Exit codes:
 When `--against` is omitted, the baseline is empty, so every origin in
 the proposed config surfaces as `added`. The `--running` baseline
 (pulled from a live admin socket) is deferred.
+
+### `aggregate` - compose project-owned origin profiles
+
+Fetches every project repository the runtime document's `origin_sources:`
+block names, composes the `origins:` map from the platform floor and the
+project profiles, and either publishes the result through the config
+authority or writes it to a file. See
+[configuration.md](configuration.md#project-owned-origin-profiles).
+
+```bash
+sbproxy aggregate -f /etc/sbproxy/sb.yml                       # publish
+sbproxy aggregate -f /etc/sbproxy/sb.yml --out composed.yml    # write a file
+sbproxy aggregate -f /etc/sbproxy/sb.yml --out composed.yml --dry-run
+sbproxy aggregate -f /etc/sbproxy/sb.yml --explain checkout.example.com
+sbproxy aggregate -f /etc/sbproxy/sb.yml --watch
+```
+
+`--out` is the offline path: the written document is ordinary config
+that boots and reloads normally, and it carries neither composition
+block, because a composed output is not a source of further composition.
+The same inputs at the same revisions produce a byte-identical file, so
+a CI diff means something. `--dry-run` prints what would change against
+a file already there and writes nothing.
+
+`--explain <host>` prints which composition layer set each leaf of one
+composed origin, and for the two layers a project authored, the
+repository and the resolved commit. `sbproxy plan --explain-origin
+<host>` prints the same thing from the verb an operator already reaches
+for; it fetches, so it is refused under `--no-fetch`.
+
+`--watch` polls each entry on the configured interval, coalesces a burst
+of movement into one composition, and publishes only when the composed
+document changed. `--polls <n>` stops after that many poll cycles, for a
+cron-shaped invocation. A proxy that both declares `origin_sources`
+entries and publishes a config authority runs the same loop in process at
+boot, so `--watch` is for a deployment that runs the aggregator
+separately.
+
+Exit codes:
+
+| Code | Meaning |
+|------|---------|
+| 0 | Published, written, or the composition was unchanged and nothing needed publishing. |
+| 1 | CLI / IO error, or a credential that would not resolve. |
+| 2 | `--dry-run` found changes (informational, not an error). |
+| 3 | The composition was refused, or the authority refused the composed document. Nothing was published and nothing was written. |
 
 ### `apply` - validate, then apply to a running proxy
 

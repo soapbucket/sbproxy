@@ -2405,7 +2405,8 @@ reports, and seeing it here is how an operator confirms that.
 Nothing is fetched. `origin_sources` names the hosts itself, so the pin
 state and the collision check are both properties of the document.
 Composition runs in an aggregator rather than on a node, so what this
-returns is the declaration and its posture.
+returns is the declaration and its posture, plus `last_round` on the one
+node that is the aggregator.
 
 ```json
 {
@@ -2436,6 +2437,36 @@ returns is the declaration and its posture.
     }
   ],
   "collision": null,
+  "aggregator": {
+    "poll_interval_secs": 120,
+    "debounce_secs": 15,
+    "max_deferral_secs": 120,
+    "concurrency": 8,
+    "deadline_secs": 300,
+    "polls_per_hour_per_repo": 30
+  },
+  "last_round": {
+    "at_unix_ms": 1756339200000,
+    "decision": "published",
+    "revision": 42,
+    "content_digest": "sha256:...",
+    "duration_ms": 812,
+    "origins": 17,
+    "resolved": [
+      {
+        "entry": "checkout",
+        "repo": "https://git.example.com/acme/checkout",
+        "revision": "refs/tags/v1.4.2",
+        "commit": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+        "from_cache": false,
+        "unchanged": true
+      }
+    ],
+    "failed": [],
+    "drops": [],
+    "provenance_hosts": ["checkout.example.com"],
+    "reason": null
+  },
   "hand_written_origins": ["status.example.com"],
   "origin_defaults": {
     "present": true,
@@ -2461,6 +2492,16 @@ returns is the declaration and its posture.
 | `claimed_hosts` | array | Every `origins:` map key the declared entries will create, and who claims it. |
 | `collision` | string or null | The refusal message when two writers claim one map key, or when an entry claims a host `origins:` already declares. `null` when there is none. |
 | `origin_defaults.addressable` | object | Per merged list, the `name:` a project can address and whether it is locked against override. |
+| `aggregator` | object | The timings this document configured, plus `polls_per_hour_per_repo`, which is the number whoever runs the git server asks about. |
+| `last_round` | object or null | The last aggregation round **this process** ran. `null` on every node that does not aggregate, which is every node but one. |
+| `last_round.decision` | string | `published`, `unchanged`, or `refused`. `unchanged` is the steady state the change detector exists to produce, not a fault. |
+| `last_round.resolved[].unchanged` | bool | Whether the entry's remote sha had not moved, so no clone happened. |
+| `last_round.resolved[].from_cache` | bool | Whether the fetch failed and the entry's last resolved profile was reused. |
+| `last_round.failed[]` | array | Entries that did not resolve, by name, with the credential-scrubbed reason and the commit reused instead. |
+| `last_round.provenance_hosts` | array | Hosts this round composed. Provenance itself is not returned here: fifty origins carry thousands of leaves, and a route that emitted all of them on every poll would be the most expensive thing on this listener. `sbproxy aggregate --explain <host>` renders one host's. |
+
+Provenance could not carry a secret even if this route returned it: an
+attributed leaf is a layer and a repository, never the leaf's value.
 
 A console page is deferred; this route is the operator surface until it
 lands, and the console will read the same JSON.
