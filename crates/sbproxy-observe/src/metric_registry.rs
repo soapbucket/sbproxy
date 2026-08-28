@@ -1810,6 +1810,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_ai_stream_tool_frames_discarded_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_stream_tool_frames_discarded"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["cause"],
+        description: "Tool-call frames an enforcing `ai_tool_call` hook or an agent-alignment guard held back that never reached the client, by cause: `blocked` (a guardrail or extension ended the stream, which drops held frames by design) and `unjudged` (the stream ended with a held call the guard session never returned a verdict for). `unjudged` should be zero; a non-zero rate means a client received an assistant turn whose tool call the gateway silently deleted.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_ai_stream_post_commit_failures_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_stream_post_commit_failure"),

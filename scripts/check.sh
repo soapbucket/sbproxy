@@ -29,9 +29,15 @@
 #                                        flavor this gate does not build are
 #                                        skipped with the build command that
 #                                        would enable them (WOR-2291).
-#   SBPROXY_CHECK_PAYMENTS=1             clippy + test the settlement feature
-#                                        union (a required CI lane; see that
-#                                        phase for why it is opt-in here)
+#   SBPROXY_CHECK_PAYMENTS=0             skip the settlement feature union.
+#                                        It runs by DEFAULT: it is a required
+#                                        CI lane and the only place
+#                                        clippy::items_after_test_module and
+#                                        the feature-gated half of
+#                                        sbproxy-billing are compiled at all.
+#                                        Setting this to 0 is a deliberate
+#                                        choice and is reprinted in the
+#                                        SKIPPED PHASES block.
 #   SBPROXY_CLEAN_AFTER_BUILD=0          keep all build artifacts after the run
 #   SBPROXY_ALLOW_DIRTY_TREE=1           do not fail on an uncommitted tree
 #   SBPROXY_ALLOW_CARGO_TEST_FALLBACK=1  permit the serial cargo test fallback
@@ -48,6 +54,142 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+
+# Wall clock for the GATE_EXIT line the cleanup trap prints.
+GATE_STARTED="$(date +%s)"
+
+# --- Diff scoping -------------------------------------------------------
+#
+# `--scope-to-diff [<base>]` runs only the phases the diff can reach.
+# `--explain` prints that decision, per changed path, and runs nothing.
+#
+# The classifier is scripts/gate-scope.py and the rule it holds is the
+# only one that makes this safe: AN UNRECOGNIZED PATH RUNS EVERYTHING.
+# A path matching no rule, an empty diff, a missing merge base, and a
+# failed git call all resolve to the full gate. Read that file before
+# changing anything here.
+#
+# Two properties keep the blast radius small. First, only phases costing
+# more than about ten seconds are skippable at all; the fourteen
+# read-only scans, fmt, the lockfile guards, the generator drift scans,
+# the changelog fragments, cargo-deny, and both halves of the
+# working-tree guard run on every invocation regardless. Six of the ten
+# CI failures of 2026-08-27 are in that unconditional set. Second, every
+# cargo phase below is `--workspace`, so scoping never narrows a package
+# selection: a phase either runs over the whole workspace or does not
+# run. There is no partial build to get wrong.
+#
+# A skipped phase is recorded through note_skip like any other, so the
+# SKIPPED PHASES block at the end lists exactly what did not run.
+
+SCOPE_TO_DIFF=0
+SCOPE_BASE='origin/main'
+SCOPE_EXPLAIN=0
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --scope-to-diff)
+      SCOPE_TO_DIFF=1
+      shift
+      # An optional base follows, unless the next token is another flag.
+      if [ "$#" -gt 0 ] && [ "${1#-}" = "$1" ]; then
+        SCOPE_BASE="$1"
+        shift
+      fi
+      ;;
+    --explain)
+      SCOPE_EXPLAIN=1
+      SCOPE_TO_DIFF=1
+      shift
+      ;;
+    -h|--help)
+      # The header, up to the first line of code. A fixed line number
+      # went stale the first time the header grew and started printing
+      # `set -euo pipefail` as if it were documentation.
+      sed -n '2,/^set -euo pipefail/p' "$0" | sed '$d'
+      printf 'usage: check.sh [--scope-to-diff [<base>]] [--explain]\n\n'
+      printf '  --scope-to-diff [<base>]  run only the phases the diff against <base>\n'
+      printf '                            (default origin/main) can reach. An\n'
+      printf '                            unrecognized path runs everything.\n'
+      printf '  --explain                 print that decision per changed path and\n'
+      printf '                            run nothing.\n'
+      exit 0
+      ;;
+    -p|--package|--exclude|--features|--all-features|--no-default-features)
+      # The one wrong argument worth its own message. Every cargo phase
+      # below is --workspace, and the payments phase says it in its own
+      # comment: narrow the tests, never the packages. A package
+      # selection changes the feature union, so a run scoped to one crate
+      # resolves different features, compiles different code, and reports
+      # a different lint set from the one CI runs. It is not this gate
+      # with less in it; it is a different check wearing its name.
+      printf 'check.sh takes no cargo package or feature selection (%s).\n\n' "$1" >&2
+      printf 'Every cargo phase in this gate is --workspace. Narrowing the\n' >&2
+      printf 'package selection changes the feature union, so the result is\n' >&2
+      printf 'not a smaller gate run, it is a different one. For the scoped\n' >&2
+      printf 'iteration loop use the per-crate commands in\n' >&2
+      printf '.github/CONTRIBUTING-agents.md, and run this with no arguments\n' >&2
+      printf 'before you push.\n' >&2
+      exit 2
+      ;;
+    *)
+      printf 'unknown argument: %s\n\n' "$1" >&2
+      printf 'usage: check.sh [--scope-to-diff [<base>]] [--explain]\n' >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [ "$SCOPE_EXPLAIN" = "1" ]; then
+  exec python3 "$ROOT/scripts/gate-scope.py" --base "$SCOPE_BASE" --explain
+fi
+
+# Default: every phase runs. Scoping can only ever turn entries off, and
+# only after gate-scope.py has said so.
+#
+# A space-delimited list of the phases turned OFF rather than an
+# associative array of every phase: `declare -A` is bash 4, macOS ships
+# /bin/bash 3.2, and this file is run as `bash scripts/check.sh` by
+# whatever bash is first on PATH. Recording only the off set also keeps
+# the safe default structural rather than conditional: a name that is not
+# in the list runs, and the empty list runs everything.
+GATE_PHASES_OFF=''
+GATE_PHASES_ON=''
+SCOPE_REASON=''
+if [ "$SCOPE_TO_DIFF" = "1" ]; then
+  SCOPE_OUTPUT="$(python3 "$ROOT/scripts/gate-scope.py" --base "$SCOPE_BASE" || true)"
+  if printf '%s' "$SCOPE_OUTPUT" | grep -q '^GATE_PHASE_'; then
+    while IFS='=' read -r key value; do
+      case "$key" in
+        GATE_PHASE_*)
+          if [ "$value" = "0" ]; then
+            GATE_PHASES_OFF="$GATE_PHASES_OFF ${key#GATE_PHASE_}"
+          else
+            GATE_PHASES_ON="$GATE_PHASES_ON ${key#GATE_PHASE_}"
+          fi
+          ;;
+        GATE_SCOPE_REASON) SCOPE_REASON="$value" ;;
+      esac
+    done <<EOF
+$SCOPE_OUTPUT
+EOF
+  else
+    # The classifier could not speak. That is not permission to skip.
+    printf '\n\033[1;33mgate-scope.py produced no decision; running every phase.\033[0m\n'
+    SCOPE_TO_DIFF=0
+  fi
+fi
+
+# True when the phase should run. Unknown names run: a phase this script
+# gates but gate-scope.py has never heard of must not vanish because the
+# two files drifted.
+phase_wanted() {
+  [ "$SCOPE_TO_DIFF" = "1" ] || return 0
+  case " $GATE_PHASES_OFF " in
+    *" $1 "*) return 1 ;;
+  esac
+  return 0
+}
 
 # Per-phase wall-clock. Each `step` call closes out the previous phase
 # with its duration, and `finish_step` closes the last one before the
@@ -76,11 +218,39 @@ step() {
 # the very end. "All checks passed" must never be able to hide a lane
 # that never executed.
 SKIPPED=''
+SKIPPED_COUNT=0
 
 note_skip() {
   SKIPPED="${SKIPPED}  * $1"$'\n'
+  SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
   printf '\n\033[1;33m!!! SKIPPED:\033[0m %s\n' "$1"
 }
+
+# A phase --scope-to-diff turned off. Goes through note_skip so it lands
+# in the same SKIPPED PHASES block as everything else: a run that skipped
+# half the gate must say so in the same place and the same words as a run
+# that was missing promtool.
+#
+# $1 is the classifier's own phase token and $2 the human label. The token
+# is printed so the log can be diffed against `check.sh --explain`, which
+# speaks in tokens; without it the two outputs shared no vocabulary and a
+# reader had to map step labels back to phase names by hand.
+scope_skip() {
+  note_skip "$1: $2 (--scope-to-diff: nothing in this diff can reach it; run 'bash scripts/check.sh' with no arguments for the full gate)"
+}
+
+if [ "$SCOPE_TO_DIFF" = "1" ]; then
+  printf '\n\033[1;34m==>\033[0m diff-scoped against %s\n' "$SCOPE_BASE"
+  printf '    reason:  %s\n' "$SCOPE_REASON"
+  # The reason line is `diff-scoped` on the only path where scoping
+  # actually happens (the classifier only writes a sentence there when it
+  # is running everything), so the phase lists are what carry the
+  # information. Same tokens --explain prints, in the same order.
+  printf '    running: %s\n' "${GATE_PHASES_ON# }"
+  printf '    skipped: %s\n' "${GATE_PHASES_OFF# }"
+  printf '    Plus the cheap read-only tier, which always runs.\n'
+  printf '    scripts/check.sh --explain shows the decision per changed path.\n'
+fi
 
 print_skip_summary() {
   printf '\n\033[1;33m========================================================\033[0m\n'
@@ -96,13 +266,53 @@ print_skip_summary() {
   printf '\033[1;33m========================================================\033[0m\n'
 }
 
+# Runs on every exit path, success or failure, and its last act is the
+# one line a gate result should ever be quoted as.
+#
+# "It was green" is not a result. It cannot distinguish a full run from
+# one that stopped at the first cargo phase, and it hides the SKIPPED
+# PHASES block entirely. GATE_EXIT carries the exit code, the test counts
+# the run actually produced, the phase it died in when it died, and how
+# many phases did not run. Quote that line.
+#
+# The counts come from the junit file nextest's ci profile writes, read
+# BEFORE cleanup-build-artifacts.sh prunes target/nextest, which is why
+# this is the first thing the function does. Every step here tolerates
+# its own failure: a cleanup trap that errors would mask the exit code it
+# exists to report.
 cleanup() {
+  local rc=$?
+  local junit tests failures head_bytes
+  junit="${CARGO_TARGET_DIR:-$ROOT/target}/nextest/ci/junit.xml"
+  tests='not-run'
+  failures='not-run'
+  if [ -f "$junit" ]; then
+    head_bytes="$(head -c 4000 "$junit" 2>/dev/null || true)"
+    tests="$(printf '%s' "$head_bytes" | tr ' ' '\n' \
+      | sed -n 's/^tests="\([0-9]*\)"$/\1/p' | head -1)"
+    failures="$(printf '%s' "$head_bytes" | tr ' ' '\n' \
+      | sed -n 's/^failures="\([0-9]*\)"$/\1/p' | head -1)"
+    tests="${tests:-unparsed}"
+    failures="${failures:-unparsed}"
+  fi
+
   if [ -n "${BATCH_DIR:-}" ]; then
     rm -rf "$BATCH_DIR"
   fi
   if [ "${SBPROXY_CLEAN_AFTER_BUILD:-1}" != "0" ]; then
-    "$ROOT/scripts/cleanup-build-artifacts.sh"
+    "$ROOT/scripts/cleanup-build-artifacts.sh" || true
   fi
+
+  if [ "$rc" = "0" ]; then
+    printf '\nGATE_EXIT=%s tests=%s failures=%s skipped_phases=%s elapsed=%ss\n' \
+      "$rc" "$tests" "$failures" "${SKIPPED_COUNT:-0}" \
+      "$(( $(date +%s) - GATE_STARTED ))"
+  else
+    printf '\nGATE_EXIT=%s tests=%s failures=%s failed_phase=%s skipped_phases=%s elapsed=%ss\n' \
+      "$rc" "$tests" "$failures" "${STEP_LABEL:-unknown}" "${SKIPPED_COUNT:-0}" \
+      "$(( $(date +%s) - GATE_STARTED ))"
+  fi
+  return "$rc"
 }
 trap cleanup EXIT
 
@@ -454,6 +664,11 @@ python3 "$ROOT/scripts/lib/cert_record.py" --self-test
 python3 "$ROOT/scripts/tests/test_cert_record.py"
 python3 "$ROOT/scripts/lib/notice_coverage.py" --self-test
 python3 "$ROOT/scripts/tests/test_notice_coverage.py"
+# The --scope-to-diff classifier's corpus: ten CI failures, each
+# asserted to still select the phase that catches it. Unconditional, so
+# a rule narrowed in gate-scope.py fails here rather than silently
+# turning a phase off on somebody else's branch.
+python3 "$ROOT/scripts/gate-scope.py" --self-test
 
 # Serial: the test_doc_generators module binds listeners and has
 # leaked one on port 18091 before; nothing that opens a port runs
@@ -465,6 +680,9 @@ python3 "$ROOT/scripts/tests/test_notice_coverage.py"
 # used to run a single class out of that module, so five of the six test
 # classes had no local equivalent at all. Invoked through make so the
 # Makefile stays the one definition of what the check is.
+if ! phase_wanted TAPES; then
+  scope_skip TAPES "generated tapes and GIF wiring (make tapes-check)"
+else
 step "generated tapes and GIF wiring are current"
 if ! command -v make >/dev/null 2>&1; then
   printf 'make not found on PATH; install it (Xcode Command Line Tools on\n' >&2
@@ -474,6 +692,7 @@ if ! command -v make >/dev/null 2>&1; then
   exit 1
 fi
 make tapes-check
+fi
 
 # The three generator --check drift scans only read the tree. Each was
 # read before it was grouped: check-doc-assets.py never writes,
@@ -526,6 +745,30 @@ run_batch "generator --check drift scans" \
   batch_doc_configs "documentation configs match canonical examples" \
   batch_examples_catalog "examples catalog is current" \
   batch_review_evidence "review-evidence parser fixtures"
+
+# CI: docs-ci.yml, both halves. This gate named docs-ci.yml in six
+# comments as the lane a phase mirrors and never ran the script itself,
+# so two of its checks had NO local equivalent at all: the `rust` code
+# blocks in docs/*.md are type-checked by rustc, and every in-tree
+# anchor is resolved offline by lychee. On 2026-08-27 that gap cost two
+# CI round trips in one day, one for three code blocks that did not
+# compile standalone and one for an anchor pointing at a heading another
+# page had renamed.
+#
+# Serial, and not in a batch: run_code spawns one rustc per code block
+# across its own pool and would fight anything running beside it.
+# Needs rustc and lychee; a `rust` block that cannot compile standalone
+# is tagged `rust,no_run` at the source rather than skipped here.
+if ! phase_wanted DOCSCI; then
+  scope_skip DOCSCI "docs-ci (rust code blocks and offline anchor resolution)"
+elif ! command -v lychee >/dev/null 2>&1; then
+  note_skip "docs-ci link half (lychee not on PATH; docs anchors and cross-page links are unchecked locally). Install with 'cargo install lychee --locked' or 'brew install lychee'."
+  step "docs code blocks compile"
+  bash "$ROOT/scripts/docs-ci.sh" --code
+else
+  step "docs code blocks compile and every anchor resolves"
+  bash "$ROOT/scripts/docs-ci.sh"
+fi
 
 # Serial: the opt-in replay path spawns fixture and proxy processes on
 # real ports, and the phase records a skip on the default path.
@@ -639,6 +882,9 @@ else
 fi
 
 # CI: ci.yml ui lane.
+if ! phase_wanted UI; then
+  scope_skip UI "ui typecheck and test (npm)"
+else
 step "ui typecheck and test"
 if ! command -v npm >/dev/null 2>&1; then
   printf 'npm not found on PATH; install Node.js (https://nodejs.org) to run the UI gate. This step is required by CI, so it cannot be skipped here.\n' >&2
@@ -652,6 +898,7 @@ if [ ! -f ui/node_modules/.package-lock.json ] || [ ui/package-lock.json -nt ui/
   (cd ui && npm ci)
 fi
 (cd ui && npm run typecheck && npm run test -- --run)
+fi
 
 # =======================================================================
 # Phase 3: minutes. Compiles the workspace.
@@ -802,9 +1049,16 @@ fi
 # follows then passes against the file this step just regenerated. Local
 # lockfile drift was auto-repaired rather than reported, and with no
 # working-tree guard nobody was ever told.
-step "cargo build"
-cargo build "${test_package_args[@]}"
+if ! phase_wanted BUILD; then
+  scope_skip BUILD "cargo build"
+else
+  step "cargo build"
+  cargo build "${test_package_args[@]}"
+fi
 
+if ! phase_wanted TEST; then
+  scope_skip TEST "cargo test (the workspace nextest lane)"
+else
 step "cargo test"
 if cargo nextest --version >/dev/null 2>&1; then
   cargo nextest run "${nextest_args[@]}"
@@ -837,13 +1091,22 @@ SBPROXY_ALLOW_CARGO_TEST_FALLBACK=1.
 MSG
   exit 1
 fi
+fi
 
 # nextest does not execute doctests, so they need their own pass.
-step "cargo doctest"
-cargo test "${test_package_args[@]}" --doc
+if ! phase_wanted DOCTEST; then
+  scope_skip DOCTEST "cargo doctest"
+else
+  step "cargo doctest"
+  cargo test "${test_package_args[@]}" --doc
+fi
 
-step "cargo clippy"
-cargo clippy --workspace --all-targets -- -D warnings
+if ! phase_wanted CLIPPY; then
+  scope_skip CLIPPY "cargo clippy"
+else
+  step "cargo clippy"
+  cargo clippy --workspace --all-targets -- -D warnings
+fi
 
 # CI: `RUSTDOCFLAGS="-D warnings -D missing_docs" cargo doc --workspace
 # --no-deps --locked`. Matched exactly. `-D missing_docs` exists in
@@ -855,8 +1118,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 # is strictly stricter than CI and produces failures CI will never
 # report. The private-items pass is available below, on its own, behind
 # an env var.
-step "cargo doc"
-RUSTDOCFLAGS="-D warnings -D missing_docs" cargo doc --workspace --no-deps --locked
+if ! phase_wanted DOC; then
+  scope_skip DOC "cargo doc (rustdoc, -D missing_docs, and the intra-doc link check)"
+else
+  step "cargo doc"
+  RUSTDOCFLAGS="-D warnings -D missing_docs" cargo doc --workspace --no-deps --locked
+fi
 
 if [ "${SBPROXY_CHECK_PRIVATE_DOCS:-0}" = "1" ]; then
   # Not a CI lane. Broken intra-doc links in private modules are real
@@ -872,39 +1139,51 @@ fi
 # shellcheck source=scripts/lib/workspace-bin.sh
 . "$ROOT/scripts/lib/workspace-bin.sh"
 
-step "config schema and reader coverage"
-run_generated_artifact_checks \
-  "$ROOT" \
-  check-config-schema.sh \
-  check-config-readers.sh
+if ! phase_wanted GENERATED; then
+  scope_skip GENERATED "config schema, reader coverage, metrics stability, decision contract, and model-host capabilities (all exec built binaries)"
+else
+  step "config schema and reader coverage"
+  run_generated_artifact_checks \
+    "$ROOT" \
+    check-config-schema.sh \
+    check-config-readers.sh
 
-step "generated docs are current"
-run_generated_artifact_checks \
-  "$ROOT" \
-  check-metrics-stability.sh \
-  check-decision-contract.sh \
-  check-model-host-capabilities.sh
+  step "generated docs are current"
+  run_generated_artifact_checks \
+    "$ROOT" \
+    check-metrics-stability.sh \
+    check-decision-contract.sh \
+    check-model-host-capabilities.sh
+fi
 
 # CI: ci.yml payments lane (WOR-2222). Last in this phase because it is the
 # most expensive thing in this file, so every cheaper failure above is found
 # first.
 #
-# Opt-in, and opt-in is not the same as optional. Every cargo call above
-# resolves the workspace's default union, and no payment feature is in any
-# default set, so without this phase the gate compiles none of the settlement
-# path: not sbproxy-core's inline settle gate, not the recovery worker or the
+# On by default since 2026-08-28. Every cargo call above resolves the
+# workspace's default union, and no payment feature is in any default set, so
+# without this phase the gate compiles none of the settlement path: not
+# sbproxy-core's inline settle gate, not the recovery worker or the
 # reconciliation sweep in billing_runtime, not the usage bridge's runtime
 # half, and not the feature-gated majority of sbproxy-billing, which is most
-# of that crate plus eleven of its twelve integration test files. That is why
-# the else branch records a skip instead of saying nothing: this is a required
-# CI lane, so a local run without it has not checked what it appears to have
-# checked.
+# of that crate plus eleven of its twelve integration test files.
 #
-# It is opt-in rather than default because the settlement union has a
+# It was opt-in until it cost a CI round trip. The settlement union has a
 # different fingerprint from every cargo call above, so both commands below
-# recompile the graph from scratch and reuse nothing. ci.yml pays the same
-# rebuild by giving the lane its own job and its own cache key.
-if [ "${SBPROXY_CHECK_PAYMENTS:-0}" = "1" ]; then
+# recompile the graph from scratch and reuse nothing, and that price bought
+# an env var everyone forgot. clippy::items_after_test_module then landed on
+# main from a lane no local run had ever executed. A gate whose most
+# expensive check is the one people skip is not measuring what it claims to.
+#
+# `SBPROXY_CHECK_PAYMENTS=0` still skips it, and the skip is reprinted in the
+# SKIPPED PHASES block naming the two CI lanes that will catch what was
+# missed. `--scope-to-diff` skips it too when no Rust file changed, which is
+# the case that made it expensive for no reason.
+if ! phase_wanted PAYMENTS; then
+  scope_skip PAYMENTS "payment settlement features (clippy + test)"
+elif [ "${SBPROXY_CHECK_PAYMENTS:-1}" != "1" ]; then
+  note_skip "payment settlement features (SBPROXY_CHECK_PAYMENTS=0 was set explicitly). No other phase in this gate compiles crates/sbproxy-billing's runtime, sbproxy-core's settlement gate, or the ~217 tests inside them, so all of it stayed unbuilt. CI's 'payments' and 'payments clippy (settlement features)' lanes both require it, and they are where clippy::items_after_test_module surfaces."
+else
   # One feature selection for both commands, matching ci.yml's
   # PAYMENT_FEATURES exactly. It names the `sbproxy` binary's flags rather
   # than sbproxy-core's so the union is the released payments binary's:
@@ -941,8 +1220,6 @@ if [ "${SBPROXY_CHECK_PAYMENTS:-0}" = "1" ]; then
     note_skip "payment test narrowing (no nextest, so the serial fallback ran the whole workspace selection instead of the three payment-gated crates)"
     cargo test --workspace --exclude sbproxy-e2e --locked --features "$payment_features"
   fi
-else
-  note_skip "payment settlement features (set SBPROXY_CHECK_PAYMENTS=1 to run it). No other phase in this gate compiles crates/sbproxy-billing's runtime, sbproxy-core's settlement gate, or the ~217 tests inside them, so all of it stayed unbuilt. CI requires this lane."
 fi
 
 # Closes the SBPROXY_SKIP_CARGO guard around every cargo phase.

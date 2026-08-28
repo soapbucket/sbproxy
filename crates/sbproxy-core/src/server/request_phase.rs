@@ -4234,7 +4234,7 @@ pub(super) async fn request_filter(
                     // indistinguishable from 40,000 real ones.
                     let failed_open = matches!(trust_outcome, AuthTrustOutcome::FailedOpen);
                     let reason = auth_allow_reason(failed_open);
-                    crate::server::record_auth_decision(
+                    crate::server::record_or_defer_auth_decision(
                         ctx,
                         &origin_label,
                         &decided_auth_type,

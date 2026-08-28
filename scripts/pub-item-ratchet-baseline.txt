@@ -1220,3 +1220,15 @@ a `pub` schema struct in `sbproxy-config`, where `schemars` derives a node per
 type and narrowing does not compile; this branch's three are private types in
 a public interface for the same kind of reason. Nothing narrowed in the merge
 that had not narrowed in a parent.
+
+2026-08-28 (WOR-2432 the aggregator, merged with main at 16b94ea2): recounted
+against the merged tree. Tests-only 324, unchanged. Unreferenced 1529 -> 1528,
+which is the only figure the merge conflicted on: this branch carried 1529 and
+main 1523, and neither describes the tree they make together.
+
+It falls by one rather than rising, which is the direction that needs no
+argument. Main's gate work (#1237) gave `scripts/`-facing items their first
+callers and removed the fixed-port test helpers that had been reachable only
+from tests; this branch adds nothing to either bucket beyond the two already
+recorded above. The gap to main's own 1523 is this branch's own items, counted
+here and not there, for the reasons written against them.

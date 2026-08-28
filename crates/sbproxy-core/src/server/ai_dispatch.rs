@@ -17015,6 +17015,78 @@ fn record_ai_tool_call_decision(
     );
 }
 
+/// Emit one batch of hub chunks to the client stream, with any
+/// released tool-call frames ahead of the batch's stream terminator.
+///
+/// WOR-2430: in hold-back mode a tool-call frame leaves the batch when
+/// it is staged and comes back in `released` once its verdict lands.
+/// For a stream whose calls complete at the end, that verdict is
+/// `MessageStop`, and `MessageStop` is the chunk the emitter turns into
+/// the terminator (`data: {..finish_reason..}` plus `data: [DONE]` on
+/// OpenAI). Appending `released` after the whole batch therefore put
+/// the rewritten call *after* `[DONE]`, where a client that stops
+/// reading at the terminator never sees it: the mutation shipped on the
+/// wire and arrived nowhere.
+///
+/// So the terminator goes last, and a batch that released nothing is
+/// not reordered at all, which keeps this inert on every stream without
+/// a held tool call.
+///
+/// "Everything else keeps its arrival order" is not something this
+/// function arranges; it is a property it inherits, and the invariant
+/// that supplies it is worth naming because a decoder change could take
+/// it away. Every native decoder pushes `MessageStop` last in the batch
+/// it produces and pushes it at most once, guarded by its own
+/// `emitted_stop` flag (`native_streams.rs`, all four states); the
+/// OpenAI decoder additionally collapses a multi-choice `finish_reason`
+/// into one `pending_stop`. `HubChunk::Usage` is deliberately pushed
+/// *before* the stop by every decoder for the same reason. So hoisting
+/// the terminator to the end moves it past nothing, and the relative
+/// order of every other chunk is untouched by construction rather than
+/// by care. `a_terminator_that_is_not_last_still_loses_no_frame` pins
+/// the behavior if that ever stops holding.
+///
+/// Frames are streamed to `emit` rather than collected: the no-release
+/// path is the whole ordinary relay, and it should not pay an
+/// allocation per batch to be told nothing moved.
+fn for_each_ordered_stream_chunk<'a>(
+    batch: &'a [sbproxy_ai::format::HubChunk],
+    released: &'a [sbproxy_ai::format::HubChunk],
+    holds_tool_frames: bool,
+    mut emit: impl FnMut(&'a sbproxy_ai::format::HubChunk),
+) {
+    use sbproxy_ai::format::HubChunk;
+
+    // A held tool frame whose verdict has not landed is not on the
+    // client stream at all; it is replayed from `released` later.
+    let retained = move |hub: &&'a HubChunk| {
+        !(holds_tool_frames && matches!(hub, HubChunk::ToolCallDelta { .. }))
+    };
+    if released.is_empty() {
+        for hub in batch.iter().filter(retained) {
+            emit(hub);
+        }
+        return;
+    }
+    // Two passes over a borrowed slice rather than one pass into two
+    // vectors: no allocation on either path, and every frame is still
+    // emitted exactly once, so a second terminator (which no decoder
+    // produces today) would be carried rather than silently dropped.
+    for hub in batch.iter().filter(retained) {
+        if !matches!(hub, HubChunk::MessageStop { .. }) {
+            emit(hub);
+        }
+    }
+    for hub in released {
+        emit(hub);
+    }
+    for hub in batch.iter().filter(retained) {
+        if matches!(hub, HubChunk::MessageStop { .. }) {
+            emit(hub);
+        }
+    }
+}
+
 /// WOR-1810: run one batch of decoded hub events through the guardrail
 /// session (`finish` additionally completes every pending tool call,
 /// for message stop / stream close). Returns the first block verdict
@@ -17552,6 +17624,233 @@ mod mutation_write_back_tests {
     fn stream_output_mutation_unknown_format_is_unrepresentable() {
         let held = [Bytes::from_static(b"data: {}\n\n")];
         assert!(apply_stream_output_mutation("clean", &held, Some("gemini")).is_none());
+    }
+
+    fn tool_delta(index: usize) -> HubChunk {
+        HubChunk::ToolCallDelta {
+            index,
+            delta: sbproxy_ai::format::HubToolCallDelta::default(),
+        }
+    }
+
+    /// A first delta carrying id and name, which is the one that opens
+    /// a content block on Anthropic and an output item on Responses.
+    fn named_tool_delta(index: usize, id: &str, name: &str) -> HubChunk {
+        HubChunk::ToolCallDelta {
+            index,
+            delta: sbproxy_ai::format::HubToolCallDelta {
+                id: Some(id.to_string()),
+                name: Some(name.to_string()),
+                arguments_chunk: Some("{}".to_string()),
+            },
+        }
+    }
+
+    fn message_stop(reason: sbproxy_ai::format::FinishReason) -> HubChunk {
+        HubChunk::MessageStop {
+            finish_reason: reason,
+        }
+    }
+
+    /// Collect what the relay would emit, in order.
+    fn ordered<'a>(
+        batch: &'a [HubChunk],
+        released: &'a [HubChunk],
+        holds_tool_frames: bool,
+    ) -> Vec<&'a HubChunk> {
+        let mut out = Vec::new();
+        super::for_each_ordered_stream_chunk(batch, released, holds_tool_frames, |hub| {
+            out.push(hub);
+        });
+        out
+    }
+
+    /// Render an ordered batch through one inbound emitter, the way
+    /// both relay call sites do, and return the joined SSE text.
+    fn render<'a>(
+        inbound: &str,
+        batch: &'a [HubChunk],
+        released: &'a [HubChunk],
+        holds_tool_frames: bool,
+    ) -> String {
+        let emitter: Box<dyn sbproxy_ai::format::ChatFormat> = match inbound {
+            "anthropic" => Box::new(sbproxy_ai::format::AnthropicMessagesFormat),
+            "responses" => Box::new(sbproxy_ai::format::OpenAiResponsesFormat),
+            _ => Box::new(sbproxy_ai::format::OpenAiChatFormat),
+        };
+        let mut ctx = sbproxy_ai::format::BridgeContext {
+            inbound_format: inbound.to_string(),
+            stream: true,
+            ..Default::default()
+        };
+        let mut out = String::new();
+        super::for_each_ordered_stream_chunk(batch, released, holds_tool_frames, |hub| {
+            if let Ok(frames) = emitter.from_hub_stream(hub, &mut ctx) {
+                for f in frames {
+                    out.push_str(&f);
+                }
+            }
+        });
+        out
+    }
+
+    #[test]
+    fn a_released_tool_frame_is_ordered_before_the_stream_terminator() {
+        // WOR-2430: `MessageStop` is the chunk the emitter turns into
+        // the terminator, and it is also the verdict that releases a
+        // held call. Emitting the batch and then the released frames
+        // put the call after `data: [DONE]`, where no client reads it.
+        let batch = [
+            tool_delta(0),
+            message_stop(sbproxy_ai::format::FinishReason::ToolCalls),
+        ];
+        let released = [tool_delta(0)];
+        let ordered = ordered(&batch, &released, true);
+        assert_eq!(ordered.len(), 2, "the held frame must not be emitted twice");
+        assert!(
+            matches!(ordered[0], HubChunk::ToolCallDelta { .. }),
+            "the released call must come first"
+        );
+        assert!(
+            matches!(ordered[1], HubChunk::MessageStop { .. }),
+            "the terminator must come last"
+        );
+    }
+
+    #[test]
+    fn a_batch_that_released_nothing_keeps_its_arrival_order() {
+        // The reordering is inert on every stream without a held call,
+        // which is what keeps this off the ordinary relay path.
+        let batch = [
+            HubChunk::ContentDelta {
+                index: 0,
+                delta: ContentPartDelta::Text("hello".to_string()),
+            },
+            message_stop(sbproxy_ai::format::FinishReason::Stop),
+        ];
+        let ordered = ordered(&batch, &[], false);
+        assert_eq!(ordered.len(), 2);
+        assert!(matches!(ordered[0], HubChunk::ContentDelta { .. }));
+        assert!(matches!(ordered[1], HubChunk::MessageStop { .. }));
+    }
+
+    #[test]
+    fn a_held_tool_frame_with_no_verdict_yet_stays_out_of_the_batch() {
+        let batch = [tool_delta(0)];
+        assert!(ordered(&batch, &[], true).is_empty());
+        assert_eq!(ordered(&batch, &[], false).len(), 1);
+    }
+
+    #[test]
+    fn two_calls_released_in_one_batch_both_precede_the_terminator() {
+        // `finish_tool_calls` drains a `BTreeMap`, so a turn that opens
+        // two calls releases both in one batch, in ascending index
+        // order. Both have to land ahead of the terminator, and the
+        // order between them has to survive the hoist.
+        let batch = [
+            tool_delta(0),
+            tool_delta(1),
+            message_stop(sbproxy_ai::format::FinishReason::ToolCalls),
+        ];
+        let released = [
+            named_tool_delta(0, "call-0", "first"),
+            named_tool_delta(1, "call-1", "second"),
+        ];
+        let ordered = ordered(&batch, &released, true);
+        assert_eq!(ordered.len(), 3, "two calls plus one terminator");
+        assert!(matches!(
+            ordered[0],
+            HubChunk::ToolCallDelta { index: 0, .. }
+        ));
+        assert!(matches!(
+            ordered[1],
+            HubChunk::ToolCallDelta { index: 1, .. }
+        ));
+        assert!(
+            matches!(ordered[2], HubChunk::MessageStop { .. }),
+            "the terminator must still come last"
+        );
+    }
+
+    #[test]
+    fn a_terminator_that_is_not_last_still_loses_no_frame() {
+        // The doc comment on `for_each_ordered_stream_chunk` leans on
+        // an invariant it does not own: no decoder emits anything after
+        // `MessageStop` in a batch. This pins the behavior if that ever
+        // stops holding, so a decoder change degrades the ordering
+        // rather than dropping a frame. `Usage` is the realistic
+        // candidate, since every decoder deliberately places it just
+        // ahead of the stop today.
+        let batch = [
+            message_stop(sbproxy_ai::format::FinishReason::ToolCalls),
+            HubChunk::ContentDelta {
+                index: 0,
+                delta: ContentPartDelta::Text("trailing".to_string()),
+            },
+        ];
+        let released = [tool_delta(0)];
+        let ordered = ordered(&batch, &released, true);
+        assert_eq!(ordered.len(), 3, "every frame is still emitted once");
+        assert!(matches!(ordered[0], HubChunk::ContentDelta { .. }));
+        assert!(matches!(ordered[1], HubChunk::ToolCallDelta { .. }));
+        assert!(matches!(ordered[2], HubChunk::MessageStop { .. }));
+    }
+
+    #[test]
+    fn the_anthropic_emitter_closes_a_released_tool_block_before_message_stop() {
+        // Anthropic is the format the fix helps most. `MessageStop`
+        // renders `content_block_stop` for every block open at that
+        // moment, so a released call emitted after it opened a content
+        // block that was never closed, on a turn already declared
+        // stopped. Ordering the release first is what lets
+        // `record_open_block` run before `take_open_block_indexes`.
+        let batch = [
+            named_tool_delta(0, "call-1", "dangerous_lookup"),
+            message_stop(sbproxy_ai::format::FinishReason::ToolCalls),
+        ];
+        let released = [named_tool_delta(0, "call-1", "dangerous_lookup")];
+        let sse = render("anthropic", &batch, &released, true);
+
+        let start = sse
+            .find("content_block_start")
+            .unwrap_or_else(|| panic!("the released call must open a block: {sse}"));
+        let stop = sse
+            .find("content_block_stop")
+            .unwrap_or_else(|| panic!("the tool block must be closed: {sse}"));
+        let message_stop = sse
+            .find("event: message_stop")
+            .unwrap_or_else(|| panic!("the turn must end: {sse}"));
+        assert!(start < stop, "the block opens before it closes: {sse}");
+        assert!(
+            stop < message_stop,
+            "the block closes before the turn ends: {sse}"
+        );
+        assert!(sse.contains("tool_use"), "{sse}");
+    }
+
+    #[test]
+    fn the_responses_emitter_adds_a_released_call_before_response_completed() {
+        // On Responses the terminator is `response.completed`. A call
+        // announced after it is an output item added to a response the
+        // client was already told was finished.
+        let batch = [
+            named_tool_delta(0, "call-1", "dangerous_lookup"),
+            message_stop(sbproxy_ai::format::FinishReason::ToolCalls),
+        ];
+        let released = [named_tool_delta(0, "call-1", "dangerous_lookup")];
+        let sse = render("responses", &batch, &released, true);
+
+        let added = sse
+            .find("response.output_item.added")
+            .unwrap_or_else(|| panic!("the released call must be announced: {sse}"));
+        let completed = sse
+            .find("response.completed")
+            .unwrap_or_else(|| panic!("the response must complete: {sse}"));
+        assert!(
+            added < completed,
+            "the call is announced before the response completes: {sse}"
+        );
+        assert!(sse.contains("function_call"), "{sse}");
     }
 }
 
@@ -19044,14 +19343,13 @@ async fn relay_ai_stream_frames(
                     let mut translated = String::new();
                     // In hold-back mode, tool-call frames for calls
                     // still awaiting a verdict stay out of the client
-                    // stream; released frames (judged clean) append
-                    // after this chunk's regular content.
-                    let emit_now = hub_chunks.iter().filter(|hub| {
-                        !(holds_tool_frames
-                            && matches!(hub, sbproxy_ai::format::HubChunk::ToolCallDelta { .. }))
-                    });
-                    for hub in emit_now.chain(released_tool_chunks.iter()) {
-                        match emitter.from_hub_stream(hub, &mut bridge_ctx) {
+                    // stream; released frames (judged clean) rejoin
+                    // this chunk's content ahead of its terminator.
+                    for_each_ordered_stream_chunk(
+                        hub_chunks,
+                        &released_tool_chunks,
+                        holds_tool_frames,
+                        |hub| match emitter.from_hub_stream(hub, &mut bridge_ctx) {
                             Ok(frames) => {
                                 for f in frames {
                                     translated.push_str(&f);
@@ -19063,8 +19361,8 @@ async fn relay_ai_stream_frames(
                                     "AI proxy: inbound format SSE emitter failed; skipping chunk"
                                 );
                             }
-                        }
-                    }
+                        },
+                    );
                     if translated.is_empty() {
                         continue;
                     }
@@ -19310,18 +19608,19 @@ async fn relay_ai_stream_frames(
                     .as_ref()
                     .filter(|_| native_translator.is_some())
                 {
-                    let emit_now = tail_events.iter().filter(|hub| {
-                        !(holds_tool_frames
-                            && matches!(hub, sbproxy_ai::format::HubChunk::ToolCallDelta { .. }))
-                    });
                     let mut translated = String::new();
-                    for hub in emit_now.chain(close_released.iter()) {
-                        if let Ok(frames) = emitter.from_hub_stream(hub, &mut bridge_ctx) {
-                            for f in frames {
-                                translated.push_str(&f);
+                    for_each_ordered_stream_chunk(
+                        &tail_events,
+                        &close_released,
+                        holds_tool_frames,
+                        |hub| {
+                            if let Ok(frames) = emitter.from_hub_stream(hub, &mut bridge_ctx) {
+                                for f in frames {
+                                    translated.push_str(&f);
+                                }
                             }
-                        }
-                    }
+                        },
+                    );
                     if !translated.is_empty() {
                         let bytes = Bytes::from(translated);
                         // WOR-1811: tail frames get the same serve-entry
@@ -19466,6 +19765,34 @@ async fn relay_ai_stream_frames(
                 break;
             }
         }
+    }
+
+    // WOR-2430: every `break` out of the relay lands here, so this is
+    // the one place that can see what hold-back kept. Anything still in
+    // `held_tool_chunks` is a tool-call frame the client will never
+    // receive, and until this counter existed that was invisible: the
+    // per-call decision record is written when a call is *judged*, so a
+    // call that was never judged leaves no record at all, and a blocked
+    // stream's record names the offending call while saying nothing
+    // about the other calls whose frames went with it. The frame
+    // ordering defect this branch fixes had exactly that shape, and it
+    // shipped for eight releases with nothing counting it.
+    if !held_tool_chunks.is_empty() {
+        let discarded: usize = held_tool_chunks.values().map(Vec::len).sum();
+        let cause = if *output_guard_blocked {
+            "blocked"
+        } else {
+            "unjudged"
+        };
+        sbproxy_ai::ai_metrics::record_stream_tool_frames_discarded(cause, discarded as u64);
+        if cause == "unjudged" {
+            warn!(
+                calls = held_tool_chunks.len(),
+                frames = discarded,
+                "AI proxy: streamed tool-call frames were held back and never judged; the client received the turn without them"
+            );
+        }
+        held_tool_chunks.clear();
     }
 
     // The post-commit failure counter used to be recorded here, ahead of
@@ -26140,6 +26467,29 @@ origins:
         .to_vec()
     }
 
+    /// The same tool-call turn, from an upstream that closes without
+    /// terminating its last SSE frame.
+    ///
+    /// There is no blank-line separator and no `[DONE]`, so `SseFramer`
+    /// holds the frame in its reassembly buffer through every `feed`
+    /// and it surfaces only from `NativeStreamTranslator::flush()` at
+    /// end of stream. The tool-call delta, the verdict that releases
+    /// it, and the terminator therefore all land in the stream-close
+    /// tail lane rather than the per-chunk lane. The client still gets
+    /// a `[DONE]`: the emitter writes it from `MessageStop`, not from
+    /// anything the upstream sent.
+    fn openai_tool_call_stream_split_at_close() -> Vec<u8> {
+        concat!(
+            "data: {\"id\":\"chatcmpl-tool\",\"object\":\"chat.completion.chunk\",",
+            "\"created\":1,\"model\":\"requested-model\",\"choices\":[{\"index\":0,",
+            "\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",",
+            "\"function\":{\"name\":\"dangerous_lookup\",\"arguments\":\"{\\\"id\\\":42}\"}}]},",
+            "\"finish_reason\":\"tool_calls\"}]}"
+        )
+        .as_bytes()
+        .to_vec()
+    }
+
     fn provider_error_body() -> serde_json::Value {
         serde_json::json!({
             "error": {
@@ -27265,6 +27615,133 @@ origins:
             "the original arguments must not ship: {response}"
         );
         assert!(response.contains("dangerous_lookup"), "{response}");
+        // Reaching the wire is not reaching the client. The rewritten
+        // call is released on `MessageStop`, which is the same chunk
+        // the emitter turns into `data: [DONE]`, and an OpenAI client
+        // stops reading there. A frame written after the terminator is
+        // a mutation that shipped and arrived nowhere (WOR-2430).
+        let terminator = response
+            .find("data: [DONE]")
+            .unwrap_or_else(|| panic!("the stream must carry a terminator: {response}"));
+        let rewrite = response
+            .find("[SAFE]")
+            .unwrap_or_else(|| panic!("the rewrite must ship: {response}"));
+        assert!(
+            rewrite < terminator,
+            "the rewritten tool call must precede the stream terminator: {response}"
+        );
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_released_tool_call_ships_before_the_stream_terminator() {
+        // The wider case behind the same ordering rule: an enforcing
+        // `ai_tool_call` hook holds every tool frame whether or not it
+        // mutates, and a plain `release` verdict lands on the same
+        // `MessageStop` that frames `data: [DONE]`. The unmodified call
+        // has to reach the client too (WOR-2430).
+        let (upstream_url, upstream_hits) =
+            upstream_bytes_fixture(openai_tool_call_stream(), "text/event-stream").await;
+        let config = openai_proxy_config(&upstream_url);
+        let (_directory, pipeline) = pipeline_with_ai_javascript(
+            "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: tool-release\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nhooks:\n  - kind: ai_tool_call\n    type: release_tool\n    export: inspect\n",
+            r#"export function inspect() { return {version:"sbproxy-envelope/v1",decision:"release"}; }"#,
+        );
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("a released tool call is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response UTF-8");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let terminator = response
+            .find("data: [DONE]")
+            .unwrap_or_else(|| panic!("the stream must carry a terminator: {response}"));
+        let call = response
+            .find("dangerous_lookup")
+            .unwrap_or_else(|| panic!("the released call must ship: {response}"));
+        assert!(
+            call < terminator,
+            "a released tool call must precede the stream terminator: {response}"
+        );
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_released_at_stream_close_ships_before_the_terminator() {
+        // The second emit site. Every other tool-call test in this file
+        // drives `openai_tool_call_stream()`, whose delta and
+        // `finish_reason` share one terminated SSE frame, so the whole
+        // hold-and-release cycle completes in the per-chunk lane and
+        // the stream-close tail lane never carries a released frame.
+        // Reverting the ordering rule at that second site alone left
+        // this entire suite green, which is the gap this test closes
+        // (WOR-2430).
+        //
+        // The fixture's last frame has no blank-line separator, so
+        // `SseFramer` keeps it buffered through every `feed` and only
+        // `NativeStreamTranslator::flush()` at end of stream surfaces
+        // it. That is the real shape behind this lane: an upstream
+        // whose final network read stops mid-frame.
+        let (upstream_url, upstream_hits) = upstream_bytes_fixture(
+            openai_tool_call_stream_split_at_close(),
+            "text/event-stream",
+        )
+        .await;
+        let config = openai_proxy_config(&upstream_url);
+        let (_directory, pipeline) = pipeline_with_ai_javascript(
+            "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: tool-tail\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nhooks:\n  - kind: ai_tool_call\n    type: tail_tool\n    export: inspect\n",
+            r#"export function inspect() { return {version:"sbproxy-envelope/v1",decision:"release"}; }"#,
+        );
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("a tail-released tool call is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response UTF-8");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let terminator = response
+            .find("data: [DONE]")
+            .unwrap_or_else(|| panic!("the stream must carry a terminator: {response}"));
+        let call = response
+            .find("dangerous_lookup")
+            .unwrap_or_else(|| panic!("the call released at stream close must ship: {response}"));
+        assert!(
+            call < terminator,
+            "a tool call released at stream close must precede the stream terminator: {response}"
+        );
         assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
     }
 
