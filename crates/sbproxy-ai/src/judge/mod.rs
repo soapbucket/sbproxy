@@ -1,7 +1,7 @@
 //! LLM-as-judge backend (single-provider, BYOK).
 //!
 //! Implements the OSS slice of the judge surface defined in
-//! `docs/adr-judge-trait.md`. The host function `judge::semantic`
+//! `docs/policy.md`. The host function `judge::semantic`
 //! takes a prompt template plus a JSON payload and returns a
 //! [`PolicyDecision`](sbproxy_plugin::PolicyDecision). The OSS
 //! backend is a single configurable provider; the enterprise router
@@ -45,7 +45,7 @@ pub use compat_judge::{CompatJudge, CompatJudgeConfig};
 
 /// Configuration for the single-provider judge backend.
 ///
-/// Fields match the public surface in `adr-judge-trait.md`. The
+/// Fields match the public surface in `docs/policy.md`. The
 /// endpoint is the upstream chat-completions URL the judge will
 /// `POST` to; `api_key_env` names the environment variable that
 /// holds the bearer token (BYOK; the proxy itself does not store the

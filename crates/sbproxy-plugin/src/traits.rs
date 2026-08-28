@@ -373,7 +373,7 @@ pub enum PolicyDecision {
     },
     /// Request is held pending human-in-the-loop approval.
     ///
-    /// See `docs/adr-policy-verdict-shape.md` for the full design
+    /// See `docs/policy.md` for the full design
     /// contract. The OSS dispatcher routes `Confirm` through the
     /// existing [`PolicyDecision::AllowWithHeaders`] mechanism by
     /// forwarding the request with `X-Policy-Confirm: <reason>` stamped
@@ -649,7 +649,7 @@ mod tests {
     /// Confirm carries reason + optional webhook + optional expiry.
     /// A past `expires_at` must compare as already elapsed; the
     /// dispatcher relies on this to synthesise an immediate deny per
-    /// `docs/adr-policy-verdict-shape.md`.
+    /// `docs/policy.md`.
     #[test]
     fn confirm_variant_round_trip() {
         let allow = PolicyDecision::Allow;

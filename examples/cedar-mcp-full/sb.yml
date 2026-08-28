@@ -1,0 +1,100 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Cedar ABAC on federated MCP tools/call.
+#
+# One OpenAPI-backed upstream (not type: local: the Cedar hook does
+# not run on local tools). RBAC allows all three derived tools so
+# Cedar is the layer that forbids delete_repo and Confirm-refuses
+# approve_deploy. The entity store is empty, so policies match
+# Agent::"anonymous" (this example has no inbound auth) and
+# ToolInvocation::"<prefix>/<tool>".
+#
+# Run (two processes; see README):
+#   sbproxy serve -f examples/cedar-mcp-full/upstream.yml &
+#   sbproxy serve -f examples/cedar-mcp-full/sb.yml
+#
+# Test:
+#   curl -s -X POST http://127.0.0.1:8080 \
+#     -H 'Host: mcp.example.com' \
+#     -H 'Content-Type: application/json' \
+#     -H 'Accept: application/json, text/event-stream' \
+#     -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl-demo","version":"1.0.0"}}}' | jq .
+#
+#   curl -s -X POST http://127.0.0.1:8080 \
+#     -H 'Host: mcp.example.com' \
+#     -H 'Content-Type: application/json' \
+#     -H 'Accept: application/json, text/event-stream' \
+#     -H 'MCP-Protocol-Version: 2025-06-18' \
+#     -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search_repos","arguments":{"q":"sbproxy"}}}' | jq .
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "mcp.example.com":
+    action:
+      type: mcp
+      mode: gateway
+      server_info:
+        name: cedar-demo
+        version: "1.0.0"
+      rbac_policies:
+        all_tools:
+          default_allow: false
+          tool_access:
+            - principals: []
+              allowed:
+                - search_repos
+                - delete_repo
+                - approve_deploy
+      cedar_policies:
+        policies: |
+          permit(principal, action, resource);
+
+          forbid(
+            principal,
+            action,
+            resource == ToolInvocation::"demo/delete_repo"
+          );
+
+          @confirm("deploy needs a human")
+          forbid(
+            principal,
+            action,
+            resource == ToolInvocation::"demo/approve_deploy"
+          );
+      federated_servers:
+        - type: openapi
+          origin: http://127.0.0.1:8091
+          prefix: demo
+          rbac: all_tools
+          timeout: 10s
+          spec:
+            openapi: "3.0.0"
+            info:
+              title: Cedar demo tools
+              version: "1.0"
+            paths:
+              "/search/repositories":
+                get:
+                  operationId: search_repos
+                  summary: Search repositories by query.
+                  parameters:
+                    - name: q
+                      in: query
+                      required: true
+                      schema:
+                        type: string
+              "/repos/delete":
+                post:
+                  operationId: delete_repo
+                  summary: Delete a repository (Cedar forbids this).
+              "/deploy/approve":
+                post:
+                  operationId: approve_deploy
+                  summary: Approve a deploy (Cedar Confirm-refuses this).
+      guardrails:
+        - type: tool_allowlist
+          allow:
+            - search_repos
+            - delete_repo
+            - approve_deploy

@@ -1785,7 +1785,7 @@ pub struct RequestContext {
     /// returning [`sbproxy_plugin::PolicyDecision::AllowWithHeaders`]
     /// (or the OSS Confirm bridge that translates `Confirm` into
     /// `AllowWithHeaders` with `X-Policy-Confirm` stamped per
-    /// `docs/adr-policy-verdict-shape.md`). Drained in
+    /// `docs/policy.md`). Drained in
     /// `response_filter`. Empty by default; appended onto the
     /// outgoing response after every other header source so the
     /// plugin policy contract reads "stamp these on the way out."

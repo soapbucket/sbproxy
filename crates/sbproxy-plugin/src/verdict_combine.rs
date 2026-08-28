@@ -20,7 +20,7 @@
 //! events and dashboards can surface the full set of policies that
 //! voted to block or to require approval, not just the first.
 //!
-//! See `docs/adr-policy-verdict-shape.md` for the broader verdict
+//! See `docs/policy.md` for the broader verdict
 //! design for the acceptance gate (allow / confirm / deny
 //! matrix documented and unit-tested).
 //!

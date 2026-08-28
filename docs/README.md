@@ -1,6 +1,6 @@
 # SBproxy documentation
 
-*Last modified: 2026-08-27*
+*Last modified: 2026-08-28*
 
 SBproxy is an open source Enterprise AI Gateway for API, MCP and agent, and AI model traffic. Every feature in this repository ships under Apache-2.0.
 
@@ -20,14 +20,21 @@ with no dependencies.
 
 ## Start here
 
-- [core-concepts.md](core-concepts.md) - request pipeline, traffic types, data plane, admin plane, and reload.
-- [getting-started.md](getting-started.md) - install, run your first config, and where to go next. Start here.
-- [request-flow.md](request-flow.md) - the request pipeline stage by stage, with every point where a hook, script, transform, or plugin can attach. Read this once you know core-concepts.md and want the full mechanical picture.
+Four walkthroughs, one per traffic shape:
+
+- [all-traffic-gateway.md](all-traffic-gateway.md) - API, MCP, and AI on one listener. Commands: [getting-started.md](getting-started.md).
+- [getting-started-ai-estate.md](getting-started-ai-estate.md) - apps calling model providers.
+- [getting-started-inbound.md](getting-started-inbound.md) - agents and crawlers calling you (content shaping + agent identity).
 - [quickstart-serve.md](quickstart-serve.md) - run one local model with `sbproxy run`.
+
+Then the maps:
+
+- [core-concepts.md](core-concepts.md) - request pipeline, traffic types, data plane, admin plane, and reload.
+- [request-flow.md](request-flow.md) - the request pipeline stage by stage, with every point where a hook, script, transform, or plugin can attach.
 - [manual.md](manual.md) - install, CLI, runtime, TLS, deployment patterns.
 - [configuration.md](configuration.md) - every `sb.yml` field with examples.
 - [json-schema.md](json-schema.md) - JSON Schema for editor autocomplete + validation of `sb.yml`.
-- [features.md](features.md) - tour of every feature by domain, plus reference catalogs of every action type, every policy type, and every scripting attachment point.
+- [features.md](features.md) - stub pointing at the hubs above, plus the action / policy / scripting catalogs.
 - [admin.md](admin.md) - the admin server: enable it, TLS, the built-in web UI, and the control-plane endpoints (keys, config, metrics, logs, prompts).
 - [admin-api-guide.md](admin-api-guide.md) - task-oriented admin API walkthrough: login/CSRF, roles, and a curl cookbook.
 - [admin-ui.md](admin-ui.md) - the built-in admin dashboard, page by page: what each view shows, mutates, and calls.
@@ -39,6 +46,7 @@ with no dependencies.
 <a id="solve-a-problem"></a>
 
 - [getting-started-api-estate.md](getting-started-api-estate.md) - put SBproxy in front of an existing API.
+- [getting-started-inbound.md](getting-started-inbound.md) - stitch of content-for-agents and agent identity (AI that calls you).
 - [getting-started-content-estate.md](getting-started-content-estate.md) - transform content for agents.
 - [getting-started-ai-estate.md](getting-started-ai-estate.md) - route requests to model providers.
 - [getting-started-agent-identity.md](getting-started-agent-identity.md) - verify agent identity and publish discovery metadata.
@@ -61,6 +69,7 @@ SBproxy's traditional reverse-proxy pillar: routing, load balancing, transforms,
 - [api-gateway.md](api-gateway.md) - the entry point for the traditional reverse-proxy pillar: routing, auth, rate limiting, WAF, load balancing, protocols, and OpenAPI, independent of any AI functionality. Start here if you're replacing Nginx, Envoy, or Kong.
 - [routing.md](routing.md) - the hub for how a request gets matched to an upstream: hostname matching, forward rules, load balancing algorithms, protocol-specific actions (GraphQL, gRPC, gRPC-Web, WebSocket), and failover.
 - [websocket.md](websocket.md) - the `websocket` action: config keys, upgrade semantics, what runs before the upgrade, `max_message_size` enforcement on the tunnel, and `subprotocols` negotiation.
+- [grpc.md](grpc.md) - the `grpc` action: h2c and TLS listeners, passthrough, `grpc_web`, REST `transcode`, and the body-reading-policy stall. Offline example: [`examples/grpc-h2c/`](../examples/grpc-h2c/).
 - [graphql.md](graphql.md) - the `graphql` action: transparent by default, fail-closed syntax validation (depth, introspection, batches) when enabled, and where in the pipeline it runs.
 - [storage.md](storage.md) - the `storage` action (serve objects from S3, GCS, Azure, or local disk), plus the map of where the gateway persists its own state and which backends hold what.
 - [routing-strategies.md](routing-strategies.md) - the `RoutingStrategy` trait: opt-in extension point for custom upstream selection inside `load_balancer`.
@@ -157,6 +166,7 @@ Point a framework you already run at the gateway: chat completions through the O
 ## Policies
 
 - [policy.md](policy.md) - the policy catalog: all 28 policy types grouped as traffic-shape/abuse, identity/access, content/input safety, AI-specific, and scripting-driven, each linked to wherever it's documented.
+- [cedar-policy.md](cedar-policy.md) - Cedar ABAC on MCP `tools/call`: compile-at-load, empty entity store, Confirm as a labelled refusal. Runnable: [`examples/cedar-mcp-full/`](../examples/cedar-mcp-full/).
 - [object-authz.md](object-authz.md) - `object_authz` policy: BOLA + BFLA enforcement with tenant-isolation and enumeration detection.
 - [waf-options.md](waf-options.md) - what the 16-rule WAF baseline catches and what it does not, and the three alternatives when you need more.
 - [exposed-credentials.md](exposed-credentials.md) - the `exposed_credentials` policy: detect known-leaked basic-auth passwords and tag or block.
@@ -215,7 +225,7 @@ Point a framework you already run at the gateway: chat completions through the O
 - [migration-credentials.md](migration-credentials.md) - migrating the legacy `virtual_keys:` shape to the unified `credentials:` block.
 - [migration-mcp-rbac.md](migration-mcp-rbac.md) - upgrading MCP `ToolAccessPolicy` to the principal-aware ACL and the default-deny flip.
 - [migration-litellm.md](migration-litellm.md) - moving a LiteLLM proxy to SBproxy with `config import-litellm` and the field-by-field mapping.
-- [comparison.md](comparison.md) - how SBproxy compares to other proxies and AI gateways.
+- [comparison.md](comparison.md) - pinned capability rows (clustering, rate limiting, PROXY protocol). The long competitor matrix is retired; start from [architecture.md](architecture.md).
 
 ## Release notes
 

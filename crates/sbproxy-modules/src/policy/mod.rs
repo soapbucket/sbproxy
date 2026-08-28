@@ -44,7 +44,7 @@ pub mod request_limit;
 pub mod request_validator;
 pub mod sec_headers;
 /// `semantic_constraint` policy module (WOR-203 PR 3b; see
-/// `adr-policy-compilation.md` and `adr-judge-trait.md`).
+/// `docs/policy.md`).
 pub mod semantic_constraint;
 pub mod sri;
 pub mod threat_protection;
