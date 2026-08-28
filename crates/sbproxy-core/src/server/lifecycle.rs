@@ -8962,7 +8962,13 @@ egress:
         let recorder = install_history_recorder_for_test(temp.path());
         crate::config_soak::clear();
         let config_path = temp.path().join("sb.yml");
-        let yaml = "proxy: {}\n# inconclusive fixture\n";
+        // A forwarding origin with no health block: something the soak
+        // has to admit it cannot see. A config with no origin at all now
+        // passes the health signal vacuously (there is no upstream that
+        // could be down), so the empty document no longer produces this
+        // verdict, which is the point of that change.
+        let yaml = "proxy: {}\norigins:\n  \"opaque.local\":\n    action:\n      \
+                    type: proxy\n      url: http://203.0.113.2:9\n";
         let before = soak_verdict_total("inconclusive", "window");
 
         reload_from_config_yaml(config_path.to_str().expect("utf-8"), yaml)

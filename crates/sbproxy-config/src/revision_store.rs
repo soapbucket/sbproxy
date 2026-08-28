@@ -1250,13 +1250,13 @@ impl RevisionStore {
     /// **Exclusivity.** Any group or other bit on `index.json`, its
     /// backup, or a blob means somebody else could have written the
     /// document this node is about to boot on. This store never creates
-    /// a file that way ([`create_private_file`] opens at `0600`), so a
+    /// a file that way (`create_private_file` opens at `0600`), so a
     /// bit set here was set from outside, and refusing is the only safe
     /// reading of it.
     ///
     /// Lives on the store rather than in the caller so it reads the same
-    /// [`INDEX_FILE`], [`INDEX_BACKUP_FILE`], and [`BLOBS_DIR`] constants
-    /// the writer uses: a layout rename moves both together instead of
+    /// `INDEX_FILE`, `INDEX_BACKUP_FILE`, and `BLOBS_DIR` constants the
+    /// writer uses: a layout rename moves both together instead of
     /// quietly turning the guard into a no-op. Non-Unix targets have no
     /// mode to inspect and this is a no-op there, stated rather than
     /// silently true.
