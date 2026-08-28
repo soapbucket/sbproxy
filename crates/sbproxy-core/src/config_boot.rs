@@ -168,24 +168,15 @@ pub struct FallbackDocument {
     pub pinned: PinnedRevision,
 }
 
-/// Resolve which fallback mode is in force.
+/// Resolve which fallback mode the command line or the environment
+/// names, or `None` when neither does and the config file's own
+/// `boot.fallback` decides.
 ///
 /// The command line beats the environment, which beats the config file.
 /// A rescue boot must not depend on the file being right, and the file
 /// is what is broken; the environment sits between the two because a
 /// systemd drop-in is how an operator makes a rescue survive a restart
 /// without editing the config they are trying to replace.
-#[must_use]
-pub fn effective_mode(
-    flag: Option<BootFallbackMode>,
-    environment: Option<&str>,
-    from_config: BootFallbackMode,
-) -> BootFallbackMode {
-    mode_from_flag_or_env(flag, environment).unwrap_or(from_config)
-}
-
-/// The mode the command line or the environment names, or `None` when
-/// neither does and the config file's own `boot.fallback` decides.
 ///
 /// Split out so the caller can answer "is a fallback even wanted" before
 /// parsing the config file for the block that names the ring. On a node
@@ -552,7 +543,7 @@ pub fn spawn_boot_success_timer(revision: u64, success_secs: u64) {
 ///
 /// A no-op when no ring is open, which is the same condition under which
 /// nothing could have incremented the counter in the first place.
-pub fn confirm_boot_success_now(revision: u64) {
+pub(crate) fn confirm_boot_success_now(revision: u64) {
     let Some(recorder) = crate::config_history::current_config_history_recorder() else {
         tracing::warn!(
             revision,
@@ -606,31 +597,23 @@ mod tests {
     #[test]
     fn the_command_line_flag_beats_the_environment_and_the_file() {
         assert_eq!(
-            effective_mode(
-                Some(BootFallbackMode::LastKnownGood),
-                Some("off"),
-                BootFallbackMode::Off
-            ),
-            BootFallbackMode::LastKnownGood,
+            mode_from_flag_or_env(Some(BootFallbackMode::LastKnownGood), Some("off")),
+            Some(BootFallbackMode::LastKnownGood),
         );
         assert_eq!(
-            effective_mode(None, Some("last-known-good"), BootFallbackMode::Off),
-            BootFallbackMode::LastKnownGood,
+            mode_from_flag_or_env(None, Some("last-known-good")),
+            Some(BootFallbackMode::LastKnownGood),
         );
-        assert_eq!(
-            effective_mode(None, None, BootFallbackMode::LastKnownGood),
-            BootFallbackMode::LastKnownGood,
-        );
-        assert_eq!(
-            effective_mode(None, None, BootFallbackMode::Off),
-            BootFallbackMode::Off,
-        );
+        // Neither decided, so the caller falls back to the file's own
+        // `boot.fallback`.
+        assert_eq!(mode_from_flag_or_env(None, None), None);
         // An unparseable environment value falls through to the file
-        // rather than silently enabling or disabling the fallback.
-        assert_eq!(
-            effective_mode(None, Some("maybe"), BootFallbackMode::LastKnownGood),
-            BootFallbackMode::LastKnownGood,
-        );
+        // rather than silently enabling or disabling the fallback. This
+        // branch is only reachable because `SB_CONFIG_FALLBACK` is read
+        // here rather than declared on the clap argument: while clap
+        // owned it, the variable landed in the `flag` slot and a typo
+        // exited the process instead (WOR-2459 fix round, Major 11).
+        assert_eq!(mode_from_flag_or_env(None, Some("maybe")), None);
     }
 
     /// A first boot with an empty ring exits the way `off` does, and

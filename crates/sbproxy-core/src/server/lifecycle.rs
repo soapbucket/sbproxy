@@ -8482,33 +8482,58 @@ egress:
         history
     }
 
-    /// WOR-2459. With `fallback: off` and a broken config, behavior is
-    /// what it has always been: the boot fails with the compile error
-    /// and nothing consults the ring.
+    /// WOR-2459, tightened in the fix round (Major 6). With
+    /// `fallback: off` the boot path is byte-identical to the release
+    /// before this one, and "byte-identical" is a stronger claim than
+    /// "still fails": `boot_document` must hand the file's bytes back
+    /// **untouched**, doing no `source:` resolve and no compile of its
+    /// own, so a git-sourced node pays one fetch per boot rather than
+    /// two and the operator sees `run`'s own error rather than a
+    /// flattened, re-wrapped copy of it.
     #[test]
-    fn boot_with_the_fallback_off_fails_exactly_as_it_always_has() {
+    fn boot_with_the_fallback_off_reads_the_file_and_does_nothing_else() {
         crate::config_boot::reset_for_test();
         let temp = tempfile::tempdir().expect("temp dir");
         let config_path = temp.path().join("sb.yml");
-        std::fs::write(&config_path, "proxy:\n  http2_cleartextt: true\n").expect("write");
+        let broken = "proxy:\n  http2_cleartextt: true\n";
+        std::fs::write(&config_path, broken).expect("write");
         // A ring that could have rescued this boot, deliberately present:
         // the point is that `off` does not look at it.
         let _history = ring_with_a_good_revision(&temp.path().join("ring"), "proxy: {}\n");
 
-        let error = boot_document(
+        let (yaml, pin) = boot_document(
             config_path.to_str().expect("utf-8"),
             Some(sbproxy_config::BootFallbackMode::Off),
         )
-        .expect_err("a broken config must not boot with the fallback off");
-        assert!(
-            format!("{error:#}").contains("http2_cleartextt"),
-            "the compile error is what the operator sees: {error:#}",
-        );
-        assert!(
-            !format!("{error:#}").contains("revision ring"),
-            "nothing about the ring is mentioned when it was never consulted: {error:#}",
-        );
+        .expect("the read succeeds; the compile is the caller's, as it always was");
+        assert_eq!(yaml, broken, "the bytes are handed back untouched");
+        assert!(pin.is_none(), "nothing was rescued and nothing is pinned");
         assert!(!crate::config_boot::on_fallback());
+
+        // And the error the operator sees is still the compile error,
+        // raised by the same step `run` has always run on these bytes.
+        let reason = boot_candidate_compiles(&yaml).expect_err("a misspelled key must not compile");
+        assert!(
+            reason.contains("http2_cleartextt"),
+            "the compile error is what the operator sees: {reason}",
+        );
+        assert!(
+            !reason.contains("revision ring"),
+            "nothing about the ring is mentioned when it was never consulted: {reason}",
+        );
+
+        // An unreadable file keeps its historical message, which is the
+        // one half of this path that does still produce an error here.
+        let missing = temp.path().join("not-there.yml");
+        let error = boot_document(
+            missing.to_str().expect("utf-8"),
+            Some(sbproxy_config::BootFallbackMode::Off),
+        )
+        .expect_err("an unreadable file still fails");
+        assert!(
+            format!("{error:#}").starts_with("failed to read config file"),
+            "the historical read-failure message is unchanged: {error:#}",
+        );
         crate::config_boot::reset_for_test();
     }
 

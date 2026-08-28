@@ -140,16 +140,25 @@ pub fn install_process_synthetic_state(state: SyntheticProbeState, stale_after: 
 
 /// Install a process-wide synthetic state for a test. Same as
 /// [`install_process_synthetic_state`]; named apart so a production call
-/// site cannot be mistaken for a fixture.
-#[doc(hidden)]
-pub fn install_process_synthetic_state_for_test(state: SyntheticProbeState, stale_after: Duration) {
+/// site cannot be mistaken for a fixture, and `#[cfg(test)]` so there
+/// cannot be one.
+#[cfg(test)]
+pub(crate) fn install_process_synthetic_state_for_test(
+    state: SyntheticProbeState,
+    stale_after: Duration,
+) {
     install_process_synthetic_state(state, stale_after);
 }
 
 /// The staleness window the installed driver's configuration implies, or
 /// `None` when no synthetic probe is configured on this node.
-#[must_use]
-pub fn process_probe_stale_after() -> Option<Duration> {
+///
+/// Tests only. Production reads the window through
+/// [`current_process_probe_outcome`], which applies it rather than
+/// handing it out; this exists so a test can prove the window is the
+/// driver's own rather than one the soak invented.
+#[cfg(test)]
+pub(crate) fn process_probe_stale_after() -> Option<Duration> {
     PROCESS_SYNTHETIC_STATE.get().map(|probe| probe.stale_after)
 }
 
