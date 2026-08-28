@@ -119,7 +119,8 @@ impl Subscription {
 /// subscription at 500 rps needs 500 HTTP POSTs a second, and the delivery
 /// budget alone is three attempts across up to fifteen seconds. Selecting
 /// one of these is a deliberate act, so a wildcard cannot reach them by
-/// accident. See [`validate_subscription`].
+/// accident: a wildcard reaching one is refused unless the subscription
+/// sets `allow_firehose`.
 pub const PER_REQUEST_EVENT_TYPES: [&str; 3] =
     ["request_started", "request_completed", "request_error"];
 

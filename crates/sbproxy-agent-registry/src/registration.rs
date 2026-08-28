@@ -328,7 +328,11 @@ impl TenantScope {
     }
 
     /// The tenant a submission made under this scope is recorded against.
-    pub fn owning_tenant(&self) -> &str {
+    ///
+    /// `pub(crate)`: the only caller is `register`, and a scope's owning
+    /// tenant is an implementation detail of how a record is keyed rather
+    /// than something a caller holding a scope needs to ask about.
+    pub(crate) fn owning_tenant(&self) -> &str {
         match self {
             Self::All => DEFAULT_TENANT,
             Self::Only(tenant) => tenant.as_str(),
@@ -626,7 +630,11 @@ pub struct RegistrationQueue {
 /// stranger. Terminal records are not counted against it: they are the audit
 /// trail, they cannot be resubmitted, and evicting them would be evicting
 /// the durable replay refusal itself.
-pub const MAX_PENDING_REGISTRATIONS: usize = 5_000;
+///
+/// `pub(crate)`: the refusal carries the number, so a caller reading the
+/// error does not need the constant, and nothing outside this crate decides
+/// the cap.
+pub(crate) const MAX_PENDING_REGISTRATIONS: usize = 5_000;
 
 /// One decision, as a value, so the four things that vary between approve,
 /// reject, and revoke travel together instead of as a row of positional
