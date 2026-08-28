@@ -18208,6 +18208,20 @@ impl RelayBodyHoldback {
 /// lives in the worker stack and not here: the stack is 8 MiB and
 /// this is a fraction of it.
 ///
+/// | measured, Linux, `x86_64-unknown-linux-gnu`, dev profile | bytes |
+/// |---|---|
+/// | streaming, through `request_filter` | 1,604,072 |
+/// | buffered, through `request_filter` | 1,471,496 |
+///
+/// `ceil(1_604_072 / 256 KiB) * 256 KiB + 512 KiB = 2_359_296`.
+///
+/// Worth knowing before assuming the platform explains a gap: the
+/// same fixture measures 1,600,952 on aarch64 macOS, 3,120 bytes
+/// less. Linux debug frames are not meaningfully larger here. The
+/// distance between this number and the 2 MiB stack that actually
+/// overflowed is the configuration, compression and a CEL policy
+/// plane and guardrails, not the target.
+///
 /// Re-derive it by reading `STACK_HIGH_WATER_BYTES` out of the
 /// `production request-path smoke` lane, which prints it on Linux
 /// on every pull request, and lowering this to match. It only
