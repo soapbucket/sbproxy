@@ -1723,7 +1723,56 @@ fn record_applied_config_revision(input: RevisionRecordingInput<'_>, outcome: &R
             .map(std::string::ToString::to_string)
             .collect(),
     };
-    recorder.record(input.content, metadata);
+    let Some(entry) = recorder.record(input.content, metadata) else {
+        // A byte-identical repeat of what is already running, or a write
+        // that failed. Neither is a new revision, so neither arms a soak
+        // window: a reload loop re-applying an unchanged file must not
+        // restart the clock on a revision that already soaked.
+        return;
+    };
+
+    // WOR-2458: arm the soak window. Until this landed, recording an
+    // applied revision was the whole of the promotion story, which is
+    // the epic's root defect. Now the pointer moves only when a window
+    // closes passing, and `arm` reaches a verdict here only for the two
+    // cases that need no traffic to decide: a degraded reload, and a
+    // node whose operator switched the soak off.
+    let soak = history_soak_config();
+    if let Some(verdict) = crate::config_soak::arm(
+        entry.revision,
+        &entry.digest,
+        &entry
+            .degraded
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>(),
+        &soak,
+    ) {
+        sbproxy_observe::metrics::record_config_soak_verdict(
+            crate::config_soak::verdict_label(verdict),
+            "window",
+        );
+        recorder.record_soak_verdict(entry.revision, verdict);
+    }
+}
+
+/// The `proxy.config_history.soak` block the running config declares, or
+/// its defaults when the running pipeline is not readable yet.
+///
+/// Read off the live pipeline rather than threaded down from the reload
+/// that is publishing: by the time this runs the new pipeline is already
+/// published (see the call site's position in
+/// `reload_compiled_config_locked`), so this reads the soak block the
+/// revision being judged actually declares, which is the right one to
+/// judge it under.
+fn history_soak_config() -> sbproxy_config::ConfigSoakConfig {
+    crate::reload::current_pipeline()
+        .config
+        .server
+        .config_history
+        .as_ref()
+        .map(|history| history.soak.clone())
+        .unwrap_or_default()
 }
 
 /// Open the config history ring `history` names and record `content` as
@@ -3883,8 +3932,18 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
                 .expect("admin runtime");
             rt.block_on(async move {
                 if let Some((synth_cfg, state)) = synthetic_driver {
+                    // Published before the driver starts, so the config
+                    // soak's operator-probe signal (WOR-2458) can read
+                    // the same outcome `/readyz` reads rather than
+                    // introducing a second probe shape.
+                    crate::synthetic::install_process_synthetic_state(state.clone());
                     crate::synthetic::spawn_loop(synth_cfg, state);
                 }
+                // WOR-2458: the soak supervisor. One task, ticking the
+                // window in flight, running the operator probe on its
+                // cadence, and closing the window when it is due. A
+                // no-op on every node that never arms one.
+                crate::config_soak::spawn();
                 // WOR-2664 review: without this the configured feed was read
                 // only when a human POSTed /admin/agent-registry/refresh, so
                 // every restart served whatever the store had cached and a
@@ -8190,6 +8249,145 @@ egress:
         let recorder = std::sync::Arc::new(recorder);
         crate::config_history::install_config_history_recorder(recorder.clone());
         recorder
+    }
+
+    /// WOR-2458. The reload transaction arms a soak window against the
+    /// revision it just recorded, and recording still never promotes.
+    ///
+    /// Driven through `reload_from_config_yaml`, the real transaction,
+    /// rather than calling `config_soak::arm` directly: the question
+    /// this answers is whether the seam is wired, and a test that armed
+    /// the window itself would answer a different one.
+    #[test]
+    fn a_committed_reload_arms_a_soak_window_and_does_not_promote() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let recorder = install_history_recorder_for_test(temp.path());
+        crate::config_soak::clear();
+        let config_path = temp.path().join("sb.yml");
+        let yaml = "proxy: {}\n# soak-arming fixture\n";
+
+        reload_from_config_yaml(config_path.to_str().expect("utf-8"), yaml)
+            .expect("a valid config publishes");
+
+        let entries = recorder.entries();
+        assert_eq!(entries.len(), 1, "one applied revision recorded");
+        assert_eq!(
+            crate::config_soak::in_flight_revision(),
+            Some(entries[0].revision),
+            "the reload armed a window against the revision it recorded",
+        );
+        assert!(
+            recorder.lkg().is_none(),
+            "recording an applied revision must never promote it: that is the defect",
+        );
+        crate::config_soak::clear();
+        crate::config_history::clear_config_history_recorder();
+    }
+
+    /// WOR-2458. A window that closes with a passing signal advances the
+    /// pointer exactly once, and the window is consumed by the close so
+    /// it cannot advance it twice.
+    #[test]
+    fn a_closed_window_with_a_passing_signal_advances_the_lkg_pointer_once() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let recorder = install_history_recorder_for_test(temp.path());
+        crate::config_soak::clear();
+        let config_path = temp.path().join("sb.yml");
+        let yaml = "proxy: {}\n# promoting fixture\n";
+
+        reload_from_config_yaml(config_path.to_str().expect("utf-8"), yaml)
+            .expect("a valid config publishes");
+        let revision = recorder.entries()[0].revision;
+        // The synthetic-transaction driver reporting a healthy round
+        // trip: the signal a quiet node has, and the one that keeps this
+        // window out of Inconclusive.
+        crate::config_soak::record_probe(crate::config_soak::ProbeObservation::Ok);
+
+        let (closed, verdict, _) =
+            crate::config_soak::confirm_now().expect("a window was in flight");
+        assert_eq!(closed, revision);
+        assert_eq!(verdict, sbproxy_config::SoakVerdict::Successful);
+        let lkg = recorder.lkg().expect("a passed soak promotes");
+        assert_eq!(lkg.revision, revision);
+        assert_eq!(lkg.state, sbproxy_config::RevisionState::Good);
+        assert!(
+            crate::config_soak::confirm_now().is_none(),
+            "the window is consumed by the close, so it cannot promote twice",
+        );
+        crate::config_soak::clear();
+        crate::config_history::clear_config_history_recorder();
+    }
+
+    /// WOR-2458. A window where every signal abstained is Inconclusive:
+    /// the pointer does not move, the entry stays `applied`, and the
+    /// verdict carries its own metric label so an operator can see that
+    /// their soak is measuring nothing.
+    #[test]
+    fn a_window_where_every_signal_abstains_is_inconclusive_and_stays_applied() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let recorder = install_history_recorder_for_test(temp.path());
+        crate::config_soak::clear();
+        let config_path = temp.path().join("sb.yml");
+        let yaml = "proxy: {}\n# inconclusive fixture\n";
+        let before = soak_verdict_total("inconclusive", "window");
+
+        reload_from_config_yaml(config_path.to_str().expect("utf-8"), yaml)
+            .expect("a valid config publishes");
+        // No probe, no traffic, no breakers: nothing measured anything.
+        let (_, verdict, reports) =
+            crate::config_soak::confirm_now().expect("a window was in flight");
+
+        assert_eq!(verdict, sbproxy_config::SoakVerdict::Inconclusive);
+        assert!(
+            reports.iter().all(|(_, outcome)| matches!(
+                outcome,
+                crate::config_soak::SignalOutcome::Abstain(_)
+            )),
+            "every signal abstained: {reports:?}",
+        );
+        assert!(
+            recorder.lkg().is_none(),
+            "a soak that measured nothing must not promote",
+        );
+        assert_eq!(
+            recorder.entries()[0].state,
+            sbproxy_config::RevisionState::Applied,
+            "the entry stays applied and never reaches good",
+        );
+        assert_eq!(
+            recorder.entries()[0].soak_verdict,
+            Some(sbproxy_config::SoakVerdict::Inconclusive),
+        );
+        assert_eq!(
+            soak_verdict_total("inconclusive", "window"),
+            before + 1.0,
+            "inconclusive carries its own metric label",
+        );
+        crate::config_soak::clear();
+        crate::config_history::clear_config_history_recorder();
+    }
+
+    /// `sbproxy_config_soak_verdict_total{verdict,signal}` for one label
+    /// pair, read off the process registry.
+    fn soak_verdict_total(verdict: &str, signal: &str) -> f64 {
+        for family in prometheus::gather() {
+            if family.name() != "sbproxy_config_soak_verdict_total" {
+                continue;
+            }
+            for metric in family.get_metric() {
+                let labels = metric.get_label();
+                let matches_verdict = labels
+                    .iter()
+                    .any(|pair| pair.name() == "verdict" && pair.value() == verdict);
+                let matches_signal = labels
+                    .iter()
+                    .any(|pair| pair.name() == "signal" && pair.value() == signal);
+                if matches_verdict && matches_signal {
+                    return metric.get_counter().value();
+                }
+            }
+        }
+        0.0
     }
 
     /// WOR-2462. A local file that does not compile is a refused

@@ -125,13 +125,14 @@ pub mod config_gossip;
 /// every config this process applies, recorded once by the shared
 /// reload transaction, and read back by the admin history surface.
 pub mod config_history;
+/// Config-authority subscriber: pull signed configuration from an
+/// upstream authority, verify it, merge it over the base document, and
+/// apply it through the shared reload transaction.
+pub mod config_soak;
 /// Honouring `source:`: resolve the config document from a git
 /// repository (or an overlay chain over one), keep it fresh on a timer,
 /// and hand the result to the shared reload transaction.
 pub mod config_source;
-/// Config-authority subscriber: pull signed configuration from an
-/// upstream authority, verify it, merge it over the base document, and
-/// apply it through the shared reload transaction.
 pub mod config_subscriber;
 pub mod content_capture;
 pub mod context;

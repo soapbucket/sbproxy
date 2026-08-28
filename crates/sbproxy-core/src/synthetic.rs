@@ -111,6 +111,44 @@ fn build_request(config: &SyntheticProbeConfig) -> Result<SyntheticRequest, &'st
     })
 }
 
+/// The process-wide synthetic-probe state, published at boot when the
+/// operator enabled `proxy.synthetic_probe`.
+///
+/// Exists so a second reader can see what the driver sees: the config
+/// soak's operator-probe signal (WOR-2458) reads this to reach a real
+/// verdict on a node with no organic traffic, which is the failure mode
+/// Flagger documents as the most common cause of a spurious rollback.
+/// `/readyz` still reads the same state through its registered probe.
+static PROCESS_SYNTHETIC_STATE: std::sync::OnceLock<SyntheticProbeState> =
+    std::sync::OnceLock::new();
+
+/// Publish the process-wide synthetic-probe state. Set once, at boot;
+/// a second call is ignored, which is what a reload of an already
+/// running driver should do.
+pub fn install_process_synthetic_state(state: SyntheticProbeState) {
+    let _ = PROCESS_SYNTHETIC_STATE.set(state);
+}
+
+/// The running driver's most recent outcome, or `None` when no
+/// synthetic probe is configured on this node.
+///
+/// `stale_after` comes from the driver's own effective staleness window,
+/// so an outcome the readiness probe would call stale is stale here too;
+/// a driver task that died must not go on reporting the last good run it
+/// managed before it did.
+#[must_use]
+pub fn current_process_probe_outcome() -> Option<(sbproxy_observe::ComponentStatus, Option<String>)>
+{
+    let state = PROCESS_SYNTHETIC_STATE.get()?;
+    Some(state.current(PROCESS_SYNTHETIC_STALE_AFTER))
+}
+
+/// Staleness window applied when the soak reads the synthetic driver's
+/// outcome. Fixed rather than read back off the config: the soak only
+/// needs "is this recent enough to believe", and the driver's own
+/// `stale_after_secs` already governs what `/readyz` reports.
+const PROCESS_SYNTHETIC_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Spawn the synthetic-probe background loop. The returned join
 /// handle outlives the process; cancelling is via dropping the task
 /// (we do not currently surface a stop handle, the same pattern other

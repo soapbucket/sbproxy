@@ -128,7 +128,12 @@ impl ConfigHistoryRecorder {
     /// running proxy's own request path depends on, so a full disk or a
     /// permissions problem here must not fail a reload transaction that
     /// otherwise succeeded and already published.
-    pub fn record(&self, content: &[u8], metadata: AppendMetadata) {
+    /// Returns the entry it appended, or `None` when the content was a
+    /// byte-identical repeat of the ring's most recent entry or the
+    /// write failed. The caller uses it to arm a soak window against the
+    /// revision that was actually recorded (WOR-2458); `None` means
+    /// there is no new revision to judge.
+    pub fn record(&self, content: &[u8], metadata: AppendMetadata) -> Option<RevisionEntry> {
         let mut store = self
             .store
             .lock()
@@ -136,18 +141,22 @@ impl ConfigHistoryRecorder {
         if let Some(last) = store.entries().last() {
             if let Ok(previous_bytes) = store.read_blob(&last.digest) {
                 if previous_bytes.as_slice() == content {
-                    return;
+                    return None;
                 }
             }
         }
-        if let Err(error) = store.append(content, metadata) {
-            tracing::error!(
-                error = %error,
-                "config history: failed to record an applied config revision"
-            );
-            return;
-        }
+        let entry = match store.append(content, metadata) {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::error!(
+                    error = %error,
+                    "config history: failed to record an applied config revision"
+                );
+                return None;
+            }
+        };
         Self::publish_metrics(&store);
+        Some(entry)
     }
 
     /// Publish `sbproxy_config_revision_info` and

@@ -3480,6 +3480,56 @@ fn handle_config_history_list() -> (u16, &'static str, String) {
     (200, "application/json", body.to_string())
 }
 
+/// `POST /admin/config/confirm`: promote the revision under soak
+/// immediately, without waiting out its window (WOR-2458).
+///
+/// The Junos `commit confirmed` ergonomic, inverted. A deployment
+/// pipeline that has just run its own smoke test knows more than a timer
+/// does, and this is what it calls instead of sleeping for two minutes.
+///
+/// `409` when no soak is in flight, rather than a cheerful `200`:
+/// confirming nothing is a caller bug (the reload never happened, or the
+/// window already closed), and answering it as success would tell a
+/// pipeline its config is now the rollback target when it is not.
+///
+/// The confirmation runs the same signals a timed close runs, so it
+/// short-circuits the *wait*, not the *judgement*: a revision that is
+/// already failing its upstream-health signal is not promoted just
+/// because somebody confirmed it. Reporting the verdict back is what
+/// lets the pipeline fail its own step on it.
+fn handle_config_confirm() -> (u16, &'static str, String) {
+    // Answered before the soak state is consulted, so a node that never
+    // opted into the ring gets the same "not enabled" body as its
+    // sibling routes rather than a confusing 409.
+    if let Err(response) = config_history_open_recorder() {
+        return response;
+    }
+    let Some((revision, verdict, reports)) = crate::config_soak::confirm_now() else {
+        return (
+            409,
+            "application/json",
+            r#"{"error":"no config soak is in flight"}"#.to_string(),
+        );
+    };
+    let signals: Vec<serde_json::Value> = reports
+        .iter()
+        .map(|(signal, outcome)| {
+            serde_json::json!({
+                "signal": signal.as_str(),
+                "outcome": outcome.as_str(),
+                "detail": outcome.detail().unwrap_or_default(),
+            })
+        })
+        .collect();
+    let body = serde_json::json!({
+        "revision": revision,
+        "verdict": crate::config_soak::verdict_label(verdict),
+        "promoted": verdict == sbproxy_config::SoakVerdict::Successful,
+        "signals": signals,
+    });
+    (200, "application/json", body.to_string())
+}
+
 /// `GET /admin/config/rejected`: every candidate config this node
 /// refused, newest first, with the reason it was refused (WOR-2462).
 ///
@@ -6035,6 +6085,18 @@ pub fn handle_admin_request(
     if path_only == "/admin/config/history" {
         if method.eq_ignore_ascii_case("GET") {
             return handle_config_history_list();
+        }
+        return (
+            405,
+            "application/json",
+            r#"{"error":"method not allowed"}"#.to_string(),
+        );
+    }
+    // WOR-2458: short-circuit the soak window for the revision under
+    // judgement. POST only: it is a state change.
+    if path_only == "/admin/config/confirm" {
+        if method.eq_ignore_ascii_case("POST") {
+            return handle_config_confirm();
         }
         return (
             405,
@@ -11892,6 +11954,87 @@ mod tests {
             provenance: BaseOrigin::Local,
             rejected_at: at,
         }
+    }
+
+    /// WOR-2458. Confirming is a mutation, so it is POST only and
+    /// behind the same auth as everything else here.
+    #[test]
+    fn config_confirm_requires_auth_and_only_answers_post() {
+        crate::config_history::clear_config_history_recorder();
+        crate::config_soak::clear();
+        let state = make_state();
+        let (status, _, _) =
+            handle_admin_request("POST", "/admin/config/confirm", &state, None, None);
+        assert_eq!(status, 401);
+
+        let auth = basic_auth("admin", "secret");
+        for method in ["GET", "PUT", "DELETE"] {
+            let (status, _, _) =
+                handle_admin_request(method, "/admin/config/confirm", &state, Some(&auth), None);
+            assert_eq!(status, 405, "{method} should not be accepted");
+        }
+        // Opt-in, like its siblings: a node with no ring has nothing to
+        // confirm and says so the same way.
+        let (status, _, body) =
+            handle_admin_request("POST", "/admin/config/confirm", &state, Some(&auth), None);
+        assert_eq!(status, 404);
+        assert_eq!(body, r#"{"error":"config history is not enabled"}"#);
+    }
+
+    /// WOR-2458. Confirming with nothing in flight is refused rather
+    /// than answered as a cheerful success: a pipeline told its config
+    /// is the rollback target when it is not would carry on deploying.
+    #[test]
+    fn config_confirm_is_refused_when_no_soak_is_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let _recorder = install_test_history_recorder(dir.path());
+        crate::config_soak::clear();
+
+        let (status, _, body) = handle_config_confirm();
+        crate::config_history::clear_config_history_recorder();
+        assert_eq!(status, 409);
+        assert_eq!(body, r#"{"error":"no config soak is in flight"}"#);
+    }
+
+    /// WOR-2458. Confirming short-circuits the wait, not the judgement:
+    /// the same signals run, and the answer says whether the revision
+    /// was actually promoted.
+    #[test]
+    fn config_confirm_closes_the_window_and_reports_the_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = install_test_history_recorder(dir.path());
+        crate::config_soak::clear();
+        let entry = recorder
+            .record(b"origins: {}\n# confirmed\n", history_metadata("operator"))
+            .expect("one recorded revision");
+        crate::config_soak::arm(
+            entry.revision,
+            &entry.digest,
+            &[],
+            &sbproxy_config::ConfigSoakConfig::default(),
+        );
+        crate::config_soak::record_probe(crate::config_soak::ProbeObservation::Ok);
+
+        let (status, _, body) = handle_config_confirm();
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        let promoted = recorder.lkg().map(|lkg| lkg.revision);
+        crate::config_history::clear_config_history_recorder();
+        crate::config_soak::clear();
+
+        assert_eq!(status, 200);
+        assert_eq!(parsed["revision"], entry.revision);
+        assert_eq!(parsed["verdict"], "passed");
+        assert_eq!(parsed["promoted"], true);
+        assert_eq!(
+            parsed["signals"].as_array().expect("signals").len(),
+            4,
+            "the caller sees what each signal said, not just the verdict",
+        );
+        assert_eq!(
+            promoted,
+            Some(entry.revision),
+            "a confirmed, passing window advances the pointer",
+        );
     }
 
     /// WOR-2462. The refused candidates are behind the same auth as
