@@ -7,7 +7,7 @@
 # need no compiler are found in seconds instead of forty minutes into a
 # CI round trip.
 #
-# On 2026-08-27 nine CI failures cost a full round trip each. Six of them
+# On 2026-08-27 ten CI failures cost a full round trip each. Six of them
 # were catchable here:
 #
 #   examples/README.md catalog stale after a merge from main
@@ -25,7 +25,7 @@
 # bench-synthetic/Cargo.lock). This script exited 1 with exactly six red
 # checks and nineteen green, naming each one.
 #
-# The other three need a compiler and are named in the NOT COVERED block
+# The other four need a compiler and are named in the NOT COVERED block
 # this script prints on every run. Read that block. A green run here is
 # not a green gate, and the difference is written down rather than
 # assumed.
@@ -202,7 +202,7 @@ done
 cat <<'MSG'
 
 ------------------------------------------------------------------------
-NOT COVERED HERE. These three of the nine CI failures need a compiler,
+NOT COVERED HERE. These four of the ten CI failures need a compiler,
 so a green run above says nothing about them:
 
   * a private intra-doc link
@@ -214,6 +214,10 @@ so a green run above says nothing about them:
   * a path-shaped config key missing from HOST_FILE_KEYS
       the every_path_shaped_schema_key_is_covered_or_explained test in
       crates/sbproxy-config, which the workspace test lane runs
+  * a config key whose committed schema was never regenerated
+      bash scripts/check-config-schema.sh, which execs a built
+      generate-schema (the `generated artifacts are current` CI step);
+      scripts/post-merge-rederive.sh rewrites it
 
 Nor does anything here run the workspace build, test, clippy, or rustdoc
 lanes, or the UI lane. Run `bash scripts/check.sh` before you push.

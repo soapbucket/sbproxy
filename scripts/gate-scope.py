@@ -77,7 +77,7 @@ PHASES = [
 # are what catch the staleness a merge from main leaves behind, which by
 # definition is not in the diff you wrote.
 #
-# Six of the nine CI failures this classifier was built against are
+# Six of the ten CI failures this classifier was built against are
 # caught by that tier, so they survive any mistake made below.
 ALWAYS = "the cheap read-only tier always runs"
 

@@ -70,7 +70,7 @@ cd "$ROOT"
 # more than about ten seconds are skippable at all; the fourteen
 # read-only scans, fmt, the lockfile guards, the generator drift scans,
 # the changelog fragments, cargo-deny, and both halves of the
-# working-tree guard run on every invocation regardless. Six of the nine
+# working-tree guard run on every invocation regardless. Six of the ten
 # CI failures of 2026-08-27 are in that unconditional set. Second, every
 # cargo phase below is `--workspace`, so scoping never narrows a package
 # selection: a phase either runs over the whole workspace or does not
@@ -587,7 +587,7 @@ python3 "$ROOT/scripts/lib/cert_record.py" --self-test
 python3 "$ROOT/scripts/tests/test_cert_record.py"
 python3 "$ROOT/scripts/lib/notice_coverage.py" --self-test
 python3 "$ROOT/scripts/tests/test_notice_coverage.py"
-# The --scope-to-diff classifier's corpus: nine CI failures, each
+# The --scope-to-diff classifier's corpus: ten CI failures, each
 # asserted to still select the phase that catches it. Unconditional, so
 # a rule narrowed in gate-scope.py fails here rather than silently
 # turning a phase off on somebody else's branch.
