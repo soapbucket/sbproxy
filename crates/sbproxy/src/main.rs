@@ -10123,6 +10123,11 @@ fn pull_refusal_hint(result: sbproxy_core::config_subscriber::CycleResult) -> &'
              secrets, cluster, model_host, config_authority, source). The whole bundle is \
              refused, not the offending keys."
         }
+        CycleResult::ConfinementRefused => {
+            "the bundle reaches for this node's environment or filesystem (an env:, file:, or \
+             vault:// reference, or a host path) that only the operator's own config may name. \
+             Move that value into the root config here, or write the literal in the bundle."
+        }
         // Not reachable from `evaluate`, which neither fetches nor reloads.
         // Named anyway so a new variant cannot be added without deciding
         // what it means here.
