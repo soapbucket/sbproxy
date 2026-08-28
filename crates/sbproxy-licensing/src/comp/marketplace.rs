@@ -282,12 +282,17 @@ impl CompMarketplace {
 
     /// Override the issued-quote ledger's row cap.
     ///
-    /// [`COMP_QUOTE_LEDGER_CAPACITY`] is the default and the number to
-    /// read for why a cap exists at all. A host with an unusual quote
-    /// volume and its own memory budget can move it; a host that does
-    /// not know it needs to should not.
+    /// Test-only on purpose. [`COMP_QUOTE_LEDGER_CAPACITY`] is not
+    /// operator-configurable: a cap an operator can raise is a cap an
+    /// operator can raise until it stops bounding anything, and the
+    /// number that matters to them is the refusal it produces, which
+    /// the counter and `docs/comp-marketplace.md` both name. This
+    /// exists so the bound is testable without issuing fifty thousand
+    /// quotes. Make it `pub` when a caller outside these tests has a
+    /// reason, not before.
+    #[cfg(test)]
     #[must_use]
-    pub fn with_quote_ledger_capacity(mut self, capacity: usize) -> Self {
+    fn with_quote_ledger_capacity(mut self, capacity: usize) -> Self {
         self.quote_ledger_capacity = capacity.max(1);
         self
     }

@@ -2897,14 +2897,33 @@ pub(super) async fn request_filter(
                         )
                         .await?;
                         sbproxy_observe::metrics::record_olp_decision(endpoint, outcome);
-                        info!(
-                            target: "sbproxy_core::olp",
-                            event = "olp_decision",
-                            endpoint = %endpoint,
-                            outcome = %outcome,
-                            kid = %cfg.key_id,
-                            "olp.introspect_or_revoke"
-                        );
+                        // Two calls with a literal `endpoint` rather
+                        // than one interpolating the variable: the
+                        // log-URL ratchet reads an interpolated field
+                        // named `endpoint` as a URL that skipped the
+                        // redactor, and a suppression would make that
+                        // guard narrower for every future call site.
+                        // The values are the same closed pair the
+                        // counter's label carries.
+                        if is_revoke {
+                            info!(
+                                target: "sbproxy_core::olp",
+                                event = "olp_decision",
+                                endpoint = "revoke",
+                                outcome = %outcome,
+                                kid = %cfg.key_id,
+                                "olp.revoke"
+                            );
+                        } else {
+                            info!(
+                                target: "sbproxy_core::olp",
+                                event = "olp_decision",
+                                endpoint = "introspect",
+                                outcome = %outcome,
+                                kid = %cfg.key_id,
+                                "olp.introspect"
+                            );
+                        }
                         return Ok(true);
                     }
                 }

@@ -20,7 +20,7 @@ pub mod types;
 
 pub use marketplace::{
     quote_acceptance_hash, BuyerKeyRegistry, CompMarketplace, InMemoryBuyerKeyRegistry,
-    COMP_ACCEPTANCE_SKEW_SECS, COMP_QUOTE_VALIDITY_SECS,
+    COMP_ACCEPTANCE_SKEW_SECS, COMP_QUOTE_LEDGER_CAPACITY, COMP_QUOTE_VALIDITY_SECS,
 };
 pub use olp_bridge::{OlpBridgeClaims, OlpBridgeSigner, OLP_JWS_TYP};
 pub use router::{comp_router, COMP_REQUEST_BODY_LIMIT};
