@@ -382,9 +382,86 @@ pub struct BundleFetch<'a> {
     pub subscriber_id: Option<&'a str>,
     /// `If-None-Match`, verbatim.
     pub if_none_match: Option<&'a str>,
+    /// What the subscriber says it last **applied** (WOR-2464), as
+    /// distinct from what it was last served.
+    ///
+    /// `None` for a subscriber that sent none of the report headers: an
+    /// older build, or one that has not completed a cycle yet. Handled
+    /// as **unknown** rather than as an error, which is the acceptance
+    /// line, and rendered as unknown rather than as applied, which is
+    /// the point of the ticket.
+    pub apply_report: Option<ApplyReportHeaders<'a>>,
     /// Peer address, used as the rate-limit key before a credential is
     /// known.
     pub peer: &'a str,
+}
+
+/// The raw apply-report header values one fetch carried (WOR-2464).
+///
+/// Borrowed rather than parsed at the frame reader, so the parsing rules
+/// (an unknown status, a revision that is not a number, a report that
+/// claims more than this authority has published) all live in one place
+/// next to the store that enforces them, and the listener stays a thin
+/// frame reader.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ApplyReportHeaders<'a> {
+    /// `x-sbproxy-config-status`.
+    pub status: Option<&'a str>,
+    /// `x-sbproxy-applied-revision`.
+    pub revision: Option<&'a str>,
+    /// `x-sbproxy-applied-hash`.
+    pub config_hash: Option<&'a str>,
+    /// `x-sbproxy-config-error`.
+    pub error: Option<&'a str>,
+    /// `x-sbproxy-soak-verdict`.
+    pub soak_verdict: Option<&'a str>,
+    /// `x-sbproxy-fallback-active`.
+    pub fallback_active: Option<&'a str>,
+}
+
+impl ApplyReportHeaders<'_> {
+    /// Whether any report header was present at all.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.status.is_none()
+            && self.revision.is_none()
+            && self.config_hash.is_none()
+            && self.error.is_none()
+            && self.soak_verdict.is_none()
+            && self.fallback_active.is_none()
+    }
+
+    /// Parse into the stored shape, or `None` when the report is absent
+    /// or unusable.
+    ///
+    /// Strict on the two fields that carry meaning: an unrecognized
+    /// `status` and an unparseable `revision` both make the whole report
+    /// `None`. A partial report would be worse than none, because the
+    /// status page would render a status against a revision the node
+    /// never named. The free-text fields are permissive and bounded by
+    /// [`sbproxy_config::SubscriberApplyReport`] on the way in.
+    #[must_use]
+    pub fn parse(&self) -> Option<sbproxy_config::SubscriberApplyReport> {
+        let status = sbproxy_config::ApplyStatus::parse(self.status?.trim())?;
+        let revision: u64 = self.revision?.trim().parse().ok()?;
+        Some(sbproxy_config::SubscriberApplyReport {
+            status,
+            revision,
+            config_hash: self.config_hash.unwrap_or_default().trim().to_string(),
+            error: self
+                .error
+                .map(str::trim)
+                .filter(|error| !error.is_empty())
+                .map(str::to_string),
+            soak_verdict: self
+                .soak_verdict
+                .map(str::trim)
+                .filter(|verdict| !verdict.is_empty())
+                .map(str::to_string),
+            fallback_active: self.fallback_active.map(str::trim) == Some("true"),
+            reported_at_unix_ms: None,
+        })
+    }
 }
 
 /// The answer to one bundle fetch.
@@ -419,6 +496,34 @@ impl BundleReply {
     #[must_use]
     pub const fn content_type(&self) -> &'static str {
         "application/json"
+    }
+}
+
+/// How long a subscriber may go without fetching before its report is
+/// treated as stale rather than current (WOR-2464).
+///
+/// Ten missed polls at the default `poll_interval` of 30 seconds. Long
+/// enough that jitter, a slow reload, and one unreachable cycle do not
+/// flip a healthy node to `stale`; short enough that a node that has
+/// stopped talking is visible inside an incident rather than after it.
+/// A fleet on a longer interval than this reads `stale` between polls,
+/// which is a deliberate trade: this authority does not know each
+/// subscriber's configured interval, and over-reporting staleness is
+/// the safe direction for a page an operator makes a rollback decision
+/// on.
+pub const SUBSCRIBER_STALE_AFTER_MS: u64 = 5 * 60 * 1_000;
+
+/// Whether a subscriber has been heard from recently (WOR-2464).
+///
+/// Three states, not two. `unknown` is the honest answer after an
+/// authority restart, because fetch times are held in memory only; a
+/// restart must not make every subscriber look like it has gone silent.
+#[must_use]
+pub fn poll_state(last_seen_at_unix_ms: Option<u64>, now_unix_ms: u64) -> &'static str {
+    match last_seen_at_unix_ms {
+        None => "unknown",
+        Some(at) if now_unix_ms.saturating_sub(at) <= SUBSCRIBER_STALE_AFTER_MS => "recent",
+        Some(_) => "stale",
     }
 }
 
@@ -852,6 +957,31 @@ impl ConfigAuthority {
 
         {
             let mut store = self.lock_store();
+            // WOR-2464: what the node says it *applied*, recorded beside
+            // what it was *served*. Under the same store lock and in the
+            // same block, so a status page read between the two cannot
+            // see a subscriber that fetched r42 and has no report at all.
+            if let Some(report) = fetch
+                .apply_report
+                .as_ref()
+                .and_then(ApplyReportHeaders::parse)
+            {
+                let high_water = store.high_water_revision();
+                if let Err(error) =
+                    store.record_applied(&credential_id, report, high_water, now_unix_ms)
+                {
+                    // The subscriber is served either way. An over-claim
+                    // is worth a warning because it is either a bug in a
+                    // node or a node trying to poison the fleet view,
+                    // and both are things an operator wants to see.
+                    tracing::warn!(
+                        error = %error,
+                        credential_id = %credential_id,
+                        subscriber_id = %subscriber_id,
+                        "config authority discarded a subscriber's applied-revision report",
+                    );
+                }
+            }
             if let Err(error) = store.record_seen(&credential_id, served.revision, now_unix_ms) {
                 // The subscriber is being served either way; losing the
                 // rollout evidence is worth an error line and nothing more.
@@ -956,9 +1086,24 @@ impl ConfigAuthority {
         let served = self.served.load_full();
         let store = self.lock_store();
         let current_revision = store.current_revision();
+        let now = now_unix_ms();
+        let mut applied_current = 0usize;
+        let mut apply_failed = 0usize;
+        let mut apply_unknown = 0usize;
         let subscribers: Vec<serde_json::Value> = store
             .subscribers()
             .map(|record| {
+                let applied = record.applied();
+                match applied {
+                    None => apply_unknown += 1,
+                    Some(report) if report.status == sbproxy_config::ApplyStatus::Failed => {
+                        apply_failed += 1;
+                    }
+                    Some(report) if current_revision > 0 && report.revision == current_revision => {
+                        applied_current += 1;
+                    }
+                    Some(_) => {}
+                }
                 serde_json::json!({
                     "subscriber_id": record.subscriber_id(),
                     "credential_id": record.credential_id(),
@@ -971,6 +1116,28 @@ impl ConfigAuthority {
                     // rollout, answered rather than left as arithmetic.
                     "up_to_date": current_revision > 0
                         && record.last_seen_revision() == current_revision,
+                    // WOR-2464: seen is not applied. Everything below is
+                    // the node's own answer about what it is serving,
+                    // and every field reads `unknown` rather than
+                    // anything reassuring for a subscriber that has
+                    // never reported one.
+                    "apply_status": applied
+                        .map_or("unknown", |report| report.status.as_str()),
+                    "applied_revision": applied.map(|report| report.revision),
+                    "applied_config_hash": applied
+                        .map(|report| report.config_hash.clone()),
+                    "apply_error": applied.and_then(|report| report.error.clone()),
+                    "soak_verdict": applied.and_then(|report| report.soak_verdict.clone()),
+                    "fallback_active": applied.map(|report| report.fallback_active),
+                    "applied_up_to_date": applied.is_some_and(|report| {
+                        current_revision > 0 && report.revision == current_revision
+                    }),
+                    // "Has not polled recently" and "polled and failed"
+                    // are different problems with different first
+                    // moves, and a page that showed only the second
+                    // would call a disconnected node healthy for as
+                    // long as its last report stayed true.
+                    "poll_state": poll_state(record.last_seen_at_unix_ms(), now),
                 })
             })
             .collect();
@@ -991,6 +1158,14 @@ impl ConfigAuthority {
             "store_dir": store.directory().display().to_string(),
             "subscriber_count": store.subscriber_count(),
             "live_subscriber_count": store.live_subscriber_count(),
+            // WOR-2464: the three numbers that turn a fleet rollback
+            // into a decision. "31 of 34 applied r42, 3 failed" is what
+            // an operator reads before deciding to roll back, and
+            // computing it here rather than in every consumer means the
+            // console, the CLI, and a script all say the same thing.
+            "applied_current_count": applied_current,
+            "apply_failed_count": apply_failed,
+            "apply_unknown_count": apply_unknown,
             "subscribers": subscribers,
         })
     }
@@ -1694,6 +1869,23 @@ where
     let subscriber_id =
         header_value(&text, crate::config_subscriber::SUBSCRIBER_ID_HEADER).unwrap_or_default();
     let if_none_match = header_value(&text, "if-none-match");
+    // WOR-2464. Read here with the rest of the head; every value is
+    // optional, so an older subscriber that sends none of them produces
+    // an empty report and is handled as unknown rather than as an error.
+    let apply_status = header_value(&text, crate::config_subscriber::APPLY_STATUS_HEADER);
+    let applied_revision = header_value(&text, crate::config_subscriber::APPLIED_REVISION_HEADER);
+    let applied_hash = header_value(&text, crate::config_subscriber::APPLIED_HASH_HEADER);
+    let apply_error = header_value(&text, crate::config_subscriber::APPLY_ERROR_HEADER);
+    let soak_verdict = header_value(&text, crate::config_subscriber::SOAK_VERDICT_HEADER);
+    let fallback_active = header_value(&text, crate::config_subscriber::FALLBACK_ACTIVE_HEADER);
+    let apply_report = ApplyReportHeaders {
+        status: apply_status.as_deref(),
+        revision: applied_revision.as_deref(),
+        config_hash: applied_hash.as_deref(),
+        error: apply_error.as_deref(),
+        soak_verdict: soak_verdict.as_deref(),
+        fallback_active: fallback_active.as_deref(),
+    };
 
     let fetch = BundleFetch {
         path,
@@ -1702,6 +1894,7 @@ where
         subscriber_id: (!subscriber_id.is_empty()).then_some(subscriber_id.as_str()),
         if_none_match: if_none_match.as_deref(),
         peer: peer_ip,
+        apply_report: (!apply_report.is_empty()).then_some(apply_report),
     };
     let reply = authority.serve_bundle(&fetch);
     if reply.status >= 400 {
