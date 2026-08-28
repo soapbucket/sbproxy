@@ -882,6 +882,32 @@ crate-external sites, and the scanner counts the ones inside `ssrf.rs`. It is
 public deliberately: it is the single place the workspace unwraps an
 IPv4-mapped IPv6 address, and a guard that writes its own range check has to
 be able to reach it or the mapped-address hole comes back.
+No move on the WOR-2606 storage tree, after one. WOR-2609 added
+`EntryState` and `TryClaim` to `sbproxy-middleware/src/idempotency.rs`,
+the return types of the `IdempotencyCache` trait's `peek` and
+`try_claim`, and both landed in both buckets: the trait is pub, so
+narrowing either to pub(crate) makes it unimplementable from outside
+the crate, and the only cross-file consumer in tree was a test double
+in `sbproxy-core`. The first read of that was "raise the baseline by
+two and record why", which is what the count is there to make somebody
+argue for.
+
+The argument did not hold, because the reason both items looked
+write-only was a 2000-line file rather than an over-exposed item. The
+two backends that consume them, `InMemoryIdempotencyCache` and
+`KvIdempotencyCache`, sat in the same file as the trait, so every
+production reference was an in-file one and the scanner correctly saw
+nothing outside. Moving the backends to
+`idempotency/backends.rs`, which the file wanted anyway (the protocol
+and its two implementations are different things to read), puts the
+production consumers where they always were logically and both counts
+return to 314 and 1462.
+
+Worth naming for the next person who reads a two-item move: the
+question the bucket asks is "does anything but a test name this", and
+a file large enough to contain both the declaration and every caller
+answers it wrongly by construction. Splitting the file is a real fix
+for that; adding a caller would not have been.
 
 2026-08-27 (WOR-2690): unreferenced baseline 1462 -> 1461. Ground gained,
 not given. `pipeline::CompiledFallback` had only ever been named inside

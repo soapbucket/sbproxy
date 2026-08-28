@@ -1845,7 +1845,7 @@ fn audit_budget_override(
 
 // --- Credential handlers ---
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 struct CredentialCreate {
     /// Optional stable id; generated when omitted.
     id: Option<String>,
@@ -1865,7 +1865,26 @@ struct CredentialCreate {
     scheme: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+/// Redacted `Debug` (WOR-2640). `secret` is the plaintext credential an
+/// operator POSTs to the admin API; a `{:?}` of a rejected request body
+/// would put it in the admin log.
+impl std::fmt::Debug for CredentialCreate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialCreate")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("provider", &self.provider)
+            .field("kind", &self.kind)
+            .field("vault_ref", &self.vault_ref)
+            .field("secret", &self.secret.as_ref().map(|_| "[REDACTED]"))
+            .field("tenant", &self.tenant)
+            .field("header", &self.header)
+            .field("scheme", &self.scheme)
+            .finish()
+    }
+}
+
+#[derive(Default, Deserialize)]
 struct CredentialUpdate {
     name: Option<String>,
     provider: Option<String>,
@@ -1873,6 +1892,20 @@ struct CredentialUpdate {
     vault_ref: Option<String>,
     secret: Option<String>,
     tenant: Option<String>,
+}
+
+/// Redacted `Debug` (WOR-2640). As [`CredentialCreate`].
+impl std::fmt::Debug for CredentialUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialUpdate")
+            .field("name", &self.name)
+            .field("provider", &self.provider)
+            .field("kind", &self.kind)
+            .field("vault_ref", &self.vault_ref)
+            .field("secret", &self.secret.as_ref().map(|_| "[REDACTED]"))
+            .field("tenant", &self.tenant)
+            .finish()
+    }
 }
 
 fn create_credential(body: Option<&str>) -> Resp {
@@ -4697,5 +4730,34 @@ mod tests {
             !content.contains("secret_hash"),
             "no verifier material may reach the typed feed: {content}"
         );
+    }
+
+    /// WOR-2640: the admin API takes a plaintext credential in the
+    /// request body, and a `{:?}` of a rejected body would put it in
+    /// the admin log.
+    #[test]
+    fn debug_never_renders_an_admin_credential_secret() {
+        let create = CredentialCreate {
+            id: Some("cred-1".to_string()),
+            secret: Some("SENTINEL-SECRET-9f3a".to_string()),
+            ..CredentialCreate::default()
+        };
+        let rendered = format!("{create:?}");
+        assert!(
+            !rendered.contains("SENTINEL-SECRET-9f3a"),
+            "the posted credential reached Debug: {rendered}"
+        );
+        assert!(rendered.contains("cred-1"), "lost the id: {rendered}");
+
+        let update = CredentialUpdate {
+            secret: Some("SENTINEL-SECRET-9f3a".to_string()),
+            ..CredentialUpdate::default()
+        };
+        assert!(!format!("{update:?}").contains("SENTINEL-SECRET-9f3a"));
+
+        // Absent stays visibly absent: an operator debugging a
+        // "credential has no material" error needs that distinction.
+        let empty = CredentialUpdate::default();
+        assert!(format!("{empty:?}").contains("secret: None"));
     }
 }

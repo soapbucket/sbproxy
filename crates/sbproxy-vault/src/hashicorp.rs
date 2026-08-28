@@ -81,7 +81,7 @@ struct BackendInner {
 /// operator wrote the token directly into config). `AppRole` exchanges
 /// `role_id + secret_id` for a token. `Kubernetes` exchanges the
 /// pod's service-account JWT for a token under the configured role.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum AuthSource {
     Token,
     AppRole {
@@ -98,6 +98,33 @@ enum AuthSource {
         /// Auth endpoint mount (defaults to `kubernetes`).
         mount: String,
     },
+}
+
+/// Redacted `Debug` (WOR-2640). `secret_id` is half of an AppRole login
+/// and is reusable until it is revoked; `role_id` is the public half and
+/// is what names the misconfigured role.
+impl std::fmt::Debug for AuthSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Token => f.write_str("Token"),
+            Self::AppRole { role_id, mount, .. } => f
+                .debug_struct("AppRole")
+                .field("role_id", role_id)
+                .field("secret_id", &"[REDACTED]")
+                .field("mount", mount)
+                .finish(),
+            Self::Kubernetes {
+                role,
+                jwt_path,
+                mount,
+            } => f
+                .debug_struct("Kubernetes")
+                .field("role", role)
+                .field("jwt_path", jwt_path)
+                .field("mount", mount)
+                .finish(),
+        }
+    }
 }
 
 /// Which Vault KV engine the configured mount serves.
@@ -140,7 +167,7 @@ pub struct HashiCorpConfig {
 }
 
 /// Operator-facing auth method enum.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum HashiCorpAuth {
     /// Static token. The operator resolves it from the config's
     /// secret reference such as `${ENV_VAR}`, `file:`, or a provider
@@ -172,6 +199,37 @@ pub enum HashiCorpAuth {
         /// Kubernetes auth mount path (defaults to `kubernetes`).
         mount: Option<String>,
     },
+}
+
+/// Redacted `Debug` (WOR-2640). The operator-facing twin of the
+/// crate-private `AuthSource`, and the one that reaches a config-load
+/// error: a static Vault client token and an AppRole `secret_id` are
+/// both reusable credentials.
+impl std::fmt::Debug for HashiCorpAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Token { .. } => f
+                .debug_struct("Token")
+                .field("token", &"[REDACTED]")
+                .finish(),
+            Self::AppRole { role_id, mount, .. } => f
+                .debug_struct("AppRole")
+                .field("role_id", role_id)
+                .field("secret_id", &"[REDACTED]")
+                .field("mount", mount)
+                .finish(),
+            Self::Kubernetes {
+                role,
+                jwt_path,
+                mount,
+            } => f
+                .debug_struct("Kubernetes")
+                .field("role", role)
+                .field("jwt_path", jwt_path)
+                .field("mount", mount)
+                .finish(),
+        }
+    }
 }
 
 impl HashiCorpVaultBackend {
@@ -979,5 +1037,49 @@ mod tests {
             format_vault_error("gateway timeout", "Bad Gateway"),
             "Bad Gateway"
         );
+    }
+
+    /// WOR-2640: a static Vault client token and an AppRole `secret_id`
+    /// are both reusable credentials. `role_id` is the public half and
+    /// has to survive, because it names the role that failed to log in.
+    #[test]
+    fn debug_never_renders_the_vault_token_or_secret_id() {
+        let token_auth = HashiCorpAuth::Token {
+            token: "SENTINEL-SECRET-9f3a".to_string(),
+        };
+        assert!(
+            !format!("{token_auth:?}").contains("SENTINEL-SECRET-9f3a"),
+            "the Vault client token reached Debug"
+        );
+
+        let approle = HashiCorpAuth::AppRole {
+            role_id: "role-1".to_string(),
+            secret_id: "SENTINEL-SECRET-9f3a".to_string(),
+            mount: None,
+        };
+        let rendered = format!("{approle:?}");
+        assert!(
+            !rendered.contains("SENTINEL-SECRET-9f3a"),
+            "the secret id reached Debug"
+        );
+        assert!(rendered.contains("role-1"), "lost the role id: {rendered}");
+
+        let cfg = HashiCorpConfig {
+            addr: "https://vault.example".to_string(),
+            auth: approle,
+            mount: "secret".to_string(),
+            engine: KvEngine::V2,
+            cache_ttl: None,
+            namespace: None,
+        };
+        assert!(!format!("{cfg:?}").contains("SENTINEL-SECRET-9f3a"));
+
+        // The internal twin the backend actually holds.
+        let internal = AuthSource::AppRole {
+            role_id: "role-1".to_string(),
+            secret_id: "SENTINEL-SECRET-9f3a".to_string(),
+            mount: "approle".to_string(),
+        };
+        assert!(!format!("{internal:?}").contains("SENTINEL-SECRET-9f3a"));
     }
 }

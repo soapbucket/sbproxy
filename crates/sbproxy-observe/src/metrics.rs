@@ -4953,15 +4953,59 @@ pub fn record_rate_limit_decision(policy: &str, result: &'static str) {
 }
 
 /// Record an idempotency-cache outcome on
-/// `sbproxy_idempotency_cache_results_total{backend, result}`. `result`
-/// is one of `hit`, `miss`, `conflict`, `not_applicable`, or `error`.
+/// `sbproxy_idempotency_cache_results_total{backend, result}`.
+///
 /// `backend` is the cache implementation that answered (`memory` or
 /// `kv`), so a broken shared store is visible next to a cold local one.
 ///
-/// `error` is a store-side read or write failure. It is counted in
-/// addition to the `miss` the lookup degrades into, so `miss` stays the
-/// denominator for lookups and `error` is the numerator for "the cache
-/// is not working".
+/// `result` is a closed set in two halves. The first half is the
+/// request's outcome, and exactly one of these is recorded per request
+/// the middleware *resolves*, so they sum to the middleware's own
+/// throughput rather than to the origin's request count. A request the
+/// middleware skips records nothing: an oversize request or response
+/// body, a multipart body, and a full buffering pool each go upstream
+/// uncached and are visible only as an `x-sbproxy-idempotency:
+/// SKIPPED-*` response header. `docs/configuration.md` says the same
+/// thing in the operator's terms.
+///
+/// * `not_applicable` - no idempotency key on the request. Recorded on
+///   the AI proxy path, which has the whole body before it decides;
+///   the streaming proxy path never engages the middleware for a
+///   keyless request and records nothing.
+/// * `miss` - this request took the key and goes upstream.
+/// * `takeover` - the same, on a key whose previous holder never came
+///   back. A nonzero rate means requests are dying mid-flight.
+/// * `hit` - a stored response was replayed.
+/// * `coalesced` - a stored response was replayed after waiting for
+///   the request that was producing it. The upstream was called once
+///   for both.
+/// * `conflict` - the key carried a different request body; answered
+///   409 `ledger.idempotency_conflict`.
+/// * `wait_timeout` - the wait budget ran out while the holder was
+///   still working; answered 409 `ledger.idempotency_in_flight`. A
+///   nonzero rate means overlapping retries are outliving the budget.
+/// * `abandoned` - the holder ended without storing a response, so
+///   there was nothing to wait for. Same 409, opposite thing to look
+///   at: requests are failing rather than running long.
+/// * `in_flight` - a live claim was found by a request that cannot wait
+///   for it, so no wait was attempted; answered 409
+///   `ledger.idempotency_in_flight` immediately. Two populations: the
+///   GraphQL late path, which has already committed the body and has
+///   nowhere to re-send it, and a request that could not take a waiter
+///   slot because the waiter pool was full.
+///
+/// The second half is diagnostic and additive rather than terminal. A
+/// request can record one of these as well as its outcome:
+///
+/// * `error` - a store-side read or write failure. Counted in addition
+///   to the outcome the failure degrades into, so `miss` stays the
+///   denominator for lookups and `error` is the numerator for "the
+///   cache is not working".
+/// * `fenced` - a publish was refused because another request owns the
+///   key or has already answered it.
+/// * `single_flight_unsupported` - the configured store has no atomic
+///   create, so overlapping first requests are not serialized. Replay
+///   and conflict detection still work.
 pub fn record_idempotency_cache_result(backend: &'static str, result: &'static str) {
     use prometheus::{register_int_counter_vec, IntCounterVec};
     use std::sync::OnceLock;

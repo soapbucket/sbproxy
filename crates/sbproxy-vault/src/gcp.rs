@@ -97,7 +97,7 @@ pub struct GcpSecretManagerConfig {
 }
 
 /// Operator-facing GCP authentication method.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GcpSecretManagerAuth {
     /// Application Default Credentials. This includes service-account
@@ -122,6 +122,30 @@ pub enum GcpSecretManagerAuth {
         /// Path to the external-account ADC JSON file.
         path: String,
     },
+}
+
+/// Redacted `Debug` (WOR-2640). `ServiceAccountKeyJson` carries the
+/// service account's RSA private key inline, which is the single most
+/// damaging value in this crate to put in a log line. The file paths
+/// stay: a path is what an operator needs to fix the wrong one.
+impl std::fmt::Debug for GcpSecretManagerAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ApplicationDefault => f.write_str("ApplicationDefault"),
+            Self::ServiceAccountKeyFile { path } => f
+                .debug_struct("ServiceAccountKeyFile")
+                .field("path", path)
+                .finish(),
+            Self::ServiceAccountKeyJson { .. } => f
+                .debug_struct("ServiceAccountKeyJson")
+                .field("json", &"[REDACTED]")
+                .finish(),
+            Self::ExternalAccountFile { path } => f
+                .debug_struct("ExternalAccountFile")
+                .field("path", path)
+                .finish(),
+        }
+    }
 }
 
 impl GcpSecretManagerBackend {
@@ -556,10 +580,19 @@ fn response_to_http_with_status(status: u16, response: ureq::Response) -> Result
     Ok(GcpHttpResponse { status, body })
 }
 
-#[derive(Debug)]
 struct CachedAccessToken {
     token: String,
     expires_at: Instant,
+}
+
+/// Redacted `Debug` (WOR-2640). This holds a live Google OAuth token.
+impl std::fmt::Debug for CachedAccessToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedAccessToken")
+            .field("token", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 struct ExternalAccountTokenProvider {
@@ -810,17 +843,38 @@ struct ExternalCredentialFormat {
     subject_token_field_name: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct StsTokenResponse {
     access_token: String,
     #[serde(default)]
     expires_in: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+/// Redacted `Debug` (WOR-2640). A deserialize failure downstream of a
+/// successful STS exchange would otherwise format the token it just
+/// received.
+impl std::fmt::Debug for StsTokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StsTokenResponse")
+            .field("access_token", &"[REDACTED]")
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
+}
+
+#[derive(Deserialize)]
 struct ImpersonationResponse {
     #[serde(rename = "accessToken")]
     access_token: String,
+}
+
+/// Redacted `Debug` (WOR-2640). As [`StsTokenResponse`].
+impl std::fmt::Debug for ImpersonationResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImpersonationResponse")
+            .field("access_token", &"[REDACTED]")
+            .finish()
+    }
 }
 
 fn is_external_account_credentials_file(path: impl AsRef<OsStr>) -> bool {
@@ -1184,5 +1238,54 @@ mod tests {
     fn gcp_error_detail_falls_back_on_non_json() {
         let body = "upstream proxy error, not json";
         assert_eq!(gcp_error_detail(body), "upstream proxy error, not json");
+    }
+
+    /// WOR-2640: the inline service-account JSON carries an RSA private
+    /// key, and both token-exchange responses carry a live OAuth token.
+    #[test]
+    fn debug_never_renders_gcp_key_material_or_tokens() {
+        let auth = GcpSecretManagerAuth::ServiceAccountKeyJson {
+            json: "{\"private_key\":\"SENTINEL-SECRET-9f3a\"}".to_string(),
+        };
+        assert!(
+            !format!("{auth:?}").contains("SENTINEL-SECRET-9f3a"),
+            "the service-account key reached Debug: {auth:?}"
+        );
+
+        let cfg = GcpSecretManagerConfig {
+            project_id: Some("proj".to_string()),
+            endpoint: None,
+            auth,
+            cache_ttl_secs: None,
+        };
+        let rendered = format!("{cfg:?}");
+        assert!(
+            !rendered.contains("SENTINEL-SECRET-9f3a"),
+            "the containing config leaked it"
+        );
+        assert!(rendered.contains("proj"), "lost the project id: {rendered}");
+
+        let cached = CachedAccessToken {
+            token: "SENTINEL-SECRET-9f3a".to_string(),
+            expires_at: std::time::Instant::now(),
+        };
+        assert!(!format!("{cached:?}").contains("SENTINEL-SECRET-9f3a"));
+
+        let sts = StsTokenResponse {
+            access_token: "SENTINEL-SECRET-9f3a".to_string(),
+            expires_in: Some(3600),
+        };
+        assert!(!format!("{sts:?}").contains("SENTINEL-SECRET-9f3a"));
+
+        let impersonated = ImpersonationResponse {
+            access_token: "SENTINEL-SECRET-9f3a".to_string(),
+        };
+        assert!(!format!("{impersonated:?}").contains("SENTINEL-SECRET-9f3a"));
+
+        // A path is not a secret and is the thing an operator fixes.
+        let by_path = GcpSecretManagerAuth::ServiceAccountKeyFile {
+            path: "/etc/sa.json".to_string(),
+        };
+        assert!(format!("{by_path:?}").contains("/etc/sa.json"));
     }
 }

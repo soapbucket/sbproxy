@@ -106,7 +106,7 @@ pub const DEFAULT_SIGNATURE_LABEL: &str = "sig1";
 ///   but signs outbound requests with Ed25519 or HMAC only, so
 ///   [`MessageSigner::new`] rejects it rather than silently signing
 ///   with something else.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SignerConfig {
     /// `keyid` parameter advertised on every signature. The verifier
     /// uses this string to look up the matching public key on its side.
@@ -121,6 +121,20 @@ pub struct SignerConfig {
     /// `Signature-Input`. An empty vector means "use
     /// [`DEFAULT_COVERED_COMPONENTS`]".
     pub covered_components: Vec<String>,
+}
+
+/// Redacted `Debug` (WOR-2640). `secret` is either an Ed25519 private
+/// seed or an HMAC shared secret, and [`SignerError`] paths format the
+/// config that produced them.
+impl std::fmt::Debug for SignerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignerConfig")
+            .field("key_id", &self.key_id)
+            .field("algorithm", &self.algorithm)
+            .field("secret", &"[REDACTED]")
+            .field("covered_components", &self.covered_components)
+            .finish()
+    }
 }
 
 /// Errors produced by the signer.
@@ -851,5 +865,28 @@ mod tests {
             !debug_str.contains("super-secret"),
             "debug output leaked secret: {debug_str}"
         );
+    }
+
+    /// WOR-2640: `secret` is an Ed25519 private seed or an HMAC shared
+    /// secret, and the signer's error paths format the config.
+    #[test]
+    fn debug_never_renders_the_signing_secret() {
+        let cfg = SignerConfig {
+            key_id: "egress-1".to_string(),
+            algorithm: SignatureAlgorithm::HmacSha256,
+            secret: b"SENTINEL-SECRET-9f3a".to_vec(),
+            covered_components: vec![],
+        };
+        let rendered = format!("{cfg:?}");
+        assert!(
+            !rendered.contains("SENTINEL-SECRET-9f3a"),
+            "the signing secret reached Debug: {rendered}"
+        );
+        // Vec<u8> renders as a byte list, so check the bytes too.
+        assert!(
+            !rendered.contains(&format!("{:?}", b"SENTINEL-SECRET-9f3a".to_vec())),
+            "the signing secret reached Debug as bytes: {rendered}"
+        );
+        assert!(rendered.contains("egress-1"));
     }
 }

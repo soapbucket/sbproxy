@@ -46,7 +46,7 @@ pub const TOKEN_LEN: usize = TOKEN_PREFIX.len() + KEY_ID_HEX_LEN + 1 + SECRET_HE
 
 /// A minted virtual key: the public id, the one-time plaintext token shown to
 /// the operator exactly once, and the at-rest hash that is persisted.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MintedKey {
     /// Stable public identifier, the prefix of the token.
     pub key_id: String,
@@ -56,11 +56,26 @@ pub struct MintedKey {
     pub secret_hash: String,
 }
 
+/// Redacted `Debug` (WOR-2640). `token` is the one-time bearer token,
+/// and it is a working credential from the moment it is minted until it
+/// is revoked. `secret_hash` stays: it is the peppered HMAC that is
+/// persisted anyway, and it is what correlates a minted key with the
+/// record it produced.
+impl std::fmt::Debug for MintedKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MintedKey")
+            .field("key_id", &self.key_id)
+            .field("token", &"[REDACTED]")
+            .field("secret_hash", &self.secret_hash)
+            .finish()
+    }
+}
+
 /// A freshly minted secret for an existing key id (rotation): the one-time
 /// plaintext token (in the same `sbp_<key_id>_<secret>` shape [`mint_key`]
 /// produces, not the legacy `sk-` shape), the plaintext secret half, and the
 /// at-rest hash that replaces the record's current hash.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MintedSecret {
     /// The full bearer token `sbp_<key_id>_<secret>`, built from the
     /// existing key id and the freshly minted secret. Shown once, never
@@ -70,6 +85,18 @@ pub struct MintedSecret {
     pub secret: String,
     /// `HMAC-SHA256(secret, pepper)`, hex-encoded. Persisted as the new hash.
     pub secret_hash: String,
+}
+
+/// Redacted `Debug` (WOR-2640). As [`MintedKey`], and the plaintext
+/// secret half is here as well as the full token.
+impl std::fmt::Debug for MintedSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MintedSecret")
+            .field("token", &"[REDACTED]")
+            .field("secret", &"[REDACTED]")
+            .field("secret_hash", &self.secret_hash)
+            .finish()
+    }
 }
 
 /// Mint a brand-new virtual key, returning the public id, the one-time token,
@@ -568,5 +595,31 @@ mod tests {
         assert_eq!(key_id, "team", "splits on the first dash, not the last");
         assert_eq!(secret, "alpha-secretvalue");
         assert!(!is_conforming_key_id("team-alpha"));
+    }
+
+    /// WOR-2640: a minted token is a working credential the moment it
+    /// exists. A `{:?}` of the mint result, in an admin handler or a
+    /// test failure, used to print it in full.
+    #[test]
+    fn debug_never_renders_a_minted_token() {
+        let minted = mint_key(b"pepper");
+        let rendered = format!("{minted:?}");
+        assert!(
+            !rendered.contains(&minted.token),
+            "the minted token reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains(&minted.key_id),
+            "the key id must survive so a mint stays traceable: {rendered}"
+        );
+
+        let rotated =
+            KeyCrypto::new(b"pepper".to_vec(), b"master".to_vec()).mint_secret(&minted.key_id);
+        let rendered = format!("{rotated:?}");
+        assert!(
+            !rendered.contains(&rotated.token) && !rendered.contains(&rotated.secret),
+            "the rotated secret reached Debug: {rendered}"
+        );
+        assert!(rendered.contains(&rotated.secret_hash));
     }
 }

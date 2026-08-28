@@ -95,7 +95,7 @@ pub struct AzureKeyVaultConfig {
 }
 
 /// Operator-facing Azure authentication method.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AzureKeyVaultAuth {
     /// System-assigned managed identity (default). Uses the App
@@ -124,6 +124,34 @@ pub enum AzureKeyVaultAuth {
     /// The logged-in Azure CLI (`az account get-access-token`).
     /// Intended for local development, not production deployments.
     AzureCli,
+}
+
+/// Redacted `Debug` (WOR-2640). `client_secret` is a reusable Entra app
+/// credential; the tenant and client ids that identify the app are not,
+/// so they stay.
+impl std::fmt::Debug for AzureKeyVaultAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ManagedIdentity => f.write_str("ManagedIdentity"),
+            Self::UserAssignedIdentity { client_id } => f
+                .debug_struct("UserAssignedIdentity")
+                .field("client_id", client_id)
+                .finish(),
+            Self::ServicePrincipal {
+                tenant_id,
+                client_id,
+                authority,
+                ..
+            } => f
+                .debug_struct("ServicePrincipal")
+                .field("tenant_id", tenant_id)
+                .field("client_id", client_id)
+                .field("client_secret", &"[REDACTED]")
+                .field("authority", authority)
+                .finish(),
+            Self::AzureCli => f.write_str("AzureCli"),
+        }
+    }
 }
 
 impl AzureKeyVaultBackend {
@@ -488,10 +516,19 @@ fn response_to_http_with_status(
 
 // --- token acquisition -------------------------------------------------
 
-#[derive(Debug)]
 struct CachedAccessToken {
     token: String,
     expires_at: Instant,
+}
+
+/// Redacted `Debug` (WOR-2640). This holds a live Entra bearer token.
+impl std::fmt::Debug for CachedAccessToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedAccessToken")
+            .field("token", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 /// One token fetch against an identity source. Implementations do the
@@ -1439,5 +1476,39 @@ mod tests {
         assert_eq!(provider.access_token().unwrap(), "tok-0");
         assert_eq!(provider.access_token().unwrap(), "tok-1");
         assert_eq!(provider.fetcher.calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// WOR-2640: the Entra app secret and a live bearer token are both
+    /// reusable, and both used to render in full.
+    #[test]
+    fn debug_never_renders_the_azure_client_secret_or_token() {
+        let auth = AzureKeyVaultAuth::ServicePrincipal {
+            tenant_id: "tenant-1".to_string(),
+            client_id: "client-1".to_string(),
+            client_secret: "SENTINEL-SECRET-9f3a".to_string(),
+            authority: None,
+        };
+        let rendered = format!("{auth:?}");
+        assert!(
+            !rendered.contains("SENTINEL-SECRET-9f3a"),
+            "the client secret reached Debug: {rendered}"
+        );
+        assert!(rendered.contains("tenant-1") && rendered.contains("client-1"));
+
+        let cfg = AzureKeyVaultConfig {
+            vault_url: "https://v.vault.azure.net".to_string(),
+            auth,
+            cache_ttl_secs: None,
+        };
+        assert!(!format!("{cfg:?}").contains("SENTINEL-SECRET-9f3a"));
+
+        let cached = CachedAccessToken {
+            token: "SENTINEL-SECRET-9f3a".to_string(),
+            expires_at: std::time::Instant::now(),
+        };
+        assert!(
+            !format!("{cached:?}").contains("SENTINEL-SECRET-9f3a"),
+            "the cached bearer token reached Debug"
+        );
     }
 }
