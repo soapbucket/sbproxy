@@ -934,6 +934,7 @@ fn status_node_from_membership(
             ("suspect", vec!["membership_suspect".to_string()])
         }
         sbproxy_mesh::ClusterMemberState::Dead => ("dead", vec!["membership_dead".to_string()]),
+        sbproxy_mesh::ClusterMemberState::Left => ("left", vec!["membership_left".to_string()]),
         sbproxy_mesh::ClusterMemberState::Unreachable => {
             ("unreachable", vec!["membership_unreachable".to_string()])
         }
@@ -1005,6 +1006,7 @@ const fn member_state_str(
         sbproxy_ai::model_directory::DirectoryMemberState::Alive => "alive",
         sbproxy_ai::model_directory::DirectoryMemberState::Suspect => "suspect",
         sbproxy_ai::model_directory::DirectoryMemberState::Dead => "dead",
+        sbproxy_ai::model_directory::DirectoryMemberState::Left => "left",
         sbproxy_ai::model_directory::DirectoryMemberState::Unreachable => "unreachable",
     }
 }

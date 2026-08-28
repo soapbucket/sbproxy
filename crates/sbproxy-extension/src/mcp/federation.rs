@@ -1378,6 +1378,14 @@ pub struct McpFederation {
     /// records `false`; a 401 or 407 records `true` -- see
     /// `classify_auth_required_from_error`. WOR-2384.
     server_auth_required: ArcSwap<HashMap<String, bool>>,
+    /// Discriminated runtime state per federated server (WOR-2110).
+    /// Separate from [`Self::server_auth_required`], which stays a
+    /// boolean for the peer-profile downgrade check.
+    server_runtime: ArcSwap<HashMap<String, super::auth_state::ServerRuntimeState>>,
+    /// In-flight tool-call auth posture, keyed by the caller's
+    /// correlation id. A step-up on one call does not move the server
+    /// out of [`super::auth_state::ServerRuntimeState::Ready`].
+    tool_call_auth: std::sync::Mutex<HashMap<String, super::auth_state::ToolCallAuthStatus>>,
     /// WOR-818: mcpApps capability values mirrored from any
     /// upstream that advertised one. Empty when no upstream
     /// supports SEP-1865. The first non-empty value is what the
@@ -1525,6 +1533,15 @@ impl McpFederation {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_default();
+        let server_runtime: HashMap<String, super::auth_state::ServerRuntimeState> = servers
+            .iter()
+            .map(|server| {
+                (
+                    server.name.clone(),
+                    super::auth_state::ServerRuntimeState::Starting,
+                )
+            })
+            .collect();
         Self {
             servers,
             tool_catalog: ArcSwap::from_pointee(ToolCatalogState::empty()),
@@ -1535,6 +1552,8 @@ impl McpFederation {
             server_capabilities: ArcSwap::from_pointee(HashMap::new()),
             server_protocol_versions: ArcSwap::from_pointee(HashMap::new()),
             server_auth_required: ArcSwap::from_pointee(HashMap::new()),
+            server_runtime: ArcSwap::from_pointee(server_runtime),
+            tool_call_auth: std::sync::Mutex::new(HashMap::new()),
             mcp_apps_capability: ArcSwap::from_pointee(None),
             client,
             openapi_client,
@@ -2073,6 +2092,8 @@ impl McpFederation {
         let mut protocol_versions: HashMap<String, String> =
             (*self.server_protocol_versions.load_full()).clone();
         let mut auth_required: HashMap<String, bool> = HashMap::new();
+        let mut runtime: HashMap<String, super::auth_state::ServerRuntimeState> =
+            (*self.server_runtime.load_full()).clone();
         for server in &self.servers {
             if server.openapi.is_some() || server.local.is_some() {
                 continue;
@@ -2086,10 +2107,36 @@ impl McpFederation {
                     // so a success is unambiguous proof the upstream
                     // did not require auth for this contact.
                     auth_required.insert(server.name.clone(), false);
+                    runtime.insert(
+                        server.name.clone(),
+                        super::auth_state::ServerRuntimeState::Ready,
+                    );
                 }
                 Err(e) => {
                     if let Some(required) = classify_auth_required_from_error(&e) {
                         auth_required.insert(server.name.clone(), required);
+                        if required {
+                            let header = e
+                                .downcast_ref::<super::streamable::McpUpstreamHttpStatus>()
+                                .and_then(|status| status.www_authenticate.as_deref());
+                            let challenge = super::auth_state::parse_bearer_challenge(header);
+                            runtime.insert(
+                                server.name.clone(),
+                                super::auth_state::ServerRuntimeState::AuthRequired { challenge },
+                            );
+                            sbproxy_observe::metrics::record_mcp_tool_dispatch(
+                                &server.name,
+                                "server_auth_required",
+                                0.0,
+                            );
+                        }
+                    } else {
+                        runtime.insert(
+                            server.name.clone(),
+                            super::auth_state::ServerRuntimeState::Error {
+                                reason: "upstream_error".to_string(),
+                            },
+                        );
                     }
                     warn!(
                         server = %server.name,
@@ -2104,6 +2151,7 @@ impl McpFederation {
         self.server_protocol_versions
             .store(Arc::new(protocol_versions));
         self.server_auth_required.store(Arc::new(auth_required));
+        self.server_runtime.store(Arc::new(runtime));
         count
     }
 
@@ -2157,6 +2205,116 @@ impl McpFederation {
     /// that persistence already lives.
     pub fn last_auth_required(&self, server_name: &str) -> Option<bool> {
         self.server_auth_required.load().get(server_name).copied()
+    }
+
+    /// Runtime state for one federated server (WOR-2110), distinct from
+    /// operator enable/disable intent and from the boolean
+    /// [`Self::last_auth_required`] used by peer-profile downgrade.
+    pub(crate) fn server_runtime_state(
+        &self,
+        server_name: &str,
+    ) -> Option<super::auth_state::ServerRuntimeState> {
+        self.server_runtime.load().get(server_name).cloned()
+    }
+
+    /// Snapshot of every federated server's runtime state plus in-flight
+    /// tool-call auth, for `GET /admin/mcp-runtime`.
+    pub fn runtime_status_json(&self) -> serde_json::Value {
+        let mut servers = Vec::new();
+        for server in &self.servers {
+            let state = self
+                .server_runtime_state(&server.name)
+                .unwrap_or(super::auth_state::ServerRuntimeState::Starting);
+            servers.push(json!({
+                "name": server.name,
+                "intent": "enabled",
+                "runtime": state,
+            }));
+        }
+        let calls: Vec<serde_json::Value> = self
+            .tool_call_auth
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|(id, status)| {
+                json!({
+                    "correlation_id": id,
+                    "auth": status,
+                })
+            })
+            .collect();
+        json!({
+            "enabled": !self.servers.is_empty(),
+            "servers": servers,
+            "tool_calls": calls,
+        })
+    }
+
+    fn begin_tool_call(&self, correlation_id: &str) {
+        self.tool_call_auth
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                correlation_id.to_string(),
+                super::auth_state::ToolCallAuthStatus::Running,
+            );
+    }
+
+    fn note_tool_call_failure(
+        &self,
+        correlation_id: &str,
+        server_name: &str,
+        tool_name: &str,
+        error: &anyhow::Error,
+    ) {
+        let Some(status) = error.downcast_ref::<super::streamable::McpUpstreamHttpStatus>() else {
+            self.complete_tool_call(correlation_id);
+            return;
+        };
+        if status.status != 401 && status.status != 407 {
+            self.complete_tool_call(correlation_id);
+            return;
+        }
+        let challenge =
+            super::auth_state::parse_bearer_challenge(status.www_authenticate.as_deref());
+        self.tool_call_auth
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                correlation_id.to_string(),
+                super::auth_state::ToolCallAuthStatus::AuthRequired {
+                    server: server_name.to_string(),
+                    tool: tool_name.to_string(),
+                    challenge,
+                },
+            );
+        sbproxy_observe::metrics::record_mcp_tool_dispatch(tool_name, "call_auth_required", 0.0);
+        tracing::info!(
+            event = "mcp_tool_call_auth_required",
+            server = %server_name,
+            tool = %tool_name,
+            "tool call blocked on an auth challenge; server remains serving other calls"
+        );
+    }
+
+    fn complete_tool_call(&self, correlation_id: &str) {
+        self.tool_call_auth
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(correlation_id);
+    }
+
+    fn complete_tool_call_success(&self, correlation_id: &str) -> bool {
+        let mut map = self
+            .tool_call_auth
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let valid = map
+            .get(correlation_id)
+            .map(super::auth_state::success_is_valid)
+            .unwrap_or(true);
+        map.remove(correlation_id);
+        valid
     }
 
     /// Initialize the upstream and return the `capabilities` object it
@@ -3039,17 +3197,29 @@ impl McpFederation {
             "routing tool call to upstream server"
         );
 
-        let resp = self
-            .dispatch_request(server, &req, upstream_headers)
-            .await?;
+        self.begin_tool_call(correlation_id);
+        let resp = match self.dispatch_request(server, &req, upstream_headers).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                self.note_tool_call_failure(correlation_id, &server.name, tool_name, &e);
+                return Err(e);
+            }
+        };
 
         if let Some(err) = resp.error {
+            self.complete_tool_call(correlation_id);
             anyhow::bail!(
                 "tool call {} error from {}: {} (code {})",
                 tool_name,
                 server.name,
                 err.message,
                 err.code
+            );
+        }
+        if !self.complete_tool_call_success(correlation_id) {
+            anyhow::bail!(
+                "tool call {} returned success while blocked on auth",
+                tool_name
             );
         }
 
@@ -3584,6 +3754,20 @@ impl McpFederation {
         self.server_protocol_versions
             .store(Arc::new(protocol_versions));
         self.server_auth_required.store(Arc::new(auth_required));
+        let mut runtime = (*self.server_runtime.load_full()).clone();
+        for (name, required) in self.server_auth_required.load().iter() {
+            if *required {
+                runtime.insert(
+                    name.clone(),
+                    super::auth_state::ServerRuntimeState::AuthRequired {
+                        challenge: super::auth_state::parse_bearer_challenge(None),
+                    },
+                );
+            } else {
+                runtime.insert(name.clone(), super::auth_state::ServerRuntimeState::Ready);
+            }
+        }
+        self.server_runtime.store(Arc::new(runtime));
     }
 
     /// Test-only: publish the resource registry directly, the same way
@@ -6498,12 +6682,51 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_call_step_up_leaves_a_ready_server_serving_other_calls() {
+        let fed = McpFederation::new(vec![mock_server("gh", "http://gh.test")]);
+        let mut runtime = HashMap::new();
+        runtime.insert(
+            "gh".to_string(),
+            crate::mcp::auth_state::ServerRuntimeState::Ready,
+        );
+        fed.server_runtime.store(Arc::new(runtime));
+        fed.begin_tool_call("corr-1");
+        let err: anyhow::Error = crate::mcp::streamable::McpUpstreamHttpStatus {
+            status: 401,
+            www_authenticate_present: true,
+            www_authenticate: Some(
+                r#"Bearer error="insufficient_scope", scope="repo""#.to_string(),
+            ),
+        }
+        .into();
+        fed.note_tool_call_failure("corr-1", "gh", "search", &err);
+        assert!(matches!(
+            fed.server_runtime_state("gh"),
+            Some(crate::mcp::auth_state::ServerRuntimeState::Ready)
+        ));
+        let calls = fed
+            .tool_call_auth
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(matches!(
+            calls.get("corr-1"),
+            Some(crate::mcp::auth_state::ToolCallAuthStatus::AuthRequired { tool, .. })
+                if tool == "search"
+        ));
+        drop(calls);
+        assert!(!fed.complete_tool_call_success("corr-1"));
+        fed.begin_tool_call("corr-2");
+        assert!(fed.complete_tool_call_success("corr-2"));
+    }
+
+    #[test]
     fn classify_auth_required_from_error_reads_401_and_407_as_true_and_everything_else_as_none() {
         use super::super::streamable::McpUpstreamHttpStatus;
 
         let unauthorized: anyhow::Error = McpUpstreamHttpStatus {
             status: 401,
             www_authenticate_present: true,
+            www_authenticate: None,
         }
         .into();
         assert_eq!(classify_auth_required_from_error(&unauthorized), Some(true));
@@ -6513,6 +6736,7 @@ mod tests {
         let bare_unauthorized: anyhow::Error = McpUpstreamHttpStatus {
             status: 401,
             www_authenticate_present: false,
+            www_authenticate: None,
         }
         .into();
         assert_eq!(
@@ -6523,6 +6747,7 @@ mod tests {
         let proxy_auth_required: anyhow::Error = McpUpstreamHttpStatus {
             status: 407,
             www_authenticate_present: false,
+            www_authenticate: None,
         }
         .into();
         assert_eq!(
@@ -6536,6 +6761,7 @@ mod tests {
         let not_found: anyhow::Error = McpUpstreamHttpStatus {
             status: 404,
             www_authenticate_present: false,
+            www_authenticate: None,
         }
         .into();
         assert_eq!(classify_auth_required_from_error(&not_found), None);
@@ -6543,6 +6769,7 @@ mod tests {
         let server_error: anyhow::Error = McpUpstreamHttpStatus {
             status: 500,
             www_authenticate_present: false,
+            www_authenticate: None,
         }
         .into();
         assert_eq!(classify_auth_required_from_error(&server_error), None);

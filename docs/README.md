@@ -74,7 +74,7 @@ SBproxy's traditional reverse-proxy pillar: routing, load balancing, transforms,
 - [storage.md](storage.md) - the `storage` action (serve objects from S3, GCS, Azure, or local disk), plus the map of where the gateway persists its own state and which backends hold what.
 - [routing-strategies.md](routing-strategies.md) - the `RoutingStrategy` trait: opt-in extension point for custom upstream selection inside `load_balancer`.
 - [transforms.md](transforms.md) - what a transform is, the common transform fields, chaining and order, and one section per shipped transform kind (JSON shaping, text/encoding, HTML/Markdown, scripting transforms, WASM, agent content-shaping).
-- [openapi-emission.md](openapi-emission.md) - publishing an OpenAPI 3.0 document from the live config.
+- [openapi-emission.md](openapi-emission.md) - publishing an OpenAPI 3.0.3 document (3.1 on request) from the live config.
 - [openapi-validation.md](openapi-validation.md) - the `openapi_validation` policy: validating request bodies against an OpenAPI 3.0 document at startup.
 
 ## AI gateway

@@ -6,7 +6,7 @@
 //! and share its closed [`EgressDenied`] vocabulary.
 
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 
 use reqwest::Url;
 use sbproxy_security::egress::{
@@ -80,20 +80,6 @@ impl EgressPolicy {
     pub fn with_scope(mut self, scope: impl Into<String>) -> Self {
         self.scope = scope.into();
         self
-    }
-
-    /// Enforce this policy against a destination URL (OpenAPI tool purpose).
-    ///
-    /// When `mode` is [`EgressMode::AllowByDefault`], returns `Ok(())`
-    /// without contacting the network (legacy compatible). When enforce /
-    /// deny-by-default, delegates to the GF authorizer and fails closed.
-    pub fn check_url(&self, url: &Url) -> Result<(), EgressDenied> {
-        self.authorize(
-            EgressPurpose::OpenApiTool,
-            url.as_str(),
-            &PermissiveTestResolver,
-        )
-        .map(|_| ())
     }
 
     /// Authorize `url` for `purpose` under this policy.
@@ -221,21 +207,6 @@ impl EgressPolicy {
 /// duplicate definition that used to live here is gone.
 pub use sbproxy_security::egress::SystemHostResolver;
 
-/// Resolver used by [`EgressPolicy::check_url`] when no caller-injected
-/// resolver is available. Returns a fixed public address so host/scheme/
-/// port checks still run without touching the network. Enforce paths that
-/// need real DNS pins should pass [`SystemHostResolver`] (or a test map).
-struct PermissiveTestResolver;
-
-impl HostResolver for PermissiveTestResolver {
-    fn resolve(&self, _host: &str, port: u16) -> Result<Vec<SocketAddr>, ()> {
-        Ok(vec![SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
-            port,
-        )])
-    }
-}
-
 fn legacy_passthrough(
     purpose: EgressPurpose,
     url: &str,
@@ -294,10 +265,6 @@ mod tests {
 
     fn addr(ip: [u8; 4], port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3])), port)
-    }
-
-    fn url(raw: &str) -> Url {
-        Url::parse(raw).expect("test url")
     }
 
     #[test]
@@ -433,7 +400,6 @@ mod tests {
                 &resolver,
             )
             .expect("legacy allow-by-default must not deny");
-        assert!(policy.check_url(&url("https://attacker.test/ok")).is_ok());
     }
 
     #[test]
@@ -544,20 +510,5 @@ mod tests {
             Err(EgressDenied::DnsPinMismatch),
             "a rebound answer must refuse before any connect"
         );
-    }
-
-    #[test]
-    fn check_url_unlisted_host_uses_shared_egress_denied() {
-        let policy = EgressPolicy {
-            mode: EgressMode::DenyByDefault,
-            hosts: vec!["other.example.com".to_string()],
-            suffixes: vec![],
-            allow_private: false,
-            scope: "server:api".to_string(),
-        };
-        let err = policy
-            .check_url(&url("https://api.example.com/pets/123"))
-            .expect_err("unlisted host");
-        assert_eq!(err, EgressDenied::UnlistedHost);
     }
 }

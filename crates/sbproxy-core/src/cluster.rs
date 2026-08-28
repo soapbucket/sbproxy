@@ -949,6 +949,7 @@ impl ClusterOwner {
                 sbproxy_mesh::ClusterMemberState::Alive => DirectoryMemberState::Alive,
                 sbproxy_mesh::ClusterMemberState::Suspect => DirectoryMemberState::Suspect,
                 sbproxy_mesh::ClusterMemberState::Dead => DirectoryMemberState::Dead,
+                sbproxy_mesh::ClusterMemberState::Left => DirectoryMemberState::Left,
                 sbproxy_mesh::ClusterMemberState::Unreachable => DirectoryMemberState::Unreachable,
             };
             let node_id = member.node_id.clone();

@@ -2766,6 +2766,19 @@ pub struct GraceConfig {
 /// The subscriber must be acquired **before** `Server::run`
 /// consumes the `Server` value; this function is a no-op when called
 /// after that point because the broadcast sender is dropped.
+/// Ask the local mesh node to tell peers it is leaving. Invoked from
+/// the shutdown-phase logger so a SIGTERM announces `Left` during the
+/// grace window rather than waiting for `MeshNode` drop.
+fn announce_mesh_leave() {
+    let Some(handle) = crate::cluster::current_cluster_handle() else {
+        return;
+    };
+    let Some(mesh) = handle.mesh_node() else {
+        return;
+    };
+    mesh.leave();
+}
+
 pub(super) fn spawn_shutdown_phase_logger(
     mut rx: tokio::sync::broadcast::Receiver<pingora_core::server::ExecutionPhase>,
     grace_seconds: u64,
@@ -2797,6 +2810,7 @@ pub(super) fn spawn_shutdown_phase_logger(
                                 grace_seconds = grace_seconds,
                                 "SIGTERM received; draining in-flight requests"
                             );
+                            announce_mesh_leave();
                         }
                         Ok(pingora_core::server::ExecutionPhase::ShutdownStarted) => {
                             tracing::info!(
@@ -2804,6 +2818,7 @@ pub(super) fn spawn_shutdown_phase_logger(
                                 grace_seconds = grace_seconds,
                                 "shutdown started"
                             );
+                            announce_mesh_leave();
                         }
                         Ok(pingora_core::server::ExecutionPhase::ShutdownGracePeriod) => {
                             tracing::info!(

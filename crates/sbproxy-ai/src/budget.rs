@@ -826,10 +826,21 @@ impl PriceTable {
 }
 
 /// The process-global operator price table (WOR-1707). Replaced on
-/// config (re)load via [`set_price_table`]; consulted by
-/// [`resolve_price`] before the built-in catalog. Empty by default, so
-/// with no config the behavior is exactly the built-in catalog.
+/// config (re)load via [`set_price_table`]. Live request accounting
+/// prefers the per-origin table scoped by [`with_price_table`] /
+/// [`with_price_table_async`] (WOR-2431); this global is the fallback
+/// for call sites that do not carry an origin (tests, admin playground,
+/// spawned work that left the request task). Empty by default, so with
+/// no config the behavior is exactly the built-in catalog.
 static PRICE_TABLE: RwLock<Option<PriceTable>> = RwLock::new(None);
+
+tokio::task_local! {
+    /// Per-request operator price table for the origin serving this
+    /// dispatch. Set by the AI action entry so `estimate_cost` and
+    /// friends resolve against this origin's `model_prices`, not the
+    /// last-compiled origin in the process.
+    static REQUEST_PRICE_TABLE: std::sync::Arc<PriceTable>;
+}
 
 /// Serializes tests, in any module of this crate, that touch the
 /// process-global `PRICE_TABLE`, so they do not race each other under a
@@ -838,27 +849,70 @@ static PRICE_TABLE: RwLock<Option<PriceTable>> = RwLock::new(None);
 #[cfg(test)]
 pub(crate) static PRICE_TABLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Run `f` with `table` as the operator price layer for this thread.
+///
+/// Used by tests and by any sync caller that already holds the origin's
+/// table. The async request path uses [`with_price_table_async`].
+pub(crate) fn with_price_table<F, R>(table: std::sync::Arc<PriceTable>, f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    REQUEST_PRICE_TABLE.sync_scope(table, f)
+}
+
+/// Run `fut` with `table` as the operator price layer for this task.
+///
+/// The AI action entry scopes `handle_ai_proxy` in this so every
+/// `estimate_cost` on that dispatch, including across `.await` points
+/// on the same task, reads the origin that is serving the request.
+pub async fn with_price_table_async<F>(table: std::sync::Arc<PriceTable>, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    REQUEST_PRICE_TABLE.scope(table, fut).await
+}
+
 /// Install the operator price table, replacing any previous one (so a
-/// config hot-reload updates prices). WOR-1707.
+/// config hot-reload updates prices). WOR-1707. This is the fallback
+/// layer; per-origin accounting goes through [`with_price_table`].
 pub fn set_price_table(table: PriceTable) {
     if let Ok(mut guard) = PRICE_TABLE.write() {
         *guard = Some(table);
     }
 }
 
+fn operator_table() -> Option<std::sync::Arc<PriceTable>> {
+    if let Ok(table) = REQUEST_PRICE_TABLE.try_with(std::sync::Arc::clone) {
+        return Some(table);
+    }
+    match PRICE_TABLE.read() {
+        Ok(guard) => guard.as_ref().cloned().map(std::sync::Arc::new),
+        Err(_) => None,
+    }
+}
+
 /// The effective price for `model` and the layer it came from: the
-/// operator table (config + rate-card) first, then the built-in catalog,
-/// else `None` (the caller applies the pessimistic fallback). WOR-1707 /
-/// WOR-1710.
+/// request-scoped origin table, then the process-global fallback, then
+/// the built-in catalog, else `None` (the caller applies the pessimistic
+/// fallback). WOR-1707 / WOR-1710 / WOR-2431.
 fn resolve_price(model: &str) -> Option<(ModelPrice, PriceSource)> {
-    if let Ok(guard) = PRICE_TABLE.read() {
-        if let Some(table) = guard.as_ref() {
-            if let Some(hit) = table.get(model) {
-                return Some(hit);
-            }
+    if let Some(table) = operator_table() {
+        if let Some(hit) = table.get(model) {
+            return Some(hit);
         }
     }
     lookup_price(model).map(|p| (p, PriceSource::Catalog))
+}
+
+/// The effective price for `model` against a specific operator table
+/// (WOR-2431), then the built-in catalog. Used by `ai.catalog` so two
+/// origins with different `model_prices` do not share a last-writer
+/// table.
+pub(crate) fn catalog_price_in(table: &PriceTable, model: &str) -> Option<ModelPrice> {
+    table
+        .get(model)
+        .map(|(price, _)| price)
+        .or_else(|| lookup_price(model))
 }
 
 /// The effective price for `model` without the source layer, for the
@@ -866,6 +920,7 @@ fn resolve_price(model: &str) -> Option<(ModelPrice, PriceSource)> {
 /// cost accounting: operator table first, then the built-in catalog;
 /// `None` when neither layer knows the model (the catalog omits it, it
 /// does not apply the pessimistic accounting fallback).
+#[cfg(test)]
 pub(crate) fn catalog_price(model: &str) -> Option<ModelPrice> {
     resolve_price(model).map(|(price, _)| price)
 }
@@ -879,6 +934,11 @@ pub(crate) fn catalog_price(model: &str) -> Option<ModelPrice> {
 /// [`crate::context_window::model_facts`], which is the seam callers
 /// should use rather than this one.
 pub(crate) fn catalog_token_limits(model: &str) -> Option<ModelTokenLimits> {
+    if let Some(table) = operator_table() {
+        if let Some(limits) = table.token_limits(model) {
+            return Some(limits);
+        }
+    }
     let guard = PRICE_TABLE.read().ok()?;
     guard.as_ref()?.token_limits(model)
 }

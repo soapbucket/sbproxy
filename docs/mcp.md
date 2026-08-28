@@ -632,6 +632,18 @@ check the tokens it mints. The broker's own
 `GET {base_path}/admin/status` is not mounted in process, because these
 routes sit on the public MCP origin ahead of the verifier.
 
+[`GET /admin/mcp-runtime`](admin-api-reference.md#get-adminmcp-runtime)
+reports each federated server's runtime state (`starting`, `ready`,
+`authRequired`, `error`, `stopped`), which is not the operator's
+enable/disable intent, and any in-flight tool call blocked on a
+step-up challenge. A scope escalation on one `tools/call` stays on
+that call. The server keeps serving other calls. `requiredScopes` is
+parsed from `WWW-Authenticate: Bearer scope="..."`, not from
+`scopes_supported` in metadata. Metrics reuse
+`sbproxy_mcp_tool_dispatch_total{result="server_auth_required"}` for a
+server-level block and `{result="call_auth_required"}` for a per-call
+step-up.
+
 Every refusal this surface makes is visible: the resource server's 401,
 the per-operation scope refusal, and each broker endpoint's 4xx write
 `sbproxy_mcp_gateway_decisions_total{surface,decision}`, one

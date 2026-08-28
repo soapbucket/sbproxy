@@ -8,6 +8,11 @@ use serde::Deserialize;
 pub struct AiProxyAction {
     /// Compiled AI gateway configuration (provider, routing, budgets, etc.).
     pub config: sbproxy_ai::AiHandlerConfig,
+    /// Maximum WebSocket message payload size in bytes for `/v1/realtime`
+    /// and any other upgraded tunnel this action carries. Default 10 MB.
+    /// `0` means no ceiling.
+    #[serde(default = "super::websocket::default_max_message_size")]
+    pub max_message_size: usize,
 }
 
 impl AiProxyAction {
@@ -61,10 +66,21 @@ impl AiProxyAction {
     }
 
     fn from_config_with_runtime(
-        value: serde_json::Value,
+        mut value: serde_json::Value,
         prepare_runtime: bool,
         registry: Option<&dyn BundleRegistry>,
     ) -> anyhow::Result<Self> {
+        // WOR-2645: the tunnel cap lives on the action, next to the AI
+        // handler config, because `/v1/realtime` upgrades under this
+        // action and no other key can name it. Peel it before the
+        // handler parses so it is not swallowed as an unknown sibling
+        // of `providers:`.
+        let max_message_size = value
+            .as_object_mut()
+            .and_then(|obj| obj.remove("max_message_size"))
+            .and_then(|v| v.as_u64())
+            .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
+            .unwrap_or(super::websocket::DEFAULT_MAX_MESSAGE_SIZE);
         // WOR-2366: the wasm routing hook resolves against the bundle
         // registry here, before the handler config parses, because the
         // registry does not exist below the action-compile layer. The two
@@ -102,7 +118,10 @@ impl AiProxyAction {
             // intact; the RAG registry is then built in validation mode,
             // which never dials.
             resolve_rag_credentials(&mut config)?;
-            return Ok(Self { config });
+            return Ok(Self {
+                config,
+                max_message_size,
+            });
         }
 
         // WOR-1767: resolve provider-URI secret references (`secret://`,
@@ -178,7 +197,10 @@ impl AiProxyAction {
         // credentials above. The same hook runs for validation
         // construction; see `resolve_rag_credentials`.
         resolve_rag_credentials(&mut config)?;
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            max_message_size,
+        })
     }
 }
 
@@ -316,6 +338,28 @@ mod tests {
     use std::sync::Arc;
 
     use super::AiProxyAction;
+
+    #[test]
+    fn from_config_peels_max_message_size_off_the_action() {
+        let action = AiProxyAction::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "k"}],
+            "max_message_size": 8192
+        }))
+        .expect("valid ai_proxy");
+        assert_eq!(action.max_message_size, 8192);
+    }
+
+    #[test]
+    fn from_config_defaults_max_message_size_to_ten_megabytes() {
+        let action = AiProxyAction::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "k"}]
+        }))
+        .expect("valid ai_proxy");
+        assert_eq!(
+            action.max_message_size,
+            super::super::websocket::DEFAULT_MAX_MESSAGE_SIZE
+        );
+    }
 
     fn install_fixture_resolver() {
         let vault = sbproxy_vault::LocalVault::new();

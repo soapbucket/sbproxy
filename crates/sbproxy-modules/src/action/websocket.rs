@@ -10,14 +10,25 @@ use super::ForwardingHeaderControls;
 
 /// Message payload ceiling a `websocket` action gets when it does not
 /// configure `max_message_size`, and the ceiling every other upgraded
-/// tunnel gets, since no other action type configures one.
+/// tunnel gets when it does not configure one either.
 pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
 
 /// Largest payload RFC 6455 section 5.5 permits on a control frame.
 pub const MAX_CONTROL_FRAME_PAYLOAD: u64 = 125;
 
-fn default_max_message_size() -> usize {
+pub(crate) fn default_max_message_size() -> usize {
     DEFAULT_MAX_MESSAGE_SIZE
+}
+
+/// Wire limit a tunnel scanner enforces. `0` means no ceiling, which is
+/// how an operator says they want an unbounded tunnel rather than the
+/// documented 10 MB default.
+pub(crate) fn tunnel_limit_bytes(max_message_size: usize) -> u64 {
+    if max_message_size == 0 {
+        u64::MAX
+    } else {
+        max_message_size as u64
+    }
 }
 
 /// WebSocket action config - proxies requests to an upstream WebSocket server.
@@ -320,9 +331,10 @@ impl WebSocketTunnelGuard {
     /// Build a guard enforcing `max_message_size` bytes per message in each
     /// direction.
     pub fn new(max_message_size: usize) -> Self {
+        let limit = tunnel_limit_bytes(max_message_size);
         Self {
-            client_to_upstream: FrameSizeScanner::new(max_message_size as u64),
-            upstream_to_client: FrameSizeScanner::new(max_message_size as u64),
+            client_to_upstream: FrameSizeScanner::new(limit),
+            upstream_to_client: FrameSizeScanner::new(limit),
             violation: None,
         }
     }
@@ -384,6 +396,27 @@ mod tests {
         let ws = WebSocketAction::from_config(json).unwrap();
         assert!(ws.subprotocols.is_empty());
         assert_eq!(ws.max_message_size, 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn a_zero_max_message_size_is_an_unbounded_tunnel() {
+        let json = serde_json::json!({
+            "type": "websocket",
+            "url": "ws://localhost:8080",
+            "max_message_size": 0
+        });
+        let ws = WebSocketAction::from_config(json).unwrap();
+        assert_eq!(ws.max_message_size, 0);
+        let mut guard = WebSocketTunnelGuard::new(0);
+        // 50 MB would trip the 10 MB default; 0 must let it through.
+        let header = {
+            let mut bytes = vec![0x81u8, 127];
+            bytes.extend_from_slice(&(50 * 1024 * 1024u64).to_be_bytes());
+            bytes
+        };
+        guard
+            .scan_client_bytes(&header)
+            .expect("max_message_size 0 means no payload ceiling");
     }
 
     #[test]

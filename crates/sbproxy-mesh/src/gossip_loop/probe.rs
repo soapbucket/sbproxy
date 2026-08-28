@@ -214,8 +214,8 @@ pub(super) fn transition_to_alive(
                     });
                 }
             }
-            PeerState::Dead => {
-                // Extremely rare: a Dead peer should not produce an
+            PeerState::Dead | PeerState::Left => {
+                // Extremely rare: a Dead or Left peer should not produce an
                 // ACK because we stopped probing it. If this happens
                 // (e.g. a witness still knows the peer), accept the
                 // refutation so the cluster converges without manual
@@ -335,7 +335,7 @@ pub(super) fn sweep_dead_for_gc(
     };
     // Wave 2D: PeerTable handles HashMap + Vec removal in one pass.
     let removed_entries = table.retain_remove(|entry| {
-        matches!(entry.state, PeerState::Dead)
+        matches!(entry.state, PeerState::Dead | PeerState::Left)
             && now.duration_since(entry.last_transition) >= dead_peer_gc
     });
     removed_entries

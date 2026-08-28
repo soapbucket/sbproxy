@@ -1,6 +1,6 @@
 # SBproxy AI gateway guide
 
-*Last modified: 2026-08-27*
+*Last modified: 2026-08-28*
 
 ![the same OpenAI-shape request answered by OpenAI, Claude, and Gemini, switched only by Host header](assets/ai-gateway.gif)
 
@@ -2416,7 +2416,7 @@ Or point at an external rate card in the LiteLLM `model_prices_and_context_windo
   rate_card: /etc/sbproxy/model_prices.json
 ```
 
-Refresh the vendored file out of band with `scripts/refresh-model-prices.sh /etc/sbproxy/model_prices.json`; the gateway loads it at config load and never fetches at runtime, so an egress-restricted host is unaffected. Resolution order for a model's price is: `model_prices` (highest), then the rate card, then the built-in catalog, then the $5 / $5 fallback. A missing or malformed rate card is logged and skipped, not fatal. Cache-read and cache-write rates carry through from both sources; the built-in catalog does not yet include them.
+Refresh the vendored file out of band with `scripts/refresh-model-prices.sh /etc/sbproxy/model_prices.json`; the gateway loads it at config load and never fetches at runtime, so an egress-restricted host is unaffected. Resolution order for a model's price is: `model_prices` (highest), then the rate card, then the built-in catalog, then the $5 / $5 fallback. Each `ai_proxy` origin keeps its own table, so two origins with different `model_prices` do not clobber each other, and a validation-only compile never installs the candidate. A missing or malformed rate card is logged and skipped, not fatal. Cache-read and cache-write rates carry through from both sources; the built-in catalog does not yet include them.
 
 ## Virtual API keys (`credentials:`)
 

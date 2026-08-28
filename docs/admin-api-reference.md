@@ -3499,6 +3499,7 @@ model-host artifact cache above:
 | GET | `/admin/federation` | OpenID Federation identity this proxy publishes, and what it requires of a peer. |
 | GET | `/admin/licensing` | CoMP marketplace bridges: what each configured origin publishes and which quote-signing key is live. |
 | GET | `/admin/mcp-oauth` | Every colocated MCP OAuth broker this proxy runs, and what each has wired in. |
+| GET | `/admin/mcp-runtime` | Federated MCP server runtime state and in-flight tool-call auth challenges. |
 
 ### `GET /admin/cache`
 
@@ -3745,6 +3746,53 @@ behind operator auth, like
 for it is separate scope, under the admin console epic; the JSON here
 is the operator surface today. See [mcp.md](mcp.md) and
 [mcp-oauth-gateway.md](mcp-oauth-gateway.md).
+
+### `GET /admin/mcp-runtime`
+
+Federated MCP server runtime state, distinct from operator enable/disable
+intent, plus in-flight tool-call auth challenges. Returns
+`{"enabled": false}` when no `mcp` action is configured. Both `admin`
+and `read_only` operators may call it. A console page is separate
+scope, under the admin console epic; the JSON here is the operator
+surface today.
+
+```json
+{
+  "enabled": true,
+  "federations": [
+    {
+      "enabled": true,
+      "servers": [
+        {
+          "name": "github",
+          "intent": "enabled",
+          "runtime": { "state": "ready" }
+        }
+      ],
+      "tool_calls": [
+        {
+          "correlation_id": "corr-1",
+          "auth": {
+            "status": "authRequired",
+            "server": "github",
+            "tool": "search",
+            "challenge": {
+              "reason": "insufficientScope",
+              "requiredScopes": ["repo"]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+`runtime.state` is one of `starting`, `ready`, `authRequired`, `error`,
+or `stopped`. A tool call blocked on a step-up challenge appears under
+`tool_calls` and does not move the owning server out of `ready`.
+`requiredScopes` is parsed from `WWW-Authenticate: Bearer scope="..."`,
+not from metadata `scopes_supported`. See [mcp.md](mcp.md).
 
 ### `POST /admin/cache/purge`
 

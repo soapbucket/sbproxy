@@ -491,7 +491,11 @@ pub(super) async fn handle_action(
                 return Ok(false);
             }
 
-            handle_ai_proxy(session, &ai.config, pipeline, &hostname, ctx, origin_idx).await?;
+            sbproxy_ai::budget::with_price_table_async(
+                ai.config.price_table(),
+                handle_ai_proxy(session, &ai.config, pipeline, &hostname, ctx, origin_idx),
+            )
+            .await?;
             Ok(true)
         }
 

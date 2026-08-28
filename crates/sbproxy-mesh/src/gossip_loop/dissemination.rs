@@ -12,11 +12,12 @@ use std::time::Instant;
 
 use crate::metrics::{
     DISSEM_IGNORE_NO_CHANGE, DISSEM_IGNORE_STALE_INCARNATION, DISSEM_IGNORE_TERMINAL_DEAD,
-    DISSEM_IGNORE_UNKNOWN_PEER, DISSEM_TRANS_ALIVE_DEAD, DISSEM_TRANS_ALIVE_SUSPECT,
-    DISSEM_TRANS_DEAD_ALIVE, DISSEM_TRANS_SELF_REFUTATION, DISSEM_TRANS_SUSPECT_ALIVE,
-    DISSEM_TRANS_SUSPECT_DEAD, MESH_DISSEMINATION_UPDATES_APPLIED,
-    MESH_DISSEMINATION_UPDATES_IGNORED, MESH_SUSPECT_TRANSITIONS, PEER_STATE_ALIVE,
-    PEER_STATE_DEAD, PEER_STATE_SUSPECT,
+    DISSEM_IGNORE_UNKNOWN_PEER, DISSEM_TRANS_ALIVE_DEAD, DISSEM_TRANS_ALIVE_LEFT,
+    DISSEM_TRANS_ALIVE_SUSPECT, DISSEM_TRANS_DEAD_ALIVE, DISSEM_TRANS_SELF_REFUTATION,
+    DISSEM_TRANS_SUSPECT_ALIVE, DISSEM_TRANS_SUSPECT_DEAD, DISSEM_TRANS_SUSPECT_LEFT,
+    MESH_DISSEMINATION_UPDATES_APPLIED, MESH_DISSEMINATION_UPDATES_IGNORED,
+    MESH_SUSPECT_TRANSITIONS, PEER_STATE_ALIVE, PEER_STATE_DEAD, PEER_STATE_LEFT,
+    PEER_STATE_SUSPECT,
 };
 use crate::peer_eviction::PeerEvictor;
 
@@ -108,6 +109,12 @@ pub(super) fn apply_update(
                     .with_label_values(&[DISSEM_IGNORE_NO_CHANGE])
                     .inc();
             }
+            PeerStateWire::Left => {
+                // Our own leave rumor; we already know we are departing.
+                MESH_DISSEMINATION_UPDATES_IGNORED
+                    .with_label_values(&[DISSEM_IGNORE_NO_CHANGE])
+                    .inc();
+            }
         }
         return;
     }
@@ -193,6 +200,9 @@ pub(super) fn apply_update(
                 }
                 PeerState::Dead => {
                     evictor.evict(&peer_key, crate::metrics::EVICT_REASON_DEAD_TIMEOUT);
+                }
+                PeerState::Left => {
+                    evictor.evict(&peer_key, "graceful_leave");
                 }
                 PeerState::Suspect { .. } => {
                     // Suspect does not touch the eviction counter; the
@@ -281,6 +291,18 @@ pub(super) fn decide_transition(
                 TransitionOutcome::Ignore(DISSEM_IGNORE_STALE_INCARNATION)
             }
         }
+        (PeerState::Alive, PeerStateWire::Left) => {
+            if update.incarnation >= prev_incarnation {
+                TransitionOutcome::Accept {
+                    new_state: PeerState::Left,
+                    new_incarnation: update.incarnation,
+                    transition_label: DISSEM_TRANS_ALIVE_LEFT,
+                    rebroadcast: true,
+                }
+            } else {
+                TransitionOutcome::Ignore(DISSEM_IGNORE_STALE_INCARNATION)
+            }
+        }
         // --- Prev: Suspect ---
         (PeerState::Suspect { .. }, PeerStateWire::Alive) => {
             if update.incarnation > prev_incarnation {
@@ -322,6 +344,18 @@ pub(super) fn decide_transition(
                 TransitionOutcome::Ignore(DISSEM_IGNORE_STALE_INCARNATION)
             }
         }
+        (PeerState::Suspect { .. }, PeerStateWire::Left) => {
+            if update.incarnation >= prev_incarnation {
+                TransitionOutcome::Accept {
+                    new_state: PeerState::Left,
+                    new_incarnation: update.incarnation,
+                    transition_label: DISSEM_TRANS_SUSPECT_LEFT,
+                    rebroadcast: true,
+                }
+            } else {
+                TransitionOutcome::Ignore(DISSEM_IGNORE_STALE_INCARNATION)
+            }
+        }
         // --- Prev: Dead ---
         (PeerState::Dead, PeerStateWire::Alive) => {
             if update.incarnation > prev_incarnation {
@@ -336,6 +370,19 @@ pub(super) fn decide_transition(
             }
         }
         (PeerState::Dead, _) => TransitionOutcome::Ignore(DISSEM_IGNORE_TERMINAL_DEAD),
+        (PeerState::Left, PeerStateWire::Alive) => {
+            if update.incarnation > prev_incarnation {
+                TransitionOutcome::Accept {
+                    new_state: PeerState::Alive,
+                    new_incarnation: update.incarnation,
+                    transition_label: DISSEM_TRANS_DEAD_ALIVE,
+                    rebroadcast: true,
+                }
+            } else {
+                TransitionOutcome::Ignore(DISSEM_IGNORE_TERMINAL_DEAD)
+            }
+        }
+        (PeerState::Left, _) => TransitionOutcome::Ignore(DISSEM_IGNORE_TERMINAL_DEAD),
     }
 }
 
@@ -346,11 +393,13 @@ pub(super) fn transition_labels(prev: PeerState, new: PeerState) -> (&'static st
         PeerState::Alive => PEER_STATE_ALIVE,
         PeerState::Suspect { .. } => PEER_STATE_SUSPECT,
         PeerState::Dead => PEER_STATE_DEAD,
+        PeerState::Left => PEER_STATE_LEFT,
     };
     let new_label = match new {
         PeerState::Alive => PEER_STATE_ALIVE,
         PeerState::Suspect { .. } => PEER_STATE_SUSPECT,
         PeerState::Dead => PEER_STATE_DEAD,
+        PeerState::Left => PEER_STATE_LEFT,
     };
     (prev_label, new_label)
 }

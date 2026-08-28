@@ -32,9 +32,9 @@ use prometheus::{
 
 /// Count of peers evicted from the membership list + hash ring.
 ///
-/// Labels: `reason`. Two values are emitted today, `probe_timeout` and
-/// `dead_timeout`. `graceful_leave` is reserved and nothing emits it;
-/// see [`EVICT_REASON_GRACEFUL_LEAVE`] for why.
+/// Labels: `reason`. `probe_timeout`, `dead_timeout`, and
+/// `graceful_leave` are the three values a live cluster emits.
+/// See [`EVICT_REASON_GRACEFUL_LEAVE`].
 pub static MESH_PEER_EVICTED: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         Opts::new("mesh_peer_evicted_total", "Peers evicted from the mesh"),
@@ -262,8 +262,12 @@ pub const DISSEM_TRANS_ALIVE_SUSPECT: &str = "alive_to_suspect";
 pub const DISSEM_TRANS_SUSPECT_ALIVE: &str = "suspect_to_alive";
 /// `transition` label: Alive -> Dead (skipping Suspect).
 pub const DISSEM_TRANS_ALIVE_DEAD: &str = "alive_to_dead";
+/// `transition` label: Alive -> Left (self-declared departure).
+pub const DISSEM_TRANS_ALIVE_LEFT: &str = "alive_to_left";
 /// `transition` label: Suspect -> Dead.
 pub const DISSEM_TRANS_SUSPECT_DEAD: &str = "suspect_to_dead";
+/// `transition` label: Suspect -> Left (self-declared departure).
+pub const DISSEM_TRANS_SUSPECT_LEFT: &str = "suspect_to_left";
 /// `transition` label: Dead -> Alive (rejoin).
 pub const DISSEM_TRANS_DEAD_ALIVE: &str = "dead_to_alive";
 /// `transition` label: local self-refutation (we learned we were Suspect
@@ -742,21 +746,14 @@ pub const EVICT_REASON_PROBE_TIMEOUT: &str = "probe_timeout";
 /// `reason` label for [`MESH_PEER_EVICTED`]: crossed the SWIM
 /// `dead_timeout` without any heartbeat.
 pub const EVICT_REASON_DEAD_TIMEOUT: &str = "dead_timeout";
-/// `reason` label for [`MESH_PEER_EVICTED`]: reserved for a peer that
-/// announced its own departure. Nothing emits it, because graceful leave
-/// is not implemented.
+/// `reason` label for [`MESH_PEER_EVICTED`]: a peer announced its own
+/// departure. Emitted when a `PeerStateWire::Left` update is applied.
 ///
-/// No leave message exists on the wire. `GossipMsg` carries `Heartbeat`,
-/// `Join`, `Ping`, `Ack`, `PingReq`, and `IndirectAck`; `MeshMessage`
-/// carries `MembershipUpdate`, `Ping`, and `Pong`. None of them says "I
-/// am going away", and no shutdown path sends one, so a node that exits
-/// cleanly is indistinguishable from a node that died: its peers notice
-/// only when the failure detector does, and evict it under
-/// `probe_timeout` or `dead_timeout` a suspect window later.
-///
-/// The constant stays so the label value is reserved rather than reused
-/// by something else. Do not alert on it and do not read its permanent
-/// zero as "no peer has ever left cleanly".
+/// A node that exits cleanly pushes a self-`Left` update and sends it
+/// to a fan-out of live peers before the gossip loop stops. Peers that
+/// apply it evict under this reason rather than waiting out the suspect
+/// window and labelling the departure as `dead_timeout`. This is a wire
+/// break: every node in the cluster must understand `Left`.
 pub const EVICT_REASON_GRACEFUL_LEAVE: &str = "graceful_leave";
 
 /// `state` label for [`MESH_PEER_COUNT`]: peer is alive.
@@ -765,6 +762,8 @@ pub const PEER_STATE_ALIVE: &str = "alive";
 pub const PEER_STATE_SUSPECT: &str = "suspect";
 /// `state` label for [`MESH_PEER_COUNT`]: peer is dead.
 pub const PEER_STATE_DEAD: &str = "dead";
+/// `state` label for [`MESH_PEER_COUNT`]: peer announced it is leaving.
+pub const PEER_STATE_LEFT: &str = "left";
 
 #[cfg(test)]
 mod tests {

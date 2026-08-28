@@ -30,6 +30,8 @@ pub enum DirectoryMemberState {
     Suspect,
     /// SWIM declared this member dead.
     Dead,
+    /// The member announced it is leaving.
+    Left,
     /// Membership is live but typed-state transport is unavailable.
     Unreachable,
 }
@@ -570,7 +572,9 @@ fn build_node(
     let membership_exclusion = match member.state {
         DirectoryMemberState::Alive => None,
         DirectoryMemberState::Suspect => Some(ModelDirectoryExclusionReason::MembershipSuspect),
-        DirectoryMemberState::Dead => Some(ModelDirectoryExclusionReason::MembershipDead),
+        DirectoryMemberState::Dead | DirectoryMemberState::Left => {
+            Some(ModelDirectoryExclusionReason::MembershipDead)
+        }
         DirectoryMemberState::Unreachable => {
             Some(ModelDirectoryExclusionReason::MembershipUnreachable)
         }

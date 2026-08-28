@@ -31,7 +31,7 @@ pub(crate) const RESPONSE_CAP_MARKER: &str = "response byte cap exceeded";
 /// (`"MCP server returned HTTP {status}"` / `"SSE MCP server returned
 /// HTTP {status}"`), while a caller that needs the structured fields
 /// can `err.downcast_ref::<McpUpstreamHttpStatus>()`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpUpstreamHttpStatus {
     /// The HTTP status code the upstream answered with.
     pub status: u16,
@@ -39,6 +39,9 @@ pub struct McpUpstreamHttpStatus {
     /// Corroborating evidence for a 401/407 classification, not
     /// required for it: some servers omit the header on a bare 401.
     pub www_authenticate_present: bool,
+    /// The `WWW-Authenticate` header value, when it was valid UTF-8.
+    /// Used to parse `requiredScopes` from `scope=`, never logged.
+    pub www_authenticate: Option<String>,
 }
 
 impl std::fmt::Display for McpUpstreamHttpStatus {
@@ -126,12 +129,15 @@ pub async fn send_request(
 
     let status = resp.status();
     if !status.is_success() {
-        let www_authenticate_present = resp
+        let www_authenticate = resp
             .headers()
-            .contains_key(reqwest::header::WWW_AUTHENTICATE);
+            .get(reqwest::header::WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
         return Err(McpUpstreamHttpStatus {
             status: status.as_u16(),
-            www_authenticate_present,
+            www_authenticate_present: www_authenticate.is_some(),
+            www_authenticate,
         }
         .into());
     }
@@ -423,6 +429,7 @@ mod tests {
         let status = McpUpstreamHttpStatus {
             status: 401,
             www_authenticate_present: true,
+            www_authenticate: Some(r#"Bearer realm="mcp""#.to_string()),
         };
         let err: anyhow::Error = status.into();
         assert_eq!(err.to_string(), "MCP server returned HTTP 401");

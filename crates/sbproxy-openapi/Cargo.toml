@@ -28,3 +28,4 @@ tracing.workspace = true
 [dev-dependencies]
 compact_str.workspace = true
 smallvec.workspace = true
+jsonschema-modern.workspace = true

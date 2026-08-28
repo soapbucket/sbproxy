@@ -339,6 +339,11 @@ pub struct AiHandlerConfig {
     /// runtime. `None` uses only `model_prices` + the built-in catalog.
     #[serde(default)]
     pub rate_card: Option<String>,
+    /// Per-origin operator price table built from `model_prices` and
+    /// `rate_card` at compile (WOR-2431). Live cost accounting and
+    /// `ai.catalog` read this, not a process-global last writer.
+    #[serde(skip)]
+    pub(crate) price_table: std::sync::Arc<crate::budget::PriceTable>,
     /// WOR-2559: origin-level hard price ceiling in USD per request (the
     /// OpenRouter `provider.max_price` analog). Before provider
     /// selection, each routing candidate on a token-priced chat surface
@@ -505,7 +510,7 @@ pub struct AiHandlerConfig {
     /// prices and context windows for this origin's declared models,
     /// converted once to the shared CEL form so each request binds it by
     /// reference-count bump. Rebuilt with the handler on config reload,
-    /// after `from_config` has installed the price table.
+    /// against this origin's [`Self::price_table`].
     #[serde(skip)]
     ai_catalog_cel: OnceLock<sbproxy_extension::cel::CelValue>,
     /// Lazy-built fair-share pool store (WOR-1880, WOR-1993).
@@ -696,8 +701,16 @@ impl AiHandlerConfig {
     /// clone this returns is a reference-count bump, not a document copy.
     pub fn ai_catalog_cel(&self) -> sbproxy_extension::cel::CelValue {
         self.ai_catalog_cel
-            .get_or_init(|| crate::routing_base_data::build_catalog_cel(&self.providers))
+            .get_or_init(|| {
+                crate::routing_base_data::build_catalog_cel(&self.providers, &self.price_table)
+            })
             .clone()
+    }
+
+    /// This origin's operator price table (WOR-2431): config `model_prices`
+    /// layered on the rate card. Clone the `Arc` to scope live accounting.
+    pub fn price_table(&self) -> std::sync::Arc<crate::budget::PriceTable> {
+        std::sync::Arc::clone(&self.price_table)
     }
 
     /// Return the compiled routing policy for this handler, compiling it
@@ -2177,15 +2190,15 @@ impl AiHandlerConfig {
                 }
             }
         }
-        // WOR-1707: install the operator price table (config prices +
-        // external rate card) into the process-global consulted by cost
-        // estimation. Runs on every config (re)load so prices update
-        // with the config; a missing/bad rate card warns and is skipped.
-        // Validation-only compiles build the table (so its warnings still
-        // fire) but never install it: a rejected candidate must not leave
-        // live cost accounting on its prices.
+        // WOR-1707 / WOR-2431: build the operator price table (config
+        // prices + external rate card) onto this origin. Live request
+        // accounting and `ai.catalog` read `config.price_table`. The
+        // process-global is still installed on a committed load so call
+        // sites that cannot carry an origin (admin playground, tests)
+        // keep a table; a validation-only compile never installs it.
         let price_table =
             crate::budget::build_price_table(&config.model_prices, config.rate_card.as_deref());
+        config.price_table = std::sync::Arc::new(price_table.clone());
         if install_price_table {
             crate::budget::set_price_table(price_table);
         }
@@ -2700,6 +2713,49 @@ mod tests {
             crate::budget::catalog_price("validation-split-other").is_none(),
             "a validation compile must not install anything"
         );
+    }
+
+    #[test]
+    fn two_origins_keep_distinct_price_tables() {
+        let _guard = crate::budget::PRICE_TABLE_TEST_LOCK.lock().unwrap();
+        let first = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "p", "api_key": "k"}],
+            "model_prices": {
+                "origin-split-model": {"input_per_million": 1.0, "output_per_million": 2.0}
+            }
+        }))
+        .expect("first origin");
+        let second = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "p", "api_key": "k"}],
+            "model_prices": {
+                "origin-split-model": {"input_per_million": 9.0, "output_per_million": 8.0}
+            }
+        }))
+        .expect("second origin");
+        assert_eq!(
+            first
+                .price_table()
+                .get("origin-split-model")
+                .map(|(price, _)| price.input_per_million),
+            Some(1.0),
+            "the first origin must keep the prices it compiled"
+        );
+        assert_eq!(
+            second
+                .price_table()
+                .get("origin-split-model")
+                .map(|(price, _)| price.input_per_million),
+            Some(9.0),
+            "the second origin must not clobber the first origin's table"
+        );
+        let first_cost = crate::budget::with_price_table(first.price_table(), || {
+            crate::budget::estimate_cost("origin-split-model", 1_000_000, 0)
+        });
+        let second_cost = crate::budget::with_price_table(second.price_table(), || {
+            crate::budget::estimate_cost("origin-split-model", 1_000_000, 0)
+        });
+        assert!((first_cost - 1.0).abs() < 1e-12);
+        assert!((second_cost - 9.0).abs() < 1e-12);
     }
 
     // --- Resilience wiring (WOR-2233) ---
@@ -3386,6 +3442,7 @@ mod tests {
             ai_routing_policy: None,
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
+            price_table: std::sync::Arc::new(crate::budget::PriceTable::new()),
             max_price_per_request: None,
             allow_request_timeout_override: false,
             max_request_timeout_ms: None,
@@ -3445,6 +3502,7 @@ mod tests {
             ai_routing_policy: None,
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
+            price_table: std::sync::Arc::new(crate::budget::PriceTable::new()),
             max_price_per_request: None,
             allow_request_timeout_override: false,
             max_request_timeout_ms: None,
@@ -3504,6 +3562,7 @@ mod tests {
             ai_routing_policy: None,
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
+            price_table: std::sync::Arc::new(crate::budget::PriceTable::new()),
             max_price_per_request: None,
             allow_request_timeout_override: false,
             max_request_timeout_ms: None,
@@ -3564,6 +3623,7 @@ mod tests {
             ai_routing_policy: None,
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
+            price_table: std::sync::Arc::new(crate::budget::PriceTable::new()),
             max_price_per_request: None,
             allow_request_timeout_override: false,
             max_request_timeout_ms: None,

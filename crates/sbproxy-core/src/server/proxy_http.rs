@@ -30,14 +30,15 @@ fn active_action<'a>(pipeline: &'a CompiledPipeline, ctx: &RequestContext) -> Op
 ///
 /// Two decisions in one place, because they were wrong together.
 ///
-/// The cap: an action that configures `max_message_size` supplies it,
-/// and every other action gets the same documented 10 MB ceiling a
-/// `websocket` action gets when it says nothing. Retrospective review of
-/// PR #1148 found the guard armed only under `Action::WebSocket`, so
-/// `/v1/realtime` (which runs under `Action::AiProxy` and returns
-/// `Ok(false)` for transparent forwarding) and any `type: proxy` origin
-/// fronting a WebSocket backend opened an unscanned tunnel: both body
-/// filters read `ctx.websocket_tunnel` and did nothing.
+/// The cap: an action that configures `max_message_size` supplies it
+/// (`websocket`, `proxy`, `load_balancer`, `ai_proxy`). Every other
+/// action, and an unset field on those four, gets the documented 10 MB
+/// ceiling. `0` means no ceiling. Retrospective review of PR #1148 found
+/// the guard armed only under `Action::WebSocket`, so `/v1/realtime`
+/// (which runs under `Action::AiProxy` and returns `Ok(false)` for
+/// transparent forwarding) and any `type: proxy` origin fronting a
+/// WebSocket backend opened an unscanned tunnel: both body filters
+/// read `ctx.websocket_tunnel` and did nothing.
 ///
 /// The gate: the downstream request must have asked for a WebSocket
 /// upgrade. A `101` for some other protocol does not carry RFC 6455
@@ -51,6 +52,9 @@ fn websocket_tunnel_guard_for_upgrade(
     }
     let max_message_size = match action {
         Some(Action::WebSocket(ws)) => ws.max_message_size,
+        Some(Action::Proxy(proxy)) => proxy.max_message_size,
+        Some(Action::LoadBalancer(lb)) => lb.max_message_size,
+        Some(Action::AiProxy(ai)) => ai.max_message_size,
         _ => sbproxy_modules::action::websocket::DEFAULT_MAX_MESSAGE_SIZE,
     };
     Some(sbproxy_modules::action::websocket::WebSocketTunnelGuard::new(max_message_size))
@@ -10120,6 +10124,100 @@ origins:
         guard
             .scan_client_bytes(&text_frame_header(1025))
             .expect_err("a message over the configured cap is refused");
+    }
+
+    #[test]
+    fn a_proxy_action_honours_configured_max_message_size() {
+        let action = first_action(
+            r#"
+origins:
+  "ws.example":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+      max_message_size: 2048
+"#,
+        );
+        let mut guard = websocket_tunnel_guard_for_upgrade(&upgrade_request(), Some(&action))
+            .expect("a proxy action's upgraded tunnel is scanned");
+        guard
+            .scan_client_bytes(&text_frame_header(2048))
+            .expect("a message at the configured cap passes");
+        let mut guard = websocket_tunnel_guard_for_upgrade(&upgrade_request(), Some(&action))
+            .expect("a proxy action's upgraded tunnel is scanned");
+        guard
+            .scan_client_bytes(&text_frame_header(2049))
+            .expect_err("a message over the configured cap is refused");
+    }
+
+    #[test]
+    fn a_load_balancer_action_honours_configured_max_message_size() {
+        let action = first_action(
+            r#"
+origins:
+  "ws.example":
+    action:
+      type: load_balancer
+      max_message_size: 4096
+      targets:
+        - url: https://test.sbproxy.dev
+"#,
+        );
+        let mut guard = websocket_tunnel_guard_for_upgrade(&upgrade_request(), Some(&action))
+            .expect("a load_balancer action's upgraded tunnel is scanned");
+        guard
+            .scan_client_bytes(&text_frame_header(4096))
+            .expect("a message at the configured cap passes");
+        let mut guard = websocket_tunnel_guard_for_upgrade(&upgrade_request(), Some(&action))
+            .expect("a load_balancer action's upgraded tunnel is scanned");
+        guard
+            .scan_client_bytes(&text_frame_header(4097))
+            .expect_err("a message over the configured cap is refused");
+    }
+
+    #[test]
+    fn an_ai_proxy_action_honours_configured_max_message_size() {
+        let action = first_action(
+            r#"
+origins:
+  "realtime.example":
+    action:
+      type: ai_proxy
+      max_message_size: 8192
+      providers:
+        - name: openai
+          api_key: "k"
+"#,
+        );
+        let mut guard = websocket_tunnel_guard_for_upgrade(&upgrade_request(), Some(&action))
+            .expect("an ai_proxy realtime tunnel is scanned");
+        guard
+            .scan_client_bytes(&text_frame_header(8192))
+            .expect("a message at the configured cap passes");
+        let mut guard = websocket_tunnel_guard_for_upgrade(&upgrade_request(), Some(&action))
+            .expect("an ai_proxy realtime tunnel is scanned");
+        guard
+            .scan_client_bytes(&text_frame_header(8193))
+            .expect_err("a message over the configured cap is refused");
+    }
+
+    #[test]
+    fn a_zero_max_message_size_disables_the_ceiling() {
+        let action = first_action(
+            r#"
+origins:
+  "ws.example":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+      max_message_size: 0
+"#,
+        );
+        let mut guard = websocket_tunnel_guard_for_upgrade(&upgrade_request(), Some(&action))
+            .expect("an unbounded tunnel is still scanned for control frames");
+        guard
+            .scan_client_bytes(&text_frame_header(50 * 1024 * 1024))
+            .expect("a 50 MB message survives when the operator set the cap to 0");
     }
 
     #[test]
