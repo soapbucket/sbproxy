@@ -1275,7 +1275,7 @@ fn abort_committed_transform_response(
 /// idempotency run. A signature over `content-digest` still authenticates the
 /// inbound representation, so finish that proof before a late cache hit can
 /// short-circuit and mark the deferred check as consumed.
-fn verify_graphql_inbound_body_binding(
+pub(crate) fn verify_graphql_inbound_body_binding(
     headers: &http::HeaderMap,
     inbound_body: &[u8],
     ctx: &mut RequestContext,
@@ -1295,6 +1295,7 @@ fn verify_graphql_inbound_body_binding(
         ctx.content_digest_verified = true;
         ctx.bot_auth_digest_check_required = false;
     }
+    crate::server::complete_deferred_body_digest_auth(ctx, verified);
     verified
 }
 

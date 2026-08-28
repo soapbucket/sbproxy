@@ -114,6 +114,7 @@ pub(crate) fn verify_and_finalize_body_proof(
     if verified {
         ctx.content_digest_verified = true;
     }
+    crate::server::complete_deferred_body_digest_auth(ctx, verified);
     finalize(ctx, !verified);
     verified
 }
@@ -121,11 +122,18 @@ pub(crate) fn verify_and_finalize_body_proof(
 /// Close a provisional body-bound proof when the request ends before the body
 /// verifier runs.
 ///
-/// This can happen on a policy or middleware short circuit. The unverified
-/// BotAuth credential is removed from the evidence bag while independent KYA
-/// or named-agent evidence is retained, then the conservative result is
-/// recorded exactly once.
+/// GET, HEAD, and other paths that never enter the request body filter
+/// (and a later policy short-circuit) leave the header-phase allow
+/// standing: nothing compared bytes and disagreed. A mismatch deny is
+/// emitted only by [`verify_and_finalize_body_proof`] and the GraphQL
+/// inbound binding, which are the sites that see the body.
 pub(crate) fn finalize_pending_body_proof_at_request_end(ctx: &mut RequestContext) {
+    // Leftover stash means the body proof never ran. Completing it as
+    // allow matches the header-phase outcome; completing it as deny
+    // would brand a successful GET (WOR-2681: GET never enters the
+    // body filter) as `content-digest body mismatch`.
+    crate::server::complete_deferred_body_digest_auth(ctx, true);
+
     if ctx.trust_tier_metric_recorded
         || !ctx.bot_auth_digest_check_required
         || ctx.content_digest_verified
