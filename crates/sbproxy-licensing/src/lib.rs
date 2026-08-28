@@ -83,10 +83,10 @@ use axum::Router;
 /// exists so this crate is runnable on its own (see
 /// `examples/standalone_marketplace.rs`) and so its own tests
 /// exercise the same route wiring an embedding host would use.
-pub fn router(marketplace: Arc<comp::CompMarketplace>, keys: Arc<keys::KeyManager>) -> Router {
+pub fn router(marketplace: Arc<comp::CompMarketplace>) -> Router {
     let comp = comp::comp_router(marketplace.clone());
     let admin = Router::new()
         .route("/admin/status", axum::routing::get(admin::status))
-        .with_state((marketplace, keys));
+        .with_state(marketplace);
     comp.merge(admin)
 }

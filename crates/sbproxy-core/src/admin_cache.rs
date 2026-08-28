@@ -323,13 +323,17 @@ origins:
     #[test]
     fn cache_reserve_degradation_initialization_failure_is_admin_visible() {
         let _guard = cache_reserve_degradation_test_guard();
+        // WOR-2673 moved this fixture off the retired `type: s3`
+        // backend, which the config compiler now refuses outright, onto
+        // one that still reaches the pipeline and fails there. The
+        // property under test is unchanged: a backend that does not
+        // construct is admin-visible as degraded, with a bounded
+        // summary that does not echo the config value that broke it.
         install_cache_reserve_test_pipeline(
             r#"    enabled: true
     backend:
-      type: s3
-      bucket: ""
-      region: us-east-1
-      kms_key_id: alias/CACHE_RESERVE_SECRET_CANARY
+      type: redis
+      redis_url: "not-a-scheme://CACHE_RESERVE_SECRET_CANARY"
 "#,
         );
 
@@ -339,7 +343,7 @@ origins:
             .expect("configured reserve has an admin state even when construction fails");
         assert_eq!(reserve["configured"], true);
         assert_eq!(reserve["active"], false);
-        assert_eq!(reserve["backend"], "s3");
+        assert_eq!(reserve["backend"], "redis");
         assert_eq!(reserve["state"], "degraded");
         assert_eq!(reserve["last_operation"], "initialize");
         assert_eq!(reserve["reason_code"], "invalid_configuration");

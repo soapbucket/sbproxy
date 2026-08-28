@@ -47,7 +47,7 @@ pub const OLP_JWS_TYP: &str = "olp-license+jws";
 
 /// JWS protected header. Field set and order matches the OSS issuer's
 /// internal `OlpHeader` (the header is not part of any public OSS
-/// API; the shape is reproduced from the JSON it serialises to).
+/// API; the shape is reproduced from the JSON it serializes to).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct OlpBridgeHeader {
     alg: String,
@@ -60,7 +60,7 @@ struct OlpBridgeHeader {
 /// Field names and semantics match
 /// `sbproxy_modules::olp::OlpLicenseClaims` exactly (`cnf` omitted;
 /// see module docs). A verifier built against the OSS claims struct
-/// deserialises this payload without modification.
+/// deserializes this payload without modification.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OlpBridgeClaims {
     /// Issuer URL. Matches `OlpConfig::issuer`.

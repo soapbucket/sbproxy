@@ -168,6 +168,7 @@ sbproxy-agent-detect = { path = "crates/sbproxy-agent-detect" }
 sbproxy-capability = { path = "crates/sbproxy-capability" }
 sbproxy-mcp-gateway = { path = "crates/sbproxy-mcp-gateway" }
 sbproxy-federation = { path = "crates/sbproxy-federation" }
+sbproxy-licensing = { path = "crates/sbproxy-licensing" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

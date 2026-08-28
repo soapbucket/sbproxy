@@ -146,7 +146,7 @@ async fn main() {
     );
 
     let app: Router =
-        sbproxy_licensing::router(marketplace, keys).route("/metrics", get(metrics_handler));
+        sbproxy_licensing::router(marketplace).route("/metrics", get(metrics_handler));
 
     let addr: SocketAddr = LISTEN_ADDR.parse().expect("static address parses");
     eprintln!("sbproxy-licensing CoMP marketplace demo");

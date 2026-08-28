@@ -456,7 +456,7 @@ proxy:
 | `notifications` | object | unset | Outbound webhook subscriptions with per-destination filters, signing keys, retries, and a durable deadletter queue. Boot-only. See [Notification fields](#notification-fields). |
 | `l2_cache_settings` | object | | Optional shared-state backend. Alias: `l2_cache`. |
 | `anomaly` | object | unset | Behavioral anomaly detection over the TLS fingerprint, resolver source, headless-library signal, and per-address rate, plus the per-agent-class reputation score it feeds and the optional admission thresholds that read it. Disabled by default. See [anomaly-detection.md](anomaly-detection.md). |
-| `cache_reserve` | object | unset | Optional cold-tier response cache backed by memory, filesystem, Redis, object storage (S3, GCS, Azure Blob, or a local directory) with optional at-rest sealing, or S3 with AWS KMS envelope encryption. See [cache-reserve.md](cache-reserve.md). |
+| `cache_reserve` | object | unset | Optional cold-tier response cache backed by memory, filesystem, Redis, or object storage (S3, GCS, Azure Blob, a local directory, or any S3-compatible store) with optional at-rest sealing. The separate `type: s3` backend is retired and refused at config load; see [cache-reserve.md](cache-reserve.md). |
 | `compression_state` | object | unset | Process-owned Local AI summary-state path. See [compression_state](#compression_state). |
 | `config_history` | object | unset | Durable local ring of every applied config revision, kept for inspection and future rollback. Disabled by default. See [config_history](#config_history). |
 | `response_cache_store` | object | unset | Picks the backing store for the shared response cache and optionally encrypts entries at rest. See [Choosing the backing store](#choosing-the-backing-store). When unset, the store is Redis if `l2_cache_settings` is configured and an in-process map otherwise. |
@@ -1650,7 +1650,8 @@ origins:
 | `deprecation` | object | | RFC 9745 `Deprecation` + RFC 8594 `Sunset` announcement for every route this origin serves. Also accepted per forward rule, where it overrides this block. See [API deprecation](#api-deprecation-rfc-9745--rfc-8594). |
 | `traffic_capture` | object | | Not supported. Setting it fails config load. Use `mirror` for live request mirroring. |
 | `message_signatures` | object | | RFC 9421 HTTP message signatures. |
-| `olp` | object | | RSL Open License Protocol token issuer and public-key endpoints. |
+| `olp` | object | | RSL Open License Protocol token issuer and public-key endpoints. `token_rate_limit_per_minute` (default 60, `0` refused) budgets `POST /.well-known/olp/token` per source IP: that endpoint is unauthenticated and mints a bearer license token per call. See [comp-marketplace.md](comp-marketplace.md#the-olp-token-endpoints-budget). |
+| `comp` | object | | IAB CoMP marketplace bridge: `/.well-known/iab-comp/{manifest.json,quote,redeem}` on this origin, minting license tokens with the `olp` block's key. Requires `olp.enabled`. See [comp-marketplace.md](comp-marketplace.md). |
 | `web_bot_auth_publish` | object | | Publish a Web Bot Auth key directory and Signature Agent Card on this origin. |
 | `idempotency` | object | | `Idempotency-Key` middleware. See [Idempotency](#idempotency). |
 | `connection_pool` | object | | Only `idle_timeout_secs` is read, as the legacy spelling of `timeouts.idle_ms`. `max_connections` and `max_lifetime_secs` fail config load. See [Connection pool](#connection-pool). |

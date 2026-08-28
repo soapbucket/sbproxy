@@ -15,18 +15,23 @@
 pub mod marketplace;
 pub mod olp_bridge;
 pub mod router;
+pub mod serve;
 pub mod types;
 
 pub use marketplace::{
     quote_acceptance_hash, BuyerKeyRegistry, CompMarketplace, InMemoryBuyerKeyRegistry,
-    COMP_QUOTE_VALIDITY_SECS,
+    COMP_ACCEPTANCE_SKEW_SECS, COMP_QUOTE_LEDGER_CAPACITY, COMP_QUOTE_VALIDITY_SECS,
 };
 pub use olp_bridge::{OlpBridgeClaims, OlpBridgeSigner, OLP_JWS_TYP};
-pub use router::comp_router;
+pub use router::{comp_router, COMP_REQUEST_BODY_LIMIT};
+pub use serve::{
+    method_not_allowed, oversize, rate_limited, serve_manifest, serve_quote, serve_redeem,
+    CompEndpoint, CompResponse,
+};
 pub use types::{
-    CompAcceptance, CompAcquisition, CompAuthorization, CompBuyer, CompEndpoints, CompManifest,
-    CompPaymentProof, CompPricing, CompPricingModel, CompPublisher, CompQuotePricing,
-    CompQuoteRequest, CompQuoteResponse, CompRateCaps, CompRedeemRequest, CompRedeemResponse,
-    CompRequestedVolume, CompSignature, CompTier, COMP_MANIFEST_CACHE_CONTROL,
+    compute_manifest_hash, CompAcceptance, CompAcquisition, CompAuthorization, CompBuyer,
+    CompEndpoints, CompManifest, CompPaymentProof, CompPricing, CompPricingModel, CompPublisher,
+    CompQuotePricing, CompQuoteRequest, CompQuoteResponse, CompRateCaps, CompRedeemRequest,
+    CompRedeemResponse, CompRequestedVolume, CompSignature, CompTier, COMP_MANIFEST_CACHE_CONTROL,
     COMP_MANIFEST_CONTENT_TYPE, COMP_NO_STORE_CACHE_CONTROL, COMP_QUOTE_CONTENT_TYPE, COMP_VERSION,
 };
