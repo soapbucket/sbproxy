@@ -620,27 +620,37 @@ impl NonceStore for HmacMemoryNonceStore {
 /// Auth runs before the body is read, so `req.body()` is empty on the
 /// live path (`check_auth` synthesizes the request from headers).
 /// Content-Length greater than zero and chunked Transfer-Encoding are
-/// the signals APISIX uses for `validate_request_body`. A non-empty
-/// body on `req` still counts so unit tests that pass bytes through
-/// `HmacAuth::verify` stay honest.
+/// the signals APISIX uses for `validate_request_body`. HTTP/2 and
+/// HTTP/3 omit Content-Length and do not use chunked TE, so when
+/// neither header is present this falls back to the method, matching
+/// `request_carries_no_body` in the request phase: GET/HEAD/OPTIONS/
+/// DELETE are bodyless, everything else is treated as carrying a body.
+/// A non-empty body on `req` still counts so unit tests that pass
+/// bytes through `HmacAuth::verify` stay honest.
 fn request_carries_a_body(req: &http::Request<bytes::Bytes>) -> bool {
     if !req.body().is_empty() {
         return true;
     }
-    if let Some(len) = req.headers().get(http::header::CONTENT_LENGTH) {
-        if let Ok(s) = len.to_str() {
-            if s.trim().parse::<u64>().ok().is_some_and(|n| n > 0) {
-                return true;
-            }
-        }
+    if let Some(length) = req
+        .headers()
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    {
+        return length > 0;
     }
-    req.headers()
+    if req
+        .headers()
         .get(http::header::TRANSFER_ENCODING)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| {
             v.split(',')
                 .any(|token| token.trim().eq_ignore_ascii_case("chunked"))
         })
+    {
+        return true;
+    }
+    !matches!(req.method().as_str(), "GET" | "HEAD" | "OPTIONS" | "DELETE")
 }
 
 #[cfg(test)]
@@ -1159,6 +1169,32 @@ mod tests {
                 );
             }
             other => panic!("expected Failed on missing body coverage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn require_body_digest_refuses_a_header_only_http2_post_without_content_length() {
+        let auth = provider_from(
+            serde_json::json!({
+                "require_body_digest": true,
+                "keys": [{ "key_id": "svc-billing", "secret": SECRET_HEX }]
+            }),
+            None,
+        );
+        let req = sign(SignSpec {
+            method: "POST",
+            target_uri: "/api/invoices",
+            body: b"",
+            ..SignSpec::default()
+        });
+        match auth.verify(&req) {
+            HmacVerdict::Failed { reason, .. } => {
+                assert!(
+                    reason.contains("content-digest"),
+                    "HTTP/2 POST has no Content-Length; method fallback must still require coverage: {reason}"
+                );
+            }
+            other => panic!("expected Failed on header-only HTTP/2 POST, got {other:?}"),
         }
     }
 

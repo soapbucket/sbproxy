@@ -1824,6 +1824,65 @@ async fn content_digest_match_records_a_single_auth_allow() {
     assert_eq!(hmac_auth_metric(origin, "deny"), deny_before);
 }
 
+/// WOR-2644 / logging seam: when the body filter never runs (GET, or
+/// a later short-circuit), a leftover stash must flush as allow, not
+/// as `content-digest body mismatch`.
+#[tokio::test]
+async fn content_digest_pending_at_request_end_without_a_body_filter_records_allow() {
+    const BODY: &[u8] = br#"{"to":"acct-1091","amount":"25.00"}"#;
+    let origin = "digest-pending-no-body-filter";
+    let pipeline = auth_test_pipeline(origin);
+    let secret_hex = "00112233445566778899aabbccddeeff";
+    let key_id = "svc-billing";
+    let auth = build_hmac_auth_provider(key_id, secret_hex);
+    let digest = sha256_digest(BODY);
+    let (sig_input, sig_value) = hmac_sign_post(
+        secret_hex,
+        key_id,
+        "/v1/transfer",
+        &["@method", "@target-uri", "content-digest"],
+        Some(&digest),
+    );
+    let headers = signed_headers(&sig_input, &sig_value, &digest);
+    let (result, _principal, _trust, decided) = check_auth_decided(
+        &auth,
+        &headers,
+        None,
+        "POST",
+        "/v1/transfer",
+        test_tenant(),
+        None,
+        None,
+    )
+    .await;
+    assert!(matches!(result, AuthResult::Allow { .. }));
+
+    let mut ctx = RequestContext::new();
+    ctx.pipeline = pipeline;
+    ctx.origin_idx = Some(0);
+    ctx.hostname = origin.into();
+    ctx.trust_tier_metric_recorded = true;
+    crate::server::request_phase::arm_deferred_body_digest_binding(&mut ctx, &decided, &headers);
+    crate::server::record_or_defer_auth_decision(
+        &mut ctx,
+        origin,
+        &decided,
+        true,
+        "credential accepted",
+    );
+    let deny_before = hmac_auth_metric(origin, "deny");
+    crate::trust_tier::finalize_pending_body_proof_at_request_end(&mut ctx);
+    assert!(
+        hmac_auth_metric(origin, "allow") > 0.0,
+        "a request that never hit the body filter is an allow"
+    );
+    assert_eq!(
+        hmac_auth_metric(origin, "deny"),
+        deny_before,
+        "must not invent a content-digest mismatch at logging"
+    );
+}
+
 /// `content-digest` in `required_components` must mean what the docs say.
 ///
 /// The honest client sends the true digest of a real body and is
