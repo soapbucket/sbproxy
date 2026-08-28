@@ -18,7 +18,7 @@
 //! `sbproxy_ai::judge` is the live policy-authoring host function
 //! (`judge::semantic`, cached, budget-capped) an operator's CEL or Lua
 //! policy calls mid-request to get an LLM's opinion on a decision, per
-//! `docs/adr-judge-trait.md`. [`crate::evaluation::judge`] here is a different, offline
+//! `docs/policy.md`. [`crate::evaluation::judge`] here is a different, offline
 //! concern: building a structured judge PROMPT and parsing a judge
 //! model's scored JSON response for an evaluation run, with no cache, no
 //! budget, and no policy integration. Neither depends on the other; both

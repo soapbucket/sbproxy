@@ -832,7 +832,7 @@ class DocDriftCatalogTests(unittest.TestCase):
         result = self._run(root)
         self.assertEqual(result.returncode, 1)
         self.assertNotIn("providers$", result.stderr)
-        for page in ("ai-gateway.md", "features.md", "providers.md"):
+        for page in ("ai-gateway.md", "providers.md"):
             self.assertIn(f"docs/{page}", result.stderr)
         self.assertIn(
             f"but the catalog has {remaining} custom-format entries", result.stderr

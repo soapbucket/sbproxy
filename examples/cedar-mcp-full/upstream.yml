@@ -1,0 +1,25 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# REST mock for the cedar-mcp-full example.
+#
+# Three routes, one per MCP tool the gateway derives from the OpenAPI
+# spec in sb.yml. Each answers 200 with a tiny JSON body so a Cedar
+# Allow is a real round-trip, not a canned MCP transcript.
+#
+# Run:
+#   sbproxy serve -f examples/cedar-mcp-full/upstream.yml
+#
+# Test directly (bypassing the MCP gateway):
+#   curl -s http://127.0.0.1:8091/search/repositories | jq .
+
+proxy:
+  http_bind_port: 8091
+
+origins:
+  "127.0.0.1":
+    action:
+      type: mock
+      status: 200
+      content_type: application/json
+      body:
+        ok: true
+        source: cedar-mcp-full-upstream

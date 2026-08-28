@@ -172,7 +172,7 @@
           }
         }
       ],
-      "description": "Rate of policy verdict events dropped because the in-memory audit bus was full. Per `docs/adr-policy-audit-binding.md` this is a paging signal: a non-zero rate means the audit consumer is offline or saturated and decisions are slipping through unrecorded. Page on a sustained non-zero value."
+      "description": "Rate of policy verdict events dropped because the in-memory audit bus was full. Per `docs/events.md` this is a paging signal: a non-zero rate means the audit consumer is offline or saturated and decisions are slipping through unrecorded. Page on a sustained non-zero value."
     },
     {
       "id": 3,
