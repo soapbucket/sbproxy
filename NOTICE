@@ -83,6 +83,13 @@ https://github.com/KyleMayes/clang-sys
 
 ===========================================================================
 
+pulldown-cmark-to-cmark
+Copyright (c) 2018 Sebastian Thiel
+Licensed under the Apache License, Version 2.0
+https://github.com/Byron/pulldown-cmark-to-cmark
+
+===========================================================================
+
 memo-map
 Copyright 2022-2026 Armin Ronacher
 Licensed under the Apache License, Version 2.0

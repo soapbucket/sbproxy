@@ -1,6 +1,6 @@
 # Upgrade SBproxy
 
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-27*
 
 Use this procedure for the Rust v1 release line. Upgrade a test or canary instance before the rest of a fleet, and keep the previous binary or image available until the new process has served traffic.
 
@@ -86,6 +86,17 @@ After the fleet is stable on the intended version, remove the temporary `sb.yml.
 
 What follows is not the changelog; it is the subset that changes behavior under an existing config, refuses a config that used to load, or moves a metric label a dashboard might key on. Skipping versions compounds the list: upgrading 1.9.0 to 1.12.0 means reading all three sections below.
 
+### Unreleased
+
+- **For out-of-tree plugin authors only: a linked plugin returning `ActionOutcome::Responded` now gets a `501` on the wire.** The variant is the 0.2 signal that the handler already wrote a response through host state, and no host state a linked `ActionHandler` reaches writes one. HTTP/1.1 and HTTP/2 previously marked the request served and sent nothing, so the client saw an empty exchange and the access log had no status; HTTP/3 already answered `501`. All three now answer `501 Not Implemented` with an `application/json` body carrying the stable `unsupported_action_outcome` reason, tick `sbproxy_errors_total{error_type="unsupported_action_outcome"}`, and publish a `request_error` event. Nothing on the wire worked before, so no functioning deployment changes behavior; return `ActionOutcome::Response { status, headers, body }` instead.
+
+- **Three `cel` transform `headers:` rules that used to load now refuse the config.** A `value_expr` can only read what its response phase binds, and no phase binds the whole response, so a rule reaching for the wrong half was resolving against an empty value and writing a wrong header. Each refusal names the origin, the rule, and the action. Run the target release's `sbproxy validate` against your config before rolling it out; if one fires, the rule was never producing the header you configured.
+  - `response.body` on an origin every route of which streams (`proxy`, `load_balancer`, `a2a`). That phase runs before the first body byte arrives.
+  - `response.headers` on an origin every route of which buffers (`static`, `mock`, `plugin`). That phase owns the body and does not yet own a response header map.
+  - Any `headers:` rule at all on an origin whose action is `echo`, `beacon`, `redirect`, `storage`, `noop`, `mcp`, `grpc`, `graphql`, `ai_proxy`, or `websocket`, with no forward rule in the other two groups. Those actions never run the origin transform chain, so the rule ran in no phase and set no header. Use a `response_modifiers:` entry instead.
+- **`op: append` on a `cel` header rule now emits every value.** On a `static` or `plugin` origin two `append` rules for one header used to leave only the second value, while the identical config on a `mock` origin emitted both. A response that previously carried one value for such a header now carries all of them, so a downstream parser reading only the first or the last may see something different.
+- **One AI metric label moves for a `3xx`.** A race leg that answered `3xx` counted as `sbproxy_ai_provider_attempts_total{outcome="error"}` and now counts as `outcome="success"`, which is what every other dispatch path already reported. A `3xx` from an AI provider is rare, so most dashboards will not move; one keying on that series for a `race` origin should be checked.
+
 ### 1.12.0
 
 - **A broken `ai_policy.expression` now refuses the config.** A syntax error or an out-of-namespace binding previously logged once and booted with the policy silently absent. If your config stops loading on this upgrade, that policy was never running; fix the expression and it starts enforcing.
@@ -114,7 +125,7 @@ Also worth checking: `compression.level` is now applied to the response encoders
 ### 1.10.0
 
 - **`engine: embedded` is removed from the model host.** It was opt-in at build time and never certified. A config that still sets it fails to parse; llama.cpp covers the CPU/Metal zero-external-binary case, and the `mistralrs` subprocess engine covers safetensors serving.
-- **For out-of-tree plugin authors only:** `sbproxy-plugin` moved to 0.3.0 with a data-bearing `ActionOutcome::Response` variant; exhaustive matches on the 0.2 enum stop compiling. The migration note is on the enum's rustdoc.
+- **For out-of-tree plugin authors only:** `sbproxy-plugin` moved to 0.3.0 with a data-bearing `ActionOutcome::Response` variant; exhaustive matches on the 0.2 enum stop compiling. The migration note is on the enum's rustdoc. Source compatibility was not behavior compatibility: see the Unreleased entry above for what the retained 0.2 `Responded` variant now does on the wire.
 
 ### 1.9.0
 
