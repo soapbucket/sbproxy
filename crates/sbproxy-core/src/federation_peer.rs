@@ -347,10 +347,10 @@ impl FederationPeerVerifier {
                         Err(error) => {
                             tracing::warn!(
                                 target: "sbproxy_federation::decision",
-                                event = "federation_peer_decision",
+                                event = "federation_peer_decision_detail",
                                 outcome = "refused",
                                 reason = "metadata_policy",
-                                %error,
+                                error = %sbproxy_security::log_safe::log_safe(&error.to_string()),
                                 "peer chain carries metadata policies that do not compose"
                             );
                             return false;
@@ -377,11 +377,11 @@ impl FederationPeerVerifier {
             if let Err(error) = sbproxy_federation::apply_block_policy(&block, block_policy) {
                 tracing::warn!(
                     target: "sbproxy_federation::decision",
-                    event = "federation_peer_decision",
+                    event = "federation_peer_decision_detail",
                     outcome = "refused",
                     reason = "metadata_policy",
-                    entity_type = %entity_type,
-                    %error,
+                    entity_type = %sbproxy_security::log_safe::log_safe(entity_type),
+                    error = %sbproxy_security::log_safe::log_safe(&error.to_string()),
                     "peer metadata violates the policy its superior imposed"
                 );
                 return false;
@@ -420,10 +420,10 @@ impl FederationPeerVerifier {
             if !satisfied {
                 tracing::warn!(
                     target: "sbproxy_federation::decision",
-                    event = "federation_peer_decision",
+                    event = "federation_peer_decision_detail",
                     outcome = "refused",
                     reason = "trust_mark",
-                    trust_mark = %required,
+                    trust_mark = %sbproxy_security::log_safe::log_safe(required),
                     "peer does not carry a required trust mark signed by the anchor"
                 );
                 return false;

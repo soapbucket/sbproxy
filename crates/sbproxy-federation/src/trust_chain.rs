@@ -274,7 +274,9 @@ impl TrustChainResolver {
                     target: "sbproxy_federation::decision",
                     event = "federation_trust_chain_decision",
                     outcome = "resolved",
-                    leaf_entity_id = leaf_entity_id.as_deref().unwrap_or("unknown"),
+                    leaf_entity_id = %sbproxy_security::log_safe::log_safe(
+                        leaf_entity_id.as_deref().unwrap_or("unknown")
+                    ),
                     trust_anchor_id = %resolved.trust_anchor_id,
                     chain_len = resolved.statements.len(),
                     "trust chain resolved"
@@ -286,8 +288,10 @@ impl TrustChainResolver {
                     target: "sbproxy_federation::decision",
                     event = "federation_trust_chain_decision",
                     outcome = "rejected",
-                    leaf_entity_id = leaf_entity_id.as_deref().unwrap_or("unknown"),
-                    error = %err,
+                    leaf_entity_id = %sbproxy_security::log_safe::log_safe(
+                        leaf_entity_id.as_deref().unwrap_or("unknown")
+                    ),
+                    error = %sbproxy_security::log_safe::log_safe(&err.to_string()),
                     "trust chain rejected"
                 );
             }

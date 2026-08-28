@@ -294,7 +294,7 @@ mod tests {
         );
     }
 
-    /// Trailing slash on the entity_id is normalised: the
+    /// Trailing slash on the entity_id is normalized: the
     /// well-known suffix MUST NOT introduce a double slash.
     #[test]
     fn well_known_url_handles_trailing_slash() {

@@ -47,7 +47,7 @@
 //!
 //! An `action: mcp` can compile this provider from its nested
 //! `oauth.resource_server` configuration. Core dispatch applies it after
-//! MCP transport trust and before catalogue reads, body parsing, or
+//! MCP transport trust and before catalog reads, body parsing, or
 //! upstream work. The same type remains usable directly by MCP servers
 //! that are not hosted behind sbproxy.
 

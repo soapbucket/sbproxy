@@ -264,8 +264,8 @@ pub fn verify_entity_statement(
                 target: "sbproxy_federation::decision",
                 event = "federation_entity_statement_decision",
                 outcome = "verified",
-                iss = %stmt.claims.iss,
-                sub = %stmt.claims.sub,
+                iss = %sbproxy_security::log_safe::log_safe(&stmt.claims.iss),
+                sub = %sbproxy_security::log_safe::log_safe(&stmt.claims.sub),
                 self_signed = stmt.claims.is_self_signed(),
                 "entity statement verified"
             );
@@ -276,7 +276,7 @@ pub fn verify_entity_statement(
                 target: "sbproxy_federation::decision",
                 event = "federation_entity_statement_decision",
                 outcome = "rejected",
-                error = %err,
+                error = %sbproxy_security::log_safe::log_safe(&err.to_string()),
                 "entity statement rejected"
             );
         }

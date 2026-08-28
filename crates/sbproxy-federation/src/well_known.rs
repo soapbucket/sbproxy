@@ -541,9 +541,10 @@ mod tests {
         );
     }
 
-    /// A bogus PEM surfaces as a typed `InvalidSigningKey` rather
-    /// than a panic. The operator gets a useful error message
-    /// instead of a backtrace when they paste in the wrong key.
+    /// A signing `kid` the published JWKS does not carry is refused at
+    /// construction rather than at every peer's verifier. The document
+    /// this entity serves is signed with a key nobody can look up, so
+    /// the endpoint answers 200 while every consumer rejects it.
     #[test]
     fn a_signing_kid_absent_from_published_jwks_is_refused_at_construction() {
         // The rotation mistake: `kid` moved, the JWKS did not. Nothing
@@ -564,6 +565,9 @@ mod tests {
         );
     }
 
+    /// A bogus PEM surfaces as a typed `InvalidSigningKey` rather
+    /// than a panic. The operator gets a useful error message
+    /// instead of a backtrace when they paste in the wrong key.
     #[test]
     fn invalid_pem_returns_typed_error() {
         let mut cfg = sample_config(

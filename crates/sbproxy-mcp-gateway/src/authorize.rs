@@ -980,4 +980,104 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body.contains("invalid_target"), "body: {body}");
     }
+
+    /// An over-length URL-shaped `client_id` is refused, not quietly
+    /// downgraded to the pre-registered path.
+    ///
+    /// The bound used to be applied by returning `None` from
+    /// `detect_cimd_client_id`, which is not a refusal: the request
+    /// fell through to the pre-registered branch, whose only gate is
+    /// the `redirect_uri` allowlist. A deployment running both
+    /// pre-registered clients and CIMD therefore admitted it with the
+    /// document's own `redirect_uris` and scope checks skipped.
+    #[tokio::test]
+    async fn security_boundary_an_over_length_client_id_is_refused_not_downgraded() {
+        let (app, _store) = build_app();
+        let long = format!(
+            "https://client.example/{}",
+            "a".repeat(crate::config::MAX_CIMD_CLIENT_ID_LEN)
+        );
+        let uri = format!(
+            "/mcp/oauth/authorize?\
+             client_id={}\
+             &redirect_uri=https%3A%2F%2Fclient.example%2Fcb\
+             &response_type=code\
+             &code_challenge=abc\
+             &code_challenge_method=S256\
+             &state=cli-state\
+             &resource=https%3A%2F%2Fmcp.example%2Fapi",
+            long.replace(':', "%3A").replace('/', "%2F")
+        );
+        let (status, _headers, body) = send(app, &uri).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an over-length client_id must be refused; body: {body}"
+        );
+        assert!(
+            body.contains("invalid_client"),
+            "the refusal must be invalid_client, got {body}"
+        );
+        // The redirect_uri on this request IS in the allowlist, so a
+        // fall-through would have produced a 302 to the upstream. That
+        // is the regression this asserts against.
+        assert!(
+            !body.contains("code_challenge"),
+            "the request must not have reached the authorization flow"
+        );
+    }
+
+    /// The CIMD refusal body carries a fixed string and never the
+    /// internal error.
+    ///
+    /// The detail names the address a caller-chosen URL resolved to,
+    /// which turns an unauthenticated `/authorize` into a
+    /// DNS-to-private-address oracle and a port scanner. The counter
+    /// goes red if the branch is deleted; nothing went red if the
+    /// `format!("CIMD resolution failed: {e}")` came back, which is
+    /// the change that actually reopens the hole.
+    #[tokio::test]
+    async fn security_boundary_the_cimd_refusal_body_is_fixed_and_names_no_address() {
+        let mut cfg = test_config();
+        cfg.cimd_enabled = true;
+        let store = InMemorySessionStore::arc(Duration::from_secs(60));
+        let app = crate::router(Arc::new(cfg), store);
+        // A CIMD URL that cannot resolve. The host is RFC 2606
+        // reserved, so the fetch fails without leaving the machine.
+        let uri = "/mcp/oauth/authorize?\
+                   client_id=https%3A%2F%2Fclient.invalid%2Fcimd.json\
+                   &redirect_uri=https%3A%2F%2Fclient.example%2Fcb\
+                   &response_type=code\
+                   &code_challenge=abc\
+                   &code_challenge_method=S256\
+                   &state=cli-state\
+                   &resource=https%3A%2F%2Fmcp.example%2Fapi";
+        let (status, _headers, body) = send(app, uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert!(
+            body.contains(CIMD_UNRESOLVED_DESCRIPTION),
+            "the body must carry the fixed description, got {body}"
+        );
+        // Check the leak markers against the body with the fixed
+        // description removed: "resolved" is a word in that sentence,
+        // and matching it there would make this test pass for the
+        // wrong reason and fail for a correct body.
+        let residue = body.replace(CIMD_UNRESOLVED_DESCRIPTION, "");
+        for leak in [
+            "resolve",
+            "blocked range",
+            "ssrf",
+            "connect",
+            "dns",
+            "10.",
+            "127.",
+            "169.254",
+            "timed out",
+        ] {
+            assert!(
+                !residue.to_ascii_lowercase().contains(leak),
+                "the refusal body leaked {leak:?}: {body}"
+            );
+        }
+    }
 }

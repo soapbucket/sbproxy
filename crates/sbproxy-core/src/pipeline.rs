@@ -2424,7 +2424,18 @@ fn build_federation_issuer(
     let Some(config) = config.filter(|config| config.enabled) else {
         return Ok(None);
     };
+    // Parse the published key set even in validation mode. Only the
+    // PEM read is skipped below, because that touches the filesystem
+    // for a private key `sbproxy validate` has no business reading.
+    // Returning early here meant a malformed JWK validated clean and
+    // then refused to boot, which is the exact class
+    // `construct_examples` exists to close.
+    let published: sbproxy_federation::FederationKeySet =
+        serde_json::from_value(config.published_jwks.clone()).map_err(|error| {
+            anyhow::anyhow!("proxy.federation.published_jwks is not a JWK set: {error}")
+        })?;
     if matches!(mode, PipelineConstructionMode::Validation) {
+        let _ = published;
         return Ok(None);
     }
     let algorithm = match config.signing_key.algorithm.as_str() {
@@ -2476,12 +2487,17 @@ fn build_federation_peer_verifier(
     let Some(config) = config.filter(|config| config.enabled) else {
         return Ok(None);
     };
-    if matches!(mode, PipelineConstructionMode::Validation) {
-        return Ok(None);
-    }
     let Some(peer_trust) = config.peer_trust.as_ref() else {
         return Ok(None);
     };
+    if matches!(mode, PipelineConstructionMode::Validation) {
+        // Build the verifier and drop it. Construction is what parses
+        // every pinned anchor's `jwks` into a `FederationKeySet`, and
+        // it dials nothing, so validation gets the key-shape refusal
+        // and the process gets no verifier.
+        let _ = crate::federation_peer::FederationPeerVerifier::new(peer_trust)?;
+        return Ok(None);
+    }
     Ok(Some(Arc::new(
         crate::federation_peer::FederationPeerVerifier::new(peer_trust)?,
     )))

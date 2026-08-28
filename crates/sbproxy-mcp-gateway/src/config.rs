@@ -39,6 +39,25 @@ pub enum StartupConfigError {
          browser's Origin header against it."
     )]
     DpopRequiresBaseUrl,
+    /// The `/authorize` limiter admits more requests over one session
+    /// lifetime than the session store can hold, so a stream of
+    /// anonymous requests inside the rate limit still wedges every new
+    /// authorization until the oldest entries expire.
+    #[error(
+        "authorize_requests_per_minute ({rate}) over session_ttl_secs ({ttl}) admits {admitted} \
+         sessions, more than the store holds ({capacity}); lower either key so their product \
+         stays under the capacity, or the limiter does not protect the store it was added for"
+    )]
+    AuthorizeRateExceedsSessionCapacity {
+        /// Sessions admitted over one full TTL at this rate.
+        admitted: u64,
+        /// What the store holds.
+        capacity: u64,
+        /// Configured rate.
+        rate: u64,
+        /// Configured session lifetime.
+        ttl: u64,
+    },
     /// Replay entries would expire while an otherwise fresh proof can
     /// still be accepted.
     #[error("dpop_jti_ttl_secs ({ttl}) is shorter than the required replay window ({minimum})")]
@@ -167,6 +186,23 @@ pub fn validate_startup(cfg: &McpGatewayConfig) -> Result<(), StartupConfigError
         if !valid {
             return Err(StartupConfigError::DpopRequiresBaseUrl);
         }
+    }
+    // The pairing `authorize_requests_per_minute` documents. The
+    // limiter and the store are separate keys, and only the pair is
+    // safe: either alone can be reasonable while the product wedges
+    // every new authorization for a full TTL.
+    let admitted_per_ttl = cfg
+        .authorize_requests_per_minute
+        .saturating_mul(cfg.session_ttl_secs)
+        / 60;
+    let capacity = crate::session::DEFAULT_SESSION_CAPACITY as u64;
+    if admitted_per_ttl > capacity {
+        return Err(StartupConfigError::AuthorizeRateExceedsSessionCapacity {
+            admitted: admitted_per_ttl,
+            capacity,
+            rate: cfg.authorize_requests_per_minute,
+            ttl: cfg.session_ttl_secs,
+        });
     }
     Ok(())
 }
@@ -493,7 +529,13 @@ pub struct McpGatewayConfig {
     /// `authorize_requests_per_minute / 60 * session_ttl_secs`. At the
     /// defaults that is 3000 against a 4096-row store, which means no
     /// stream of anonymous requests inside the limit can wedge new
-    /// authorizations. Raise both together or the guarantee goes.
+    /// authorizations.
+    ///
+    /// `validate_startup` refuses a pair that breaks it rather than
+    /// leaving the arithmetic in this doc comment: raising
+    /// `session_ttl_secs` to an hour at the default rate admits 18000
+    /// per TTL against that store, which is the wedge the limiter was
+    /// added to remove.
     #[serde(default = "McpGatewayConfig::default_authorize_requests_per_minute")]
     pub authorize_requests_per_minute: u64,
 
@@ -1106,5 +1148,119 @@ mod tests {
             ..Default::default()
         };
         validate_startup(&cfg).expect("DPoP off, validation should succeed");
+    }
+
+    /// Device code needs a canonical origin, and used to boot without
+    /// one whenever DPoP was off.
+    ///
+    /// The consent POST compares the browser's `Origin` against the
+    /// broker's own. With no base URL, `resolve_verification_uri`
+    /// returns the relative `/mcp/oauth/verify`, `Url::parse` fails,
+    /// and `verify_same_origin` returns false unconditionally, so every
+    /// legitimate approval was a 403 on a config that validated clean.
+    #[test]
+    fn validate_startup_requires_a_base_url_when_device_code_is_enabled() {
+        let cfg = McpGatewayConfig {
+            external_base_url: String::new(),
+            device_code_enabled: true,
+            // The combination that used to slip through: the base-URL
+            // check ran only under DPoP.
+            dpop_supported: false,
+            dpop_require_nonce: false,
+            broker_signing_key: Some(JwkKey::Pem {
+                pem: "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----".to_string(),
+                alg: "ES256".to_string(),
+                kid: Some("broker-2026-08".to_string()),
+                public_jwk: Some(serde_json::json!({
+                    "kty": "EC", "crv": "P-256", "kid": "broker-2026-08",
+                    "alg": "ES256", "use": "sig", "x": "a", "y": "b"
+                })),
+            }),
+            ..McpGatewayConfig::default()
+        };
+        let err = validate_startup(&cfg).expect_err("device code with no base URL must be refused");
+        assert!(
+            matches!(err, StartupConfigError::DpopRequiresBaseUrl),
+            "got {err:?}"
+        );
+    }
+
+    /// The same config with a base URL is accepted, so the refusal is
+    /// about the missing origin and not about device code itself.
+    #[test]
+    fn validate_startup_accepts_device_code_with_a_base_url() {
+        let cfg = McpGatewayConfig {
+            external_base_url: "https://broker.example".to_string(),
+            device_code_enabled: true,
+            dpop_supported: false,
+            dpop_require_nonce: false,
+            broker_signing_key: Some(JwkKey::Pem {
+                pem: "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----".to_string(),
+                alg: "ES256".to_string(),
+                kid: Some("broker-2026-08".to_string()),
+                public_jwk: Some(serde_json::json!({
+                    "kty": "EC", "crv": "P-256", "kid": "broker-2026-08",
+                    "alg": "ES256", "use": "sig", "x": "a", "y": "b"
+                })),
+            }),
+            ..McpGatewayConfig::default()
+        };
+        assert!(validate_startup(&cfg).is_ok(), "a base URL satisfies it");
+    }
+
+    /// The limiter and the store are separate keys and only the pair is
+    /// safe. This was asserted for the two default constants and
+    /// nowhere else, so an hour-long session TTL at the default rate
+    /// reopened the wedge the limiter was added to close.
+    #[test]
+    fn validate_startup_rejects_a_rate_that_can_fill_the_session_store() {
+        let cfg = McpGatewayConfig {
+            external_base_url: "https://broker.example".to_string(),
+            // 50/min over 3600s admits 3000... raise the TTL and it is
+            // 18000 against a 4096-row store.
+            session_ttl_secs: 3600,
+            ..McpGatewayConfig::default()
+        };
+        let admitted = cfg.authorize_requests_per_minute.saturating_mul(3600) / 60;
+        assert!(
+            admitted > crate::session::DEFAULT_SESSION_CAPACITY as u64,
+            "fixture must actually exceed the store, got {admitted}"
+        );
+        let err = validate_startup(&cfg).expect_err("the pairing must be refused");
+        assert!(
+            matches!(
+                err,
+                StartupConfigError::AuthorizeRateExceedsSessionCapacity { .. }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    /// The defaults are the pairing the doc comment describes, and they
+    /// pass. Without this the test above would also pass on a build
+    /// that refused everything.
+    #[test]
+    fn the_default_rate_and_session_lifetime_are_a_valid_pair() {
+        let cfg = McpGatewayConfig {
+            external_base_url: "https://broker.example".to_string(),
+            ..McpGatewayConfig::default()
+        };
+        assert!(
+            validate_startup(&cfg).is_ok(),
+            "the shipped defaults must satisfy their own documented arithmetic"
+        );
+    }
+
+    /// The CIMD client-id bound has to fit under the store's key budget
+    /// once the cache prefix is prepended, or the refusal moves into
+    /// the store and names the wrong cause. Asserted at compile time
+    /// too; this is the message a reader gets.
+    #[test]
+    fn the_cimd_client_id_bound_fits_the_local_store_key_budget() {
+        assert!(
+            MAX_CIMD_CLIENT_ID_LEN + "cimd:doc:".len() < 1_024,
+            "MAX_CIMD_CLIENT_ID_LEN ({MAX_CIMD_CLIENT_ID_LEN}) plus the cache prefix must fit \
+             LocalStore's 1024-byte key budget"
+        );
     }
 }

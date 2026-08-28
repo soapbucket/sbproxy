@@ -422,7 +422,7 @@ fn every_production_decision_write_is_a_promised_surface() {
 /// a second promise about the same family, in a second place, and it
 /// had already drifted from the code once (`token`/`cimd_unresolved`
 /// was emitted and unlisted). The registry description is prose an
-/// operator reads in the catalogue; this table is what a developer
+/// operator reads in the catalog; this table is what a developer
 /// reads at the call site. Both have to be true.
 fn rustdoc_table_pairs(root: &Path) -> Vec<(String, String)> {
     let path = root.join("crates/sbproxy-mcp-gateway/src/metrics.rs");

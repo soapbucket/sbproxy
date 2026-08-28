@@ -196,9 +196,9 @@ pub fn verify_trust_mark(
                 target: "sbproxy_federation::decision",
                 event = "federation_trust_mark_decision",
                 outcome = "verified",
-                iss = %mark.claims.iss,
-                sub = %mark.claims.sub,
-                id = %mark.claims.id,
+                iss = %sbproxy_security::log_safe::log_safe(&mark.claims.iss),
+                sub = %sbproxy_security::log_safe::log_safe(&mark.claims.sub),
+                id = %sbproxy_security::log_safe::log_safe(&mark.claims.id),
                 "trust mark verified"
             );
         }
@@ -208,7 +208,7 @@ pub fn verify_trust_mark(
                 target: "sbproxy_federation::decision",
                 event = "federation_trust_mark_decision",
                 outcome = "rejected",
-                error = %err,
+                error = %sbproxy_security::log_safe::log_safe(&err.to_string()),
                 "trust mark rejected"
             );
         }

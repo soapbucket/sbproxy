@@ -70,6 +70,15 @@ async fn manifest(State(mp): State<Arc<CompMarketplace>>) -> Response {
 /// newline-delimited records, which is how a fabricated "quoted"
 /// decision gets into an audit trail. Control characters go, and the
 /// value is capped so one request cannot write a megabyte into the log.
+///
+/// This is a deliberate duplicate of `sbproxy_observe::log_safe`, which
+/// is what the federation peer-trust decision calls for the same
+/// reason. This crate depends on `sbproxy-storage` and nothing else in
+/// the workspace, and it is unlinked from every binary (WOR-2673), so
+/// pulling in `sbproxy-observe` for ten lines would be the larger
+/// mistake. If a third caller appears, move this to a crate all three
+/// already depend on rather than adding a fourth copy. The two
+/// implementations are kept byte-identical on purpose.
 fn log_safe(value: &str) -> String {
     const MAX: usize = 200;
     let mut out: String = value

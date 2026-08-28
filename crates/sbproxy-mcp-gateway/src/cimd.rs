@@ -445,7 +445,7 @@ async fn enforce_fetch_envelope(
 /// one that OAuth 2.1 s1.5 does not permit.
 fn validate_document(doc: &ClientIdMetadataDocument, client_id_url: &str) -> Result<()> {
     // The document MUST self-identify with the URL we fetched it from.
-    // Compare strings exactly: clients can normalise their own URLs
+    // Compare strings exactly: clients can normalize their own URLs
     // however they like, but the AS decides which form is canonical.
     if doc.client_id != client_id_url {
         bail!(

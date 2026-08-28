@@ -863,6 +863,62 @@ mod tests {
         assert_eq!(resolved.addrs.len(), 1);
         assert_eq!(resolved.addrs[0].port(), 8080);
     }
+
+    /// The IPv4-embedding v6 forms `canonical_ip` does not unwrap must
+    /// still be refused at the dial.
+    ///
+    /// `canonical_ip` handles `::ffff:a.b.c.d` and nothing else, which
+    /// left four other spellings of an embedded IPv4 address passing
+    /// every range check: `to_ipv4_mapped()` and `to_ipv4()` are both
+    /// `None` for them, `is_ula` and `is_link_local_v6` compare the
+    /// wrong prefix, and multicast is false. On a network that routes
+    /// them, which for NAT64 is any IPv6-only Kubernetes cluster, the
+    /// embedded address is reachable.
+    ///
+    /// Reachable unauthenticated from
+    /// `/authorize?client_id=https://[64:ff9b::a9fe:a9fe]/x`.
+    #[test]
+    fn security_boundary_ipv4_embedding_v6_forms_are_refused() {
+        let refused = [
+            // RFC 6052 NAT64 well-known prefix, carrying the cloud
+            // metadata address.
+            "64:ff9b::a9fe:a9fe",
+            // The same prefix carrying an RFC 1918 address.
+            "64:ff9b::a00:5",
+            // RFC 8215 local-use NAT64 prefix.
+            "64:ff9b:1::a9fe:a9fe",
+            // RFC 6052 IPv4-translated (SIIT): the ffff group sits one
+            // earlier than in the mapped form.
+            "::ffff:0:a9fe:a9fe",
+            "::ffff:0:a00:5",
+            // 6to4 over a link-local address.
+            "2002:a9fe:a9fe::",
+            // 6to4 over RFC 1918.
+            "2002:a00:5::",
+            // The deprecated IPv4-compatible form, already covered.
+            "::a9fe:a9fe",
+        ];
+        for spelling in refused {
+            let ip: IpAddr = spelling.parse().expect("fixture parses");
+            assert!(
+                validate_dialable_addrs(&[SocketAddr::new(ip, 443)]).is_err(),
+                "{spelling} must be refused at the dial: it carries an IPv4 address a socket \
+                 has no business reaching, in a spelling canonical_ip does not unwrap"
+            );
+        }
+    }
+
+    /// And 6to4 over a public address is still dialable, so the block
+    /// is not refused wholesale.
+    #[test]
+    fn a_6to4_address_over_public_space_is_still_dialable() {
+        // 2002:0808:0808:: embeds 8.8.8.8.
+        let ip: IpAddr = "2002:808:808::".parse().unwrap();
+        assert!(
+            validate_dialable_addrs(&[SocketAddr::new(ip, 443)]).is_ok(),
+            "6to4 is global unicast; only an embedded private or reserved address is refused"
+        );
+    }
 }
 
 /// Guard for the "Caller status" block in this module's docs.
