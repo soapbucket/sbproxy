@@ -171,14 +171,118 @@ curl -s -u admin:demo-change-me \
 
 `plan_text` is the same `terraform plan`-style diff `sbproxy plan` renders, computed between the stored revision and whatever is running when you ask, so it stays useful even after several more revisions have landed.
 
+## Watch a revision soak
+
+`lkg_revision` is `null` in the responses above, and it stays that way until a revision earns the pointer. Recording is not promoting: a config that compiles is not a config that works, and the whole point of this block is that something has to observe the config running before it becomes the thing you would roll back to.
+
+This example arms a 15 second window on every reload and points an operator probe at the admin server's `/healthz`. Reload once, then watch:
+
+```bash
+curl -s -u admin:demo-change-me http://127.0.0.1:9090/metrics \
+  | grep -E 'sbproxy_config_(lkg_revision|soak_verdict_total)'
+```
+
+```
+sbproxy_config_lkg_revision 2
+sbproxy_config_soak_verdict_total{signal="operator_probe",verdict="passed"} 1
+sbproxy_config_soak_verdict_total{signal="request_outcome",verdict="abstain"} 1
+sbproxy_config_soak_verdict_total{signal="upstream_health",verdict="abstain"} 1
+sbproxy_config_soak_verdict_total{signal="degraded_subsystems",verdict="abstain"} 1
+sbproxy_config_soak_verdict_total{signal="window",verdict="passed"} 1
+```
+
+Three signals abstained and one passed, so the window passed and `lkg_revision` moves off `-1` to the revision that just soaked. Three of those abstentions are worth reading:
+
+- `request_outcome` abstains because a demo box serves no traffic. Below `min_requests` it reports nothing rather than calling four requests and one error a 25% failure rate. This is the mistake that produces spurious rollbacks in canary systems, and abstaining is the fix.
+- `degraded_subsystems` abstains on a *clean* reload. It is a veto, not a promoter: nothing came up degraded, which proves the config constructed and proves nothing about whether it works.
+- `upstream_health` abstains because this example's origin is a `type: proxy` with no `health_check:`, `circuit_breaker:`, or `outlier_detection:` block, so there is nothing for the soak to read. It will not report health it never looked for. That is also why this walkthrough declares a `probe:` rather than relying on `proxy.synthetic_probe`: the synthetic origin is a non-network action, and while `upstream_health` is blind a synthetic pass cannot promote on its own. On a node whose origins all answer from the proxy itself there is no upstream to be blind to, and the driver alone is enough.
+
+Comment out the `probe:` block and reload again, and every signal abstains. The verdict is then `inconclusive`, `lkg_revision` stays where it was, and the entry stays `applied` rather than reaching `good`. That is deliberate. Promoting on a window that measured nothing would be promote-on-apply with fifteen extra seconds attached.
+
+A deployment pipeline does not have to wait:
+
+```bash
+curl -s -u admin:demo-change-me -X POST http://127.0.0.1:9090/admin/config/confirm | jq .
+```
+
+```json
+{
+  "revision": 2,
+  "verdict": "passed",
+  "promoted": true,
+  "signals": [
+    {"signal": "degraded_subsystems", "outcome": "abstain", "detail": "no subsystem stayed on prior state, which is not by itself evidence that this config works"},
+    {"signal": "upstream_health", "outcome": "abstain", "detail": "1 origin(s) expose no health signal, so this cannot say their upstreams are reachable: default/api.local. declare a health_check, a circuit_breaker, or an outlier detector on them, or a soak probe that exercises them"},
+    {"signal": "request_outcome", "outcome": "abstain", "detail": "the window observed 0 request(s), under the min_requests of 5"},
+    {"signal": "operator_probe", "outcome": "passed", "detail": ""}
+  ]
+}
+```
+
+That short-circuits the wait, not the judgment. Read `promoted` rather than assuming a `200` means the pointer moved.
+
+## Break the config on purpose
+
+Two things happen when you push a config that does not apply, and both of them are new here.
+
+First, the refusal is kept. Add a misspelled key to `sb.yml` and save it:
+
+```bash
+printf '\n  http2_cleartextt: true\n' >> sb.yml   # under proxy:
+curl -s -u admin:demo-change-me http://127.0.0.1:9090/admin/config/rejected | jq '.entries[0]'
+```
+
+```json
+{
+  "digest": "3f79bb7b435b05321651daefd374cdc681dc06faa65e374e38337b88ca046dea",
+  "reason": "compile_failed",
+  "stage": "file_watcher",
+  "detail": "unknown field `http2_cleartextt`",
+  "count": 1,
+  "first_seen_at": "2026-08-26T09:02:11.004Z",
+  "last_seen_at": "2026-08-26T09:02:11.004Z"
+}
+```
+
+The node always knew this; before, it became a log line and then it was gone. Save the same broken file again and `count` goes to 2 rather than a second row appearing.
+
+Second, restart with the file still broken. `boot.fallback` is `last_known_good` in this example, so the node walks the ring instead of exiting:
+
+```
+WARN this node booted on a configuration restored from its revision ring, not on the
+     config file it was pointed at. the file watcher, SIGHUP, and the source: refresh
+     poller are suspended until an operator clears the pin with
+     DELETE /admin/config/fallback revision=2
+```
+
+```bash
+curl -s -u admin:demo-change-me http://127.0.0.1:9090/admin/config/fallback | jq .
+```
+
+```json
+{
+  "active": true,
+  "revision": 2,
+  "digest": "c43d279441bb6ff6c451dfb376618835253bc8515d019ea181f116a1ec152697",
+  "suspended": ["file_watcher", "sighup", "config_refresh_poller"]
+}
+```
+
+Fix the file and save it, and nothing happens: the watcher is suspended, which is the point. Leaving it live would re-apply the broken file on the next save in that directory and loop straight back into the state the fallback just rescued the node from. Clear the pin and the three suspended paths come back without a restart:
+
+```bash
+curl -s -u admin:demo-change-me -X DELETE http://127.0.0.1:9090/admin/config/fallback | jq .
+```
+
+Set `boot.fallback: off` (the shipping default) and the same restart exits 1 with the compile error, exactly as it always has.
+
 ## What this ring does not do yet
 
-Today it is a local audit trail an operator reads by hand. `lkg_revision` above stayed `null` through this whole walkthrough because nothing in this release ever marks a revision as last-known-good, and nothing reads that pointer to decide anything. Reapplying a prior entry is also not implemented: `config show` prints the stored document so an operator can read or copy it, but nothing in this ring puts it back. `keep_rejected` reserves ring space for refused candidates, but writing to that space is a later change too, so a config that fails to apply is not yet recorded here at all.
-
-To move a running config back today, use whatever put the current one there in the first place: `sbproxy apply -f <known-good.yml>`, a Kubernetes rollback, or a Helm rollback. Soak-window promotion and a rollback that reapplies a ring entry directly are follow-on work.
+Nothing reverts automatically. A failed soak records its verdict and leaves the running config alone; deciding to roll back and doing it are separate, and the second half is follow-on work. Reapplying a prior entry by hand works today: `config show` prints the stored document, and `sbproxy apply -f -` puts it back.
 
 ## Reference
 
 - [docs/configuration.md](../../docs/configuration.md#config_history) - the `proxy.config_history` block, its fields, and the restart requirement
 - [docs/admin-api-reference.md](../../docs/admin-api-reference.md#get-adminconfighistory) - the full `GET /admin/config/history` and `GET /admin/config/history/{digest}` wire contract
-- [docs/operator-runbook.md](../../docs/operator-runbook.md#config-history-ring) - the ring in the context of an actual rollback procedure
+- [docs/admin-api-reference.md](../../docs/admin-api-reference.md#get-adminconfigrejected) - `GET /admin/config/rejected`, `POST /admin/config/confirm`, and the fallback routes
+- [docs/operator-runbook.md](../../docs/operator-runbook.md#config-history-ring) - the ring in the context of an actual rollback procedure, including the soak window and the fallback boot

@@ -1033,6 +1033,48 @@ also runs on candidate documents and publishing a gauge there zeroed the
 live series on every authority publish. And the read-and-merge prologue the
 two config admin routes had duplicated became one `effective_document`
 helper, which took a symbol out of the wider count.
+
+2026-08-28 (WOR-2455 config rollback core, merged with main at 304d6d53):
+tests-only unchanged at 324, unreferenced 1520 to 1523. Three additions,
+all of the kind this list already carries in bulk.
+
+`ConfigBootConfig` in `sbproxy-config/src/types.rs` is the `boot:` block
+under `proxy.config_history`, pub for the same reason every other node of
+the config tree is: serde constructs it, the schema generator walks it, and
+narrowing it breaks the derive on the pub parent. Production reads its
+three fields in `sbproxy-core/src/server/lifecycle.rs::boot_document`
+through the parent, so the field names appear and the type name does not.
+Its two siblings, `ConfigSoakConfig` and `ConfigSoakProbeConfig`, are not
+on the list because `sbproxy-core/src/config_soak.rs` names both.
+
+`FailedCandidate` and `FallbackDocument` in
+`sbproxy-core/src/config_boot.rs` are the error payload and the return of
+`walk_for_bootable`, so both have to be at least as visible as it is. The
+module itself is pub because `crates/sbproxy/src/main.rs` reads
+`EXIT_CONFIG_RING_EXHAUSTED` from it to choose the process exit code.
+
+Two avoidable items were narrowed before recording this rather than raising
+the number for them. `sbproxy-core/src/config_soak.rs` is a `pub(crate)`
+module with every item narrowed to match, since the reload transaction and
+the admin surface are its only consumers and both are in-crate;
+`config_subscriber::rejection_reason_for` is `pub(crate)` for the same
+reason. `config_soak::clear` is `#[cfg(test)]`: no production path drops a
+soak window without a verdict.
+
+2026-08-28 (WOR-2455 config rollback core merged with main at 454e0abf,
+WOR-2432's aggregation foundations): recounted against the merged tree
+rather than carried from either parent. Tests-only 323, unreferenced 1521.
+
+Both parents' numbers are wrong for this tree and neither was taken. This
+branch recorded 324 and 1523; main recorded 323 and 1518. The tests-only
+figure lands on main's 323 because the two synthetic helpers this branch
+narrowed to `#[cfg(test)] pub(crate)` never entered that count, so main's
+`origin_source_entry_counts` and `effective_document` reductions are the
+only movement. The unreferenced figure is three above main's 1518 and two
+below this branch's 1523: this branch adds `ConfigBootConfig`,
+`FailedCandidate`, and `FallbackDocument` for the reasons recorded above,
+while main's `effective_document` and `origin_source_entry_counts` work
+removed two the branch had counted.
 2026-08-28 (WOR-2673, cache-reserve consolidation): tests-only 324 -> 323.
 `S3ReserveConfig` and the `S3Reserve` surface around it went with the
 AWS-SDK cache-reserve backend, which the object-storage backend replaces.
@@ -1068,4 +1110,20 @@ main's origin-profile work gave out-of-file consumers to items this
 branch had left file-local while this branch's licensing wiring did the
 same for main's. Lowered at the merge rather than after it, so the
 ground both sides gained is held.
+
+2026-08-28 (WOR-2673 merged with main at 1cd47627): recounted against the
+merged tree, not carried from either parent. Tests-only 321, unreferenced
+1524. Both parents read 1521 on the second count and the merge is three
+above both, which is the union rather than a regression: main's config
+soak and rejected-candidate work (WOR-2458/2459/2462) added public
+`sbproxy-config` schema types that this branch does not consume, and this
+branch's `origins.<host>.comp` nested types are ones main does not, so
+each parent's figure counted its own additions and none of the other's.
+Narrowing is unavailable to both sets for the same reason: they are field
+types of `pub` schema structs in one of the three public crates, and
+`schemars` derives a JSON Schema node per type. Every other nested config
+struct in `types.rs` sits in this bucket already. The other five ratchet
+baselines (unwrap 794, panic 0, metric-visibility 242, log-url 41,
+request-error 0) were zeroed and recounted the same way; all five came
+back at the value both parents already held.
 

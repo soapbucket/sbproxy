@@ -111,6 +111,79 @@ fn build_request(config: &SyntheticProbeConfig) -> Result<SyntheticRequest, &'st
     })
 }
 
+/// The process-wide synthetic-probe state, published at boot when the
+/// operator enabled `proxy.synthetic_probe`.
+///
+/// Exists so a second reader can see what the driver sees: the config
+/// soak's operator-probe signal (WOR-2458) reads this to reach a real
+/// verdict on a node with no organic traffic, which is the failure mode
+/// Flagger documents as the most common cause of a spurious rollback.
+/// `/readyz` still reads the same state through its registered probe.
+static PROCESS_SYNTHETIC_STATE: std::sync::OnceLock<ProcessSyntheticProbe> =
+    std::sync::OnceLock::new();
+
+/// Publish the process-wide synthetic-probe state and the staleness
+/// window the driver's own configuration implies. Set once, at boot; a
+/// second call is ignored, which is what a reload of an already running
+/// driver should do.
+///
+/// The window travels with the state rather than being reinvented by the
+/// reader. `/readyz` calls an outcome stale past
+/// `SyntheticProbeConfig::effective_stale_after_secs`, and a second
+/// reader using a different number would disagree with the readiness
+/// probe about the same reading: with `interval_secs: 120` a hard-coded
+/// 60s window called every outcome stale while `/readyz` called every
+/// one fresh (WOR-2458 fix round, Blocker 4).
+pub fn install_process_synthetic_state(state: SyntheticProbeState, stale_after: Duration) {
+    let _ = PROCESS_SYNTHETIC_STATE.set(ProcessSyntheticProbe { state, stale_after });
+}
+
+/// Install a process-wide synthetic state for a test. Same as
+/// [`install_process_synthetic_state`]; named apart so a production call
+/// site cannot be mistaken for a fixture, and `#[cfg(test)]` so there
+/// cannot be one.
+#[cfg(test)]
+pub(crate) fn install_process_synthetic_state_for_test(
+    state: SyntheticProbeState,
+    stale_after: Duration,
+) {
+    install_process_synthetic_state(state, stale_after);
+}
+
+/// The staleness window the installed driver's configuration implies, or
+/// `None` when no synthetic probe is configured on this node.
+///
+/// Tests only. Production reads the window through
+/// [`current_process_probe_outcome`], which applies it rather than
+/// handing it out; this exists so a test can prove the window is the
+/// driver's own rather than one the soak invented.
+#[cfg(test)]
+pub(crate) fn process_probe_stale_after() -> Option<Duration> {
+    PROCESS_SYNTHETIC_STATE.get().map(|probe| probe.stale_after)
+}
+
+/// The process-wide driver state plus the staleness window its own
+/// configuration implies.
+struct ProcessSyntheticProbe {
+    state: SyntheticProbeState,
+    stale_after: Duration,
+}
+
+/// The running driver's most recent outcome, or `None` when no
+/// synthetic probe is configured on this node.
+///
+/// The staleness window is the driver's own
+/// `effective_stale_after_secs`, captured at install, so an outcome the
+/// readiness probe would call stale is stale here too and a driver task
+/// that died cannot go on reporting the last good run it managed before
+/// it did.
+#[must_use]
+pub fn current_process_probe_outcome() -> Option<(sbproxy_observe::ComponentStatus, Option<String>)>
+{
+    let probe = PROCESS_SYNTHETIC_STATE.get()?;
+    Some(probe.state.current(probe.stale_after))
+}
+
 /// Spawn the synthetic-probe background loop. The returned join
 /// handle outlives the process; cancelling is via dropping the task
 /// (we do not currently surface a stop handle, the same pattern other

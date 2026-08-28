@@ -91,12 +91,12 @@ impl SyntheticProbeState {
         match g.as_ref() {
             None => (
                 ComponentStatus::Unhealthy,
-                Some("synthetic_probe_no_outcome_yet".to_string()),
+                Some(SYNTHETIC_NO_OUTCOME_DETAIL.to_string()),
             ),
             Some(o) if o.observed_at.elapsed() > stale_after => (
                 ComponentStatus::Unhealthy,
                 Some(format!(
-                    "synthetic_probe_stale: last_outcome_age_secs={}",
+                    "{SYNTHETIC_STALE_DETAIL_PREFIX}: last_outcome_age_secs={}",
                     o.observed_at.elapsed().as_secs()
                 )),
             ),
@@ -104,6 +104,24 @@ impl SyntheticProbeState {
         }
     }
 }
+
+/// Detail [`SyntheticProbeState::current`] reports before the driver has
+/// produced its first outcome.
+///
+/// A named constant because a second reader now has to tell "the driver
+/// has not run yet" apart from "the driver ran and the pipeline is
+/// broken": `/readyz` treats both as unhealthy and drains the node,
+/// which is right for readiness, while the config soak
+/// (`sbproxy_core::config_soak`) must treat the first as an absence of
+/// evidence rather than evidence against a config. Matching on a string
+/// literal in the other crate would have drifted the first time this
+/// message was reworded.
+pub const SYNTHETIC_NO_OUTCOME_DETAIL: &str = "synthetic_probe_no_outcome_yet";
+
+/// Prefix of the detail [`SyntheticProbeState::current`] reports for an
+/// outcome older than the caller's staleness window. See
+/// [`SYNTHETIC_NO_OUTCOME_DETAIL`] for why this is a constant.
+pub const SYNTHETIC_STALE_DETAIL_PREFIX: &str = "synthetic_probe_stale";
 
 /// Configuration for the synthetic probe registration.
 #[derive(Debug, Clone)]

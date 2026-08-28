@@ -353,6 +353,13 @@ pub enum SourceCycle {
     CompileFailed,
     /// Another reload held the reload lock. Nothing was applied.
     ReloadBusy,
+    /// This node is pinned to a configuration its boot fallback restored
+    /// from the revision ring, so the poller is deliberately inert
+    /// (WOR-2459). Its own value rather than `NotModified`: the commit
+    /// *did* move, and reporting otherwise would tell an operator the
+    /// source was unchanged when it was their fix that was being held
+    /// back.
+    Suspended,
 }
 
 impl SourceCycle {
@@ -369,6 +376,7 @@ impl SourceCycle {
             Self::Invalid => "invalid",
             Self::CompileFailed => "compile_failed",
             Self::ReloadBusy => "reload_busy",
+            Self::Suspended => "suspended",
         }
     }
 
@@ -546,6 +554,35 @@ impl SourcePoller {
             }
         };
 
+        // WOR-2459: suspended while the node is pinned to a
+        // configuration its boot fallback restored. The poller reloads
+        // from the same `source:` pointer the broken local file names,
+        // so leaving it live would undo the rescue on its next tick.
+        // Checked per cycle rather than by not starting the poller, so
+        // clearing the pin resumes it without a restart.
+        if crate::config_boot::reload_suspended("config_refresh_poller") {
+            // Recorded, not skipped. Every other exit from this function
+            // records exactly one fetch, which is the invariant this
+            // function's own documentation states: the counter's sum
+            // over a node is the number of cycles attempted. An early
+            // return that recorded nothing left a pinned node with a
+            // flatlined `sbproxy_config_source_fetch_total` and a
+            // `debug!` that `release_max_level_info` compiles out, which
+            // is indistinguishable from a dead poller
+            // (WOR-2459 fix round, Major 8).
+            sbproxy_observe::metrics::record_config_source_fetch(
+                self.kind,
+                SourceCycle::Suspended.as_str(),
+            );
+            tracing::info!(
+                kind = self.kind,
+                commit = resolved.head_commit().unwrap_or("unknown"),
+                "the config source resolved a new commit, but this node is pinned to a \
+                 configuration its boot fallback restored, so the refresh poller is inert. \
+                 clear the pin with DELETE /admin/config/fallback to apply it",
+            );
+            return SourceCycle::Suspended;
+        }
         let outcome = crate::server::try_reload_from_config_yaml(
             &self.config_path,
             &effective,
@@ -937,6 +974,7 @@ mod tests {
             SourceCycle::Invalid,
             SourceCycle::CompileFailed,
             SourceCycle::ReloadBusy,
+            SourceCycle::Suspended,
         ]
         .iter()
         .map(|cycle| cycle.as_str())
@@ -953,6 +991,7 @@ mod tests {
                 "invalid",
                 "compile_failed",
                 "reload_busy",
+                "suspended",
             ],
         );
     }
