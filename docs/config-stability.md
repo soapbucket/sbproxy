@@ -335,6 +335,43 @@ when a code path that was supposed to read it starts reading it. Nothing here
 is a schema change: the same file compiles before and after. What changes is
 which traffic the value you already wrote now refuses.
 
+### `ext_authz.headers_to_forward: []` forwards nothing, not everything
+
+**Who this reaches.** Anyone moving an `ext_authz` block off a build that
+linked the enterprise auth crate. The key, the type name, and the wire
+protocol are identical, so the config compiles unchanged and the change is
+invisible until traffic hits it.
+
+**What changed.** The enterprise provider read an empty (or absent)
+`headers_to_forward` as "forward every request header". SBproxy reads it as
+what it says: an allowlist, and an empty allowlist forwards nothing. The
+first request after an operator set only `url` used to ship `Authorization`,
+`Cookie`, and every internal trust header to the authorization service; now
+it ships the method and the path.
+
+**Why.** A boundary in this workspace is an allowlist. A default that
+forwards the caller's credentials and session cookie to a service the
+operator has just named, before anyone has decided that service should see
+them, is the wrong direction to fail in. Envoy's own `ext_authz` HTTP
+service filter treats `allowed_headers` the same way.
+
+**What you will see if you skip this.** The authorization service stops
+seeing the header it decides on, refuses everything, and every request to
+the origin gets the service's own refusal status. The gateway logs nothing
+unusual, because from its side the callout succeeded and the answer was
+`allowed: false`.
+
+**What to do.** Name the headers the service reads:
+
+```yaml
+authentication:
+  type: ext_authz
+  url: http://authz.internal:9002/check
+  headers_to_forward: [authorization, cookie, x-tenant]
+```
+
+Name only what it reads. The list is what leaves your proxy.
+
 ### `egress.usage_sinks` now gates the `events:` webhook sink
 
 **Who this reaches.** Any config that has both `egress.usage_sinks` set to

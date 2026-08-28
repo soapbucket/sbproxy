@@ -145,9 +145,15 @@ fn compile_action_for_origin_with_runtime(
 ///
 /// Built-in auth types match through the explicit arms below. Anything
 /// that doesn't match a built-in falls through to the inventory-based
-/// auth plugin registry, so enterprise auth types (`saml`, `biscuit`,
-/// `oauth`, `oauth_introspection`, `ext_authz`, ...) work transparently
-/// when their crates are linked into the binary.
+/// auth plugin registry, so a linked plugin crate can add an auth type
+/// (`saml`, `biscuit`, ...) without patching the proxy.
+///
+/// WOR-2667 moved `ext_authz`, `oauth_introspection`, and `kya` from
+/// that fall-through into the arms below. They are built-ins now, which
+/// means a config naming one compiles in a stock binary rather than
+/// only in a build that linked a plugin crate. The precedence is
+/// unchanged and it matters here: a built-in wins the name, so a plugin
+/// that registered one of those three no longer claims it.
 pub fn compile_auth(config: &serde_json::Value) -> Result<Auth> {
     compile_auth_with_optional_registry(config, None)
 }
@@ -277,6 +283,17 @@ fn compile_auth_with_optional_registry(
         )?)),
         "oidc" => Ok(Auth::Oidc(Box::new(
             crate::auth::oidc::OidcAuth::from_config(config.clone())?,
+        ))),
+        "ext_authz" => Ok(Auth::ExtAuthz(Box::new(
+            crate::auth::ext_authz::ExtAuthzProvider::from_config(config.clone())?,
+        ))),
+        "oauth_introspection" => Ok(Auth::OauthIntrospection(Box::new(
+            crate::auth::oauth_introspection::OauthIntrospectionProvider::from_config(
+                config.clone(),
+            )?,
+        ))),
+        "kya" => Ok(Auth::Kya(Box::new(
+            crate::auth::kya::KyaVerifier::from_config(config.clone())?,
         ))),
         "noop" => Ok(Auth::Noop),
         other => {
@@ -1493,6 +1510,59 @@ hooks:
         });
         let auth = compile_auth(&json).unwrap();
         assert_eq!(auth.auth_type(), "hmac_auth");
+    }
+
+    /// WOR-2667: the three providers ported out of the enterprise tree
+    /// are built-ins now. Before this, each of these configs compiled
+    /// only in a binary that had linked a plugin crate registering the
+    /// name, and fell through to `unknown auth type` in a stock build.
+    #[test]
+    fn compile_auth_ext_authz() {
+        let json = serde_json::json!({
+            "type": "ext_authz",
+            "url": "http://authz-svc/check",
+            "headers_to_forward": ["x-tenant"],
+        });
+        let auth = compile_auth(&json).expect("ext_authz compiles as a built-in");
+        assert_eq!(auth.auth_type(), "ext_authz");
+    }
+
+    #[test]
+    fn compile_auth_oauth_introspection() {
+        let json = serde_json::json!({
+            "type": "oauth_introspection",
+            "introspection_url": "https://idp.internal/introspect",
+            "client_id": "sbproxy",
+            "required_scopes": ["api.read"],
+        });
+        let auth = compile_auth(&json).expect("oauth_introspection compiles as a built-in");
+        assert_eq!(auth.auth_type(), "oauth_introspection");
+    }
+
+    #[test]
+    fn compile_auth_kya() {
+        let json = serde_json::json!({
+            "type": "kya",
+            "issuers": [{"url": "https://api.skyfire.test"}],
+            "min_kyab_balance": 1000,
+        });
+        let auth = compile_auth(&json).expect("kya compiles as a built-in");
+        assert_eq!(auth.auth_type(), "kya");
+    }
+
+    /// The three new providers evaluate through the same dispatch every
+    /// non-`forward_auth` type uses, so they are admissible slots in an
+    /// `authentication:` composition. A refusal here would mean the
+    /// composition path cannot run them, which is the reason
+    /// `forward_auth` is refused.
+    #[test]
+    fn compile_auth_list_accepts_the_ported_providers() {
+        let json = serde_json::json!([
+            {"type": "kya", "issuers": [{"url": "https://api.skyfire.test"}]},
+            {"type": "ext_authz", "url": "http://authz-svc/check"},
+        ]);
+        let auth = compile_auth(&json).expect("the ported providers compose");
+        assert_eq!(auth.auth_type(), "any_of");
     }
 
     #[test]

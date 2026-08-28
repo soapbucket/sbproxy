@@ -11,8 +11,8 @@ pub mod store;
 
 pub use at_rest::{AtRestPosture, CacheDurability};
 pub use reserve::{
-    CacheReserveBackend, FsReserve, MemoryReserve, RedisReserve, ReserveCacheStore, ReserveConfig,
-    ReserveMetadata, ReserveStats,
+    CacheReserveBackend, FsReserve, MemoryReserve, ObjectStoreReserve, RedisReserve,
+    ReserveCacheStore, ReserveConfig, ReserveMetadata, ReserveStats,
 };
 pub use response::{
     caller_identity, canonicalize_query, compute_cache_key, evaluate_cached_preconditions,

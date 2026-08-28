@@ -1,0 +1,67 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# RFC 7662 token introspection: ask the issuer whether a token is live.
+#
+# The caller presents an ordinary `Authorization: Bearer <token>`. The
+# proxy POSTs that token to `introspection_url`, authenticating itself
+# with `client_id` and `client_secret`, and reads back
+# `{"active": true, "scope": "...", "sub": "...", "exp": ...}`.
+#
+# Reach for this instead of `jwt` when the token is an opaque reference
+# token rather than a JWT, or when a revocation has to take effect on
+# the next request rather than at the token's expiry. `jwt` verifies
+# locally and cannot know a token was revoked five seconds ago; this
+# provider asks, and pays a round trip for the answer.
+#
+# `cache_ttl` is what makes that affordable. A verdict is cached under
+# the token's SHA-256, so the cache never holds a plaintext credential,
+# and the entry expires at whichever of `exp` and `cache_ttl` comes
+# first. Set `cache_ttl: 0` when a revocation has to be seen
+# immediately.
+#
+# This example needs an introspection endpoint listening at
+# `introspection_url`; the README has one in a dozen lines of Python.
+# Without it every request answers 503, per RFC 7662 section 2.3.
+#
+# Run:
+#   make run CONFIG=examples/auth-oauth-introspection/sb.yml
+#
+# Test (with the stub endpoint running; see README):
+#   # 200 - the token is active and carries api.read
+#   curl -i -H 'Host: introspect.local' \
+#        -H 'Authorization: Bearer live-token-with-read' \
+#        http://127.0.0.1:8080/get
+#
+#   # 403 - active, but missing the required scope
+#   curl -i -H 'Host: introspect.local' \
+#        -H 'Authorization: Bearer live-token-no-scope' \
+#        http://127.0.0.1:8080/get
+#
+#   # 401 - the authorization server says the token is not active
+#   curl -i -H 'Host: introspect.local' \
+#        -H 'Authorization: Bearer revoked-token' \
+#        http://127.0.0.1:8080/get
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "introspect.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    authentication:
+      type: oauth_introspection
+      introspection_url: http://127.0.0.1:9003/introspect
+      client_id: sbproxy-gateway
+      # Secrets take the usual reference forms. `${VAR}`, `env:`,
+      # `file:`, and backend URIs such as `vault://` all resolve
+      # through the same resolver every other secret-bearing field
+      # uses, and a reference nothing can resolve refuses to boot
+      # rather than becoming the credential.
+      client_secret: introspection-demo-secret
+      token_type_hint: access_token
+      required_scopes:
+        - api.read
+      cache_ttl: 60
+      timeout_secs: 5

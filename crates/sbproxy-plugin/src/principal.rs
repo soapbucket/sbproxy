@@ -130,6 +130,15 @@ pub enum PrincipalSource {
     /// Basic credentials. Added at the end of the enum per the
     /// serialized-form stability note above.
     Ldap,
+    /// WOR-2667: an external authorization service allowed the request
+    /// and named the subject.
+    ExtAuthz,
+    /// WOR-2667: an RFC 7662 introspection endpoint reported the
+    /// presented opaque token active.
+    OauthIntrospection,
+    /// WOR-2667: a Know Your Agent token verified against its issuer's
+    /// key set.
+    Kya,
 }
 
 impl PrincipalSource {
@@ -149,6 +158,9 @@ impl PrincipalSource {
             Self::Plugin => "plugin",
             Self::Hmac => "hmac_auth",
             Self::Ldap => "ldap_auth",
+            Self::ExtAuthz => "ext_authz",
+            Self::OauthIntrospection => "oauth_introspection",
+            Self::Kya => "kya",
         }
     }
 }

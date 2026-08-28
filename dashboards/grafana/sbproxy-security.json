@@ -52,7 +52,7 @@
     "to": "now"
   },
   "refresh": "10s",
-  "version": 1,
+  "version": 3,
   "schemaVersion": 39,
   "panels": [
     {
@@ -257,7 +257,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (auth_type) (rate(sbproxy_auth_results_total{result=\"failure\"}[5m]))",
+          "expr": "sum by (auth_type) (rate(sbproxy_auth_results_total{result=\"deny\"}[5m]))",
           "legendFormat": "{{auth_type}}",
           "datasource": {
             "type": "prometheus",
@@ -265,7 +265,7 @@
           }
         }
       ],
-      "description": "Measures Auth Failures by Type. Runbook: docs/operator-runbook.md#security-controls. When red, inspect the matching component, confirm healthy range, and follow the rollback guidance if the spike follows a config change."
+      "description": "Auth refusals per second, split by the provider that decided. `sbproxy_auth_results_total` labels its result `allow` or `deny`; this panel read `failure`, a value nothing has ever written, and drew an empty graph over every refusal the gateway made (corrected in WOR-2667)."
     },
     {
       "id": 4,
@@ -929,6 +929,333 @@
         }
       ],
       "description": "Legacy-derivation acceptances over the last 24 hours, per component. This is the number that decides whether the compatibility fallback can be removed: close the window once both components hold at zero across a full traffic cycle, weekly and monthly batch callers included, not just across one quiet afternoon. Anything above zero means at least one signer has not moved yet. No alert fires on this: a deprecation counter is a planning input, not a page. Runbook: docs/operator-runbook.md#security-controls."
+    },
+    {
+      "id": 14,
+      "title": "External Authorization Outcomes",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 56
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(sbproxy_ext_authz_decisions_total[5m]))",
+          "legendFormat": "{{outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Every `ext_authz` callout, by what came back. `fail_open` is the one to alert on: those requests were admitted without the authorization service deciding anything, because the callout failed and the origin is configured with `failure_mode_allow: true`. `unavailable` is the same failure refusing instead of admitting. Absent until an origin configures an `ext_authz` provider."
+    },
+    {
+      "id": 15,
+      "title": "Token Introspection Results",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 56
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (result) (rate(sbproxy_oauth_introspection_results_total[5m]))",
+          "legendFormat": "{{result}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "RFC 7662 introspection results per second. `cached` is a verdict the local cache answered without reaching the authorization server, so the ratio of `cached` to everything else is what `cache_ttl` is buying. `unavailable` means the server could not be reached and the request was refused with a 503. Absent until an origin configures an `oauth_introspection` provider."
+    },
+    {
+      "id": 16,
+      "title": "Agent Identity Verdicts (KYA)",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 64
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (verdict) (rate(sbproxy_kya_verdicts_total[5m]))",
+          "legendFormat": "{{verdict}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Know Your Agent token verification, by verdict. `revoked` and `expired` are agents presenting credentials their issuer has withdrawn; `insufficient_balance` is a verified agent refused because its spend balance is below the origin's floor; `directory_unavailable` means the issuer's JWKS or denylist could not be fetched and no cached copy was still inside its stale-grace window. Absent until an origin configures a `kya` provider."
+    },
+    {
+      "id": 17,
+      "title": "Behavioral Anomalies",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 72
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (kind, severity) (rate(sbproxy_anomaly_detected_total[5m]))",
+          "legendFormat": "{{kind}} / {{severity}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Observations the anomaly detector put in the long tail for their agent class, by kind and severity. `ja4_outlier` is a TLS fingerprint the class has essentially never presented; `headless_library` is a headless browser showing up where one does not belong, and never reports below `warn`; `request_rate_spike` is one address far past its class's per-address mean. Absent until `proxy.anomaly.enabled` is true, and quiet for a while after every restart: the window is in memory, so a deploy costs the detector its baseline and it says nothing until it has re-learned one."
+    },
+    {
+      "id": 18,
+      "title": "Agent Reputation",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 72
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "min by (tenant_id, agent_class) (sbproxy_agent_reputation_score)",
+          "legendFormat": "{{tenant_id}} / {{agent_class}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Reputation per tenant and agent class, 1.0 down to 0.0, over the detector's rolling 28-day window. A critical verdict costs five times a warning, and weight decays by rolling out of the window rather than on a timer, so a class that stops misbehaving recovers on its own; the gauge is republished on every analysis, not only when a verdict fires, so the number moves while the class recovers. A class that goes entirely silent keeps its last score until it sends again. Advisory unless an operator sets proxy.anomaly.reputation.deny_below or challenge_below, which turn it into an admission decision."
+    },
+    {
+      "id": 19,
+      "title": "Anomaly Detector Capacity",
+      "type": "timeseries",
+      "description": "How many (tenant, agent class) windows the detector holds, against its cap of 512, and how often a request arrived for a class it had no slot for. The resident set is the key count times the per-key window, so this is the line to size the process against. A non-zero budget rate means windows are being displaced, which churns the baseline a reputation.deny_below floor reads: a class with no window has no score, and no score is admitted.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 80
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sbproxy_anomaly_tracked_keys",
+          "legendFormat": "tracked keys",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "rate(sbproxy_anomaly_key_budget_spent_total[5m])",
+          "legendFormat": "budget spent /s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      }
     }
   ],
   "templating": {

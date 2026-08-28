@@ -819,12 +819,17 @@ fn build_responses(origin: &sbproxy_config::CompiledOrigin) -> Value {
 /// A pluggable mapper from a gateway auth config to an OpenAPI 3.0
 /// SecurityScheme.
 ///
-/// SBproxy ships baseline mappers for the auth types the open-source proxy
-/// implements (api_keys, basic_auth, oauth_client_creds). Extensions
-/// register richer mappers via [`inventory::submit!`] for
-/// extension-provided auth types (SAML, biscuit, oauth_introspection,
-/// ext_authz) and may override OSS mappers when they want to publish
-/// fuller metadata.
+/// SBproxy ships built-in mappers for every auth type the proxy
+/// implements. A linked plugin crate registers a mapper for its own auth
+/// type via [`inventory::submit!`], and may override a built-in when it
+/// wants to publish fuller metadata.
+///
+/// WOR-2675 rewrote the built-in set. It previously covered three names,
+/// two of which the proxy does not implement: `api_keys` (the real type
+/// is `api_key`) and `oauth_client_creds` (no inbound provider of any
+/// name). Every origin using a shipped auth type therefore published the
+/// generic placeholder, telling a client to send `Authorization` when
+/// the origin wanted `X-Api-Key`.
 ///
 /// Registration is link-time: any crate compiled into the final binary
 /// that submits an entry contributes its mapping. Resolution iterates
@@ -847,8 +852,7 @@ inventory::collect!(AuthSchemeMapper);
 /// Resolution order:
 /// 1. Registered [`AuthSchemeMapper`] entries with a matching
 ///    `auth_type` (extension override path).
-/// 2. Built-in mappers for the auth types the open-source proxy
-///    implements directly.
+/// 2. Built-in mappers for the auth types the proxy implements.
 /// 3. Generic fallback: `apiKey` placeholder + `x-sbproxy-auth-type`
 ///    extension so the doc still validates and operators see the
 ///    original type.
@@ -862,23 +866,287 @@ fn map_auth(auth: &Value, scheme_name: &str) -> Option<Value> {
         }
     }
 
-    // OSS built-ins. These are intentionally minimal; richer mappings
-    // for additional auth types (SAML, biscuit, oauth_introspection,
-    // ext_authz, full OAuth authorization-code flow) are provided by
-    // out-of-tree mappers registered through the inventory hook above.
+    // Built-in mappers, one per auth type the proxy implements.
     //
     // Everything these arms read is client-facing on purpose, and that
     // is the rule for anything added here. This document is served
     // unauthenticated on `/.well-known/openapi.json`, so a field only
-    // earns its place if a caller cannot use the API without it: the
-    // `api_keys` header name is the header the caller has to send, and
-    // OAuth's `tokenUrl` is the endpoint it has to call for a token,
-    // which the OpenAPI flow object requires anyway. No arm reads a key,
-    // a secret, a client id, or an introspection credential, and none
-    // should start. If a future auth type needs one of those to be
-    // described, describe the shape and leave the value in the config,
-    // the way `match_shape` does for matchers.
+    // earns its place if a caller cannot use the API without it: a
+    // header name is the header the caller has to send, a required
+    // scope is what its token has to carry, a KYA issuer is whose token
+    // the origin accepts. No arm reads a key, a secret, a client id, an
+    // introspection credential, or the address of an internal service,
+    // and none should start, with one carve-out stated rather than
+    // hidden: `oauth_client_creds` emits its `token_url`, because the
+    // OpenAPI `clientCredentials` flow object requires `tokenUrl` and a
+    // caller cannot get a token without it. That is a client-facing
+    // endpoint by construction, unlike an introspection endpoint, which
+    // only the gateway calls. The enterprise mappers this replaces
+    // published an `oauth_introspection` endpoint URL and an `ext_authz`
+    // service address on exactly this document; those are infrastructure
+    // a caller has no use for and an attacker does. If a future auth
+    // type needs one of those to be described, describe the shape and
+    // leave the value in the config, the way `match_shape` does for
+    // matchers.
     Some(match auth_type {
+        // `noop` is an origin that challenges nobody. Returning `None`
+        // rather than a scheme is what keeps the emitted document from
+        // telling a client to send a credential the origin will not
+        // look at.
+        "noop" => return None,
+        "api_key" | "api_keys" => {
+            // `header_name` is the shipped field; `header` is what the
+            // pre-WOR-2675 mapper read, kept so a plugin registering
+            // `api_keys` with the older spelling still emits its header.
+            let header = auth
+                .get("header_name")
+                .or_else(|| auth.get("header"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("X-Api-Key");
+            // The query form is opt-in and, when set, is the second way
+            // in. OpenAPI 3.0 cannot express "either of these", so the
+            // header is the scheme and the query parameter rides an
+            // extension rather than being silently dropped.
+            let mut scheme = json!({
+                "type": "apiKey",
+                "in": "header",
+                "name": header,
+                "x-sbproxy-auth-type": auth_type,
+            });
+            if let Some(param) = auth.get("query_param").and_then(|v| v.as_str()) {
+                scheme["x-sbproxy-api-key-query-param"] = Value::String(param.to_string());
+            }
+            scheme
+        }
+        "basic_auth" => json!({
+            "type": "http",
+            "scheme": "basic",
+            "x-sbproxy-auth-type": auth_type,
+        }),
+        "digest" => json!({
+            "type": "http",
+            "scheme": "digest",
+            "description": "RFC 7616 digest authentication. The gateway challenges with \
+                            SHA-256 unless the origin pinned MD5.",
+            "x-sbproxy-auth-type": auth_type,
+        }),
+        "bearer" | "bearer_token" => {
+            let mut scheme = json!({
+                "type": "http",
+                "scheme": "bearer",
+                "x-sbproxy-auth-type": auth_type,
+            });
+            if auth.get("require_dpop").and_then(Value::as_bool) == Some(true) {
+                scheme["description"] = Value::String(
+                    "Bearer token bound to a DPoP proof (RFC 9449). Every request must carry \
+                     a fresh `DPoP` proof header alongside the token."
+                        .to_string(),
+                );
+                scheme["x-sbproxy-require-dpop"] = Value::Bool(true);
+            }
+            scheme
+        }
+        "jwt" => {
+            let mut scheme = json!({
+                "type": "http",
+                "scheme": "bearer",
+                "bearerFormat": "JWT",
+                "x-sbproxy-auth-type": auth_type,
+            });
+            // The audience a caller has to request is client-facing; the
+            // JWKS URL the gateway fetches is not.
+            if let Some(audience) = auth.get("audience").and_then(|v| v.as_str()) {
+                scheme["x-sbproxy-required-audience"] = Value::String(audience.to_string());
+            }
+            if auth.get("require_dpop").and_then(Value::as_bool) == Some(true) {
+                scheme["x-sbproxy-require-dpop"] = Value::Bool(true);
+            }
+            if auth.get("require_mtls_bound").and_then(Value::as_bool) == Some(true) {
+                scheme["x-sbproxy-require-mtls-bound"] = Value::Bool(true);
+            }
+            scheme
+        }
+        // `Signature` is not an IANA HTTP authentication scheme, so
+        // `{"type":"http","scheme":"signature"}` makes a generated
+        // client send `Authorization: Signature ...`, which no RFC 9421
+        // verifier reads. What the caller actually sends is a
+        // `Signature` header, which `apiKey` expresses exactly.
+        "hmac_auth" => json!({
+            "type": "apiKey",
+            "in": "header",
+            "name": "Signature",
+            "description": "RFC 9421 HTTP Message Signatures with `hmac-sha256`. Send \
+                            `Signature` and `Signature-Input`; a token on its own is not \
+                            accepted.",
+            "x-sbproxy-auth-type": auth_type,
+        }),
+        "ldap_auth" | "ldap" => json!({
+            "type": "http",
+            "scheme": "basic",
+            "description": "HTTP Basic credentials, bound against a directory on every \
+                            request. A password the directory revokes stops working \
+                            immediately.",
+            "x-sbproxy-auth-type": auth_type,
+        }),
+        "bot_auth" | "web_bot_auth" => json!({
+            "type": "apiKey",
+            "in": "header",
+            "name": "Signature",
+            "description": "Web Bot Auth: an RFC 9421 message signature from a key in the \
+                            gateway's agent directory. Send `Signature`, `Signature-Input`, \
+                            and `Signature-Agent`.",
+            "x-sbproxy-auth-type": auth_type,
+        }),
+        "cap" => json!({
+            "type": "http",
+            "scheme": "bearer",
+            "bearerFormat": "cap",
+            "description": "Crawler Authorization Protocol capability token, carrying its \
+                            own path and rate grants.",
+            "x-sbproxy-auth-type": auth_type,
+        }),
+        "oidc" => {
+            // The browser login flow, described the way OpenAPI has a
+            // vocabulary for. `issuer` is the IdP the origin pins, and
+            // its discovery document is public by construction: an
+            // OpenID Provider publishes it unauthenticated. The
+            // `client_id`, the `client_secret`, and the `cookie_secret`
+            // stay out.
+            let mut scheme = json!({
+                "type": "openIdConnect",
+                "description": "OpenID Connect login at the gateway. A browser without a \
+                                session cookie is redirected to the IdP and returns with \
+                                one; the API is not callable with a bearer token here.",
+                "x-sbproxy-auth-type": auth_type,
+            });
+            match auth.get("issuer").and_then(|v| v.as_str()) {
+                Some(issuer) => {
+                    scheme["openIdConnectUrl"] = Value::String(format!(
+                        "{}/.well-known/openid-configuration",
+                        issuer.trim_end_matches('/')
+                    ));
+                }
+                // `openIdConnectUrl` is required on the scheme object,
+                // so a block with no issuer would emit an invalid
+                // document. Fall back to the shape OpenAPI can express
+                // rather than to something that does not validate.
+                None => {
+                    scheme = json!({
+                        "type": "apiKey",
+                        "in": "cookie",
+                        "name": auth
+                            .get("session_cookie_name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("__Host-sbproxy_session"),
+                        "description": "OpenID Connect session cookie minted by the gateway \
+                                        after a browser login.",
+                        "x-sbproxy-auth-type": auth_type,
+                    });
+                }
+            }
+            scheme
+        }
+        "forward_auth" | "forward" => json!({
+            "type": "apiKey",
+            "in": "header",
+            "name": "Authorization",
+            "description": "The gateway replays each request against an authorization \
+                            service it runs. What that service requires is not described \
+                            here, because the gateway does not know it.",
+            "x-sbproxy-auth-type": auth_type,
+        }),
+        // WOR-2667 / WOR-2675: the three providers ported out of the
+        // enterprise tree.
+        "ext_authz" => {
+            // The service decides on the headers the origin allowlisted,
+            // so those names are precisely what a caller has to send.
+            // The service's own address is not published: it is internal
+            // infrastructure, and the enterprise mapper's habit of
+            // emitting it is not carried over.
+            let forwarded: Vec<&str> = auth
+                .get("headers_to_forward")
+                .and_then(|v| v.as_array())
+                .map(|list| list.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            let mut scheme = json!({
+                "type": "apiKey",
+                "in": "header",
+                "name": forwarded.first().copied().unwrap_or("Authorization"),
+                "description": "The admission decision is made by an authorization service \
+                                the gateway calls. What it accepts is not described here, \
+                                because the gateway does not know it.",
+                "x-sbproxy-auth-type": auth_type,
+            });
+            if !forwarded.is_empty() {
+                scheme["x-sbproxy-forwarded-headers"] = json!(forwarded);
+            }
+            scheme
+        }
+        "oauth_introspection" => {
+            let mut scheme = json!({
+                "type": "http",
+                "scheme": "bearer",
+                "description": "Opaque bearer token, validated against the issuing \
+                                authorization server on every request the gateway's verdict \
+                                cache cannot answer (RFC 7662). A revoked token stops \
+                                working without waiting for its expiry.",
+                "x-sbproxy-auth-type": auth_type,
+            });
+            // A caller cannot get in without the right scopes, so they
+            // belong here. The introspection endpoint is the gateway's
+            // business and stays out.
+            if let Some(scopes) = auth.get("required_scopes").and_then(|v| v.as_array()) {
+                if !scopes.is_empty() {
+                    scheme["x-sbproxy-required-scopes"] = Value::Array(scopes.clone());
+                }
+            }
+            scheme
+        }
+        "kya" => {
+            let mut scheme = json!({
+                "type": "apiKey",
+                "in": "header",
+                "name": "X-Skyfire-KYA",
+                "description": "Know Your Agent token: an issuer-signed agent identity. \
+                                Send it in `X-Skyfire-KYA`.",
+                "x-sbproxy-auth-type": auth_type,
+            });
+            // Which issuers are trusted, and what balance clears the
+            // floor, are both things an agent needs before it can call.
+            // Both are public by nature: the issuer URL is one the agent
+            // already talks to, and the floor is a number the origin
+            // wants advertised.
+            let issuers: Vec<&str> = auth
+                .get("issuers")
+                .and_then(|v| v.as_array())
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|issuer| issuer.get("url").and_then(Value::as_str))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !issuers.is_empty() {
+                scheme["x-sbproxy-kya-issuers"] = json!(issuers);
+            }
+            if let Some(minimum) = auth.get("min_kyab_balance").and_then(Value::as_u64) {
+                scheme["x-sbproxy-kya-min-balance"] = json!(minimum);
+            }
+            scheme
+        }
+        // Kept, and not because the proxy implements it. No auth type in
+        // this workspace produces `oauth_client_creds`: the inbound
+        // client-credentials provider the name suggests does not exist,
+        // and the outbound client-credentials grant is
+        // `outbound_credential`, which the proxy uses to get a token for
+        // an upstream and which never appears in an origin's
+        // `authentication:` block. WOR-2675 checked whether it collided
+        // with the enterprise provider of a similar name and found it
+        // did not: that one registers as `oauth_client_credentials` and
+        // was not ported, because it admits any bearer token of eight or
+        // more characters without verifying it. The arm stays so a
+        // linked plugin that does implement an inbound client-credentials
+        // type under this name keeps its oauth2 flow object instead of
+        // dropping to the placeholder.
         "oauth_client_creds" => {
             let token_url = auth
                 .get("token_url")
@@ -895,27 +1163,10 @@ fn map_auth(auth: &Value, scheme_name: &str) -> Option<Value> {
                 "x-sbproxy-auth-type": auth_type,
             })
         }
-        "api_keys" => {
-            let header = auth
-                .get("header")
-                .and_then(|v| v.as_str())
-                .unwrap_or("X-API-Key");
-            json!({
-                "type": "apiKey",
-                "in": "header",
-                "name": header,
-                "x-sbproxy-auth-type": auth_type,
-            })
-        }
-        "basic_auth" => json!({
-            "type": "http",
-            "scheme": "basic",
-            "x-sbproxy-auth-type": auth_type,
-        }),
         // Unknown auth types: emit a placeholder so the doc validates
-        // and surface the original type as an extension. When an
-        // out-of-tree mapper is linked in, the registered mapper above
-        // kicks in instead.
+        // and surface the original type as an extension. When a plugin
+        // mapper is linked in, the registered mapper above kicks in
+        // instead.
         _ => json!({
             "type": "apiKey",
             "in": "header",
@@ -1115,6 +1366,188 @@ mod tests {
             scheme["flows"]["clientCredentials"]["tokenUrl"],
             "https://auth.example.com/token"
         );
+    }
+
+    /// WOR-2675. The shipped type is `api_key` and its field is
+    /// `header_name`; the pre-WOR-2675 mapper matched `api_keys` and
+    /// read `header`, so every origin using the real type published a
+    /// generic placeholder telling the caller to send `Authorization`.
+    #[test]
+    fn build_maps_the_api_key_type_the_proxy_actually_implements() {
+        let mut snap = make_minimal_snapshot();
+        snap.origins[0].auth_config = Some(serde_json::json!({
+            "type": "api_key",
+            "header_name": "X-Acme-Key",
+            "api_keys": ["secret"],
+            "query_param": "key",
+        }));
+        let spec = build(&snap, None);
+        let scheme = spec["components"]["securitySchemes"]
+            .as_object()
+            .expect("securitySchemes object")
+            .values()
+            .next()
+            .expect("a scheme")
+            .clone();
+        assert_eq!(scheme["type"], "apiKey");
+        assert_eq!(scheme["in"], "header");
+        assert_eq!(scheme["name"], "X-Acme-Key");
+        assert_eq!(scheme["x-sbproxy-api-key-query-param"], "key");
+        assert!(
+            scheme["description"].is_null(),
+            "the real type must not fall through to the placeholder: {scheme}"
+        );
+    }
+
+    /// The document is served unauthenticated. Nothing an operator
+    /// configured as a credential may reach it.
+    #[test]
+    fn no_scheme_publishes_a_secret_from_its_auth_block() {
+        let mut snap = make_minimal_snapshot();
+        snap.origins[0].auth_config = Some(serde_json::json!([
+            {"type": "api_key", "header_name": "X-Acme-Key", "api_keys": ["key-material"]},
+            {
+                "type": "oauth_introspection",
+                "introspection_url": "https://idp.internal/introspect",
+                "client_id": "sbproxy-gateway",
+                "client_secret": "client-secret-material",
+                "required_scopes": ["api.read"],
+            },
+            {"type": "ext_authz", "url": "http://authz.internal:9002/check"},
+        ]));
+        let rendered = serde_json::to_string(&build(&snap, None)).expect("spec serializes");
+        for forbidden in [
+            "key-material",
+            "client-secret-material",
+            "sbproxy-gateway",
+            "idp.internal",
+            "authz.internal",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "{forbidden} reached an unauthenticated document"
+            );
+        }
+        // The scope, by contrast, is exactly what a caller needs.
+        assert!(rendered.contains("api.read"), "{rendered}");
+    }
+
+    #[test]
+    fn build_maps_oauth_introspection_as_a_bearer_scheme() {
+        let mut snap = make_minimal_snapshot();
+        snap.origins[0].auth_config = Some(serde_json::json!({
+            "type": "oauth_introspection",
+            "introspection_url": "https://idp.internal/introspect",
+            "client_id": "sbproxy",
+            "required_scopes": ["api.read", "api.write"],
+        }));
+        let spec = build(&snap, None);
+        let scheme = spec["components"]["securitySchemes"]
+            .as_object()
+            .expect("schemes")
+            .values()
+            .next()
+            .expect("a scheme")
+            .clone();
+        assert_eq!(scheme["type"], "http");
+        assert_eq!(scheme["scheme"], "bearer");
+        assert_eq!(scheme["x-sbproxy-required-scopes"][1], "api.write");
+    }
+
+    #[test]
+    fn build_maps_ext_authz_to_its_allowlisted_header() {
+        let mut snap = make_minimal_snapshot();
+        snap.origins[0].auth_config = Some(serde_json::json!({
+            "type": "ext_authz",
+            "url": "http://authz.internal:9002/check",
+            "headers_to_forward": ["x-tenant", "authorization"],
+        }));
+        let spec = build(&snap, None);
+        let scheme = spec["components"]["securitySchemes"]
+            .as_object()
+            .expect("schemes")
+            .values()
+            .next()
+            .expect("a scheme")
+            .clone();
+        assert_eq!(scheme["type"], "apiKey");
+        assert_eq!(
+            scheme["name"], "x-tenant",
+            "the first allowlisted header is what a caller has to send"
+        );
+        assert_eq!(scheme["x-sbproxy-forwarded-headers"][1], "authorization");
+    }
+
+    #[test]
+    fn build_maps_kya_with_its_issuers_and_balance_floor() {
+        let mut snap = make_minimal_snapshot();
+        snap.origins[0].auth_config = Some(serde_json::json!({
+            "type": "kya",
+            "issuers": [{"url": "https://api.skyfire.example"}],
+            "min_kyab_balance": 1000,
+        }));
+        let spec = build(&snap, None);
+        let scheme = spec["components"]["securitySchemes"]
+            .as_object()
+            .expect("schemes")
+            .values()
+            .next()
+            .expect("a scheme")
+            .clone();
+        assert_eq!(scheme["type"], "apiKey");
+        assert_eq!(scheme["name"], "X-Skyfire-KYA");
+        assert_eq!(
+            scheme["x-sbproxy-kya-issuers"][0],
+            "https://api.skyfire.example"
+        );
+        assert_eq!(scheme["x-sbproxy-kya-min-balance"], 1000);
+    }
+
+    /// An origin that challenges nobody must not tell a client to send a
+    /// credential. Before WOR-2675 `noop` fell through to the generic
+    /// placeholder, which published an `Authorization` apiKey
+    /// requirement on an origin that does not look at one.
+    #[test]
+    fn build_emits_no_security_requirement_for_noop() {
+        let mut snap = make_minimal_snapshot();
+        snap.origins[0].auth_config = Some(serde_json::json!({"type": "noop"}));
+        let spec = build(&snap, None);
+        assert!(
+            spec["components"]["securitySchemes"]
+                .as_object()
+                .is_none_or(|schemes| schemes.is_empty()),
+            "noop must publish no scheme: {}",
+            spec["components"]["securitySchemes"]
+        );
+        assert!(
+            spec["paths"]["/users/{id}"]["get"]["security"].is_null(),
+            "noop must attach no security requirement"
+        );
+    }
+
+    /// Every auth type the proxy dispatches has a mapper, so the generic
+    /// placeholder is reserved for names that came from a plugin. A new
+    /// built-in provider that forgets its mapper fails here rather than
+    /// shipping a document that misdescribes it.
+    #[test]
+    fn every_built_in_auth_type_has_a_mapper_of_its_own() {
+        for auth_type in sbproxy_config::KNOWN_AUTH_TYPES {
+            if *auth_type == "noop" {
+                // Deliberately mapped to no scheme at all.
+                assert!(
+                    map_auth(&serde_json::json!({"type": auth_type}), "s").is_none(),
+                    "noop must map to no scheme"
+                );
+                continue;
+            }
+            let scheme = map_auth(&serde_json::json!({"type": auth_type}), "s")
+                .unwrap_or_else(|| panic!("{auth_type} produced no scheme"));
+            let description = scheme["description"].as_str().unwrap_or_default();
+            assert!(
+                !description.contains("has no registered OpenAPI mapper"),
+                "{auth_type} falls through to the generic placeholder"
+            );
+        }
     }
 
     #[test]
