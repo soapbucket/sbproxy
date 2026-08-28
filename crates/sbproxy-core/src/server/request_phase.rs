@@ -7844,18 +7844,20 @@ origins:
 /// A class with no history is admitted. Refusing on the absence of
 /// evidence would refuse every caller for the first `min_observations`
 /// requests after every restart.
-async fn reputation_admission(
-    session: &mut Session,
-    ctx: &mut RequestContext,
-) -> Result<bool> {
+async fn reputation_admission(session: &mut Session, ctx: &mut RequestContext) -> Result<bool> {
     let Some(detector) = crate::anomaly::detector() else {
         return Ok(false);
     };
+    // `unknown` is the same fallback `AnomalyDetector::analyze_on` uses
+    // for a request the resolver did not classify, so the gate and the
+    // histogram agree on which key they are talking about.
     #[cfg(feature = "agent-class")]
-    let agent_class = ctx.agent_id.as_ref().map(|id| id.as_str().to_string());
+    let agent_class: String = ctx
+        .agent_id
+        .as_ref()
+        .map_or_else(|| "unknown".to_string(), |id| id.as_str().to_string());
     #[cfg(not(feature = "agent-class"))]
-    let agent_class: Option<String> = None;
-    let agent_class = agent_class.unwrap_or_else(|| "unknown".to_string());
+    let agent_class: String = "unknown".to_string();
     let Some((action, score)) = detector.admission_for(&ctx.tenant_id, &agent_class) else {
         return Ok(false);
     };

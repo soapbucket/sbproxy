@@ -280,8 +280,7 @@ impl ObjectStoreReserve {
         };
         let digest: String = rest.split('/').collect();
         // 32 bytes of SHA-256, hex. Anything else is not ours.
-        (digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()))
-            .then_some(digest)
+        (digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())).then_some(digest)
     }
 
     /// Frame metadata and body into one payload, sealing it when a key
@@ -758,7 +757,10 @@ mod tests {
             reserve.digest_from_path(&Path::from("reserve/not-hex")),
             None
         );
-        assert_eq!(reserve.digest_from_path(&Path::from("elsewhere/aabb")), None);
+        assert_eq!(
+            reserve.digest_from_path(&Path::from("elsewhere/aabb")),
+            None
+        );
     }
 
     /// WOR-2673 review F4, red first. Object names used to be
@@ -795,7 +797,11 @@ mod tests {
             path.as_ref().starts_with("sbproxy/reserve/"),
             "unexpected path: {path}"
         );
-        assert_eq!(path.as_ref().split('/').count(), 5, "unexpected path: {path}");
+        assert_eq!(
+            path.as_ref().split('/').count(),
+            5,
+            "unexpected path: {path}"
+        );
 
         let (body, metadata) = sample(Duration::from_secs(60));
         reserve
@@ -816,8 +822,8 @@ mod tests {
     #[tokio::test]
     async fn an_oversized_object_is_refused_from_its_metadata() {
         let store = memory_store();
-        let reserve = ObjectStoreReserve::new(store.clone(), "s3", "reserve", None)
-            .with_max_entry_bytes(64);
+        let reserve =
+            ObjectStoreReserve::new(store.clone(), "s3", "reserve", None).with_max_entry_bytes(64);
         // Written out of band, the way a shared bucket lets anything
         // with write access to the prefix do.
         store
@@ -879,7 +885,11 @@ mod tests {
             .await
             .expect("corrupt put");
         assert!(
-            reserve.get("/a").await.expect("get is not an error").is_none(),
+            reserve
+                .get("/a")
+                .await
+                .expect("get is not an error")
+                .is_none(),
             "a corrupt object falls through to origin rather than panicking a worker"
         );
     }

@@ -48,7 +48,7 @@ pub use scope::{auto_scope, parse_scope, validate_access, SecretScope};
 pub use secret_string::SecretString;
 pub use vault_ref::{
     legacy_vault_env_name, legacy_vault_reference_replacement, looks_like_secret_reference_uri,
-    looks_like_vault_uri, migrate_legacy_vault_references_in_text, LegacyVaultReferenceMigration,
-    unexpanded_env_placeholder, LegacyVaultReferenceReplacement, VaultProviderType, VaultRef,
+    looks_like_vault_uri, migrate_legacy_vault_references_in_text, unexpanded_env_placeholder,
+    LegacyVaultReferenceMigration, LegacyVaultReferenceReplacement, VaultProviderType, VaultRef,
     VaultRefError, LEGACY_VAULT_REFERENCE_REMOVAL_VERSION,
 };

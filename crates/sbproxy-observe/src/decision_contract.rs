@@ -83,7 +83,12 @@ pub const FIELD_CONTRACTS: &[FieldContract] = &[
     },
     FieldContract {
         event: DecisionEvent::Anomaly,
-        fields: &["anomaly_kind", "reputation_bucket", "verdict", "identity_source"],
+        fields: &[
+            "anomaly_kind",
+            "reputation_bucket",
+            "verdict",
+            "identity_source",
+        ],
         note: "Two decisions on one event. A detection record carries `anomaly_kind` and a \
                `verdict` holding the severity, and its outcome is always an allow, because a \
                verdict is an observation and the request proceeds. An admission record \

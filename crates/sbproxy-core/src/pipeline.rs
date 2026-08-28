@@ -895,10 +895,7 @@ fn build_cache_reserve(
             // region, an expired instance profile, a bucket policy
             // change) is invisible on every dashboard and the startup
             // `warn!` is the only record.
-            sbproxy_observe::metrics::record_cache_reserve_error(
-                CACHE_RESERVE_INIT_ORIGIN,
-                "init",
-            );
+            sbproxy_observe::metrics::record_cache_reserve_error(CACHE_RESERVE_INIT_ORIGIN, "init");
         }
         (None, None)
     }
@@ -1119,7 +1116,7 @@ pub(crate) fn resolve_at_rest_key_material(
     if material.len() < sbproxy_security::sealed_record::MIN_KEY_MATERIAL_BYTES {
         anyhow::bail!(
             "{config_path} resolved to {} bytes of key material; at-rest encryption needs at \
-             least {}. Use 32 random bytes, base64 or hex encoded, not a passphrase",
+             least {} bytes. Use 32 random bytes, base64 or hex encoded, not a passphrase",
             material.len(),
             sbproxy_security::sealed_record::MIN_KEY_MATERIAL_BYTES
         );
@@ -3194,15 +3191,14 @@ impl CompiledPipeline {
         // already turned the detector off. The same failed reload with
         // anomaly still enabled replaced a warmed detector with an
         // empty one for a config change that was never applied.
-        let anomaly_settings = (!matches!(mode, PipelineConstructionMode::Validation))
-            .then(|| {
-                config
-                    .server
-                    .anomaly
-                    .as_ref()
-                    .filter(|anomaly| anomaly.enabled)
-                    .map(crate::anomaly::AnomalySettings::from_config)
-            });
+        let anomaly_settings = (!matches!(mode, PipelineConstructionMode::Validation)).then(|| {
+            config
+                .server
+                .anomaly
+                .as_ref()
+                .filter(|anomaly| anomaly.enabled)
+                .map(crate::anomaly::AnomalySettings::from_config)
+        });
 
         let (cache_reserve, cache_reserve_admission) = build_cache_reserve(
             &config.server.cache_reserve,

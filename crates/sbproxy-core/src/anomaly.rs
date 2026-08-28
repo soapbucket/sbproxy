@@ -70,7 +70,7 @@
 //!   reading it is 28 integer loads rather than a scan over every
 //!   distinct value in the window.
 //! * The distinct set per field per day is a **bounded LRU**
-//!   ([`MAX_CATEGORICAL_VALUES_PER_DAY`]), so both the memory and the
+//!   (`MAX_CATEGORICAL_VALUES_PER_DAY`, 1,024), so both the memory and
 //!   eviction are O(1) per observation.
 //!
 //! This is the standard shape for cardinality under adversarial input:
@@ -87,7 +87,7 @@
 //! out stronger. A flooding client makes the detector noisier about
 //! itself, not blinder.
 //!
-//! The state is also sharded across [`SHARDS`] mutexes keyed by the
+//! The state is also sharded across 16 mutexes keyed by the
 //! same `(tenant, agent class)` pair the histogram is keyed by, so one
 //! busy class does not serialize every other class behind it.
 //!
@@ -101,7 +101,7 @@
 //! quiet detector after a deploy is a detector that is still learning,
 //! not a quiet network.
 //!
-//! A config **reload** does not cost the window. [`install`] keeps the
+//! A config **reload** does not cost the window. `install` keeps the
 //! running detector when the resolved settings are unchanged, which is
 //! the common case: a reload triggered by a neighbouring file, or by an
 //! edit somewhere else in the config, leaves the baseline alone. A
@@ -331,8 +331,7 @@ impl ClassHistogram {
         }
         let counts = bucket.categorical.entry(field).or_insert_with(|| {
             LruCache::new(
-                NonZeroUsize::new(MAX_CATEGORICAL_VALUES_PER_DAY)
-                    .unwrap_or(NonZeroUsize::MIN),
+                NonZeroUsize::new(MAX_CATEGORICAL_VALUES_PER_DAY).unwrap_or(NonZeroUsize::MIN),
             )
         });
         if let Some(slot) = counts.get_mut(value) {
@@ -512,9 +511,7 @@ impl AnomalySettings {
     pub fn from_config(config: &sbproxy_config::AnomalyConfig) -> Self {
         Self {
             min_observations: config.min_observations.max(1),
-            outlier_frequency: config
-                .outlier_frequency
-                .clamp(MIN_OUTLIER_FREQUENCY, 1.0),
+            outlier_frequency: config.outlier_frequency.clamp(MIN_OUTLIER_FREQUENCY, 1.0),
             rate_spike_multiplier: config.rate_spike_multiplier.max(1.0),
             rate_spike_min_mean: config.rate_spike_min_mean.max(0.0),
             deny_below: config
@@ -631,7 +628,11 @@ impl AnomalyDetector {
     /// computed is not a bad score, and refusing on the absence of
     /// evidence would refuse every caller for the first
     /// `min_observations` requests after every restart.
-    pub fn admission_for(&self, tenant: &str, agent_class: &str) -> Option<(ReputationAction, f64)> {
+    pub fn admission_for(
+        &self,
+        tenant: &str,
+        agent_class: &str,
+    ) -> Option<(ReputationAction, f64)> {
         if !self.settings.admission_configured() {
             return None;
         }
@@ -689,8 +690,7 @@ impl AnomalyDetector {
             }
         }
         if let Some(library) = view.headless_library {
-            if let Some(severity) =
-                self.judge_categorical(histogram, FIELD_HEADLESS, library, true)
+            if let Some(severity) = self.judge_categorical(histogram, FIELD_HEADLESS, library, true)
             {
                 // A headless library in the tail arrives with intent
                 // attached, so it never stays at `info`.
@@ -873,9 +873,14 @@ pub fn install(settings: Option<AnomalySettings>) {
     });
 }
 
-/// Install a detector built elsewhere. Tests and the registry seam use
-/// this; the pipeline uses [`install`], which owns the reuse decision.
-pub fn install_detector(detector: Option<Arc<AnomalyDetector>>) {
+/// Install a detector built elsewhere, for the tests that need to drive
+/// the registry seam with a pre-warmed window.
+///
+/// Test-only and private on purpose. Production installs through
+/// [`install`], which owns the reuse decision; a second public entry
+/// point would let a caller swap the detector without it.
+#[cfg(test)]
+fn install_detector(detector: Option<Arc<AnomalyDetector>>) {
     DETECTOR.store(detector);
     HOOK_REGISTERED.get_or_init(|| {
         sbproxy_plugin::register_anomaly_hook(Arc::new(ConfiguredDetectorHook));
@@ -1183,7 +1188,10 @@ mod tests {
         assert!(!detector.analyze_on(&novel, today()).is_empty());
 
         assert!(
-            detector.reputation("tenant-a", "shared-class").expect("seen") < 1.0,
+            detector
+                .reputation("tenant-a", "shared-class")
+                .expect("seen")
+                < 1.0,
             "the tenant whose traffic produced the verdict carries it"
         );
         assert_eq!(
@@ -1327,11 +1335,7 @@ mod tests {
             let class = format!("class-{index}");
             detector.analyze_on(&view(&class, Some("t13d"), None, None), today());
         }
-        let tracked: usize = detector
-            .shards
-            .iter()
-            .map(|shard| shard.lock().len())
-            .sum();
+        let tracked: usize = detector.shards.iter().map(|shard| shard.lock().len()).sum();
         assert_eq!(
             tracked, MAX_TRACKED_KEYS,
             "a caller passing arbitrary class strings must not grow the window without bound"
@@ -1512,7 +1516,10 @@ mod tests {
         install(Some(settings()));
         let first = detector().expect("installed");
         for _ in 0..60 {
-            first.analyze_on(&view("reload-probe", Some("t13d_USUAL"), None, None), today());
+            first.analyze_on(
+                &view("reload-probe", Some("t13d_USUAL"), None, None),
+                today(),
+            );
         }
 
         install(Some(settings()));
@@ -1521,8 +1528,10 @@ mod tests {
             Arc::ptr_eq(&first, &second),
             "an unchanged config must keep the running detector, window and all"
         );
-        let verdicts =
-            second.analyze_on(&view("reload-probe", Some("t13d_NOVEL"), None, None), today());
+        let verdicts = second.analyze_on(
+            &view("reload-probe", Some("t13d_NOVEL"), None, None),
+            today(),
+        );
         assert!(
             !verdicts.is_empty(),
             "and the baseline it learned has to still be there"

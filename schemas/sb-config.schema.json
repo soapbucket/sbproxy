@@ -6354,6 +6354,38 @@
           "default": 5.0,
           "type": "number",
           "format": "double"
+        },
+        "reputation": {
+          "description": "What admission does with the reputation score. Both thresholds are unset by default, which leaves the score advisory.",
+          "default": {},
+          "allOf": [
+            {
+              "$ref": "#/definitions/AnomalyReputationConfig"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "AnomalyReputationConfig": {
+      "description": "Admission thresholds on the reputation score (WOR-2666).\n\nThe score is published whether or not anything acts on it, and nothing acts on it until an operator names a number. That split is deliberate and it is the same one Cloudflare's threat score has: the gateway computes it always, and a rule decides what it means. An operator watches the gauge for a while, sees what their own traffic scores, and only then writes a floor.\n\n# Read this before setting one\n\nThe score is keyed on the agent class the resolver produced, and that class is a *claim* unless the resolver source was a verified one (`bot_auth`, `kya`, `rdns`, `tls_fingerprint`). Anyone can send GPTBot's `User-Agent`, be resolved into the `gptbot` class, and misbehave there, which moves the score the real GPTBot is then admitted against. The decision record carries the resolver source for exactly this reason, so a rule written after the fact can tell the two apart.\n\nThe class `unknown` is a single shared bucket for everything the resolver did not recognize. A floor that catches `unknown` catches most of the unclassified web with it.",
+      "type": "object",
+      "properties": {
+        "deny_below": {
+          "description": "Score below which admission refuses the request with a `403`.\n\nUnset by default. `0.0` to `1.0`, where 1.0 is a class that has produced no anomalies in the window.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "challenge_below": {
+          "description": "Score below which admission answers `429` instead of proxying.\n\nUnset by default. Set above `deny_below` to get a two-step posture; `deny_below` wins when a score is under both.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
         }
       },
       "additionalProperties": false
