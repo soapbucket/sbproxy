@@ -1588,6 +1588,142 @@ spec:
     );
 }
 
+/// R1: the same script route reached by an override instead of an
+/// addition.
+///
+/// The floor locks a header on one entry and carries a second, unlocked
+/// entry after it. The project does not rename anything and does not add
+/// anything: it merges a `lua_script` onto the unlocked entry, which
+/// already sits after the lock. `merge_plain` inserts the key, the
+/// declarative comparison sees `{lua_script}` intersecting the lock's
+/// header path in nothing, and the script writes the locked header.
+///
+/// The addition arm had this closed and the override arm did not, while
+/// both shipped docs stated the closure for a project *layer*.
+#[test]
+fn a_project_override_that_merges_a_script_onto_an_entry_after_a_lock_is_refused() {
+    let floor = r#"
+response_modifiers:
+  - name: platform_security
+    locked: true
+    headers:
+      set:
+        Content-Security-Policy: "default-src 'self'"
+  - name: platform_branding
+    headers:
+      set:
+        X-Served-By: sbproxy
+"#;
+    for script in ["lua_script", "js_script", "rego_module"] {
+        let profile = format!(
+            "name: checkout\nspec:\n  api:\n    base:\n      action: {{type: proxy, \
+             url: https://checkout.internal}}\n      response_modifiers:\n        \
+             - name: platform_branding\n          {script}: \"sets the locked header\"\n"
+        );
+        let error = compose_err(&profile, CHECKOUT_ENTRY, Some(floor));
+        let text = error.to_string();
+        assert!(
+            matches!(error, OriginResolveError::LockedEffectShadowed { .. }),
+            "`{script}` merged onto an unlocked entry after a lock must be refused: {text}"
+        );
+        assert!(text.contains(script), "names the script key: {text}");
+        assert!(text.contains("platform_security"), "names the lock: {text}");
+        assert!(
+            text.contains("platform_branding"),
+            "names the entry it merged onto: {text}"
+        );
+    }
+}
+
+/// The check reads the incoming entry, not the merged result, so a floor
+/// entry that already carried a script of its own is not retroactively
+/// refused by a project layer editing some other field of it.
+///
+/// Without that narrowing the platform could not ship a scripted
+/// modifier at all once anything in the list was locked, because every
+/// project override of it would inherit the script and be refused for
+/// carrying it.
+#[test]
+fn a_project_override_of_a_floor_entry_that_already_carries_a_script_is_not_refused() {
+    let floor = r#"
+response_modifiers:
+  - name: platform_security
+    locked: true
+    headers:
+      set:
+        Content-Security-Policy: "default-src 'self'"
+  - name: platform_branding
+    lua_script: "the platform's own script"
+    headers:
+      set:
+        X-Served-By: sbproxy
+"#;
+    let profile = r#"
+name: checkout
+spec:
+  api:
+    base:
+      action: {type: proxy, url: https://checkout.internal}
+      response_modifiers:
+        - name: platform_branding
+          headers:
+            set:
+              X-Service: checkout
+"#;
+    let resolution = compose(profile, CHECKOUT_ENTRY, Some(floor));
+    let modifiers = list(
+        &as_yaml(&resolution, "checkout.acme.test"),
+        "response_modifiers",
+    );
+    assert_eq!(modifiers.len(), 2);
+    assert_eq!(
+        modifiers[1]
+            .get("lua_script")
+            .and_then(serde_yaml::Value::as_str),
+        Some("the platform's own script"),
+        "the floor's own script survived the project's edit"
+    );
+}
+
+/// A lock binds the project, not the platform. The entry `overrides:`
+/// block may bring a script into a locked list, because both sides of
+/// that argument are the runtime config, and it is layered last anyway.
+///
+/// This is the sentence both docs state next to the script rule, and it
+/// is what keeps "a project layer is refused" from reading as "any
+/// layer is refused".
+#[test]
+fn the_entry_override_layer_may_bring_a_script_into_a_locked_list() {
+    let floor = r#"
+response_modifiers:
+  - name: platform_security
+    locked: true
+    headers:
+      set:
+        Content-Security-Policy: "default-src 'self'"
+"#;
+    let entry_yaml = r#"
+name: checkout
+repo: https://git.test/acme/checkout
+path: sbproxy/origin.yaml
+hosts:
+  api: ["checkout.acme.test"]
+overrides:
+  response_modifiers:
+    - name: incident_script
+      lua_script: "the platform's own incident override"
+"#;
+    let resolution = compose(CHECKOUT_PROFILE, entry_yaml, Some(floor));
+    assert_eq!(
+        list(
+            &as_yaml(&resolution, "checkout.acme.test"),
+            "response_modifiers"
+        )
+        .len(),
+        2
+    );
+}
+
 /// N4: a lock can be reached without renaming anything and without
 /// adding anything.
 ///

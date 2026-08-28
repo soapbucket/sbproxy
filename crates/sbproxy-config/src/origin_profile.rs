@@ -1491,8 +1491,32 @@ pub fn resolve_origins(
     bindings: &[ProfileBinding<'_>],
     hand_written: &BTreeSet<String>,
 ) -> Result<OriginResolution, OriginResolveError> {
+    resolve_origins_with(defaults, bindings, hand_written, false)
+}
+
+/// [`resolve_origins`] with the caller saying whether the runtime
+/// document declares an extension bundle source.
+///
+/// The aggregator holds the whole runtime document and is the caller
+/// that can answer this; [`resolve_origins`] cannot, because it takes
+/// the floor as a bare mapping. Without it the floor's type check would
+/// be `Refuse` here while `compile_config` warned on the same document,
+/// so a floor naming a bundle-provided policy type would pass
+/// `sbproxy validate` and then be hard-refused by the aggregator: the
+/// far-end-of-a-GitOps-loop failure these checks exist to move earlier,
+/// reintroduced for the bundle case (WOR-2432 verification R2).
+///
+/// # Errors
+///
+/// The same set as [`resolve_origins`].
+pub fn resolve_origins_with(
+    defaults: Option<&Mapping>,
+    bindings: &[ProfileBinding<'_>],
+    hand_written: &BTreeSet<String>,
+    declares_extension_bundles: bool,
+) -> Result<OriginResolution, OriginResolveError> {
     if let Some(defaults) = defaults {
-        validate_origin_defaults(defaults)?;
+        validate_origin_defaults_with(defaults, declares_extension_bundles)?;
     }
     let entries: Vec<OriginSourceEntry> = bindings
         .iter()
@@ -1887,9 +1911,11 @@ fn merge_plain(base: &mut Mapping, over: &Mapping) {
 /// * A project addition that would shadow a locked entry's effect is the
 ///   same refusal, because a lock that bound only the name would be one
 ///   rename away from useless. See [`effect_keys`].
-/// * A project addition carrying a script body into a modifier list that
-///   holds a lock is refused too, because the effect comparison cannot
-///   read a program. See [`opaque_addition_over_a_lock`].
+/// * A project layer bringing a script body into a modifier list that
+///   holds a lock is refused too, on either arm, because the effect
+///   comparison cannot read a program and an override reaches the same
+///   place an addition does with a rename saved. See
+///   [`opaque_script_over_a_lock`].
 /// * A project override of an **unlocked** entry that introduces an
 ///   effect a lock above it already holds is the same refusal, because
 ///   `merge_plain` replaces scalars and `type:` is one of them.
@@ -1929,6 +1955,16 @@ fn merge_named_list(
                     .and_then(Option::as_ref)
                     .map(effect_keys)
                     .unwrap_or_default();
+                // Read before the mutable borrow too, and against the
+                // incoming entry rather than the merged one: an override
+                // that inserts a script body into an unlocked entry
+                // sitting after a lock is the same route an addition
+                // takes, one rename saved (WOR-2432 verification R1).
+                let opaque = if context.author == LayerAuthor::Project {
+                    opaque_script_over_a_lock(result[..index].iter().flatten(), item, list)
+                } else {
+                    None
+                };
                 let Some(slot) = result.get_mut(index) else {
                     continue;
                 };
@@ -1952,6 +1988,18 @@ fn merge_named_list(
                     });
                     *slot = None;
                     continue;
+                }
+                // After the lock check, which is the more precise error,
+                // and after the disable branch, which drops the entry so
+                // nothing lands at all.
+                if let Some((locked, script)) = opaque {
+                    return Err(locked_effect_shadowed(
+                        context,
+                        list,
+                        incoming_name,
+                        locked,
+                        opaque_script_reason(script),
+                    ));
                 }
                 match (current, item) {
                     (Value::Mapping(existing_map), Value::Mapping(incoming_map)) => {
@@ -1985,16 +2033,13 @@ fn merge_named_list(
                     if let Some((locked, shadowed)) =
                         shadowed_lock(result[..index].iter().flatten(), &introduced)
                     {
-                        return Err(OriginResolveError::LockedEffectShadowed(Box::new(
-                            LockedEffectShadow {
-                                entry: context.entry.name.clone(),
-                                profile: context.profile.to_string(),
-                                list: list.to_string(),
-                                locked,
-                                addition: incoming_name.unwrap_or("(unnamed)").to_string(),
-                                shadowed,
-                            },
-                        )));
+                        return Err(locked_effect_shadowed(
+                            context,
+                            list,
+                            incoming_name,
+                            locked,
+                            shadowed,
+                        ));
                     }
                 }
             }
@@ -2022,35 +2067,26 @@ fn merge_named_list(
                     // present the effect comparison below is answering a
                     // question it cannot see the input to.
                     if let Some((locked, script)) =
-                        opaque_addition_over_a_lock(result.iter().flatten(), item, list)
+                        opaque_script_over_a_lock(result.iter().flatten(), item, list)
                     {
-                        return Err(OriginResolveError::LockedEffectShadowed(Box::new(
-                            LockedEffectShadow {
-                                entry: context.entry.name.clone(),
-                                profile: context.profile.to_string(),
-                                list: list.to_string(),
-                                locked,
-                                addition: incoming_name.unwrap_or("(unnamed)").to_string(),
-                                shadowed: format!(
-                                    "an opaque `{script}` body, which the effect comparison \
-                                     cannot read"
-                                ),
-                            },
-                        )));
+                        return Err(locked_effect_shadowed(
+                            context,
+                            list,
+                            incoming_name,
+                            locked,
+                            opaque_script_reason(script),
+                        ));
                     }
                     if let Some((locked, shadowed)) =
                         shadowed_lock(result.iter().flatten(), &effect_keys(item))
                     {
-                        return Err(OriginResolveError::LockedEffectShadowed(Box::new(
-                            LockedEffectShadow {
-                                entry: context.entry.name.clone(),
-                                profile: context.profile.to_string(),
-                                list: list.to_string(),
-                                locked,
-                                addition: incoming_name.unwrap_or("(unnamed)").to_string(),
-                                shadowed,
-                            },
-                        )));
+                        return Err(locked_effect_shadowed(
+                            context,
+                            list,
+                            incoming_name,
+                            locked,
+                            shadowed,
+                        ));
                     }
                 }
                 appended.push(item.clone());
@@ -2060,6 +2096,34 @@ fn merge_named_list(
     let mut merged: Vec<Value> = result.into_iter().flatten().collect();
     merged.extend(appended);
     Ok(merged)
+}
+
+/// The refusal a project layer gets for reaching a locked entry.
+///
+/// One constructor rather than three copies: the addition arm, the
+/// override arm and the opaque-script check all raise the same error,
+/// and three literals is three places for the boxed struct's fields to
+/// drift apart.
+fn locked_effect_shadowed(
+    context: &LayerContext<'_>,
+    list: &str,
+    incoming_name: Option<&str>,
+    locked: String,
+    shadowed: String,
+) -> OriginResolveError {
+    OriginResolveError::LockedEffectShadowed(Box::new(LockedEffectShadow {
+        entry: context.entry.name.clone(),
+        profile: context.profile.to_string(),
+        list: list.to_string(),
+        locked,
+        addition: incoming_name.unwrap_or("(unnamed)").to_string(),
+        shadowed,
+    }))
+}
+
+/// How an opaque script body is described in a refusal.
+fn opaque_script_reason(script: &str) -> String {
+    format!("an opaque `{script}` body, which the effect comparison cannot read")
 }
 
 /// The `name:` of a list entry, when it has one.
@@ -2107,14 +2171,25 @@ where
 }
 
 /// The first locked entry in `existing`, and the script key that makes
-/// `addition` unreadable to [`effect_keys`], when both are present.
+/// `incoming` unreadable to [`effect_keys`], when both are present.
+///
+/// Asked from **both** project arms of the merge, against the incoming
+/// layer's own entry rather than the merged result. An addition carrying
+/// a script is the obvious route; an override is the same route with a
+/// rename saved, because `merge_plain` will insert `lua_script` into an
+/// unlocked floor entry that already sits after the lock and the
+/// declarative comparison sees `{lua_script}` intersecting nothing
+/// (WOR-2432 verification R1). Against `incoming` and not the merged
+/// value so a floor entry that already carried a script of its own is
+/// not retroactively refused by the project layer that edits some other
+/// field of it.
 ///
 /// Only the two modifier lists are asked. A `policies:` or `transforms:`
 /// entry running a script is discriminated by its own `type:`, which the
 /// effect comparison already reads. See [`MODIFIER_SCRIPT_KEYS`].
-fn opaque_addition_over_a_lock<'a, I>(
+fn opaque_script_over_a_lock<'a, I>(
     existing: I,
-    addition: &Value,
+    incoming: &Value,
     list: &str,
 ) -> Option<(String, &'static str)>
 where
@@ -2123,7 +2198,7 @@ where
     if !matches!(list, "request_modifiers" | "response_modifiers") {
         return None;
     }
-    let map = addition.as_mapping()?;
+    let map = incoming.as_mapping()?;
     let script = MODIFIER_SCRIPT_KEYS
         .iter()
         .find(|key| map.contains_key(**key))
@@ -2335,6 +2410,72 @@ mod tests {
                  `RawOriginConfig`; delete the entry rather than leaving a stale reason"
             );
             assert!(!reason.is_empty(), "`{field}` has no written reason");
+        }
+    }
+
+    /// `MODIFIER_SCRIPT_KEYS` is a hand-written list, so the only
+    /// question that matters about it is what it is missing.
+    ///
+    /// It is exactly right today. Nothing made it stay right: a fifth
+    /// program-shaped field on either modifier struct would be a hole in
+    /// the lock rule that no test noticed, which is the drift this
+    /// branch closes everywhere else by deriving both sides of a
+    /// classification from `schema_for!`. The const's own doc names the
+    /// future field as the reason it is a const rather than four
+    /// literals; this is the other half of that (WOR-2432 verification
+    /// R3).
+    ///
+    /// # What this cannot see
+    ///
+    /// A program-shaped field whose **name** carries none of the markers
+    /// below. The markers are the honest half of the guard and they are
+    /// listed rather than implied, exactly like the path-marker sweep in
+    /// `crate::confined_template`: a field called `handler` or `rule`
+    /// would pass this and still be opaque to `effect_keys`. Two signals
+    /// are not available here the way they are for the schema sweep,
+    /// because neither modifier struct's fields carry a description this
+    /// test can read.
+    #[test]
+    fn every_program_shaped_modifier_field_is_a_modifier_script_key() {
+        const PROGRAM_MARKERS: &[&str] = &["script", "module", "wasm", "program", "bytecode"];
+        let declared: BTreeSet<String> = MODIFIER_SCRIPT_KEYS
+            .iter()
+            .map(|key| (*key).to_string())
+            .collect();
+
+        let mut fields: BTreeSet<String> = BTreeSet::new();
+        fields.extend(schema_properties::<crate::types::RequestModifierConfig>());
+        fields.extend(schema_properties::<crate::types::ResponseModifierConfig>());
+        assert!(
+            fields.len() >= 9,
+            "the sweep found only {} modifier fields, which means it broke rather than that \
+             the structs shrank",
+            fields.len()
+        );
+
+        let program_shaped: BTreeSet<String> = fields
+            .iter()
+            .filter(|field| {
+                let lowered = field.to_ascii_lowercase();
+                PROGRAM_MARKERS
+                    .iter()
+                    .any(|marker| lowered.contains(marker))
+            })
+            .cloned()
+            .collect();
+        assert_eq!(
+            program_shaped, declared,
+            "`MODIFIER_SCRIPT_KEYS` must be exactly the program-shaped fields of the two \
+             modifier structs. A field on one side and not the other is either a hole in the \
+             lock rule (a body `effect_keys` cannot read and nothing refuses) or a stale \
+             entry naming a field that no longer exists"
+        );
+
+        for key in MODIFIER_SCRIPT_KEYS {
+            assert!(
+                fields.contains(*key),
+                "`{key}` is on the list but is not a field of either modifier struct"
+            );
         }
     }
 

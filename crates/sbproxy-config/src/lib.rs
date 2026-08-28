@@ -90,12 +90,12 @@ pub use listing::{
 };
 pub use model_host::*;
 pub use origin_profile::{
-    claimed_hosts, origin_source_entry_counts, resolve_origins, revision_is_immutable,
-    validate_origin_defaults, validate_origin_defaults_with, validate_origin_sources,
-    validate_origin_sources_with, DroppedDefault, HostClaim, LockedEffectShadow, OriginProfile,
-    OriginProfileInput, OriginProfileOrigin, OriginProfileSpec, OriginResolution,
-    OriginResolveError, OriginSourceEntryCounts, ProfileBinding, PLATFORM_OWNED_ORIGIN_FIELDS,
-    PROFILE_LIST_MERGE_KEYS, PROFILE_WRITABLE_ORIGIN_FIELDS,
+    claimed_hosts, origin_source_entry_counts, resolve_origins, resolve_origins_with,
+    revision_is_immutable, validate_origin_defaults, validate_origin_defaults_with,
+    validate_origin_sources, validate_origin_sources_with, DroppedDefault, HostClaim,
+    LockedEffectShadow, OriginProfile, OriginProfileInput, OriginProfileOrigin, OriginProfileSpec,
+    OriginResolution, OriginResolveError, OriginSourceEntryCounts, ProfileBinding,
+    PLATFORM_OWNED_ORIGIN_FIELDS, PROFILE_LIST_MERGE_KEYS, PROFILE_WRITABLE_ORIGIN_FIELDS,
 };
 pub use payments::{
     iso_4217_decimals, settlement_amount, AdvertisedRailName, AmountConversionError, BreakerConfig,
