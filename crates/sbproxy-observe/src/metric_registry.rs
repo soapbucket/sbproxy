@@ -2390,6 +2390,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_fallback_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_fallback_served"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["trigger", "origin", "tenant"],
+        description: "fallback_origin responses served, by trigger (`status` when the primary answered with a status listed under `on_status`, `error` when it failed outright and `on_error` caught it), origin, and tenant. A fallback is a degraded response by construction, so its rate is the first number worth alerting on when a primary starts failing; before this the only evidence was a boolean on an access-log row.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_gateway_reconcile_duration_seconds",
         kind: MetricKind::Histogram,
         writer: Writer::Recorder("record_reconcile"),

@@ -691,8 +691,40 @@ pub struct RequestContext {
     /// `response_filter` slice of `sbproxy_phase_duration_seconds`.
     /// `None` when no response_filter ran (e.g. early auth rejection).
     pub response_filter_finished_at: Option<Instant>,
-    /// HTTP status code from the upstream response (set in response_filter).
+    /// The status the client ends up seeing (set in `response_filter`,
+    /// and by every path that short-circuits or replaces a response).
+    /// `final_response_status` prefers this over the written header.
     pub response_status: Option<u16>,
+    /// The status on the upstream response as it entered
+    /// `response_filter`'s header stages.
+    ///
+    /// Recorded *after* the two stages that legitimately translate a
+    /// status before any header stage sees it - the Proxy-Wasm
+    /// response-header filter, which applies a filter-supplied
+    /// `:status`, and the gRPC-to-HTTP status mapping on a `transcode`
+    /// origin - and *before* every stage below that point, which is
+    /// where a `fallback_origin`, a `status` response modifier and the
+    /// metering refusal all replace what the client sees. Not "whatever
+    /// the origin's socket said": a Proxy-Wasm filter that rewrites a
+    /// `500` to a `200` makes this field `200`, and on a transcoded RPC
+    /// this is the mapped HTTP status, which is also the status every
+    /// other surface reads. Stating it that way rather than "before any
+    /// stage can rewrite it" is deliberate: the wider claim was not the
+    /// one the code held, and a stage added above the record point would
+    /// have quietly widened the gap with nothing going red.
+    ///
+    /// Separate from `response_status` because that field holds the
+    /// status the client sees, and on a `fallback_origin` or a `status`
+    /// response modifier the two differ. The access log's
+    /// `upstream_status` reads this and surfaces it only when they do.
+    /// Before WOR-2686 that field read `response_status` and filtered it
+    /// against a number computed from `response_status`, so it was
+    /// unreachable on every request the proxy has ever served.
+    ///
+    /// `None` when no upstream response exists: a short-circuited
+    /// request, or an `on_error` fallback, where `fail_to_proxy` fires
+    /// before any upstream answered.
+    pub upstream_status: Option<u16>,
 
     // --- Rate limit info ---
     /// Rate limit info from the policy check, used to add response headers.
@@ -812,11 +844,31 @@ pub struct RequestContext {
     pub path_params: Option<HashMap<String, String>>,
 
     // --- Fallback state ---
-    /// Set to true when the primary upstream failed and a fallback response was served.
+    /// Set to true when the AI dispatcher abandoned an in-flight provider
+    /// call because the client's connection was gone (WOR-2690).
+    ///
+    /// Read by `fail_to_proxy` to decline the origin's `on_error`
+    /// fallback for that one case. The fallback exists to give a waiting
+    /// caller something rather than a 502, and there is no waiting caller
+    /// here; on an `ai_proxy` fallback, running it would dispatch a
+    /// second paid provider call for someone who has already left, handing
+    /// straight back the spend the cancellation saved.
+    ///
+    /// Deliberately a marker on the request rather than a test of the
+    /// error's `ErrorSource`. Pingora stamps `Downstream` on request
+    /// sanitization failures too (a malformed `Connection` header, say),
+    /// where the caller is alive and reading and its configured fallback
+    /// is exactly what it should get.
+    pub ai_upstream_cancelled_on_client_disconnect: bool,
+    /// Set to true when the primary upstream failed (`on_error`) or
+    /// answered with a listed bad status (`on_status`) and a fallback
+    /// response was served instead. Both triggers write the fallback
+    /// response directly to the session (see `serve_fallback_action` and
+    /// its callers in `server/proxy_http.rs`), so this field is a pure
+    /// after-the-fact record for the access log and for
+    /// `response_body_filter`'s WOR-2686 guard that discards any real
+    /// upstream body still in flight once a fallback has fired.
     pub fallback_triggered: bool,
-    /// When on_status fallback triggers in response_filter, the replacement body is stored
-    /// here so response_body_filter can swap it in.
-    pub fallback_body: Option<bytes::Bytes>,
 
     // --- CSRF state ---
     /// CSRF token to set as a cookie on the response (for safe methods).
@@ -883,12 +935,28 @@ pub struct RequestContext {
 
     // --- Wave 5 day-6 Item 1: CEL header transform mutations ---
     /// Header mutations produced by the `headers:` array on a `type:
-    /// cel` transform. The static action and `response_filter` drain
-    /// this and stamp the operations onto the outgoing response so
-    /// operators can set / append / remove response headers from a
-    /// CEL expression. Empty by default; populated by the transform
-    /// pipeline at `apply_transform_with_ctx` time.
+    /// cel` transform. The `static`, `mock`, and `plugin` actions drain
+    /// this and stamp the operations onto the response they are about
+    /// to write, so operators can set / append / remove response
+    /// headers from a CEL expression. Empty by default; populated by
+    /// the transform pipeline at `apply_transform_with_ctx` time, and
+    /// only for an action that will drain it -- a streaming response
+    /// evaluates the same rules in `response_filter`, where the header
+    /// map still exists, and never stashes here (WOR-2630).
     pub cel_response_header_mutations: Vec<CelHeaderMutation>,
+    /// Whether the action dispatched for this request buffers its
+    /// whole response before writing any of it, so a `cel` transform's
+    /// `headers:` rules still own the header map when the body-buffer
+    /// phase runs and [`Self::cel_response_header_mutations`] will be
+    /// drained.
+    ///
+    /// Stamped by `handle_action` from the action it actually
+    /// dispatches, which a matched forward rule can change out from
+    /// under the origin's own action. `false` until then, which is the
+    /// streaming answer: an action that streams evaluated the same
+    /// rules in `response_filter`, where the header map still existed
+    /// (WOR-2630).
+    pub response_buffered_before_headers: bool,
 
     // --- WOR-168 transform-error attribution ---
     /// Set by the body-buffer transform pipeline when a transform
@@ -1861,6 +1929,7 @@ impl RequestContext {
             upstream_first_byte_at: None,
             response_filter_finished_at: None,
             response_status: None,
+            upstream_status: None,
             rate_limit_info: None,
             shared_rate_limit_decision: None,
             shared_agent_budget_decision: None,
@@ -1877,8 +1946,8 @@ impl RequestContext {
             rsl_inject_link_emitted: false,
             forward_rule_idx: None,
             path_params: None,
+            ai_upstream_cancelled_on_client_disconnect: false,
             fallback_triggered: false,
-            fallback_body: None,
             csrf_cookie: None,
             replacement_request_body: None,
             websocket_tunnel: None,
@@ -1891,6 +1960,7 @@ impl RequestContext {
             openapi_deprecation: None,
             trust_headers: None,
             callback_inject_headers: None,
+            response_buffered_before_headers: false,
             cel_response_header_mutations: Vec::new(),
             transform_error_attribution: None,
             crawl_challenge: None,

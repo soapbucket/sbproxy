@@ -1,6 +1,6 @@
 # SBproxy scripting reference: CEL, Rego, Lua, JavaScript, and WASM
 
-*Last modified: 2026-08-22*
+*Last modified: 2026-08-27*
 
 SBproxy includes five scripting engines for custom logic: CEL (Common Expression Language), Rego (via Regorus), Lua, JavaScript, and WASM. All run in sandboxed environments with access to request context.
 
@@ -210,7 +210,7 @@ A top-level alias namespace for the `request.agent_*` fields, for cleaner expres
 | `response.headers` | map | Response headers, lowercase keys |
 | `response.body_size` | int | Response body size in bytes, when known |
 
-The `response` namespace is available where CEL runs at response time: assertion policies and the `cel` transform. The `cel` transform additionally binds `response.body` (the body as a UTF-8 string).
+The `response` namespace is available where CEL runs at response time: assertion policies and the `cel` transform. In the `cel` transform the namespace is split by phase, and no phase binds all of it: an origin whose action streams an upstream response binds `response.status` and `response.headers` and has no body yet, and an origin whose action buffers its whole response binds `response.status` and `response.body` and does not yet own a response header map. See the phase table in [3.6](#36-the-cel-response-transform).
 
 Within a populated namespace, missing fields render as zero values (`""`, `0`, `false`, empty map), so expressions like `size(request.agent_id) > 0` work without probing for presence first. A namespace whose subsystem never ran for the request (for example `request.tls` on a plain HTTP listener) may be absent entirely; guard those accesses or accept the fail-closed deny.
 
@@ -505,7 +505,25 @@ origins:
           - { op: remove, name: x-internal-trace }
 ```
 
-Each `value_expr` sees `response.body`, `response.status`, `response.headers`, and the `request.*` namespace. A string result is used verbatim; ints, floats, and bools render as strings; maps and lists are JSON-serialized; null skips the rule. `Set-Cookie` is on a deny-list: a CEL header rule cannot set it.
+Each `value_expr` sees `response.status` and the `request.*` namespace, plus whichever of `response.headers` and `response.body` its phase binds (below). A string result is used verbatim; ints, floats, and bools render as strings; maps and lists are JSON-serialized; null skips the rule. `Set-Cookie` is on a deny-list: a CEL header rule cannot set it.
+
+`op: set` replaces every existing value of that header, `op: append` adds one beside them, and `op: remove` drops them all. The three mean the same thing on every action type.
+
+**Which phase a rule runs in.** A header rule can only change a header while the header map is still yours to change, and that moment is different for a response streamed from an upstream than for one sbproxy writes itself. Envoy and Kong draw the same line: a header filter runs before the body exists, and a body filter runs after the headers are gone. The consequence worth reading twice is that **no phase binds the whole response**.
+
+| Origin's action | Phase the rules run in | `response.status` | `response.headers` | `response.body` |
+| -- | -- | :-: | :-: | :-: |
+| `proxy`, `load_balancer`, `a2a` | Response header phase, before the first body byte arrives | upstream status | upstream headers | not available |
+| `static`, `mock`, `plugin` | After the whole response is buffered and before any of it is written | the status the action produced | not available | the whole body |
+| `echo`, `beacon`, `redirect`, `storage`, `noop`, `mcp`, `grpc`, `graphql`, `ai_proxy`, `websocket` | None. These settle the request without running the origin's transform chain at all | not available | not available | not available |
+
+Three rules follow from the table, and each is enforced rather than documented:
+
+* **A rule evaluates exactly once, in one phase.** A streaming origin evaluates in the header phase and applies the mutation there; the later body-buffer stage does not evaluate again.
+* **A rule that reaches for what no route on its origin can bind is refused when the config compiles**, naming the origin, the rule, and the action. `response.body` on an origin every route of which streams; `response.headers` on an origin every route of which buffers; any header rule at all on an origin whose action is in the third row and which has no forward rule in the first two. Set a constant or request-derived header on a third-row action with a `response_modifiers:` entry instead.
+* **A rule the config accepts, but that this particular route cannot serve, is skipped and counted.** One origin can serve two routes in different phases: a `proxy` origin with a `static` forward rule buffers on `/local/` and streams everywhere else. The route that can bind what the rule reads runs it; the route that cannot skips it and ticks `sbproxy_errors_total{error_type="response_body_unavailable"}` or `{error_type="response_headers_unavailable"}`, with a `WARN` naming the rule. It never resolves against an empty body or an empty header map.
+
+The compile refusal reads the expression as written. It sees `response.body`, `response["body"]`, `response['body']`, and the same three forms for `headers`, with whitespace anywhere between the tokens, and it does not mistake a name inside a string literal for a reference. It cannot see a reference reached through a `cel.bind` alias or assembled by string concatenation; those reach the runtime, where the phase that cannot bind the value resolves it to an empty one.
 
 Every `value_expr` is compiled when the config compiles. A syntax error refuses the config, naming the origin and the header the expression belongs to. Responses then only evaluate.
 
@@ -1449,7 +1467,7 @@ With debug logging on, script failures are logged with the engine, the error mes
 | WAF custom rule (Lua / JS) | A rule whose script errors is skipped and counted; if no rule blocked but at least one went unevaluated, the pass reports a WAF failure and the policy's `failure_posture` decides (default closed) |
 | Lua / JS / Rego modifiers | Error logged per request; the modifier's headers are not applied; the request proceeds. Unlike `policy: rego`, a Rego modifier module that fails to parse follows this row, not the `rego` policy row above: the module is not compiled at config load |
 | `lua_json` / `js_json` / `javascript` transforms | Error logged per request; the body is left unchanged |
-| `cel` transform | A missing or empty `headers:` array, a CEL parse error in any `value_expr`, an authored `on_request:` (removed; transforms have no request phase), or an authored `on_response:` / `expression:` (removed; CEL decides rather than produces) fails config compile; a runtime evaluation error skips only the failing header rule |
+| `cel` transform | A missing or empty `headers:` array, a CEL parse error in any `value_expr`, a header rule reaching for a binding no route on its origin can supply (`response.body` where every route streams, `response.headers` where every route buffers, any rule at all on an action that runs no transform chain), an authored `on_request:` (removed; transforms have no request phase), or an authored `on_response:` / `expression:` (removed; CEL decides rather than produces) fails config compile; a rule the config accepted but this route's phase cannot bind is skipped, counted on `sbproxy_errors_total`, and logged; a runtime evaluation error skips only the failing header rule |
 | WASM transform | Missing `module_path` / `module_bytes`, a module that fails to compile, or an authored `allowed_hosts:` (removed; modules have no network surface) fails config compile; runtime errors skip the transform |
 | `response_cache.key_event` | An `engine` of `cel` or `wasm`, any other unknown engine, or an empty `source` fails config compile; an engine fault or a document that cannot be decoded is logged and bypasses the cache for that request, with no read and no write |
 | `response_cache.admit_event` | The same config-compile checks; composes with `stale_while_revalidate` (the background refresh runs the event too). An engine fault or a document that cannot be decoded is logged and the response is stored under the configured `ttl_secs` |

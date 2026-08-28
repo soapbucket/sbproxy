@@ -45,3 +45,27 @@ origins:
           json_body:
             source: fallback
             trigger: status
+
+  # on_status, WOR-2686: primary returns 503 with a genuinely empty body
+  # (Content-Length: 0, no bytes) and a marker header. Regression case for
+  # the header leak and body/Content-Length mismatch: the fallback's own
+  # headers and body must fully replace the primary's, not merge with them.
+  "fb-status-empty.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888/status-empty/503
+    fallback_origin:
+      on_status: [502, 503, 504]
+      add_debug_header: true
+      origin:
+        id: fb-status-empty-fallback
+        hostname: fb-status-empty-fallback
+        workspace_id: test
+        version: "1.0.0"
+        action:
+          type: static
+          status_code: 200
+          content_type: application/json
+          json_body:
+            source: fallback
+            trigger: status-empty
