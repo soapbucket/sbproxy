@@ -2168,7 +2168,9 @@ fn run_proxy(
                 // rescue it" apart from every other fatal boot failure
                 // without parsing a log line. Every other failure keeps
                 // the exit code it has always had.
-                let code = if format!("{e:#}").contains("revision ring was exhausted") {
+                let code = if format!("{e:#}")
+                    .contains(sbproxy_core::config_boot::RING_EXHAUSTED_MARKER)
+                {
                     sbproxy_core::config_boot::EXIT_CONFIG_RING_EXHAUSTED
                 } else {
                     1

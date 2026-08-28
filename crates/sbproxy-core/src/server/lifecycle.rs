@@ -2756,7 +2756,7 @@ fn resolve_or_default_admin_operator_pepper(
 /// it came from. On every node that did not ask for a fallback this is
 /// exactly the read it replaced: read the file, hand it back, and let
 /// the caller's own compile report any problem, so `fallback: off`
-/// behaviour is byte identical to what shipped before.
+/// behavior is byte identical to what shipped before.
 ///
 /// The "does it work" test the walk applies is `source:` resolution plus
 /// `compile_config`, the same two steps `run` performs on the primary
@@ -2907,7 +2907,7 @@ pub fn run_with_fallback(
     // was told to boot on does not work and the operator asked for a
     // fallback, walk the revision ring for one that does before giving
     // up. `boot_fallback_document` is a no-op on every node that did not
-    // ask, so the historical behaviour (read, fail, exit) is byte
+    // ask, so the historical behavior (read, fail, exit) is byte
     // identical there.
     let (yaml, fallback_pin) = boot_document(config_path, fallback)?;
     // The drift baseline is the LOCAL file, deliberately captured before
@@ -8661,12 +8661,14 @@ egress:
         // The synthetic-transaction driver reporting a healthy round
         // trip: the signal a quiet node has, and the one that keeps this
         // window out of Inconclusive.
-        crate::config_soak::record_probe(crate::config_soak::ProbeObservation::Ok);
+        crate::config_soak::record_probe(
+            crate::config_soak::ProbeKind::Synthetic,
+            crate::config_soak::ProbeObservation::Ok,
+        );
 
-        let (closed, verdict, _) =
-            crate::config_soak::confirm_now().expect("a window was in flight");
-        assert_eq!(closed, revision);
-        assert_eq!(verdict, sbproxy_config::SoakVerdict::Successful);
+        let closed = crate::config_soak::confirm_now().expect("a window was in flight");
+        assert_eq!(closed.revision, revision);
+        assert_eq!(closed.verdict, sbproxy_config::SoakVerdict::Successful);
         let lkg = recorder.lkg().expect("a passed soak promotes");
         assert_eq!(lkg.revision, revision);
         assert_eq!(lkg.state, sbproxy_config::RevisionState::Good);
@@ -8694,16 +8696,16 @@ egress:
         reload_from_config_yaml(config_path.to_str().expect("utf-8"), yaml)
             .expect("a valid config publishes");
         // No probe, no traffic, no breakers: nothing measured anything.
-        let (_, verdict, reports) =
-            crate::config_soak::confirm_now().expect("a window was in flight");
+        let closed = crate::config_soak::confirm_now().expect("a window was in flight");
 
-        assert_eq!(verdict, sbproxy_config::SoakVerdict::Inconclusive);
+        assert_eq!(closed.verdict, sbproxy_config::SoakVerdict::Inconclusive);
         assert!(
-            reports.iter().all(|(_, outcome)| matches!(
+            closed.reports.iter().all(|(_, outcome)| matches!(
                 outcome,
                 crate::config_soak::SignalOutcome::Abstain(_)
             )),
-            "every signal abstained: {reports:?}",
+            "every signal abstained: {:?}",
+            closed.reports,
         );
         assert!(
             recorder.lkg().is_none(),

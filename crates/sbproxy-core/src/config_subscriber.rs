@@ -497,8 +497,9 @@ pub(crate) fn rejection_reason_for(result: CycleResult) -> Option<sbproxy_config
 /// Record one refused candidate into the config revision ring's
 /// `rejected/` directory (WOR-2462).
 ///
-/// A no-op when the result is not a refusal (see
-/// [`rejection_reason_for`]) or when no ring is open. `content` is the
+/// A no-op when the result is not a refusal (`rejection_reason_for`, in
+/// this module, decides which results are) or when no ring is open.
+/// `content` is the
 /// candidate's pre-resolution bytes: the authority's own document for a
 /// bundle refusal, the merged document for one the reload transaction
 /// refused.

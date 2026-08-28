@@ -3565,14 +3565,15 @@ fn handle_config_confirm() -> (u16, &'static str, String) {
     if let Err(response) = config_history_open_recorder() {
         return response;
     }
-    let Some((revision, verdict, reports)) = crate::config_soak::confirm_now() else {
+    let Some(closed) = crate::config_soak::confirm_now() else {
         return (
             409,
             "application/json",
             r#"{"error":"no config soak is in flight"}"#.to_string(),
         );
     };
-    let signals: Vec<serde_json::Value> = reports
+    let signals: Vec<serde_json::Value> = closed
+        .reports
         .iter()
         .map(|(signal, outcome)| {
             serde_json::json!({
@@ -3583,9 +3584,9 @@ fn handle_config_confirm() -> (u16, &'static str, String) {
         })
         .collect();
     let body = serde_json::json!({
-        "revision": revision,
-        "verdict": crate::config_soak::verdict_label(verdict),
-        "promoted": verdict == sbproxy_config::SoakVerdict::Successful,
+        "revision": closed.revision,
+        "verdict": crate::config_soak::verdict_label(closed.verdict),
+        "promoted": closed.verdict == sbproxy_config::SoakVerdict::Successful,
         "signals": signals,
     });
     (200, "application/json", body.to_string())
@@ -3680,8 +3681,10 @@ fn config_history_timeline(
         row["at"] = serde_json::Value::String(config_history_rfc3339(entry.last_seen_at));
         rows.push((entry.last_seen_at, row));
     }
-    rows.sort_by(|left, right| right.0.cmp(&left.0));
-    rows.into_iter().map(|(_, row)| row).collect()
+    // Newest first, so `sort_by_key` on the timestamp then reverse
+    // rather than a descending comparator.
+    rows.sort_by_key(|(at, _)| *at);
+    rows.into_iter().rev().map(|(_, row)| row).collect()
 }
 
 /// `GET /admin/config/history/{digest}`: the stored pre-resolution
@@ -12169,7 +12172,10 @@ mod tests {
             &[],
             &sbproxy_config::ConfigSoakConfig::default(),
         );
-        crate::config_soak::record_probe(crate::config_soak::ProbeObservation::Ok);
+        crate::config_soak::record_probe(
+            crate::config_soak::ProbeKind::Synthetic,
+            crate::config_soak::ProbeObservation::Ok,
+        );
 
         let (status, _, body) = handle_config_confirm();
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");

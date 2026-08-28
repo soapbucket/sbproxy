@@ -1295,7 +1295,7 @@ The four signals, and what each of them catches:
 | Degraded subsystems | The reload's own outcome | A pipeline that published while the key plane, a sink, or the model runtime stayed on prior state. Reports immediately, so a degraded reload fails without waiting the window out. |
 | Upstream health | The running config's circuit breakers | A config that repointed an origin at a dead address, on a node with almost no traffic. |
 | Request outcome | `sbproxy_requests_total` by status class, plus the upstream retry and timeout counters | A policy that denies everything, an auth block that rejects every caller, a transform that corrupts bodies. |
-| Operator probe | `probe:` above, and `proxy.synthetic_probe` when it is running | Whatever you know and the proxy does not. |
+| Operator probe | `probe:` above, and `proxy.synthetic_probe` when it is running | Whatever you know and the proxy does not. Both feed this one signal, and either of them failing fails it: a passing synthetic run never covers for an operator probe that is failing. |
 
 The verdict has three states, not two. Argo Rollouts has the one people
 forget: an analysis run completes successful, failed, or **inconclusive**,

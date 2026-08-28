@@ -345,30 +345,69 @@ pub(crate) enum ProbeObservation {
     Unreachable(String),
 }
 
-/// The operator-probe signal.
+/// Which probe produced an observation.
+///
+/// Kept apart on the window rather than folded into one slot. The
+/// supervisor reads the synthetic driver on every tick and the operator
+/// probe only on its own `interval_secs`, so a single slot would let the
+/// next synthetic pass erase an operator-probe failure a few seconds
+/// after it was recorded, which is the one observation an operator
+/// configured the probe to see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeKind {
+    /// `proxy.config_history.soak.probe`: an HTTP GET the operator
+    /// declared.
+    Operator,
+    /// The synthetic-transaction driver `proxy.synthetic_probe` starts.
+    Synthetic,
+}
+
+/// The operator-probe signal, over both probes that can feed it.
 ///
 /// A probe that timed out or could not be reached **fails** the soak
 /// rather than abstaining, and says which. An abstention there would
 /// mean a probe an operator deliberately configured could go silently
 /// missing and still let a bad config be promoted, which is the opposite
-/// of why they configured it.
+/// of why they configured it. Either probe failing fails the signal;
+/// a synthetic pass never covers for an operator probe that is failing.
 ///
 /// Absent both a declared probe and a running synthetic driver, this
 /// abstains: there is nothing to observe.
 #[must_use]
-pub(crate) fn probe_signal(observation: Option<&ProbeObservation>) -> SignalOutcome {
-    match observation {
-        None => SignalOutcome::Abstain(
-            "no operator probe is declared and no synthetic driver is running".to_string(),
-        ),
-        Some(ProbeObservation::Ok) => SignalOutcome::Pass,
-        Some(ProbeObservation::Unexpected(detail)) => {
-            SignalOutcome::Fail(format!("the probe answered unexpectedly: {detail}"))
+pub(crate) fn probe_signal(
+    operator: Option<&ProbeObservation>,
+    synthetic: Option<&ProbeObservation>,
+) -> SignalOutcome {
+    let observations = [
+        (ProbeKind::Operator, operator),
+        (ProbeKind::Synthetic, synthetic),
+    ];
+    for (kind, observation) in observations {
+        let label = match kind {
+            ProbeKind::Operator => "the operator probe",
+            ProbeKind::Synthetic => "the synthetic transaction driver",
+        };
+        match observation {
+            Some(ProbeObservation::Unexpected(detail)) => {
+                return SignalOutcome::Fail(format!("{label} answered unexpectedly: {detail}"))
+            }
+            Some(ProbeObservation::Unreachable(detail)) => {
+                return SignalOutcome::Fail(format!(
+                    "{label} timed out or could not be reached: {detail}"
+                ))
+            }
+            _ => {}
         }
-        Some(ProbeObservation::Unreachable(detail)) => SignalOutcome::Fail(format!(
-            "the probe timed out or could not be reached: {detail}"
-        )),
     }
+    if observations
+        .iter()
+        .any(|(_, observation)| matches!(observation, Some(ProbeObservation::Ok)))
+    {
+        return SignalOutcome::Pass;
+    }
+    SignalOutcome::Abstain(
+        "no operator probe is declared and no synthetic driver is running".to_string(),
+    )
 }
 
 /// Fold every signal's report into one verdict.
@@ -407,6 +446,23 @@ pub(crate) const fn verdict_label(verdict: SoakVerdict) -> &'static str {
     }
 }
 
+/// What one closed soak window produced: the revision it judged, the
+/// verdict it reached, and what every signal said.
+///
+/// A named type rather than a tuple because three callers destructure it
+/// (the supervisor's timed close, `POST /admin/config/confirm`, and the
+/// tests), and a caller that swapped the verdict and the reports would
+/// still compile against a tuple.
+#[derive(Debug, Clone)]
+pub(crate) struct SoakOutcome {
+    /// Ring revision this window judged.
+    pub(crate) revision: u64,
+    /// The verdict it reached.
+    pub(crate) verdict: SoakVerdict,
+    /// One entry per signal, in the order they are evaluated.
+    pub(crate) reports: Vec<(SoakSignal, SignalOutcome)>,
+}
+
 /// One soak window in flight.
 #[derive(Debug, Clone)]
 pub(crate) struct SoakWindow {
@@ -426,8 +482,10 @@ pub(crate) struct SoakWindow {
     pub(crate) degraded: Vec<String>,
     /// The soak block in force for this window.
     pub(crate) config: ConfigSoakConfig,
-    /// The most recent probe tick's observation, when a probe has run.
-    pub(crate) probe: Option<ProbeObservation>,
+    /// The most recent operator-probe tick, when one has run.
+    pub(crate) operator_probe: Option<ProbeObservation>,
+    /// The most recent synthetic-driver reading, when one is running.
+    pub(crate) synthetic_probe: Option<ProbeObservation>,
 }
 
 /// The process-wide slot holding the window in flight, if any.
@@ -510,7 +568,8 @@ pub(crate) fn arm(
         baseline_error_rate: baseline.error_rate(),
         degraded: degraded.to_vec(),
         config: config.clone(),
-        probe: None,
+        operator_probe: None,
+        synthetic_probe: None,
     });
     None
 }
@@ -539,15 +598,18 @@ pub(crate) fn clear() {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }
 
-/// Record the most recent probe observation against the window in
-/// flight. A no-op when no window is armed.
-pub(crate) fn record_probe(observation: ProbeObservation) {
+/// Record the most recent observation from one probe against the window
+/// in flight. A no-op when no window is armed.
+pub(crate) fn record_probe(kind: ProbeKind, observation: ProbeObservation) {
     if let Some(window) = in_flight()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_mut()
     {
-        window.probe = Some(observation);
+        match kind {
+            ProbeKind::Operator => window.operator_probe = Some(observation),
+            ProbeKind::Synthetic => window.synthetic_probe = Some(observation),
+        }
     }
 }
 
@@ -583,7 +645,10 @@ pub(crate) fn judge(
         ),
         (
             SoakSignal::OperatorProbe,
-            probe_signal(window.probe.as_ref()),
+            probe_signal(
+                window.operator_probe.as_ref(),
+                window.synthetic_probe.as_ref(),
+            ),
         ),
     ];
     (aggregate(&reports), reports)
@@ -598,7 +663,7 @@ fn record_signal(signal: SoakSignal, outcome: &SignalOutcome) {
 /// the verdict it reached.
 ///
 /// `None` when no window is armed or the window has not closed yet.
-pub(crate) fn close_due() -> Option<(u64, SoakVerdict, Vec<(SoakSignal, SignalOutcome)>)> {
+pub(crate) fn close_due() -> Option<SoakOutcome> {
     let window = {
         let mut slot = in_flight()
             .lock()
@@ -619,7 +684,7 @@ pub(crate) fn close_due() -> Option<(u64, SoakVerdict, Vec<(SoakSignal, SignalOu
 ///
 /// `None` when no window is in flight, which is what makes that route
 /// answer `409` rather than pretending to promote something.
-pub(crate) fn confirm_now() -> Option<(u64, SoakVerdict, Vec<(SoakSignal, SignalOutcome)>)> {
+pub(crate) fn confirm_now() -> Option<SoakOutcome> {
     let window = in_flight()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -633,7 +698,7 @@ pub(crate) fn confirm_now() -> Option<(u64, SoakVerdict, Vec<(SoakSignal, Signal
 
 /// Judge `window` against the live signals, record the verdict onto the
 /// ring and the metrics, and publish the decision event.
-fn finish(window: &SoakWindow) -> (u64, SoakVerdict, Vec<(SoakSignal, SignalOutcome)>) {
+fn finish(window: &SoakWindow) -> SoakOutcome {
     let (open_breakers, observed_breakers) = sample_circuit_breakers();
     let (verdict, reports) = judge(
         window,
@@ -669,7 +734,11 @@ fn finish(window: &SoakWindow) -> (u64, SoakVerdict, Vec<(SoakSignal, SignalOutc
              soak probe on a node this quiet",
         ),
     }
-    (window.revision, verdict, reports)
+    SoakOutcome {
+        revision: window.revision,
+        verdict,
+        reports,
+    }
 }
 
 /// The first failing signal's detail, for the log line and the event.
@@ -788,7 +857,7 @@ async fn run_operator_probe(probe: &ConfigSoakProbeConfig, client: &reqwest::Cli
         }
         Err(error) => ProbeObservation::Unreachable(format!("{error}")),
     };
-    record_probe(observation);
+    record_probe(ProbeKind::Operator, observation);
 }
 
 /// Read the running synthetic-transaction driver's most recent outcome,
@@ -837,21 +906,25 @@ pub(crate) fn spawn() {
         let mut last_probe_ms: u64 = 0;
         loop {
             ticker.tick().await;
+            // Cloned out under the lock and dropped before any await:
+            // the slot is a `std::sync::Mutex`, and holding one across
+            // the probe's `await` is what `clippy::await_holding_lock`
+            // exists to stop.
             let armed = {
                 let slot = in_flight()
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                slot.as_ref()
-                    .map(|window| (window.config.probe.clone(), window.config.enabled))
+                slot.as_ref().map(|window| window.config.probe.clone())
             };
-            let Some((probe, _)) = armed else {
+            let Some(probe) = armed else {
                 continue;
             };
             // The synthetic driver's outcome first: it needs no I/O of
-            // our own, and an operator who declared both gets the
-            // explicit probe's answer on top.
+            // our own, and it is what keeps a quiet node's window out of
+            // `Inconclusive`. Recorded into its own slot, so an operator
+            // probe that failed a moment ago is not erased by it.
             if let Some(observation) = synthetic_observation() {
-                record_probe(observation);
+                record_probe(ProbeKind::Synthetic, observation);
             }
             if let Some(probe) = probe {
                 let due = now_ms().saturating_sub(last_probe_ms)
@@ -887,7 +960,8 @@ mod tests {
             baseline_error_rate: None,
             degraded,
             config,
-            probe: None,
+            operator_probe: None,
+            synthetic_probe: None,
         }
     }
 
@@ -1056,7 +1130,7 @@ mod tests {
         );
 
         // The same node with the synthetic driver running.
-        quiet.probe = Some(ProbeObservation::Ok);
+        quiet.synthetic_probe = Some(ProbeObservation::Ok);
         let (verdict, _) = judge(
             &quiet,
             RequestCounts {
@@ -1075,7 +1149,7 @@ mod tests {
     #[test]
     fn a_passing_probe_does_not_mask_an_unreachable_upstream() {
         let mut quiet = window(soak(50), Vec::new());
-        quiet.probe = Some(ProbeObservation::Ok);
+        quiet.synthetic_probe = Some(ProbeObservation::Ok);
         let (verdict, reports) = judge(
             &quiet,
             RequestCounts {
@@ -1120,18 +1194,24 @@ mod tests {
     /// says which of the two failure shapes it was.
     #[test]
     fn an_unreachable_probe_fails_and_says_so() {
-        let timed_out = probe_signal(Some(&ProbeObservation::Unreachable(
-            "no answer within 2000ms".to_string(),
-        )));
+        let timed_out = probe_signal(
+            Some(&ProbeObservation::Unreachable(
+                "no answer within 2000ms".to_string(),
+            )),
+            None,
+        );
         assert!(matches!(timed_out, SignalOutcome::Fail(_)), "{timed_out:?}");
         assert!(timed_out
             .detail()
             .expect("a failure explains itself")
             .contains("timed out or could not be reached"));
 
-        let wrong_status = probe_signal(Some(&ProbeObservation::Unexpected(
-            "expected 200 and got 503".to_string(),
-        )));
+        let wrong_status = probe_signal(
+            Some(&ProbeObservation::Unexpected(
+                "expected 200 and got 503".to_string(),
+            )),
+            None,
+        );
         assert!(matches!(wrong_status, SignalOutcome::Fail(_)));
         assert!(wrong_status
             .detail()
@@ -1139,9 +1219,41 @@ mod tests {
             .contains("answered unexpectedly"));
 
         assert!(
-            matches!(probe_signal(None), SignalOutcome::Abstain(_)),
+            matches!(probe_signal(None, None), SignalOutcome::Abstain(_)),
             "no probe at all is an abstention, not a failure",
         );
+    }
+
+    /// A synthetic pass on the next tick must not erase an operator
+    /// probe that is failing. The supervisor reads the driver every
+    /// second and the operator probe only on its own interval, so a
+    /// single slot would have lost exactly the observation an operator
+    /// configured the probe to catch.
+    #[test]
+    fn a_synthetic_pass_does_not_cover_for_a_failing_operator_probe() {
+        let outcome = probe_signal(
+            Some(&ProbeObservation::Unreachable(
+                "connection refused".to_string(),
+            )),
+            Some(&ProbeObservation::Ok),
+        );
+        assert!(matches!(outcome, SignalOutcome::Fail(_)), "{outcome:?}");
+        assert!(outcome
+            .detail()
+            .expect("a failure explains itself")
+            .contains("operator probe"));
+
+        // And the other way round: a failing synthetic driver is a
+        // failure whatever the operator's own probe says.
+        let outcome = probe_signal(
+            Some(&ProbeObservation::Ok),
+            Some(&ProbeObservation::Unexpected("unhealthy".to_string())),
+        );
+        assert!(matches!(outcome, SignalOutcome::Fail(_)), "{outcome:?}");
+        assert!(outcome
+            .detail()
+            .expect("a failure explains itself")
+            .contains("synthetic transaction driver"));
     }
 
     /// The error rate is judged against what this node was already
@@ -1183,9 +1295,9 @@ mod tests {
             "confirming with no window in flight must not invent one",
         );
         assert_eq!(arm(11, "digest", &[], &soak(50)), None);
-        let (revision, _verdict, reports) = confirm_now().expect("a window was in flight");
-        assert_eq!(revision, 11);
-        assert_eq!(reports.len(), 4, "all four signals report");
+        let closed = confirm_now().expect("a window was in flight");
+        assert_eq!(closed.revision, 11);
+        assert_eq!(closed.reports.len(), 4, "all four signals report");
         assert!(
             confirm_now().is_none(),
             "the window is consumed by the confirmation",
@@ -1217,7 +1329,7 @@ mod tests {
     #[test]
     fn the_soak_verdict_event_carries_the_revision_and_every_signal() {
         let mut judged = window(soak(50), Vec::new());
-        judged.probe = Some(ProbeObservation::Ok);
+        judged.operator_probe = Some(ProbeObservation::Ok);
         let (verdict, reports) = judge(
             &judged,
             RequestCounts {

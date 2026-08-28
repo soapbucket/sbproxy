@@ -69,6 +69,18 @@ use sbproxy_config::{BootFallbackMode, ConfigHistoryConfig, RevisionStore};
 /// died, without parsing a log line.
 pub const EXIT_CONFIG_RING_EXHAUSTED: i32 = 78;
 
+/// The phrase [`BootWalkFailure::Exhausted`] renders, and the one
+/// `crates/sbproxy/src/main.rs` matches on to choose
+/// [`EXIT_CONFIG_RING_EXHAUSTED`] over the plain `1`.
+///
+/// A named constant rather than the same sentence typed in two places:
+/// `run` returns `anyhow::Error`, so the binary has a string and not a
+/// type to dispatch on, and a reworded message would otherwise silently
+/// drop the distinct exit code with nothing going red.
+/// `an_exhausted_ring_names_every_revision_tried_and_why` asserts the
+/// rendered message still carries it.
+pub const RING_EXHAUSTED_MARKER: &str = "the config revision ring was exhausted";
+
 /// Whether this process is serving a config its boot fallback restored.
 static ON_FALLBACK: AtomicBool = AtomicBool::new(false);
 
@@ -129,8 +141,7 @@ impl std::fmt::Display for BootWalkFailure {
             Self::Exhausted(tried) => {
                 write!(
                     formatter,
-                    "the config revision ring was exhausted; {} candidate(s) were tried and \
-                     none booted:",
+                    "{RING_EXHAUSTED_MARKER}; {} candidate(s) were tried and none booted:",
                     tried.len()
                 )?;
                 for candidate in tried {
@@ -633,6 +644,10 @@ mod tests {
             );
         }
         assert!(rendered.contains("nothing constructs"), "{rendered}");
+        assert!(
+            rendered.contains(RING_EXHAUSTED_MARKER),
+            "the binary dispatches the distinct exit code off this phrase: {rendered}",
+        );
     }
 
     /// The boot counter is left incremented on a failed attempt, so a

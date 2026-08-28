@@ -1205,9 +1205,10 @@ impl RevisionStore {
 
     /// Every stored rejected candidate, oldest refusal first.
     ///
-    /// Ordered by `last_seen_at`, the same key eviction uses; see
-    /// [`Self::evict_rejections`] for why that is the recency that
-    /// matters. A file that fails to parse is skipped rather than
+    /// Ordered by `last_seen_at`, the same key eviction uses: a
+    /// candidate an authority is still serving, and this node is still
+    /// refusing every poll interval, is the one an operator is looking
+    /// for right now. A file that fails to parse is skipped rather than
     /// failing the whole read: one unreadable rejection must not hide
     /// the others during the incident they were kept for.
     ///
