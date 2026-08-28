@@ -66,11 +66,19 @@ The alternative is a database the proxy cannot start without, which is the depen
 
 Three other bounds are worth knowing, because each one is a place the detector deliberately stops rather than growing:
 
-- **512 tenant-and-class pairs.** The class comes from a closed taxonomy, so this is never reached in a healthy deployment. Past it the detector stops learning new pairs rather than allocating a window for whatever string reached it.
+- **512 tenant-and-class pairs.** The class comes from a closed taxonomy, so a single-tenant deployment never reaches this; thirty tenants at seventeen classes does. Past it a new pair displaces the pair in its shard that has gone longest without being analyzed, rather than being refused: a refused pair has no score, and no score is admitted, so refusing would have let one tenant's key growth switch off another tenant's floor. `sbproxy_anomaly_key_budget_spent_total` counts every displacement, and `sbproxy_anomaly_tracked_keys` is the number to watch it approach.
 - **1,024 distinct values per dimension per day.** A bounded LRU: past the cap the least recently observed value is evicted. Every dimension the detector reads is derived from something the client controls, and an unbounded set is memory a caller can buy. Eviction costs that value its history, so its next sighting looks *more* anomalous rather than less, which is the direction to fail in. The denominator is a separate running counter, so an evicted observation still counts.
 - **4,096 addresses per class per day.** Past that the quietest tracked address is evicted, which under a distributed attacker forgets an honest one. That is why the per-address rate is one signal of four rather than the whole detector.
 
 The per-request cost is bounded for the same reason and in the same place. Reading the denominator is 28 integer loads whatever the client has done to the distinct-value count, and the histogram is sharded across 16 mutexes keyed by tenant and class, so one busy class does not serialize every other one.
+
+### Sizing the process
+
+Those caps bound the per-request cost. They do not make the detector small, and the arithmetic is worth doing before you turn it on in front of a lot of tenants.
+
+One tracked pair holds 28 day buckets. Each bucket holds up to 1,024 distinct values per categorical field across three fields, plus up to 4,096 per-address counters. Fully exercised, that is roughly 10 MB of categorical state and 7 MB of address state per pair, so 512 pairs is on the order of several gigabytes resident.
+
+That is a worst case, not a typical one: only today's bucket grows, older buckets hold whatever they held, and a class that presents one fingerprint holds one entry rather than 1,024. But it is a real ceiling and it is reachable by a deployment that fronts many tenants with varied traffic. Watch `sbproxy_anomaly_tracked_keys` against the process's own memory, and treat a rising `sbproxy_anomaly_key_budget_spent_total` as the signal that the cap is doing work rather than sitting idle.
 
 ## A reload does not cost the window
 
@@ -99,13 +107,19 @@ proxy:
       deny_below: 0.2        # 403
 ```
 
-That is the same shape Cloudflare's threat score has: the gateway computes the number always, and a rule the operator writes decides what it means. `deny_below` wins when a score is under both. The check runs after the origin resolves and before authentication, because the decision is about the caller's standing rather than its credential, and a floored class should not get its token verified and its issuer dialed before it is refused.
+That is the same shape Cloudflare's threat score has: the gateway computes the number always, and a rule the operator writes decides what it means. `deny_below` wins when a score is under both.
 
-A class with no history is admitted. Refusing on the absence of evidence would refuse every caller for the first `min_observations` requests after every restart.
+**Where it runs.** After authentication, not before. The agent class is what the resolver produced, and `bot_auth` restamps it only once it has verified a signature, `kya` later still; running the gate earlier would mean it could never see a verified source, and the histogram, which the response phase fills, would key on a different class than the gate did. A floored caller therefore pays for an authentication round trip before it is refused, which is the cheaper of the two mistakes.
+
+**A class with no history is admitted.** Refusing on the absence of evidence would refuse every caller for the first `min_observations` requests after every restart.
+
+**A refusal is not permanent.** The gate rolls the class's 28-day window forward before it reads the score, and a refused request still feeds the detector, so a class that was floored by a flood recovers as the flood's weight rolls out of the window and is admitted again on the first request after it does. That matters more here than anywhere else on this page: the class is a claim, so a caller that sends GPTBot's User-Agent can move the score the real GPTBot is admitted against, and a permanent refusal would make that a permanent ban somebody else could hand out.
+
+**What the refused caller is told.** A generic `403` or `429`. The class, the band, and the resolver source go to the log line and the decision record and not to the caller: handing them back tells a hostile client which class the gateway resolved it into and how close to the floor it currently sits, which is a probe oracle for a dimension it controls.
 
 **Read this before picking a number.** Two properties of the score decide whether a threshold does what you want:
 
-- **The class is a claim unless the resolver source was a verified one.** Anyone can send GPTBot's `User-Agent`, be resolved into the `gptbot` class, and misbehave there, which moves the score the real GPTBot is then admitted against. Only `bot_auth`, `kya`, `rdns`, and `tls_fingerprint` are verified. The decision record carries the source (see below) so a rule written after the fact can tell the two apart, and pairing a reputation floor with [Web Bot Auth](web-bot-auth.md) or [KYA](configuration.md#kya) is what makes it mean something.
+- **The class is a claim unless the resolver source was a verified one.** Anyone can send GPTBot's `User-Agent`, be resolved into the `gptbot` class, and misbehave there, which moves the score the real GPTBot is then admitted against. Only `bot_auth`, `kya`, `rdns`, and `tls_fingerprint` are verified. Because the gate runs after authentication, it sees the class those sources restamped rather than the pre-auth guess, and the decision record carries the source so a rule written after the fact can tell a verified class from a claimed one. Pairing a reputation floor with [Web Bot Auth](web-bot-auth.md) or [KYA](configuration.md#kya) is what makes it mean something.
 - **`unknown` is a shared bucket.** It holds everything the resolver did not recognize, which on a public gateway is most of the web. A floor that catches `unknown` catches all of it.
 
 ## Watching it
@@ -114,6 +128,8 @@ A class with no history is admitted. Refusing on the absence of evidence would r
 |---|---|---|
 | `sbproxy_anomaly_detected_total` | `kind`, `severity` | Every flagged observation |
 | `sbproxy_agent_reputation_score` | `tenant_id`, `agent_class` | The score, 1.0 down to 0.0 |
+| `sbproxy_anomaly_tracked_keys` | none | `(tenant, agent class)` pairs the detector holds a window for, against a cap of 512 |
+| `sbproxy_anomaly_key_budget_spent_total` | none | Requests that arrived for a pair with no slot. Non-zero means windows are being displaced |
 
 The "Behavioral Anomalies" and "Agent Reputation" panels on the `SBProxy Security` dashboard draw both, and the admin console's Metrics view carries an Anomalies card. Every verdict writes a structured log line carrying the kind, the severity, and a reason: `warn` and `critical` at `warn`, everything else at `info`. Nothing logs at `debug`, because a release build compiles `debug!` out and a counted verdict with no record at all is worse than a noisier log.
 

@@ -4908,20 +4908,23 @@ impl ProxyHttp for SbProxy {
             let _ = upstream_response.insert_header("x-sbproxy-retry-skip-reason", reason);
         }
 
-        // --- Wave 5 / G5.6 wire: AnomalyDetectorHook dispatch ---
+        // --- AnomalyDetectorHook dispatch ---
         //
         // Run every registered anomaly detector hook against the
         // per-request context now that all signals have been populated
         // (TLS fingerprint, ML classification, headless detection,
-        // request rate). Verdicts are forwarded to whichever sink the
-        // hook impl wires (audit log, tracing, reputation updater).
-        // The OSS pipeline does not act on the verdicts directly; a
-        // plugin is responsible for routing them through whatever
-        // alert sink and reputation tally it wants.
+        // request rate).
         //
-        // OSS-only builds register no anomaly hooks; the iteration is
-        // a no-op. A plugin can install detectors at startup via the
-        // `sbproxy-plugin` registry.
+        // Since WOR-2666 the pipeline acts on what comes back rather
+        // than leaving it to a plugin: every verdict is counted on
+        // `sbproxy_anomaly_detected_total`, logged at the level its
+        // severity earns, published as a typed `anomaly` decision
+        // record, and folded into the per-tenant reputation score that
+        // `proxy.anomaly.reputation.deny_below` reads at request time.
+        // `install` registers the built-in detector in the OSS binary,
+        // so this loop is not empty unless `proxy.anomaly` is off. A
+        // plugin can still register a detector of its own, and its
+        // verdicts take the same path.
         {
             let hooks = sbproxy_plugin::anomaly_hooks();
             if !hooks.is_empty() {

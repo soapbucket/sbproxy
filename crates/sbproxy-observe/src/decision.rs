@@ -147,9 +147,11 @@ pub enum DecisionEvent {
     /// mean joining two labels to answer it.
     ///
     /// The record carries the reputation band and the resolver source,
-    /// never the raw signal. A JA4 or a client address on a SIEM feed
-    /// is caller data on a record that ships unredacted, and neither is
-    /// something a rule can usefully select on.
+    /// never the raw signal, and that holds for the `reason` as well as
+    /// for the fields. A JA4 or a client address on a SIEM feed is
+    /// caller data on a record that ships unredacted, and neither is
+    /// something a rule can usefully select on; the value that fired
+    /// stays on the local log line.
     Anomaly,
 }
 

@@ -3,8 +3,8 @@ use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
 use prometheus::{
-    CounterVec, Encoder, GaugeVec, Histogram, HistogramVec, IntCounterVec, IntGauge, Opts,
-    Registry, TextEncoder,
+    CounterVec, Encoder, GaugeVec, Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    Opts, Registry, TextEncoder,
 };
 
 use crate::agent_labels::AgentLabels;
@@ -616,10 +616,28 @@ pub struct ProxyMetrics {
     /// implementation existed to emit it for.
     pub anomaly_detected: Option<IntCounterVec>,
     /// WOR-2666: gauge `sbproxy_agent_reputation_score` in `[0.0, 1.0]`
-    /// per agent class, where 1.0 is a class that has produced no
-    /// anomalies inside the rolling window. Read by an operator, not by
-    /// the request path.
+    /// per tenant and agent class, where 1.0 is a class that has
+    /// produced no anomalies inside the rolling window.
     pub agent_reputation_score: Option<GaugeVec>,
+    /// WOR-2666: gauge `sbproxy_anomaly_tracked_keys` of
+    /// `(tenant, agent class)` pairs the detector currently holds a
+    /// window for.
+    ///
+    /// The detector's resident set is this number times the per-key
+    /// window, so it is the one figure that turns "the caps are
+    /// bounded" into a size an operator can plan against. It is also
+    /// how the budget below becomes visible before it starts evicting.
+    pub anomaly_tracked_keys: Option<IntGauge>,
+    /// WOR-2666: counter `sbproxy_anomaly_key_budget_spent_total` of
+    /// requests that arrived for a key the detector had no slot for.
+    ///
+    /// Every increment is a key that displaced another key's window, or
+    /// a request the detector declined to judge. Either way the
+    /// baseline an operator's `deny_below` reads is being churned, and
+    /// silence here used to be the only signal: the budget was spent
+    /// with no counter and no log line, and `admission_for` reads a
+    /// missing score as "admit".
+    pub anomaly_key_budget_spent: Option<IntCounter>,
     /// WOR-2673: counter `sbproxy_cache_reserve_errors_total` of reserve
     /// operations the backend refused, by operation.
     ///
@@ -724,6 +742,46 @@ fn registered_gauge_vec(
         return None;
     }
     Some(gauge)
+}
+
+/// [`registered_counter_vec`] for an unlabeled gauge.
+fn registered_int_gauge(
+    registry: &Registry,
+    name: &'static str,
+    help: &'static str,
+) -> Option<IntGauge> {
+    let gauge = match IntGauge::new(name, help) {
+        Ok(gauge) => gauge,
+        Err(error) => {
+            tracing::error!(metric = name, %error, "metric family could not be built");
+            return None;
+        }
+    };
+    if let Err(error) = registry.register(Box::new(gauge.clone())) {
+        tracing::error!(metric = name, %error, "metric family could not be registered");
+        return None;
+    }
+    Some(gauge)
+}
+
+/// [`registered_counter_vec`] for an unlabeled counter.
+fn registered_int_counter(
+    registry: &Registry,
+    name: &'static str,
+    help: &'static str,
+) -> Option<IntCounter> {
+    let counter = match IntCounter::new(name, help) {
+        Ok(counter) => counter,
+        Err(error) => {
+            tracing::error!(metric = name, %error, "metric family could not be built");
+            return None;
+        }
+    };
+    if let Err(error) = registry.register(Box::new(counter.clone())) {
+        tracing::error!(metric = name, %error, "metric family could not be registered");
+        return None;
+    }
+    Some(counter)
 }
 
 fn registered_counter_vec(
@@ -1143,6 +1201,18 @@ impl ProxyMetrics {
             &["tenant_id", "agent_class"],
         );
 
+        let anomaly_tracked_keys = registered_int_gauge(
+            &registry,
+            "sbproxy_anomaly_tracked_keys",
+            "(tenant, agent class) pairs the anomaly detector currently holds a window for",
+        );
+
+        let anomaly_key_budget_spent = registered_int_counter(
+            &registry,
+            "sbproxy_anomaly_key_budget_spent_total",
+            "Requests that arrived for an agent class the detector had no tracking slot for",
+        );
+
         let cache_reserve_errors = registered_counter_vec(
             &registry,
             "sbproxy_cache_reserve_errors_total",
@@ -1379,6 +1449,8 @@ impl ProxyMetrics {
             cache_reserve_errors,
             anomaly_detected,
             agent_reputation_score,
+            anomaly_tracked_keys,
+            anomaly_key_budget_spent,
             cache_reserve_evictions,
             synthetic_probe_failures,
             mirror_state_drift,
@@ -1715,6 +1787,32 @@ pub fn record_auth(origin: &str, auth_type: &str, allowed: bool) {
 pub fn record_anomaly_detected(kind: &str, severity: &str) {
     if let Some(counter) = metrics().anomaly_detected.as_ref() {
         counter.with_label_values(&[kind, severity]).inc();
+    }
+}
+
+/// Publish how many `(tenant, agent class)` windows the detector holds
+/// (WOR-2666).
+///
+/// The detector's resident set is this number times the per-key window,
+/// so this is the figure that turns "the per-request cost is bounded"
+/// into a memory size an operator can plan against. Without it, the cap
+/// was reachable and invisible.
+pub fn set_anomaly_tracked_keys(count: usize) {
+    if let Some(gauge) = metrics().anomaly_tracked_keys.as_ref() {
+        gauge.set(count as i64);
+    }
+}
+
+/// Count one request that arrived for an agent class the detector had
+/// no tracking slot for (WOR-2666).
+///
+/// Non-zero means the key budget is spent and windows are being
+/// displaced, which churns the baseline an operator's `deny_below`
+/// reads. The failure it makes visible is a quiet one: a key with no
+/// slot has no score, and no score reads as "admit".
+pub fn record_anomaly_key_budget_spent() {
+    if let Some(counter) = metrics().anomaly_key_budget_spent.as_ref() {
+        counter.inc();
     }
 }
 

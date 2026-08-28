@@ -1201,6 +1201,61 @@
         }
       ],
       "description": "Reputation per tenant and agent class, 1.0 down to 0.0, over the detector's rolling 28-day window. A critical verdict costs five times a warning, and weight decays by rolling out of the window rather than on a timer, so a class that stops misbehaving recovers on its own; the gauge is republished on every analysis, not only when a verdict fires, so the number moves while the class recovers. A class that goes entirely silent keeps its last score until it sends again. Advisory unless an operator sets proxy.anomaly.reputation.deny_below or challenge_below, which turn it into an admission decision."
+    },
+    {
+      "id": 19,
+      "title": "Anomaly Detector Capacity",
+      "type": "timeseries",
+      "description": "How many (tenant, agent class) windows the detector holds, against its cap of 512, and how often a request arrived for a class it had no slot for. The resident set is the key count times the per-key window, so this is the line to size the process against. A non-zero budget rate means windows are being displaced, which churns the baseline a reputation.deny_below floor reads: a class with no window has no score, and no score is admitted.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 80
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sbproxy_anomaly_tracked_keys",
+          "legendFormat": "tracked keys",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "rate(sbproxy_anomaly_key_budget_spent_total[5m])",
+          "legendFormat": "budget spent /s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      }
     }
   ],
   "templating": {

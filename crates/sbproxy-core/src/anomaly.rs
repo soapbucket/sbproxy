@@ -129,6 +129,13 @@
 //! same shape Cloudflare's threat score has, where the number is always
 //! there and a WAF rule decides whether it means anything.
 //!
+//! A refusal is not a one-way door. The gate rolls the window forward
+//! before it reads the score and feeds the refused request back into
+//! the detector, so a class floored by a flood recovers as that flood's
+//! weight rolls out of the window. Without that, a refusal would freeze
+//! the window at its worst value for the life of the process, on a
+//! class any caller can join by choosing a User-Agent.
+//!
 //! Two properties matter before anyone picks a number, and both are
 //! stated in `docs/anomaly-detection.md` rather than buried here: the
 //! score is keyed on a *claimed* identity unless the resolver source
@@ -270,12 +277,19 @@ struct ClassHistogram {
     /// still inside the window. A fixed-size array rather than a `Vec`
     /// so `days[0]` is an invariant the type holds.
     days: [DayBucket; WINDOW_DAYS],
+    /// The last day `analyze_on` judged a request for this key.
+    ///
+    /// Only the eviction order reads it. `days[0].day` moves on a
+    /// rotation whoever triggered it, including the admission gate, so
+    /// it cannot answer "which key has nothing asking about it".
+    last_analyzed: Option<NaiveDate>,
 }
 
 impl Default for ClassHistogram {
     fn default() -> Self {
         Self {
             days: std::array::from_fn(|_| DayBucket::default()),
+            last_analyzed: None,
         }
     }
 }
@@ -478,6 +492,21 @@ impl ReputationAction {
             Self::Challenge => "challenge",
         }
     }
+
+    /// What the refused caller is told.
+    ///
+    /// Deliberately generic, and deliberately not the reason string the
+    /// log line and the decision record carry. Those name the agent
+    /// class and the reputation band; handing them back tells a hostile
+    /// caller which class the gateway resolved it into and how close to
+    /// the floor it currently sits, which is a probe oracle for a
+    /// dimension the same caller controls by choosing a User-Agent.
+    pub fn client_message(self) -> &'static str {
+        match self {
+            Self::Deny => "forbidden",
+            Self::Challenge => "too many requests",
+        }
+    }
 }
 
 /// Detector settings, resolved from `proxy.anomaly`.
@@ -602,13 +631,50 @@ impl AnomalyDetector {
         &self.shards[index]
     }
 
-    /// Claim one of the process-wide key slots, or refuse.
+    /// Claim one of the process-wide key slots, or say the budget is
+    /// spent.
     fn reserve_key_slot(&self) -> bool {
         self.tracked
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |tracked| {
                 (tracked < MAX_TRACKED_KEYS).then_some(tracked + 1)
             })
             .is_ok()
+    }
+
+    /// Make room for a new key by dropping the one in this shard that
+    /// has gone longest without being analyzed.
+    ///
+    /// # Why evict rather than refuse
+    ///
+    /// The budget is process-wide and a slot was never released, so the
+    /// first version refused every unseen `(tenant, class)` past the
+    /// cap: `analyze_on` returned empty, `reputation()` returned `None`,
+    /// and `admission_for` reads `None` as "admit". One tenant's key
+    /// growth therefore switched off another tenant's `deny_below`,
+    /// silently, with no counter and no log line. 512 is reachable in
+    /// normal operation (thirty tenants at seventeen classes), so this
+    /// was not a theoretical cliff.
+    ///
+    /// Evicting the stalest key in the shard the new key hashes to
+    /// keeps the bound and keeps enforcement alive: the class that
+    /// loses its window is the one nothing has asked about, and it
+    /// relearns from the next request. The scan is bounded by the
+    /// shard's own size, which the same cap bounds.
+    fn evict_stalest(guard: &mut HashMap<String, ClassHistogram>) -> bool {
+        let Some(victim) = guard
+            .iter()
+            .min_by_key(|(_, histogram)| histogram.last_analyzed)
+            .map(|(key, _)| key.clone())
+        else {
+            return false;
+        };
+        guard.remove(&victim);
+        true
+    }
+
+    /// Tracked keys, for the gauge and for `Debug`.
+    pub fn tracked_keys(&self) -> usize {
+        self.tracked.load(Ordering::Acquire)
     }
 
     /// Reputation score for one tenant's agent class, or `None` when
@@ -621,8 +687,48 @@ impl AnomalyDetector {
             .map(|histogram| score_from_weight(histogram.weighted_anomalies()))
     }
 
+    /// Roll one key's window forward to `today`, republish its gauge,
+    /// and return the rolled score. `None` when the pair is unknown.
+    ///
+    /// # Why this exists
+    ///
+    /// `rotate_to` used to run only from `analyze_on`, which runs only
+    /// from the response phase. A class refused by `deny_below` never
+    /// reaches a response phase, so its window never rolled and its
+    /// weight never decayed: one flood that floored a class locked that
+    /// class out for the life of the process, while the page an
+    /// operator reads before setting a floor promised a 28-day decay.
+    /// A class any caller can join by sending a User-Agent is not a
+    /// class to hand a permanent ban.
+    ///
+    /// So the refusal path rolls the window itself. Rotation is now
+    /// driven by the request that is *about* to be judged rather than
+    /// by the one that got through, which is the only ordering that
+    /// lets a floored class recover.
+    pub fn refresh_reputation(
+        &self,
+        tenant: &str,
+        agent_class: &str,
+        today: NaiveDate,
+    ) -> Option<f64> {
+        let key = Self::key_for(tenant, agent_class);
+        let mut guard = self.shard_for(&key).lock();
+        let histogram = guard.get_mut(&key)?;
+        histogram.rotate_to(today);
+        let score = score_from_weight(histogram.weighted_anomalies());
+        drop(guard);
+        sbproxy_observe::metrics::set_agent_reputation_score(tenant, agent_class, score);
+        Some(score)
+    }
+
     /// What an operator's thresholds say about this caller, or `None`
     /// when no threshold is set or the class has no history.
+    ///
+    /// The window is rolled to `today` first, so the decision is taken
+    /// on a score that has decayed rather than on the one the class was
+    /// frozen at when it was last analyzed. Without that a refusal is
+    /// permanent, because a refused request never reaches the response
+    /// phase that used to be the only thing that rotated.
     ///
     /// A class with no history is admitted. A score that has never been
     /// computed is not a bad score, and refusing on the absence of
@@ -632,11 +738,12 @@ impl AnomalyDetector {
         &self,
         tenant: &str,
         agent_class: &str,
+        today: NaiveDate,
     ) -> Option<(ReputationAction, f64)> {
         if !self.settings.admission_configured() {
             return None;
         }
-        let score = self.reputation(tenant, agent_class)?;
+        let score = self.refresh_reputation(tenant, agent_class, today)?;
         self.settings
             .action_for(score)
             .map(|action| (action, score))
@@ -656,13 +763,24 @@ impl AnomalyDetector {
         let shard = self.shard_for(&key);
         let mut guard = shard.lock();
         if !guard.contains_key(&key) && !self.reserve_key_slot() {
-            // Past the cap the detector stops learning new keys rather
-            // than growing without bound. Silence is the right failure
-            // here: a fabricated verdict is worse than none.
-            return Vec::new();
+            // The budget is spent. Make room by dropping the key in
+            // this shard nothing has asked about for longest, rather
+            // than refusing to learn the new one: refusing meant
+            // `reputation()` stayed `None` for it forever, and
+            // `admission_for` reads `None` as "admit", so one tenant's
+            // key growth switched off another tenant's enforcement.
+            if !Self::evict_stalest(&mut guard) {
+                // This shard is empty and the budget is still spent, so
+                // every slot is held by another shard. Count it and say
+                // nothing rather than judge on no baseline.
+                sbproxy_observe::metrics::record_anomaly_key_budget_spent();
+                return Vec::new();
+            }
+            sbproxy_observe::metrics::record_anomaly_key_budget_spent();
         }
         let histogram = guard.entry(key).or_default();
         histogram.rotate_to(today);
+        histogram.last_analyzed = Some(today);
 
         let mut verdicts = Vec::new();
 
@@ -742,6 +860,11 @@ impl AnomalyDetector {
         // the dashboard an operator was told to alert on, while its
         // internal weight had long since rolled out of the window.
         sbproxy_observe::metrics::set_agent_reputation_score(view.tenant_id, agent_class, score);
+        // One atomic store, and the only figure that turns "the caps
+        // are bounded" into a resident-set size an operator can plan
+        // against. Published here rather than on a timer because there
+        // is no timer to own and this is where the count changes.
+        sbproxy_observe::metrics::set_anomaly_tracked_keys(self.tracked_keys());
         verdicts
     }
 
@@ -874,13 +997,13 @@ pub fn install(settings: Option<AnomalySettings>) {
 }
 
 /// Install a detector built elsewhere, for the tests that need to drive
-/// the registry seam with a pre-warmed window.
+/// a seam with a pre-warmed window.
 ///
-/// Test-only and private on purpose. Production installs through
+/// Test-only and `pub(crate)` on purpose. Production installs through
 /// [`install`], which owns the reuse decision; a second public entry
 /// point would let a caller swap the detector without it.
 #[cfg(test)]
-fn install_detector(detector: Option<Arc<AnomalyDetector>>) {
+pub(crate) fn install_detector(detector: Option<Arc<AnomalyDetector>>) {
     DETECTOR.store(detector);
     HOOK_REGISTERED.get_or_init(|| {
         sbproxy_plugin::register_anomaly_hook(Arc::new(ConfiguredDetectorHook));
@@ -1108,6 +1231,71 @@ mod tests {
         }
         let entry = flagged.expect("a sustained burst from one address must be flagged");
         assert_eq!(entry.kind, KIND_REQUEST_RATE_SPIKE);
+    }
+
+    /// WOR-2666 re-review N8, red first. `examples/anomaly-detection/`
+    /// ships a walkthrough with exact numbers in it, and nothing
+    /// checked them: the settings it uses are not the ones any other
+    /// test exercises, and the first version's "nothing is flagged
+    /// yet" step actually fired twice, because `mean_before` is read
+    /// before the observation, so with one address the count is always
+    /// one past the mean.
+    ///
+    /// This is the example's config and the example's walkthrough. If
+    /// it goes red, the README is wrong.
+    #[test]
+    fn the_shipped_example_walkthrough_produces_the_numbers_it_prints() {
+        const EXAMPLE_MIN_MEAN: f64 = 6.0;
+        const EXAMPLE_MULTIPLIER: f64 = 1.0;
+        const QUIET_REQUESTS: usize = 5;
+        const NOISY_REQUESTS: usize = 8;
+
+        let detector = AnomalyDetector::new(AnomalySettings {
+            min_observations: 5,
+            outlier_frequency: 0.01,
+            rate_spike_multiplier: EXAMPLE_MULTIPLIER,
+            rate_spike_min_mean: EXAMPLE_MIN_MEAN,
+            deny_below: None,
+            challenge_below: None,
+        });
+        let quiet: IpAddr = "198.51.100.7".parse().expect("an address");
+        let noisy: IpAddr = "203.0.113.9".parse().expect("an address");
+
+        // Step one: five requests from one address. The README says
+        // nothing is flagged, and with one address the per-address mean
+        // is that address's own rate, so nothing can be meaningfully
+        // past it.
+        for _ in 0..QUIET_REQUESTS {
+            let verdicts = detector.analyze_on(&view("unknown", None, None, Some(quiet)), today());
+            assert!(
+                verdicts.is_empty(),
+                "the first loop must stay quiet or the README's first step is a lie: {verdicts:?}"
+            );
+        }
+
+        // Step two: eight from a second address. Exactly one fires, and
+        // it is the last one.
+        let mut flagged = Vec::new();
+        for request in 1..=NOISY_REQUESTS {
+            let verdicts = detector.analyze_on(&view("unknown", None, None, Some(noisy)), today());
+            for entry in verdicts {
+                flagged.push((request, entry));
+            }
+        }
+        assert_eq!(
+            flagged.len(),
+            1,
+            "the README prints a count of 1: {flagged:?}"
+        );
+        let (request, entry) = &flagged[0];
+        assert_eq!(*request, NOISY_REQUESTS, "and says which request fires it");
+        assert_eq!(entry.kind, KIND_REQUEST_RATE_SPIKE);
+        assert_eq!(entry.severity, SEVERITY_WARN, "the README prints `warn`");
+        assert_eq!(
+            detector.reputation("acme", "unknown"),
+            Some(0.99),
+            "one warn is one point of a hundred, which is the score the README prints"
+        );
     }
 
     #[test]
@@ -1342,6 +1530,47 @@ mod tests {
         );
     }
 
+    /// WOR-2666 re-review N6, red first. Past the cap the detector used
+    /// to refuse to learn a new key, and `admission_for` reads a
+    /// missing score as "admit", so one tenant's key growth silently
+    /// switched off another tenant's `deny_below`. It evicts the
+    /// stalest key in the shard instead, so a class that arrives after
+    /// the cap is still judged.
+    #[test]
+    fn a_key_arriving_past_the_cap_is_still_judged() {
+        let detector = AnomalyDetector::new(settings());
+        for index in 0..MAX_TRACKED_KEYS {
+            let class = format!("class-{index}");
+            detector.analyze_on(&view(&class, Some("t13d"), None, None), today());
+        }
+        assert_eq!(detector.tracked_keys(), MAX_TRACKED_KEYS);
+
+        // A new class, arriving with the budget already spent. Give it
+        // a baseline and then a novel fingerprint: it has to be flagged,
+        // which is only possible if it got a window at all.
+        let latecomer = "class-arrived-late";
+        for _ in 0..60 {
+            detector.analyze_on(&view(latecomer, Some("t13d_USUAL"), None, None), today());
+        }
+        let verdicts =
+            detector.analyze_on(&view(latecomer, Some("t13d_NOVEL"), None, None), today());
+        assert_eq!(
+            verdicts.len(),
+            1,
+            "a class that arrived after the cap must still be judged, or the cap is a way to \
+             switch enforcement off: {verdicts:?}"
+        );
+        assert!(
+            detector.reputation("acme", latecomer).is_some(),
+            "and it must have a score, because no score is admitted"
+        );
+        assert_eq!(
+            detector.tracked_keys(),
+            MAX_TRACKED_KEYS,
+            "while the bound still holds"
+        );
+    }
+
     #[test]
     fn settings_clamp_values_that_would_disable_the_detector_silently() {
         let clamped = AnomalySettings::from_config(&sbproxy_config::AnomalyConfig {
@@ -1375,7 +1604,7 @@ mod tests {
         }
         advisory.analyze_on(&view("gptbot", Some("t13d_NOVEL"), None, None), today());
         assert!(
-            advisory.admission_for("acme", "gptbot").is_none(),
+            advisory.admission_for("acme", "gptbot", today()).is_none(),
             "the default must publish the score and act on nothing"
         );
 
@@ -1390,7 +1619,7 @@ mod tests {
         // under the challenge floor and over the deny floor.
         detector.analyze_on(&view("gptbot", Some("t13d_NOVEL"), None, None), today());
         let (action, score) = detector
-            .admission_for("acme", "gptbot")
+            .admission_for("acme", "gptbot", today())
             .expect("a score under the challenge floor is an admission decision");
         assert_eq!(action, ReputationAction::Challenge);
         assert!(score < 0.99 && score > 0.5, "{score}");
@@ -1402,7 +1631,7 @@ mod tests {
             detector.analyze_on(&view("gptbot", Some(&ja4), None, None), today());
         }
         let (action, _) = detector
-            .admission_for("acme", "gptbot")
+            .admission_for("acme", "gptbot", today())
             .expect("a floored class is still an admission decision");
         assert_eq!(
             action,
@@ -1419,7 +1648,9 @@ mod tests {
         let mut gated = settings();
         gated.deny_below = Some(1.0);
         let detector = AnomalyDetector::new(gated);
-        assert!(detector.admission_for("acme", "never-seen").is_none());
+        assert!(detector
+            .admission_for("acme", "never-seen", today())
+            .is_none());
     }
 
     #[test]

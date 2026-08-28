@@ -94,8 +94,11 @@ pub const FIELD_CONTRACTS: &[FieldContract] = &[
                verdict is an observation and the request proceeds. An admission record \
                carries `reputation_bucket` and a `verdict` holding the action, and its \
                outcome is a deny. `identity_source` is on both, because the class the score \
-               is keyed on is a claim unless that source is a verified one. Never the raw \
-               score, the fingerprint, or the client address.",
+               is keyed on is a claim unless that source is a verified one. Neither the \
+               fields nor the `reason` carry the raw score, the TLS fingerprint, or the \
+               client address: those are caller-chosen values on a record that ships \
+               unredacted, and none of them is a term a rule can select on. The fingerprint \
+               that fired stays on the local log line.",
     },
     FieldContract {
         event: DecisionEvent::Auth,

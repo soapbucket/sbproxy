@@ -1907,20 +1907,6 @@ pub(super) async fn request_filter(
     };
     ctx.origin_idx = Some(origin_idx);
 
-    // WOR-2666: the reputation score's request-time consumer.
-    //
-    // Off unless an operator set `proxy.anomaly.reputation.deny_below`
-    // or `challenge_below`, which is the whole posture: the score is
-    // published whether or not anything acts on it, and it becomes an
-    // admission decision only when someone names a number. Placed here,
-    // after the origin resolves and before auth, because the decision
-    // is about the caller's standing rather than its credential, and
-    // because an origin is what the decision record and the metric are
-    // scoped by.
-    if reputation_admission(session, ctx).await? {
-        return Ok(true);
-    }
-
     if crate::proxy_wasm_http::start_request(session, ctx, origin_idx).await? {
         return Ok(true);
     }
@@ -3536,7 +3522,11 @@ pub(super) async fn request_filter(
             // same way it is when an out-of-tree `IdentityResolverHook`
             // populates it.
             #[cfg(feature = "agent-class")]
-            stamp_kya_context(ctx, &decided_auth_type);
+            stamp_kya_context(
+                ctx,
+                &decided_auth_type,
+                matches!(trust_outcome, AuthTrustOutcome::FailedOpen),
+            );
             // Phase-timing capture: snapshot the moment the auth
             // provider returned (success, deny, or challenge). The
             // access-log + `sbproxy_phase_duration_seconds{phase="auth"}`
@@ -3604,12 +3594,7 @@ pub(super) async fn request_filter(
                     // plain allow made 40,000 unauthorized admissions
                     // indistinguishable from 40,000 real ones.
                     let failed_open = matches!(trust_outcome, AuthTrustOutcome::FailedOpen);
-                    let reason = if failed_open {
-                        "admitted without a decision: the provider's backend failed and it is \
-                         configured to fail open"
-                    } else {
-                        "credential accepted"
-                    };
+                    let reason = auth_allow_reason(failed_open);
                     crate::server::record_auth_decision(
                         ctx,
                         &origin_label,
@@ -3783,6 +3768,29 @@ pub(super) async fn request_filter(
     // have now run. Compute once so every downstream policy sees the same
     // conservative tier and the distribution metric has a live writer.
     crate::trust_tier::finalize(ctx, false);
+
+    // WOR-2666: the reputation score's request-time consumer.
+    //
+    // Off unless an operator set `proxy.anomaly.reputation.deny_below`
+    // or `challenge_below`, which is the whole posture: the score is
+    // published whether or not anything acts on it, and it becomes an
+    // admission decision only when someone names a number.
+    //
+    // Here, and not earlier. The first version ran this right after the
+    // origin resolved, to spare a floored class the cost of an issuer
+    // dial, and that read the wrong key on two dimensions:
+    // `ctx.tenant_id` is stamped from the matched origin further down,
+    // and the agent class at that point is whatever the rule-based
+    // resolver worked out from the User-Agent. `bot_auth` restamps the
+    // class only after it has verified a signature and `kya` stamps its
+    // identity later still, so the gate could never see a verified
+    // source, and the histogram, which `response_filter` fills, keys on
+    // the restamped class. Gate and histogram disagreeing about which
+    // class a caller belongs to is worse than an authentication round
+    // trip a refused caller did not need.
+    if reputation_admission(session, ctx).await? {
+        return Ok(true);
+    }
 
     // --- P0 edge capture ---
     //
@@ -7817,6 +7825,25 @@ origins:
     }
 }
 
+/// The audit reason an admitted request's decision record carries.
+///
+/// Its own function so the two strings can be asserted without driving
+/// the whole auth stage. WOR-2667's review found a fail-open recorded
+/// as `Auth`/`Allow`/`credential accepted`, byte-identical to a real
+/// admission: an analyst reconstructing a twenty-minute authorization
+/// outage had 40,000 records saying a credential was checked, for
+/// requests where none was. The counter said `fail_open` and the
+/// evidence feed said otherwise, and only one of those is the audit
+/// trail.
+pub(crate) fn auth_allow_reason(failed_open: bool) -> &'static str {
+    if failed_open {
+        "admitted without a decision: the provider's backend failed and it is configured to \
+         fail open"
+    } else {
+        "credential accepted"
+    }
+}
+
 /// Refuse a caller whose agent class sits under an operator-set
 /// reputation floor (WOR-2666).
 ///
@@ -7858,19 +7885,40 @@ async fn reputation_admission(session: &mut Session, ctx: &mut RequestContext) -
         .map_or_else(|| "unknown".to_string(), |id| id.as_str().to_string());
     #[cfg(not(feature = "agent-class"))]
     let agent_class: String = "unknown".to_string();
-    let Some((action, score)) = detector.admission_for(&ctx.tenant_id, &agent_class) else {
+
+    let today = chrono::Utc::now().date_naive();
+    // Rolls the window before it reads it, which is what lets a floored
+    // class recover: see `AnomalyDetector::refresh_reputation`.
+    let Some((action, score)) = detector.admission_for(&ctx.tenant_id, &agent_class, today) else {
         return Ok(false);
     };
+
+    // WOR-2666 re-review N1. A refused request never reaches
+    // `response_filter`, so without this the detector would learn
+    // nothing from the traffic it is refusing: the class's window would
+    // hold only the flood that floored it, and every later observation
+    // would be lost. Feeding the refusal keeps the population honest
+    // and keeps the day buckets moving.
+    let verdicts = detector.analyze_on(&anomaly_view(ctx, session, &agent_class), today);
+    for entry in &verdicts {
+        crate::anomaly::record_verdict(ctx.hostname.as_str(), entry);
+    }
 
     #[cfg(feature = "agent-class")]
     let identity_source = ctx.agent_id_source.map(|source| source.as_str());
     #[cfg(not(feature = "agent-class"))]
     let identity_source: Option<&str> = None;
+    for entry in &verdicts {
+        crate::server::record_anomaly_decision(ctx, entry, identity_source);
+    }
 
     let bucket = crate::anomaly::reputation_bucket(score);
     let status = action.status();
-    // The band and the class, never the score and never a signal. The
-    // reason string reaches the audit record and the log line both.
+    // The band, the class, and the resolver source reach the log line
+    // and the decision record. They do not reach the caller: the body
+    // below is generic, because a hostile caller reading its own band
+    // back learns which class the gateway resolved it into and how
+    // close it is to the floor, and the class is a claim it controls.
     let reason = format!(
         "agent class {agent_class} reputation is {bucket}, under the configured {} floor",
         action.as_label()
@@ -7891,7 +7939,7 @@ async fn reputation_admission(session: &mut Session, ctx: &mut RequestContext) -
     send_error_with_pages(
         session,
         status,
-        &reason,
+        action.client_message(),
         origin.and_then(|o| o.error_pages.as_deref()),
         origin.and_then(|o| o.problem_details.as_ref()),
         &path,
@@ -7900,6 +7948,59 @@ async fn reputation_admission(session: &mut Session, ctx: &mut RequestContext) -
     .await?;
     ctx.response_status = Some(status);
     Ok(true)
+}
+
+/// The view the anomaly detector reads, built from the request phase.
+///
+/// The same fields `response_filter` builds it from, so the gate and
+/// the response-phase dispatch judge the same request the same way.
+fn anomaly_view<'a>(
+    ctx: &'a RequestContext,
+    session: &'a Session,
+    agent_class: &'a str,
+) -> sbproxy_plugin::RequestContextView<'a> {
+    let request = session.req_header();
+    #[cfg(feature = "agent-class")]
+    let agent_id_source = ctx.agent_id_source.map(|source| source.as_str());
+    #[cfg(not(feature = "agent-class"))]
+    let agent_id_source: Option<&str> = None;
+    #[cfg(feature = "tls-fingerprint")]
+    let (ja4_fingerprint, ja4_trustworthy, headless_library) = {
+        let ja4 = ctx
+            .tls_fingerprint
+            .as_ref()
+            .and_then(|fingerprint| fingerprint.ja4.as_deref());
+        let trustworthy = ctx
+            .tls_fingerprint
+            .as_ref()
+            .is_some_and(|fingerprint| fingerprint.trustworthy);
+        let library = match ctx.headless_signal.as_ref() {
+            Some(crate::context::HeadlessSignal::Detected { library, .. }) => {
+                Some(library.as_str())
+            }
+            _ => None,
+        };
+        (ja4, trustworthy, library)
+    };
+    #[cfg(not(feature = "tls-fingerprint"))]
+    let (ja4_fingerprint, ja4_trustworthy, headless_library): (
+        Option<&str>,
+        bool,
+        Option<&str>,
+    ) = (None, false, None);
+    sbproxy_plugin::RequestContextView {
+        tenant_id: ctx.tenant_id.as_str(),
+        hostname: ctx.hostname.as_str(),
+        method: request.method.as_str(),
+        path: request.uri.path(),
+        query: request.uri.query().unwrap_or(""),
+        agent_id: Some(agent_class),
+        agent_id_source,
+        ja4_fingerprint,
+        ja4_trustworthy,
+        headless_library,
+        client_ip: ctx.client_ip,
+    }
 }
 
 /// WOR-2667: mirror a verified `kya` principal's metadata onto the
@@ -7918,21 +8019,36 @@ async fn reputation_admission(session: &mut Session, ctx: &mut RequestContext) -
 /// there and leave `request.kya.verdict` unset for a request a KYA
 /// token actually authenticated.
 #[cfg(feature = "agent-class")]
-pub(crate) fn stamp_kya_context(ctx: &mut RequestContext, decided_auth_type: &str) {
+pub(crate) fn stamp_kya_context(
+    ctx: &mut RequestContext,
+    decided_auth_type: &str,
+    failed_open: bool,
+) {
     if decided_auth_type != "kya" {
         return;
     }
     let metadata = &ctx.principal.attrs.metadata;
     if metadata.get("kya_verdict").is_none() {
-        // A `kya` provider that decided the request and stamped no
-        // metadata took exactly one path: `directory_unavailable` under
-        // `fail_open: true`, which admits anonymously. Every other
-        // non-verified verdict refuses, so the request never reaches
-        // here. Inferring it is what makes the documented
-        // `request.kya.verdict == "directory_unavailable"` policy fire;
-        // without it the field read `""` and a policy written to
-        // tighten behavior while the issuer is down never ran.
-        ctx.kya_verdict = Some("directory_unavailable");
+        // The fail-open admission is the one path that reaches a policy
+        // chain with no kya metadata on the principal: `fail_open: true`
+        // turns `directory_unavailable` into an anonymous allow.
+        // Inferring the verdict there is what makes the documented
+        // `request.kya.verdict == "directory_unavailable"` policy fire.
+        //
+        // Only there. The first version of this inferred it whenever the
+        // metadata was absent, and `stamp_kya_context` is called on every
+        // outcome including the refusing ones, so a missing, expired,
+        // revoked, invalid, or under-balance token stamped
+        // `directory_unavailable` too. That is an affirmatively false
+        // value in a field the same round documented as carrying exactly
+        // two: a policy branching on "the issuer is down" would fire for
+        // a revoked token, which is the opposite of what the operator
+        // wrote. `failed_open` is the trust outcome the auth stage
+        // already computed, so the caller knows and this does not have to
+        // guess.
+        if failed_open {
+            ctx.kya_verdict = Some("directory_unavailable");
+        }
         return;
     }
     // The label set is the closed one `KyaVerdict::metric_label`
@@ -7965,70 +8081,262 @@ pub(crate) fn stamp_kya_context(ctx: &mut RequestContext, decided_auth_type: &st
     ctx.kya_kyab_balance = metadata
         .get("kya_kyab_balance")
         .and_then(|amount| amount.parse::<u64>().ok());
+    ctx.kya_kyab_currency = metadata.get("kya_kyab_currency").cloned();
 }
 
-/// WOR-2666: the reputation gate's wiring, checked at the seam a unit
-/// test can reach.
-///
-/// **What this cannot see.** There is no `Session` fake in this
-/// workspace, so nothing here drives `request_filter` end to end. What
-/// it proves is that the gate is called from inside `request_filter`
-/// and that it is called before authentication runs, and what it
-/// therefore cannot prove is that a refused caller's response reaches
-/// the wire with the status this claims. Deleting the call site turns
-/// this red; changing what `send_error_with_pages` does with the status
-/// does not. The behavior of the decision itself is covered by
-/// `anomaly::tests::admission_reads_the_score_only_when_a_threshold_is_set`.
+/// WOR-2667 re-review N4: the fail-open evidence record, at the seam.
 #[cfg(test)]
-mod reputation_admission_tests {
-    /// The source of this file, read at compile time so the guard
-    /// cannot drift from what shipped.
-    const SOURCE: &str = include_str!("request_phase.rs");
-
+mod fail_open_reason_tests {
+    /// A fail-open and a real admission must not produce the same audit
+    /// record. Folded together, an operator reconstructing which
+    /// requests were admitted without an authorization decision has no
+    /// way to do it: every one is an `Auth`/`Allow`/`credential
+    /// accepted` record identical to a genuine one.
     #[test]
-    fn the_reputation_gate_is_called_from_the_request_filter() {
-        // Built rather than written out, so the needle does not match
-        // this test's own text.
-        let needle = format!("if {}(session, ctx).await? {{", "reputation_admission");
-        let calls: Vec<usize> = SOURCE.match_indices(&needle).map(|(at, _)| at).collect();
+    fn a_fail_open_admission_does_not_read_as_an_accepted_credential() {
+        let admitted = super::auth_allow_reason(false);
+        let failed_open = super::auth_allow_reason(true);
+        assert_eq!(admitted, "credential accepted");
+        assert_ne!(
+            admitted, failed_open,
+            "the two admissions have to be distinguishable in the evidence feed"
+        );
+        assert!(
+            failed_open.contains("without a decision"),
+            "the reason is what an analyst reads: {failed_open}"
+        );
+        assert!(
+            failed_open.contains("fail open"),
+            "and it has to name the setting that caused it: {failed_open}"
+        );
+    }
+
+    /// The alertable half. `record_decision_fail_open` writes its own
+    /// family rather than an `outcome` label on the shared one, so a
+    /// dashboard can page on it; this pins that the family exists and
+    /// takes the `auth` event, which is what the request path passes.
+    #[test]
+    fn the_fail_open_family_counts_the_auth_event() {
+        use sbproxy_observe::decision::{DecisionEngine, DecisionEvent};
+
+        let family = &sbproxy_observe::metrics::metrics().decision_event_fail_open;
+        let labels = [
+            DecisionEvent::Auth.as_label(),
+            DecisionEngine::BuiltIn.as_label(),
+            "n4-origin",
+            "n4-tenant",
+        ];
+        let before = family.with_label_values(&labels).get();
+        sbproxy_observe::decision::record_decision_fail_open(
+            DecisionEvent::Auth,
+            DecisionEngine::BuiltIn,
+            "n4-origin",
+            "n4-tenant",
+        );
         assert_eq!(
-            calls.len(),
-            1,
-            "the reputation gate must have exactly one call site in the request path"
-        );
-        let filter_at = SOURCE
-            .find("pub(super) async fn request_filter(")
-            .expect("request_filter is in this file");
-        let definition_at = SOURCE
-            .find("async fn reputation_admission(")
-            .expect("the gate is in this file");
-        assert!(
-            calls[0] > filter_at && calls[0] < definition_at,
-            "the call has to be inside request_filter, not in the gate's own body"
-        );
-
-        // Before authentication. The decision is about the caller's
-        // standing rather than its credential, and running it after
-        // auth would mean a floored class still gets its token
-        // verified, its introspection callout dialed, and its KYA
-        // issuer fetched before it is refused.
-        let auth_at = SOURCE
-            .find("crate::server::record_auth_decision(")
-            .expect("the auth decision seam is in this file");
-        assert!(
-            calls[0] < auth_at,
-            "the reputation gate must run before authentication"
+            family.with_label_values(&labels).get(),
+            before + 1,
+            "an auth fail-open has to move its own family, not only the reason string"
         );
     }
+}
 
-    #[test]
-    fn the_two_actions_answer_the_statuses_the_docs_promise() {
-        use crate::anomaly::ReputationAction;
-        assert_eq!(ReputationAction::Deny.status(), 403);
-        assert_eq!(ReputationAction::Challenge.status(), 429);
-        assert_eq!(ReputationAction::Deny.as_label(), "deny");
-        assert_eq!(ReputationAction::Challenge.as_label(), "challenge");
+/// WOR-2666: the reputation gate, driven through `request_filter` over
+/// a real socket.
+///
+/// This replaces a source-text guard that asserted the call site
+/// existed. The guard's own rustdoc justified itself with "there is no
+/// `Session` fake in this workspace", which was false: the harness
+/// below is a copy of `empty_body_buffered_policy_tests`, in this file,
+/// and it binds a listener, builds a `Session`, and reads the bytes the
+/// gateway wrote. Everything the guard could not see (that
+/// `send_error_with_pages` is reached, that the caller gets the status,
+/// that the rest of the filter is short-circuited) is what this asserts.
+#[cfg(test)]
+mod reputation_gate_wire_tests {
+    use std::time::Duration;
+
+    use chrono::NaiveDate;
+    use pingora_core::protocols::l4::stream::Stream;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
+    use crate::anomaly::{AnomalyDetector, AnomalySettings};
+
+    /// A pipeline whose only origin answers 200, so anything other than
+    /// 200 on the wire came from the gate.
+    fn pipeline_with_reputation_floor() -> crate::pipeline::CompiledPipeline {
+        let config = sbproxy_config::compile_config(
+            r#"
+proxy:
+  anomaly:
+    enabled: true
+    min_observations: 5
+    reputation:
+      deny_below: 0.5
+origins:
+  "reputation.test":
+    action:
+      type: static
+      status: 200
+      content_type: text/plain
+      body: "origin answered"
+"#,
+        )
+        .expect("fixture config");
+        crate::pipeline::CompiledPipeline::from_config(config).expect("fixture pipeline")
     }
+
+    fn settings() -> AnomalySettings {
+        AnomalySettings {
+            min_observations: 5,
+            outlier_frequency: 0.01,
+            rate_spike_multiplier: 10.0,
+            rate_spike_min_mean: 5.0,
+            deny_below: Some(0.5),
+            challenge_below: None,
+        }
+    }
+
+    fn view<'a>(ja4: &'a str) -> sbproxy_plugin::RequestContextView<'a> {
+        sbproxy_plugin::RequestContextView {
+            tenant_id: "__default__",
+            hostname: "reputation.test",
+            method: "GET",
+            path: "/",
+            query: "",
+            // No agent-class catalog in the fixture config, so the
+            // request path resolves nothing and the gate keys on
+            // `unknown`, which is what this has to match.
+            agent_id: Some("unknown"),
+            agent_id_source: None,
+            ja4_fingerprint: Some(ja4),
+            ja4_trustworthy: true,
+            headless_library: None,
+            client_ip: None,
+        }
+    }
+
+    /// Floor the `unknown` class on `day` by flooding it with novel
+    /// fingerprints, each of which is a critical verdict worth 5 of the
+    /// 100 that saturate the score.
+    fn floored_detector(day: NaiveDate) -> std::sync::Arc<AnomalyDetector> {
+        let detector = std::sync::Arc::new(AnomalyDetector::new(settings()));
+        for _ in 0..20 {
+            detector.analyze_on(&view("t13d_USUAL"), day);
+        }
+        for index in 0..20 {
+            let ja4 = format!("t13d_NOVEL_{index}");
+            detector.analyze_on(&view(&ja4), day);
+        }
+        assert_eq!(
+            detector.reputation("__default__", "unknown"),
+            Some(0.0),
+            "the fixture has to actually floor the class"
+        );
+        detector
+    }
+
+    async fn drive(pipeline: crate::pipeline::CompiledPipeline) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind downstream fixture");
+        let address = listener.local_addr().expect("downstream address");
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect downstream fixture");
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: reputation.test\r\nconnection: close\r\n\r\n")
+                .await
+                .expect("write request");
+            stream.shutdown().await.expect("half-close request");
+            let mut response = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                match stream.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(read) => response.extend_from_slice(&chunk[..read]),
+                    Err(_) => break,
+                }
+            }
+            response
+        });
+        let (stream, _) = listener.accept().await.expect("accept downstream");
+        let mut session = Session::new_h1(Box::new(Stream::from(stream)));
+        session
+            .as_downstream_mut()
+            .read_request()
+            .await
+            .expect("parse downstream request");
+        let mut ctx = crate::context::RequestContext::new();
+        ctx.pipeline = std::sync::Arc::new(pipeline);
+        let handled = request_filter(&mut session, &mut ctx)
+            .await
+            .expect("the filter terminates");
+        assert!(
+            handled,
+            "both legs of this test short-circuit: a refusal writes the response, and a static \
+             origin serves it"
+        );
+        drop(session);
+        let wire = tokio::time::timeout(Duration::from_secs(2), client)
+            .await
+            .expect("downstream response timeout")
+            .expect("downstream client task");
+        String::from_utf8(wire).expect("HTTP response is UTF-8")
+    }
+
+    /// WOR-2666 re-review N2 and N1, red first, both legs.
+    ///
+    /// The first leg is what the source guard could not see: a floored
+    /// class gets `403` on the wire instead of the origin's body.
+    ///
+    /// The second is the Blocker. `rotate_to` used to run only from
+    /// `analyze_on`, which runs only from `response_filter`, which a
+    /// refused request never reaches: the window froze at its worst
+    /// value and the refusal was permanent for the life of the process,
+    /// on a class any caller can join by sending a User-Agent. Here the
+    /// same detector is floored on a day outside the window and the
+    /// same request is admitted, because the gate rolls the window
+    /// before it reads it.
+    #[tokio::test]
+    async fn a_floored_class_is_refused_and_then_recovers_when_the_window_rolls() {
+        let today = chrono::Utc::now().date_naive();
+
+        crate::anomaly::install_detector(Some(floored_detector(today)));
+        let refused = drive(pipeline_with_reputation_floor()).await;
+        assert!(
+            refused.starts_with("HTTP/1.1 403"),
+            "a floored class must be refused on the wire: {refused}"
+        );
+        assert!(
+            !refused.contains("origin answered"),
+            "and the origin must not have served it: {refused}"
+        );
+        assert!(
+            !refused.contains("unknown") && !refused.contains("floored"),
+            "the body must not hand the caller its own class and band back: {refused}"
+        );
+
+        // Floored on a day that has since rolled out of the window.
+        let stale = today - chrono::Duration::days(WINDOW_DAYS_FOR_TEST + 1);
+        crate::anomaly::install_detector(Some(floored_detector(stale)));
+        let admitted = drive(pipeline_with_reputation_floor()).await;
+        assert!(
+            admitted.starts_with("HTTP/1.1 200"),
+            "a class whose weight has rolled out of the window must be admitted again, or a \
+             single flood is a permanent ban: {admitted}"
+        );
+        assert!(admitted.contains("origin answered"), "{admitted}");
+
+        crate::anomaly::install_detector(None);
+    }
+
+    /// The window the recovery leg above rolls past. Kept here rather
+    /// than exported from `anomaly` so the test states the number it
+    /// depends on.
+    const WINDOW_DAYS_FOR_TEST: i64 = 28;
 }
 
 /// WOR-2667: the `kya` provider's context stamping, tested at the seam
@@ -8058,7 +8366,7 @@ mod kya_context_tests {
             ("kya_agent_id", "acme-research-bot"),
             ("kya_agent_class", "assistant"),
         ]);
-        stamp_kya_context(&mut ctx, "kya");
+        stamp_kya_context(&mut ctx, "kya", false);
         assert_eq!(ctx.kya_verdict, Some("verified"));
         assert_eq!(ctx.kya_vendor.as_deref(), Some("skyfire"));
         assert_eq!(ctx.kya_version.as_deref(), Some("1.0"));
@@ -8076,7 +8384,7 @@ mod kya_context_tests {
         let mut ctx =
             ctx_with_kya_metadata(&[("kya_verdict", "verified"), ("kya_agent_id", "agt_01H8XYZ")]);
         ctx.agent_id = Some(sbproxy_classifiers::AgentId("openai-gptbot".to_string()));
-        stamp_kya_context(&mut ctx, "kya");
+        stamp_kya_context(&mut ctx, "kya", false);
         assert_eq!(ctx.kya_agent_id.as_deref(), Some("agt_01H8XYZ"));
         assert_eq!(
             ctx.agent_id.as_ref().map(|id| id.as_str()),
@@ -8100,9 +8408,25 @@ mod kya_context_tests {
     #[test]
     fn a_fail_open_admission_is_readable_as_directory_unavailable() {
         let mut ctx = crate::context::RequestContext::new();
-        stamp_kya_context(&mut ctx, "kya");
+        stamp_kya_context(&mut ctx, "kya", true);
         assert_eq!(ctx.kya_verdict, Some("directory_unavailable"));
         assert_eq!(ctx.kya_agent_id, None, "nothing was verified");
+    }
+
+    /// WOR-2667 re-review N1, red first. `stamp_kya_context` runs on
+    /// every kya outcome, including the refusing ones, and the first
+    /// version inferred `directory_unavailable` from absent metadata
+    /// alone. A revoked token therefore stamped "the issuer is down",
+    /// which is not merely unset but affirmatively false in a field the
+    /// same round documented as carrying exactly two values.
+    #[test]
+    fn a_refusal_that_is_not_a_fail_open_stamps_no_verdict() {
+        let mut ctx = crate::context::RequestContext::new();
+        stamp_kya_context(&mut ctx, "kya", false);
+        assert_eq!(
+            ctx.kya_verdict, None,
+            "a refused token must not read as an unreachable issuer"
+        );
     }
 
     /// A `kya` slot that wins inside an `any_of` composition is still
@@ -8111,7 +8435,7 @@ mod kya_context_tests {
     #[test]
     fn a_provider_that_did_not_decide_stamps_nothing() {
         let mut ctx = ctx_with_kya_metadata(&[("kya_verdict", "verified")]);
-        stamp_kya_context(&mut ctx, "bearer");
+        stamp_kya_context(&mut ctx, "bearer", false);
         assert_eq!(ctx.kya_verdict, None);
         assert_eq!(ctx.kya_agent_id, None);
     }
@@ -8125,7 +8449,7 @@ mod kya_context_tests {
             ("kya_verdict", "definitely-fine"),
             ("kya_vendor", "skyfire"),
         ]);
-        stamp_kya_context(&mut ctx, "kya");
+        stamp_kya_context(&mut ctx, "kya", false);
         assert_eq!(ctx.kya_verdict, None);
         assert_eq!(
             ctx.kya_vendor, None,
@@ -8167,7 +8491,7 @@ mod kya_context_tests {
         ];
         for label in every_verdict.iter().map(KyaVerdict::metric_label) {
             let mut ctx = ctx_with_kya_metadata(&[("kya_verdict", label)]);
-            stamp_kya_context(&mut ctx, "kya");
+            stamp_kya_context(&mut ctx, "kya", false);
             assert_eq!(ctx.kya_verdict, Some(label), "label {label} was dropped");
         }
     }
@@ -8176,7 +8500,7 @@ mod kya_context_tests {
     fn a_balance_that_is_not_a_number_is_dropped_rather_than_defaulted() {
         let mut ctx =
             ctx_with_kya_metadata(&[("kya_verdict", "verified"), ("kya_kyab_balance", "lots")]);
-        stamp_kya_context(&mut ctx, "kya");
+        stamp_kya_context(&mut ctx, "kya", false);
         assert_eq!(
             ctx.kya_kyab_balance, None,
             "an unparseable balance must not read as zero, which a \

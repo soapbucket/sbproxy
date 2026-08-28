@@ -73,12 +73,21 @@
 //! at `MAX_EVICTION_SCAN` (1,000) objects per call and reports how many
 //! it deleted.
 //!
+//! It also keeps a cursor. A sweep that hits the cap records the last
+//! object it examined and the next one resumes after it, wrapping back
+//! to the start when a pass reaches the end of the listing. Without
+//! that, "bounded" meant the same first thousand objects were re-listed
+//! and re-downloaded every tick and nothing past them was ever
+//! examined: a recurring bill against a paid store, for no work.
+//!
 //! The proxy runs it on a timer (every fifteen minutes, from the
 //! pipeline's background tasks), so a small reserve does expire without
 //! any bucket configuration. That is what the bound is for: one
-//! bounded pass per interval whatever the reserve holds. It is not a
-//! substitute for a lifecycle rule at scale, and the sections below and
-//! `docs/cache-reserve.md` say so in the same words.
+//! bounded pass per interval whatever the reserve holds, working
+//! forward. It is not a substitute for a lifecycle rule at scale, and
+//! the sections below and `docs/cache-reserve.md` say so in the same
+//! words: a reserve of a million objects takes about ten days of ticks
+//! to walk once.
 //!
 //! An index of empty marker objects named `{expiry}/{key}` would make
 //! the sweep a single lexicographically-ordered list with no reads at
@@ -149,6 +158,17 @@ pub struct ObjectStoreReserve {
     /// cap can be exercised at a size a test can afford. Every
     /// production constructor sets it to the constant.
     max_entry_bytes: usize,
+    /// Where the last eviction sweep stopped, so the next one resumes
+    /// there instead of re-listing the same first `MAX_EVICTION_SCAN`
+    /// objects forever. `None` means start from the beginning, which is
+    /// both the initial state and the wrap-around after a sweep that
+    /// reached the end of the listing.
+    ///
+    /// In memory rather than on the backend on purpose: a restart
+    /// resuming from the top costs one extra pass over the first
+    /// thousand objects, and persisting a cursor means a write per
+    /// sweep against the bucket this feature exists to keep cheap.
+    sweep_cursor: parking_lot::Mutex<Option<Path>>,
 }
 
 impl std::fmt::Debug for ObjectStoreReserve {
@@ -194,6 +214,7 @@ impl ObjectStoreReserve {
             backend: backend.into(),
             keys,
             max_entry_bytes: MAX_ENTRY_BYTES,
+            sweep_cursor: parking_lot::Mutex::new(None),
         }
     }
 
@@ -426,23 +447,53 @@ impl CacheReserveBackend for ObjectStoreReserve {
     }
 
     async fn evict_expired(&self, before: SystemTime) -> Result<u64> {
+        self.sweep_at_most(MAX_EVICTION_SCAN, before).await
+    }
+}
+
+impl ObjectStoreReserve {
+    /// One bounded eviction pass, resuming from the last one.
+    ///
+    /// `cap` is a parameter rather than [`MAX_EVICTION_SCAN`] read
+    /// directly so the resume behavior can be exercised at a size a
+    /// test can afford; production always passes the constant.
+    async fn sweep_at_most(&self, cap: usize, before: SystemTime) -> Result<u64> {
         let prefix = Path::from(self.prefix.trim_end_matches('/'));
-        let mut listing = self.store.list(Some(&prefix));
+        // WOR-2673 re-review N5. The sweep resumes where the last one
+        // stopped. Without the cursor, `list` restarted at the
+        // lexicographically first object every tick, so on any reserve
+        // larger than `MAX_EVICTION_SCAN` the same first thousand
+        // objects were re-listed and fully re-downloaded every fifteen
+        // minutes and nothing past them was ever examined until they
+        // were deleted. "Finishes the backlog across calls" was not
+        // merely optimistic; it was the opposite of what happened, and
+        // on a paid object store it was a recurring bill for no work.
+        let resume_from = self.sweep_cursor.lock().clone();
+        let mut listing = match resume_from.as_ref() {
+            Some(offset) => self.store.list_with_offset(Some(&prefix), offset),
+            None => self.store.list(Some(&prefix)),
+        };
         let mut examined = 0usize;
         let mut deleted = 0u64;
+        let mut last_examined: Option<Path> = None;
+        let mut exhausted = true;
         while let Some(entry) = listing.next().await {
-            if examined >= MAX_EVICTION_SCAN {
+            if examined >= cap {
+                // Not exhausted: there is more after this point, and
+                // the cursor is what makes the next tick start there.
+                exhausted = false;
                 tracing::debug!(
                     examined,
                     deleted,
-                    "cache reserve eviction sweep hit its per-call scan cap; the rest of the \
-                     backlog is picked up by the next sweep. Configure a bucket lifecycle rule \
-                     on the reserve prefix for a reserve this size"
+                    "cache reserve eviction sweep hit its per-call scan cap; the next sweep \
+                     resumes after the last object this one examined. Configure a bucket \
+                     lifecycle rule on the reserve prefix for a reserve this size"
                 );
                 break;
             }
             let meta = entry.context("cache reserve object listing")?;
             examined += 1;
+            last_examined = Some(meta.location.clone());
             let Some(digest) = self.digest_from_path(&meta.location) else {
                 // Something else's object under the same prefix. Never
                 // delete it: the operator may be sharing the bucket.
@@ -474,6 +525,11 @@ impl CacheReserveBackend for ObjectStoreReserve {
                 deleted += 1;
             }
         }
+        // Exhausted means the listing ran out, so the next sweep starts
+        // over: that is the wrap-around, and it is what makes an object
+        // that became expired behind the cursor get collected on the
+        // following pass rather than never.
+        *self.sweep_cursor.lock() = if exhausted { None } else { last_examined };
         Ok(deleted)
     }
 }
@@ -662,6 +718,88 @@ mod tests {
         assert_eq!(deleted, 1);
         assert!(reserve.get("/fresh").await.expect("get").is_some());
         assert!(reserve.get("/stale").await.expect("get").is_none());
+    }
+
+    /// WOR-2673 re-review N5, red first. The sweep is capped at
+    /// `MAX_EVICTION_SCAN` objects per call, and without a cursor
+    /// `list` restarted at the lexicographically first object every
+    /// tick: the same first thousand were re-examined forever and
+    /// everything past them was never reached. Here the cap is one, so
+    /// three ticks have to reach three different objects.
+    #[tokio::test]
+    async fn consecutive_sweeps_resume_instead_of_restarting() {
+        let store = memory_store();
+        let reserve = ObjectStoreReserve::new(store.clone(), "local", "reserve", None);
+        let (body, mut metadata) = sample(Duration::from_secs(3600));
+        // All three already expired, so whichever the sweep reaches is
+        // the one it deletes, and "which did it reach" is the question.
+        metadata.expires_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        for key in ["/a", "/b", "/c"] {
+            reserve
+                .put(key, body.clone(), metadata.clone())
+                .await
+                .expect("put");
+        }
+
+        let mut deleted_total = 0u64;
+        for _ in 0..3 {
+            deleted_total += reserve
+                .sweep_at_most(1, SystemTime::now())
+                .await
+                .expect("sweep");
+        }
+        assert_eq!(
+            deleted_total, 3,
+            "three one-object sweeps must reach three different objects, not the same one \
+             three times"
+        );
+        for key in ["/a", "/b", "/c"] {
+            assert!(
+                reserve.get(key).await.expect("get").is_none(),
+                "{key} survived three sweeps"
+            );
+        }
+    }
+
+    /// And the cursor wraps: a sweep that reaches the end starts over,
+    /// so an entry that expires behind the cursor is collected on the
+    /// next pass rather than never.
+    #[tokio::test]
+    async fn a_sweep_that_reaches_the_end_starts_over() {
+        let store = memory_store();
+        let reserve = ObjectStoreReserve::new(store.clone(), "local", "reserve", None);
+        let (body, fresh) = sample(Duration::from_secs(3600));
+        reserve
+            .put("/kept", body.clone(), fresh)
+            .await
+            .expect("put");
+
+        // A full pass over one fresh object deletes nothing and
+        // exhausts the listing.
+        assert_eq!(
+            reserve
+                .evict_expired(SystemTime::now())
+                .await
+                .expect("sweep"),
+            0
+        );
+        assert!(
+            reserve.sweep_cursor.lock().is_none(),
+            "an exhausted listing must reset the cursor, or the reserve is swept once and \
+             never again"
+        );
+
+        // It expires later. The next sweep has to see it again.
+        let (body, mut stale) = sample(Duration::from_secs(3600));
+        stale.expires_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        reserve.put("/kept", body, stale).await.expect("re-put");
+        assert_eq!(
+            reserve
+                .evict_expired(SystemTime::now())
+                .await
+                .expect("sweep"),
+            1
+        );
     }
 
     #[tokio::test]

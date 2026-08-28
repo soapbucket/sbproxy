@@ -38,15 +38,18 @@
 #
 # Test:
 #   # 1. Five requests from one address. Nothing is flagged: this is
-#   #    the baseline the spike will be measured against.
+#   #    the baseline the spike will be measured against, and it stays
+#   #    under `rate_spike_min_mean` on purpose.
 #   for i in $(seq 1 5); do
 #     curl -s -o /dev/null -H 'Host: anomaly.local' \
 #       -H 'X-Forwarded-For: 198.51.100.7' http://127.0.0.1:8080/a
 #   done
 #
-#   # 2. Five from a second address. The fifth is past the per-address
-#   #    mean by the configured multiple, and is flagged `warn`.
-#   for i in $(seq 1 5); do
+#   # 2. Eight from a second address. The eighth is the one that fires:
+#   #    at that point the class has seen 5 from one address and 7 from
+#   #    the other, a mean of 6.0, and an eighth from the second is past
+#   #    it. `warn`, because it is nowhere near five times the mean.
+#   for i in $(seq 1 8); do
 #     curl -s -o /dev/null -H 'Host: anomaly.local' \
 #       -H 'X-Forwarded-For: 203.0.113.9' http://127.0.0.1:8080/a
 #   done
@@ -59,6 +62,11 @@
 #
 #   # 4. And the log line, which carries the count and the mean and
 #   #    never the address.
+#
+# Those numbers are pinned by
+# `anomaly::tests::the_shipped_example_walkthrough_produces_the_numbers_it_prints`,
+# so a change to the detector that moves them fails the build rather
+# than quietly making this file wrong.
 
 proxy:
   http_bind_port: 8080
@@ -93,12 +101,18 @@ proxy:
     # One address past its class's per-address mean by this multiple
     # today is a rate spike. Past five times this, it is critical.
     # 1.0 is the floor and a demo number: ten is the default, and it is
-    # the one to leave in place for traffic that is not ten curls.
+    # the one to leave in place for traffic that is not thirteen curls.
     rate_spike_multiplier: 1.0
 
     # Mean per-address rate below which the spike check does not
     # engage, so a single burst against an idle class is not a spike.
-    rate_spike_min_mean: 3.0
+    #
+    # 6.0 is chosen so the walkthrough's first loop stays silent. The
+    # mean is read before the request is counted, so with a single
+    # address the count is always one past the mean and any floor the
+    # first loop can reach would fire on it. Five requests from one
+    # address take the mean to 4.0, which is under this.
+    rate_spike_min_mean: 6.0
 
     # Reputation admission. Both unset by default, which leaves the
     # score advisory: published, and acted on by nothing. Uncomment to

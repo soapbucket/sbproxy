@@ -931,7 +931,8 @@ fn build_object_store_reserve(
     // reserve on S3 and a config line that says it is on disk.
     if backend != "local" && path.is_some() {
         anyhow::bail!(
-            "cache_reserve.backend.path is only for the local backend; remove it or set              backend: local"
+            "cache_reserve.backend.path is only for the local backend; remove it or set \
+             backend: local"
         );
     }
     let store: Arc<dyn object_store::ObjectStore> = match backend {
@@ -3579,10 +3580,22 @@ impl CompiledPipeline {
     ///
     /// Failures are logged and counted, never fatal: a sweep that
     /// cannot list is a reserve that keeps serving.
+    ///
+    /// # The task holds a `Weak`, and that is load-bearing
+    ///
+    /// `activate_background_tasks` runs on every successful config
+    /// reload and `background_tasks_started` is per-pipeline, so a
+    /// reload spawns a new sweep. Holding a strong `Arc` on the reserve
+    /// meant the old loop never ended: each reload left one more
+    /// permanent task listing and downloading up to 1,000 objects every
+    /// fifteen minutes against a prefix and a key ring the config may
+    /// have retired. The health-probe spawn in the same function takes
+    /// a `Weak` for exactly this reason, and so does this one.
     fn spawn_cache_reserve_sweep_on(&self, handle: &tokio::runtime::Handle) {
-        let Some(reserve) = self.cache_reserve.clone() else {
+        let Some(reserve) = self.cache_reserve.as_ref() else {
             return;
         };
+        let reserve = Arc::downgrade(reserve);
         handle.spawn(async move {
             let mut ticker = tokio::time::interval(CACHE_RESERVE_SWEEP_INTERVAL);
             // The first tick fires immediately; skip it so a restart
@@ -3590,6 +3603,16 @@ impl CompiledPipeline {
             ticker.tick().await;
             loop {
                 ticker.tick().await;
+                let Some(reserve) = reserve.upgrade() else {
+                    // The pipeline that owned this reserve is gone, so
+                    // a reload replaced it. Ending here is what keeps
+                    // one sweep per live reserve rather than one per
+                    // reload the process has ever done.
+                    tracing::debug!(
+                        "cache reserve expiry sweep stopping: the reserve was replaced"
+                    );
+                    return;
+                };
                 match reserve.evict_expired(std::time::SystemTime::now()).await {
                     Ok(0) => {}
                     Ok(removed) => tracing::debug!(
@@ -3599,7 +3622,8 @@ impl CompiledPipeline {
                     Err(error) => {
                         tracing::warn!(
                             error = %error,
-                            "cache reserve expiry sweep failed; entries stay until the next tick                              or a bucket lifecycle rule removes them"
+                            "cache reserve expiry sweep failed; entries stay until the next tick \
+                             or a bucket lifecycle rule removes them"
                         );
                         sbproxy_observe::metrics::record_cache_reserve_error(
                             CACHE_RESERVE_SWEEP_ORIGIN,
@@ -5215,6 +5239,39 @@ mod object_store_reserve_tests {
         assert!(reserve.is_some(), "a resolvable key must build the reserve");
     }
 
+    /// A reserve that counts how many times it was swept.
+    #[derive(Default)]
+    struct CountingReserve {
+        sweeps: std::sync::atomic::AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl CacheReserveBackend for CountingReserve {
+        async fn put(
+            &self,
+            _key: &str,
+            _value: bytes::Bytes,
+            _metadata: sbproxy_cache::reserve::ReserveMetadata,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get(
+            &self,
+            _key: &str,
+        ) -> anyhow::Result<Option<(bytes::Bytes, sbproxy_cache::reserve::ReserveMetadata)>>
+        {
+            Ok(None)
+        }
+        async fn delete(&self, _key: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn evict_expired(&self, _before: std::time::SystemTime) -> anyhow::Result<u64> {
+            self.sweeps
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Ok(0)
+        }
+    }
+
     /// WOR-2673 review F6, the seam test. `evict_expired` was
     /// implemented on all four backends and called from nothing outside
     /// `#[cfg(test)]`, while three operator-facing pages presented the
@@ -5223,38 +5280,7 @@ mod object_store_reserve_tests {
     /// backend was actually swept.
     #[tokio::test(start_paused = true)]
     async fn the_expiry_sweep_has_a_production_caller() {
-        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-
-        #[derive(Default)]
-        struct CountingReserve {
-            sweeps: AtomicU64,
-        }
-
-        #[async_trait::async_trait]
-        impl CacheReserveBackend for CountingReserve {
-            async fn put(
-                &self,
-                _key: &str,
-                _value: bytes::Bytes,
-                _metadata: sbproxy_cache::reserve::ReserveMetadata,
-            ) -> anyhow::Result<()> {
-                Ok(())
-            }
-            async fn get(
-                &self,
-                _key: &str,
-            ) -> anyhow::Result<Option<(bytes::Bytes, sbproxy_cache::reserve::ReserveMetadata)>>
-            {
-                Ok(None)
-            }
-            async fn delete(&self, _key: &str) -> anyhow::Result<()> {
-                Ok(())
-            }
-            async fn evict_expired(&self, _before: std::time::SystemTime) -> anyhow::Result<u64> {
-                self.sweeps.fetch_add(1, AtomicOrdering::AcqRel);
-                Ok(0)
-            }
-        }
+        use std::sync::atomic::Ordering as AtomicOrdering;
 
         let backend = Arc::new(CountingReserve::default());
         let mut pipeline = CompiledPipeline::empty_for_test();
@@ -5275,6 +5301,51 @@ mod object_store_reserve_tests {
         assert!(
             backend.sweeps.load(AtomicOrdering::Acquire) >= 1,
             "a configured reserve must actually be swept, not only be sweepable"
+        );
+    }
+
+    /// WOR-2673 re-review N4, red first. `activate_background_tasks`
+    /// runs on every successful reload, so a sweep holding a strong
+    /// `Arc` on the reserve outlives the pipeline that configured it:
+    /// each reload leaves one more permanent loop listing and
+    /// downloading against a bucket the config may have retired.
+    #[tokio::test(start_paused = true)]
+    async fn the_sweep_stops_when_its_reserve_is_replaced() {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        let backend = Arc::new(CountingReserve::default());
+        let mut pipeline = CompiledPipeline::empty_for_test();
+        pipeline.cache_reserve = Some(backend.clone());
+        pipeline.start_background_tasks_on(&tokio::runtime::Handle::current());
+
+        // One tick with the reserve alive, to prove the loop is running.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+            tokio::time::advance(CACHE_RESERVE_SWEEP_INTERVAL).await;
+            tokio::task::yield_now().await;
+            if backend.sweeps.load(AtomicOrdering::Acquire) >= 1 {
+                break;
+            }
+        }
+        let swept_while_alive = backend.sweeps.load(AtomicOrdering::Acquire);
+        assert!(swept_while_alive >= 1, "the loop has to be running first");
+
+        // Now drop every strong reference the pipeline held. A strong
+        // `Arc` inside the task would keep the backend alive here and
+        // the loop would go on sweeping it.
+        let weak = Arc::downgrade(&backend);
+        pipeline.cache_reserve = None;
+        drop(pipeline);
+        drop(backend);
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+            tokio::time::advance(CACHE_RESERVE_SWEEP_INTERVAL).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            weak.upgrade().is_none(),
+            "the sweep task must not be the last owner of a retired reserve"
         );
     }
 

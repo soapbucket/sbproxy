@@ -4102,6 +4102,15 @@ async fn check_auth_with_tls_outcome(
                         attrs
                             .metadata
                             .insert("kya_kyab_balance".to_string(), balance.amount.to_string());
+                        // The amount alone is not comparable, which is
+                        // the whole reason the provider's own floor
+                        // became denominated. A policy writing its own
+                        // comparison needs the same thing.
+                        if !balance.currency.is_empty() {
+                            attrs
+                                .metadata
+                                .insert("kya_kyab_currency".to_string(), balance.currency.clone());
+                        }
                     }
                     let sub = agent.sub.clone();
                     let principal = sbproxy_plugin::Principal {
@@ -4899,13 +4908,88 @@ pub(crate) fn record_anomaly_decision(
         &origin_id,
         &origin_id,
         &ctx.tenant_id,
-        &verdict.reason,
+        &anomaly_audit_reason(verdict, identity_source),
         sbproxy_observe::decision::DecisionDetails::anomaly(
             verdict.kind,
             verdict.severity,
             identity_source,
         ),
     );
+}
+
+/// The reason a detection record carries, which is not the verdict's own
+/// reason string.
+///
+/// WOR-2666 re-review N9. `AnomalyVerdict::reason` names the value that
+/// was flagged, and for `ja4_outlier` that value is the caller's TLS
+/// fingerprint, computed from a ClientHello the caller chose. The field
+/// contract for this event says the record never carries the raw score,
+/// the fingerprint, or the client address, and the admission half
+/// honored that while the detection half published the fingerprint in
+/// prose.
+///
+/// The value stays on the log line, which is local and already carries
+/// the hostname. What ships to a SIEM is what a rule can select on: the
+/// dimension that fired, how strong it was, and which resolver produced
+/// the identity it was keyed on. All three are also structured fields
+/// on the same record, so the reason is a sentence rather than the only
+/// copy.
+fn anomaly_audit_reason(
+    verdict: &sbproxy_plugin::AnomalyVerdict,
+    identity_source: Option<&str>,
+) -> String {
+    match identity_source {
+        Some(source) => format!(
+            "{} at {} for an identity resolved by {source}",
+            verdict.kind, verdict.severity
+        ),
+        None => format!(
+            "{} at {} for an unresolved identity",
+            verdict.kind, verdict.severity
+        ),
+    }
+}
+
+#[cfg(test)]
+mod anomaly_audit_reason_tests {
+    use sbproxy_plugin::AnomalyVerdict;
+
+    /// WOR-2666 re-review N9, red first. The detection record used to
+    /// publish `verdict.reason` verbatim, and for `ja4_outlier` that
+    /// string is the caller's TLS fingerprint, which the same event's
+    /// field contract promises never ships.
+    #[test]
+    fn a_detection_record_does_not_carry_the_fingerprint_that_fired() {
+        let verdict = AnomalyVerdict {
+            kind: "ja4_outlier",
+            severity: "critical",
+            reason: "t13d1516h2_8daaf6152771_b186095e22b6 is in the long tail for agent class \
+                     gptbot"
+                .to_string(),
+        };
+        let audit = super::anomaly_audit_reason(&verdict, Some("user_agent"));
+        assert!(
+            !audit.contains("t13d1516h2"),
+            "the fingerprint must not reach a record that ships unredacted: {audit}"
+        );
+        assert!(audit.contains("ja4_outlier"), "{audit}");
+        assert!(audit.contains("critical"), "{audit}");
+        assert!(
+            audit.contains("user_agent"),
+            "the resolver source is what tells a rule whether the class was verified: {audit}"
+        );
+    }
+
+    #[test]
+    fn an_unresolved_identity_says_so_rather_than_going_silent() {
+        let verdict = AnomalyVerdict {
+            kind: "request_rate_spike",
+            severity: "warn",
+            reason: "one address is at 900 requests today".to_string(),
+        };
+        let audit = super::anomaly_audit_reason(&verdict, None);
+        assert!(audit.contains("unresolved identity"), "{audit}");
+    }
 }
 
 /// Publish one reputation admission decision onto the decision feed

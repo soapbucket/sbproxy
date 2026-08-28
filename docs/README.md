@@ -223,7 +223,7 @@ Point a framework you already run at the gateway: chat completions through the O
 - [config-authority-drills.md](config-authority-drills.md) - two-process certification drills for signed config distribution.
 - [listings.md](listings.md) - the repo-native `Listing` primitive: schema, loader, three pinning modes, plan-validation rules.
 - [bulk-redirects.md](bulk-redirects.md) - the `redirect` action's source-to-destination row list, compiled at load time into an O(1) path lookup.
-- [cache-reserve.md](cache-reserve.md) - long-tail cold tier under the response cache: backends (memory, filesystem, Redis) and admission sampling.
+- [cache-reserve.md](cache-reserve.md) - long-tail cold tier under the response cache: backends (memory, filesystem, Redis, object storage) and admission sampling.
 - [glossary.md](glossary.md) - vocabulary used in this documentation set.
 - [headers-reference.md](headers-reference.md) - every response header the proxy can emit, with the config that triggers it.
 - [model-pinning.md](model-pinning.md) - how SHA-256 hashes get computed and pinned for the classifier known-model registry.

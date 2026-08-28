@@ -58,15 +58,17 @@ done
 curl -s http://127.0.0.1:9090/metrics | grep sbproxy_anomaly_detected_total
 ```
 
-Nothing. There is one address, so the per-address mean is that address's
-own rate, and nothing can be past its own mean. A detector that flagged
-the first sighting of everything would flag every request on a fresh
-deployment, which is the same as flagging nothing.
+Nothing, and the reason is worth knowing before you tune this on your
+own traffic: the mean is read before the request is counted, so with a
+single address the count is always exactly one past the mean. Any floor
+those five requests could reach would fire on them. `rate_spike_min_mean`
+is set to `6.0` here so they stay under it, and five requests from one
+address take the mean to `4.0`.
 
 ## Then make one address the loud one
 
 ```bash
-for i in $(seq 1 5); do
+for i in $(seq 1 8); do
   curl -s -o /dev/null -H 'Host: anomaly.local' \
     -H 'X-Forwarded-For: 203.0.113.9' http://127.0.0.1:8080/a
 done
@@ -81,16 +83,22 @@ sbproxy_anomaly_detected_total{kind="request_rate_spike",severity="warn"} 1
 sbproxy_agent_reputation_score{agent_class="unknown",tenant_id="__default__"} 0.99
 ```
 
-The fifth request from the second address is the one that fires: at that
-point the class has seen 5 requests from one address and 4 from the
-other, a mean of 4.5, and a fifth from the second address is past it.
-The verdict is a `warn`, which costs its class one point of reputation
-out of a hundred, so the score reads 0.99.
+The eighth request from the second address is the one that fires: at that
+point the class has seen 5 requests from one address and 7 from the
+other, a mean of `6.0`, and an eighth from the second address is past it.
+The verdict is a `warn` rather than a `critical` because it is nowhere
+near five times the mean, and a `warn` costs its class one point of
+reputation out of a hundred, so the score reads `0.99`.
+
+Those numbers are pinned by a test
+(`anomaly::tests::the_shipped_example_walkthrough_produces_the_numbers_it_prints`),
+so a change to the detector that moves them fails the build rather than
+quietly making this page wrong.
 
 This example sets `min_observations: 5` so a handful of curls is enough
-for the dimensions that use it, and `rate_spike_multiplier: 1.0` so ten
-requests are enough for the one that does not. Leave both at their
-defaults (50 and 10.0) in production.
+for the dimensions that use it, and `rate_spike_multiplier: 1.0` so
+thirteen requests are enough for the one that does not. Leave both at
+their defaults (50 and 10.0) in production.
 
 ## What it flags
 

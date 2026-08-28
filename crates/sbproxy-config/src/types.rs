@@ -1820,10 +1820,12 @@ pub struct ProxyServerConfig {
     /// Optional Cache Reserve (long-tail cold tier) configuration.
     ///
     /// When `enabled`, response-cache entries that pass the admission
-    /// filter are mirrored to the configured backend (memory,
-    /// filesystem, or Redis). On a hot miss the proxy consults the
-    /// reserve before falling through to origin and promotes the
-    /// entry back into the hot tier on hit.
+    /// filter are mirrored to the configured backend: memory,
+    /// filesystem, Redis, or object storage (S3, Google Cloud Storage,
+    /// Azure Blob, or a local directory, with optional at-rest
+    /// sealing). On a hot miss the proxy consults the reserve before
+    /// falling through to origin and promotes the entry back into the
+    /// hot tier on hit.
     #[serde(default)]
     pub cache_reserve: Option<CacheReserveConfig>,
     /// Optional selection of the shared response-cache backing store.
