@@ -204,6 +204,10 @@ clap_complete = "4"
 rlimit = "0.10"
 
 [dev-dependencies]
+# The OpenID Federation process test decodes the compact-JWS payload the
+# proxy serves to assert its claims. Already in the lock graph through
+# sbproxy-core, so this adds no new dependency.
+base64.workspace = true
 # Process-boundary classifier-hook egress tests serve the exact generated
 # contracts the shipped client calls. These are test-only because the binary
 # reaches the same types transitively through sbproxy-core.

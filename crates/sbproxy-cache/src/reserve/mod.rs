@@ -6,16 +6,19 @@
 //!    two [`CacheStore`](crate::CacheStore) implementations into a hot/cold
 //!    pair. It remains the in-process building block when both tiers are
 //!    cheap (memory + filesystem).
-//! 2. The async [`CacheReserveBackend`] trait plus four
-//!    implementations ([`MemoryReserve`], [`FsReserve`],
-//!    [`RedisReserve`], [`ObjectStoreReserve`]). The trait is the
+//! 2. The async [`CacheReserveBackend`] trait plus five OSS
+//!    implementations ([`MemoryReserve`], [`FsReserve`], [`RedisReserve`],
+//!    [`ObjectStoreReserve`], and [`S3Reserve`]). The trait is the
 //!    integration point for backends that need to perform real I/O.
 //!    WOR-2673 landed the object-storage one, which covers S3, Google
 //!    Cloud Storage, Azure Blob, and a local directory through the
 //!    `object_store` crate the workspace already carries, with optional
-//!    AES-256-GCM sealing before an entry leaves the process. An
+//!    AES-256-GCM sealing before an entry leaves the process. The
+//!    [`S3Reserve`] backend sits alongside it for deployments that want
+//!    the AWS SDK directly with KMS-wrapped envelope encryption. An
 //!    out-of-tree build can still register its own `impl
-//!    CacheReserveBackend` without re-vendoring the data plane.
+//!    CacheReserveBackend` (GCS, Azure Blob, ...) without re-vendoring
+//!    the OSS data plane.
 //!
 //! The async trait is independent of `CacheStore`. It carries explicit
 //! [`ReserveMetadata`] so backends can persist content type, vary
@@ -28,12 +31,14 @@ pub mod memory;
 /// WOR-2673: S3 / GCS / Azure Blob / local-directory reserve.
 pub mod object_store;
 pub mod redis;
+pub mod s3;
 
 pub use composer::{ReserveCacheStore, ReserveConfig, ReserveStats};
 pub use filesystem::FsReserve;
 pub use memory::MemoryReserve;
 pub use object_store::{ObjectStoreReserve, SBCR_SCHEME};
 pub use redis::RedisReserve;
+pub use s3::{S3Reserve, S3ReserveConfig};
 
 use async_trait::async_trait;
 use bytes::Bytes;

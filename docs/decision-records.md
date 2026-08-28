@@ -15,6 +15,7 @@ What a consumer may rely on from the decision-audit feed. Retrofitting a field i
 | `waf` | as `policy` | Runs in the policy chain. Select on `unmapped.policy_id`; a separate emitter would put two records on the bus for one decision. |
 | `cache.key` | yes |  |
 | `cache.admit` | yes |  |
+| `cache.reserve.health` | yes |  |
 | `route.decide` | yes |  |
 | `ai.guardrail.input` | yes |  |
 | `ai.guardrail.output` | yes |  |
@@ -82,6 +83,14 @@ The method, never the subject. Details ship unredacted, and a resolved principal
 - `unmapped.swr_secs`
 
 An absent `ttl_secs` means the decision settled no TTL and the origin's configured value applies. A zero would claim the decision chose none.
+
+### `cache.reserve.health`
+
+- `unmapped.backend`
+- `unmapped.state`
+- `unmapped.reason_code`
+
+One record per health transition, never per reserve operation. `backend`, `state`, and `reason_code` are closed proxy-authored vocabularies; raw SDK, filesystem, and configuration errors never enter structured detail.
 
 ### `ai.guardrail.input`
 

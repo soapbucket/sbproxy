@@ -184,6 +184,7 @@ tokio-util = { workspace = true }
 # exposes GET/SET-shaped operations.
 redis = { workspace = true }
 sbproxy-vault = { version = "0.1.0", path = "../sbproxy-vault" }
+sbproxy-mcp-gateway.workspace = true
 
 # WOR-2519: LDAP client for the `ldap_auth` directory-bind provider
 # (auth/ldap.rs). Dual MIT/Apache-2.0, Tokio-native, and its TLS goes

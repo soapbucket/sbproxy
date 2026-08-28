@@ -1271,6 +1271,126 @@
         }
       ],
       "description": "What the optional NATS and ClickHouse request-event sinks did with each event. published is a batch the destination confirmed: for NATS that is a PONG after the publishes, for ClickHouse a 2xx on the insert. dropped is the hand-off queue at capacity, which means the request path outran the sink and events were discarded rather than made to wait on a broker. error is a batch the destination did not take, and it is lost: this sink does not retry, because holding a request-event batch is a spool with its own operational surface. reconnected counts broker redials, and a steady rate there is a broker cycling rather than a healthy one."
+    },
+    {
+      "id": 18,
+      "title": "Cache Reserve Backend State",
+      "type": "stat",
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 0,
+        "y": 61
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "Healthy",
+                  "color": "green",
+                  "index": 0
+                },
+                "1": {
+                  "text": "Degraded",
+                  "color": "red",
+                  "index": 1
+                }
+              }
+            }
+          ],
+          "noValue": "Cache Reserve not configured"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (backend) (sbproxy_cache_reserve_degraded)",
+          "legendFormat": "{{backend}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Current Cache Reserve health by configured backend. A value of one means the cold tier has failed initialization or its latest operation failed; requests continue through the hot cache and origin fallback. Check GET /admin/cache for the bounded reason and recovery timestamp."
+    },
+    {
+      "id": 19,
+      "title": "Cache Reserve Health Transitions",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 12,
+        "y": 61
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "noValue": "No Cache Reserve health transitions"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (backend, state, reason) (rate(sbproxy_cache_reserve_health_transitions_total[5m]))",
+          "legendFormat": "{{backend}} / {{state}} / {{reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Transition-only Cache Reserve health events. Repeated failures while already degraded do not add noise; a healthy transition means a later backend operation succeeded and cleared the degraded state."
     }
   ],
   "templating": {

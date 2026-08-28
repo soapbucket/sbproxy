@@ -363,6 +363,64 @@ impl EphemeralKv for RedisStore {
         })
         .await
     }
+
+    async fn compare_exchange(
+        &self,
+        key: &str,
+        expected: Option<Bytes>,
+        replacement: Option<(Bytes, Duration)>,
+    ) -> Result<bool, StorageError> {
+        observe_op("compare_exchange", BACKEND, "ephemeral", async {
+            check_key(key)?;
+            if let Some(value) = expected.as_ref() {
+                check_value(value)?;
+            }
+            if let Some((value, ttl)) = replacement.as_ref() {
+                check_value(value)?;
+                if *ttl < Duration::from_secs(1) {
+                    return Err(StorageError::InvalidConfig(
+                        "ephemeral compare_exchange ttl must be at least 1s; redis expiry is whole seconds".into(),
+                    ));
+                }
+            }
+            let full = self.key_for(key);
+            let mut conn = self.connection().await?;
+            let script = r#"
+                local current = redis.call('GET', KEYS[1])
+                if ARGV[1] == '0' then
+                    if current then return 0 end
+                else
+                    if (not current) or current ~= ARGV[2] then return 0 end
+                end
+                if ARGV[3] == '1' then
+                    redis.call('SET', KEYS[1], ARGV[4], 'EX', ARGV[5])
+                else
+                    redis.call('DEL', KEYS[1])
+                end
+                return 1
+            "#;
+            let expected_present = if expected.is_some() { "1" } else { "0" };
+            let expected_bytes = expected.unwrap_or_default();
+            let replacement_present = if replacement.is_some() { "1" } else { "0" };
+            let (replacement_bytes, ttl_secs) = replacement
+                .map(|(value, ttl)| (value, ttl.as_secs()))
+                .unwrap_or_default();
+            let changed: i64 = redis::cmd("EVAL")
+                .arg(script)
+                .arg(1)
+                .arg(full)
+                .arg(expected_present)
+                .arg(expected_bytes.as_ref())
+                .arg(replacement_present)
+                .arg(replacement_bytes.as_ref())
+                .arg(ttl_secs)
+                .query_async(&mut conn)
+                .await
+                .map_err(map_redis_error)?;
+            Ok(changed == 1)
+        })
+        .await
+    }
 }
 
 // --- PersistentKv ---
@@ -433,6 +491,56 @@ impl PersistentKv for RedisStore {
                 }
             }
             Ok(out)
+        })
+        .await
+    }
+
+    async fn compare_exchange(
+        &self,
+        key: &str,
+        expected: Option<Bytes>,
+        replacement: Option<Bytes>,
+    ) -> Result<bool, StorageError> {
+        observe_op("compare_exchange", BACKEND, "persistent", async {
+            check_key(key)?;
+            if let Some(value) = expected.as_ref() {
+                check_value(value)?;
+            }
+            if let Some(value) = replacement.as_ref() {
+                check_value(value)?;
+            }
+            let full = self.key_for(key);
+            let mut conn = self.connection().await?;
+            let script = r#"
+                local current = redis.call('GET', KEYS[1])
+                if ARGV[1] == '0' then
+                    if current then return 0 end
+                else
+                    if (not current) or current ~= ARGV[2] then return 0 end
+                end
+                if ARGV[3] == '1' then
+                    redis.call('SET', KEYS[1], ARGV[4])
+                else
+                    redis.call('DEL', KEYS[1])
+                end
+                return 1
+            "#;
+            let expected_present = if expected.is_some() { "1" } else { "0" };
+            let expected_bytes = expected.unwrap_or_default();
+            let replacement_present = if replacement.is_some() { "1" } else { "0" };
+            let replacement_bytes = replacement.unwrap_or_default();
+            let changed: i64 = redis::cmd("EVAL")
+                .arg(script)
+                .arg(1)
+                .arg(full)
+                .arg(expected_present)
+                .arg(expected_bytes.as_ref())
+                .arg(replacement_present)
+                .arg(replacement_bytes.as_ref())
+                .query_async(&mut conn)
+                .await
+                .map_err(map_redis_error)?;
+            Ok(changed == 1)
         })
         .await
     }

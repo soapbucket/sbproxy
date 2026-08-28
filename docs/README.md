@@ -106,6 +106,7 @@ Route AI, govern the AI that calls you, and run AI models yourself.
 
 - [mcp-and-agents.md](mcp-and-agents.md) - the map across MCP (tool calling) and A2A (agent-to-agent) traffic: which doc covers which layer.
 - [mcp.md](mcp.md) - the MCP gateway: wire shape, capabilities, and `experimental.agentSkillsUrl` advertising.
+- [mcp-oauth-gateway.md](mcp-oauth-gateway.md) - standalone OAuth 2.1 broker (PKCE, DPoP, mTLS-bound tokens, device-code, CIMD, token exchange) for an MCP server not fronted by `sbproxy`, plus the resource-server companion that verifies the tokens it issues.
 - [mcp-compose.md](mcp-compose.md) - `type: local` servers: config-declared tools (static, HTTP, or a step DAG), the interpolation vocabulary, DAG semantics, and template/JS/Lua response shaping.
 - [mcp-gateway-guardrails.md](mcp-gateway-guardrails.md) - MCP gateway guardrails: egress, session risk, quarantine, stdio, run-as-user, and compaction.
 - [mcp-security.md](mcp-security.md) - MCP and agent threat classes: tool poisoning, definition tampering, prompt injection in tool output, and tenant isolation.
@@ -128,6 +129,7 @@ Route AI, govern the AI that calls you, and run AI models yourself.
 - [402-challenge.md](402-challenge.md) - the exact bytes of every payment challenge, credential, problem document, and receipt.
 - [l402.md](l402.md) - L402 (Lightning HTTP 402) design notes: the protocol shape SBproxy would implement. None of it ships in the current binary.
 - [ai-crawl-control.md](ai-crawl-control.md) - the `ai_crawl_control` policy: Pay Per Crawl token challenge and ledger trait.
+- [comp-marketplace.md](comp-marketplace.md) - the `sbproxy-licensing` crate: IAB CoMP marketplace bridge (manifest, signed quote, redeem), bridging into the OSS OLP license-token wire format on redeem.
 - [ai-usage-ledger.md](ai-usage-ledger.md) - the verifiable usage ledger: hash-chained, Ed25519-signed spend receipts you can re-derive and verify.
 - [metering.md](metering.md) - attested metering: signed, hash-chained consumption receipts, the operator surface that reads and verifies the chain, and buyer-side verification against the published key set.
 - [value-ledger-economics.md](value-ledger-economics.md) - the Value Ledger: local-vs-cloud lane split, reference prices, and the savings report at `/admin/model-host/value`.
@@ -175,6 +177,7 @@ Point a framework you already run at the gateway: chat completions through the O
 - [mcp-security.md](mcp-security.md) - see [MCP and agents](#mcp-and-agents).
 - [authentication.md](authentication.md) - the chooser over all twelve inbound auth providers: which fits which caller, accepting several on one origin (credential migrations), and what the gateway does with the resulting identity.
 - [auth-oidc.md](auth-oidc.md) - the `oidc` auth provider: OpenID Connect Relying-Party login flow (authorization-code + PKCE, sealed session cookie, optional userinfo trust-header projection, RP-initiated logout).
+- [federation.md](federation.md) - `proxy.federation`: the OpenID Federation 1.0 entity statement this proxy publishes, and `peer_trust`, which walks a caller's claimed entity to a pinned anchor on the request path. Also the `sbproxy-federation` crate behind it (JWS sign/verify, RFC 7638 key thumbprints, metadata policy, trust marks, trust-chain resolution) for establishing trust between independently-operated gateways.
 - [web-bot-auth.md](web-bot-auth.md) - the `bot_auth` provider: verifying RFC 9421-signed AI crawlers against a published key directory.
 - [cap.md](cap.md) - the `cap` provider: verifying Crawler Authorization Protocol capability tokens (path globs, rate grants, agent binding) against an issuer's JWKS.
 - [trust-tiers.md](trust-tiers.md) - the four-value trust tier every request gets (`suspicious`, `strong`, `named`, `anonymous`), what earns each, and how policies and dashboards consume it.

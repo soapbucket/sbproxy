@@ -150,6 +150,7 @@ fn feature_flag_store(
 /// new path sees consistent data within sub-microsecond skew.
 pub fn load_pipeline(new_pipeline: CompiledPipeline) {
     let next_feature_flags = feature_flag_store(&new_pipeline.config);
+    let previous_cache_reserve_health = current_pipeline_full().cache_reserve_health.clone();
     // --- Wave 4 / G4.10 wire: projection cache refresh ---
     //
     // Compute projections before storing the pipeline so the cache is
@@ -256,6 +257,15 @@ pub fn load_pipeline(new_pipeline: CompiledPipeline) {
     // rejected by a lifecycle hook, while every successful startup and reload
     // converges on this publication boundary.
     new_pipeline.activate_background_tasks();
+    previous_cache_reserve_health.retire();
+    let cache_reserve_audit_enabled = new_pipeline.config.decision_audit.publishes(
+        sbproxy_observe::decision::DecisionEvent::CacheReserveHealth.as_label(),
+        None,
+        None,
+    );
+    new_pipeline
+        .cache_reserve_health
+        .activate(cache_reserve_audit_enabled);
     sbproxy_extension::flags::replace_global_store_after(next_feature_flags, || {
         pipeline_store().store(Arc::new(new_pipeline));
         advance_config_version();

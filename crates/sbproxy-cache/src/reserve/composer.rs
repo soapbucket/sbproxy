@@ -9,9 +9,13 @@
 //! and a sampling rate so cold-only one-offs don't churn through the
 //! larger backing store.
 //!
-//! Mirrors the Cloudflare "Cache Reserve" pattern. OSS pairs an
-//! in-memory primary with a `FileCacheStore` reserve; enterprise
-//! builds layer an object-store-backed reserve over the same trait.
+//! Mirrors the Cloudflare "Cache Reserve" pattern. This composer pairs
+//! an in-memory primary with a `FileCacheStore` reserve over the
+//! synchronous `CacheStore` trait. Object-store-backed cold tiers
+//! (Redis, S3 + KMS) implement the async `CacheReserveBackend` trait
+//! in this module instead and are wired in directly by
+//! `sbproxy-core`'s pipeline compiler, not through this composer; see
+//! the module-level doc comment on `super` for the split.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

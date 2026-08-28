@@ -49,6 +49,7 @@ ALLOWED=(
   "crates/sbproxy-config/src/test_env.rs"
   "crates/sbproxy-core/src/test_env.rs"
   "crates/sbproxy-k8s-operator/src/test_env.rs"
+  "crates/sbproxy-mcp-gateway/src/test_env.rs"
   "crates/sbproxy-middleware/src/test_env.rs"
   "crates/sbproxy-model-host/src/test_env.rs"
   "crates/sbproxy-modules/src/test_env.rs"
