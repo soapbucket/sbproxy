@@ -21,7 +21,7 @@ Configuration in a file is configuration you have to copy to every box. The usua
 - **Every payload is signed.** A subscriber verifies an Ed25519 signature over the canonical bundle before it compiles anything, so an authority that gets compromised at the network layer still cannot push configuration. A revision counter refuses a replay of an older bundle, and it survives a restart.
 - **The authority validates exactly what boot validates.** `compile_config` alone leaves `action`, `policies`, `transforms`, and `authentication` as opaque JSON, so a typo inside a policy entry would sign cleanly and then fail on every subscriber at once. The publish path runs the module constructors and the model-host checks too, so a payload that cannot boot never gets a revision number.
 
-The subscriber also owns a list of paths no authority can touch: `proxy.listeners`, `proxy.tls`, `proxy.admin`, `proxy.secrets`, `proxy.cluster`, `proxy.model_host`, `proxy.config_authority`, and `source`. A payload that names one is refused at publish time and, if it somehow arrives anyway, refused again at merge time. That is what keeps a fleet-wide push from taking away the admin port you would use to undo it.
+The subscriber also owns a list of paths no authority can touch: `proxy.listeners`, `proxy.tls`, `proxy.admin`, `proxy.secrets`, `proxy.cluster`, `proxy.model_host`, `proxy.config_authority`, `source`, and `origin_sources`. A payload that names one is refused at publish time and, if it somehow arrives anyway, refused again at merge time. That is what keeps a fleet-wide push from taking away the admin port you would use to undo it.
 
 ## Two ways to drive it
 

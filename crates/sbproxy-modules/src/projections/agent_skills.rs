@@ -1802,6 +1802,7 @@ spec:
         host_map.insert(CompactString::new("with.example.com"), 0);
         host_map.insert(CompactString::new("without.example.com"), 1);
         let cfg = CompiledConfig {
+            origin_source_entries: Default::default(),
             extension_bundles: Default::default(),
             origins: vec![with_skills, without],
             host_map,

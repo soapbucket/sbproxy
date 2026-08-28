@@ -128,6 +128,16 @@ use serde_yaml::{Mapping, Value};
 /// - `source`: the authority overlays the base document. It does not get
 ///   to choose which repository the base document comes from, which
 ///   would let it swap out its own input.
+/// - `origin_sources` (WOR-2436): strictly worse than `source`, and for
+///   the same reason one level up. `source` names one repository; this
+///   block names N of them, and the documents it pulls carry Lua, WASM
+///   and JS bodies that the `{{ }}` interpolator deliberately never
+///   reads. An authority able to write it turns into arbitrary code
+///   fetch on every node that trusts it. Its sibling `origin_defaults`
+///   is deliberately **not** denied: that block is the platform setting
+///   a security floor every composed origin starts from, which is the
+///   whole reason the block exists, and an authority that could not
+///   write it could not raise the floor.
 pub const AUTHORITY_DENIED_PATHS: &[&str] = &[
     "proxy.cluster",
     "proxy.admin",
@@ -139,6 +149,7 @@ pub const AUTHORITY_DENIED_PATHS: &[&str] = &[
     "proxy.compression_state",
     "proxy.config_history",
     "source",
+    "origin_sources",
 ];
 
 /// Where the base document came from, as determined by the caller.
@@ -755,6 +766,42 @@ mod tests {
             denied_paths_in("- one\n- two\n"),
             Err(MergeError::RemoteNotMapping)
         ));
+    }
+
+    /// WOR-2436: the two composition blocks are treated differently on
+    /// purpose, and the difference is the whole design. Pinned here so
+    /// neither half can drift into the other by accident.
+    ///
+    /// `origin_sources` names N project repositories whose Lua, WASM and
+    /// JS bodies the interpolator deliberately never reads, so an
+    /// authority able to write it is arbitrary code fetch on every
+    /// subscriber. `origin_defaults` is the platform raising a security
+    /// floor, which is the one thing this channel exists to distribute.
+    #[test]
+    fn origin_sources_is_denied_to_an_authority_and_origin_defaults_is_not() {
+        let sources = "origin_sources:\n  entries:\n    - name: checkout\n      \
+                       repo: https://git.test/acme/checkout\n      path: sbproxy/origin.yaml\n";
+        assert_eq!(
+            denied_paths_in(sources).expect("scan"),
+            vec!["origin_sources".to_string()]
+        );
+        for mode in MODES {
+            let error = merge_config(SIMPLE_BASE, local(), sources, mode)
+                .expect_err("origin_sources must be refused");
+            assert_eq!(denied_paths(error), vec!["origin_sources".to_string()]);
+        }
+
+        let defaults = "origin_defaults:\n  policies:\n    - name: waf\n      type: waf\n";
+        assert!(denied_paths_in(defaults).expect("scan").is_empty());
+        for mode in MODES {
+            let outcome = merge_config(SIMPLE_BASE, local(), defaults, mode)
+                .expect("the platform floor is exactly what an authority publishes");
+            assert!(
+                outcome.merged_yaml.contains("origin_defaults"),
+                "{mode:?}: {}",
+                outcome.merged_yaml
+            );
+        }
     }
 
     #[test]

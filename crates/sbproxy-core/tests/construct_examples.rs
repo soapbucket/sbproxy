@@ -298,6 +298,159 @@ fn every_oss_example_constructs_its_pipeline() {
     }
 }
 
+/// Compose every published project profile against the runtime half
+/// beside it, then run the result through the same module construction
+/// the sweep above runs, and the same one `ConfigAuthority::publish`
+/// runs before it signs anything.
+///
+/// The two sweeps that existed could not see this. `validate_examples`
+/// and `every_oss_example_constructs_its_pipeline` both start from
+/// `sb.yml`, where `origin_defaults` is an opaque `Mapping` and
+/// `origin.yaml` is not a file either of them opens. So a published
+/// project profile could name an action field that does not exist, a
+/// policy type no module answers to, or an auth field a
+/// `deny_unknown_fields` shim refuses, and every gate in the repository
+/// stayed green while the aggregator's first publish would have been
+/// refused. It shipped that way once; this is the check that would have
+/// caught it.
+///
+/// Composition itself is pure, so this needs no git and no network: the
+/// profile is read off disk as text exactly as the aggregator will hand
+/// it in.
+#[test]
+fn every_example_origin_profile_composes_and_constructs() {
+    export_example_env_dummies();
+    let root = workspace_root();
+    std::env::set_current_dir(&root).expect("chdir to workspace root");
+    let examples = root.join("examples");
+    if !examples.is_dir() {
+        eprintln!("skipping: no examples directory at {}", examples.display());
+        return;
+    }
+
+    let mut pairs: Vec<PathBuf> = Vec::new();
+    for entry in std::fs::read_dir(&examples)
+        .expect("read examples/")
+        .flatten()
+    {
+        let directory = entry.path();
+        if directory.is_dir()
+            && directory.join("origin.yaml").is_file()
+            && directory.join("sb.yml").is_file()
+        {
+            pairs.push(directory);
+        }
+    }
+    pairs.sort();
+    assert!(
+        !pairs.is_empty(),
+        "no example directory carries both sb.yml and origin.yaml, so this sweep would pass \
+         vacuously; if the origin-profiles example moved, move this with it"
+    );
+
+    let mut failures: Vec<String> = Vec::new();
+    for directory in &pairs {
+        let label = directory
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let runtime_text =
+            std::fs::read_to_string(directory.join("sb.yml")).expect("sb.yml is readable");
+        let profile =
+            std::fs::read_to_string(directory.join("origin.yaml")).expect("origin.yaml readable");
+        let runtime: sbproxy_config::ConfigFile = match serde_yaml::from_str(&runtime_text) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                failures.push(format!("{label}: sb.yml does not parse: {error}"));
+                continue;
+            }
+        };
+        let Some(sources) = runtime.origin_sources.as_ref() else {
+            failures.push(format!(
+                "{label}: ships an origin.yaml but no `origin_sources:` to deploy it"
+            ));
+            continue;
+        };
+        let hand_written: std::collections::BTreeSet<String> =
+            runtime.origins.keys().cloned().collect();
+        let bindings: Vec<sbproxy_config::origin_profile::ProfileBinding<'_>> = sources
+            .entries
+            .iter()
+            .map(|entry| sbproxy_config::origin_profile::ProfileBinding {
+                entry,
+                document: &profile,
+            })
+            .collect();
+        let resolution = match sbproxy_config::origin_profile::resolve_origins(
+            runtime.origin_defaults.as_ref(),
+            &bindings,
+            &hand_written,
+        ) {
+            Ok(resolution) => resolution,
+            Err(error) => {
+                failures.push(format!("{label}: composition: {error}"));
+                continue;
+            }
+        };
+        assert!(
+            !resolution.origins.is_empty(),
+            "{label}: composed no origins, so constructing them proves nothing"
+        );
+
+        // Splice the composed origins into the runtime document and put
+        // the whole thing through the real load path. Going back through
+        // text rather than through the typed struct is deliberate: it is
+        // what the aggregator publishes and what a node parses, so an
+        // origin that only survives in memory is caught here.
+        let mut document: serde_yaml::Value =
+            serde_yaml::from_str(&runtime_text).expect("sb.yml re-parses as a value");
+        let Some(map) = document.as_mapping_mut() else {
+            failures.push(format!("{label}: sb.yml root is not a mapping"));
+            continue;
+        };
+        // The composition blocks are the aggregator's input, not a
+        // node's, and the composed document is what the fleet receives.
+        map.remove("origin_sources");
+        map.remove("origin_defaults");
+        let origins = map
+            .entry(serde_yaml::Value::String("origins".to_string()))
+            .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+        let Some(origins) = origins.as_mapping_mut() else {
+            failures.push(format!("{label}: `origins:` is not a mapping"));
+            continue;
+        };
+        for (host, origin) in &resolution.origins {
+            let value = serde_yaml::to_value(origin).expect("a composed origin re-serializes");
+            origins.insert(serde_yaml::Value::String(host.clone()), value);
+        }
+        let composed_text =
+            serde_yaml::to_string(&document).expect("the composed document serializes");
+
+        let compiled = match sbproxy_config::compile_config(&composed_text) {
+            Ok(compiled) => compiled,
+            Err(error) => {
+                failures.push(format!("{label}: composed compile_config: {error:#}"));
+                continue;
+            }
+        };
+        if let Err(error) = sbproxy_core::pipeline::CompiledPipeline::from_config_for_validation_at(
+            compiled, directory,
+        ) {
+            failures.push(format!(
+                "{label}: composed pipeline construction: {error:#}"
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "{} of {} example project profile(s) failed to compose and construct:\n  {}",
+        failures.len(),
+        pairs.len(),
+        failures.join("\n  ")
+    );
+}
+
 /// With the RAG adapters compiled in (`--features rag-full`, which the
 /// released binary ships by default), the ai-rag-local example must
 /// construct its pipeline end to end, not just compile its config.

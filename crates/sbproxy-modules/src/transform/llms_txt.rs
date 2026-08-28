@@ -653,6 +653,7 @@ mod tests {
             host_map.insert(origin.hostname.clone(), idx);
         }
         Arc::new(CompiledConfig {
+            origin_source_entries: Default::default(),
             extension_bundles: Default::default(),
             origins,
             host_map,

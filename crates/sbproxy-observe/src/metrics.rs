@@ -3738,6 +3738,42 @@ pub fn set_config_revision_info(revision: u64, digest: &str, provenance: &str) {
     *current = Some((revision, digest.to_string(), provenance.to_string()));
 }
 
+/// Project repositories declared under `origin_sources`, by runtime
+/// tier and whether the entry is pinned to an immutable revision
+/// (WOR-2436).
+///
+/// Set at config load, so it describes the document this process is
+/// running rather than an aggregation cycle. Two questions it answers
+/// that nothing else does: whether a fleet that should be pulling N
+/// project repositories has quietly dropped to zero, and whether any
+/// entry is following a movable ref. The second series is always zero in
+/// a `production` tier, because the load-time check refuses the config
+/// outright, so a non-zero reading there means a node is running a
+/// document that predates the rule.
+///
+/// Registration failure is swallowed rather than panicked on. The
+/// neighbours in this file predate the rule that production code ends no
+/// process it cannot recover from; a config load that died because a
+/// gauge would not register would take the proxy down over a number.
+pub fn set_origin_source_entries(tier: &str, pinned: bool, count: i64) {
+    use prometheus::{register_int_gauge_vec, IntGaugeVec};
+    use std::sync::OnceLock;
+    static G: OnceLock<Option<IntGaugeVec>> = OnceLock::new();
+    let gauge = G.get_or_init(|| {
+        register_int_gauge_vec!(
+            "sbproxy_origin_source_entries",
+            "Project repositories declared under origin_sources, by runtime tier and pin state",
+            &["tier", "pinned"]
+        )
+        .ok()
+    });
+    if let Some(gauge) = gauge.as_ref() {
+        gauge
+            .with_label_values(&[tier, if pinned { "true" } else { "false" }])
+            .set(count);
+    }
+}
+
 /// Publish the config revision ring's current entry count on
 /// `sbproxy_config_history_entries`.
 ///
