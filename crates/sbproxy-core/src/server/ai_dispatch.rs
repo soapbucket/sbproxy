@@ -21715,6 +21715,8 @@ fn shadow_surface_is_eligible(surface: &sbproxy_ai::handler::AiSurface) -> bool 
     surface.supports_shadow_eval()
 }
 
+// Probe: touches a path in context-compression-eval.yml's filter so the
+// smoke lane runs against unmodified main. Delete this branch after.
 #[cfg(test)]
 mod external_guardrail_context_tests {
     use std::collections::BTreeSet;
