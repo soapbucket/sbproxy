@@ -350,7 +350,16 @@ struct AggregateArgs {
     /// Keep running: poll each entry on the configured interval,
     /// coalesce a burst of movement into one composition, and publish
     /// when the composed document actually changed.
-    #[arg(long = "watch", action = ArgAction::SetTrue, conflicts_with = "dry_run")]
+    ///
+    /// Refuses to combine with the one-shot flags rather than ignoring
+    /// them. `--watch --out f.yml` used to drop `--out` without a word
+    /// and loop publishing to the admin API instead, which on a node
+    /// with an admin listener is a fleet publish nobody asked for.
+    #[arg(
+        long = "watch",
+        action = ArgAction::SetTrue,
+        conflicts_with_all = ["dry_run", "out", "explain"]
+    )]
     watch: bool,
     /// Stop after this many poll cycles in `--watch`. Zero means run
     /// until interrupted, which is the operational default; a positive
@@ -9827,10 +9836,14 @@ fn handle_aggregate_subcommand(args: &AggregateArgs) -> anyhow::Result<i32> {
                  `origin_sources:`, as a positional argument or through -f / --config"
             )
         })?;
-    let text = std::fs::read_to_string(&path)
-        .map_err(|error| anyhow::anyhow!("read '{}': {error}", path.display()))?;
-    let mut aggregator = sbproxy_core::config_aggregator::Aggregator::from_document(&text)
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    // `from_path` rather than a read plus `from_document`, so a
+    // `--watch` run re-reads the document each cycle instead of
+    // composing from the one it saw at start-up.
+    let mut aggregator = sbproxy_core::config_aggregator::Aggregator::from_path(
+        &path,
+        sbproxy_config::source::FetchContext::with_git_binary(),
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
     aggregator
         .resolve_credentials()
         .map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -9840,26 +9853,19 @@ fn handle_aggregate_subcommand(args: &AggregateArgs) -> anyhow::Result<i32> {
             admin: &args.admin,
             mode: args.mode,
         };
-        let timings = aggregator.timings().clone();
         let polls = (args.polls > 0).then_some(args.polls);
-        println!(
-            "aggregate: watching {} entr{}; poll {}s, debounce {}s, ceiling {}s",
-            aggregator.entries().len(),
-            if aggregator.entries().len() == 1 {
-                "y"
-            } else {
-                "ies"
-            },
-            timings.poll_interval_secs,
-            timings.debounce_secs,
-            timings.max_deferral_secs
-        );
-        sbproxy_core::config_aggregator::aggregation_loop(
-            &mut aggregator,
-            &publisher,
-            &timings,
-            polls,
-        );
+        {
+            let entries = aggregator.entries().len();
+            let timings = aggregator.timings();
+            println!(
+                "aggregate: watching {entries} entr{}; poll {}s, debounce {}s, ceiling {}s",
+                if entries == 1 { "y" } else { "ies" },
+                timings.poll_interval_secs,
+                timings.debounce_secs,
+                timings.max_deferral_secs
+            );
+        }
+        sbproxy_core::config_aggregator::aggregation_loop(&mut aggregator, &publisher, polls);
         return Ok(0);
     }
 
@@ -9967,7 +9973,7 @@ fn handle_aggregate_subcommand(args: &AggregateArgs) -> anyhow::Result<i32> {
         admin: &args.admin,
         mode: args.mode,
     };
-    match aggregator.run_round(&publisher) {
+    match aggregator.publish_composed(composed, &publisher) {
         Ok(sbproxy_core::config_aggregator::RoundOutcome::Published { revision, outcome }) => {
             match args.format {
                 OutputFormat::Json => println!(
@@ -10002,6 +10008,16 @@ fn handle_aggregate_subcommand(args: &AggregateArgs) -> anyhow::Result<i32> {
                     outcome.content_digest
                 ),
             }
+            Ok(0)
+        }
+        // `RoundOutcome` is `#[non_exhaustive]`, so a decision added
+        // later reaches this arm rather than failing to compile in a
+        // downstream crate. Reporting the digest and exiting 0 is the
+        // conservative reading: nothing about the authority changed that
+        // this binary understands.
+        Ok(other) => {
+            eprintln!("aggregate: the round finished with an outcome this build does not render");
+            let _ = other;
             Ok(0)
         }
         Err(error) => {
@@ -17082,6 +17098,52 @@ origins:
         };
         assert_eq!(handle_plan_subcommand(&args).unwrap(), 0);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// `--watch` refuses the one-shot flags rather than dropping them.
+    ///
+    /// It used to return before `--out` and `--explain` were read, so
+    /// `aggregate --out f.yml --watch` looped POSTing composed documents
+    /// to the admin API while the file was never written. On a node with
+    /// an admin listener that is a fleet publish nobody asked for
+    /// (WOR-2432 review, Major 5).
+    #[test]
+    fn aggregate_watch_refuses_the_one_shot_flags() {
+        use clap::Parser as _;
+
+        for conflicting in [
+            vec!["--out", "composed.yml"],
+            vec!["--explain", "api.example.com"],
+            vec!["--out", "composed.yml", "--dry-run"],
+        ] {
+            let mut argv = vec!["sbproxy", "aggregate", "-f", "sb.yml", "--watch"];
+            argv.extend(conflicting.iter().copied());
+            let parsed = Cli::try_parse_from(&argv);
+            assert!(
+                parsed.is_err(),
+                "`{}` must be refused rather than silently dropping a flag",
+                argv.join(" ")
+            );
+        }
+
+        // And each of them still parses on its own, so the conflict is
+        // the pairing rather than the flag.
+        for alone in [
+            vec!["--out", "composed.yml"],
+            vec!["--explain", "api.example.com"],
+        ] {
+            let mut argv = vec!["sbproxy", "aggregate", "-f", "sb.yml"];
+            argv.extend(alone.iter().copied());
+            assert!(
+                Cli::try_parse_from(&argv).is_ok(),
+                "`{}` is a valid one-shot invocation",
+                argv.join(" ")
+            );
+        }
+        assert!(
+            Cli::try_parse_from(["sbproxy", "aggregate", "-f", "sb.yml", "--watch"]).is_ok(),
+            "and --watch on its own is valid"
+        );
     }
 
     #[test]

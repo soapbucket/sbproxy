@@ -69,6 +69,7 @@ const OFFLINE_HEADER_MARKER: &str = "# composed by sbproxy aggregate";
 /// repository this reports is credential-stripped by
 /// [`sbproxy_config::redact_repo`] before it reaches a variant.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum AggregateError {
     /// The runtime document does not parse as a config file.
     #[error("aggregate: the runtime document does not parse: {0}")]
@@ -87,11 +88,20 @@ pub enum AggregateError {
         .entries.len(),
         if .entries.len() == 1 { "y" } else { "ies" },
         if .entries.len() == 1 { "has" } else { "have" },
-        .entries.join(", ")
+        .details.join("; ")
     )]
     Unresolvable {
         /// The entry names, in `origin_sources` order.
         entries: Vec<String>,
+        /// `<entry>: <reason>` per entry, in the same order.
+        ///
+        /// The names alone were not enough. "checkout could not be
+        /// resolved" sends an operator to the network; the reason
+        /// separates a repository that is down from a profile committed
+        /// as a symlink, one past the read cap, and one that is there
+        /// and is not UTF-8, and those are four different people's
+        /// problems.
+        details: Vec<String>,
     },
     /// The round's global deadline passed with entries outstanding.
     #[error(
@@ -143,6 +153,7 @@ pub enum AggregateError {
 
 /// One project repository resolved for one composition.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[non_exhaustive]
 pub struct ResolvedEntry {
     /// The `origin_sources` entry name.
     pub entry: String,
@@ -166,6 +177,7 @@ pub struct ResolvedEntry {
 /// falling back to its last-known-good is a degraded success and the
 /// operator has to be told which repository is unreachable.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[non_exhaustive]
 pub struct EntryFailure {
     /// The `origin_sources` entry name.
     pub entry: String,
@@ -178,12 +190,31 @@ pub struct EntryFailure {
 }
 
 /// What one composition produced.
+///
+/// Two documents, deliberately, because the two consumers want
+/// different things. [`Self::yaml`] is the whole runtime document with
+/// its composition blocks replaced by the origins they produced, which
+/// is what `--out` writes: a single node boots that file unmodified, so
+/// it has to carry `proxy:`. [`Self::payload`] is the origins overlay
+/// alone, which is what gets published: a bundle carrying `proxy:`
+/// would be refused outright, and it would be wrong even if it were
+/// not, because a subscriber's listeners, TLS and admin surface are not
+/// the fleet's to set.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct CompositionOutcome {
-    /// The composed runtime document, ready to publish or to write.
+    /// The composed runtime document, ready to write to a file.
     pub yaml: String,
-    /// `sha256:<hex>` of [`Self::yaml`], which is the change detector
+    /// The overlay the config authority publishes: the composed and
+    /// hand-written `origins:` map, plus `origin_defaults` when the
+    /// runtime document carries one, and nothing else.
+    pub payload: String,
+    /// `sha256:<hex>` of [`Self::payload`], which is the change detector
     /// the publish gate compares.
+    ///
+    /// The payload rather than the whole document, so editing a node's
+    /// own `proxy:` block in the aggregator's runtime file does not
+    /// publish a revision that changes nothing for any subscriber.
     pub content_digest: String,
     /// Every entry that resolved, in `origin_sources` order.
     pub resolved: Vec<ResolvedEntry>,
@@ -263,6 +294,24 @@ pub struct Aggregator {
     runtime_yaml: String,
     sources: OriginSourcesConfig,
     config: ConfigFile,
+    /// The runtime document's own `origins:` node, kept as authored.
+    ///
+    /// The typed `ConfigFile::origins` would round-trip through
+    /// `RawOriginConfig`, which has no `skip_serializing_if` and would
+    /// write all fifty-two fields per hand-written origin into the
+    /// published payload. Keeping the authored node means a hand-written
+    /// origin reaches the fleet exactly as somebody wrote it.
+    hand_written_origins: serde_yaml::Value,
+    /// Where the runtime document was read from, when it was read from
+    /// a file. `None` for a document handed in as text.
+    ///
+    /// The in-process loop re-reads it every round. Without that, a
+    /// SIGHUP or a config-watcher reload updates the node's own pipeline
+    /// and `GET /admin/origin-composition`, while the aggregator keeps
+    /// publishing from the document it read at boot, so the two halves
+    /// of one admin response disagree and the operator's only signal is
+    /// that nothing happened.
+    config_path: Option<std::path::PathBuf>,
     fetch: FetchContext,
     cache: BTreeMap<String, CachedProfile>,
     /// Remote sha last observed per fetch key, which is what makes a
@@ -315,22 +364,106 @@ impl Aggregator {
         runtime_yaml: &str,
         fetch: FetchContext,
     ) -> Result<Self, AggregateError> {
-        let config: ConfigFile = serde_yaml::from_str(runtime_yaml)
-            .map_err(|error| AggregateError::Parse(error.to_string()))?;
-        let sources = config
-            .origin_sources
-            .clone()
-            .ok_or(AggregateError::NoSources)?;
+        let (config, sources, hand_written_origins) = Self::parse(runtime_yaml)?;
         Ok(Self {
             runtime_yaml: runtime_yaml.to_string(),
             sources,
             config,
+            hand_written_origins,
+            config_path: None,
             fetch,
             cache: BTreeMap::new(),
             observed: BTreeMap::new(),
             dirty: BTreeSet::new(),
             last_published_digest: None,
         })
+    }
+
+    /// Build an aggregator from a document on disk, and remember where
+    /// it came from so later rounds can re-read it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AggregateError::Io`] when the file cannot be read, and
+    /// otherwise as [`Self::from_document`].
+    pub fn from_path(path: &std::path::Path, fetch: FetchContext) -> Result<Self, AggregateError> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| AggregateError::Io(format!("read '{}': {error}", path.display())))?;
+        let mut aggregator = Self::with_fetch_context(&text, fetch)?;
+        aggregator.config_path = Some(path.to_path_buf());
+        Ok(aggregator)
+    }
+
+    /// The three parsed views of one runtime document.
+    fn parse(
+        runtime_yaml: &str,
+    ) -> Result<(ConfigFile, OriginSourcesConfig, serde_yaml::Value), AggregateError> {
+        let config: ConfigFile = serde_yaml::from_str(runtime_yaml)
+            .map_err(|error| AggregateError::Parse(error.to_string()))?;
+        let sources = config
+            .origin_sources
+            .clone()
+            .ok_or(AggregateError::NoSources)?;
+        let raw: serde_yaml::Value = serde_yaml::from_str(runtime_yaml)
+            .map_err(|error| AggregateError::Parse(error.to_string()))?;
+        let hand_written = raw
+            .get("origins")
+            .cloned()
+            .unwrap_or(serde_yaml::Value::Null);
+        Ok((config, sources, hand_written))
+    }
+
+    /// Re-read the runtime document, when it came from a file and its
+    /// text has changed.
+    ///
+    /// Returns whether anything was swapped. The per-entry caches and
+    /// the observed shas are keyed by entry name and by repository, not
+    /// by position, so they survive an edit: an entry the operator did
+    /// not touch keeps its last resolved profile and is not re-fetched
+    /// just because a neighbour was added.
+    ///
+    /// A document that no longer parses, or that lost its
+    /// `origin_sources` block, is a warning and a no-op rather than a
+    /// stop. The aggregator keeps publishing from the last good document
+    /// while the operator fixes the file, which is the same posture the
+    /// node's own reload takes.
+    pub fn refresh_document(&mut self) -> bool {
+        let Some(path) = self.config_path.clone() else {
+            return false;
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return false;
+        };
+        if text == self.runtime_yaml {
+            return false;
+        }
+        match Self::parse(&text) {
+            Ok((config, sources, hand_written)) => {
+                tracing::info!(
+                    path = %path.display(),
+                    entries = sources.entries.len(),
+                    "aggregate: runtime document changed; composing from the new one",
+                );
+                self.runtime_yaml = text;
+                self.config = config;
+                self.sources = sources;
+                self.hand_written_origins = hand_written;
+                // Everything is re-examined against the new document,
+                // rather than trusting a dirty set computed against the
+                // old one.
+                self.dirty.clear();
+                true
+            }
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "aggregate: the runtime document changed but does not load; still composing \
+                     from the last one that did",
+                );
+                false
+            }
+        }
     }
 
     /// Record a resolved credential for one repository, so a private
@@ -390,7 +523,7 @@ impl Aggregator {
     }
 
     /// Ask every entry whether its revision moved, with no working tree
-    /// materialised.
+    /// materialized.
     ///
     /// Returns the entry names whose sha differs from the one this
     /// aggregator last observed. An entry pinned to a full commit sha is
@@ -403,23 +536,41 @@ impl Aggregator {
     /// happened, and the fetch that follows is where the failure gets
     /// its proper handling and its last-known-good fallback.
     ///
+    /// The poll phase runs under the same bounded pool and the same
+    /// round deadline as the fetch phase. Serially it was neither: ten
+    /// entries pointing at a git host that has started blackholing
+    /// connections cost ten times `timeout_secs` (default 60) in one
+    /// cycle, so a `poll_interval_secs: 120` loop spends ten minutes
+    /// inside `poll()`, the interval gate never gates anything again,
+    /// and the documented thirty requests per hour per repository turns
+    /// into a continuous poll storm against the healthy repositories
+    /// while nothing composes at all.
+    ///
     /// # Errors
     ///
     /// Never. Every per-entry failure is folded into "treat as moved".
     pub fn poll(&mut self) -> Vec<String> {
         let mut moved: Vec<String> = Vec::new();
-        let mut answered: BTreeMap<FetchKey, Option<String>> = BTreeMap::new();
         let mut dirty: BTreeSet<FetchKey> = BTreeSet::new();
+        let keys: Vec<FetchKey> = {
+            let mut seen: BTreeSet<FetchKey> = BTreeSet::new();
+            self.sources
+                .entries
+                .iter()
+                .map(fetch_key)
+                .filter(|key| seen.insert(key.clone()))
+                .collect()
+        };
+        let answered = poll_groups(
+            &self.fetch,
+            &self.sources.entries,
+            &keys,
+            self.sources.aggregator.concurrency.max(1),
+            Instant::now() + Duration::from_secs(self.sources.aggregator.deadline_secs.max(1)),
+        );
         for entry in &self.sources.entries {
             let key = fetch_key(entry);
-            let sha = match answered.get(&key) {
-                Some(sha) => sha.clone(),
-                None => {
-                    let sha = poll_one(&self.fetch, entry);
-                    answered.insert(key.clone(), sha.clone());
-                    sha
-                }
-            };
+            let sha = answered.get(&key).cloned().flatten();
             let changed = match sha.as_ref() {
                 Some(sha) => self.observed.get(&key) != Some(sha),
                 // The cloner could not answer cheaply, or the remote
@@ -499,7 +650,10 @@ impl Aggregator {
             // round re-fetch, which is the safe direction. Taken after,
             // this would record a sha newer than the tree that was read
             // and the change would be missed entirely.
-            if let Some(entry) = self.sources.entries.get(indices[0]) {
+            if let Some(entry) = indices
+                .first()
+                .and_then(|index| self.sources.entries.get(*index))
+            {
                 if let Some(sha) = poll_one(&self.fetch, entry) {
                     polled.insert(key.clone(), sha);
                 }
@@ -529,6 +683,39 @@ impl Aggregator {
             })
             .collect();
         if !outstanding.is_empty() && Instant::now() >= deadline {
+            // Same reason as the `Unresolvable` path below: an operator
+            // alerting on `failed > 0` has to see the outstanding
+            // entries here, not the previous round's zeroes. `resolved`
+            // and `unchanged` are the entries that really did finish,
+            // which for a deadline is usually few and sometimes none.
+            let finished: Vec<ResolvedEntry> = self
+                .sources
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(index, entry)| {
+                    unchanged.contains(index) || fetched.contains_key(&fetch_key(entry))
+                })
+                .map(|(index, entry)| ResolvedEntry {
+                    entry: entry.name.clone(),
+                    repo: sbproxy_config::redact_repo(&entry.repo),
+                    revision: entry.revision.clone().unwrap_or_else(|| "HEAD".to_string()),
+                    commit: String::new(),
+                    from_cache: false,
+                    unchanged: unchanged.contains(&index),
+                })
+                .collect();
+            let timed_out: Vec<EntryFailure> = outstanding
+                .iter()
+                .map(|name| EntryFailure {
+                    entry: name.clone(),
+                    repo: String::new(),
+                    reason: "the round's deadline passed before this repository was read"
+                        .to_string(),
+                    reused_commit: None,
+                })
+                .collect();
+            write_entry_gauges(&finished, &timed_out);
             return Err(AggregateError::Deadline {
                 outstanding,
                 total: self.sources.entries.len(),
@@ -595,19 +782,25 @@ impl Aggregator {
                         });
                     }
                     None => {
-                        // A path that is not in the tree is the entry's
-                        // fault rather than the network's, so it is not
-                        // eligible for the last-known-good fallback: the
-                        // previous document would keep a fleet running
-                        // on a profile the repository no longer ships.
+                        // A path the checkout did not yield is the
+                        // entry's fault rather than the network's, so it
+                        // is not eligible for the last-known-good
+                        // fallback: the previous document would keep a
+                        // fleet running on a profile the repository no
+                        // longer ships. The reason comes from the read
+                        // guard, so "missing", "is a symlink", "is not
+                        // UTF-8" and "is past the size cap" stay
+                        // distinguishable.
                         unresolvable.push(entry.name.clone());
                         failed.push(EntryFailure {
                             entry: entry.name.clone(),
                             repo,
-                            reason: format!(
-                                "`{}` is not in the repository at the resolved revision",
-                                entry.path
-                            ),
+                            reason: tree.refusals.get(&entry.path).cloned().unwrap_or_else(|| {
+                                format!(
+                                    "`{}` produced no document at the resolved revision",
+                                    entry.path
+                                )
+                            }),
                             reused_commit: None,
                         });
                     }
@@ -648,6 +841,15 @@ impl Aggregator {
                 }
             }
         }
+        // Written before the composition and before the abort below, so
+        // the fetch picture is visible on every path. The gauge's own
+        // doc and `docs/configuration.md` both promise "every outcome on
+        // every round including the zeroes", and the two paths where
+        // that used to be false are exactly the two an operator alerts
+        // on: a partition that takes out every repository returned
+        // `Unresolvable` with the gauges left showing the last good
+        // round, which reads as evidence of absence.
+        write_entry_gauges(&resolved, &failed);
         if !unresolvable.is_empty() {
             for failure in &failed {
                 tracing::warn!(
@@ -657,30 +859,17 @@ impl Aggregator {
                     "aggregate: entry did not resolve",
                 );
             }
+            let details = failed
+                .iter()
+                .filter(|failure| unresolvable.contains(&failure.entry))
+                .map(|failure| format!("{}: {}", failure.entry, failure.reason))
+                .collect();
             return Err(AggregateError::Unresolvable {
                 entries: unresolvable,
+                details,
             });
         }
 
-        // Written before the composition, so a document that will not
-        // compile still leaves the fetch picture visible. Every outcome
-        // is written on every round including the zeroes, so a failure
-        // that clears shows as the drop rather than as a series that
-        // stops moving.
-        let unchanged_count = resolved.iter().filter(|entry| entry.unchanged).count();
-        let cached_count = resolved.iter().filter(|entry| entry.from_cache).count();
-        sbproxy_observe::metrics::set_aggregate_entries(
-            "resolved",
-            i64::try_from(resolved.len() - unchanged_count - cached_count).unwrap_or(i64::MAX),
-        );
-        sbproxy_observe::metrics::set_aggregate_entries(
-            "unchanged",
-            i64::try_from(unchanged_count).unwrap_or(i64::MAX),
-        );
-        sbproxy_observe::metrics::set_aggregate_entries(
-            "failed",
-            i64::try_from(failed.len()).unwrap_or(i64::MAX),
-        );
         let outcome = self.compose_documents(&documents, resolved, failed, started)?;
         sbproxy_observe::metrics::record_aggregate_compose_duration(outcome.duration.as_secs_f64());
         Ok(outcome)
@@ -710,13 +899,9 @@ impl Aggregator {
             .entries
             .iter()
             .filter_map(|entry| {
-                documents
-                    .get(&entry.name)
-                    .map(|(document, commit)| ProfileBinding {
-                        entry,
-                        document: document.as_str(),
-                        commit: Some(commit.as_str()),
-                    })
+                documents.get(&entry.name).map(|(document, commit)| {
+                    ProfileBinding::new(entry, document.as_str()).with_commit(commit.as_str())
+                })
             })
             .collect();
         let resolution = resolve_origins_with(
@@ -726,19 +911,28 @@ impl Aggregator {
             declares_bundles,
         )?;
         let yaml = splice_origins(&self.runtime_yaml, &resolution.composed)?;
+        let payload = composition_payload(
+            &self.config,
+            &self.hand_written_origins,
+            &resolution.composed,
+        )?;
         let origins = resolution.origins.len();
-        if yaml.len() > MAX_CONFIG_YAML_BYTES {
+        // The payload rather than the whole document, because the limit
+        // is the size a signed bundle may carry and the payload is what
+        // gets signed. A node's own `proxy:` block never travels.
+        if payload.len() > MAX_CONFIG_YAML_BYTES {
             return Err(AggregateError::TooLarge {
-                bytes: yaml.len(),
+                bytes: payload.len(),
                 limit: MAX_CONFIG_YAML_BYTES,
                 origins,
                 entries: self.sources.entries.len(),
-                bytes_per_origin: yaml.len() / origins.max(1),
+                bytes_per_origin: payload.len() / origins.max(1),
             });
         }
-        let content_digest = sbproxy_config::ConfigBundle::content_digest_of(&yaml);
+        let content_digest = sbproxy_config::ConfigBundle::content_digest_of(&payload);
         Ok(CompositionOutcome {
             yaml,
+            payload,
             content_digest,
             resolved,
             failed,
@@ -763,6 +957,17 @@ impl Aggregator {
 
     /// Record that a composition was published, so the next identical
     /// one publishes nothing.
+    /// Seed the change detector from a digest published earlier.
+    ///
+    /// Called at [`spawn`] with whatever the authority is already
+    /// serving. Without it a restart republishes a byte-identical
+    /// revision, and every published revision is a full pipeline rebuild
+    /// on every subscriber, so a rolling restart of the aggregator would
+    /// reload the entire fleet for no configuration change at all.
+    pub fn seed_published_digest(&mut self, digest: impl Into<String>) {
+        self.last_published_digest = Some(digest.into());
+    }
+
     fn mark_published(&mut self, outcome: &CompositionOutcome) {
         self.last_published_digest = Some(outcome.content_digest.clone());
     }
@@ -798,11 +1003,20 @@ impl Aggregator {
 
     /// What `--out` would change against a file that is already there.
     ///
-    /// Returns `None` when the file does not exist, and otherwise the
-    /// unified-style summary of what would change. The header is
-    /// compared along with the body, because a composed file whose only
-    /// difference is a resolved sha is still a different composition and
-    /// a CI diff that hid that would hide the interesting half.
+    /// Returns `None` when the file does not exist, an empty vector when
+    /// the bytes are identical, and otherwise the differing lines. The
+    /// header is compared along with the body, because a composed file
+    /// whose only difference is a resolved sha is still a different
+    /// composition and a CI diff that hid that would hide the
+    /// interesting half.
+    ///
+    /// The changed decision is `existing != proposed` on the whole text,
+    /// never on the diff being non-empty. Those are not the same
+    /// question: a set-difference diff reports nothing for two documents
+    /// with the same lines in a different order, which is exactly what
+    /// swapping two services' `hosts:` between entries produces, and a
+    /// `--dry-run` that answered "already holds this composition" there
+    /// would defeat the acceptance line that a CI diff is meaningful.
     ///
     /// # Errors
     ///
@@ -821,20 +1035,7 @@ impl Aggregator {
         if existing == proposed {
             return Ok(Some(Vec::new()));
         }
-        let before: Vec<&str> = existing.lines().collect();
-        let after: Vec<&str> = proposed.lines().collect();
-        let mut lines: Vec<String> = Vec::new();
-        for line in &before {
-            if !after.contains(line) {
-                lines.push(format!("- {line}"));
-            }
-        }
-        for line in &after {
-            if !before.contains(line) {
-                lines.push(format!("+ {line}"));
-            }
-        }
-        Ok(Some(lines))
+        Ok(Some(line_diff(&existing, &proposed)))
     }
 }
 
@@ -856,6 +1057,14 @@ fn fetch_key(entry: &OriginSourceEntry) -> FetchKey {
 struct FetchedTree {
     commit: String,
     documents: BTreeMap<String, String>,
+    /// Why a path the group asked for produced no document.
+    ///
+    /// Kept alongside the successes so the entry's refusal names the
+    /// real reason. "Not in the repository at the resolved revision" is
+    /// the wrong answer for a file that is there and is a symlink, or is
+    /// there and is not UTF-8, or is there and is a gigabyte, and each
+    /// of those sends an operator somewhere different.
+    refusals: BTreeMap<String, String>,
 }
 
 /// Ask one repository which commit its revision points at.
@@ -865,6 +1074,17 @@ struct FetchedTree {
 /// trip, so a pinned entry is polled exactly once, in the round that
 /// first records it.
 fn poll_one(fetch: &FetchContext, entry: &OriginSourceEntry) -> Option<String> {
+    poll_one_bounded(fetch, entry, Duration::from_secs(entry.timeout_secs.max(1)))
+}
+
+/// [`poll_one`] with the round's remaining budget clamping the entry's
+/// own timeout, so one blackholing host cannot hold a poll cycle open
+/// past the round it belongs to.
+fn poll_one_bounded(
+    fetch: &FetchContext,
+    entry: &OriginSourceEntry,
+    remaining: Duration,
+) -> Option<String> {
     if let Some(revision) = entry.revision.as_deref() {
         if sbproxy_config::source::is_full_commit_sha(revision) {
             // A sha cannot move, so once it has been recorded there is
@@ -879,7 +1099,7 @@ fn poll_one(fetch: &FetchContext, entry: &OriginSourceEntry) -> Option<String> {
         revision: entry.revision.as_deref(),
         credential: entry.credential.as_deref(),
         verify_signature: entry.verify_signature,
-        timeout: Duration::from_secs(entry.timeout_secs.max(1)),
+        timeout: Duration::from_secs(entry.timeout_secs.max(1)).min(remaining),
         fetch_context: fetch,
     };
     match poll_git_revision(&request) {
@@ -894,6 +1114,49 @@ fn poll_one(fetch: &FetchContext, entry: &OriginSourceEntry) -> Option<String> {
             None
         }
     }
+}
+
+/// Ask every distinct repository which commit its revision points at,
+/// under the same bounded pool and round deadline the fetch phase uses.
+///
+/// A group whose poll did not get a turn before the deadline is absent
+/// from the map, which the caller reads as "could not answer cheaply"
+/// and therefore as moved. That is the safe direction: an unanswered
+/// poll costs one fetch, and a poll wrongly reported unchanged costs a
+/// stale fleet.
+fn poll_groups(
+    fetch: &FetchContext,
+    entries: &[OriginSourceEntry],
+    keys: &[FetchKey],
+    concurrency: usize,
+    deadline: Instant,
+) -> BTreeMap<FetchKey, Option<String>> {
+    use std::sync::Mutex;
+
+    let queue = Mutex::new(keys.iter().collect::<std::collections::VecDeque<_>>());
+    let answers: Mutex<BTreeMap<FetchKey, Option<String>>> = Mutex::new(BTreeMap::new());
+    let workers = concurrency.min(keys.len().max(1));
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let Some(key) = queue.lock().ok().and_then(|mut queue| queue.pop_front()) else {
+                    return;
+                };
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return;
+                }
+                let Some(entry) = entries.iter().find(|entry| &fetch_key(entry) == key) else {
+                    continue;
+                };
+                let answer = poll_one_bounded(fetch, entry, remaining);
+                if let Ok(mut answers) = answers.lock() {
+                    answers.insert(key.clone(), answer);
+                }
+            });
+        }
+    });
+    answers.into_inner().unwrap_or_default()
 }
 
 /// Fetch every needed group under a bounded pool and a global deadline.
@@ -938,8 +1201,12 @@ fn fetch_groups(
                     // look at a healthy repository.
                     return;
                 }
-                let Some(first) = entries.get(indices[0]) else {
-                    return;
+                // `first()` rather than `indices[0]`: the invariant that
+                // a group is non-empty is held by the construction in
+                // `compose`, and an index that only the constructor
+                // knows is safe is a panic waiting for the next caller.
+                let Some(first) = indices.first().and_then(|index| entries.get(*index)) else {
+                    continue;
                 };
                 let paths: BTreeSet<String> = indices
                     .iter()
@@ -976,28 +1243,115 @@ fn fetch_one(
         request,
         |tree: MaterializedGitTree<'_>| -> Result<FetchedTree, ConfigSourceError> {
             let mut documents = BTreeMap::new();
+            let mut refusals = BTreeMap::new();
             for path in paths {
-                // `join` on an absolute or traversing path would escape
-                // the checkout, so the path is checked rather than
-                // trusted. An entry's `path:` is runtime-authored, but
-                // the runtime document is also what an authority is
-                // denied from writing precisely because a path in it is
-                // a host resource.
-                if Path::new(path).is_absolute() || path.split('/').any(|part| part == "..") {
-                    continue;
-                }
-                let full = tree.root().join(path);
-                if let Ok(text) = std::fs::read_to_string(&full) {
-                    documents.insert(path.clone(), text);
+                // Both halves of the trust boundary, in one guard. The
+                // traversal check constrains the runtime document, which
+                // is the platform's. The symlink refusal, the
+                // resolve-and-compare and the size cap constrain the
+                // checkout, which is the project's, and that is the half
+                // the epic exists to distrust: `git clone` materializes
+                // symlinks, so a project committing `sbproxy/origin.yaml`
+                // as a link at the aggregator's own `/etc/sbproxy/sb.yml`
+                // would otherwise be read with this process's rights.
+                match sbproxy_config::source::read_file_within(
+                    tree.root(),
+                    path,
+                    sbproxy_config::source::MAX_CHECKOUT_FILE_BYTES,
+                    "origin_sources.entries[].path",
+                ) {
+                    Ok(text) => {
+                        documents.insert(path.clone(), text);
+                    }
+                    Err(error) => {
+                        refusals.insert(path.clone(), error.to_string());
+                    }
                 }
             }
             Ok(FetchedTree {
                 commit: tree.revision().commit.clone(),
                 documents,
+                refusals,
             })
         },
     )
     .map_err(|error: ConfigSourceError| error.to_string())
+}
+
+/// The differing lines between two documents, bounded.
+///
+/// Common prefix and common suffix are trimmed and the differing middle
+/// is printed, which is linear in the input and is the right answer for
+/// two documents generated by the same composer: an edit shows as a
+/// contiguous block, not as a scatter. The previous version asked
+/// `after.contains(line)` per line, which is quadratic (about 10^10
+/// comparisons on the 4 MiB document the size limit allows) and is a
+/// *set* difference, so a reordering compared equal.
+///
+/// The output is capped. A diff nobody can read is not more useful than
+/// a count, and this goes to a terminal.
+fn line_diff(existing: &str, proposed: &str) -> Vec<String> {
+    const MAX_DIFF_LINES: usize = 200;
+
+    let before: Vec<&str> = existing.lines().collect();
+    let after: Vec<&str> = proposed.lines().collect();
+    let common_prefix = before
+        .iter()
+        .zip(after.iter())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let common_suffix = before[common_prefix..]
+        .iter()
+        .rev()
+        .zip(after[common_prefix..].iter().rev())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let removed = &before[common_prefix..before.len() - common_suffix];
+    let added = &after[common_prefix..after.len() - common_suffix];
+
+    let mut lines: Vec<String> = Vec::new();
+    let total = removed.len() + added.len();
+    for line in removed {
+        if lines.len() == MAX_DIFF_LINES {
+            break;
+        }
+        lines.push(format!("- {line}"));
+    }
+    for line in added {
+        if lines.len() == MAX_DIFF_LINES {
+            break;
+        }
+        lines.push(format!("+ {line}"));
+    }
+    if total > lines.len() {
+        lines.push(format!(
+            "... and {} more changed line(s)",
+            total - lines.len()
+        ));
+    }
+    lines
+}
+
+/// Publish the three per-outcome entry gauges for one round.
+///
+/// One function rather than three calls at each of the three exits, so
+/// a new exit cannot forget one of them and so the arithmetic that
+/// splits `resolved` from `unchanged` cannot drift between paths.
+fn write_entry_gauges(resolved: &[ResolvedEntry], failed: &[EntryFailure]) {
+    let unchanged = resolved.iter().filter(|entry| entry.unchanged).count();
+    let cached = resolved.iter().filter(|entry| entry.from_cache).count();
+    sbproxy_observe::metrics::set_aggregate_entries(
+        "resolved",
+        i64::try_from(resolved.len().saturating_sub(unchanged + cached)).unwrap_or(i64::MAX),
+    );
+    sbproxy_observe::metrics::set_aggregate_entries(
+        "unchanged",
+        i64::try_from(unchanged).unwrap_or(i64::MAX),
+    );
+    sbproxy_observe::metrics::set_aggregate_entries(
+        "failed",
+        i64::try_from(failed.len()).unwrap_or(i64::MAX),
+    );
 }
 
 /// The reason string for an entry whose group is absent or failed.
@@ -1008,12 +1362,76 @@ fn reason_or_deadline(outcome: Option<&Result<FetchedTree, String>>) -> String {
     }
 }
 
+/// The overlay a config authority publishes: `origins:`, plus
+/// `origin_defaults` when the runtime document carries one.
+///
+/// Built from scratch rather than by removing keys from the runtime
+/// document, and that is the whole point. A payload assembled by
+/// subtraction carries whatever nobody thought to subtract, and the
+/// runtime document is full of things a fleet must never receive: this
+/// is the node that runs the aggregator, so it necessarily declares
+/// `proxy.config_authority`, and any entry with a `credential:` needs a
+/// `proxy.secrets` backend in the same file to resolve it against. Both
+/// are on [`sbproxy_config::AUTHORITY_DENIED_PATHS`], so a
+/// subtract-two-keys payload is refused by the publish screen on every
+/// real configuration, and a subtract-more-keys payload would be one
+/// new denied path away from the same bug. Constructing the allowed set
+/// makes the refusal unreachable by shape rather than by list.
+///
+/// `origin_defaults` rides along because it is deliberately **not** a
+/// denied path: the platform raising a security floor across the fleet
+/// is the one thing that channel exists for, and a subscriber's
+/// `GET /admin/origin-composition` then reports the floor its composed
+/// origins were actually built from. It is not re-applied anywhere on a
+/// node, because nothing on a node composes.
+///
+/// Everything else a platform team wants to distribute goes through
+/// `sbproxy config authority publish` with a payload it writes. This
+/// verb composes origins.
+///
+/// # Errors
+///
+/// Returns [`AggregateError::Parse`] when the runtime document's root is
+/// not a mapping or the result will not serialize.
+fn composition_payload(
+    config: &ConfigFile,
+    hand_written: &serde_yaml::Value,
+    origins: &BTreeMap<String, serde_yaml::Mapping>,
+) -> Result<String, AggregateError> {
+    let mut document = serde_yaml::Mapping::new();
+    if let Some(defaults) = config.origin_defaults.as_ref() {
+        document.insert(
+            serde_yaml::Value::String("origin_defaults".to_string()),
+            serde_yaml::Value::Mapping(defaults.clone()),
+        );
+    }
+    let mut map = match hand_written {
+        serde_yaml::Value::Mapping(existing) => existing.clone(),
+        // A runtime document with no `origins:` at all, or one whose
+        // `origins:` is not a mapping. The second is refused where it is
+        // read; this arm keeps the payload well-formed either way.
+        _ => serde_yaml::Mapping::new(),
+    };
+    for (host, origin) in origins {
+        map.insert(
+            serde_yaml::Value::String(host.clone()),
+            serde_yaml::Value::Mapping(origin.clone()),
+        );
+    }
+    document.insert(
+        serde_yaml::Value::String("origins".to_string()),
+        serde_yaml::Value::Mapping(map),
+    );
+    serde_yaml::to_string(&serde_yaml::Value::Mapping(document))
+        .map_err(|error| AggregateError::Parse(error.to_string()))
+}
+
 /// Splice composed origins into the runtime document.
 ///
-/// Through text and back rather than through the typed struct, because
-/// text is what the authority signs and what a node parses, so an origin
-/// that only survives in memory is caught here rather than at a
-/// subscriber's boot.
+/// The **offline** half, and the one `--out` writes. Through text and
+/// back rather than through the typed struct, because text is what a
+/// node parses, so an origin that only survives in memory is caught
+/// here rather than at a boot.
 ///
 /// Both composition blocks are removed. `origin_sources` because a
 /// composed output is not a source of further composition and
@@ -1021,6 +1439,9 @@ fn reason_or_deadline(outcome: Option<&Result<FetchedTree, String>>) -> String {
 /// floor is already folded into every composed origin and leaving it
 /// would let a node re-apply it over hand-written origins the aggregator
 /// never touched.
+///
+/// Nothing here is published. The published payload is
+/// [`composition_payload`], which is built up rather than cut down.
 ///
 /// # Errors
 ///
@@ -1154,6 +1575,22 @@ impl Coalescer {
         }
     }
 
+    /// Adopt new timings without closing the window that is open.
+    ///
+    /// The runtime document is re-read every cycle, so the two durations
+    /// can change under a pending window. Rebuilding the coalescer
+    /// instead would drop the pending entries, which is a lost publish
+    /// rather than a retuned one.
+    pub(crate) fn retune(&mut self, config: &sbproxy_config::OriginAggregatorConfig) {
+        self.debounce = Duration::from_secs(config.debounce_secs);
+        self.max_deferral = Duration::from_secs(config.max_deferral_secs);
+    }
+
+    /// How many entries are waiting on the current window.
+    pub(crate) fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
     /// Clear the window after a compose.
     pub(crate) fn reset(&mut self) {
         self.window_opened = None;
@@ -1213,6 +1650,7 @@ impl CompositionPublisher for AuthorityPublisher {
 
 /// What one round decided.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum RoundOutcome {
     /// The composition differed and went to the authority.
     Published {
@@ -1235,6 +1673,7 @@ pub enum RoundOutcome {
 /// construction. A node that never aggregates leaves this empty and the
 /// admin route says so rather than inventing a zero.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct AggregationStatus {
     /// When the round finished, in unix milliseconds.
     pub at_unix_ms: u64,
@@ -1313,6 +1752,32 @@ impl Aggregator {
                 return Err(error);
             }
         };
+        self.publish_composed(composed, publisher)
+    }
+
+    /// Decide whether to publish a composition already in hand, and
+    /// publish it if so.
+    ///
+    /// Split out from [`Self::run_round`] because the one-shot CLI has
+    /// already composed by the time it decides to publish: it needs the
+    /// outcome for `--explain`, for the failure warnings and for the
+    /// JSON summary. Composing a second time inside `run_round` cost a
+    /// second round of I/O and, worse, reported every entry as
+    /// `unchanged` the second time through, so
+    /// `sbproxy_aggregate_entries{outcome="resolved"}` read zero
+    /// immediately after a publish that resolved every entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AggregateError::Publish`] when the authority refused
+    /// the composed document. The refusal is recorded on the admin
+    /// status and counted before it is returned, because the operator
+    /// who has to fix it is reading one of those two surfaces.
+    pub fn publish_composed(
+        &mut self,
+        composed: CompositionOutcome,
+        publisher: &dyn CompositionPublisher,
+    ) -> Result<RoundOutcome, AggregateError> {
         if !self.would_change(&composed) {
             sbproxy_observe::metrics::record_aggregate_round("unchanged");
             record_status(status_of(&composed, "unchanged", None, None));
@@ -1323,7 +1788,12 @@ impl Aggregator {
             );
             return Ok(RoundOutcome::Unchanged { outcome: composed });
         }
-        match publisher.publish(&composed.yaml) {
+        // The payload, never the runtime document. A bundle carrying a
+        // node's `proxy:` block is refused by the denied-path screen on
+        // every real configuration, and would be wrong even if it were
+        // not: a subscriber's listeners, TLS, admin surface and secrets
+        // are not the fleet's to set.
+        match publisher.publish(&composed.payload) {
             Ok(revision) => {
                 self.mark_published(&composed);
                 sbproxy_observe::metrics::record_aggregate_round("published");
@@ -1402,22 +1872,28 @@ fn now_unix_ms() -> u64 {
 /// after that is per-round and is logged rather than returned, because a
 /// single unreachable repository must not stop a proxy from serving.
 pub fn spawn(config_path: &str, mode: sbproxy_config::BundleMode) -> anyhow::Result<()> {
-    let text = match std::fs::read_to_string(config_path) {
-        Ok(text) => text,
+    // `from_path` rather than a read plus `with_fetch_context`, because
+    // remembering where the document came from is what lets every round
+    // re-read it. A SIGHUP or a config-watcher reload updates the node's
+    // own pipeline and `GET /admin/origin-composition`; an aggregator
+    // frozen at boot would keep publishing the boot-time document, so
+    // the two halves of one admin response would disagree and the
+    // operator's only signal would be that nothing happened.
+    let mut aggregator = match Aggregator::from_path(
+        std::path::Path::new(config_path),
+        FetchContext::with_git_binary(),
+    ) {
+        Ok(aggregator) => aggregator,
+        Err(AggregateError::NoSources) => return Ok(()),
+        Err(AggregateError::Io(reason)) => {
+            tracing::debug!(%reason, "aggregate: no readable config document; not aggregating");
+            return Ok(());
+        }
         Err(error) => {
-            tracing::debug!(%error, "aggregate: no readable config document; not aggregating");
+            tracing::warn!(%error, "aggregate: not aggregating on this node");
             return Ok(());
         }
     };
-    let mut aggregator =
-        match Aggregator::with_fetch_context(&text, FetchContext::with_git_binary()) {
-            Ok(aggregator) => aggregator,
-            Err(AggregateError::NoSources) => return Ok(()),
-            Err(error) => {
-                tracing::warn!(%error, "aggregate: not aggregating on this node");
-                return Ok(());
-            }
-        };
     if aggregator.entries().is_empty() {
         return Ok(());
     }
@@ -1434,12 +1910,17 @@ pub fn spawn(config_path: &str, mode: sbproxy_config::BundleMode) -> anyhow::Res
         tracing::error!(%error, "aggregate: entry credentials did not resolve; not aggregating");
         return Ok(());
     }
+    // Seed the change detector from what this authority is already
+    // serving, so a restart does not republish a byte-identical payload
+    // and rebuild every subscriber's pipeline for nothing.
+    if let Some(digest) = authority.current_content_digest() {
+        aggregator.seed_published_digest(digest);
+    }
     let publisher = AuthorityPublisher::new(authority, mode);
-    let timings = aggregator.timings().clone();
     std::thread::Builder::new()
         .name("sbproxy-aggregate".to_string())
         .spawn(move || {
-            aggregation_loop(&mut aggregator, &publisher, &timings, None);
+            aggregation_loop(&mut aggregator, &publisher, None);
         })
         .map_err(|error| anyhow::anyhow!("spawn the aggregation thread: {error}"))?;
     tracing::info!("aggregate: composition loop started");
@@ -1454,25 +1935,65 @@ pub fn spawn(config_path: &str, mode: sbproxy_config::BundleMode) -> anyhow::Res
 /// bound counting compositions would never be reached and the loop would
 /// never return. A test and a cron-shaped invocation both want "look
 /// this many times", which is what this is.
+///
+/// The timings are re-read from the aggregator each cycle rather than
+/// captured once, because the runtime document is re-read each cycle
+/// too: an operator who lowers `poll_interval_secs` and reloads expects
+/// the next cycle to use it.
 pub fn aggregation_loop(
     aggregator: &mut Aggregator,
     publisher: &dyn CompositionPublisher,
-    timings: &sbproxy_config::OriginAggregatorConfig,
     polls: Option<u32>,
 ) {
-    let poll_interval = Duration::from_secs(timings.poll_interval_secs.max(1));
-    let mut coalescer = Coalescer::new(timings);
+    let mut coalescer = Coalescer::new(aggregator.timings());
     let mut next_poll = Instant::now();
     let mut polled = 0_u32;
+    let mut compose = |aggregator: &mut Aggregator,
+                       coalescer: &mut Coalescer,
+                       entries: usize,
+                       deferral_ceiling: bool| {
+        coalescer.reset();
+        tracing::info!(
+            entries,
+            deferral_ceiling,
+            "aggregate: composing for the entries that moved",
+        );
+        if let Err(error) = aggregator.run_round(publisher) {
+            tracing::error!(%error, "aggregate: round failed");
+        }
+    };
     loop {
         let now = Instant::now();
         if now >= next_poll {
             if polls.is_some_and(|limit| polled >= limit) {
+                // Drain a window that is still open before returning.
+                // With `debounce_secs > poll_interval_secs` the last
+                // window is never closed by a `decide`, so a bounded run
+                // would otherwise observe movement and then exit without
+                // composing for it, which is the silent no-op a
+                // cron-shaped invocation would never notice.
+                let pending = coalescer.pending_count();
+                if pending > 0 {
+                    compose(aggregator, &mut coalescer, pending, false);
+                }
                 return;
             }
+            // Before the poll, so an entry added to the document this
+            // cycle is polled this cycle rather than next.
+            aggregator.refresh_document();
+            coalescer.retune(aggregator.timings());
             let moved = aggregator.poll();
             polled = polled.saturating_add(1);
             coalescer.observe(&moved, now);
+            // Bound rather than chained so the config-reader registry
+            // can see an unambiguous read of the field: the scanner
+            // looks for a plain access on a value of the config type,
+            // and the whole point of that gate is that a documented key
+            // nothing reads cannot ship.
+            let poll_interval = {
+                let timings: &sbproxy_config::OriginAggregatorConfig = aggregator.timings();
+                Duration::from_secs(timings.poll_interval_secs.max(1))
+            };
             next_poll = now + poll_interval;
         }
         match coalescer.decide(Instant::now()) {
@@ -1480,15 +2001,7 @@ pub fn aggregation_loop(
                 entries,
                 deferral_ceiling,
             } => {
-                coalescer.reset();
-                tracing::info!(
-                    entries = entries.len(),
-                    deferral_ceiling,
-                    "aggregate: composing for the entries that moved",
-                );
-                if let Err(error) = aggregator.run_round(publisher) {
-                    tracing::error!(%error, "aggregate: round failed");
-                }
+                compose(aggregator, &mut coalescer, entries.len(), deferral_ceiling);
             }
             CoalesceDecision::Waiting { next_check } => {
                 let until_poll = next_poll.saturating_duration_since(Instant::now());

@@ -15,10 +15,10 @@
 //! publisher would prove only that the aggregator can call a function.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
@@ -66,6 +66,20 @@ struct FixtureGit {
     /// What `ls_remote` answers, when it should disagree with the
     /// commit a checkout reports. That is what an annotated tag does.
     ls_remote_sha: Mutex<Option<String>>,
+    /// Extra wall-clock every `ls_remote` takes. The real one is a
+    /// network round trip; the fixture's is instant, which is why the
+    /// serial poll phase was invisible to the whole suite.
+    poll_delay: Mutex<Duration>,
+    /// Peak simultaneous polls, for the bounded-poll assertion.
+    polls_in_flight: AtomicUsize,
+    peak_polls_in_flight: AtomicUsize,
+    /// Paths the checkout materializes as symlinks rather than files,
+    /// pointing at the given target. That is what `git clone` does with
+    /// a symlink a project repository committed.
+    links: Mutex<BTreeMap<String, PathBuf>>,
+    /// Paths the checkout materializes with raw bytes, so a test can
+    /// produce a file that is there and is not readable as text.
+    raw: Mutex<BTreeMap<String, Vec<u8>>>,
 }
 
 impl FixtureGit {
@@ -107,6 +121,26 @@ impl FixtureGit {
     fn peak_concurrency(&self) -> usize {
         self.peak_in_flight.load(Ordering::SeqCst)
     }
+
+    fn peak_poll_concurrency(&self) -> usize {
+        self.peak_polls_in_flight.load(Ordering::SeqCst)
+    }
+
+    /// Materialize `path` with bytes that are not valid UTF-8.
+    fn write_raw(&self, path: &str, bytes: Vec<u8>) {
+        self.raw
+            .lock()
+            .expect("raw")
+            .insert(path.to_string(), bytes);
+    }
+
+    /// Materialize `path` as a symlink at `target` instead of a file.
+    fn link(&self, path: &str, target: PathBuf) {
+        self.links
+            .lock()
+            .expect("links")
+            .insert(path.to_string(), target);
+    }
 }
 
 /// The `Box<dyn Cloner>` a [`FetchContext`] takes, sharing one fixture.
@@ -136,6 +170,13 @@ impl Cloner for SharedGit {
         request: &LsRemoteRequest<'_>,
     ) -> Result<Option<String>, ConfigSourceError> {
         self.0.polls.fetch_add(1, Ordering::SeqCst);
+        let now = self.0.polls_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.0.peak_polls_in_flight.fetch_max(now, Ordering::SeqCst);
+        let delay = *self.0.poll_delay.lock().expect("poll delay");
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+        self.0.polls_in_flight.fetch_sub(1, Ordering::SeqCst);
         if self
             .0
             .unreachable
@@ -184,14 +225,29 @@ impl SharedGit {
                 request.repo
             )));
         };
+        let links = self.0.links.lock().expect("links").clone();
+        let raw = self.0.raw.lock().expect("raw").clone();
         for (path, body) in &repo.files {
             let full = request.dest.join(path);
             if let Some(parent) = full.parent() {
                 std::fs::create_dir_all(parent)
                     .map_err(|error| ConfigSourceError::Clone(error.to_string()))?;
             }
-            std::fs::write(&full, body)
-                .map_err(|error| ConfigSourceError::Clone(error.to_string()))?;
+            // `git clone` materializes a committed symlink as a symlink,
+            // which is the half of the trust boundary the checkout owns.
+            if let Some(target) = links.get(path) {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(target, &full)
+                    .map_err(|error| ConfigSourceError::Clone(error.to_string()))?;
+                #[cfg(not(unix))]
+                let _ = target;
+                continue;
+            }
+            match raw.get(path) {
+                Some(bytes) => std::fs::write(&full, bytes),
+                None => std::fs::write(&full, body),
+            }
+            .map_err(|error| ConfigSourceError::Clone(error.to_string()))?;
         }
         Ok(ResolvedRevision {
             repo: request.repo.to_string(),
@@ -240,11 +296,83 @@ spec:
 "#;
 
 /// A runtime document with one entry, composed against a platform floor.
+///
+/// The `proxy:` block is the shipped shape, not a minimal one. Every
+/// node that can run the in-process aggregator declares
+/// `proxy.config_authority` by construction, and every entry with a
+/// `credential:` needs a `proxy.secrets` backend in the same file to
+/// resolve it against, exactly as `examples/origin-profiles/sb.yml`
+/// does. Both are on `AUTHORITY_DENIED_PATHS`. A fixture that carried
+/// only `http_bind_port` was a config no operator could write, and it
+/// hid a payload that every real configuration would have had refused
+/// (WOR-2432 review, Blocker 1). A hand-written `origins:` key is here
+/// for the same reason: it has to reach the fleet, because the runtime
+/// document is the aggregator's and not each subscriber's.
 fn runtime(entries: &str) -> String {
+    runtime_with_proxy(AGGREGATOR_NODE_PROXY, entries)
+}
+
+/// The offline half's runtime document: a single node with no config
+/// authority at all.
+///
+/// `--out` is explicitly the path for a deployment that has none, and a
+/// composed document carrying a `config_authority.publish` block whose
+/// signing key does not exist is refused by `compile_config` for a
+/// reason that has nothing to do with composition. The publish tests use
+/// [`AGGREGATOR_NODE_PROXY`], which is the shape that matters there.
+fn single_node_runtime(entries: &str) -> String {
+    runtime_with_proxy(SINGLE_NODE_PROXY, entries)
+}
+
+/// The `proxy:` block of a node that runs the in-process aggregator.
+///
+/// `config_authority.publish` is here because the loop only starts where
+/// one is; `secrets` is here because an entry with a `credential:` needs
+/// a backend in the same file; `admin` carries a real password because a
+/// publishing node's admin API guards a fleet-wide write and
+/// `compile_config` refuses the shipped default there. All three are on
+/// `AUTHORITY_DENIED_PATHS`, which is the point.
+const AGGREGATOR_NODE_PROXY: &str = r#"proxy:
+  http_bind_port: 0
+  admin:
+    enabled: true
+    port: 0
+    password: fixture-admin-password
+  secrets:
+    backends:
+      - type: local
+        name: ci
+        entries:
+          github-token: "local-dev-token"
+  config_authority:
+    publish:
+      authority_id: fixture-authority
+      key_id: fixture-key
+      signing_key_file: /nonexistent/fixture.key
+      store_dir: /nonexistent/store
+      bind: 127.0.0.1:65535"#;
+
+/// The `proxy:` block of a single node that composes to a file.
+const SINGLE_NODE_PROXY: &str = r#"proxy:
+  http_bind_port: 0
+  secrets:
+    backends:
+      - type: local
+        name: ci
+        entries:
+          github-token: "local-dev-token""#;
+
+fn runtime_with_proxy(proxy: &str, entries: &str) -> String {
     format!(
         r#"
-proxy:
-  http_bind_port: 0
+{proxy}
+origins:
+  "status.acme.test":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: ok
 origin_defaults:
   policies:
     - name: platform_waf
@@ -267,9 +395,7 @@ origin_sources:
     )
 }
 
-fn one_entry() -> String {
-    runtime(
-        r#"    - name: checkout
+const ONE_ENTRY: &str = r#"    - name: checkout
       repo: https://example.test/checkout.git
       path: sbproxy/origin.yaml
       environment: prod
@@ -277,8 +403,16 @@ fn one_entry() -> String {
         upstream: https://checkout.internal
       hosts:
         api: [api.acme.test]
-"#,
-    )
+"#;
+
+fn one_entry() -> String {
+    runtime(ONE_ENTRY)
+}
+
+/// The same entry on a node with no config authority, for the offline
+/// tests: `--out` exists for exactly that deployment.
+fn one_entry_single_node() -> String {
+    single_node_runtime(ONE_ENTRY)
 }
 
 fn aggregator(document: &str, git: &Arc<FixtureGit>) -> Aggregator {
@@ -323,8 +457,8 @@ fn the_aggregator_resolves_every_entry_composes_and_publishes_through_the_author
     assert_eq!(outcome.origins, 1);
     assert_eq!(authority.current_revision(), 1);
 
-    // The composed document really carries the origin, the floor, and
-    // the environment layer, and it carries neither composition block.
+    // The offline document really carries the origin, the floor, and the
+    // environment layer, and it carries neither composition block.
     let composed: sbproxy_config::ConfigFile =
         serde_yaml::from_str(&outcome.yaml).expect("composed document parses");
     assert!(composed.origins.contains_key("api.acme.test"));
@@ -338,6 +472,94 @@ fn the_aggregator_resolves_every_entry_composes_and_publishes_through_the_author
     assert!(
         outcome.yaml.contains("owasp_crs"),
         "the platform floor reached the composed origin"
+    );
+}
+
+/// The published payload carries no path a subscriber owns outright.
+///
+/// The fixture runtime document declares `proxy.config_authority`,
+/// `proxy.secrets` and `proxy.admin`, all three on
+/// `AUTHORITY_DENIED_PATHS`, because that is what a real aggregator node
+/// looks like: the in-process loop only starts where an authority is
+/// configured, and an entry with a `credential:` needs a backend in the
+/// same file to resolve it against.
+///
+/// A payload built by removing two keys from the runtime document keeps
+/// all three, so `validate_publish_payload` refuses every round with
+/// `denied_path` and nothing is ever published (WOR-2432 review,
+/// Blocker 1). The payload is built up from the origins instead, so the
+/// refusal is unreachable by shape rather than by list.
+#[test]
+fn the_published_payload_carries_no_denied_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let git = Arc::new(FixtureGit::with(
+        "https://example.test/checkout.git",
+        "a".repeat(40).as_str(),
+        &[("sbproxy/origin.yaml", CHECKOUT_PROFILE)],
+    ));
+    let document = one_entry();
+    // The fixture is only worth anything if it really carries them.
+    for denied in ["proxy.config_authority", "proxy.secrets", "proxy.admin"] {
+        let key = denied.split('.').next_back().expect("a key");
+        assert!(
+            document.contains(&format!("  {key}:")),
+            "the fixture runtime document must declare {denied}, or this test proves nothing"
+        );
+    }
+    assert!(
+        !sbproxy_config::denied_paths_in(&document)
+            .expect("the runtime document parses")
+            .is_empty(),
+        "the runtime document itself is full of denied paths, which is the whole point"
+    );
+
+    let mut aggregator = aggregator(&document, &git);
+    let authority = Arc::new(
+        ConfigAuthority::from_config(&publish_config(dir.path())).expect("authority builds"),
+    );
+    let publisher = AuthorityPublisher::new(Arc::clone(&authority), BundleMode::Overlay);
+    let outcome = aggregator
+        .run_round(&publisher)
+        .expect("a real runtime document must publish");
+    let RoundOutcome::Published { revision, outcome } = outcome else {
+        panic!("the first round must publish");
+    };
+    assert_eq!(revision, 1);
+    assert_eq!(authority.current_revision(), 1);
+
+    let denied = sbproxy_config::denied_paths_in(&outcome.payload).expect("the payload parses");
+    assert!(
+        denied.is_empty(),
+        "the published payload names path(s) every subscriber owns: {denied:?}\n{}",
+        outcome.payload
+    );
+
+    // And it is the right narrow shape, not merely a clean one.
+    let payload: serde_yaml::Mapping =
+        serde_yaml::from_str(&outcome.payload).expect("the payload is a mapping");
+    let keys: Vec<String> = payload
+        .keys()
+        .filter_map(|key| key.as_str().map(str::to_string))
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["origin_defaults".to_string(), "origins".to_string()],
+        "the payload is built up from the origins overlay, not cut down from the document"
+    );
+    let parsed: sbproxy_config::ConfigFile =
+        serde_yaml::from_str(&outcome.payload).expect("the payload is a config document");
+    assert!(
+        parsed.origins.contains_key("api.acme.test"),
+        "the composed origin travels"
+    );
+    assert!(
+        parsed.origins.contains_key("status.acme.test"),
+        "and so does the hand-written one, because the runtime document is the aggregator's and \
+         not each subscriber's"
+    );
+    assert!(
+        parsed.origin_defaults.is_some(),
+        "`origin_defaults` is deliberately not a denied path: it is the platform's floor channel"
     );
 }
 
@@ -545,7 +767,7 @@ fn an_entry_that_never_resolved_aborts_the_round_rather_than_dropping_its_hosts(
     git.break_repo("https://example.test/checkout.git");
     let mut aggregator = aggregator(&one_entry(), &git);
     let error = aggregator.compose().expect_err("nothing to fall back to");
-    let AggregateError::Unresolvable { entries } = &error else {
+    let AggregateError::Unresolvable { entries, .. } = &error else {
         panic!("expected an unresolvable refusal, got {error}");
     };
     assert_eq!(entries, &["checkout".to_string()]);
@@ -994,13 +1216,12 @@ fn the_loop_publishes_once_for_a_fleet_that_stops_moving() {
         &[("sbproxy/origin.yaml", CHECKOUT_PROFILE)],
     ));
     let mut aggregator = aggregator(&one_entry(), &git);
-    let timings = aggregator.timings().clone();
     let publisher = RecordingPublisher::default();
     // The bound counts poll cycles rather than compositions, which is
     // the only bound that can be reached: a fleet where nothing moves
     // composes nothing, so a loop counting compositions would never
     // return. Three polls, one movement (the first), one publish.
-    aggregation_loop(&mut aggregator, &publisher, &timings, Some(3));
+    aggregation_loop(&mut aggregator, &publisher, Some(3));
     let published = publisher.published.lock().expect("published");
     assert_eq!(
         published.len(),
@@ -1025,7 +1246,7 @@ fn out_writes_a_composed_document_that_validates_and_carries_no_origin_sources()
         "a".repeat(40).as_str(),
         &[("sbproxy/origin.yaml", CHECKOUT_PROFILE)],
     ));
-    let mut aggregator = aggregator(&one_entry(), &git);
+    let mut aggregator = aggregator(&one_entry_single_node(), &git);
     let composed = aggregator.compose().expect("composes");
     Aggregator::write_composed(&composed, &out).expect("writes");
 
@@ -1052,7 +1273,7 @@ fn the_composed_output_is_byte_identical_across_two_runs() {
         &[("sbproxy/origin.yaml", CHECKOUT_PROFILE)],
     ));
     let first = {
-        let mut aggregator = aggregator(&one_entry(), &git);
+        let mut aggregator = aggregator(&one_entry_single_node(), &git);
         let composed = aggregator.compose().expect("composes");
         let path = dir.path().join("first.yml");
         Aggregator::write_composed(&composed, &path).expect("writes");
@@ -1060,7 +1281,7 @@ fn the_composed_output_is_byte_identical_across_two_runs() {
     };
     let second = {
         // A fresh aggregator, so nothing carries over between runs.
-        let mut aggregator = aggregator(&one_entry(), &git);
+        let mut aggregator = aggregator(&one_entry_single_node(), &git);
         let composed = aggregator.compose().expect("composes");
         let path = dir.path().join("second.yml");
         Aggregator::write_composed(&composed, &path).expect("writes");
@@ -1084,7 +1305,7 @@ fn out_writes_nothing_at_all_when_an_entry_will_not_resolve() {
         &[("sbproxy/origin.yaml", CHECKOUT_PROFILE)],
     );
     git.break_repo("https://example.test/checkout.git");
-    let mut aggregator = aggregator(&one_entry(), &git);
+    let mut aggregator = aggregator(&one_entry_single_node(), &git);
     assert!(aggregator.compose().is_err(), "the resolve fails");
     assert!(
         !out.exists(),
@@ -1102,7 +1323,7 @@ fn the_composed_header_names_every_source_entry_and_its_resolved_sha() {
         "a".repeat(40).as_str(),
         &[("sbproxy/origin.yaml", CHECKOUT_PROFILE)],
     ));
-    let mut aggregator = aggregator(&one_entry(), &git);
+    let mut aggregator = aggregator(&one_entry_single_node(), &git);
     let composed = aggregator.compose().expect("composes");
     let header = composed.header();
     assert!(header.starts_with("# composed by sbproxy aggregate"));
@@ -1136,7 +1357,7 @@ fn dry_run_reports_what_would_change_and_writes_nothing() {
         "a".repeat(40).as_str(),
         &[("sbproxy/origin.yaml", CHECKOUT_PROFILE)],
     ));
-    let mut aggregator = aggregator(&one_entry(), &git);
+    let mut aggregator = aggregator(&one_entry_single_node(), &git);
     let composed = aggregator.compose().expect("composes");
 
     // Nothing there yet.
@@ -1204,4 +1425,547 @@ fn publish_config(dir: &Path) -> ConfigAuthorityPublishConfig {
     };
     publish.validate().expect("fixture publish validates");
     publish
+}
+
+// --- the review's findings, each with the test that would have caught it
+
+/// The entry gauges are written on the abort paths too.
+///
+/// The gauge's own doc and `docs/configuration.md` both promise "every
+/// outcome on every round including the zeroes, so a failure that clears
+/// shows as the drop rather than as a series that stops moving". That
+/// used to be false on exactly the two paths an operator alerts on: a
+/// partition that takes out every repository returned `Unresolvable`
+/// with the gauges left showing the last good round, which reads as
+/// evidence of absence (WOR-2432 review, Major 2).
+#[test]
+fn the_entry_gauges_are_written_when_the_round_aborts() {
+    let git = Arc::new(FixtureGit::default());
+    let mut entries = String::new();
+    for index in 0..3 {
+        let repo = format!("https://example.test/down{index}.git");
+        git.set(
+            &repo,
+            &format!("{index}{}", "a".repeat(39)),
+            &[("sbproxy/origin.yaml", BILLING_PROFILE)],
+        );
+        git.break_repo(&repo);
+        entries.push_str(&format!(
+            "    - name: down{index}\n      repo: {repo}\n      path: sbproxy/origin.yaml\n      \
+             hosts:\n        api: [down{index}.acme.test]\n"
+        ));
+    }
+    // A good round first, so the gauge holds numbers that would be stale
+    // rather than absent. Absent and stale look different to an alert
+    // and the stale one is worse.
+    {
+        let healthy = Arc::new(FixtureGit::with(
+            "https://example.test/checkout.git",
+            "a".repeat(40).as_str(),
+            &[("sbproxy/origin.yaml", CHECKOUT_PROFILE)],
+        ));
+        aggregator(&one_entry(), &healthy)
+            .compose()
+            .expect("a healthy round");
+    }
+    assert_eq!(gauge_value("failed"), 0, "the healthy round left failed=0");
+
+    let mut aggregator = aggregator(&runtime(&entries), &git);
+    let error = aggregator
+        .compose()
+        .expect_err("nothing has ever resolved, so the round aborts");
+    assert!(matches!(error, AggregateError::Unresolvable { .. }));
+    assert_eq!(
+        gauge_value("failed"),
+        3,
+        "an abort has to move the gauge an operator alerts on"
+    );
+    assert_eq!(gauge_value("resolved"), 0);
+}
+
+/// The current value of one `sbproxy_aggregate_entries` series.
+fn gauge_value(outcome: &str) -> i64 {
+    prometheus::gather()
+        .iter()
+        .find(|family| family.name() == "sbproxy_aggregate_entries")
+        .and_then(|family| {
+            family
+                .get_metric()
+                .iter()
+                .find(|metric| {
+                    metric
+                        .get_label()
+                        .iter()
+                        .any(|pair| pair.name() == "outcome" && pair.value() == outcome)
+                })
+                .map(|metric| metric.get_gauge().value() as i64)
+        })
+        .unwrap_or(-1)
+}
+
+/// The poll phase runs under the same bounded pool the fetch phase does.
+///
+/// Serially it was neither bounded nor deadline-capped, so a handful of
+/// blackholing git hosts turned a two-minute poll interval into a
+/// continuous poll storm against the healthy repositories while nothing
+/// composed at all. Invisible to the whole suite, because the fixture's
+/// `ls_remote` returned instantly and honored no delay unlike its
+/// `fetch` (WOR-2432 review, Major 3).
+#[test]
+fn the_poll_phase_is_bounded_and_runs_concurrently() {
+    let git = Arc::new(FixtureGit::default());
+    let mut entries = String::new();
+    for index in 0..6 {
+        let repo = format!("https://example.test/slowpoll{index}.git");
+        git.set(
+            &repo,
+            &format!("{index}{}", "a".repeat(39)),
+            &[("sbproxy/origin.yaml", BILLING_PROFILE)],
+        );
+        entries.push_str(&format!(
+            "    - name: slowpoll{index}\n      repo: {repo}\n      path: sbproxy/origin.yaml\n \
+             \x20    hosts:\n        api: [slowpoll{index}.acme.test]\n"
+        ));
+    }
+    *git.poll_delay.lock().expect("poll delay") = Duration::from_millis(150);
+    let document = runtime(&entries).replace("concurrency: 4", "concurrency: 3");
+    let mut aggregator = aggregator(&document, &git);
+    let started = Instant::now();
+    let moved = aggregator.poll();
+    let elapsed = started.elapsed();
+    assert_eq!(moved.len(), 6, "every entry is new, so every entry moved");
+    assert!(
+        git.peak_poll_concurrency() > 1,
+        "polls must overlap; peak was {}",
+        git.peak_poll_concurrency()
+    );
+    assert!(
+        git.peak_poll_concurrency() <= 3,
+        "and stay under `concurrency`; peak was {}",
+        git.peak_poll_concurrency()
+    );
+    assert!(
+        elapsed < Duration::from_millis(6 * 150),
+        "six serial polls would take {}ms; this took {}ms",
+        6 * 150,
+        elapsed.as_millis()
+    );
+}
+
+/// A poll that outruns the round's deadline does not hold the cycle.
+#[test]
+fn the_poll_phase_stops_at_the_round_deadline() {
+    let git = Arc::new(FixtureGit::default());
+    let mut entries = String::new();
+    for index in 0..4 {
+        let repo = format!("https://example.test/blackhole{index}.git");
+        git.set(
+            &repo,
+            &format!("{index}{}", "a".repeat(39)),
+            &[("sbproxy/origin.yaml", BILLING_PROFILE)],
+        );
+        entries.push_str(&format!(
+            "    - name: blackhole{index}\n      repo: {repo}\n      path: \
+             sbproxy/origin.yaml\n      timeout_secs: 60\n      hosts:\n        \
+             api: [blackhole{index}.acme.test]\n"
+        ));
+    }
+    *git.poll_delay.lock().expect("poll delay") = Duration::from_millis(700);
+    let document = runtime(&entries)
+        .replace("concurrency: 4", "concurrency: 1")
+        .replace("deadline_secs: 30", "deadline_secs: 1");
+    let mut aggregator = aggregator(&document, &git);
+    let started = Instant::now();
+    let moved = aggregator.poll();
+    let elapsed = started.elapsed();
+    assert_eq!(
+        moved.len(),
+        4,
+        "an entry whose poll never got a turn is reported as moved, which is the safe direction"
+    );
+    assert!(
+        elapsed < Duration::from_millis(1_600),
+        "the round's one-second deadline bounds the poll phase; four serial 700ms polls would \
+         be 2.8s and four serial 60s timeouts would be four minutes. This took {}ms",
+        elapsed.as_millis()
+    );
+    assert!(
+        git.poll_count() < 4,
+        "a poll that never got a turn before the deadline must not have run; {} of 4 ran",
+        git.poll_count()
+    );
+}
+
+/// A reordering is a change, and `--dry-run` has to say so.
+///
+/// The diff was a set difference, so two documents with the same lines
+/// in a different order compared equal, and `report_aggregate_dry_run`
+/// read the empty diff as "unchanged" and exited 0. Swapping two
+/// services' `hosts:` between entries is exactly that shape, and a CI
+/// gate keyed on exit 2 would have passed while `--out` wrote a
+/// genuinely different file (WOR-2432 review, Major 4).
+#[test]
+fn a_reordering_is_reported_as_a_change_rather_than_as_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("composed.yml");
+    let git = Arc::new(FixtureGit::default());
+    git.set(
+        "https://example.test/a.git",
+        &"a".repeat(40),
+        &[("sbproxy/origin.yaml", BILLING_PROFILE)],
+    );
+    git.set(
+        "https://example.test/b.git",
+        &"b".repeat(40),
+        &[("sbproxy/origin.yaml", BILLING_PROFILE)],
+    );
+    // Two *different* profiles, so swapping which entry claims which
+    // host really changes the composed content while leaving the line
+    // multiset identical. That is the shape a set difference cannot see.
+    git.set(
+        "https://example.test/b.git",
+        &"b".repeat(40),
+        &[(
+            "sbproxy/origin.yaml",
+            &BILLING_PROFILE.replace("https://billing.internal", "https://ledger.internal"),
+        )],
+    );
+    let swap = |first: &str, second: &str| {
+        single_node_runtime(&format!(
+            "    - name: alpha\n      repo: https://example.test/a.git\n      path: \
+             sbproxy/origin.yaml\n      hosts:\n        api: [{first}]\n    - name: beta\n      \
+             repo: https://example.test/b.git\n      path: sbproxy/origin.yaml\n      hosts:\n \
+             \x20      api: [{second}]\n"
+        ))
+    };
+
+    let before = aggregator(&swap("one.acme.test", "two.acme.test"), &git)
+        .compose()
+        .expect("composes");
+    Aggregator::write_composed(&before, &out).expect("writes");
+
+    // The two profiles are identical, so swapping which entry claims
+    // which host produces a document with the same line multiset.
+    let after = aggregator(&swap("two.acme.test", "one.acme.test"), &git)
+        .compose()
+        .expect("composes");
+    let second = dir.path().join("second.yml");
+    Aggregator::write_composed(&after, &second).expect("writes");
+    assert_ne!(
+        std::fs::read_to_string(&out).expect("read back"),
+        std::fs::read_to_string(&second).expect("read back"),
+        "the fixture has to actually differ, or this test proves nothing"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&out)
+            .expect("read")
+            .lines()
+            .map(str::to_string)
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::fs::read_to_string(&second)
+            .expect("read")
+            .lines()
+            .map(str::to_string)
+            .collect::<std::collections::BTreeSet<_>>(),
+        "and it has to differ only in order, which is the case a set difference cannot see"
+    );
+
+    let diff = Aggregator::diff_against(&after, &out)
+        .expect("diff")
+        .expect("the file exists");
+    assert!(
+        !diff.is_empty(),
+        "a document whose lines are the same in a different order is still a different document"
+    );
+}
+
+/// A project committing its profile as a symlink is refused.
+///
+/// The traversal guard constrained `entry.path`, which the platform
+/// writes. `git clone` materializes symlinks, so the untrusted half of
+/// the boundary could point the profile at any file the composing
+/// process can read (WOR-2432 review, Major 6).
+#[cfg(unix)]
+#[test]
+fn a_profile_committed_as_a_symlink_is_refused_rather_than_followed() {
+    let secret = tempfile::NamedTempFile::new().expect("tempfile");
+    std::fs::write(secret.path(), "name: stolen\nspec: {}\n").expect("write the target");
+    let git = Arc::new(FixtureGit::with(
+        "https://example.test/checkout.git",
+        "a".repeat(40).as_str(),
+        &[("sbproxy/origin.yaml", CHECKOUT_PROFILE)],
+    ));
+    git.link("sbproxy/origin.yaml", secret.path().to_path_buf());
+    let mut aggregator = aggregator(&one_entry(), &git);
+    let error = aggregator.compose().expect_err("a symlink is refused");
+    let message = error.to_string();
+    assert!(
+        message.contains("symbolic link"),
+        "the refusal says what it refused: {message}"
+    );
+    assert!(
+        !message.contains("stolen"),
+        "and never carries the target's contents: {message}"
+    );
+}
+
+/// A profile past the read cap is refused before it is allocated.
+///
+/// `read_to_string` had no bound and `MAX_CONFIG_YAML_BYTES` was checked
+/// after the read, after two parses and after the merge. One project
+/// committing a large generated blob would take down the one process
+/// the whole fleet composes in, and recover into the same read next
+/// round (WOR-2432 review, Major 7).
+#[test]
+fn a_profile_past_the_read_cap_is_refused() {
+    let oversized = format!(
+        "name: checkout\n# {}\nspec: {{}}\n",
+        "x".repeat(
+            usize::try_from(sbproxy_config::source::MAX_CHECKOUT_FILE_BYTES).unwrap_or(0) + 16
+        )
+    );
+    let git = Arc::new(FixtureGit::with(
+        "https://example.test/checkout.git",
+        "a".repeat(40).as_str(),
+        &[("sbproxy/origin.yaml", oversized.as_str())],
+    ));
+    let mut aggregator = aggregator(&one_entry(), &git);
+    let error = aggregator
+        .compose()
+        .expect_err("an oversized profile is refused");
+    let message = error.to_string();
+    assert!(
+        message.contains("past the") && message.contains("byte limit"),
+        "the refusal names the cap: {message}"
+    );
+}
+
+/// The loop re-reads the runtime document between rounds.
+///
+/// `spawn` read the file once and the aggregator kept it for the process
+/// lifetime, so a SIGHUP or a config-watcher reload updated the node's
+/// own pipeline and `GET /admin/origin-composition` while the aggregator
+/// kept publishing the boot-time document. The two halves of one admin
+/// response disagreed and the operator's only signal was that nothing
+/// happened (WOR-2432 review, Major 8).
+#[test]
+fn the_loop_re_reads_the_runtime_document_between_rounds() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("sb.yml");
+    let git = Arc::new(FixtureGit::default());
+    git.set(
+        "https://example.test/checkout.git",
+        &"a".repeat(40),
+        &[("sbproxy/origin.yaml", CHECKOUT_PROFILE)],
+    );
+    git.set(
+        "https://example.test/billing.git",
+        &"b".repeat(40),
+        &[("sbproxy/origin.yaml", BILLING_PROFILE)],
+    );
+    std::fs::write(&path, one_entry()).expect("write the runtime document");
+
+    let mut aggregator =
+        Aggregator::from_path(&path, context(&git)).expect("the aggregator reads the file");
+    let first = aggregator.compose().expect("composes");
+    assert_eq!(first.origins, 1);
+
+    // The platform engineer adds a service and reloads.
+    let with_two = runtime(&format!(
+        "{ONE_ENTRY}    - name: billing\n      repo: https://example.test/billing.git\n      \
+         path: sbproxy/origin.yaml\n      hosts:\n        api: [billing.acme.test]\n"
+    ));
+    std::fs::write(&path, &with_two).expect("rewrite the runtime document");
+
+    assert!(
+        aggregator.refresh_document(),
+        "a changed document on disk has to be picked up"
+    );
+    let second = aggregator.compose().expect("composes again");
+    assert_eq!(
+        second.origins, 2,
+        "the new entry's origins reach the fleet without a restart"
+    );
+    assert!(
+        !aggregator.refresh_document(),
+        "and an unchanged document is not re-parsed on every round"
+    );
+}
+
+/// A restart does not republish what the authority already serves.
+///
+/// The digest lived only in memory, so a restart composed the same
+/// payload, saw no previous digest, and published a byte-identical
+/// revision, which is a full pipeline rebuild on every subscriber
+/// (WOR-2432 review, Minor 10).
+#[test]
+fn a_seeded_digest_stops_a_restart_republishing_the_same_payload() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let git = Arc::new(FixtureGit::with(
+        "https://example.test/checkout.git",
+        "a".repeat(40).as_str(),
+        &[("sbproxy/origin.yaml", CHECKOUT_PROFILE)],
+    ));
+    let authority = Arc::new(
+        ConfigAuthority::from_config(&publish_config(dir.path())).expect("authority builds"),
+    );
+    let publisher = AuthorityPublisher::new(Arc::clone(&authority), BundleMode::Overlay);
+    aggregator(&one_entry(), &git)
+        .run_round(&publisher)
+        .expect("the first process publishes");
+    assert_eq!(authority.current_revision(), 1);
+    let digest = authority
+        .current_content_digest()
+        .expect("the authority is serving something");
+
+    // A second process, same document, same repositories.
+    let mut restarted = aggregator(&one_entry(), &git);
+    restarted.seed_published_digest(digest);
+    let outcome = restarted
+        .run_round(&publisher)
+        .expect("the restarted process runs a round");
+    assert!(
+        matches!(outcome, RoundOutcome::Unchanged { .. }),
+        "a restart must not republish a payload the authority is already serving"
+    );
+    assert_eq!(authority.current_revision(), 1);
+}
+
+/// A one-shot publish reports the entries it actually resolved.
+///
+/// The CLI composed once for `--explain` and the summary, then called
+/// `run_round`, which composed again; the second pass found everything
+/// cached and reported every entry as `unchanged`, so
+/// `sbproxy_aggregate_entries{outcome="resolved"}` read zero immediately
+/// after a publish that resolved every entry (WOR-2432 review, Minor
+/// 11).
+#[test]
+fn a_one_shot_publish_reports_the_entries_it_resolved() {
+    let git = Arc::new(FixtureGit::with(
+        "https://example.test/checkout.git",
+        "a".repeat(40).as_str(),
+        &[("sbproxy/origin.yaml", CHECKOUT_PROFILE)],
+    ));
+    let mut aggregator = aggregator(&one_entry(), &git);
+    let publisher = RecordingPublisher::default();
+    let composed = aggregator.compose().expect("composes once");
+    assert_eq!(gauge_value("resolved"), 1);
+    let outcome = aggregator
+        .publish_composed(composed, &publisher)
+        .expect("publishes the composition already in hand");
+    assert!(matches!(outcome, RoundOutcome::Published { .. }));
+    assert_eq!(
+        gauge_value("resolved"),
+        1,
+        "publishing a composition must not recompose it and report every entry as unchanged"
+    );
+    assert_eq!(git.fetch_count(), 1, "and must not fetch a second time");
+}
+
+/// The confinement seam refuses every host-backed reference form.
+///
+/// The `${VAR}` case was the only one pinned at this seam; `env:`,
+/// `file:` and `vault://env/` were pinned one layer down in
+/// `confined_template` (WOR-2432 review, Minor 13).
+#[test]
+fn every_host_backed_reference_form_is_refused_at_the_aggregator_seam() {
+    for reference in [
+        "${PATH}",
+        "env:PATH",
+        "file:/etc/passwd",
+        "vault://env/PATH",
+    ] {
+        // Each form as a whole value, which is what a host-backed
+        // reference is: the confined pass asks whether a value *is* one,
+        // not whether a URL happens to contain the characters.
+        let profile = format!(
+            "name: checkout\nspec:\n  api:\n    base:\n      action:\n        type: proxy\n      \
+             \x20 url: \"{reference}\"\n"
+        );
+        let git = Arc::new(FixtureGit::with(
+            "https://example.test/checkout.git",
+            "a".repeat(40).as_str(),
+            &[("sbproxy/origin.yaml", profile.as_str())],
+        ));
+        let document = runtime(
+            r#"    - name: checkout
+      repo: https://example.test/checkout.git
+      path: sbproxy/origin.yaml
+      hosts:
+        api: [api.acme.test]
+"#,
+        );
+        let error = aggregator(&document, &git).compose().err();
+        let Some(error) = error else {
+            panic!("`{reference}` composed instead of being refused");
+        };
+        let message = error.to_string();
+        assert!(
+            !message.contains("/usr/bin") && !message.contains("root:"),
+            "and the refusal carries no resolved host value: {message}"
+        );
+    }
+}
+
+/// With `debounce_secs` above `poll_interval_secs`, a bounded run still
+/// composes for the window it opened.
+///
+/// The last window is never closed by a `decide` in that configuration,
+/// so a `--polls n` run observed movement and then exited without
+/// composing for it, which is a silent no-op a cron-shaped invocation
+/// would never notice (WOR-2432 review, Minor 15).
+#[test]
+fn a_bounded_run_drains_a_window_the_debounce_left_open() {
+    let git = Arc::new(FixtureGit::with(
+        "https://example.test/checkout.git",
+        "a".repeat(40).as_str(),
+        &[("sbproxy/origin.yaml", CHECKOUT_PROFILE)],
+    ));
+    let document = one_entry()
+        .replace("poll_interval_secs: 1", "poll_interval_secs: 1")
+        .replace("debounce_secs: 0", "debounce_secs: 600")
+        .replace("max_deferral_secs: 1", "max_deferral_secs: 600");
+    let mut aggregator = aggregator(&document, &git);
+    let publisher = RecordingPublisher::default();
+    aggregation_loop(&mut aggregator, &publisher, Some(1));
+    assert_eq!(
+        publisher.published.lock().expect("published").len(),
+        1,
+        "a bounded run that saw movement must compose for it before it returns"
+    );
+}
+
+/// A profile that is there but unreadable says which of the two it is.
+///
+/// "Not in the repository at the resolved revision" is the wrong answer
+/// for a file that is there and is not UTF-8, and the two send an
+/// operator to different places (WOR-2432 review, Minor 16).
+#[test]
+fn a_profile_that_is_there_but_not_utf8_is_reported_as_such() {
+    let git = Arc::new(FixtureGit::with(
+        "https://example.test/checkout.git",
+        "a".repeat(40).as_str(),
+        &[("sbproxy/origin.yaml", "placeholder")],
+    ));
+    let mut aggregator = aggregator(&one_entry(), &git);
+    // Compose once so the checkout shape is exercised, then replace the
+    // file with bytes that are not UTF-8 on the next fetch.
+    git.set(
+        "https://example.test/checkout.git",
+        &"b".repeat(40),
+        &[("sbproxy/origin.yaml", "placeholder")],
+    );
+    git.write_raw("sbproxy/origin.yaml", vec![0xff, 0xfe, 0xfd]);
+    let error = aggregator
+        .compose()
+        .expect_err("unreadable bytes are refused");
+    let message = error.to_string();
+    assert!(
+        message.contains("could not be read") || message.contains("UTF-8"),
+        "the refusal distinguishes unreadable from missing: {message}"
+    );
+    assert!(
+        !message.contains("is not in the repository"),
+        "and does not claim the file is absent when it is there: {message}"
+    );
 }

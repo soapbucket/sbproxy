@@ -8229,7 +8229,9 @@ A repository URL is credential-stripped, an entry credential is reported as pres
 ### `sbproxy aggregate`: running the composition
 
 ```bash
-# Publish through the config authority this document configures.
+# Compose the origins overlay and publish it through the config
+# authority this document configures. The node's own `proxy:` block
+# stays here; only `origins:` and `origin_defaults` travel.
 sbproxy aggregate -f /etc/sbproxy/sb.yml
 
 # Compose to a file instead, for a single node or a CI review step.
@@ -8248,11 +8250,17 @@ sbproxy aggregate -f /etc/sbproxy/sb.yml --watch
 
 One round fetches every entry, composes, and publishes only when the composed document differs from the last one published. A proxy that both declares `origin_sources` entries and publishes a config authority runs the same loop in process at boot, which is where the metrics below come from; a node with entries and no authority logs that it is not composing rather than doing it silently, because its answer is `--out` and that is an operator's decision.
 
-The composed document carries **neither** composition block. `origin_sources` is removed because a composed output is not a source of further composition and re-composing one would loop; `origin_defaults` is removed because the floor is already folded into every composed origin, and leaving it would let a node re-apply it over hand-written origins the aggregator never touched.
+Two documents come out of one composition, and they are not the same document.
+
+**What `--out` writes** is the whole runtime document with its composition blocks replaced by the origins they produced. A single node boots that file unmodified, so it has to keep `proxy:`. It carries neither composition block: `origin_sources` because a composed output is not a source of further composition and re-composing one would loop, and `origin_defaults` because the floor is already folded into every composed origin.
+
+**What gets published** is narrower: the `origins:` map (composed plus hand-written) and `origin_defaults`, and nothing else. It is built up rather than cut down, and that is the point. The node running the aggregator necessarily declares `proxy.config_authority`, and any entry with a `credential:` needs a `proxy.secrets` backend in the same file to resolve it against. Both are on the [subscriber-owned path list](#what-the-subscriber-owns-outright), so a payload assembled by removing keys from the runtime document is refused by the publish screen on every real configuration, and it would be the wrong thing to send even if it were not: a subscriber's listeners, TLS, admin surface and secrets are not the fleet's to set. `origin_defaults` rides along because it is deliberately not on that list; a subscriber's `GET /admin/origin-composition` then reports the floor its composed origins were built from. Nothing on a node re-applies it, because nothing on a node composes.
+
+Anything else a platform team wants to distribute goes through `sbproxy config authority publish` with a payload it writes. This verb composes origins.
 
 A revision beginning with `refs/` takes a targeted `git init` plus shallow fetch rather than a clone, because `git clone --branch` takes a short name and refuses a full ref. That matters here more than anywhere else: `refs/tags/<name>` is the spelling a `production` tier requires. An annotated tag resolves to the commit a checkout reports, not to the tag object.
 
-A composed origin is materialized **once per host**, so a profile bound to ten hosts is ten origins, and the size a signed bundle may carry (`MAX_CONFIG_YAML_BYTES`, 4 MiB) is a ceiling on hosts rather than on projects. Measured against a realistic floor (a proxy action, three floor policies, one project policy, one response modifier) a composed origin is 435 bytes, so the ceiling is reached at roughly 9,600 hosts. Past it the composition is refused with a message naming the limit, how many origins materialized, and the mean bytes each; nothing is published.
+A composed origin is materialized **once per host**, so a profile bound to ten hosts is ten origins, and the size a signed bundle may carry (`MAX_CONFIG_YAML_BYTES`, 4 MiB) is a ceiling on hosts rather than on projects. The limit is checked against the published payload, since that is what gets signed. Measured against a realistic floor (a proxy action, three floor policies, one project policy, one response modifier) a composed origin is 435 bytes, so the ceiling is reached at roughly 9,600 hosts. Past it the composition is refused with a message naming the limit, how many origins materialized, and the mean bytes each; nothing is published.
 
 Two failure classes are kept apart, deliberately. A single entry that will not fetch falls back to its last successfully resolved profile, is named in the output and counted on `sbproxy_aggregate_entries{outcome="failed"}`, and the other entries are unaffected: one unreachable repository must not discard forty-nine other projects' last-known-good. An entry that fails its **first** fetch has nothing to fall back on, and there the whole round is refused, because composing without it would publish an `origins:` map silently missing that project's hosts. A composed document that does not compile, does not construct, or names a denied path is refused at the authority and never published at all.
 

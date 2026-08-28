@@ -944,6 +944,34 @@ pub struct ProfileBinding<'a> {
     pub commit: Option<&'a str>,
 }
 
+impl<'a> ProfileBinding<'a> {
+    /// One entry paired with the document it deploys, with no resolved
+    /// commit.
+    ///
+    /// A constructor rather than only a literal, because `commit` was
+    /// added to a public struct after PR1 shipped and every external
+    /// literal is a source break. `#[non_exhaustive]` would be worse
+    /// here than the break it prevents: this is an input type, so a
+    /// literal is the natural way to write one, and the attribute takes
+    /// literals away entirely. A constructor with a `with_` for the
+    /// optional half leaves both spellings working.
+    #[must_use]
+    pub const fn new(entry: &'a OriginSourceEntry, document: &'a str) -> Self {
+        Self {
+            entry,
+            document,
+            commit: None,
+        }
+    }
+
+    /// The same binding with the commit the caller resolved.
+    #[must_use]
+    pub const fn with_commit(mut self, commit: &'a str) -> Self {
+        self.commit = Some(commit);
+        self
+    }
+}
+
 /// A default a project switched off, recorded so the drop is auditable.
 ///
 /// There is no delete verb, matching the existing merge contract.

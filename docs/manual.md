@@ -373,6 +373,9 @@ sbproxy aggregate -f /etc/sbproxy/sb.yml --watch
 `--out` is the offline path: the written document is ordinary config
 that boots and reloads normally, and it carries neither composition
 block, because a composed output is not a source of further composition.
+What gets **published** is narrower than what `--out` writes: the
+`origins:` map plus `origin_defaults`, built up rather than cut down, so
+a node's own `proxy:` block never travels to the fleet.
 The same inputs at the same revisions produce a byte-identical file, so
 a CI diff means something. `--dry-run` prints what would change against
 a file already there and writes nothing.
@@ -385,8 +388,11 @@ for; it fetches, so it is refused under `--no-fetch`.
 
 `--watch` polls each entry on the configured interval, coalesces a burst
 of movement into one composition, and publishes only when the composed
-document changed. `--polls <n>` stops after that many poll cycles, for a
-cron-shaped invocation. A proxy that both declares `origin_sources`
+document changed. It re-reads the runtime document every cycle, so an
+edit plus a reload reaches the aggregator without a restart. `--polls
+<n>` stops after that many poll cycles, for a cron-shaped invocation.
+`--watch` refuses to combine with `--out`, `--dry-run` or `--explain`
+rather than ignoring them. A proxy that both declares `origin_sources`
 entries and publishes a config authority runs the same loop in process at
 boot, so `--watch` is for a deployment that runs the aggregator
 separately.

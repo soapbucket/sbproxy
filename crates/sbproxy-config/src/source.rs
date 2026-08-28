@@ -334,7 +334,7 @@ pub struct FetchRequest<'a> {
     pub timeout: Duration,
     /// Whether the resolved tag or commit must carry a valid signature.
     pub verify_signature: bool,
-    /// Empty directory the working tree is materialised into.
+    /// Empty directory the working tree is materialized into.
     pub dest: &'a Path,
     /// Writable directory outside `dest` for captured child output.
     ///
@@ -380,7 +380,7 @@ pub trait Cloner: Send + Sync {
     }
 
     /// Ask the remote which commit a reference points at, without
-    /// materialising a working tree.
+    /// materializing a working tree.
     ///
     /// One network round trip and no working tree, which is what makes
     /// a poll affordable at fifty repositories: `git ls-remote` answers
@@ -391,7 +391,7 @@ pub trait Cloner: Send + Sync {
     ///
     /// `Ok(None)` means "this cloner cannot answer cheaply", not "the
     /// reference does not exist". The default is `Ok(None)` so a cloner
-    /// that only knows how to materialise a tree keeps working and its
+    /// that only knows how to materialize a tree keeps working and its
     /// caller falls back to a fetch; a missing reference is an
     /// [`ConfigSourceError`].
     ///
@@ -413,7 +413,7 @@ pub trait Cloner: Send + Sync {
 /// One cheap remote-reference lookup, the polling half of
 /// [`FetchRequest`].
 ///
-/// No `dest`, because nothing is materialised. `Debug` is implemented by
+/// No `dest`, because nothing is materialized. `Debug` is implemented by
 /// hand for the same reason [`FetchRequest`]'s is: the separate
 /// credential must never enter a log line.
 pub struct LsRemoteRequest<'a> {
@@ -573,7 +573,7 @@ impl GitBinaryCloner {
         })
     }
 
-    /// Resolve `HEAD` in an already-materialised working tree.
+    /// Resolve `HEAD` in an already-materialized working tree.
     fn head_commit(
         &self,
         dest: &Path,
@@ -1612,8 +1612,130 @@ where
     })
 }
 
+/// Cap on one file read out of a materialized checkout.
+///
+/// A config document and an origin profile are both hand-written YAML:
+/// the largest in this repository is a few tens of kilobytes and the
+/// bundle a composed document goes into is capped at 4 MiB, so 4 MiB is
+/// generous for either and still bounded.
+///
+/// The cap exists because the file is authored by whoever owns the
+/// repository, which for an `origin_sources` entry is deliberately not
+/// whoever runs the proxy. Checking a size *after* `read_to_string` has
+/// already allocated is not a cap at all: one project repository
+/// committing a two-gigabyte file would take the process that composes
+/// the whole fleet's configuration down, and it would do it again on
+/// the next round.
+pub const MAX_CHECKOUT_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Read one file out of a materialized checkout, refusing anything that
+/// is not a plain file genuinely inside it.
+///
+/// Three refusals, and the middle one is the reason this is a shared
+/// function rather than a `join` at each call site.
+///
+/// * A relative path with no `..` component and no absolute prefix.
+///   This constrains the **runtime** document, which is the trusted
+///   half: `source.path` and `origin_sources.entries[].path` are both
+///   written by whoever runs the proxy.
+/// * A path whose resolved target is still inside the checkout, and
+///   which is a regular file rather than a symlink. This constrains the
+///   **checkout**, which is the untrusted half. `git clone`
+///   materializes symlinks, so a project repository can commit
+///   `sbproxy/origin.yaml` as a link at the aggregator's own
+///   `/etc/sbproxy/sb.yml` and be read with the aggregator's filesystem
+///   rights. A traversal check on the configured path cannot see that,
+///   and a guard narrower than its claim is worse than none.
+/// * A file past `max_bytes`, checked with `metadata` **before** the
+///   read rather than after it.
+///
+/// # What this cannot see
+///
+/// A file that grows between the `metadata` call and the read. The
+/// window is microseconds and the checkout is a temporary directory this
+/// process just created, so the only writer is a `git` that has already
+/// exited. The read is capped by `take` anyway, so the worst case is a
+/// truncated document that fails to parse rather than an unbounded
+/// allocation.
+///
+/// # Errors
+///
+/// Returns [`ConfigSourceError::Invalid`] for a path shape that is
+/// refused before anything is opened, and [`ConfigSourceError::Read`]
+/// for a missing file, an unreadable one, a symlink, an escape, or one
+/// past `max_bytes`. The three cases are distinguished in the message,
+/// because "not in the repository" and "there but unreadable" send an
+/// operator to different places.
+pub fn read_file_within(
+    root: &Path,
+    relative: &str,
+    max_bytes: u64,
+    label: &str,
+) -> Result<String, ConfigSourceError> {
+    use std::io::Read as _;
+
+    let candidate = Path::new(relative);
+    if candidate.is_absolute()
+        || relative
+            .split('/')
+            .any(|part| part == ".." || part == "." || part.is_empty())
+    {
+        return Err(ConfigSourceError::Invalid(format!(
+            "{label} '{relative}' must be a relative path inside the repository, with no `..`              or `.` components"
+        )));
+    }
+    let full = root.join(candidate);
+    // `symlink_metadata` does not follow, so a link is visible as one.
+    let metadata = std::fs::symlink_metadata(&full).map_err(|error| {
+        ConfigSourceError::Read(format!(
+            "{label} '{relative}' is not in the repository at the resolved revision: {error}"
+        ))
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(ConfigSourceError::Read(format!(
+            "{label} '{relative}' is a symbolic link. A repository this proxy does not own can              point a link anywhere the reading process can reach, so a link is refused rather              than followed; commit the file itself"
+        )));
+    }
+    if !metadata.is_file() {
+        return Err(ConfigSourceError::Read(format!(
+            "{label} '{relative}' is not a regular file"
+        )));
+    }
+    if metadata.len() > max_bytes {
+        return Err(ConfigSourceError::Read(format!(
+            "{label} '{relative}' is {} bytes, past the {max_bytes}-byte limit for a file read              out of a repository this proxy does not own",
+            metadata.len()
+        )));
+    }
+    // Belt and braces after the symlink refusal: a hard link, or a
+    // component of the path that is itself a link, still has to resolve
+    // inside the checkout.
+    let resolved_root = std::fs::canonicalize(root)
+        .map_err(|error| ConfigSourceError::Read(format!("resolve the checkout root: {error}")))?;
+    let resolved = std::fs::canonicalize(&full).map_err(|error| {
+        ConfigSourceError::Read(format!("resolve {label} '{relative}': {error}"))
+    })?;
+    if !resolved.starts_with(&resolved_root) {
+        return Err(ConfigSourceError::Read(format!(
+            "{label} '{relative}' resolves outside the checkout"
+        )));
+    }
+    let file = std::fs::File::open(&resolved).map_err(|error| {
+        ConfigSourceError::Read(format!("{label} '{relative}' could not be opened: {error}"))
+    })?;
+    let mut text = String::new();
+    file.take(max_bytes)
+        .read_to_string(&mut text)
+        .map_err(|error| {
+            ConfigSourceError::Read(format!(
+                "{label} '{relative}' is there but could not be read (it may not be UTF-8):                  {error}"
+            ))
+        })?;
+    Ok(text)
+}
+
 /// Ask a repository which commit an entry's revision points at, with no
-/// working tree materialised.
+/// working tree materialized.
 ///
 /// The polling half of [`materialize_git_tree`], and it takes the same
 /// [`GitTreeRequest`] so a caller cannot poll one repository and fetch
@@ -2224,7 +2346,16 @@ fn load_git(
             fetch_context: fetch_ctx,
         },
         |tree| {
-            let text = std::fs::read_to_string(tree.root().join(relative)).map_err(|error| {
+            // The same guard the aggregator uses, for the same reason:
+            // a `confine: true` source is a repository this proxy does
+            // not own, and `git clone` materializes symlinks.
+            let text = read_file_within(
+                tree.root(),
+                &relative.to_string_lossy(),
+                MAX_CHECKOUT_FILE_BYTES,
+                "source.path",
+            )
+            .map_err(|error| {
                 ConfigSourceError::Read(format!(
                     "'{}' at {} in {}: {error}",
                     spec.path,
@@ -2322,7 +2453,7 @@ mod tests {
         assert_eq!(resolved_ls_remote_sha("\n\n"), None);
     }
 
-    /// A cloner that only knows how to materialise a tree answers the
+    /// A cloner that only knows how to materialize a tree answers the
     /// cheap question with "I cannot", so its caller fetches rather than
     /// believing nothing moved.
     #[test]
