@@ -529,7 +529,7 @@ impl OriginProfileSpec {
 /// [`Self::ProfileParse`], [`Self::Compose`]) would not: serde renders
 /// the offending value into its own message, so `invalid type: string
 /// "sk-live-...", expected f32` is a secret in a refusal. They carry a
-/// [`redact_serde_message`] rendering instead of the error itself, which
+/// `redact_serde_message` rendering instead of the error itself, which
 /// keeps the backtick-quoted field names serde uses for identifiers and
 /// replaces every double-quoted value with `[redacted]`. The cost is the
 /// `#[source]` chain on those three, which is the right trade: a chain
@@ -956,7 +956,7 @@ pub struct OriginResolution {
 
 /// Check `origin_defaults` at config load.
 ///
-/// See [`validate_origin_body`] for the three rules and why they run
+/// See `validate_origin_body` for the three rules and why they run
 /// here rather than at the aggregator.
 ///
 /// # Errors
