@@ -33,6 +33,7 @@ pub(crate) enum ServerRuntimeState {
         reason: String,
     },
     /// The federation is no longer probing this server.
+    #[allow(dead_code)] // documented GET /admin/mcp-runtime state; no production writer yet
     Stopped,
 }
 

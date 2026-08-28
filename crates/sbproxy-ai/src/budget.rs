@@ -827,8 +827,8 @@ impl PriceTable {
 
 /// The process-global operator price table (WOR-1707). Replaced on
 /// config (re)load via [`set_price_table`]. Live request accounting
-/// prefers the per-origin table scoped by [`with_price_table`] /
-/// [`with_price_table_async`] (WOR-2431); this global is the fallback
+/// prefers the per-origin table scoped by [`with_price_table_async`]
+/// (WOR-2431); this global is the fallback
 /// for call sites that do not carry an origin (tests, admin playground,
 /// spawned work that left the request task). Empty by default, so with
 /// no config the behavior is exactly the built-in catalog.
@@ -851,8 +851,8 @@ pub(crate) static PRICE_TABLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex
 
 /// Run `f` with `table` as the operator price layer for this thread.
 ///
-/// Used by tests and by any sync caller that already holds the origin's
-/// table. The async request path uses [`with_price_table_async`].
+/// Test-only. The async request path uses [`with_price_table_async`].
+#[cfg(test)]
 pub(crate) fn with_price_table<F, R>(table: std::sync::Arc<PriceTable>, f: F) -> R
 where
     F: FnOnce() -> R,
@@ -874,7 +874,7 @@ where
 
 /// Install the operator price table, replacing any previous one (so a
 /// config hot-reload updates prices). WOR-1707. This is the fallback
-/// layer; per-origin accounting goes through [`with_price_table`].
+/// layer; per-origin accounting goes through [`with_price_table_async`].
 pub fn set_price_table(table: PriceTable) {
     if let Ok(mut guard) = PRICE_TABLE.write() {
         *guard = Some(table);
