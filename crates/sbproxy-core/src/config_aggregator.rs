@@ -1101,12 +1101,13 @@ impl Aggregator {
     /// `--dry-run` that answered "already holds this composition" there
     /// would defeat the acceptance line that a CI diff is meaningful.
     ///
-    /// The two answers are made to agree rather than left to. A caller
-    /// reading the returned vector's emptiness as "unchanged" is right,
-    /// because [`line_diff`] never returns an empty vector: `str::lines()`
-    /// drops the trailing newline and any `\r`, so a text that differs
-    /// only there gets a line saying so instead of nothing. A guard
-    /// narrower than the claim above it is worse than none.
+    /// The two answers are made to agree rather than left to agree. A
+    /// caller reading the returned vector's emptiness as "unchanged" is
+    /// right, because the private `line_diff` behind this never returns
+    /// an empty vector for two texts that differ: `str::lines()` drops
+    /// the trailing newline and any `\r`, so a difference that lives
+    /// only there gets a line saying so rather than nothing at all. A
+    /// guard narrower than the claim above it is worse than none.
     ///
     /// # Errors
     ///
