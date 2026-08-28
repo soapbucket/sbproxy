@@ -893,3 +893,94 @@ fn a_git_overlay_chain_records_every_commit_it_resolved() {
         "base survives"
     );
 }
+
+// --- fully-qualified refs (WOR-2437) ----------------------------------
+
+/// A document whose only interesting property is its bind port, so a
+/// test can tell one fixture repository's document from another's.
+fn config_with_port(port: u16) -> String {
+    REPO_CONFIG.replace("http_bind_port: 8080", &format!("http_bind_port: {port}"))
+}
+
+/// A `refs/tags/<name>` revision resolves, against a real `git`.
+///
+/// The spelling a production-tier `origin_sources` entry is **required**
+/// to use (WOR-2436), because git does not tell a tag from a branch by
+/// spelling and a rule that guessed would be one a branch could walk
+/// through. Nothing had ever fetched one: every test here used a branch
+/// or a bare sha, and `source:` has no tier rule pushing anyone toward
+/// the long form. `git clone --branch refs/tags/v1.0.0` fails with
+/// "Remote branch refs/tags/v1.0.0 not found in upstream origin",
+/// because `--branch` takes a short name, so a production aggregator
+/// could not have resolved a single entry.
+///
+/// Both tag kinds are covered. An **annotated** tag is the one that
+/// matters twice over: the ref points at a tag object rather than at the
+/// commit, so a resolution that reported the ref's own sha would report
+/// something no checkout of that tag ever shows.
+#[test]
+fn a_fully_qualified_tag_ref_resolves() {
+    if !require_git("a_fully_qualified_tag_ref_resolves") {
+        return;
+    }
+    let fixture = Fixture::new(&config_with_port(9310));
+    let commit = fixture.head();
+    git(&fixture.work, &["tag", "lightweight-1.0.0"]);
+    git(
+        &fixture.work,
+        &["tag", "-a", "annotated-1.0.0", "-m", "release"],
+    );
+    // The annotated tag really is a different object from the commit, or
+    // the assertion below would pass for the wrong reason.
+    let tag_object = git(&fixture.work, &["rev-parse", "refs/tags/annotated-1.0.0"]);
+    assert_ne!(
+        tag_object, commit,
+        "an annotated tag points at a tag object, which is the case this test exists for"
+    );
+
+    for reference in ["refs/tags/lightweight-1.0.0", "refs/tags/annotated-1.0.0"] {
+        let source = git_source(&fixture.url(), Some(reference));
+        let resolved =
+            resolve(&source).unwrap_or_else(|error| panic!("`{reference}` must resolve: {error}"));
+        assert_eq!(
+            resolved.revisions[0].commit, commit,
+            "`{reference}` resolves to the commit a checkout reports, not to the ref's own sha"
+        );
+        assert_eq!(resolved.revisions[0].reference, reference);
+        let compiled =
+            sbproxy_config::compile_config(&resolved.text).expect("the tagged document compiles");
+        assert_eq!(compiled.server.http_bind_port, 9310);
+    }
+}
+
+/// A fully-qualified branch ref resolves too.
+///
+/// The same path serves it, and this is what says the widening did not
+/// buy the tag case at the branch case's expense.
+#[test]
+fn a_fully_qualified_branch_ref_resolves() {
+    if !require_git("a_fully_qualified_branch_ref_resolves") {
+        return;
+    }
+    let fixture = Fixture::new(&config_with_port(9311));
+    let source = git_source(&fixture.url(), Some("refs/heads/main"));
+    let resolved = resolve(&source).expect("`refs/heads/main` must resolve");
+    assert_eq!(resolved.revisions[0].commit, fixture.head());
+}
+
+/// A fully-qualified ref that does not exist is refused, and the message
+/// names the repository rather than reporting an empty document.
+#[test]
+fn a_fully_qualified_ref_that_does_not_exist_is_refused() {
+    if !require_git("a_fully_qualified_ref_that_does_not_exist_is_refused") {
+        return;
+    }
+    let fixture = Fixture::new(&config_with_port(9312));
+    let source = git_source(&fixture.url(), Some("refs/tags/never-tagged"));
+    let error = resolve(&source).expect_err("a ref that is not there cannot resolve");
+    let message = error.to_string();
+    assert!(
+        message.contains("never-tagged"),
+        "the refusal names the revision that is missing: {message}"
+    );
+}

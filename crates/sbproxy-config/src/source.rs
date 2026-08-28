@@ -753,15 +753,27 @@ impl Cloner for GitBinaryCloner {
         let dest = request.dest;
         let dest_str = dest.to_string_lossy().to_string();
         let pinned = request.revision.is_some_and(is_full_commit_sha);
+        // `git clone --branch` takes a short name and refuses a
+        // fully-qualified ref: `--branch refs/tags/v1.4.2` fails with
+        // "Remote branch refs/tags/v1.4.2 not found in upstream origin".
+        // A production-tier `origin_sources` entry has to spell a tag
+        // that way (WOR-2436), because git does not tell a tag from a
+        // branch by spelling, so the clone path cannot serve it and the
+        // targeted fetch below has to. `git fetch origin <full ref>`
+        // takes it exactly as written, which is the whole reason that
+        // spelling was chosen.
+        let qualified = request
+            .revision
+            .is_some_and(|revision| revision.starts_with("refs/"));
         let http_auth = GitHttpAuth::new(
             request.credential_username,
             request.credential,
             request.repo,
         );
 
-        if pinned {
-            let sha = request.revision.unwrap_or_default();
-            self.fetch_pinned_sha(request, &dest_str, sha, http_auth.as_ref())?;
+        if pinned || qualified {
+            let revision = request.revision.unwrap_or_default();
+            self.fetch_targeted(request, &dest_str, revision, http_auth.as_ref())?;
         } else {
             let mut args: Vec<&str> = vec!["clone", "--quiet", "--depth", "1"];
             if let Some(reference) = request.revision {
@@ -829,12 +841,22 @@ impl Cloner for GitBinaryCloner {
         // `--exit-code` turns "the reference does not exist" into a
         // non-zero exit rather than a silent empty answer, which would
         // otherwise read as "unchanged" forever.
+        //
+        // Two patterns, not one. `git ls-remote <repo> refs/tags/v1`
+        // prints only the tag object; the peeled `refs/tags/v1^{}` line
+        // that carries the commit does not match that pattern and is
+        // filtered out, so asking for the peeled form explicitly is the
+        // only way to see it. Verified against git 2.50: the pair
+        // returns both lines for an annotated tag, and for a branch or
+        // `HEAD` the second pattern simply matches nothing and the exit
+        // code still reflects the first.
+        let peeled = request.revision.map_or_else(
+            || "HEAD^{}".to_string(),
+            |revision| format!("{revision}^{{}}"),
+        );
         let mut args: Vec<&str> = vec!["ls-remote", "--exit-code", "--", request.repo];
-        if let Some(revision) = request.revision {
-            args.push(revision);
-        } else {
-            args.push("HEAD");
-        }
+        args.push(request.revision.unwrap_or("HEAD"));
+        args.push(&peeled);
         let output = self.run(
             &args,
             None,
@@ -855,7 +877,7 @@ impl Cloner for GitBinaryCloner {
 
 /// The commit `git ls-remote` resolved a reference to.
 ///
-/// Each line is `<sha>\t<ref>`. An **annotated** tag prints two: the tag
+/// Each line is `<sha>\t<ref>`. An **annotated** tag has two: the tag
 /// object, and the commit it points at under a `^{}` suffix. The peeled
 /// line is the one this returns when it is present, because the tag
 /// object's sha is not what any checkout of that tag reports, and a
@@ -863,6 +885,11 @@ impl Cloner for GitBinaryCloner {
 /// commit would find them different forever and clone on every single
 /// round. A production tier pins with `refs/tags/<name>`, so that is
 /// not an edge case; it is the main case.
+///
+/// The peeled line only arrives because the caller asks for it by name.
+/// `git ls-remote <repo> refs/tags/v1` filters to refs matching that
+/// pattern, and `refs/tags/v1^{}` does not match it, so a single-pattern
+/// query returns the tag object alone. See the caller.
 ///
 /// # What this cannot see
 ///
@@ -893,14 +920,18 @@ fn resolved_ls_remote_sha(stdout: &str) -> Option<String> {
 }
 
 impl GitBinaryCloner {
-    /// Materialise one exact commit sha.
+    /// Materialise one exact revision: a full commit sha, or a
+    /// fully-qualified ref such as `refs/tags/v1.4.2`.
     ///
+    /// Two things `git clone` cannot do, and one path that does both.
     /// `git clone --depth 1` cannot ask for an arbitrary commit: the
     /// server has to allow it, which most do not by default (it is
-    /// `uploadpack.allowReachableSHA1InWant`). So the pinned path is
-    /// `git init` plus a targeted shallow fetch, and falls back to a
-    /// full fetch of every ref when the server refuses the shallow one.
-    fn fetch_pinned_sha(
+    /// `uploadpack.allowReachableSHA1InWant`). And `git clone --branch`
+    /// takes a short name, so it refuses a fully-qualified ref outright.
+    /// `git init` plus a targeted shallow fetch takes either, and falls
+    /// back to a full fetch of every ref when the server refuses the
+    /// shallow one.
+    fn fetch_targeted(
         &self,
         request: &FetchRequest<'_>,
         dest_str: &str,
@@ -962,8 +993,8 @@ impl GitBinaryCloner {
             )?;
             if !full.success {
                 return Err(ConfigSourceError::Clone(format!(
-                    "git fetch of {} at {sha} failed, both as a shallow single-commit fetch \
-                     (the server may not allow it) and as a full fetch: {}",
+                    "git fetch of {} at {sha} failed, both as a shallow targeted fetch \
+                     (the server may not allow one for a bare commit) and as a full fetch: {}",
                     redact_repo(request.repo),
                     scrub_credentials(full.stderr.trim())
                 )));
@@ -977,8 +1008,8 @@ impl GitBinaryCloner {
             )?;
             if !checkout.success {
                 return Err(ConfigSourceError::RevisionMismatch(format!(
-                    "commit {sha} is not present in {} after a full fetch; the pin names a \
-                     commit this repository does not contain: {}",
+                    "{sha} is not present in {} after a full fetch; the pin names a revision \
+                     this repository does not contain: {}",
                     redact_repo(request.repo),
                     scrub_credentials(checkout.stderr.trim())
                 )));
