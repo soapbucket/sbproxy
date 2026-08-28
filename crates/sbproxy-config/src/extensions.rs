@@ -1083,7 +1083,18 @@ fn invalid<T>(message: impl Into<String>) -> Result<T, BundleManifestError> {
     )))
 }
 
-fn sanitize_detail(detail: &str) -> String {
+/// Make caller-supplied text safe to render into an error or a log
+/// line: every control character becomes a space, and the result is
+/// capped on a char boundary.
+///
+/// Shared rather than reimplemented. `crate::source`'s unconfined-source
+/// warning renders a config key path assembled from a fetched document's
+/// own mapping key names, and YAML allows a newline or an ANSI escape
+/// inside a quoted key, so an externally authored repository could
+/// otherwise forge a complete log line under the default fmt layer
+/// (WOR-2433 re-review round 3). Same shape, same cap, one
+/// implementation.
+pub(crate) fn sanitize_detail(detail: &str) -> String {
     // The longest BundleManifestError display prefix is 33 bytes, so a
     // 479-byte detail keeps the complete public error at or below 512 bytes.
     const MAX_DETAIL_BYTES: usize = 479;

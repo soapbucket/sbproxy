@@ -111,6 +111,27 @@ pub fn extract_type(value: &serde_json::Value) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("missing or empty 'type' field"))
 }
 
+/// The access-log `custom_fields` DOTTED interpolation vocabulary, the
+/// prefixes `sbproxy-core`'s `custom_log::resolve_var` answers from the
+/// per-request context rather than from the process environment
+/// (`crates/sbproxy-core/src/server/custom_log.rs:274-286`, documented
+/// in docs/access-log.md).
+///
+/// Same reasoning as [`ACCESS_LOG_BARE_VARS`], which covered only the
+/// bare names: substituting a process variable would bake a boot-time
+/// constant into a per-request log field, and reporting one as
+/// unresolved would make a config authority refuse a whole bundle over
+/// a documented form. Missing these two cost the confined fragment pass
+/// a false refusal against a `fields:` block written exactly as
+/// documented (WOR-2433 review).
+///
+/// `env.` is deliberately absent: `resolve_var` answers `${env.NAME}`
+/// from `std::env::var`, so it is a real environment reference on both
+/// sides. Prefixes are matched exactly as `resolve_var` matches them,
+/// `request.header.` and not the wider `request.`, so the carve-out
+/// cannot be wider than the runtime resolver it mirrors.
+const ACCESS_LOG_DOTTED_PREFIXES: &[&str] = &["request.header.", "attribution."];
+
 /// The access-log `custom_fields` bare-name interpolation vocabulary,
 /// resolved per request by `sbproxy-core`'s `custom_log::resolve_var`
 /// and documented in docs/access-log.md. Like the dotted runtime
@@ -157,22 +178,53 @@ const ACCESS_LOG_BARE_VARS: &[&str] = &[
 /// The bare access-log names in [`ACCESS_LOG_BARE_VARS`] are excluded
 /// by exact match for the same reason: they are per-request vocabulary
 /// resolved by `custom_log.rs`, never env references.
-fn placeholder_is_env_reference(var_name: &str) -> bool {
+pub(crate) fn placeholder_is_env_reference(var_name: &str) -> bool {
+    // `${}` names nothing. `interpolate_env_vars` guards on
+    // `!var_name.is_empty()` and never looks it up, so calling it an
+    // environment reference is a false positive in both directions: the
+    // hazard scan told an operator to export a variable with no name,
+    // and a config authority subscriber refuses a whole bundle over a
+    // literal `${}` that could never have resolved. Excluded so this
+    // predicate is exactly as wide as the pass it describes, which is
+    // what the confined pass's biconditional test asserts
+    // (WOR-2433 review).
+    if var_name.is_empty() {
+        return false;
+    }
     if ACCESS_LOG_BARE_VARS.contains(&var_name) {
         return false;
     }
     let name = var_name.split_once(":-").map_or(var_name, |(name, _)| name);
+    if ACCESS_LOG_DOTTED_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    {
+        return false;
+    }
     !(name.starts_with("args.") || name.starts_with("steps."))
 }
 
 /// Interpolate `${VAR_NAME}` patterns in a string with environment variables.
+///
+/// This is the pass `compile_config` runs over the raw document text
+/// before anything parses it, and it is public so the CLI paths that
+/// read a config without compiling it (`sbproxy config print`,
+/// `sbproxy mcp lock`) resolve `${VAR}` identically instead of carrying
+/// a near-copy that drifts (WOR-2433).
+///
+/// It reads the process environment without restriction, which is
+/// correct for a document the operator who runs the proxy wrote and
+/// wrong for one composed from somewhere else. An externally authored
+/// fragment goes through [`crate::confined_template`] instead, which
+/// resolves only the inputs its caller binds.
 ///
 /// `${VAR:-default}` takes the shell meaning: the variable's value when it
 /// is set and non-empty, the literal default otherwise. Unresolvable
 /// variables without a default are left as-is (literal `${...}` in the
 /// output), which `scan_yaml_hazards` reports after parsing. A
 /// placeholder whose name is not a possible environment variable name
-/// (see [`placeholder_is_env_reference`]) is not touched at all.
+/// (an MCP `args.` / `steps.` runtime path, or an access-log bare name;
+/// see `placeholder_is_env_reference`) is not touched at all.
 ///
 /// `$$` escapes: `$${VAR}` is never substituted (docs/mcp-compose.md
 /// documents it as rendering the literal text `${VAR}`). This pass
@@ -181,7 +233,7 @@ fn placeholder_is_env_reference(var_name: &str) -> bool {
 /// substitution) -- the same rule the MCP engine's scanner applies. The
 /// pass strips nothing: the `$$` bytes stay in the output for the
 /// runtime consumer that owns the unescape.
-fn interpolate_env_vars(input: &str) -> String {
+pub fn interpolate_env_vars(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
 
@@ -236,10 +288,19 @@ fn interpolate_env_vars(input: &str) -> String {
                         },
                     }
                 } else {
+                    // Either an empty name (`${}`) or an unterminated
+                    // `${`. Both are left literal, byte for byte: the
+                    // closing brace is re-emitted when the input had
+                    // one, so `${}` round-trips instead of coming back
+                    // as `${`. The CLI's deleted private copy got this
+                    // right and this one did not, and `sbproxy config
+                    // print` is the command an operator runs precisely
+                    // to see the value the box will actually use
+                    // (WOR-2433 review).
                     result.push_str("${");
                     result.push_str(&var_name);
-                    if !found_close {
-                        // Unterminated ${, just push what we have
+                    if found_close {
+                        result.push('}');
                     }
                 }
             } else {
@@ -250,6 +311,50 @@ fn interpolate_env_vars(input: &str) -> String {
         }
     }
     result
+}
+
+/// Every live `${VAR}` env placeholder in `s`, as full `${...}` slices.
+///
+/// The one scanner both the fleet-wide hazard report
+/// ([`scan_yaml_hazards`]) and the confined fragment pass
+/// ([`crate::confined_template`]) run, so the detector cannot drift
+/// narrower than [`interpolate_env_vars`], the enforcer. A placeholder
+/// is live here exactly when that function would resolve it from the
+/// process environment: unescaped by the `$$` pair-parity rule, and a
+/// name [`placeholder_is_env_reference`] owns.
+pub(crate) fn env_references_in(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = s;
+    while let Some(start) = rest.find("${") {
+        let tail = &rest[start..];
+        match tail.find('}') {
+            Some(end) => {
+                // `$${...}` is the documented escape: the placeholder
+                // never opens, so it is not a live reference. An
+                // odd-length `$` run before the placeholder's own `$`
+                // escapes it; an even run leaves it live (`$$${VAR}` is
+                // one escaped pair, then a real reference) -- the same
+                // pair-parity rule `interpolate_env_vars` and the MCP
+                // engine's scanner apply.
+                let escaping_dollars = rest[..start]
+                    .chars()
+                    .rev()
+                    .take_while(|&c| c == '$')
+                    .count();
+                let escaped = escaping_dollars % 2 == 1;
+                // A placeholder in the MCP local-tool vocabulary
+                // (`${args.id}`, `${steps.x.y}`) is left for its own
+                // consumer and never reported here; every other
+                // unescaped name is an environment reference.
+                if !escaped && placeholder_is_env_reference(&tail[2..end]) {
+                    out.push(&tail[..=end]);
+                }
+                rest = &tail[end + 1..];
+            }
+            None => break,
+        }
+    }
+    out
 }
 
 /// Pre-parse hazard scan: reject custom YAML tags, report unresolved
@@ -269,42 +374,6 @@ fn interpolate_env_vars(input: &str) -> String {
 /// caller to warn about; credential fields upgrade the warning to a hard
 /// error at their typed checks.
 fn scan_yaml_hazards(yaml: &str) -> Result<Vec<String>> {
-    fn unresolved_refs_in(s: &str) -> Vec<&str> {
-        let mut out = Vec::new();
-        let mut rest = s;
-        while let Some(start) = rest.find("${") {
-            let tail = &rest[start..];
-            match tail.find('}') {
-                Some(end) => {
-                    // `$${...}` is the documented escape: the
-                    // placeholder never opens, so it is not an
-                    // unresolved reference. An odd-length `$` run
-                    // before the placeholder's own `$` escapes it;
-                    // an even run leaves it live (`$$${VAR}` is one
-                    // escaped pair, then a real reference) -- the
-                    // same pair-parity rule `interpolate_env_vars`
-                    // and the MCP engine's scanner apply.
-                    let escaping_dollars = rest[..start]
-                        .chars()
-                        .rev()
-                        .take_while(|&c| c == '$')
-                        .count();
-                    let escaped = escaping_dollars % 2 == 1;
-                    // A placeholder in the MCP local-tool vocabulary
-                    // (`${args.id}`, `${steps.x.y}`) is left for its
-                    // own consumer and never reported here; every
-                    // other unescaped name is an unresolved env
-                    // reference.
-                    if !escaped && placeholder_is_env_reference(&tail[2..end]) {
-                        out.push(&tail[..=end]);
-                    }
-                    rest = &tail[end + 1..];
-                }
-                None => break,
-            }
-        }
-        out
-    }
     fn walk(
         value: &serde_yaml::Value,
         path: &str,
@@ -318,7 +387,7 @@ fn scan_yaml_hazards(yaml: &str) -> Result<Vec<String>> {
                 walk(&tagged.value, path, tags, unresolved);
             }
             serde_yaml::Value::String(s) => {
-                for r in unresolved_refs_in(s) {
+                for r in env_references_in(s) {
                     unresolved.push(format!("{path}: {r}"));
                 }
             }
@@ -429,7 +498,7 @@ pub fn interpolate_config_vars(
 /// Look up a possibly-dotted variable path (`api_version`,
 /// `feature_flags.beta_api`) in the origin's variables map. The first
 /// segment indexes the map; the rest walk nested JSON objects.
-fn lookup_variable_path<'a>(
+pub(crate) fn lookup_variable_path<'a>(
     variables: &'a std::collections::HashMap<String, serde_json::Value>,
     path: &str,
 ) -> Option<&'a serde_json::Value> {
