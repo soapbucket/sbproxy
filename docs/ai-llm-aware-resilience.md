@@ -40,9 +40,9 @@ flowchart TD
 
 The breaker and outlier boxes in step A are a real eligibility gate, not
 decoration: `Router::provider_eligible` checks both before a provider is
-offered to the strategy. What is missing today is the write side. See
-"What is adaptive, and what fails over" below for the gap between that gate
-and what actually feeds it.
+offered to the strategy, and every settled provider attempt on the
+request path feeds them. See "What is adaptive, and what fails over"
+below for which outcomes count which way.
 
 ## Failure classification
 
@@ -115,11 +115,10 @@ A class with no entry (or an explicit `0`) never triggers a cooldown, so
 an empty policy preserves current behavior exactly. The axis is advisory
 in the same sense as the circuit breaker and outlier ejection: when
 every candidate is cooling down, the router routes to the full permitted
-set rather than manufacturing an outage. Unlike those two axes, the
-write side is the dispatch loop's own failure classification, so a
-configured `cooldown_policy` acts on real traffic immediately (see "What
-is adaptive, and what fails over" for the breaker's read-side-only
-status).
+set rather than manufacturing an outage. Its write side is the dispatch
+loop's own failure classification, on both the sequential and the raced
+path, so a configured `cooldown_policy` acts on real traffic
+immediately.
 
 Each cooldown ticks
 `sbproxy_ai_provider_cooldowns_total{provider, cause}` and logs a `WARN`
@@ -452,29 +451,41 @@ a 200 response is a valid completion and is not intercepted. Off by default.
 `circuit_breaker` and `outlier_detection` configure a real eligibility
 gate: `Router::provider_eligible` checks a breaker's state and an
 outlier ejection before offering a provider to the routing strategy, and a
-provider failing either check is skipped until it recovers. That gate needs
-a live feed of request outcomes, and the production AI dispatch path
-(`crates/sbproxy-core/src/server/ai_dispatch.rs`) does not currently supply
-one: neither the sequential failover loop nor the `race` dispatch calls the
-router methods that update the breaker or the sliding-window detector
-(`record_provider_success` / `record_provider_failure`). Those two are
-wired end to end only on the admin playground's chat path
-(`crates/sbproxy-core/src/admin_playground.rs`), not on the
-`/v1/chat/completions` path real traffic takes. A configured
-`circuit_breaker` or `outlier_detection` block is accepted without error,
-but a provider failing every request is not ejected by either signal today
-(SUSPECTED PRODUCT BUG; ticketed for the `race` case as WOR-2532, see
-`examples/ai-race/README.md` for a live repro). `health_check` is
-unaffected: its active probes run on an independent background task and
-never depend on request-path recording. The per-error-class
-`cooldown_policy` axis is also unaffected, in the other direction: its
-write side is the dispatch loop's own failure classification, so it is
-fed by production traffic from the day it is configured. The PeakEWMA latency model is a
+provider failing either check is skipped until it recovers. Both are fed
+by production traffic. Every settled provider attempt on the
+`/v1/chat/completions` path records one outcome against all three
+health axes at once, whatever the routing strategy and whether the
+request streams or not: the raced fan-out records each leg as it
+settles, and the sequential loop records each failover leg and the
+response it keeps.
+
+Which way an outcome counts:
+
+| Attempt settled as | Attempt metric | Breaker and outlier detector | Cooldown policy |
+|---|---|---|---|
+| `1xx`-`3xx` | `success` | success | not consulted |
+| `4xx` | `error` | success | classified and consulted |
+| `5xx` | `error` | failure | classified and consulted |
+| transport error or timeout | `error` | failure | not consulted |
+| local engine never started | `error` | no sample | not consulted |
+| raced loser the winner cancelled | not recorded | no sample | not consulted |
+
+A `4xx` counting as upstream health is deliberate and matches Envoy's
+`consecutive_5xx` detector: the caller sent a bad request and the
+provider answered it correctly, so ejecting on it would take a healthy
+provider out of the pool for someone else's malformed prompt. The
+consequence worth knowing is that a provider answering `429` to
+everything reads as healthy to the breaker and the outlier detector;
+`cooldown_policy: { rate_limit: <seconds> }` is the axis that parks it,
+and sbproxy has no `consecutive_gateway_failure` equivalent that would
+separate the two. `health_check` is independent of all of this: its
+active probes run on a background task and never depend on request-path
+recording. The PeakEWMA latency model is a
 separate, independently selected routing strategy
 (`routing: { strategy: peak_ewma }`); it does not run automatically
-alongside `circuit_breaker` or `outlier_detection` even once that gap
-closes. Failover itself routes to a different provider, so a retry never
-re-runs a side-effecting request against the same upstream.
+alongside `circuit_breaker` or `outlier_detection`. Failover itself
+routes to a different provider, so a retry never re-runs a
+side-effecting request against the same upstream.
 
 ## Calling it
 
