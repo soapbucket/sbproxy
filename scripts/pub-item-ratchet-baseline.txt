@@ -1116,3 +1116,34 @@ The tests-only figure is this branch's 324, because main's rollback work
 added nothing to that bucket. The unreferenced figure is three above both,
 which is exactly this branch's three unnarrowable additions landing on top
 of main's `ConfigBootConfig`, `FailedCandidate` and `FallbackDocument`.
+
+2026-08-28 (WOR-2432 the aggregator, review round): tests-only 324 -> 326,
+unreferenced 1524 -> 1526. Recounted against the tree after the merge with
+main at 1cd47627, which is where both numbers are locked.
+
+The same two items move both figures, and both are integration-test seams
+whose production caller lives in the same file, which is the blind spot this
+scan is documented as having.
+
+`Aggregator::seed_published_digest` is new. The change detector lived only in
+memory, so a restart composed the same payload, saw no previous digest, and
+published a byte-identical revision, which rebuilds every subscriber's
+pipeline for nothing (review Minor 10). `spawn` now seeds it from what the
+authority already serves; `spawn` is in `config_aggregator.rs`, so the scan
+sees only `tests/config_aggregator.rs` naming it. The test that proves a
+restart stays quiet has to construct a second `Aggregator` and hand it the
+digest a first one published, and an integration test links against the
+library's public API, so `pub` is the only visibility that compiles.
+
+`Aggregator::run_round` did have a production caller outside the file until
+this round: `main.rs` used it for the one-shot publish. That was the defect in
+review Minor 11, because `run_round` composes, so the one-shot path composed
+twice and the second pass reported every entry as `unchanged`, leaving
+`sbproxy_aggregate_entries{outcome="resolved"}` at 0 after a publish that
+resolved N entries. `main.rs` now calls `publish_composed` with the
+composition it already has, and `run_round`'s only remaining callers are
+`aggregation_loop` in the same file and ten tests. It stays `pub` because it
+is the single-round form of the loop and the seam an embedder without a watch
+thread would use, and because pushing those ten tests through
+`aggregation_loop` would make each one wait on a real clock to assert
+something that has nothing to do with timing.
