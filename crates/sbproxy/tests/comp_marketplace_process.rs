@@ -97,7 +97,13 @@ fn start_proxy(root: &Path, config: &Path, port: u16) -> Child {
         .stderr(Stdio::piped())
         .spawn()
         .expect("start sbproxy");
-    let deadline = Instant::now() + Duration::from_secs(20);
+    // 45s rather than the 20s its sibling federation test uses. Both
+    // spawn a full proxy, and this file was observed hitting exactly 20s
+    // on a machine that was still compiling the rest of the workspace.
+    // A startup deadline that a busy machine can trip is a flake, not a
+    // signal: the thing under test is what the proxy serves, not how
+    // fast it boots.
+    let deadline = Instant::now() + Duration::from_secs(45);
     loop {
         if child.try_wait().expect("poll sbproxy").is_some() {
             let output = child.wait_with_output().expect("collect sbproxy output");

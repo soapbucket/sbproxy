@@ -2485,7 +2485,11 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
             ..
         }) = reserve.backend.as_ref()
         {
-            let bucket = bucket.as_deref().unwrap_or("your-bucket");
+            let bucket = bucket
+                .as_deref()
+                .map(str::trim)
+                .filter(|bucket| !bucket.is_empty())
+                .unwrap_or("your-bucket");
             let region_line = region
                 .as_deref()
                 .map(|region| format!("\n        region: {region}"))
