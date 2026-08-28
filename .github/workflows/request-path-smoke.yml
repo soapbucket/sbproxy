@@ -68,7 +68,7 @@ jobs:
         run: >-
           cargo test -p sbproxy-core --locked --lib
           the_ai_dispatch_path_stays_inside_its_stack_budget
-          -- --exact --nocapture
+          -- --nocapture
 
       - name: build sbproxy binary
         run: cargo build -p sbproxy --locked

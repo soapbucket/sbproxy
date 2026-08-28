@@ -5,9 +5,11 @@
 # `scripts/stack-budget-baseline.count` holds one number: the bytes of
 # worker stack `the_ai_dispatch_path_stays_inside_its_stack_budget` runs
 # a real dispatch on. That test builds a Pingora runtime whose worker
-# stack is exactly this size and drives a streamed and a buffered AI
-# request through it. A path that no longer fits overflows and the
-# process aborts, which under nextest is that test and nothing else.
+# stack is exactly this size and drives a whole streamed AI request
+# through `request_phase::request_filter` on it, which is the real entry
+# point and the frame every later one sits above. A path that no longer
+# fits overflows and the process aborts, which under nextest is that
+# test and nothing else.
 #
 # # Why the number can only fall
 #
@@ -179,7 +181,7 @@ if [ "$current" -gt "$previous" ]; then
   echo >&2
   echo "Read the current depth with:" >&2
   echo "  cargo test -p sbproxy-core --lib \\" >&2
-  echo "    the_ai_dispatch_path_stays_inside_its_stack_budget -- --exact --nocapture" >&2
+  echo "    the_ai_dispatch_path_stays_inside_its_stack_budget -- --nocapture" >&2
   exit 1
 fi
 

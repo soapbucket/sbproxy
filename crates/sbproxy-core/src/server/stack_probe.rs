@@ -86,7 +86,8 @@ pub(crate) fn record_depth() {
     // `here()` is `#[inline(never)]` in pingora-runtime, so its frame
     // sits one call below this one. That constant offset is counted in
     // the reported number, which is the conservative direction.
-    let Some(used) = pingora_runtime::worker_stack::used_here(pingora_runtime::worker_stack::here())
+    let Some(used) =
+        pingora_runtime::worker_stack::used_here(pingora_runtime::worker_stack::here())
     else {
         // Not a Pingora runtime thread: nothing to measure against.
         return;

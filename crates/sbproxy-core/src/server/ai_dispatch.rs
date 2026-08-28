@@ -24498,7 +24498,6 @@ mod external_guardrail_context_tests {
                 "an operator who writes the key gets it"
             );
         }
-
     }
     struct QualityVerdictHook {
         scores: Option<Vec<crate::hooks::QualityScore>>,
