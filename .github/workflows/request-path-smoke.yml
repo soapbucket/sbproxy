@@ -50,9 +50,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # Restore-only, same reasoning as the rust-cache step in the job
-      # above: this key held ~2.0 GB of the 10 GB budget that ci.yml's
-      # header arithmetic gives back to the per-PR keys.
+      # Restore-only: this key held ~2.0 GB of the 10 GB budget that
+      # ci.yml's header arithmetic gives back to the per-PR keys. The
+      # key name is unchanged from when this job lived in
+      # context-compression-eval.yml, so the warm cache carries over.
       - uses: ./.github/actions/rust-setup
         with:
           cache-key: context-compression-request-path

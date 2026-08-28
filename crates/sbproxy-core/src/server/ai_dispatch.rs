@@ -18249,10 +18249,10 @@ origins:
       type: ai_proxy
       usage_parser: openai
       providers:
-- name: openai
-  api_key: "fixture-key"
-  base_url: "{upstream_url}"
-  allow_private_base_url: true
+        - name: openai
+          api_key: "fixture-key"
+          base_url: "{upstream_url}"
+          allow_private_base_url: true
 "#
     );
     let config = sbproxy_config::compile_config(&yaml).expect("fixture config compiles");
@@ -23398,17 +23398,21 @@ mod external_guardrail_context_tests {
         ///
         /// # What this measures instead
         ///
-        /// The dispatch runs on a real Pingora runtime worker whose
-        /// stack is set to exactly [`STACK_BUDGET`]. Pingora's runtime
-        /// records where each worker's stack starts, the request path
-        /// takes the address of a local at its deepest point, and the
-        /// difference is bytes actually in use. Two things are checked:
+        /// The request runs on a real Pingora runtime worker with a
+        /// production-sized stack. Pingora's runtime records where each
+        /// worker's stack starts, the request path takes the address of
+        /// a local at its deepest point, and the difference is bytes
+        /// actually in use. Two things are checked:
         ///
-        /// 1. The dispatch completes. A path that outgrows the budget
-        ///    overflows and the process aborts, which under nextest is
-        ///    this test and nothing else. That covers the *whole* call
-        ///    chain, including every frame below the probes, in reqwest,
-        ///    in hyper, in the TLS stack, in serde.
+        /// 1. The measured depth is inside [`STACK_BUDGET`]. This is an
+        ///    assertion and not an overflow on purpose: a stack overflow
+        ///    aborts, and an abort has no number and no message, which
+        ///    is the wrong failure for the check that exists to explain
+        ///    this class of bug. The abort is still there underneath,
+        ///    for a path that outgrows the whole production stack, and
+        ///    that one covers the entire call chain including every
+        ///    frame below the probes: reqwest, hyper, the TLS stack,
+        ///    serde.
         /// 2. The probe reported a non-zero depth. Without this the
         ///    measurement could quietly stop working, the budget check
         ///    would pass vacuously, and we would be back to a guard that

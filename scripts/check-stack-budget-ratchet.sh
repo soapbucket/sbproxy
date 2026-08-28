@@ -3,13 +3,12 @@
 # Refuse to raise the stack budget the AI dispatch path runs against.
 #
 # `scripts/stack-budget-baseline.count` holds one number: the bytes of
-# worker stack `the_ai_dispatch_path_stays_inside_its_stack_budget` runs
-# a real dispatch on. That test builds a Pingora runtime whose worker
-# stack is exactly this size and drives a whole streamed AI request
-# through `request_phase::request_filter` on it, which is the real entry
-# point and the frame every later one sits above. A path that no longer
-# fits overflows and the process aborts, which under nextest is that
-# test and nothing else.
+# worker stack the AI request path is allowed to use.
+#
+# `the_ai_dispatch_path_stays_inside_its_stack_budget` drives a whole
+# streamed AI request through `request_phase::request_filter`, which is
+# the real entry point and the frame every later one sits above, on a
+# real Pingora worker, and asserts the measured depth against it.
 #
 # # Why the number can only fall
 #
