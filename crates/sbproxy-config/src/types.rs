@@ -1474,6 +1474,38 @@ pub struct ConfigSoakConfig {
     /// whatever the operator knows and the proxy does not.
     #[serde(default)]
     pub probe: Option<ConfigSoakProbeConfig>,
+    /// Whether a failed soak re-applies the last known good revision on
+    /// its own. **Off by default**, and the only key in this block that
+    /// is (WOR-2461).
+    ///
+    /// # Why this one defaults off
+    ///
+    /// A node that undoes an operator's change without being asked is
+    /// surprising in a way that costs trust, and the failure mode is
+    /// asymmetric: a flapping upstream during a deploy window reverts a
+    /// good config, the operator re-applies it, it reverts again, and
+    /// the safety feature is now the incident. With it off the soak
+    /// still runs and still promotes, so the operator gets a correct
+    /// last-known-good pointer, a metric, an event, and an alert, with
+    /// none of that risk. Calibrate the thresholds against real traffic
+    /// with this off before arming it.
+    ///
+    /// Junos `commit confirmed` is the closest prior art and it is
+    /// deliberately not what this is: there the operator opts in per
+    /// commit and the rollback timer is armed for that one change.
+    /// Here the opt-in is per node and standing, which is a bigger
+    /// promise, so it is off until someone makes it.
+    ///
+    /// # It arms only for a diff an arc-swap can undo
+    ///
+    /// A `Restart` or `Breaking` diff (listener ports, admin block,
+    /// cluster identity, an origin's action or auth type) cannot be
+    /// undone by swapping the pipeline pointer back, and half-reverting
+    /// would leave the process in a state neither config describes.
+    /// Those get boot fallback and `POST /admin/config/rollback`
+    /// instead. The stored `blast_radius` on the ring entry decides it.
+    #[serde(default)]
+    pub auto_revert: bool,
 }
 
 impl Default for ConfigSoakConfig {
@@ -1486,6 +1518,7 @@ impl Default for ConfigSoakConfig {
             require_no_degraded_subsystems: true,
             require_upstream_health: true,
             probe: None,
+            auto_revert: false,
         }
     }
 }
@@ -1891,7 +1924,38 @@ boot:
         assert_eq!(cfg.boot.fallback, BootFallbackMode::LastKnownGood);
         assert_eq!(cfg.boot.max_attempts, 2);
         assert_eq!(cfg.boot.success_secs, 15);
+        assert!(
+            !cfg.soak.auto_revert,
+            "auto_revert is the one key in this block that defaults off, and a block that \
+             names every other soak key without naming it must still come back off",
+        );
         cfg.validate().expect("valid");
+    }
+
+    /// WOR-2461. `auto_revert` ships off, and it is the only key in the
+    /// soak block that does. Pinned as its own test rather than as an
+    /// assertion inside another, because a default flipping on is the
+    /// one change here that would take production action without an
+    /// operator asking.
+    #[test]
+    fn auto_revert_is_off_by_default_and_opting_in_is_explicit() {
+        assert!(
+            !ConfigSoakConfig::default().auto_revert,
+            "a node that undoes an operator's change without being asked is surprising in a \
+             way that costs trust",
+        );
+        assert!(
+            !ConfigHistoryConfig::default().soak.auto_revert,
+            "and it stays off through the block that turns the soak itself on",
+        );
+        let armed: ConfigHistoryConfig =
+            serde_yaml::from_str("enabled: true\nsoak:\n  auto_revert: true\n").expect("parses");
+        assert!(armed.soak.auto_revert, "opting in is one key");
+        assert!(
+            armed.soak.enabled,
+            "and arming the revert does not require restating that the soak is on",
+        );
+        armed.validate().expect("valid");
     }
 
     /// A zero window would promote on apply, which is the defect the
