@@ -23429,7 +23429,7 @@ mod external_guardrail_context_tests {
                 &mut context,
                 None,
             ));
-            // The watchdog is not the synchronisation; it is the bound
+            // The watchdog is not the synchronization; it is the bound
             // on a relay that never delivers, which is a real failure
             // and says so.
             let mut delivered =
