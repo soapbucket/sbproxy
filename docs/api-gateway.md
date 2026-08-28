@@ -1,10 +1,10 @@
 # API gateway guide
 
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-28*
 
 SBproxy is a reverse proxy first. Before it routes to an AI provider or federates an MCP server, it does the job Nginx, Envoy, or Kong do: match a hostname, authenticate the caller, apply rate limits and a WAF, load-balance across upstreams, and proxy the request. This guide is the entry point for that traditional pillar. If you are putting SBproxy in front of an existing HTTP API, or evaluating it as a replacement for a reverse proxy you already run, start here.
 
-This page links out to deep-dive docs rather than restating them. For the full request lifecycle, read [core-concepts.md](core-concepts.md) first; for the five-pillar overview (API, AI, MCP, A2A, Agent), see [features.md](features.md#1-api-traditional-reverse-proxy--gateway); for the field-by-field schema, [configuration.md](configuration.md) is canonical.
+This page links out to deep-dive docs rather than restating them. For the full request lifecycle, read [core-concepts.md](core-concepts.md) first; for the four walkthroughs and the action catalog, see [all-traffic-gateway.md](all-traffic-gateway.md) and [features.md](features.md#6-reference-every-action-type); for the field-by-field schema, [configuration.md](configuration.md) is canonical.
 
 ## Minimal config
 
@@ -111,7 +111,7 @@ Twelve built-in auth types cover the common cases: API key, Basic, Bearer, JWT (
 - [outbound-dpop.md](outbound-dpop.md) - RFC 9449 sender-constrained credentials for calls SBproxy makes upstream, as opposed to inbound caller auth.
 - [object-authz.md](object-authz.md) - BOLA/BFLA fine-grained access control once a caller is authenticated.
 
-**Examples:** [auth-jwt](../examples/auth-jwt/), [auth-forward](../examples/auth-forward/), [mtls-client-auth](../examples/mtls-client-auth/), [auth-api-key](../examples/auth-api-key/), [auth-basic](../examples/auth-basic/), [auth-bearer](../examples/auth-bearer/), [auth-bearer-dpop](../examples/auth-bearer-dpop/), [auth-cap](../examples/auth-cap/), [keys-inbound-headers](../examples/keys-inbound-headers/), [sessions](../examples/sessions/)
+**Examples:** [auth-jwt](../examples/auth-jwt/), [auth-forward](../examples/auth-forward/), [mtls-client-auth](../examples/mtls-client-auth/), [auth-api-key](../examples/auth-api-key/), [auth-basic](../examples/auth-basic/), [auth-digest](../examples/auth-digest/), [auth-bearer](../examples/auth-bearer/), [auth-bearer-dpop](../examples/auth-bearer-dpop/), [auth-cap](../examples/auth-cap/), [keys-inbound-headers](../examples/keys-inbound-headers/), [sessions](../examples/sessions/)
 
 ## Rate limiting, WAF, and abuse controls
 

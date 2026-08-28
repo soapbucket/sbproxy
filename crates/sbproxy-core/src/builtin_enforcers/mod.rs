@@ -15,7 +15,7 @@
 //! `Policy::Plugin(_)` keeps its original trait object while dynamic
 //! bundle execution metadata is retained beside the compiled enforcer.
 //!
-//! See `docs/adr-policy-engine-unification.md` and
+//! See `docs/policy.md` and
 //! `docs/phase0-oss-implementation-plan.md` Item 1 for the larger
 //! plan.
 

@@ -7295,8 +7295,8 @@ fn default_anomaly_rate_spike_min_mean() -> f64 {
 /// promotes the entry back into the hot tier on hit.
 ///
 /// Backend selection is open-ended via [`CacheReserveBackendConfig`]
-/// so the in-tree memory / filesystem / redis / s3 backends can be
-/// extended without touching this schema.
+/// so the in-tree memory / filesystem / redis / object-storage
+/// backends can be extended without touching this schema.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CacheReserveConfig {
@@ -7366,35 +7366,47 @@ pub enum CacheReserveBackendConfig {
         #[serde(default)]
         key_prefix: Option<String>,
     },
-    /// S3-backed reserve with AWS KMS envelope encryption. A cold,
-    /// cross-region-replicable tier; cross-region replication itself
-    /// is configured at the bucket level, outside this schema.
-    /// Credentials resolve through the standard AWS chain (env,
-    /// profile, IMDS, container credentials), never through this
-    /// config block.
+    /// Retired (WOR-2673): the AWS-SDK S3 backend with KMS envelope
+    /// encryption. [`Self::ObjectStore`] with `backend: s3` replaces
+    /// it and reaches the same buckets.
+    ///
+    /// This variant still deserializes, and the config compiler still
+    /// refuses it by name, on purpose. This enum carries
+    /// `#[serde(other)]`, so deleting the variant outright would have
+    /// made an existing `type: s3` block parse as "a backend
+    /// registered out of tree": the config would load, the proxy would
+    /// serve, the startup log would carry one `warn!`, and the cold
+    /// tier would be gone. Every field is optional here because none
+    /// of them is read for behavior; they exist so a real operator
+    /// config parses far enough to reach a refusal that names its
+    /// replacement.
+    ///
+    /// See `docs/cache-reserve.md` for the field-by-field migration,
+    /// including the one behavior that does not carry over: KMS-wrapped
+    /// per-object data keys. The replacement seals locally with
+    /// AES-256-GCM, or leaves sealing to the bucket's own SSE-KMS.
     S3 {
-        /// Source S3 bucket.
-        bucket: String,
-        /// AWS region the bucket lives in.
-        region: String,
-        /// KMS key ID, ARN, or alias used to wrap/unwrap the
-        /// per-object data key (or, in `sse_kms_bucket_default` mode,
-        /// passed as `ssekms_key_id`).
-        kms_key_id: String,
-        /// Optional key prefix prepended to every object (e.g.
-        /// `"reserve/"`).
+        /// Ignored. Was the source S3 bucket.
+        #[serde(default)]
+        bucket: Option<String>,
+        /// Ignored. Was the AWS region the bucket lives in.
+        #[serde(default)]
+        region: Option<String>,
+        /// Ignored, and the field whose behavior does not carry over.
+        /// Was the KMS key that wrapped each object's data key.
+        #[serde(default)]
+        kms_key_id: Option<String>,
+        /// Ignored. Was the key prefix prepended to every object.
         #[serde(default)]
         prefix: Option<String>,
-        /// Optional replication target bucket name, surfaced for
-        /// diagnostics only. Cross-region replication is configured
-        /// at the bucket level and this backend never acts on it.
+        /// Ignored. Was a diagnostics-only hint; cross-region
+        /// replication was always configured at the bucket level.
         #[serde(default)]
         replication_target_bucket: Option<String>,
-        /// When `true`, upload plaintext and rely on S3 SSE-KMS
-        /// bucket-default encryption instead of local envelope
-        /// encryption. Defaults to `false`.
+        /// Ignored. Was the switch between local envelope encryption
+        /// and S3 bucket-default SSE-KMS.
         #[serde(default)]
-        sse_kms_bucket_default: bool,
+        sse_kms_bucket_default: Option<bool>,
     },
     /// WOR-2673: object storage. One variant covers S3, Google Cloud
     /// Storage, Azure Blob Storage, and a local directory, because they
@@ -10181,6 +10193,18 @@ pub struct RawOriginConfig {
     /// obtain and verify license tokens.
     #[serde(default)]
     pub olp: Option<OlpConfig>,
+    /// WOR-2673: IAB Content Authorization Marketplace Protocol (CoMP)
+    /// bridge. When set, the proxy serves
+    /// `/.well-known/iab-comp/{manifest.json,quote,redeem}` on this
+    /// origin, so an AI buyer can read the licensing catalog, get a
+    /// signed price, and redeem a paid acceptance for an OLP license
+    /// token without any publisher-specific integration.
+    ///
+    /// Requires this origin's [`Self::olp`] block: the bridge mints
+    /// with that issuer's signing key, so the token it hands back is
+    /// one this same origin's `/.well-known/olp/introspect` verifies.
+    #[serde(default)]
+    pub comp: Option<CompMarketplaceConfig>,
     /// WOR-805 AC#4: opt in to publishing SBproxy's own Web Bot
     /// Auth signing-key directory at
     /// `/.well-known/http-message-signatures-directory` and the
@@ -14291,6 +14315,50 @@ pub struct OlpConfig {
     /// `/.well-known/olp/revoke` (RFC 7009) 404'd. Set to enable.
     #[serde(default)]
     pub introspect: Option<OlpIntrospectConfig>,
+
+    /// Tokens one source IP may mint per minute at
+    /// `POST /.well-known/olp/token`. Defaults to 60.
+    ///
+    /// That endpoint is unauthenticated by design: an RSL crawler
+    /// following a `WWW-Authenticate: License` challenge has no
+    /// credential yet, and a request carrying no `client_credentials`
+    /// form falls back to an anonymous `sub`. Every call mints a fresh
+    /// Ed25519-signed bearer license token. Without a bound, one source
+    /// mints them at whatever rate the CPU allows, and the endpoint
+    /// answers before authentication and before the policy chain where
+    /// an origin's own rate limits live, so nothing else on the request
+    /// path sees it (WOR-2673).
+    ///
+    /// The budget is a token bucket keyed on the **raw socket peer**,
+    /// not `X-Forwarded-For`. On an unauthenticated endpoint a
+    /// forgeable header is not an identity: a caller that picks a new
+    /// `X-Forwarded-For` per request would get a fresh full bucket
+    /// every time and grow the tracking map while doing it. A
+    /// deployment behind a load balancer therefore budgets the balancer,
+    /// which is the honest reading of who the proxy is actually talking
+    /// to.
+    ///
+    /// This value is both the burst and the steady-state rate: the
+    /// bucket holds this many tokens and refills at one sixtieth of it
+    /// per second, the same shape
+    /// [`OlpIntrospectConfig`]'s inactive-response limiter uses.
+    ///
+    /// `0` is refused at config compile. There is deliberately no
+    /// "unlimited" setting: an unauthenticated mint endpoint whose
+    /// bound is one typo away from being off is not bounded.
+    #[serde(default = "default_olp_token_rate_limit_per_minute")]
+    pub token_rate_limit_per_minute: u32,
+}
+
+/// Default for [`OlpConfig::token_rate_limit_per_minute`].
+///
+/// Sixty per minute, so a well-behaved crawler minting one token per
+/// license and caching it for the token's TTL is never near the bound,
+/// and a client looping the endpoint is cut to roughly one mint per
+/// second. Matches `INTROSPECT_CAPACITY` on the sibling limiter so an
+/// operator reading both sees one number.
+fn default_olp_token_rate_limit_per_minute() -> u32 {
+    60
 }
 
 /// Redacted `Debug` (WOR-2606). Two seeds. `signing_key` is a
@@ -14313,6 +14381,10 @@ impl std::fmt::Debug for OlpConfig {
             .field("signing_key", &"[REDACTED]")
             .field("key_id", &self.key_id)
             .field("issuer", &self.issuer)
+            .field(
+                "token_rate_limit_per_minute",
+                &self.token_rate_limit_per_minute,
+            )
             .field("default_scope", &self.default_scope)
             .field(
                 "content_key_seed",
@@ -14320,6 +14392,205 @@ impl std::fmt::Debug for OlpConfig {
             )
             .finish_non_exhaustive()
     }
+}
+
+/// WOR-2673: IAB Content Authorization Marketplace Protocol (CoMP)
+/// bridge, on a per-origin basis.
+///
+/// CoMP is the discovery-and-purchase front door to the license tokens
+/// the origin's `olp:` block already issues. It publishes a signed
+/// catalog of licensing tiers, prices a buyer's requested volume into a
+/// signed quote, and converts a signed, paid acceptance of that quote
+/// into an OLP license token. Three well-known endpoints:
+///
+/// * `GET  /.well-known/iab-comp/manifest.json`
+/// * `POST /.well-known/iab-comp/quote`
+/// * `POST /.well-known/iab-comp/redeem`
+///
+/// YAML key: `origins.<host>.comp`. See `docs/comp-marketplace.md`.
+///
+/// The bridge does not carry its own OLP issuer. It signs the license
+/// token it returns with the same key `origins.<host>.olp.signing_key`
+/// names, under the same `kid`, so the token verifies against the
+/// origin's own `/.well-known/olp/introspect` with no extra trust
+/// configuration. `olp.enabled: true` on the same origin is therefore
+/// required, and the config compiler refuses the block without it.
+#[derive(Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CompMarketplaceConfig {
+    /// Master toggle. When false the three well-known endpoints 404.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Master key the CoMP quote-signing key is derived from, as a
+    /// hex- or base64-encoded value of at least 32 bytes.
+    ///
+    /// Resolved like every other config secret: a provider URI
+    /// (`secret://backend/name`, `vault://...`), a `file:/path`
+    /// reference, or a whole-value `${ENV_VAR}`. HKDF-SHA256 expands
+    /// it into one Ed25519 signing key per [`Self::rotation_id`], so
+    /// rotation is a label change rather than the minting and
+    /// distribution of a new raw seed.
+    ///
+    /// This is not the OLP token key. Quote signatures live in their
+    /// own `comp-...` kid namespace precisely so a quote signature can
+    /// never be replayed as a license token.
+    pub master_key: String,
+
+    /// Rotation label the active quote-signing key is derived under,
+    /// for example `2026-q3-001`. Bumping it derives and publishes a
+    /// new `comp-<rotation_id>` kid; the previous one keeps verifying
+    /// until the process restarts.
+    pub rotation_id: String,
+
+    /// Publisher identity the manifest advertises.
+    pub publisher: CompPublisherConfig,
+
+    /// Licensing tiers the manifest publishes. At least one is
+    /// required, and at least one must be `authorization: olp`, since
+    /// that is the only kind `redeem` can mint a token for.
+    #[serde(default)]
+    pub tiers: Vec<CompTierConfig>,
+
+    /// Buyer verification keys, by `kid`. A redeem request is signed
+    /// by the buyer and refused unless its `kid` resolves here, so this
+    /// list is the onboarding boundary: a buyer whose key is absent
+    /// cannot redeem anything at any price.
+    #[serde(default)]
+    pub buyer_keys: Vec<CompBuyerKeyConfig>,
+
+    /// SHA-256 of the canonical JSON of the manifest, in
+    /// `sha256:<hex>` form, published in the manifest itself.
+    ///
+    /// Computed over the manifest with this field cleared when it is
+    /// omitted, which is what the CoMP field is specified to be. Set it
+    /// explicitly only when an out-of-band process (a signed catalog
+    /// feed, a marketplace aggregator) owns the value.
+    #[serde(default)]
+    pub manifest_hash: Option<String>,
+
+    /// Honor a redeem whose `quote_id` this process never issued.
+    /// Defaults to `false`.
+    ///
+    /// The bridge keeps its issued-quote ledger in memory, matching the
+    /// no-external-store rule this port ships under, so a reload or a
+    /// restart forgets every quote it signed. With the default, a buyer
+    /// holding a quote from before that restart is refused and has to
+    /// ask for a new one, which costs it one round trip.
+    ///
+    /// Turning this on removes that refusal, and removes with it the
+    /// only thing standing between an onboarded buyer key and a token
+    /// per call with a fabricated `quote_id`, no quote, and no price.
+    /// A deployment that turns it on should be running a shared
+    /// revocation denylist, because that check is then the only durable
+    /// one left. See `docs/comp-marketplace.md`.
+    #[serde(default)]
+    pub allow_unknown_quotes: bool,
+}
+
+/// Redacted `Debug` (WOR-2673). `master_key` is the HKDF input every
+/// CoMP quote-signing key is derived from: reading it forges a
+/// publisher quote at any price, which a buyer's client has no way to
+/// tell from a real one. Everything else in this block is published in
+/// the manifest the bridge serves to anyone who asks, so it stays.
+/// Curated and `finish_non_exhaustive`, so a key-shaped field added
+/// later is absent rather than printed.
+impl std::fmt::Debug for CompMarketplaceConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompMarketplaceConfig")
+            .field("enabled", &self.enabled)
+            .field("master_key", &"[REDACTED]")
+            .field("rotation_id", &self.rotation_id)
+            .field("publisher", &self.publisher)
+            .field("tiers", &self.tiers)
+            .field("buyer_keys", &self.buyer_keys)
+            .field("manifest_hash", &self.manifest_hash)
+            .field("allow_unknown_quotes", &self.allow_unknown_quotes)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Publisher identity block of the CoMP manifest.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CompPublisherConfig {
+    /// Legal or trading name of the publisher.
+    pub name: String,
+    /// Licensing contact address a buyer can reach a human at.
+    pub contact: String,
+    /// RFC 3339 timestamp of the publisher's marketplace verification,
+    /// when a marketplace has issued one. Advisory; nothing in the
+    /// proxy checks it.
+    #[serde(default)]
+    pub verified_at: Option<String>,
+}
+
+/// One licensing tier in the CoMP manifest.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CompTierConfig {
+    /// Stable tier identifier a buyer names in a quote request.
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// One-line description of what the tier licenses.
+    pub description: String,
+    /// License URN this tier grants, stamped into the minted token's
+    /// `license_urn` claim.
+    pub license: String,
+    /// Content shape: `html`, `json-envelope`, or `bulk-archive`.
+    pub shape: String,
+    /// Acquisition flow: `public`, `cap`, or `olp`. Only `olp` tiers
+    /// can be redeemed for a license token.
+    pub authorization: String,
+    /// Route allow-list glob echoed to the buyer. Advisory: the
+    /// marketplace bridge publishes it, and the origin's own policies
+    /// enforce access.
+    pub route_glob: String,
+    /// Pricing block.
+    pub pricing: CompTierPricingConfig,
+    /// Rate ceiling advertised for the tier.
+    #[serde(default)]
+    pub rate_caps: Option<CompRateCapsConfig>,
+}
+
+/// Pricing block of a CoMP tier.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CompTierPricingConfig {
+    /// `free`, `per_request`, or `flat_rate`.
+    pub model: String,
+    /// ISO 4217 currency code.
+    pub currency: String,
+    /// Whole-unit amount. For `free` and `flat_rate`.
+    #[serde(default)]
+    pub amount: Option<u64>,
+    /// Micro-unit amount (millionths of a currency unit). For
+    /// `per_request`.
+    #[serde(default)]
+    pub amount_micros: Option<u64>,
+}
+
+/// Rate ceiling advertised for a CoMP tier.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CompRateCapsConfig {
+    /// Maximum requests per second.
+    pub max_rps: f64,
+    /// Maximum bytes per day.
+    pub max_bytes_per_day: u64,
+}
+
+/// One onboarded buyer's verification key.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CompBuyerKeyConfig {
+    /// Key id the buyer names in its redeem signature header.
+    pub kid: String,
+    /// Ed25519 public key, base64url without padding, 32 bytes
+    /// decoded. Public by definition, so it carries no secret and is
+    /// not resolved through the secret layer.
+    pub public_key: String,
 }
 
 /// WOR-808 PR9: RFC 7662 OAuth Token Introspection + RFC 7009 Token
@@ -15945,6 +16216,29 @@ mod decision_audit_scope_tests {
             rendered.contains("olp-kid-1") && rendered.contains("api.example.test"),
             "the kid and issuer must survive: both are advertised in the JWS \
              header and the well-known document: {rendered}"
+        );
+
+        // The HKDF input every CoMP quote-signing key is derived from
+        // (WOR-2673). Reading it forges a publisher quote at any price,
+        // which a buyer's client cannot tell from a real one.
+        let comp: CompMarketplaceConfig = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "master_key": SENTINEL,
+            "rotation_id": "2026-q3-001",
+            "publisher": { "name": "Example Co.", "contact": "licensing@example.test" },
+            "tiers": [],
+            "buyer_keys": [],
+        }))
+        .expect("comp fixture parses");
+        let rendered = format!("{comp:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the CoMP master key reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("2026-q3-001") && rendered.contains("Example Co."),
+            "the rotation label and the publisher must survive: both are published in \
+             the manifest this bridge serves to anyone who asks: {rendered}"
         );
     }
 }

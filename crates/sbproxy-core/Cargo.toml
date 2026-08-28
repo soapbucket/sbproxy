@@ -124,6 +124,11 @@ sbproxy-util.workspace = true
 sbproxy-httpkit.workspace = true
 sbproxy-config.workspace = true
 sbproxy-federation.workspace = true
+# WOR-2673: the IAB CoMP marketplace bridge served on
+# `/.well-known/iab-comp/*` for origins that configure `comp:`.
+# Leaf crate: it depends on sbproxy-storage and nothing else in the
+# workspace, so this edge does not widen the request path's graph.
+sbproxy-licensing.workspace = true
 sbproxy-tls.workspace = true
 sbproxy-modules.workspace = true
 sbproxy-mcp-gateway.workspace = true

@@ -3313,7 +3313,7 @@ pub fn run_with_fallback(
     // stub on the receiver prints each record to stderr as a JSON line,
     // prefixed by its record kind. An extension can replace the consumer
     // with a NATS-backed audit-chain subscriber per
-    // `docs/adr-policy-audit-binding.md`.
+    // `docs/events.md`.
     //
     // Installed here, before `CompiledPipeline::from_config_at` below,
     // so no request can reach a publish site before the bus exists.
@@ -6904,6 +6904,7 @@ origins:
             deprecation: None,
             message_signatures: None,
             olp: None,
+            comp: None,
             web_bot_auth_publish: None,
             idempotency: None,
             timeouts: sbproxy_config::UpstreamTimeouts::default(),

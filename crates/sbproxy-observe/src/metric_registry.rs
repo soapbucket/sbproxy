@@ -2100,7 +2100,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Proxy,
         labels: &["backend"],
-        description: "Whether the configured Cache Reserve backend is degraded.",
+        description: "Whether the configured Cache Reserve backend is degraded. `backend` is the provider (`memory`, `filesystem`, `redis`, `s3`, `gcs`, `azure`, `local`, or `object_store` for a provider this build does not name), not the client library in front of it.",
         dead_reason: None,
     },
     MetricCapability {
@@ -2133,7 +2133,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Proxy,
         labels: &["backend", "state", "reason"],
-        description: "Cache Reserve backend health transitions by bounded reason.",
+        description: "Cache Reserve backend health transitions by bounded reason. `backend` carries the same closed provider vocabulary as `sbproxy_cache_reserve_degraded`.",
         dead_reason: None,
     },
     MetricCapability {
@@ -2274,7 +2274,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["outcome"],
-        description: "IAB CoMP marketplace manifest serves, by outcome. Written by the `sbproxy-licensing` router; empty on a deployment that does not mount it.",
+        description: "IAB CoMP marketplace manifest serves, by outcome. Written by `sbproxy_licensing::comp::serve`, which the proxy request path calls for an origin with a `comp:` block and the crate's own axum router calls for a standalone host; empty on a deployment with neither.",
         dead_reason: None,
     },
     MetricCapability {
@@ -2285,7 +2285,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["outcome"],
-        description: "IAB CoMP marketplace quote outcomes. Written by the `sbproxy-licensing` router; empty on a deployment that does not mount it.",
+        description: "IAB CoMP marketplace quote outcomes, including the oversize-body refusal. Written by `sbproxy_licensing::comp::serve`, which the proxy request path calls for an origin with a `comp:` block and the crate's own axum router calls for a standalone host; empty on a deployment with neither.",
         dead_reason: None,
     },
     MetricCapability {
@@ -2296,7 +2296,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["outcome"],
-        description: "IAB CoMP marketplace redeem outcomes. Written by the `sbproxy-licensing` router; empty on a deployment that does not mount it.",
+        description: "IAB CoMP marketplace redeem outcomes, including the oversize-body refusal. Written by `sbproxy_licensing::comp::serve`, which the proxy request path calls for an origin with a `comp:` block and the crate's own axum router calls for a standalone host; empty on a deployment with neither.",
         dead_reason: None,
     },
     MetricCapability {
@@ -3821,6 +3821,17 @@ pub const METRICS: &[MetricCapability] = &[
         description: "Age of the cached OCSP staple for the host, in seconds. Published once \
              a minute by the refresh task; absent until the first successful fetch, so \
              never-stapled is distinguishable from stale.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_olp_decisions_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_olp_decision"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Proxy,
+        labels: &["endpoint", "outcome"],
+        description: "RSL Open Licensing Protocol endpoint outcomes by endpoint (`token`, `key`, `introspect`, `revoke`) and outcome (`ok`, `rejected`, `rate_limited`, `error`). `rate_limited` is the per-source token budget on `POST /.well-known/olp/token` refusing a mint; it is its own value rather than a `rejected` so an operator can tell a flood from a broken client. Written by the proxy request path for an origin with an `olp:` block; empty on a deployment that configures none.",
         dead_reason: None,
     },
     MetricCapability {

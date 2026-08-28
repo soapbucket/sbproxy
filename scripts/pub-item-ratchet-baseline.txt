@@ -1147,3 +1147,76 @@ is the single-round form of the loop and the seam an embedder without a watch
 thread would use, and because pushing those ten tests through
 `aggregation_loop` would make each one wait on a real clock to assert
 something that has nothing to do with timing.
+2026-08-28 (WOR-2673, cache-reserve consolidation): tests-only 324 -> 323.
+`S3ReserveConfig` and the `S3Reserve` surface around it went with the
+AWS-SDK cache-reserve backend, which the object-storage backend replaces.
+The item was reachable only from its own tests and the mock-SDK integration
+file, both of which were removed with it. Unreferenced 1520 -> 1519, the
+same removal.
+
+2026-08-28 (WOR-2673, licensing wiring): tests-only 323 -> 322. Wiring
+`sbproxy-licensing` into the proxy gave the CoMP marketplace surface its
+first production consumers: `sbproxy_core::pipeline::build_comp_marketplace`
+builds it from `origins.<host>.comp`, `request_phase` serves the three
+well-known endpoints through it, and `admin_licensing` reads it. Items
+that previously only the crate's own tests and its example named now
+have a caller inside a shipped binary.
+
+Unreferenced 1519 -> 1523, all four the nested config structs of
+`origins.<host>.comp`: `CompPublisherConfig`, `CompTierConfig`,
+`CompTierPricingConfig`, `CompRateCapsConfig`, and `CompBuyerKeyConfig`.
+Narrowing is not available to them: they are field types of a `pub`
+schema struct in `sbproxy-config`, which is one of the three public
+crates, and `schemars` derives a JSON Schema node per type. Every other
+nested config struct in `types.rs` sits in this same bucket for the same
+reason. `COMP_ACCEPTANCE_SKEW_SECS` is not among them: it is re-exported
+from `comp/mod.rs` beside `COMP_QUOTE_VALIDITY_SECS`, which is where an
+operator reading the five-minute window in the docs would look for it.
+
+2026-08-28 (WOR-2673 merged with main at 454e0abfc): recounted against the
+merged tree rather than carried from either parent, because neither
+parent's figure describes it. Tests-only 321, unreferenced 1521. This
+branch alone read 322 / 1523 and main alone 323 / 1518; the merge is
+below both on the first count and between them on the second, because
+main's origin-profile work gave out-of-file consumers to items this
+branch had left file-local while this branch's licensing wiring did the
+same for main's. Lowered at the merge rather than after it, so the
+ground both sides gained is held.
+
+2026-08-28 (WOR-2673 merged with main at 1cd47627): recounted against the
+merged tree, not carried from either parent. Tests-only 321, unreferenced
+1524. Both parents read 1521 on the second count and the merge is three
+above both, which is the union rather than a regression: main's config
+soak and rejected-candidate work (WOR-2458/2459/2462) added public
+`sbproxy-config` schema types that this branch does not consume, and this
+branch's `origins.<host>.comp` nested types are ones main does not, so
+each parent's figure counted its own additions and none of the other's.
+Narrowing is unavailable to both sets for the same reason: they are field
+types of `pub` schema structs in one of the three public crates, and
+`schemars` derives a JSON Schema node per type. Every other nested config
+struct in `types.rs` sits in this bucket already. The other five ratchet
+baselines (unwrap 794, panic 0, metric-visibility 242, log-url 41,
+request-error 0) were zeroed and recounted the same way; all five came
+back at the value both parents already held.
+
+
+2026-08-28 (WOR-2432 the aggregator, merged with main at 49145cbd): recounted
+against the merged tree, not carried from either parent, and neither parent's
+figure describes it. Tests-only 324, unreferenced 1529. This branch alone read
+326 / 1526 and main alone 321 / 1524.
+
+Tests-only comes out two below this branch, which is main's ground being kept
+rather than this branch's being handed back. Main deleted the AWS-SDK
+cache-reserve backend, taking `S3ReserveConfig` and its tests with it, and
+wired `sbproxy-licensing` into the proxy, which gave the CoMP marketplace
+surface its first production consumers. Both were counted here and neither is
+any more. This branch's own two, `Aggregator::seed_published_digest` and
+`Aggregator::run_round`, are still in the bucket for the reasons written above.
+
+Unreferenced comes out three above both parents, which is the union and not a
+regression: each parent's figure counted its own additions and none of the
+other's. Main's `origins.<host>.comp` nested config structs are field types of
+a `pub` schema struct in `sbproxy-config`, where `schemars` derives a node per
+type and narrowing does not compile; this branch's three are private types in
+a public interface for the same kind of reason. Nothing narrowed in the merge
+that had not narrowed in a parent.

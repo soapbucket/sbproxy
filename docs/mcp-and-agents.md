@@ -1,6 +1,6 @@
 # MCP and agent traffic
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-28*
 
 ![Initialize an MCP session against the admin API and confirm the notification handshake](assets/admin-mcp.gif)
 
@@ -21,6 +21,8 @@ Jump straight to a page:
 
 - Federate several upstream MCP servers behind one endpoint -
   [`mcp.md`](mcp.md)
+- Write Cedar ABAC on federated `tools/call` -
+  [`cedar-policy.md`](cedar-policy.md)
 - Stop a tool description or tool output from acting as an instruction
   to the model - [`mcp-security.md`](mcp-security.md)
 - Enforce egress allowlisting, session risk, or output quarantine on

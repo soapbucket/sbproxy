@@ -325,6 +325,12 @@ pub const PLATFORM_OWNED_ORIGIN_FIELDS: &[(&str, &str)] = &[
         "the license-token issuer and its published key, which is deployment identity",
     ),
     (
+        "comp",
+        "the CoMP marketplace bridge: it mints with the `olp` block's signing key, sets the \
+         prices this deployment sells at, and names the buyer keys allowed to redeem, so a \
+         project that could set it could mint licenses under the host's identity",
+    ),
+    (
         "web_bot_auth_publish",
         "publishes this deployment's own signing-key directory",
     ),

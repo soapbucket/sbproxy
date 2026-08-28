@@ -1,5 +1,5 @@
 # Routing and traffic management
-*Last modified: 2026-08-27*
+*Last modified: 2026-08-28*
 
 How SBproxy decides which upstream serves a request: hostname matching, forward rules, load balancing, protocol-specific actions, failover, and the extension point for custom selection logic. This page is the hub; [configuration.md](configuration.md) is the field-by-field source of truth for every block below.
 
@@ -149,7 +149,7 @@ Beyond plain HTTP `proxy`, dedicated actions route other transports through the 
 - **gRPC** (`type: grpc`): proxies `grpc://`/`grpcs://`, with `grpc_web: true` letting browser gRPC-Web clients reach a native gRPC upstream, and optional REST-to-gRPC `transcode` bindings from an OpenAPI-style HTTP route to a unary gRPC call. Plain passthrough is byte-transparent and carries every RPC cardinality, unary through bidirectional streaming; the two translation modes are narrower, and one policy composition is a trap. See [gRPC limits](#grpc-limits) below. Runnable at [`examples/grpc-h2c/`](../examples/grpc-h2c/).
 - **GraphQL** (`type: graphql`): transparent by default; setting `max_depth`, `allow_introspection: false`, or `validate_queries: true` turns on fail-closed parsing (syntax only, not schema-aware) ahead of the upstream, including a 64 KiB validated-body limit and whole-batch rejection. Runnable at [`examples/graphql-gateway/`](../examples/graphql-gateway/).
 
-Field tables for each: [configuration.md#websocket](configuration.md#websocket), [configuration.md#grpc](configuration.md#grpc), [configuration.md#graphql](configuration.md#graphql). WebSocket and GraphQL also have their own dedicated pages, [websocket.md](websocket.md) and [graphql.md](graphql.md), covering upgrade semantics, validation placement, and honest limits in more depth than the field tables alone.
+Field tables for each: [configuration.md#websocket](configuration.md#websocket), [configuration.md#grpc](configuration.md#grpc), [configuration.md#graphql](configuration.md#graphql). Each protocol action also has a dedicated page: [websocket.md](websocket.md), [grpc.md](grpc.md), and [graphql.md](graphql.md).
 
 ### gRPC limits
 

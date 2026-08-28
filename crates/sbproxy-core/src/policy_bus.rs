@@ -1,6 +1,6 @@
 //! Policy-decision audit event bus.
 //!
-//! Per `docs/adr-policy-audit-binding.md`, every policy decision
+//! Per `docs/events.md`, every policy decision
 //! emits a `PolicyVerdictEvent` (see
 //! [`sbproxy_observe::events::PolicyVerdictEvent`]) on the audit
 //! bus and the hot path finishes as soon as the event is
@@ -337,7 +337,7 @@ fn send_record(record: AuditRecord) -> Result<(), Box<AuditRecord>> {
 /// produced. Callers that only count the drop ignore it; callers that
 /// want the event back match the [`AuditRecord::PolicyVerdict`] arm.
 ///
-/// Per `docs/adr-policy-audit-binding.md` the hot path never
+/// Per `docs/events.md` the hot path never
 /// blocks on the audit bus, so this is the only emission entry
 /// point exposed to the dispatcher.
 pub fn try_publish(event: PolicyVerdictEvent) -> Result<(), Box<AuditRecord>> {

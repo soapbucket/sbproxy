@@ -1630,7 +1630,16 @@ mod tests {
         let short = RegistrationQueue::new(
             Arc::new(EmbeddedKvStore::open(temp_path(), "agent_registry").expect("store")),
             Arc::new(MemoryKv::new("agent_registry")),
-            Duration::milliseconds(30),
+            // 300ms, not 30. Both `register` calls below write through an
+            // embedded redb store, and the duplicate assertion only holds
+            // while the second one lands inside this window. At 30ms that
+            // was a wall-clock race against two durable writes: green
+            // alone and on an idle machine, red under a loaded full-suite
+            // run, where the disk is contended. Nothing about the property
+            // needs the window to be tight, so it is not. The `sleep`
+            // below moves with it, or the expiry half of this test stops
+            // proving anything.
+            Duration::milliseconds(300),
             Duration::days(30),
         )
         .expect("queue");
@@ -1644,7 +1653,7 @@ mod tests {
                 .await,
             Err(RegistryError::DuplicateMetadata(_))
         ));
-        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         let (second, _) = short
             .register(&TenantScope::All, fresh, now())
             .await

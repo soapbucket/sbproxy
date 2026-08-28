@@ -3538,6 +3538,7 @@ model-host artifact cache above:
 | POST | `/admin/cache/key-policy/evict` | Drop one (or all) cached key policies so the next request re-reads the keystore. |
 | GET | `/admin/cache/semantic` | Recent semantic (embedding) cache lookup decisions per AI origin. |
 | GET | `/admin/federation` | OpenID Federation identity this proxy publishes, and what it requires of a peer. |
+| GET | `/admin/licensing` | CoMP marketplace bridges: what each configured origin publishes and which quote-signing key is live. |
 | GET | `/admin/mcp-oauth` | Every colocated MCP OAuth broker this proxy runs, and what each has wired in. |
 
 ### `GET /admin/cache`
@@ -3636,6 +3637,105 @@ the well-known route from the request path and never mounts that crate's
 router. An admin console page for it is separate scope, under the admin
 console epic; the JSON here is the operator surface today. See
 [federation.md](federation.md).
+
+### `GET /admin/licensing`
+
+Content licensing: the CoMP marketplace bridge and the RSL Open
+Licensing Protocol issuer, per origin. Returns
+`{"enabled": false, "origins": []}` when no origin sets `comp` or `olp`,
+so a poll can tell "off" from a typo in the path. Both `admin` and
+`read_only` operators may call it.
+
+```json
+{
+  "enabled": true,
+  "origins": [
+    {
+      "hostname": "api.example.com",
+      "olp": {
+        "enabled": true,
+        "signing_kid": "2026-q3",
+        "issuer": "https://api.example.com",
+        "default_scope": "ai-input",
+        "default_ttl_secs": 86400,
+        "content_key_configured": false,
+        "introspect": {
+          "enabled": true,
+          "introspect_path": "/.well-known/olp/introspect",
+          "revoke_path": "/.well-known/olp/revoke",
+          "revocation_store": "redis"
+        }
+      },
+      "comp": {
+        "enabled": true,
+        "publisher_domain": "api.example.com",
+        "publisher_name": "Example Publishing Co.",
+        "tier_count": 3,
+        "olp_tier_count": 1,
+        "active_signing_kid": "comp-2026-q3-001",
+        "trusted_kid_count": 1,
+        "manifest_hash": "sha256:9f2c...",
+        "generated_at": "2026-08-28T07:41:02Z",
+        "endpoints": {
+          "manifest": "https://api.example.com/.well-known/iab-comp/manifest.json",
+          "quote": "https://api.example.com/.well-known/iab-comp/quote",
+          "redeem": "https://api.example.com/.well-known/iab-comp/redeem"
+        }
+      }
+    }
+  ]
+}
+```
+
+Each origin carries both halves, and both always carry `enabled`, so
+one field answers "does this origin have a bridge" without a consumer
+having to tell `false` apart from a key that is not there. An origin
+with an OLP issuer and no CoMP bridge appears with
+`"comp": {"enabled": false}` and a populated `olp`; an origin with
+neither is not listed at all.
+
+The `olp` object is the issuer half. It answers the questions an
+operator otherwise had to mint a token and decode it to ask: which kid
+is signing, what issuer the tokens claim, how long they live, and
+whether the RFC 7662 / RFC 7009 pair is mounted at all.
+
+`revocation_store` is the variant name only (`memory`, `redb`, or
+`redis`), never the redb path or the Redis URL, which routinely carries
+a password in its userinfo. It is the field to check when a revocation
+did not take on the replica you are looking at: `memory` is per-process
+and lost on restart.
+
+Two more fields are worth polling, both under `comp`.
+`active_signing_kid` is `null` until a rotation has been activated, and
+every quote request fails closed until
+it is, so a null here explains an endpoint answering nothing but
+rejections. `olp_tier_count` is how many of `tier_count` a buyer can
+actually redeem for a license token: the difference is the `cap` and
+`public` tiers, which the manifest advertises and `redeem` cannot mint
+for. A catalog of twelve tiers with one redeem a day reads differently
+once you know eleven of them were never redeemable.
+
+`generated_at` and `manifest_hash` are stamped when the pipeline built
+the manifest, so they move on a config reload and not otherwise. No key
+material appears here, and no token this bridge has minted is retained
+anywhere this route can read.
+
+The traffic counterpart is `sbproxy_olp_decisions_total` (by `endpoint`
+and `outcome`) and the three `sbproxy_comp_marketplace_*` families, all
+drawn by `dashboards/grafana/sbproxy-comp-marketplace.json`. Every
+issuance, introspection, and revocation also emits an `olp_decision`
+structured event, and every quote and redeem a `comp_quote_decision` or
+`comp_redeem_decision` one. No bearer token appears in any of them.
+
+Behind operator auth for the same reason
+[`GET /admin/federation`](#get-adminfederation) is: sbproxy serves the
+CoMP well-known endpoints from the request path and never mounts the
+licensing crate's own axum router, so that crate's unauthenticated
+`GET /admin/status` never answers here. The manifest half of this
+response is already public; which origins have a bridge configured at
+all is not. An admin console page for it is separate scope, under the
+admin console epic; the JSON here is the operator surface today. See
+[comp-marketplace.md](comp-marketplace.md).
 
 ### `GET /admin/mcp-oauth`
 
