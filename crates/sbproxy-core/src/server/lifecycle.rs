@@ -400,7 +400,7 @@ pub fn reload_from_config_path_unaudited(config_path: &str) -> anyhow::Result<Re
 /// Callers use it to keep a suspension out of the channels a fault
 /// belongs in: the ERROR log, and the `config_audit` rejection record.
 #[must_use]
-pub fn is_suspended_reload(error: &anyhow::Error) -> bool {
+pub(crate) fn is_suspended_reload(error: &anyhow::Error) -> bool {
     format!("{error:#}").contains(SUSPENDED_RELOAD_MARKER)
 }
 

@@ -12668,8 +12668,13 @@ origin_sources:
             &[],
             &sbproxy_config::ConfigSoakConfig::default(),
         );
+        // The operator's own probe, which dials a real URL and so
+        // promotes on its own. A synthetic pass cannot stand in: this
+        // fixture declares no upstream, the health signal abstains, and
+        // a synthetic pass is discarded with it (verification residual
+        // R1).
         crate::config_soak::record_probe(
-            crate::config_soak::ProbeKind::Synthetic,
+            crate::config_soak::ProbeKind::Operator,
             crate::config_soak::ProbeObservation::Ok,
         );
 
