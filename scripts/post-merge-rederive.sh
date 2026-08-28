@@ -96,8 +96,22 @@ rederive_generated() {
   # So: if anything the generator is built from is newer than the
   # generator, the binary is not authoritative. `find -newer` is a per-inode
   # mtime comparison, so this costs milliseconds.
+  #
+  # Sources and manifests only, and `target` pruned. The first version of
+  # this compared against everything under crates/, which meant a scratch
+  # directory a test had left behind
+  # (crates/sbproxy-core/target/test-cluster-control-state) held every
+  # generator hostage forever: the script reported all nine as unbuilt on a
+  # tree where they were current. A freshness check that is never satisfied
+  # is the same defect as one that always is.
   local newer
-  newer="$(find crates Cargo.toml Cargo.lock -newer "$prebuilt" -print 2>/dev/null | head -1)"
+  newer="$(
+    {
+      find crates -name target -prune -o \
+        \( -name '*.rs' -o -name 'Cargo.toml' \) -newer "$prebuilt" -print
+      find Cargo.toml Cargo.lock -newer "$prebuilt" -print
+    } 2>/dev/null | head -1
+  )"
   if [ -n "$newer" ]; then
     printf '  \033[1;33mskip\033[0m    %s (%s is older than %s)\n' \
       "$label" "$bin" "$newer"
