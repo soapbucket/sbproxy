@@ -665,6 +665,26 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "proxy.cache_reserve.backend.type",
         "sbproxy_core::pipeline::build_cache_reserve",
     ),
+    // WOR-2673: the AWS-SDK reserve backend was retired in favor of the
+    // object-storage one. Its fields stay in the schema so an existing
+    // `type: s3` block still parses far enough for `compile_config` to
+    // refuse it by name; this enum carries `#[serde(other)]`, so
+    // deleting the variant would have made the block parse as an
+    // out-of-tree backend and lose the cold tier in silence. Four of
+    // the six are read by the refusal to build its message; these two
+    // are not read at all, and neither reaches a running proxy.
+    unsupported(
+        "proxy.cache_reserve.backend.replication_target_bucket",
+        "Retired with the AWS-SDK reserve backend (WOR-2673). It was a diagnostics-only hint \
+         no code ever acted on; cross-region replication is an S3 bucket-level replication \
+         rule. `compile_config` refuses the whole `type: s3` block that carries it.",
+    ),
+    unsupported(
+        "proxy.cache_reserve.backend.sse_kms_bucket_default",
+        "Retired with the AWS-SDK reserve backend (WOR-2673). SSE-KMS is configured on the \
+         bucket, so the surviving object-storage backend needs no switch for it. \
+         `compile_config` refuses the whole `type: s3` block that carries it.",
+    ),
     stable(
         "proxy.acme.challenge_types[]",
         "sbproxy_core::server::lifecycle::run",

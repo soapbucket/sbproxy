@@ -208,6 +208,15 @@ rlimit = "0.10"
 # proxy serves to assert its claims. Already in the lock graph through
 # sbproxy-core, so this adds no new dependency.
 base64.workspace = true
+# The CoMP marketplace process test signs a buyer acceptance the way an
+# onboarded buyer's client would, so the redeem it drives is the real
+# signature check rather than a stub. Already in the lock graph through
+# sbproxy-licensing and sbproxy-modules; test-only here.
+ed25519-dalek = "2"
+# The same test reuses the crate's own request and response types
+# instead of hand-writing their JSON, so a field rename breaks the test
+# rather than silently changing what it asserts.
+sbproxy-licensing.workspace = true
 # Process-boundary classifier-hook egress tests serve the exact generated
 # contracts the shipped client calls. These are test-only because the binary
 # reaches the same types transitively through sbproxy-core.

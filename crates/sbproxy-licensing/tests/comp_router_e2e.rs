@@ -160,6 +160,33 @@ async fn quote_endpoint_returns_signed_quote() {
     assert_eq!(parsed.pricing.amount_micros, 2500u64 * 100_000);
 }
 
+/// The current time as the RFC 3339 stamp a buyer would put in its
+/// acceptance.
+fn rfc3339_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock is after the unix epoch")
+        .as_secs() as i64;
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
 #[tokio::test]
 async fn comp_redeem_token_is_accepted_by_the_oss_olp_verifier() {
     let (mp, signer) = build_marketplace();
@@ -204,7 +231,11 @@ async fn comp_redeem_token_is_accepted_by_the_oss_olp_verifier() {
             // What a buyer holding the quote would compute. The redeem
             // is bound to the quote by this value.
             accepted_quote_hash: quote_acceptance_hash(&quote_for_hash).unwrap(),
-            accepted_at: "2026-05-02T14:35:00Z".into(),
+            // Stamped from the clock. The redeem path bounds how far
+            // an acceptance may sit from the bridge's own time
+            // (WOR-2673), so a frozen date would fail this test for a
+            // reason that has nothing to do with what it proves.
+            accepted_at: rfc3339_now(),
             buyer_legal_entity: "Acme AI Inc.".into(),
         },
         payment_proof: CompPaymentProof {
@@ -294,7 +325,11 @@ async fn redeem_endpoint_rejects_bad_signature_with_401() {
         },
         buyer_acceptance: CompAcceptance {
             accepted_quote_hash: "sha256:placeholder".into(),
-            accepted_at: "2026-05-02T14:35:00Z".into(),
+            // Stamped from the clock. The redeem path bounds how far
+            // an acceptance may sit from the bridge's own time
+            // (WOR-2673), so a frozen date would fail this test for a
+            // reason that has nothing to do with what it proves.
+            accepted_at: rfc3339_now(),
             buyer_legal_entity: "Acme AI Inc.".into(),
         },
         payment_proof: CompPaymentProof {
