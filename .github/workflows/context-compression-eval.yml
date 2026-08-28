@@ -167,3 +167,6 @@ jobs:
           cargo test -p sbproxy-e2e --locked --test ai_native_inbound
           anthropic_native_upstream_receives_the_compressed_message_list
           -- --exact --test-threads=1
+
+# Diagnostic: this comment exists only to make the path filter above match a
+# commit that changes nothing, so the lane runs against an untouched main.
