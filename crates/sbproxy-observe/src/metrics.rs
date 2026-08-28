@@ -9457,3 +9457,81 @@ mod tests {
         );
     }
 }
+
+/// WOR-2673 re-review N4: the OLP family has a writer that reaches it.
+///
+/// The CoMP families are pinned by
+/// `serving_moves_the_metric_family_the_dashboard_reads` in
+/// `sbproxy-licensing`; this one had nothing, so a `record_olp_decision`
+/// wired to a field that never registered would have shown up as a flat
+/// Grafana panel weeks later rather than as a red test.
+#[cfg(test)]
+mod olp_decision_metric_tests {
+    use super::{metrics, record_olp_decision};
+
+    /// Current value for one `(endpoint, outcome)` pair, or `None` when
+    /// the family did not register at all.
+    fn value(endpoint: &str, outcome: &str) -> Option<f64> {
+        for family in metrics().registry.gather() {
+            if family.name() != "sbproxy_olp_decisions_total" {
+                continue;
+            }
+            for metric in family.get_metric() {
+                let labels: std::collections::HashMap<&str, &str> = metric
+                    .get_label()
+                    .iter()
+                    .map(|label| (label.name(), label.value()))
+                    .collect();
+                if labels.get("endpoint").copied() == Some(endpoint)
+                    && labels.get("outcome").copied() == Some(outcome)
+                {
+                    return Some(metric.get_counter().value());
+                }
+            }
+            // The family is registered but carries no series for this
+            // pair yet, which reads as zero rather than as absent.
+            return Some(0.0);
+        }
+        // `gather()` omits a `CounterVec` that has no children at all,
+        // so an absent family before the first write is indistinguishable
+        // from an unregistered one. That is why the assertions below
+        // require the family to be *present* after the write: a recorder
+        // wired to a field that never registered leaves it absent
+        // forever.
+        None
+    }
+
+    #[test]
+    fn recording_an_olp_decision_moves_the_family_the_dashboard_reads() {
+        // Every endpoint the registry declares, so a recorder wired to
+        // the wrong field for one of them cannot hide behind the others.
+        for endpoint in ["token", "key", "introspect", "revoke"] {
+            let before = value(endpoint, "ok").unwrap_or(0.0);
+            record_olp_decision(endpoint, "ok");
+            let after = value(endpoint, "ok").unwrap_or_else(|| {
+                panic!(
+                    "sbproxy_olp_decisions_total is absent after recording {endpoint}/ok, so \
+                     the recorder is wired to a family nothing scrapes"
+                )
+            });
+            assert!(
+                after > before,
+                "recording {endpoint}/ok must move the family: {before} -> {after}"
+            );
+        }
+    }
+
+    /// The two refusal values the request path writes, so a label that
+    /// stopped being reachable fails here rather than on a dashboard.
+    #[test]
+    fn the_refusal_outcomes_are_writable() {
+        for outcome in ["rejected", "rate_limited", "error"] {
+            let before = value("token", outcome).unwrap_or(0.0);
+            record_olp_decision("token", outcome);
+            assert!(
+                value("token", outcome).expect("registered after the write") > before,
+                "token/{outcome} must be writable"
+            );
+        }
+    }
+}

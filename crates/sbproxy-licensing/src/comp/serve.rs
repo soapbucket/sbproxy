@@ -95,10 +95,57 @@ pub(crate) fn log_safe(value: &str) -> String {
 /// drift from the label vocabulary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompEndpoint {
+    /// `GET /.well-known/iab-comp/manifest.json`.
+    Manifest,
     /// `POST /.well-known/iab-comp/quote`.
     Quote,
     /// `POST /.well-known/iab-comp/redeem`.
     Redeem,
+}
+
+/// The refusal for a request whose method the endpoint does not serve.
+///
+/// Lives here for the same reason [`oversize`] does (WOR-2673 re-review
+/// N8): a method guard is a refusal, and every other refusal in this
+/// feature moves a counter and writes a decision event. The guards were
+/// silent, so a client hammering `GET` at the redeem endpoint was
+/// indistinguishable from no traffic.
+///
+/// The manifest's counter has no `rejected` value in its vocabulary
+/// (it is a serve counter, labeled `ok` / `error`), so a wrong method
+/// there is counted `error` rather than inventing a fourth label for
+/// one call site.
+pub fn method_not_allowed(endpoint: CompEndpoint) -> CompResponse {
+    match endpoint {
+        CompEndpoint::Manifest => {
+            tracing::info!(
+                event = "comp_manifest_decision",
+                outcome = "rejected",
+                reason = "method_not_allowed",
+                "comp.manifest.rejected"
+            );
+            metrics::record_manifest_serve("error");
+        }
+        CompEndpoint::Quote => {
+            tracing::info!(
+                event = "comp_quote_decision",
+                outcome = "rejected",
+                reason = "method_not_allowed",
+                "comp.quote.rejected"
+            );
+            metrics::record_quote("rejected");
+        }
+        CompEndpoint::Redeem => {
+            tracing::info!(
+                event = "comp_redeem_decision",
+                outcome = "rejected",
+                reason = "method_not_allowed",
+                "comp.redeem.rejected"
+            );
+            metrics::record_redeem("rejected");
+        }
+    }
+    CompResponse::error(405, "method_not_allowed")
 }
 
 /// The refusal for a request body past a transport's size cap.
@@ -116,6 +163,19 @@ pub fn oversize(endpoint: CompEndpoint) -> CompResponse {
     // was refused before parsing, so there is no `tier_id` or
     // `quote_id` to log, and the size itself is the whole finding.
     match endpoint {
+        // Unreachable in practice: the manifest route is a GET and
+        // neither transport reads a body for it. Counted rather than
+        // ignored so the match stays total and a future caller cannot
+        // pass it silently.
+        CompEndpoint::Manifest => {
+            tracing::info!(
+                event = "comp_manifest_decision",
+                outcome = "rejected",
+                reason = "body_too_large",
+                "comp.manifest.rejected"
+            );
+            metrics::record_manifest_serve("error");
+        }
         CompEndpoint::Quote => {
             tracing::info!(
                 event = "comp_quote_decision",
@@ -310,7 +370,7 @@ fn map_error(error: LicensingError) -> CompResponse {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::comp::marketplace::InMemoryBuyerKeyRegistry;
     use crate::comp::olp_bridge::OlpBridgeSigner;
@@ -319,7 +379,7 @@ mod tests {
     use crate::revocation::{InMemoryRevocation, Revocation};
     use std::sync::Arc;
 
-    fn marketplace() -> CompMarketplace {
+    pub(crate) fn marketplace() -> CompMarketplace {
         let keys = KeyManager::new(MasterKey::new(vec![0x31u8; 32]).expect("32-byte key"));
         keys.set_active("2026-q3-001").expect("derive");
         let manifest = Arc::new(CompManifest {
@@ -512,7 +572,7 @@ mod tests {
 
     /// Reading one family's current value for a label, or 0 when the
     /// family did not register.
-    fn counter(
+    pub(crate) fn counter(
         family: &std::sync::LazyLock<Option<prometheus::IntCounterVec>>,
         outcome: &str,
     ) -> u64 {

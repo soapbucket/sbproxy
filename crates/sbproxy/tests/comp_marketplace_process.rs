@@ -270,6 +270,9 @@ origins:
       issuer: https://marketplace.test
       default_scope: ai-input
       default_ttl_secs: 3600
+      # Small on purpose: step 10 walks past it in four requests
+      # instead of sixty-one.
+      token_rate_limit_per_minute: 3
     comp:
       enabled: true
       master_key: "{COMP_MASTER_KEY}"
@@ -474,16 +477,25 @@ origins:
     assert_eq!(admin["enabled"], true, "{body}");
     let origin = &admin["origins"][0];
     assert_eq!(origin["hostname"], "marketplace.test", "{body}");
-    assert_eq!(origin["publisher_name"], "Example Publishing Co.", "{body}");
-    assert_eq!(origin["tier_count"], 1, "{body}");
-    assert_eq!(origin["olp_tier_count"], 1, "{body}");
+    // Both halves nest and both carry `enabled`, so one field answers
+    // "does this origin have a bridge" (WOR-2673 re-review N2).
+    let comp = &origin["comp"];
+    assert_eq!(comp["enabled"], true, "{body}");
+    assert_eq!(origin["olp"]["enabled"], true, "{body}");
+    assert_eq!(
+        origin["olp"]["signing_kid"], "process-test-olp-key",
+        "{body}"
+    );
+    assert_eq!(comp["publisher_name"], "Example Publishing Co.", "{body}");
+    assert_eq!(comp["tier_count"], 1, "{body}");
+    assert_eq!(comp["olp_tier_count"], 1, "{body}");
     // Not `null`: a null here means no rotation was activated and every
     // quote request fails closed, which is the field's whole job.
-    assert_eq!(origin["active_signing_kid"], "comp-2026-q3-001", "{body}");
-    assert_eq!(origin["trusted_kid_count"], 1, "{body}");
-    assert_eq!(origin["manifest_hash"], hash, "{body}");
+    assert_eq!(comp["active_signing_kid"], "comp-2026-q3-001", "{body}");
+    assert_eq!(comp["trusted_kid_count"], 1, "{body}");
+    assert_eq!(comp["manifest_hash"], hash, "{body}");
     assert_eq!(
-        origin["endpoints"]["redeem"], "https://marketplace.test/.well-known/iab-comp/redeem",
+        comp["endpoints"]["redeem"], "https://marketplace.test/.well-known/iab-comp/redeem",
         "{body}"
     );
     // No secret and no minted token reaches the operator surface.
@@ -498,6 +510,42 @@ origins:
         head.starts_with("HTTP/1.1 401"),
         "the licensing route must sit behind operator auth: {head}"
     );
+
+    // --- 10. One source cannot mint license tokens without bound ---
+    //
+    // WOR-2673. `POST /.well-known/olp/token` is unauthenticated by
+    // design: an RSL crawler following a `WWW-Authenticate: License`
+    // challenge has no credential yet, and a body that is not a
+    // `client_credentials` form mints under an anonymous `sub`. Every
+    // call signs a fresh Ed25519 bearer token, and the endpoint answers
+    // from `request_filter` ahead of bot detection, threat protection,
+    // authentication, and the policy chain, so nothing else on the path
+    // bounds it. The budget configured above is the bound, and this is
+    // it holding over the wire from one source.
+    let mut minted = 0usize;
+    let mut refused = 0usize;
+    for _ in 0..4 {
+        let (head, body) =
+            split(&request(port, "POST", "/.well-known/olp/token", Some(b"{}")).expect("resp"));
+        if head.starts_with("HTTP/1.1 200") {
+            minted += 1;
+            assert!(body.contains("access_token"), "{body}");
+        } else {
+            assert!(head.starts_with("HTTP/1.1 429"), "{head}\n{body}");
+            assert!(body.contains("slow_down"), "{body}");
+            assert!(
+                head.to_ascii_lowercase().contains("retry-after:"),
+                "a 429 a client should back off from carries Retry-After: {head}"
+            );
+            assert!(
+                !body.contains("access_token"),
+                "a refused mint must not carry a token: {body}"
+            );
+            refused += 1;
+        }
+    }
+    assert_eq!(minted, 3, "the configured budget is what is minted");
+    assert_eq!(refused, 1, "the request past the budget is refused");
 
     let _ = child.kill();
     let _ = child.wait();

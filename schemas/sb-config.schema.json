@@ -11133,6 +11133,13 @@
               "type": "null"
             }
           ]
+        },
+        "token_rate_limit_per_minute": {
+          "description": "Tokens one source IP may mint per minute at `POST /.well-known/olp/token`. Defaults to 60.\n\nThat endpoint is unauthenticated by design: an RSL crawler following a `WWW-Authenticate: License` challenge has no credential yet, and a request carrying no `client_credentials` form falls back to an anonymous `sub`. Every call mints a fresh Ed25519-signed bearer license token. Without a bound, one source mints them at whatever rate the CPU allows, and the endpoint answers before authentication and before the policy chain where an origin's own rate limits live, so nothing else on the request path sees it (WOR-2673).\n\nThe budget is a token bucket keyed on the **raw socket peer**, not `X-Forwarded-For`. On an unauthenticated endpoint a forgeable header is not an identity: a caller that picks a new `X-Forwarded-For` per request would get a fresh full bucket every time and grow the tracking map while doing it. A deployment behind a load balancer therefore budgets the balancer, which is the honest reading of who the proxy is actually talking to.\n\nThis value is both the burst and the steady-state rate: the bucket holds this many tokens and refills at one sixtieth of it per second, the same shape [`OlpIntrospectConfig`]'s inactive-response limiter uses.\n\n`0` is refused at config compile. There is deliberately no \"unlimited\" setting: an unauthenticated mint endpoint whose bound is one typo away from being off is not bounded.",
+          "default": 60,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
         }
       },
       "additionalProperties": false

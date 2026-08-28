@@ -223,6 +223,13 @@ Refusing rather than evicting the oldest row is deliberate: eviction
 would let a flood push a paying buyer's quote out of the ledger, turning
 a denial of service into a denial of purchase.
 
+The 50,000 is **per bridge, so per origin**. Each `comp:` block builds
+its own ledger, so a process serving N bridged origins bounds at
+`N x 50,000` rows, roughly `N x 10 MB`. Ten bridged origins is about
+100 MB of worst case; size against that number rather than against
+50,000 alone. The cap is checked before the quote is signed, so a
+refused request during a flood costs a map sweep and not a signature.
+
 Two more refusals bound the request in time, both on the buyer's own
 `accepted_at`:
 
@@ -235,6 +242,44 @@ Two more refusals bound the request in time, both on the buyer's own
 - A timestamp the bridge cannot parse is refused rather than read as
   "now". Treating an unreadable value as the current time turns a
   bounded window into no window at all.
+
+## The OLP token endpoint's budget
+
+The bridge mints through the origin's own OLP issuer, and that issuer's
+`POST /.well-known/olp/token` is unauthenticated by design: an RSL
+crawler following a `WWW-Authenticate: License` challenge has no
+credential yet, and a request whose body is not a `client_credentials`
+form mints under an anonymous subject. Every call signs a fresh Ed25519
+bearer license token, and like the CoMP endpoints it answers before
+authentication and before the policy chain.
+
+`origins.<host>.olp.token_rate_limit_per_minute` is the bound. It
+defaults to 60 and is both the burst and the steady-state rate: the
+bucket holds that many tokens and refills at one sixtieth of it per
+second, so a well-behaved crawler minting one token per license and
+caching it for the token's TTL is never near it, and a client looping
+the endpoint is cut to roughly one mint per second. Past the budget the
+answer is `429 {"error":"slow_down"}` with `Retry-After`, counted as
+`sbproxy_olp_decisions_total{endpoint="token",outcome="rate_limited"}`
+and logged as an `olp_decision` event.
+
+`0` is refused at config load. There is deliberately no "unlimited"
+setting: a bound one typo away from being off is not a bound. To raise
+it, name the number you want.
+
+The budget is keyed on the **raw socket peer**, not `X-Forwarded-For`.
+On an unauthenticated endpoint a forgeable header is not an identity: a
+caller rotating it would draw a fresh full bucket per request and grow
+the proxy's tracking map while doing it. A deployment behind a load
+balancer therefore budgets the balancer, which is the honest reading of
+who the proxy is talking to; put the per-client limit on the balancer,
+where the client is actually identified.
+
+The tracking map is itself bounded at 10,000 simultaneously
+over-budget sources, after which a source the proxy has not seen is
+refused. That is the fail-closed direction, and the cost is worth
+stating: a distributed flood large enough to hold that many buckets over
+budget also denies the endpoint to a source arriving after it.
 
 ## Running it standalone
 

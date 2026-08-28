@@ -13573,6 +13573,50 @@ pub struct OlpConfig {
     /// `/.well-known/olp/revoke` (RFC 7009) 404'd. Set to enable.
     #[serde(default)]
     pub introspect: Option<OlpIntrospectConfig>,
+
+    /// Tokens one source IP may mint per minute at
+    /// `POST /.well-known/olp/token`. Defaults to 60.
+    ///
+    /// That endpoint is unauthenticated by design: an RSL crawler
+    /// following a `WWW-Authenticate: License` challenge has no
+    /// credential yet, and a request carrying no `client_credentials`
+    /// form falls back to an anonymous `sub`. Every call mints a fresh
+    /// Ed25519-signed bearer license token. Without a bound, one source
+    /// mints them at whatever rate the CPU allows, and the endpoint
+    /// answers before authentication and before the policy chain where
+    /// an origin's own rate limits live, so nothing else on the request
+    /// path sees it (WOR-2673).
+    ///
+    /// The budget is a token bucket keyed on the **raw socket peer**,
+    /// not `X-Forwarded-For`. On an unauthenticated endpoint a
+    /// forgeable header is not an identity: a caller that picks a new
+    /// `X-Forwarded-For` per request would get a fresh full bucket
+    /// every time and grow the tracking map while doing it. A
+    /// deployment behind a load balancer therefore budgets the balancer,
+    /// which is the honest reading of who the proxy is actually talking
+    /// to.
+    ///
+    /// This value is both the burst and the steady-state rate: the
+    /// bucket holds this many tokens and refills at one sixtieth of it
+    /// per second, the same shape
+    /// [`OlpIntrospectConfig`]'s inactive-response limiter uses.
+    ///
+    /// `0` is refused at config compile. There is deliberately no
+    /// "unlimited" setting: an unauthenticated mint endpoint whose
+    /// bound is one typo away from being off is not bounded.
+    #[serde(default = "default_olp_token_rate_limit_per_minute")]
+    pub token_rate_limit_per_minute: u32,
+}
+
+/// Default for [`OlpConfig::token_rate_limit_per_minute`].
+///
+/// Sixty per minute, so a well-behaved crawler minting one token per
+/// license and caching it for the token's TTL is never near the bound,
+/// and a client looping the endpoint is cut to roughly one mint per
+/// second. Matches `INTROSPECT_CAPACITY` on the sibling limiter so an
+/// operator reading both sees one number.
+fn default_olp_token_rate_limit_per_minute() -> u32 {
+    60
 }
 
 /// Redacted `Debug` (WOR-2606). Two seeds. `signing_key` is a
@@ -13595,6 +13639,10 @@ impl std::fmt::Debug for OlpConfig {
             .field("signing_key", &"[REDACTED]")
             .field("key_id", &self.key_id)
             .field("issuer", &self.issuer)
+            .field(
+                "token_rate_limit_per_minute",
+                &self.token_rate_limit_per_minute,
+            )
             .field("default_scope", &self.default_scope)
             .field(
                 "content_key_seed",

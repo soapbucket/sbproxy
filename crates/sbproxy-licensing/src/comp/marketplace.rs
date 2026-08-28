@@ -35,7 +35,17 @@ use super::types::{
 /// Maximum quote validity window. One hour.
 pub const COMP_QUOTE_VALIDITY_SECS: u64 = 3600;
 
-/// Rows the issued-quote ledger holds before it starts refusing.
+/// Rows one bridge's issued-quote ledger holds before it starts
+/// refusing.
+///
+/// **Per bridge, so per origin.** Each `origins.<host>.comp` block
+/// builds its own `CompMarketplace` with its own ledger, so a process
+/// serving N origins with a bridge bounds at `N x
+/// COMP_QUOTE_LEDGER_CAPACITY` rows, roughly `N x 10 MB`. That is the
+/// number to size against, not this one. Ten bridged origins is about
+/// 100 MB of worst case, which is a bound a proxy can hold; a
+/// deployment with hundreds of bridged origins on one process should
+/// know it is choosing that ceiling.
 ///
 /// `POST /quote` is unauthenticated, and on the proxy it answers and
 /// returns before bot detection, threat protection, authentication, and
@@ -395,6 +405,31 @@ impl CompMarketplace {
             },
         };
 
+        // Sweep and check the cap *before* signing (WOR-2673 re-review
+        // N6). The signature is the expensive part of this function, and
+        // a flood at capacity is exactly when it is worth not paying:
+        // checking first makes every refused request cost a map sweep
+        // instead of a sweep plus an Ed25519 signature.
+        //
+        // The sweep has to run under the same guard as the check, or the
+        // cap would be a lifetime one rather than a live-row one:
+        // keeping expired rows as tombstones is what makes the redeem
+        // expiry check reachable at all, and dropping them at expiry is
+        // what made it unreachable before.
+        {
+            let mut ledger = self
+                .issued_quotes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            ledger
+                .retain(|_, issued| issued.valid_until.saturating_add(QUOTE_TOMBSTONE_SECS) > now);
+            if ledger.len() >= self.quote_ledger_capacity {
+                return Err(LicensingError::QuoteLedgerFull {
+                    capacity: self.quote_ledger_capacity,
+                });
+            }
+        }
+
         let signing_input = canonical_quote_signing_input(&response)?;
         let (kid, sig) = self.keys.sign(&signing_input)?;
         response.signature.kid = kid;
@@ -405,22 +440,18 @@ impl CompMarketplace {
                 .issued_quotes
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            // Keep expired rows as tombstones. Sweeping them at expiry
-            // is what made the expiry check unreachable: the only code
-            // that removed a row was this sweep, and once removed the id
-            // fell into the "unknown to this process" branch, which
-            // proceeds. Any buyer could trigger the sweep by asking for
-            // a new quote, so the window in which the check fired was
-            // close to zero.
-            ledger
-                .retain(|_, issued| issued.valid_until.saturating_add(QUOTE_TOMBSTONE_SECS) > now);
-            // WOR-2673 review B1. The sweep above is what makes this a
-            // live-row cap rather than a lifetime one, so a bridge that
-            // has been up for a month is not permanently refusing. Past
-            // the cap the quote is refused before the row is written:
-            // returning a signed quote this bridge did not record would
-            // be worse than refusing, because the redeem for it would
-            // then hit the unknown-quote branch.
+            // Re-check under the second guard. The lock was released
+            // across the signature, so concurrent quoters could have
+            // filled the ledger in the window. Without this the cap
+            // would be exceeded by up to the number of threads signing
+            // at once; with it a signature is wasted only in that race,
+            // never during a sustained flood, because the check above
+            // already refused those before signing.
+            //
+            // Refusing here discards a quote this bridge signed and
+            // never returned, which is the right direction: returning a
+            // signed quote the ledger does not hold would send the
+            // buyer's redeem into the unknown-quote branch.
             if ledger.len() >= self.quote_ledger_capacity {
                 return Err(LicensingError::QuoteLedgerFull {
                     capacity: self.quote_ledger_capacity,
@@ -1153,17 +1184,38 @@ mod tests {
     }
 
     /// Consumption happens under the same guard that reads the row, so
-    /// two concurrent redeems of one quote cannot both pass the check
-    /// and both mint.
-    #[tokio::test]
-    async fn two_concurrent_redeems_of_one_quote_mint_once() {
+    /// concurrent redeems of one quote cannot both pass the check and
+    /// both mint.
+    ///
+    /// Multi-threaded and spawned rather than `tokio::join!` on the
+    /// current-thread runtime (WOR-2673 re-review N5). Neither `.await`
+    /// inside `redeem` yields, so a joined pair runs to completion one
+    /// after the other and passes just as well if the row were marked
+    /// *after* the mint, which is the ordering this test exists to
+    /// discriminate. Eight tasks on four threads race the guard for
+    /// real.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_redeems_of_one_quote_mint_once() {
         let (mp, _, signer) = build_marketplace();
         let quote = mp.quote(quote_request()).unwrap();
         let redeem = build_redeem_for(&quote, &signer);
 
-        let (first, second) = tokio::join!(mp.redeem(redeem.clone()), mp.redeem(redeem));
-        let minted = usize::from(first.is_ok()) + usize::from(second.is_ok());
-        assert_eq!(minted, 1, "exactly one of two concurrent redeems may mint");
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let mp = Arc::clone(&mp);
+            let redeem = redeem.clone();
+            tasks.push(tokio::spawn(async move { mp.redeem(redeem).await.is_ok() }));
+        }
+        let mut minted = 0usize;
+        for task in tasks {
+            if task.await.expect("no redeem task panics") {
+                minted += 1;
+            }
+        }
+        assert_eq!(
+            minted, 1,
+            "exactly one of eight concurrent redeems of one quote may mint"
+        );
     }
 
     /// WOR-2673 fail-closed: an acceptance stamped in the future.
@@ -1250,6 +1302,60 @@ mod tests {
                 "'{stamp}' got {error:?}"
             );
         }
+    }
+
+    /// WOR-2673 re-review N4: the runtime half of the single-OLP-tier
+    /// invariant, which only the config compiler had a test for.
+    ///
+    /// `validate_comp_marketplace` refuses a catalog with two, so a
+    /// config-loaded proxy never reaches this. A host building a
+    /// `CompMarketplace` in memory does, and the review's own rule is
+    /// that a detector has to be as wide as its enforcer: without this
+    /// the runtime re-check could be deleted and every test would stay
+    /// green while a buyer who quoted the cheap tier received the
+    /// expensive tier's license.
+    #[tokio::test]
+    async fn a_manifest_with_two_olp_tiers_refuses_a_redeem_rather_than_guessing() {
+        let mgr = KeyManager::new(MasterKey::new(vec![0x33u8; 32]).unwrap());
+        mgr.set_active("2026-q2-001").unwrap();
+        let bridge = Arc::new(OlpBridgeSigner::new(
+            [0x44u8; 32],
+            "olp-2026-q2-001",
+            "https://api.example.com",
+            "ai-input",
+            3600,
+        ));
+        let revocation: Arc<dyn Revocation> = Arc::new(InMemoryRevocation::new());
+        let buyer_keys = Arc::new(InMemoryBuyerKeyRegistry::new());
+        let buyer_signing = SigningKey::from_bytes(&[0x55u8; 32]);
+        buyer_keys.insert("buyer-1", buyer_signing.verifying_key());
+
+        // The manifest the compiler would have refused: two redeemable
+        // tiers, so a redeem naming only a quote_id cannot say which.
+        let mut manifest = (*build_manifest()).clone();
+        let mut second = manifest.tiers[0].clone();
+        second.id = "tier_bulk_archive".into();
+        second.license = "urn:rsl:bulk-archive:default".into();
+        manifest.tiers.push(second);
+        let mp = Arc::new(CompMarketplace::new(
+            mgr,
+            Arc::new(manifest),
+            revocation,
+            bridge,
+            buyer_keys,
+        ));
+
+        let quote = mp.quote(quote_request()).unwrap();
+        let redeem = build_redeem_for(&quote, &buyer_signing);
+        let error = mp
+            .redeem(redeem)
+            .await
+            .expect_err("an ambiguous catalog must refuse rather than pick one");
+        let message = error.to_string();
+        assert!(
+            message.contains("tier_ai_inference") && message.contains("tier_bulk_archive"),
+            "the refusal must name both tiers: {message}"
+        );
     }
 
     /// WOR-2673 fail-closed: a `quote_id` this process never issued.

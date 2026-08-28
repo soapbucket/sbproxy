@@ -3383,30 +3383,38 @@ so a poll can tell "off" from a typo in the path. Both `admin` and
           "revocation_store": "redis"
         }
       },
-      "publisher_domain": "api.example.com",
-      "publisher_name": "Example Publishing Co.",
-      "tier_count": 3,
-      "olp_tier_count": 1,
-      "active_signing_kid": "comp-2026-q3-001",
-      "trusted_kid_count": 1,
-      "manifest_hash": "sha256:9f2c...",
-      "generated_at": "2026-08-28T07:41:02Z",
-      "endpoints": {
-        "manifest": "https://api.example.com/.well-known/iab-comp/manifest.json",
-        "quote": "https://api.example.com/.well-known/iab-comp/quote",
-        "redeem": "https://api.example.com/.well-known/iab-comp/redeem"
+      "comp": {
+        "enabled": true,
+        "publisher_domain": "api.example.com",
+        "publisher_name": "Example Publishing Co.",
+        "tier_count": 3,
+        "olp_tier_count": 1,
+        "active_signing_kid": "comp-2026-q3-001",
+        "trusted_kid_count": 1,
+        "manifest_hash": "sha256:9f2c...",
+        "generated_at": "2026-08-28T07:41:02Z",
+        "endpoints": {
+          "manifest": "https://api.example.com/.well-known/iab-comp/manifest.json",
+          "quote": "https://api.example.com/.well-known/iab-comp/quote",
+          "redeem": "https://api.example.com/.well-known/iab-comp/redeem"
+        }
       }
     }
   ]
 }
 ```
 
+Each origin carries both halves, and both always carry `enabled`, so
+one field answers "does this origin have a bridge" without a consumer
+having to tell `false` apart from a key that is not there. An origin
+with an OLP issuer and no CoMP bridge appears with
+`"comp": {"enabled": false}` and a populated `olp`; an origin with
+neither is not listed at all.
+
 The `olp` object is the issuer half. It answers the questions an
 operator otherwise had to mint a token and decode it to ask: which kid
 is signing, what issuer the tokens claim, how long they live, and
-whether the RFC 7662 / RFC 7009 pair is mounted at all. An origin with
-an OLP issuer and no CoMP bridge appears with `"comp": {"enabled":
-false}`; an origin with neither is not listed.
+whether the RFC 7662 / RFC 7009 pair is mounted at all.
 
 `revocation_store` is the variant name only (`memory`, `redb`, or
 `redis`), never the redb path or the Redis URL, which routinely carries
@@ -3414,8 +3422,8 @@ a password in its userinfo. It is the field to check when a revocation
 did not take on the replica you are looking at: `memory` is per-process
 and lost on restart.
 
-Two more fields are worth polling. `active_signing_kid` is `null` until
-a rotation has been activated, and every quote request fails closed until
+Two more fields are worth polling, both under `comp`.
+`active_signing_kid` is `null` until a rotation has been activated, and every quote request fails closed until
 it is, so a null here explains an endpoint answering nothing but
 rejections. `olp_tier_count` is how many of `tier_count` a buyer can
 actually redeem for a license token: the difference is the `cap` and

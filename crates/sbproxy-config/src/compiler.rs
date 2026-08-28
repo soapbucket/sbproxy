@@ -2137,6 +2137,26 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         }
     }
 
+    // WOR-2673: the OLP token endpoint's per-source budget. Zero is a
+    // refusal rather than "unlimited": that endpoint is unauthenticated,
+    // mints an Ed25519 bearer license token per call, and answers ahead
+    // of authentication and the policy chain where an origin's own rate
+    // limits live, so this value is the only bound on it. A bound one
+    // typo away from being off is not a bound.
+    for (host, origin) in &config_file.origins {
+        if let Some(olp) = origin.olp.as_ref().filter(|olp| olp.enabled) {
+            if olp.token_rate_limit_per_minute == 0 {
+                anyhow::bail!(
+                    "config compile: origin `{host}` olp.token_rate_limit_per_minute is 0, which \
+                     is not a way to say unlimited. POST /.well-known/olp/token is \
+                     unauthenticated and mints a bearer license token per call, so it always \
+                     carries a budget. Remove the key for the default of 60 per minute, or set \
+                     the number you want"
+                );
+            }
+        }
+    }
+
     // WOR-2673: the CoMP marketplace bridge. Validated here rather than
     // at pipeline build so `sbproxy validate` catches a catalog nobody
     // can buy from, on a machine that holds none of the secrets.

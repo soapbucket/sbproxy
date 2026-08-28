@@ -1458,7 +1458,7 @@ origins:
 | `deprecation` | object | | RFC 9745 `Deprecation` + RFC 8594 `Sunset` announcement for every route this origin serves. Also accepted per forward rule, where it overrides this block. See [API deprecation](#api-deprecation-rfc-9745--rfc-8594). |
 | `traffic_capture` | object | | Not supported. Setting it fails config load. Use `mirror` for live request mirroring. |
 | `message_signatures` | object | | RFC 9421 HTTP message signatures. |
-| `olp` | object | | RSL Open License Protocol token issuer and public-key endpoints. |
+| `olp` | object | | RSL Open License Protocol token issuer and public-key endpoints. `token_rate_limit_per_minute` (default 60, `0` refused) budgets `POST /.well-known/olp/token` per source IP: that endpoint is unauthenticated and mints a bearer license token per call. See [comp-marketplace.md](comp-marketplace.md#the-olp-token-endpoints-budget). |
 | `comp` | object | | IAB CoMP marketplace bridge: `/.well-known/iab-comp/{manifest.json,quote,redeem}` on this origin, minting license tokens with the `olp` block's key. Requires `olp.enabled`. See [comp-marketplace.md](comp-marketplace.md). |
 | `web_bot_auth_publish` | object | | Publish a Web Bot Auth key directory and Signature Agent Card on this origin. |
 | `idempotency` | object | | `Idempotency-Key` middleware. See [Idempotency](#idempotency). |

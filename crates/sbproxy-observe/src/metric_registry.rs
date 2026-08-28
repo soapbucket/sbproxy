@@ -2223,17 +2223,6 @@ pub const METRICS: &[MetricCapability] = &[
         ),
     },
     MetricCapability {
-        name: "sbproxy_olp_decisions_total",
-        kind: MetricKind::Counter,
-        writer: Writer::Recorder("record_olp_decision"),
-        support: SupportLevel::Stable,
-        compat: CompatTier::Beta,
-        registry: Registry::Proxy,
-        labels: &["endpoint", "outcome"],
-        description: "RSL Open Licensing Protocol endpoint outcomes by endpoint (`token`, `key`, `introspect`, `revoke`) and outcome (`ok`, `rejected`, `error`). Written by the proxy request path for an origin with an `olp:` block; empty on a deployment that configures none.",
-        dead_reason: None,
-    },
-    MetricCapability {
         name: "sbproxy_comp_marketplace_manifest_serves_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("MANIFEST_SERVES_TOTAL"),
@@ -3744,6 +3733,17 @@ pub const METRICS: &[MetricCapability] = &[
         description: "Age of the cached OCSP staple for the host, in seconds. Published once \
              a minute by the refresh task; absent until the first successful fetch, so \
              never-stapled is distinguishable from stale.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_olp_decisions_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_olp_decision"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Proxy,
+        labels: &["endpoint", "outcome"],
+        description: "RSL Open Licensing Protocol endpoint outcomes by endpoint (`token`, `key`, `introspect`, `revoke`) and outcome (`ok`, `rejected`, `rate_limited`, `error`). `rate_limited` is the per-source token budget on `POST /.well-known/olp/token` refusing a mint; it is its own value rather than a `rejected` so an operator can tell a flood from a broken client. Written by the proxy request path for an origin with an `olp:` block; empty on a deployment that configures none.",
         dead_reason: None,
     },
     MetricCapability {

@@ -2884,6 +2884,41 @@ pub(super) async fn request_filter(
                             || req_path == introspect_cfg.revoke_path)
                     {
                         if req_method != http::Method::POST {
+                            // WOR-2673 re-review N8. A method guard is a
+                            // refusal like any other, and every other
+                            // refusal on these endpoints is counted and
+                            // logged. Which endpoint it was is not known
+                            // yet (the path decides `is_revoke` below),
+                            // so this one is attributed to `introspect`,
+                            // the more likely of the pair.
+                            let refused_endpoint = if req_path == introspect_cfg.revoke_path {
+                                "revoke"
+                            } else {
+                                "introspect"
+                            };
+                            sbproxy_observe::metrics::record_olp_decision(
+                                refused_endpoint,
+                                "rejected",
+                            );
+                            if refused_endpoint == "revoke" {
+                                info!(
+                                    target: "sbproxy_core::olp",
+                                    event = "olp_decision",
+                                    endpoint = "revoke",
+                                    outcome = "rejected",
+                                    reason = "method_not_allowed",
+                                    "olp.revoke.rejected"
+                                );
+                            } else {
+                                info!(
+                                    target: "sbproxy_core::olp",
+                                    event = "olp_decision",
+                                    endpoint = "introspect",
+                                    outcome = "rejected",
+                                    reason = "method_not_allowed",
+                                    "olp.introspect.rejected"
+                                );
+                            }
                             send_error(session, 405, "POST only").await?;
                             return Ok(true);
                         }
@@ -2932,6 +2967,15 @@ pub(super) async fn request_filter(
                 Some(cfg) if cfg.enabled => {
                     if req_path == "/.well-known/olp/key" {
                         if req_method != http::Method::GET {
+                            sbproxy_observe::metrics::record_olp_decision("key", "rejected");
+                            info!(
+                                target: "sbproxy_core::olp",
+                                event = "olp_decision",
+                                endpoint = "key",
+                                outcome = "rejected",
+                                reason = "method_not_allowed",
+                                "olp.key.rejected"
+                            );
                             send_error(session, 405, "GET only").await?;
                             return Ok(true);
                         }
@@ -2979,6 +3023,15 @@ pub(super) async fn request_filter(
                     }
                     // /.well-known/olp/token
                     if req_method != http::Method::POST {
+                        sbproxy_observe::metrics::record_olp_decision("token", "rejected");
+                        info!(
+                            target: "sbproxy_core::olp",
+                            event = "olp_decision",
+                            endpoint = "token",
+                            outcome = "rejected",
+                            reason = "method_not_allowed",
+                            "olp.token.rejected"
+                        );
                         send_error(session, 405, "POST only").await?;
                         return Ok(true);
                     }
@@ -2989,6 +3042,66 @@ pub(super) async fn request_filter(
                     // claim to that client_id. Any other content-type
                     // (or no body) falls back to the legacy anonymous
                     // path so existing automation still mints tokens.
+                    //
+                    // WOR-2673: budget first, before the body read and
+                    // before the Ed25519 sign. This endpoint is
+                    // unauthenticated, mints a bearer license token per
+                    // call, keeps no ledger, and answers ahead of bot
+                    // detection, threat protection, authentication, and
+                    // the policy chain, so nothing else on the request
+                    // path bounds it. Checking here rather than after
+                    // the parse keeps a refused request from costing a
+                    // buffer or a signature.
+                    match olp_token_source_ip(session) {
+                        Some(source)
+                            if !olp_token_rate_limiter()
+                                .check_and_consume(source, cfg.token_rate_limit_per_minute) =>
+                        {
+                            sbproxy_observe::metrics::record_olp_decision("token", "rate_limited");
+                            info!(
+                                target: "sbproxy_core::olp",
+                                event = "olp_decision",
+                                endpoint = "token",
+                                outcome = "rate_limited",
+                                client_ip = %source,
+                                budget_per_minute = cfg.token_rate_limit_per_minute,
+                                "olp.token.rate_limited"
+                            );
+                            // `slow_down` is the registered OAuth error
+                            // code for "you are polling too fast"
+                            // (RFC 8628 s3.5); RFC 6749 s5.2 defines
+                            // none for a rate limit, and inventing one
+                            // would be worse than reusing the nearest
+                            // registered spelling. 429 with
+                            // `Retry-After` is what a client acts on.
+                            let body = serde_json::json!({
+                                "error": "slow_down",
+                                "error_description":
+                                    "token issuance rate limit exceeded for this source",
+                            })
+                            .to_string();
+                            send_response_with_headers(
+                                session,
+                                429,
+                                "application/json",
+                                body.as_bytes(),
+                                &[("retry-after".to_string(), "1".to_string())],
+                            )
+                            .await?;
+                            ctx.response_status = Some(429);
+                            return Ok(true);
+                        }
+                        // A peer address the transport cannot report is
+                        // not a reason to mint without a budget, but it
+                        // is also not attributable to anyone, so it is
+                        // counted and allowed rather than silently
+                        // dropped. In practice this is a unix-socket or
+                        // test transport, not a network client.
+                        None => {
+                            debug!("olp: token request with no peer address; budget not applied");
+                        }
+                        Some(_) => {}
+                    }
                     let content_type = session
                         .req_header()
                         .headers
@@ -3157,8 +3270,36 @@ pub(super) async fn request_filter(
                     http::Method::POST
                 };
                 if method != expected {
-                    send_error(session, 405, "method not allowed").await?;
-                    ctx.response_status = Some(405);
+                    // Counted and logged like every other CoMP refusal
+                    // (WOR-2673 re-review N8), from the same shared
+                    // body. The manifest route has no `rejected` label
+                    // in its vocabulary, so a wrong method there is an
+                    // `error` on the serve counter instead.
+                    let refused = if req_path == crate::pipeline::COMP_QUOTE_PATH {
+                        sbproxy_licensing::comp::method_not_allowed(
+                            sbproxy_licensing::comp::CompEndpoint::Quote,
+                        )
+                    } else if req_path == crate::pipeline::COMP_REDEEM_PATH {
+                        sbproxy_licensing::comp::method_not_allowed(
+                            sbproxy_licensing::comp::CompEndpoint::Redeem,
+                        )
+                    } else {
+                        sbproxy_licensing::comp::method_not_allowed(
+                            sbproxy_licensing::comp::CompEndpoint::Manifest,
+                        )
+                    };
+                    send_response_with_headers(
+                        session,
+                        refused.status,
+                        refused.content_type,
+                        &refused.body,
+                        &[(
+                            "cache-control".to_string(),
+                            refused.cache_control.to_string(),
+                        )],
+                    )
+                    .await?;
+                    ctx.response_status = Some(refused.status);
                     return Ok(true);
                 }
                 let rendered = if req_path == crate::pipeline::COMP_MANIFEST_PATH {
@@ -6023,6 +6164,119 @@ mod redis_revocation_store_tests {
 /// firing >60 inactive lookups per minute from one IP gets 429'd;
 /// burst up to 60 is allowed. Per-origin instance so multi-tenant
 /// deployments cannot cross-contaminate.
+/// Per-source token budget for `POST /.well-known/olp/token`
+/// (WOR-2673).
+///
+/// That endpoint is unauthenticated by design, mints an Ed25519 bearer
+/// license token on every call, keeps no ledger, and answers from
+/// `request_filter` ahead of bot detection, threat protection,
+/// authentication, and the policy chain where an origin's own rate
+/// limits live. Nothing else on the path bounds it, so this does.
+///
+/// Two deliberate differences from [`IntrospectRateLimiter`] next door,
+/// both because this endpoint is reachable without a credential where
+/// that one sits behind a mandatory caller-auth check:
+///
+/// * The key is the **raw socket peer**, never `X-Forwarded-For`. A
+///   forgeable header is not an identity on an unauthenticated
+///   endpoint: a caller rotating the header would draw a fresh full
+///   bucket per request and grow this map while doing it.
+/// * The map is bounded. An unbounded `IpAddr -> bucket` map on a path
+///   anyone can reach is the same class of defect the CoMP quote
+///   ledger's cap exists to close.
+struct OlpTokenRateLimiter {
+    buckets: std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, OlpTokenBucket>>,
+}
+
+/// One source's budget.
+struct OlpTokenBucket {
+    tokens: f64,
+    last_refill: std::time::Instant,
+}
+
+/// Sources this limiter tracks before it starts refusing new ones.
+///
+/// A bucket is about 60 bytes plus map overhead, so this is a few
+/// hundred kilobytes at the cap. The sweep below means reaching it
+/// takes that many sources *simultaneously over budget*, not that many
+/// sources seen: a bucket that has refilled to full carries no state
+/// worth keeping and is dropped.
+///
+/// Past the cap a new source is refused rather than admitted, which is
+/// the fail-closed direction and the opposite of what an unbounded map
+/// does. The cost is real and worth stating: a distributed flood large
+/// enough to hold this many buckets over budget also denies the
+/// endpoint to a source arriving after it. That is the cheaper of the
+/// two failures for an endpoint that mints bearer credentials.
+const OLP_TOKEN_LIMITER_MAX_SOURCES: usize = 10_000;
+
+impl OlpTokenRateLimiter {
+    fn new() -> Self {
+        Self {
+            buckets: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Returns `true` when this source may mint one more token.
+    ///
+    /// `per_minute` is the origin's `olp.token_rate_limit_per_minute`,
+    /// which is both the burst and the steady-state rate: the bucket
+    /// holds that many tokens and refills at one sixtieth of it per
+    /// second. Config load refuses zero, and the `max(1.0)` here is the
+    /// belt for a caller that built the config in memory.
+    fn check_and_consume(&self, ip: std::net::IpAddr, per_minute: u32) -> bool {
+        let capacity = f64::from(per_minute).max(1.0);
+        let refill_per_sec = capacity / 60.0;
+        let now = std::time::Instant::now();
+        let mut buckets = self
+            .buckets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !buckets.contains_key(&ip) && buckets.len() >= OLP_TOKEN_LIMITER_MAX_SOURCES {
+            // Drop every source that has refilled to full: those carry
+            // no budget state, so forgetting them changes no decision.
+            buckets.retain(|_, bucket| {
+                let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
+                (bucket.tokens + elapsed * refill_per_sec) < capacity
+            });
+            if buckets.len() >= OLP_TOKEN_LIMITER_MAX_SOURCES {
+                return false;
+            }
+        }
+        let bucket = buckets.entry(ip).or_insert(OlpTokenBucket {
+            tokens: capacity,
+            last_refill: now,
+        });
+        let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * refill_per_sec).min(capacity);
+        bucket.last_refill = now;
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn olp_token_rate_limiter() -> &'static OlpTokenRateLimiter {
+    static L: std::sync::OnceLock<OlpTokenRateLimiter> = std::sync::OnceLock::new();
+    L.get_or_init(OlpTokenRateLimiter::new)
+}
+
+/// The raw socket peer for the OLP token budget.
+///
+/// Deliberately not [`introspect_client_ip`], which prefers
+/// `X-Forwarded-For`. That is right for an operator-scoped endpoint
+/// behind a mandatory auth check and wrong here: see
+/// [`OlpTokenRateLimiter`].
+fn olp_token_source_ip(session: &pingora_proxy::Session) -> Option<std::net::IpAddr> {
+    session
+        .client_addr()
+        .and_then(|addr| addr.as_inet())
+        .map(|addr| addr.ip())
+}
+
 struct IntrospectRateLimiter {
     buckets: std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, IntrospectBucket>>,
 }
@@ -6136,9 +6390,17 @@ pub(super) fn client_cert_x5t_s256(
 /// review M5).
 ///
 /// Returning the label rather than recording it at each of the ten
-/// exits is what keeps the counter as wide as the handler: a new exit
-/// added later has to name an outcome to compile, where a scattered set
-/// of `record_*` calls would simply be missing one.
+/// exits is what keeps the counter as wide as *this function*: a new
+/// exit added here has to name an outcome to compile, where a scattered
+/// set of `record_*` calls would simply be missing one.
+///
+/// That guarantee stops at this function's boundary, which is worth
+/// saying because the claim used to be written as if it covered the
+/// whole OLP block (WOR-2673 re-review N8). The method guards above
+/// this call site are ordinary `send_error` exits and were silent until
+/// they were given their own `record_olp_decision` calls by hand;
+/// nothing makes a future exit *outside* this function name an
+/// outcome.
 async fn handle_olp_introspect_or_revoke(
     session: &mut pingora_proxy::Session,
     olp: &sbproxy_config::OlpConfig,
@@ -7255,6 +7517,7 @@ mod challenge_tests {
             default_ttl_secs: 60,
             content_key_seed: None,
             introspect: None,
+            token_rate_limit_per_minute: 60,
         }
     }
 
@@ -9244,5 +9507,97 @@ mod idempotency_wait_slot_tests {
         assert!(enter_idempotency_wait_slot(&mut held, &waiters).is_none());
         assert!(held.is_none());
         assert_eq!(buffers.available_permits(), 1);
+    }
+}
+
+/// WOR-2673: the per-source budget on the unauthenticated OLP token
+/// endpoint.
+#[cfg(test)]
+mod olp_token_rate_limiter_tests {
+    use super::{OlpTokenRateLimiter, OLP_TOKEN_LIMITER_MAX_SOURCES};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn ip(last: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, last))
+    }
+
+    /// The property the endpoint had none of: one source cannot mint
+    /// without bound.
+    ///
+    /// Before the limiter, `POST /.well-known/olp/token` signed an
+    /// Ed25519 bearer license token on every call, unauthenticated,
+    /// with no ledger, ahead of every stage that could have refused it.
+    #[test]
+    fn a_single_source_cannot_mint_beyond_its_budget() {
+        let limiter = OlpTokenRateLimiter::new();
+        let budget = 5;
+        for attempt in 1..=budget {
+            assert!(
+                limiter.check_and_consume(ip(1), budget),
+                "mint {attempt} of {budget} is inside the budget"
+            );
+        }
+        assert!(
+            !limiter.check_and_consume(ip(1), budget),
+            "the mint past the budget must be refused"
+        );
+    }
+
+    /// One source running out does not refuse another. A shared bucket
+    /// would turn one noisy crawler into an outage for every crawler.
+    #[test]
+    fn one_exhausted_source_does_not_refuse_another() {
+        let limiter = OlpTokenRateLimiter::new();
+        for _ in 0..3 {
+            assert!(limiter.check_and_consume(ip(1), 3));
+        }
+        assert!(!limiter.check_and_consume(ip(1), 3));
+        assert!(
+            limiter.check_and_consume(ip(2), 3),
+            "a second source has its own budget"
+        );
+    }
+
+    /// Config load refuses zero, so this is the belt for a config built
+    /// in memory: the floor is one token, never an unbounded endpoint.
+    #[test]
+    fn a_zero_budget_floors_at_one_rather_than_becoming_unlimited() {
+        let limiter = OlpTokenRateLimiter::new();
+        assert!(limiter.check_and_consume(ip(1), 0), "the first is allowed");
+        assert!(
+            !limiter.check_and_consume(ip(1), 0),
+            "a zero budget must not read as unlimited"
+        );
+    }
+
+    /// The tracking map is bounded, which an unauthenticated path needs
+    /// and the sibling introspect limiter does not have.
+    ///
+    /// Every source here is driven over budget first, so the sweep for
+    /// refilled buckets cannot reclaim any of them. That is the case
+    /// the cap exists for; a source seen once and left alone is swept.
+    #[test]
+    fn the_source_map_is_bounded_and_a_new_source_past_the_cap_is_refused() {
+        let limiter = OlpTokenRateLimiter::new();
+        for index in 0..OLP_TOKEN_LIMITER_MAX_SOURCES {
+            let octets = (index as u32).to_be_bytes();
+            let source = IpAddr::V4(Ipv4Addr::new(10, octets[1], octets[2], octets[3]));
+            // Budget of one, consumed, so the bucket is empty and the
+            // sweep cannot drop it.
+            assert!(limiter.check_and_consume(source, 1));
+        }
+        assert!(
+            !limiter.check_and_consume(ip(9), 1),
+            "a new source past the cap is refused rather than tracked"
+        );
+        assert_eq!(
+            limiter
+                .buckets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            OLP_TOKEN_LIMITER_MAX_SOURCES,
+            "the map does not grow past its cap"
+        );
     }
 }
