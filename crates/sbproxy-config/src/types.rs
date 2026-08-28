@@ -939,6 +939,44 @@ pub enum ConfigSource {
         /// Off by default, because most repositories are not signed.
         #[serde(default)]
         verify_signature: bool,
+        /// Treat the fetched document as externally authored: it may
+        /// not carry a host-backed secret reference (`env:NAME`,
+        /// `file:PATH`, `vault://env/NAME`) and may not name a host
+        /// path the proxy opens (WOR-2433).
+        ///
+        /// Off by default, and deliberately: turning it on for
+        /// everybody would be a fail-closed upgrade on running fleets.
+        /// A GitOps repository that names a host path anywhere would
+        /// refuse its own config on the release that changed the
+        /// default, and a node that boots into a refusal serves
+        /// nothing. The host-path half also has no substitute spelling,
+        /// because a path still has to be a path on this host, so the
+        /// only place to move one is a layer this node owns.
+        ///
+        /// It is not silent while it is off: a document that reaches
+        /// for this host logs one warning naming the **first** finding
+        /// the check reaches, at boot and again whenever a refresh
+        /// brings a revision this process has not already checked,
+        /// naming the source and the key and never the value. First
+        /// rather than every, because the check stops at the first
+        /// thing it refuses: a document naming both a host path and an
+        /// `env:` reference reports one of them now and the other once
+        /// you fix it.
+        ///
+        /// Per source leaf, not per tree. A `git_overlay` resolves each
+        /// `kind: git` node with its own `confine`, so an overlay left
+        /// unconfined keeps its own powers and warns on its own.
+        ///
+        /// Turn it on when the repository is written by somebody other
+        /// than whoever runs this proxy; the document then gets the same
+        /// treatment a config-authority bundle gets. A secret still has
+        /// a spelling under it: `${VAR}` survives confinement and is
+        /// substituted before the parse, which is what
+        /// `proxy.cluster.security.shared_key` and every other
+        /// secret-bearing field can use. See the `Confined fragments`
+        /// section of docs/configuration.md.
+        #[serde(default)]
+        confine: bool,
         /// Hard timeout for one fetch, in seconds. The child `git`
         /// process is killed when it expires; a config-load path with
         /// no timeout hangs startup.
@@ -3348,6 +3386,53 @@ pub enum ConfigAuthorityConfigError {
     },
 }
 
+/// Every prefix the process secret resolver resolves **off the machine
+/// that resolves it**, in the order
+/// `SecretResolver::resolve_with_limit` tests them
+/// (`crates/sbproxy-vault/src/resolver.rs:135-165`), paired with what
+/// each one reads.
+///
+/// The single place this crate spells the resolver's reference
+/// vocabulary. [`is_secret_reference`] and
+/// [`host_backed_secret_reference`] both classify through
+/// [`host_backed_prefix`] rather than matching a scheme literal of
+/// their own, which is what `scripts/check-secret-resolver-drift.py`
+/// asks of every call site: a second hand-rolled parse of this syntax
+/// is a detector that can drift narrower than the resolver enforcing
+/// it, and this branch shipped exactly that until CI said so
+/// (WOR-2433).
+///
+/// The `${VAR}` form the resolver also reads from the environment is
+/// deliberately absent: it is a template spelling, refused earlier and
+/// by name in [`crate::confined_template`], and folding it in here would
+/// make [`host_backed_secret_reference`] report a template as a secret
+/// reference to every caller that asks which host resource a value
+/// opens.
+pub(crate) const HOST_BACKED_SECRET_PREFIXES: &[(&str, HostSecretSource)] = &[
+    // Checked before the provider-URI parse, so the legacy alias keeps
+    // its environment semantics rather than being read as a `vault`
+    // backend named `env`.
+    ("vault://env/", HostSecretSource::LegacyVaultEnvironment),
+    ("env:", HostSecretSource::Environment),
+    ("file:", HostSecretSource::HostFile),
+];
+
+/// Which host resource `trimmed` names, if it names one.
+///
+/// The one prefix match in this crate. Callers ask this rather than
+/// spelling a scheme themselves, so the vocabulary has exactly one
+/// definition and a new prefix reaches every detector at once.
+fn host_backed_prefix(trimmed: &str) -> Option<HostSecretSource> {
+    HOST_BACKED_SECRET_PREFIXES
+        .iter()
+        .find_map(|(prefix, source)| {
+            trimmed
+                .strip_prefix(prefix)
+                .filter(|rest| !rest.is_empty())
+                .map(|_| *source)
+        })
+}
+
 /// Whether `value` names a secret rather than carrying one inline.
 ///
 /// Mirrors the forms the process secret resolver accepts. Deliberately a
@@ -3361,10 +3446,8 @@ pub enum ConfigAuthorityConfigError {
 /// than duplicating a third copy of this heuristic.
 pub fn is_secret_reference(value: &str) -> bool {
     let trimmed = value.trim();
-    for prefix in ["env:", "file:"] {
-        if let Some(rest) = trimmed.strip_prefix(prefix) {
-            return !rest.is_empty();
-        }
+    if host_backed_prefix(trimmed).is_some() {
+        return true;
     }
     if trimmed.starts_with("${") && trimmed.ends_with('}') && trimmed.len() > 3 {
         return true;
@@ -3384,6 +3467,112 @@ pub fn is_secret_reference(value: &str) -> bool {
         }
         None => false,
     }
+}
+
+/// What a secret reference reads on the machine that resolves it, when
+/// it reads the host directly rather than an operator-declared backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostSecretSource {
+    /// `env:NAME` - the process environment.
+    Environment,
+    /// `vault://env/NAME` - the legacy alias for the same read.
+    LegacyVaultEnvironment,
+    /// `file:/path` - an arbitrary path on the host filesystem.
+    HostFile,
+}
+
+impl HostSecretSource {
+    /// The reference spelling, for an error message. Never the value.
+    #[must_use]
+    pub fn form(self) -> &'static str {
+        match self {
+            Self::Environment => "env:NAME",
+            Self::LegacyVaultEnvironment => "vault://env/NAME",
+            Self::HostFile => "file:PATH",
+        }
+    }
+
+    /// What the form reads, for an error message.
+    #[must_use]
+    pub fn reads(self) -> &'static str {
+        match self {
+            Self::Environment | Self::LegacyVaultEnvironment => "the process environment",
+            Self::HostFile => "a file on the host filesystem",
+        }
+    }
+}
+
+/// Whether `value` is a secret reference the process resolver reads
+/// straight off the host, rather than through a backend the operator
+/// declared under `proxy.secrets`.
+///
+/// This is the shape half of a guard whose enforcing half lives in
+/// another crate. `sbproxy-vault`'s `SecretResolver::resolve_with_limit`
+/// (`crates/sbproxy-vault/src/resolver.rs:135-165`) tests four prefixes
+/// before it reaches the backend manager, in this order: the legacy
+/// `vault://env/NAME` alias, a whole-value `${VAR}`, `env:NAME`, and
+/// `file:PATH`. The first, third and fourth are what this returns; the
+/// second is a template form the confined pass
+/// ([`crate::confined_template`]) already refuses as `${VAR}`.
+///
+/// # What this cannot see
+///
+/// `sbproxy-config` does not depend on `sbproxy-vault` and cannot, so
+/// this is a mirror rather than a call, and a new host-backed prefix
+/// added to that resolver will not appear here on its own. Three things
+/// hold it. The mirror has exactly one spelling in this crate, the
+/// crate-private `HOST_BACKED_SECRET_PREFIXES` table, which this
+/// function and [`is_secret_reference`] both classify through, so the
+/// two can no longer disagree with each other; this doc names the
+/// resolver's exact
+/// function and line range; and `sbproxy-vault`'s
+/// `every_host_backed_prefix_is_mirrored_by_the_confined_pass` pins the
+/// resolver's prefix set with a failure message pointing back here.
+/// `every_host_backed_prefix_the_resolver_reads_is_refused` walks the
+/// table from the other end, asserting each prefix is classified, is
+/// refused by the confined pass, and cannot be smuggled past either by
+/// surrounding whitespace. The mirror is deliberately the wider of the
+/// two everywhere they differ,
+/// and they differ twice. `vault://env/` is matched on the scheme and
+/// authority alone, while the resolver additionally requires a
+/// syntactically valid variable name, so a fragment writing a malformed
+/// one is refused rather than waved through. And the value is trimmed
+/// before the prefixes are tested, while the resolver tests the raw
+/// value, so a leading space cannot smuggle a reference past this and
+/// into a field that trims later.
+///
+/// Provider-URI schemes (`secret://`, `vault://<backend>/`, `awssm://`,
+/// `gcpsm://`, `k8ssecret://`, `secretfile://<backend>/`) are
+/// deliberately absent: each resolves only against a backend named under
+/// `proxy.secrets`, which is in [`crate::AUTHORITY_DENIED_PATHS`] and is
+/// not a field an externally authored document may set, so the operator
+/// still chooses what those reach.
+#[must_use]
+pub fn host_backed_secret_reference(value: &str) -> Option<HostSecretSource> {
+    let trimmed = value.trim();
+    // Two questions, both answered by shared code rather than by a
+    // scheme literal written here. Is this a secret reference at all?
+    // [`is_secret_reference`] decides, so this detector can never call
+    // something a bare literal that the crate's own classifier calls a
+    // reference. And if it is, which host resource does it open?
+    // [`host_backed_prefix`] decides, off the one table that names the
+    // resolver's vocabulary.
+    //
+    // There is no carve-out for `file://`, because the resolver has
+    // none: its branch is a bare `strip_prefix("file:")`, so
+    // `file:///etc/sbproxy/creds` reaches
+    // `read_to_string("///etc/sbproxy/creds")`, which POSIX resolves to
+    // `/etc/sbproxy/creds`. Sparing the git transport spelling would
+    // leave this narrower than the enforcer at the one spelling an
+    // author would reach for. Nothing needs the exemption: a `source:`
+    // block is read off the operator's own local document, the loader
+    // never hands a fetched document's `source:` back to git, and
+    // `source` is on [`crate::AUTHORITY_DENIED_PATHS`], so no externally
+    // authored document names a git transport at all.
+    if !is_secret_reference(trimmed) {
+        return None;
+    }
+    host_backed_prefix(trimmed)
 }
 
 /// Validate one bounded, non-empty, control-character-free value.
@@ -14542,5 +14731,97 @@ mod decision_audit_scope_tests {
             "the kid and issuer must survive: both are advertised in the JWS \
              header and the well-known document: {rendered}"
         );
+    }
+}
+
+#[cfg(test)]
+mod host_backed_secret_reference_tests {
+    use super::*;
+
+    /// WOR-2433, after CI's secret-resolver drift guard. Both detectors
+    /// classify through [`HOST_BACKED_SECRET_PREFIXES`] now, so the
+    /// property worth asserting is over that table rather than over
+    /// three hand-written strings: adding a prefix reaches
+    /// `is_secret_reference` and `host_backed_secret_reference`
+    /// together, and this fails if it ever reaches only one.
+    #[test]
+    fn every_prefix_in_the_shared_table_is_classified_by_both_detectors() {
+        assert!(
+            !HOST_BACKED_SECRET_PREFIXES.is_empty(),
+            "an empty table would make every assertion below vacuous",
+        );
+        for (prefix, expected) in HOST_BACKED_SECRET_PREFIXES {
+            // `//host/x` is the shape the historical `file://`
+            // carve-out spared: the resolver has no such carve-out, so
+            // neither may this.
+            for tail in ["NAME", "/etc/sbproxy/creds", "a/b", "x", "//host/x"] {
+                let value = format!("{prefix}{tail}");
+                assert!(
+                    is_secret_reference(&value),
+                    "`{value}` is a reference the resolver reads and the shared classifier \
+                     does not call one",
+                );
+                assert_eq!(
+                    host_backed_secret_reference(&value),
+                    Some(*expected),
+                    "`{value}` is read off this host and was not classified as such",
+                );
+                // Whitespace cannot smuggle a reference past the
+                // detector and into a field that trims later.
+                for padded in [
+                    format!(" {value}"),
+                    format!("{value} "),
+                    format!("\t{value}\n"),
+                ] {
+                    assert_eq!(
+                        host_backed_secret_reference(&padded),
+                        Some(*expected),
+                        "`{padded:?}` slipped past the detector",
+                    );
+                }
+            }
+            // A prefix with nothing after it names no host resource,
+            // because the resolver would have nothing to look up.
+            // `is_secret_reference` is deliberately not asserted here:
+            // `vault://env/` is still a syntactic provider URI to it,
+            // and the wider of the two answers is the safe one for a
+            // classifier whose job is to decide what must not be
+            // printed inline.
+            assert!(host_backed_secret_reference(prefix).is_none(), "`{prefix}`");
+        }
+    }
+
+    /// The two detectors are ordered, not merely consistent: everything
+    /// host-backed is a reference, and the operator-declared provider
+    /// URIs are references that are *not* host-backed, which is the
+    /// distinction `ConfinementPolicy::remote_document` rests on.
+    #[test]
+    fn a_provider_uri_is_a_reference_but_is_not_host_backed() {
+        for value in [
+            "secret://backend/name",
+            "vault://prod/api-key",
+            "awssm://prod/pepper",
+            "gcpsm://p/s",
+            "k8ssecret://ns/name",
+            "secretfile://backend/name",
+        ] {
+            assert!(is_secret_reference(value), "`{value}`");
+            assert!(
+                host_backed_secret_reference(value).is_none(),
+                "`{value}` resolves only against a backend the operator declared under \
+                 proxy.secrets, so it must not be reported as a host read",
+            );
+        }
+        // And an inline literal is neither.
+        for value in [
+            "hunter2",
+            "",
+            "   ",
+            "https://example.test/x",
+            "not-a-reference",
+        ] {
+            assert!(!is_secret_reference(value), "`{value}`");
+            assert!(host_backed_secret_reference(value).is_none(), "`{value}`");
+        }
     }
 }

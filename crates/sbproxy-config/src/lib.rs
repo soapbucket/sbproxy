@@ -12,6 +12,9 @@
 //!   ([`config_authority`])
 //! - Merging an authority-supplied document into a locally owned one
 //!   ([`config_merge`])
+//! - Resolving an externally authored config fragment against a
+//!   caller-supplied binding set, with no access to the process
+//!   environment ([`confined_template`])
 //! - A durable, node-local, content-addressed ring of applied config
 //!   revisions, used to find the last known good document
 //!   ([`revision_store`])
@@ -31,6 +34,7 @@ pub mod compiler;
 pub mod config_authority;
 pub mod config_bundle;
 pub mod config_merge;
+pub mod confined_template;
 pub mod duration;
 pub mod extensions;
 pub mod key_registry;
@@ -67,6 +71,10 @@ pub use config_bundle::{
 pub use config_merge::{
     changed_leaf_paths, denied_paths_in, merge_config, BaseOrigin, MergeError, MergeMode,
     MergeOutcome, Provenance, ProvenanceMap, AUTHORITY_DENIED_PATHS,
+};
+pub use confined_template::{
+    check_confined_document, check_confined_value, resolve_confined_fragment,
+    ConfinedTemplateError, ConfinementPolicy,
 };
 pub use extensions::*;
 pub use listing::{

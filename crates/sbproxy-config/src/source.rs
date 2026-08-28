@@ -33,6 +33,16 @@
 //!   pin, so a branch moving underneath the node cannot be followed.
 //! * Set `verify_signature: true`. The loader then requires a good
 //!   signature on the resolved tag or commit.
+//! * Set `confine: true` when the repository is written by somebody
+//!   other than whoever runs the proxy. The fetched document then goes
+//!   through [`crate::confined_template`] with
+//!   [`crate::ConfinementPolicy::remote_document`]: no secret reference
+//!   that reads this host (`env:NAME`, `file:PATH`, `vault://env/NAME`)
+//!   and no config key naming a path on it. Off by default, because on
+//!   an ordinary GitOps node the repository *is* the operator's config
+//!   and the local file is only a pointer, so sealing those spellings
+//!   would leave the operator nowhere to write a secret reference at
+//!   all (WOR-2433).
 //!
 //! ## How a git source is fetched
 //!
@@ -173,6 +183,21 @@ pub enum ConfigSourceError {
     /// path, a path that escapes the repository, or a timeout of zero.
     #[error("source.invalid: {0}")]
     Invalid(String),
+    /// The document the repository served reaches for something only the
+    /// host owner may reach: a secret read straight off the process
+    /// environment or the filesystem, or a host path the proxy would
+    /// open (WOR-2433). Only raised for a source the operator marked
+    /// `confine: true`.
+    ///
+    /// Separate from [`Self::Invalid`] because it is not a malformed
+    /// document. It parses, it would compile, and refusing it is a trust
+    /// decision rather than a syntax one, so it earns its own metric
+    /// label and its own operator message. A fetched document that does
+    /// not parse is reported as [`Self::Invalid`] even though the
+    /// confinement check is what noticed, so this counter keeps meaning
+    /// "somebody tried to reach this host".
+    #[error("source.confinement: {0}")]
+    Confinement(String),
 }
 
 impl ConfigSourceError {
@@ -198,6 +223,7 @@ impl ConfigSourceError {
             Self::Timeout(_) => "timeout",
             Self::RevisionMismatch(_) => "revision_mismatch",
             Self::Signature(_) => "verify_failed",
+            Self::Confinement(_) => "confinement_refused",
             Self::Read(_) | Self::Merge(_) | Self::RecursionLimit | Self::Invalid(_) => "invalid",
         }
     }
@@ -1423,6 +1449,17 @@ fn sanitize_materialization_error(
         ConfigSourceError::Merge(detail) => {
             ConfigSourceError::Merge(clean(detail, resolved_credential, http_auth))
         }
+        // A confinement refusal names a field path and a static form,
+        // never a value, and its label is redacted at the point it is
+        // built (`confine_fetched_document`) because this sanitizer only
+        // wraps the fetch and the check runs after `load_git` returns.
+        // It goes through `clean` anyway: this match is exhaustive on
+        // purpose so that a new variant has to make this decision
+        // explicitly, and a second scrub of an already-redacted string
+        // is a no-op rather than a cost.
+        ConfigSourceError::Confinement(detail) => {
+            ConfigSourceError::Confinement(clean(detail, resolved_credential, http_auth))
+        }
         ConfigSourceError::MissingGitBinary(detail) => {
             ConfigSourceError::MissingGitBinary(clean(detail, resolved_credential, http_auth))
         }
@@ -1615,6 +1652,7 @@ fn load_with_depth(
             path,
             credential,
             verify_signature,
+            confine,
             timeout_secs,
             refresh_interval_secs: _,
         } => {
@@ -1627,6 +1665,34 @@ fn load_with_depth(
                 timeout: Duration::from_secs(*timeout_secs),
             };
             let (text, resolved) = load_git(&spec, fetch_ctx)?;
+            // The document a repository serves is authored by whoever
+            // can push to that repository, which is not necessarily
+            // whoever runs this proxy. When the operator says those are
+            // different parties (`source.confine: true`), the document
+            // gets the same boundary a config-authority bundle gets
+            // (WOR-2433).
+            //
+            // Opt-in rather than on by default, because flipping it on
+            // is a fail-closed upgrade on a running fleet: every GitOps
+            // deployment whose repository names a host path would refuse
+            // its own config on the release that changed the default,
+            // and a node that boots into a refusal serves nothing. The
+            // unconfined path is not silent, though - a document that
+            // reaches for this host logs one warning naming the first
+            // finding, so an operator on the default learns the setting
+            // exists. See `ConfigSource::Git`'s `confine` field for the
+            // rest.
+            //
+            // `remote_document()` keeps `${VAR}`, which is the
+            // documented and only supported way to run one shared
+            // document across a fleet, and withholds the two powers a
+            // remote document was never granted: a secret reference read
+            // straight off this host, and a host path the proxy opens.
+            if *confine {
+                confine_fetched_document(&spec, &text)?;
+            } else {
+                warn_unconfined_host_reference(&spec, &text, &resolved);
+            }
             revisions.push(resolved);
             Ok(text)
         }
@@ -1640,6 +1706,197 @@ fn load_with_depth(
         }
     }
 }
+
+/// Check a fetched document against the externally-authored boundary,
+/// naming it by repository and path.
+///
+/// Two details the call site would otherwise get wrong. The label goes
+/// through [`redact_repo`] like every other repository string that
+/// reaches a log line or an error message: this one is rendered on every
+/// boot and every refresh of a refusing document, and a `source.repo`
+/// carrying `https://token@host/repo.git` would print the token each
+/// time (WOR-2433 re-review). And a document that does not parse is
+/// reported as [`ConfigSourceError::Invalid`], not as a confinement
+/// refusal: this check is the first parse of the fetched text, and
+/// `Confinement` means "it parses, it would compile, and this node
+/// refuses what it reaches for", which is what makes its metric label
+/// worth reading.
+fn confine_fetched_document(spec: &GitSpec<'_>, text: &str) -> Result<(), ConfigSourceError> {
+    let label = format!("{}:{}", redact_repo(spec.repo), spec.path);
+    crate::confined_template::check_confined_document(
+        &label,
+        text,
+        &crate::confined_template::ConfinementPolicy::remote_document(),
+    )
+    .map_err(|error| match error {
+        // "config fragment does not parse as YAML" is the wrong noun for
+        // a whole document an operator hands the proxy, and this check is
+        // the first thing that parses it, so the message is rebuilt here
+        // rather than borrowed (WOR-2433 re-review).
+        crate::confined_template::ConfinedTemplateError::Parse { source, .. } => {
+            ConfigSourceError::Invalid(format!(
+                "config document `{label}` does not parse as YAML: {source}"
+            ))
+        }
+        other => ConfigSourceError::Confinement(other.to_string()),
+    })
+}
+
+/// Warn once when an **unconfined** git source serves a document that
+/// reaches for this host.
+///
+/// `source.confine` defaults to off, which keeps every GitOps fleet
+/// working across the upgrade, and leaves the operator with no signal
+/// that the setting exists or that their repository is reaching for the
+/// node. This is that signal: the same checker the opt-in runs, with the
+/// refusal turned into one warning naming the source and the key. The
+/// value is never rendered - the checker's own refusals carry a field
+/// path and a static form and never a value, which is what makes this
+/// safe to log.
+///
+/// The **first** finding, not one per finding: the checker returns on
+/// the first thing it refuses, so a document naming both a host path and
+/// an `env:` reference reports one of them now and the other once that
+/// one is fixed. Four places used to say "one warning per finding" and
+/// the code never did (WOR-2433 re-review round 3); they say this now.
+///
+/// Skipped entirely for a `(source, commit)` this process has already
+/// walked. `confine` defaults to off, so this walk is on the ordinary
+/// path: it parses the whole document into a `serde_yaml::Value` and
+/// allocates a `String` per scalar, and the refresh poller resolves the
+/// same commit every cycle. A commit and a path pin the bytes, so
+/// re-walking them can only produce the answer already given, and the
+/// finding dedup below suppressed the line but not the work
+/// (WOR-2433 re-review round 3).
+///
+/// Deduplicated per source and finding on top of that, because a
+/// refresh that does bring a new commit usually brings the same finding
+/// with it. A document that changes to reach for something else warns
+/// again, which is the behavior that matters.
+///
+/// The key path in the summary is assembled from the fetched document's
+/// own mapping key names, and YAML permits a newline or an ANSI escape
+/// inside a quoted key, so it goes through
+/// [`crate::extensions::sanitize_detail`] before it is formatted: an
+/// unsanitized document-controlled string at a log site is newline log
+/// forging. The label goes through it too, after [`redact_repo`].
+///
+/// Returns the redacted source label and the summary it logged, for the
+/// test that pins this, and `None` when the document reaches for nothing
+/// (or when this revision, or this exact finding, has already been
+/// reported).
+fn warn_unconfined_host_reference(
+    spec: &GitSpec<'_>,
+    text: &str,
+    resolved: &ResolvedRevision,
+) -> Option<(String, String)> {
+    let label =
+        crate::extensions::sanitize_detail(&format!("{}:{}", redact_repo(spec.repo), spec.path));
+    if !first_check_of_revision(&label, &resolved.commit) {
+        return None;
+    }
+    let refusal = crate::confined_template::check_confined_document(
+        &label,
+        text,
+        &crate::confined_template::ConfinementPolicy::remote_document(),
+    )
+    .err()?;
+    // Every host-reaching refusal warns; the two that do not are the
+    // compile's business and are reported by the compile that follows
+    // (`Parse` is a malformed document, `YamlTag` is a tag the compiler
+    // refuses on every path). No other variant can occur under
+    // `remote_document`, which grants `${VAR}` and the operator's own
+    // declared secret backends.
+    //
+    // `HostReachingDefault` was missing here for one round, which made
+    // the default path silent on the exact spelling the same round
+    // closed: `refuse_host_reaching_default` runs *before*
+    // `refuse_host_secret_reference` on a string, so
+    // `api_key: "${SB_NOPE:-env:AWS_SECRET_ACCESS_KEY}"` produced this
+    // variant and nothing else, and this function answered `None`
+    // (WOR-2433 re-review round 4).
+    let summary = match &refusal {
+        crate::confined_template::ConfinedTemplateError::HostSecretReference {
+            path, form, ..
+        } => format!(
+            "`{}` is a `{form}` secret reference read off this host",
+            crate::extensions::sanitize_detail(path)
+        ),
+        crate::confined_template::ConfinedTemplateError::HostFileInlining { path, .. } => {
+            format!(
+                "`{}` names a path the proxy opens on this host",
+                crate::extensions::sanitize_detail(path)
+            )
+        }
+        crate::confined_template::ConfinedTemplateError::HostReachingDefault {
+            path, form, ..
+        } => format!(
+            "`{}` writes a `${{VAR:-default}}` whose default is {form}",
+            crate::extensions::sanitize_detail(path)
+        ),
+        crate::confined_template::ConfinedTemplateError::Parse { .. }
+        | crate::confined_template::ConfinedTemplateError::YamlTag { .. } => return None,
+        _ => return None,
+    };
+    if !first_report_of(&label, &summary) {
+        return None;
+    }
+    tracing::warn!(
+        source = %label,
+        finding = %summary,
+        "config source is not confined and its document reaches for this host; the \
+         repository can read this node's environment, secrets and filesystem. Set \
+         `source.confine: true` to refuse that, after moving the named key into the \
+         layer this node owns"
+    );
+    Some((label, summary))
+}
+
+/// Whether this process has yet walked `commit` for `label`.
+///
+/// Same bounded shape as [`first_report_of`], and bounded for the same
+/// reason: a process that has resolved this many distinct commits is
+/// long-lived enough that walking one document again costs less than the
+/// set does. A poisoned lock falls through to walking, because the walk
+/// is what produces the warning and silence is the wrong failure here.
+fn first_check_of_revision(label: &str, commit: &str) -> bool {
+    static CHECKED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let checked = CHECKED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let Ok(mut seen) = checked.lock() else {
+        return true;
+    };
+    if seen.len() >= MAX_REMEMBERED_UNCONFINED_FINDINGS {
+        return true;
+    }
+    seen.insert(format!("{label} @ {commit}"))
+}
+
+/// Whether this is the first time `summary` has been reported for
+/// `label` in this process.
+///
+/// Bounded: the set stops growing at
+/// [`MAX_REMEMBERED_UNCONFINED_FINDINGS`], after which every finding is
+/// treated as new. A process with that many distinct findings has a
+/// louder problem than a repeated log line.
+fn first_report_of(label: &str, summary: &str) -> bool {
+    static REPORTED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let reported = REPORTED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let Ok(mut seen) = reported.lock() else {
+        // A poisoned lock means another thread panicked while holding
+        // it. Warning twice is better than not warning.
+        return true;
+    };
+    if seen.len() >= MAX_REMEMBERED_UNCONFINED_FINDINGS {
+        return true;
+    }
+    seen.insert(format!("{label} :: {summary}"))
+}
+
+/// How many distinct unconfined-source entries this process remembers,
+/// for the finding dedup and for the revision cache alike.
+const MAX_REMEMBERED_UNCONFINED_FINDINGS: usize = 256;
 
 /// One `Git` source, flattened so the loader is not passing seven
 /// arguments around.
@@ -1832,6 +2089,7 @@ mod tests {
             path: path.to_string(),
             credential: None,
             verify_signature: false,
+            confine: false,
             timeout_secs: 60,
             refresh_interval_secs: 60,
         }
@@ -1843,6 +2101,350 @@ mod tests {
         ctx: &FetchContext,
     ) -> Result<ResolvedDocument, ConfigSourceError> {
         load_source_blocking(source, inline, ctx)
+    }
+
+    /// WOR-2433 re-review. The confinement label is built from the
+    /// `source.repo` string, which may carry a token, and it is rendered
+    /// on every boot and every refresh of a refusing document. This
+    /// error never passes through `sanitize_materialization_error`
+    /// either, because that only wraps the fetch and this check runs
+    /// after `load_git` has returned, so the redaction has to happen
+    /// where the label is built.
+    #[test]
+    fn a_confinement_refusal_never_carries_the_repositorys_credential() {
+        for repo in [
+            "https://ghp_examplesecrettoken@github.com/acme/config.git",
+            "https://acme:ghp_examplesecrettoken@github.com/acme/config.git",
+        ] {
+            let spec = GitSpec {
+                repo,
+                revision: None,
+                path: "sb.yml",
+                credential: None,
+                verify_signature: false,
+                timeout: Duration::from_secs(60),
+            };
+            let error = confine_fetched_document(
+                &spec,
+                "origins:\n  api:\n    authentication:\n      api_key: \"env:AWS_SECRET_ACCESS_KEY\"\n",
+            )
+            .expect_err("a confined document may not read this host's environment");
+
+            let rendered = error.to_string();
+            assert!(
+                !rendered.contains("ghp_examplesecrettoken"),
+                "the refusal carried the repository credential: {rendered}"
+            );
+            assert!(
+                rendered.contains("github.com/acme/config.git:sb.yml"),
+                "the refusal must still say which document it refused: {rendered}"
+            );
+        }
+    }
+
+    /// A resolved revision for the warning tests, which care about the
+    /// commit only as a cache key.
+    fn revision_at(commit: &str) -> ResolvedRevision {
+        ResolvedRevision {
+            repo: "https://example.test/warn.git".into(),
+            reference: "HEAD".into(),
+            commit: commit.into(),
+        }
+    }
+
+    /// WOR-2433 re-review, the ruling on the default. `source.confine`
+    /// stays off, so the unconfined path has to say something: an
+    /// operator who never heard of the setting otherwise gets no signal
+    /// that their repository can read this node's environment.
+    #[test]
+    fn an_unconfined_source_reaching_for_this_host_warns_once_per_finding() {
+        let spec = GitSpec {
+            repo: "https://ghp_examplesecrettoken@github.com/acme/warn-once.git",
+            revision: None,
+            path: "sb.yml",
+            credential: None,
+            verify_signature: false,
+            timeout: Duration::from_secs(60),
+        };
+        let document =
+            "origins:\n  api:\n    authentication:\n      api_key: \"env:AWS_SECRET_ACCESS_KEY\"\n";
+
+        let (label, summary) =
+            warn_unconfined_host_reference(&spec, document, &revision_at("warn-once-1"))
+                .expect("an unconfined source reaching for this host must be reported");
+
+        assert!(
+            !label.contains("ghp_examplesecrettoken"),
+            "the warning carried the repository credential: {label}"
+        );
+        assert!(
+            label.contains("github.com/acme/warn-once.git:sb.yml"),
+            "{label}"
+        );
+        assert!(
+            summary.contains("origins.api.authentication.api_key"),
+            "the warning must name the key: {summary}"
+        );
+        assert!(
+            !summary.contains("AWS_SECRET_ACCESS_KEY"),
+            "the warning named the variable rather than the form: {summary}"
+        );
+        // A new commit, so the revision cache does not answer this one:
+        // the walk runs again and the finding dedup is what stays quiet.
+        assert!(
+            warn_unconfined_host_reference(&spec, document, &revision_at("warn-once-2")).is_none(),
+            "the same finding must not be reported on every refresh cycle"
+        );
+    }
+
+    /// WOR-2433 re-review round 3, New 9. The docs say the warning fires
+    /// "at boot and again whenever a refresh brings a revision this
+    /// process has not already checked", and the dedup set above
+    /// suppressed the log line without suppressing the walk: a full
+    /// `serde_yaml` parse plus a `String` per scalar, every refresh
+    /// cycle, on the default path where nothing asked for a check.
+    ///
+    /// The observable is a *different* finding at the same commit. The
+    /// finding dedup cannot explain silence here, so the only thing that
+    /// can is the walk not having run.
+    #[test]
+    fn an_unconfined_source_is_not_rewalked_at_a_revision_already_checked() {
+        let spec = GitSpec {
+            repo: "https://github.com/acme/warn-revision.git",
+            revision: None,
+            path: "sb.yml",
+            credential: None,
+            verify_signature: false,
+            timeout: Duration::from_secs(60),
+        };
+        let commit = revision_at("f00dcafe");
+
+        let (_, first) = warn_unconfined_host_reference(
+            &spec,
+            "origins:\n  api:\n    authentication:\n      api_key: \"env:AWS_SECRET_ACCESS_KEY\"\n",
+            &commit,
+        )
+        .expect("the first sight of a revision is walked");
+        assert!(first.contains("api_key"), "{first}");
+
+        assert!(
+            warn_unconfined_host_reference(
+                &spec,
+                "origins:\n  api:\n    request_modifiers:\n      - rego_module_path: /etc/x.rego\n",
+                &commit,
+            )
+            .is_none(),
+            "a revision this process already walked must not be walked again"
+        );
+
+        // And a genuinely new revision is walked, so the skip is a cache
+        // rather than a mute button.
+        assert!(
+            warn_unconfined_host_reference(
+                &spec,
+                "origins:\n  api:\n    request_modifiers:\n      - rego_module_path: /etc/x.rego\n",
+                &revision_at("deadbeef"),
+            )
+            .is_some(),
+            "a revision this process has not checked must be walked"
+        );
+    }
+
+    /// WOR-2433 re-review round 3, New 5. The key path in the summary is
+    /// assembled from the document's own mapping key names, and YAML
+    /// permits a newline or an ANSI escape inside a quoted key, so an
+    /// externally authored repository could forge a complete log line
+    /// under the default fmt layer.
+    #[test]
+    fn a_document_controlled_key_cannot_forge_a_log_line() {
+        let spec = GitSpec {
+            repo: "https://github.com/acme/warn-forge.git",
+            revision: None,
+            path: "sb.yml",
+            credential: None,
+            verify_signature: false,
+            timeout: Duration::from_secs(60),
+        };
+        // A quoted key carrying a newline, a carriage return and an ANSI
+        // SGR sequence, wrapped around a key the guard refuses so the
+        // path reaches the log line at all.
+        let document = concat!(
+            "\"forged\\n2026-08-27T00:00:00Z WARN sbproxy: all clear\\r\\u001b[31m\":\n",
+            "  rego_module_path: /etc/sbproxy/x.rego\n",
+        );
+
+        let (label, summary) =
+            warn_unconfined_host_reference(&spec, document, &revision_at("forge"))
+                .expect("the host path is still refused; only its rendering changes");
+
+        for (name, rendered) in [("label", &label), ("finding", &summary)] {
+            assert!(
+                !rendered.contains('\n') && !rendered.contains('\r'),
+                "a newline survived into the {name} field: {rendered:?}"
+            );
+            assert!(
+                !rendered.contains('\u{1b}'),
+                "an ANSI escape survived into the {name} field: {rendered:?}"
+            );
+            assert!(
+                !rendered.chars().any(char::is_control),
+                "a control character survived into the {name} field: {rendered:?}"
+            );
+        }
+        assert!(
+            summary.contains("rego_module_path"),
+            "the warning must still name the key it refused: {summary}"
+        );
+    }
+
+    #[test]
+    fn an_unconfined_source_naming_a_host_path_warns_about_the_key() {
+        let spec = GitSpec {
+            repo: "https://github.com/acme/warn-path.git",
+            revision: None,
+            path: "sb.yml",
+            credential: None,
+            verify_signature: false,
+            timeout: Duration::from_secs(60),
+        };
+        let document =
+            "origins:\n  api:\n    request_modifiers:\n      - rego_module_path: /etc/sbproxy/x.rego\n";
+
+        let (_, summary) =
+            warn_unconfined_host_reference(&spec, document, &revision_at("warn-path"))
+                .expect("a host path in an unconfined document must be reported");
+
+        assert!(summary.contains("rego_module_path"), "{summary}");
+        assert!(
+            !summary.contains("/etc/sbproxy/x.rego"),
+            "the warning echoed the path: {summary}"
+        );
+    }
+
+    /// WOR-2433 re-review round 4, New 2. `confine` defaults to off, and
+    /// the docs say the warning "is the answer to what would
+    /// `confine: true` refuse if I turned it on". For a document that
+    /// reaches the host through a `${VAR:-default}` it was not: the walk
+    /// produced `HostReachingDefault`, this function rendered two
+    /// variants and returned `None` for everything else, and
+    /// `first_check_of_revision` then cached the silence for the life of
+    /// the process at that commit.
+    #[test]
+    fn an_unconfined_source_reaching_for_this_host_through_a_default_warns() {
+        let spec = GitSpec {
+            repo: "https://github.com/acme/warn-default.git",
+            revision: None,
+            path: "sb.yml",
+            credential: None,
+            verify_signature: false,
+            timeout: Duration::from_secs(60),
+        };
+
+        let (_, summary) = warn_unconfined_host_reference(
+            &spec,
+            "origins:\n  api:\n    authentication:\n      api_key: \"${SB_NOPE_2433:-env:AWS_SECRET_ACCESS_KEY}\"\n",
+            &revision_at("warn-default-1"),
+        )
+        .expect("a default that reaches this host is a finding like any other");
+        assert!(summary.contains("api_key"), "{summary}");
+        assert!(
+            !summary.contains("AWS_SECRET_ACCESS_KEY"),
+            "the warning echoed the default it refused: {summary}"
+        );
+
+        let (_, summary) = warn_unconfined_host_reference(
+            &spec,
+            "origins:\n  api:\n    action:\n      type: proxy\n      url: \"${SB_NOPE_2433:-/etc/sbproxy/x}\"\n",
+            &revision_at("warn-default-2"),
+        )
+        .expect("an absolute path in a default is a finding too");
+        assert!(summary.contains("url"), "{summary}");
+        assert!(
+            !summary.contains("/etc/sbproxy/x"),
+            "the warning echoed the path it refused: {summary}"
+        );
+    }
+
+    #[test]
+    fn the_loader_reports_an_unconfined_source_that_reaches_for_this_host() {
+        // A covered function is not a wired one. The dedup set is the
+        // observable: if `load` reported this finding, a direct call
+        // with the same source and document returns `None` because it
+        // has already been said.
+        const DOCUMENT: &str =
+            "origins:\n  api:\n    authentication:\n      api_key: \"env:AWS_SECRET_ACCESS_KEY\"\n";
+        let mut repos: HashMapOfRepos = std::collections::HashMap::new();
+        repos.insert(
+            "https://example.test/warn-wired.git".into(),
+            vec![("sb.yml", DOCUMENT)],
+        );
+        let (ctx, _cloner) = ctx_with(FixtureCloner::new(repos));
+        let source = git_source(
+            "https://example.test/warn-wired.git",
+            Some("main"),
+            "sb.yml",
+        );
+
+        let loaded = load(&source, "", &ctx).expect("an unconfined source still loads");
+        assert_eq!(loaded.text, DOCUMENT, "and is served unchanged");
+
+        let spec = GitSpec {
+            repo: "https://example.test/warn-wired.git",
+            revision: None,
+            path: "sb.yml",
+            credential: None,
+            verify_signature: false,
+            timeout: Duration::from_secs(60),
+        };
+        // A commit the fixture never resolved to, so the revision cache
+        // cannot answer this call and the finding dedup is still the
+        // only thing that can make it quiet.
+        assert!(
+            warn_unconfined_host_reference(&spec, DOCUMENT, &revision_at("not-the-fixtures"))
+                .is_none(),
+            "the loader did not report the finding, so nothing warned the operator"
+        );
+    }
+
+    #[test]
+    fn an_unconfined_source_with_a_clean_document_says_nothing() {
+        // `${VAR}` is the documented way one shared document names
+        // per-node values, so it is not a finding and must not train
+        // operators to ignore this warning.
+        let spec = GitSpec {
+            repo: "https://github.com/acme/warn-clean.git",
+            revision: None,
+            path: "sb.yml",
+            credential: None,
+            verify_signature: false,
+            timeout: Duration::from_secs(60),
+        };
+
+        assert!(warn_unconfined_host_reference(
+            &spec,
+            "proxy:\n  cluster:\n    node_id: \"${SB_NODE_ID}\"\n",
+            &revision_at("warn-clean"),
+        )
+        .is_none());
+    }
+
+    /// The other half of the same site: a document that does not parse is
+    /// a syntax problem, not a trust decision, so it must not climb the
+    /// confinement counter.
+    #[test]
+    fn a_confined_document_that_does_not_parse_is_invalid() {
+        let spec = GitSpec {
+            repo: "https://github.com/acme/config.git",
+            revision: None,
+            path: "sb.yml",
+            credential: None,
+            verify_signature: false,
+            timeout: Duration::from_secs(60),
+        };
+        let error = confine_fetched_document(&spec, "origins:\n  api\n    action: [unclosed\n")
+            .expect_err("a malformed document must fail");
+        assert!(matches!(error, ConfigSourceError::Invalid(_)), "{error:?}");
+        assert_eq!(error.metric_label(), "invalid");
     }
 
     #[test]
@@ -2081,6 +2683,7 @@ mod tests {
             path: "sb.yml".into(),
             credential: Some("env:SB_GIT_TOKEN".into()),
             verify_signature: false,
+            confine: false,
             timeout_secs: 60,
             refresh_interval_secs: 60,
         };
@@ -2102,6 +2705,7 @@ mod tests {
             path: "sb.yml".into(),
             credential: Some("env:SB_GIT_TOKEN".into()),
             verify_signature: false,
+            confine: false,
             timeout_secs: 60,
             refresh_interval_secs: 60,
         };
