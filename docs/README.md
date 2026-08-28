@@ -160,6 +160,7 @@ Point a framework you already run at the gateway: chat completions through the O
 - [exposed-credentials.md](exposed-credentials.md) - the `exposed_credentials` policy: detect known-leaked basic-auth passwords and tag or block.
 - [agent-budget.md](agent-budget.md) - `agent_budget` policy: semantic rate-limit primitive keyed on resolved agent identity.
 - [content-digest.md](content-digest.md) - `content_digest` policy: RFC 9530 request-body verification for integrity-critical inboxes.
+- [anomaly-detection.md](anomaly-detection.md) - the rolling per-agent-class histogram that flags long-tail TLS fingerprints, headless libraries, and per-address rate spikes, and the reputation score it feeds.
 - [headless-detection.md](headless-detection.md) - header-only headless / stealth-browser indicator heuristics surfaced under `request.agent.headless_*`.
 - [feature-flags.md](feature-flags.md) - the sticky-bucketing flag store plus the `flag_enabled(name, key)` CEL helper.
 
@@ -225,7 +226,7 @@ Point a framework you already run at the gateway: chat completions through the O
 - [config-authority-drills.md](config-authority-drills.md) - two-process certification drills for signed config distribution.
 - [listings.md](listings.md) - the repo-native `Listing` primitive: schema, loader, three pinning modes, plan-validation rules.
 - [bulk-redirects.md](bulk-redirects.md) - the `redirect` action's source-to-destination row list, compiled at load time into an O(1) path lookup.
-- [cache-reserve.md](cache-reserve.md) - long-tail cold tier under the response cache: backends (memory, filesystem, Redis) and admission sampling.
+- [cache-reserve.md](cache-reserve.md) - long-tail cold tier under the response cache: backends (memory, filesystem, Redis, object storage) and admission sampling.
 - [glossary.md](glossary.md) - vocabulary used in this documentation set.
 - [headers-reference.md](headers-reference.md) - every response header the proxy can emit, with the config that triggers it.
 - [model-pinning.md](model-pinning.md) - how SHA-256 hashes get computed and pinned for the classifier known-model registry.

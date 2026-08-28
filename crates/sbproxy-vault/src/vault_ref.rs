@@ -445,6 +445,33 @@ pub fn looks_like_vault_uri(s: &str) -> bool {
     looks_like_secret_reference_uri(s)
 }
 
+/// The variable name inside a whole-value `${VAR}` reference the config
+/// layer left unexpanded, or `None` for anything else.
+///
+/// `interpolate_env_vars` rewrites the raw YAML before any consumer
+/// sees it, and it leaves an unset reference as the literal text. So a
+/// placeholder still standing here does not mean "resolve me later": it
+/// means the variable was not set and no `:-` default was written.
+///
+/// Every caller that turns a config string into key material or into an
+/// outbound credential has to refuse that value rather than use it.
+/// `${SBPROXY_RESERVE_KEY}` is 22 bytes of ASCII, which clears the
+/// 16-byte at-rest key-material floor, so a forgotten variable in a pod
+/// spec seals a whole cold cache tier under a string published in this
+/// repository.
+///
+/// An embedded placeholder inside a larger string returns `None`: that
+/// is a different failure with a different message, and the resolver
+/// already warns about it.
+pub fn unexpanded_env_placeholder(value: &str) -> Option<&str> {
+    let inner = value.strip_prefix("${")?.strip_suffix('}')?;
+    if inner.contains('{') || inner.contains('}') {
+        return None;
+    }
+    let name = inner.split_once(":-").map_or(inner, |(name, _)| name);
+    is_env_var_name(name).then_some(name)
+}
+
 pub(crate) fn warn_legacy_vault_reference_once(legacy: &str, replacement: &str) {
     static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     let key = format!("{legacy}\0{replacement}");
@@ -841,6 +868,35 @@ providers:
         ));
         assert!(!looks_like_secret_reference_uri("secret:openai"));
         assert!(!looks_like_secret_reference_uri("plain-string"));
+    }
+
+    /// WOR-2673 review F1. A whole-value placeholder the config layer
+    /// left standing is an unset variable, not a reference to resolve
+    /// later, and every key-material caller has to be able to see it.
+    #[test]
+    fn an_unexpanded_whole_value_placeholder_is_recognized() {
+        assert_eq!(
+            unexpanded_env_placeholder("${SBPROXY_RESERVE_KEY}"),
+            Some("SBPROXY_RESERVE_KEY")
+        );
+        assert_eq!(
+            unexpanded_env_placeholder("${SB_KEY:-fallback}"),
+            Some("SB_KEY")
+        );
+        // Not whole-value: the resolver already warns about these, and
+        // the failure an operator has to fix is a different one.
+        assert_eq!(unexpanded_env_placeholder("prefix-${SB_KEY}"), None);
+        assert_eq!(unexpanded_env_placeholder("${SB_KEY}-suffix"), None);
+        assert_eq!(unexpanded_env_placeholder("${A}${B}"), None);
+        // Not a placeholder at all.
+        assert_eq!(unexpanded_env_placeholder("file:/etc/sbproxy/key"), None);
+        assert_eq!(unexpanded_env_placeholder("vault://primary/key"), None);
+        assert_eq!(unexpanded_env_placeholder("${}"), None);
+        assert_eq!(unexpanded_env_placeholder("${9LEADING_DIGIT}"), None);
+        assert_eq!(
+            unexpanded_env_placeholder("bXktcmVhbC1rZXktbWF0ZXJpYWw="),
+            None
+        );
     }
 
     /// The compatibility name now uses the general reference detector.

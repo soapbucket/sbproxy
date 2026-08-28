@@ -107,3 +107,37 @@ fn example_restricts_methods_to_allowed_set() {
     assert!(path.get("put").is_none());
     assert!(path.get("delete").is_none());
 }
+
+/// WOR-2675: the example's second host carries an `authentication:`
+/// block, so its emitted document has to carry the scheme a caller has
+/// to satisfy, and none of the credential material behind it.
+///
+/// Named for the seam rather than for the shape: this is the emitted
+/// document, built from the shipped example, which is the thing an
+/// operator reads.
+#[test]
+fn example_publishes_the_auth_scheme_without_the_credential() {
+    let cfg = load_example();
+    if cfg.origins.is_empty() {
+        eprintln!("skipping: example file not present");
+        return;
+    }
+    let spec = sbproxy_openapi::build(&cfg, Some("secure.localhost"));
+    let schemes = spec["components"]["securitySchemes"]
+        .as_object()
+        .expect("securitySchemes object");
+    let scheme = schemes
+        .values()
+        .next()
+        .expect("the authenticated host publishes a scheme");
+    assert_eq!(scheme["type"], "apiKey");
+    assert_eq!(scheme["in"], "header");
+    assert_eq!(scheme["name"], "X-Acme-Key");
+    assert_eq!(scheme["x-sbproxy-auth-type"], "api_key");
+
+    let rendered = serde_json::to_string(&spec).expect("spec serializes");
+    assert!(
+        !rendered.contains("demo-key-1"),
+        "the configured key reached an unauthenticated document"
+    );
+}

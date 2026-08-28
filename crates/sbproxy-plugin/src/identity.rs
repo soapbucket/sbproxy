@@ -128,6 +128,14 @@ pub trait IdentityHeaderLookup: Send + Sync {
 /// the pipeline's request-context type. New hooks add fields by
 /// extending this struct, not by widening trait signatures.
 pub struct RequestContextView<'a> {
+    /// Tenant the request resolved to, or `__default__` on a
+    /// deployment with no tenancy configured.
+    ///
+    /// Carried because anything a hook keys state on has to mix the
+    /// tenant in by the host. The anomaly detector's histogram is the
+    /// first such state: without this, one tenant's traffic decided
+    /// what another tenant's reputation score said.
+    pub tenant_id: &'a str,
     /// Hostname of the request.
     pub hostname: &'a str,
     /// HTTP method as `&str` (`"GET"`, `"POST"`, ...).
@@ -573,6 +581,7 @@ mod tests {
         register_anomaly_hook(hook);
 
         let view = RequestContextView {
+            tenant_id: "__default__",
             hostname: "h.example.com",
             method: "GET",
             path: "/",

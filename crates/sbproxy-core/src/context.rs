@@ -1177,10 +1177,14 @@ pub struct RequestContext {
     // `None` means the KYA hook never ran (no enterprise binary, or
     // the operator has not configured KYA in `sb.yml`).
     /// KYA verdict label as exposed to CEL / Lua / JS / WASM under
-    /// `request.kya.verdict`. One of:
-    /// `"verified"`, `"missing"`, `"expired"`, `"revoked"`,
-    /// `"invalid"`, `"directory_unavailable"`. `None` when no KYA
-    /// hook ran.
+    /// `request.kya.verdict`.
+    ///
+    /// Two values reach a policy, and only two, because only two
+    /// continue into the policy chain: `"verified"`, and
+    /// `"directory_unavailable"` when `fail_open: true` admitted the
+    /// request anyway. Every other verdict the built-in provider can
+    /// return refuses, so no policy runs to read it. `None` when no
+    /// KYA hook ran.
     #[cfg(feature = "agent-class")]
     pub kya_verdict: Option<&'static str>,
     /// KYA agent vendor (e.g. `"skyfire"`) exposed under
@@ -1193,11 +1197,38 @@ pub struct RequestContext {
     /// produce a verified token.
     #[cfg(feature = "agent-class")]
     pub kya_version: Option<String>,
-    /// KYAB advisory balance amount (smallest unit) exposed under
+    /// KYAB advisory balance amount (smallest unit of
+    /// [`Self::kya_kyab_currency`]) exposed under
     /// `request.kya.kyab_balance.amount`. `None` when the verified
     /// token did not carry a balance, or when no KYA hook ran.
     #[cfg(feature = "agent-class")]
     pub kya_kyab_balance: Option<u64>,
+    /// WOR-2667: the currency the balance is denominated in, exposed
+    /// under `request.kya.kyab_balance.currency`.
+    ///
+    /// The provider's own `min_kyab_balance` floor is denominated by
+    /// `min_kyab_currency`, because 5000 JPY and 5000 COP are about
+    /// thirty-two dollars and about a dollar twenty. A policy writing
+    /// its own comparison needs the same thing to compare against, and
+    /// without this it had the amount and nothing else.
+    #[cfg(feature = "agent-class")]
+    pub kya_kyab_currency: Option<String>,
+    /// WOR-2667: the agent identifier the *verified token* carried,
+    /// exposed under `request.kya.agent_id`.
+    ///
+    /// Deliberately separate from [`Self::agent_id`], which the
+    /// agent-class resolver fills from the User-Agent and the operator
+    /// catalog. Those are different claims with different strengths: a
+    /// policy that pins `request.kya.agent_id` is pinning an
+    /// issuer-signed identity, and serving it the resolver's guess
+    /// would let any caller sending the right User-Agent clear the pin.
+    #[cfg(feature = "agent-class")]
+    pub kya_agent_id: Option<String>,
+    /// WOR-2667: the agent class the verified token claimed, exposed
+    /// under `request.kya.agent_class`. Also from the token, not from
+    /// the resolver.
+    #[cfg(feature = "agent-class")]
+    pub kya_agent_class: Option<String>,
 
     // --- aipref signal (Wave 4 / G4.9) ---
     //
@@ -2033,6 +2064,12 @@ impl RequestContext {
             kya_version: None,
             #[cfg(feature = "agent-class")]
             kya_kyab_balance: None,
+            #[cfg(feature = "agent-class")]
+            kya_kyab_currency: None,
+            #[cfg(feature = "agent-class")]
+            kya_agent_id: None,
+            #[cfg(feature = "agent-class")]
+            kya_agent_class: None,
             aipref: None,
             canonical_url: None,
             metrics: RequestMetrics::default(),

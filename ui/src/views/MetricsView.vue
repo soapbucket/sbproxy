@@ -6,6 +6,7 @@ import {
   parsePrometheus,
   findFamily,
   groupByLabel,
+  groupByLabels,
   sumSamples,
   histogramAvgByLabel,
   histogramQuantileByLabels,
@@ -134,6 +135,28 @@ const cacheFamily = computed(() =>
 const authFamily = computed(() =>
   findFamily(families.value, "sbproxy_auth_results_total"),
 );
+/* The three providers that reach a service to decide (WOR-2667). None
+ * of the three families carries an origin label, on purpose: they answer
+ * "what did the callout conclude" rather than "for whom", and the
+ * per-origin split already lives on sbproxy_auth_results_total. */
+const extAuthzFamily = computed(() =>
+  findFamily(families.value, "sbproxy_ext_authz_decisions_total"),
+);
+const introspectionFamily = computed(() =>
+  findFamily(families.value, "sbproxy_oauth_introspection_results_total"),
+);
+const kyaFamily = computed(() =>
+  findFamily(families.value, "sbproxy_kya_verdicts_total"),
+);
+/* WOR-2666: what the anomaly detector flagged, and what each agent
+ * class scores as a result. Nothing on the request path reads the
+ * score, so this card and the Grafana panel are what it is for. */
+const anomalyFamily = computed(() =>
+  findFamily(families.value, "sbproxy_anomaly_detected_total"),
+);
+const reputationFamily = computed(() =>
+  findFamily(families.value, "sbproxy_agent_reputation_score"),
+);
 
 const tokenFamily = computed(() =>
   findFamily(
@@ -260,6 +283,79 @@ const authResults = computed(() => {
           : undefined,
     }));
 });
+/* One card for the three callout providers. Renders nothing until an
+ * origin configures one, and colors the outcomes that mean a request
+ * was refused, or admitted without a decision, as failures. `fail_open`
+ * is red rather than green for that reason: the request went through,
+ * but nothing authorized it. */
+/* The outcomes that mean the caller got in. Everything else on these
+ * three families is a refusal, a fail-open, or an outage. */
+const SUCCESS_OUTCOMES = new Set([
+  "ext_authz allow",
+  "introspection active",
+  "introspection cached",
+  "kya verified",
+]);
+
+const authCallouts = computed(() => {
+  const rows: { key: string; value: number; color?: string }[] = [];
+  const push = (
+    prefix: string,
+    family: MetricFamily | undefined,
+    label: string,
+  ) => {
+    for (const row of groupByLabel(family, label)) {
+      const key = `${prefix} ${row.key}`;
+      rows.push({
+        key,
+        value: row.value,
+        /* An explicit success set, not a substring match: `/active/`
+         * also matches `inactive`, so a rejected token rendered
+         * green. The set is keyed on the prefixed row, because
+         * `active` means one thing under `introspection` and nothing
+         * under the other two families. */
+        color: SUCCESS_OUTCOMES.has(key) ? "var(--sb-ok)" : "var(--sb-err)",
+      });
+    }
+  };
+  push("ext_authz", extAuthzFamily.value, "outcome");
+  push("introspection", introspectionFamily.value, "result");
+  push("kya", kyaFamily.value, "verdict");
+  return rows;
+});
+
+/* Verdicts by kind and severity, then the score each class currently
+ * carries. Severity colors the row: an `info` verdict is a note, a
+ * `critical` one is a page. */
+const anomalies = computed(() => {
+  const rows: { key: string; value: number; color?: string }[] = [];
+  for (const row of groupByLabels(anomalyFamily.value, ["kind", "severity"])) {
+    rows.push({
+      key: row.key,
+      value: row.value,
+      color: /critical/.test(row.key)
+        ? "var(--sb-err)"
+        : /warn/.test(row.key)
+          ? "var(--sb-warn)"
+          : undefined,
+    });
+  }
+  /* Both labels, not just the class. The score is keyed by tenant, so
+   * grouping on the class alone would add two tenants' gauges together
+   * and render a number that is not a score. */
+  for (const row of groupByLabels(reputationFamily.value, [
+    "tenant_id",
+    "agent_class",
+  ])) {
+    rows.push({
+      key: `reputation / ${row.key}`,
+      value: Math.round(row.value * 100) / 100,
+      color: row.value < 0.5 ? "var(--sb-err)" : "var(--sb-ok)",
+    });
+  }
+  return rows;
+});
+
 const bytesByDirection = computed(() => {
   const f = scopeByOrigin(bytesFamily.value);
   return f ? groupByLabel(f, "direction").slice(0, 4) : [];
@@ -345,12 +441,29 @@ const cacheReserve = computed(() => {
     ["writes", "sbproxy_cache_reserve_writes_total"],
     ["evictions", "sbproxy_cache_reserve_evictions_total"],
   ] as const;
-  return items
+  const rows: { key: string; value: number; color?: string }[] = items
     .map(([key, name]) => {
       const f = findFamily(families.value, name);
-      return { key, value: f ? sumSamples(f) : 0 };
+      return { key: key as string, value: f ? sumSamples(f) : 0 };
     })
     .filter((item) => item.value > 0);
+  /* WOR-2673: reserve errors are swallowed on the request path by
+   * design, so the request is served either way and this card is where
+   * a failing cold tier becomes visible at all. Broken out by
+   * operation, because a failing `put` against a healthy `get` is
+   * usually expired write credentials rather than an unreachable
+   * store. */
+  for (const row of groupByLabel(
+    findFamily(families.value, "sbproxy_cache_reserve_errors_total"),
+    "operation",
+  )) {
+    rows.push({
+      key: `errors / ${row.key}`,
+      value: row.value,
+      color: "var(--sb-err)",
+    });
+  }
+  return rows;
 });
 
 // Token throughput (avg tok/s) per model, the standard local-model
@@ -573,6 +686,8 @@ const hasAnyPanel = computed(
     errorsByType.value.length ||
     cacheResults.value.length ||
     authResults.value.length ||
+    authCallouts.value.length ||
+    anomalies.value.length ||
     bytesByDirection.value.length ||
     tokensByDirection.value.length ||
     tokensByProvider.value.length ||
@@ -789,6 +904,20 @@ function formatPct(v: number): string {
         <div class="sb-card" v-if="authResults.length">
           <h3>Auth results</h3>
           <MiniBars :items="authResults" />
+        </div>
+        <div class="sb-card" v-if="anomalies.length">
+          <h3>
+            Anomalies
+            <span v-if="selectedOrigin" class="sb-eyebrow">all origins</span>
+          </h3>
+          <MiniBars :items="anomalies" />
+        </div>
+        <div class="sb-card" v-if="authCallouts.length">
+          <h3>
+            Auth callouts
+            <span v-if="selectedOrigin" class="sb-eyebrow">all origins</span>
+          </h3>
+          <MiniBars :items="authCallouts" />
         </div>
         <div class="sb-card" v-if="bytesByDirection.length">
           <h3>Bytes by direction</h3>

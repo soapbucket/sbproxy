@@ -133,6 +133,12 @@ const INJECTS: &[&str] = &[
     "crates/sbproxy-extension/src/mcp/federation.rs",
     // The Web Bot Auth signature-agent directory fetch.
     "crates/sbproxy-modules/src/auth/bot_auth_directory.rs",
+    // The `ext_authz` authorization callout (WOR-2667).
+    "crates/sbproxy-modules/src/auth/ext_authz.rs",
+    // The KYA issuer's JWKS and denylist fetches (WOR-2667).
+    "crates/sbproxy-modules/src/auth/kya.rs",
+    // The RFC 7662 introspection call (WOR-2667).
+    "crates/sbproxy-modules/src/auth/oauth_introspection.rs",
     // The OAuth token exchange and client-credentials grant.
     "crates/sbproxy-modules/src/auth/outbound_credential.rs",
     // The AI-crawl ledger redeem call.

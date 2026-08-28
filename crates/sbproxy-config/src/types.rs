@@ -1963,13 +1963,25 @@ pub struct ProxyServerConfig {
     /// `l2_cache_settings` (alias).
     #[serde(default, rename = "l2_cache_settings", alias = "l2_cache")]
     pub l2_cache: Option<L2CacheConfig>,
+    /// WOR-2666: optional behavioral anomaly detection.
+    ///
+    /// When `enabled`, the proxy keeps a rolling per-agent-class
+    /// histogram of the categorical signals it already collects (TLS
+    /// fingerprint, ML classification, headless-library detection) plus
+    /// a per-IP request rate, and flags observations that sit in the
+    /// long tail. Absent or disabled, no histogram is built and the
+    /// detector hook is not installed.
+    #[serde(default)]
+    pub anomaly: Option<AnomalyConfig>,
     /// Optional Cache Reserve (long-tail cold tier) configuration.
     ///
     /// When `enabled`, response-cache entries that pass the admission
-    /// filter are mirrored to the configured backend (memory,
-    /// filesystem, or Redis). On a hot miss the proxy consults the
-    /// reserve before falling through to origin and promotes the
-    /// entry back into the hot tier on hit.
+    /// filter are mirrored to the configured backend: memory,
+    /// filesystem, Redis, or object storage (S3, Google Cloud Storage,
+    /// Azure Blob, or a local directory, with optional at-rest
+    /// sealing). On a hot miss the proxy consults the reserve before
+    /// falling through to origin and promotes the entry back into the
+    /// hot tier on hit.
     #[serde(default)]
     pub cache_reserve: Option<CacheReserveConfig>,
     /// Optional selection of the shared response-cache backing store.
@@ -2773,6 +2785,7 @@ impl Default for ProxyServerConfig {
             secrets: None,
             key_management: None,
             l2_cache: None,
+            anomaly: None,
             cache_reserve: None,
             response_cache_store: None,
             compression_state: None,
@@ -6188,6 +6201,137 @@ impl std::fmt::Debug for L2CacheParams {
     }
 }
 
+// --- Anomaly detection config (WOR-2666) ---
+
+/// Behavioral anomaly detection over the signals the proxy already
+/// collects.
+///
+/// The detector is comparative, not a rule set: it learns what a given
+/// agent class normally looks like and flags what does not fit. That
+/// makes it useful exactly where a signature list is not, and it also
+/// means it says nothing at all until it has a baseline, which
+/// [`Self::min_observations`] is the floor for.
+///
+/// # What it cannot survive
+///
+/// The histogram is in memory and has no persistence option. A restart
+/// empties the window, and the detector is silent again until it has
+/// re-learned a baseline. That is a deliberate consequence of the rule
+/// that nothing here may require an external store: the alternative is
+/// a database the proxy cannot start without. Operators running short
+/// deployments, or restarting often, should expect the detector to
+/// spend a meaningful fraction of its life below
+/// `min_observations` and read `sbproxy_anomaly_detected_total`
+/// accordingly.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AnomalyConfig {
+    /// Master switch. When `false`, no histogram is built and no
+    /// detector hook is installed.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Observations a dimension needs before the detector will call
+    /// anything an outlier.
+    ///
+    /// Below this the histogram cannot tell "rare" from "first time
+    /// ever", and a detector that flags every first sighting is a
+    /// detector nobody reads.
+    #[serde(default = "default_anomaly_min_observations")]
+    pub min_observations: u64,
+
+    /// Relative frequency below which an observed value is an outlier.
+    /// Defaults to `0.01`: a fingerprint has to have been under 1% of
+    /// the window's traffic for its class before it is flagged.
+    #[serde(default = "default_anomaly_outlier_frequency")]
+    pub outlier_frequency: f64,
+
+    /// Multiple of the per-IP mean at which today's request count for
+    /// one IP is a rate spike. Defaults to `10.0`.
+    #[serde(default = "default_anomaly_rate_spike_multiplier")]
+    pub rate_spike_multiplier: f64,
+
+    /// Mean per-IP rate below which the rate-spike check does not
+    /// engage, so a single burst against an idle class is not a spike.
+    #[serde(default = "default_anomaly_rate_spike_min_mean")]
+    pub rate_spike_min_mean: f64,
+
+    /// What admission does with the reputation score. Both thresholds
+    /// are unset by default, which leaves the score advisory.
+    #[serde(default)]
+    pub reputation: AnomalyReputationConfig,
+}
+
+/// Admission thresholds on the reputation score (WOR-2666).
+///
+/// The score is published whether or not anything acts on it, and
+/// nothing acts on it until an operator names a number. That split is
+/// deliberate and it is the same one Cloudflare's threat score has: the
+/// gateway computes it always, and a rule decides what it means. An
+/// operator watches the gauge for a while, sees what their own traffic
+/// scores, and only then writes a floor.
+///
+/// # Read this before setting one
+///
+/// The score is keyed on the agent class the resolver produced, and
+/// that class is a *claim* unless the resolver source was a verified
+/// one (`bot_auth`, `kya`, `rdns`, `tls_fingerprint`). Anyone can send
+/// GPTBot's `User-Agent`, be resolved into the `gptbot` class, and
+/// misbehave there, which moves the score the real GPTBot is then
+/// admitted against. The decision record carries the resolver source
+/// for exactly this reason, so a rule written after the fact can tell
+/// the two apart.
+///
+/// The class `unknown` is a single shared bucket for everything the
+/// resolver did not recognize. A floor that catches `unknown` catches
+/// most of the unclassified web with it.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AnomalyReputationConfig {
+    /// Score below which admission refuses the request with a `403`.
+    ///
+    /// Unset by default. `0.0` to `1.0`, where 1.0 is a class that has
+    /// produced no anomalies in the window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny_below: Option<f64>,
+
+    /// Score below which admission answers `429` instead of proxying.
+    ///
+    /// Unset by default. Set above `deny_below` to get a two-step
+    /// posture; `deny_below` wins when a score is under both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub challenge_below: Option<f64>,
+}
+
+impl Default for AnomalyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_observations: default_anomaly_min_observations(),
+            outlier_frequency: default_anomaly_outlier_frequency(),
+            rate_spike_multiplier: default_anomaly_rate_spike_multiplier(),
+            rate_spike_min_mean: default_anomaly_rate_spike_min_mean(),
+            reputation: AnomalyReputationConfig::default(),
+        }
+    }
+}
+
+fn default_anomaly_min_observations() -> u64 {
+    50
+}
+
+fn default_anomaly_outlier_frequency() -> f64 {
+    0.01
+}
+
+fn default_anomaly_rate_spike_multiplier() -> f64 {
+    10.0
+}
+
+fn default_anomaly_rate_spike_min_mean() -> f64 {
+    5.0
+}
+
 // --- Cache Reserve Config ---
 
 /// Top-level Cache Reserve configuration.
@@ -6270,13 +6414,102 @@ pub enum CacheReserveBackendConfig {
         #[serde(default)]
         key_prefix: Option<String>,
     },
-    /// Catch-all for backends registered out-of-tree (e.g. an
-    /// `s3` backend). The in-tree pipeline ignores these with a
-    /// warning; an out-of-tree startup hook intercepts the variant
-    /// before the warning fires.
+    /// WOR-2673: object storage. One variant covers S3, Google Cloud
+    /// Storage, Azure Blob Storage, and a local directory, because they
+    /// all reach the proxy through the same `object_store` trait. The
+    /// field names are the `storage` action's, so an operator who has
+    /// configured that already knows this.
+    ObjectStore {
+        /// `s3`, `gcs`, `azure`, or `local`.
+        #[serde(default = "default_reserve_object_backend")]
+        backend: String,
+        /// Bucket name, or the container name on Azure. Required for
+        /// every backend but `local`.
+        #[serde(default)]
+        bucket: Option<String>,
+        /// Root directory for the `local` backend. Required there and
+        /// refused elsewhere.
+        #[serde(default)]
+        path: Option<String>,
+        /// Region, for `s3`. Falls back to the provider's own
+        /// environment discovery (`AWS_REGION`) when omitted.
+        #[serde(default)]
+        region: Option<String>,
+        /// Endpoint override, for `s3`. Set this for MinIO, Cloudflare
+        /// R2, Backblaze B2, or any other S3-compatible store.
+        #[serde(default)]
+        endpoint: Option<String>,
+        /// Key prefix inside the bucket. Defaults to
+        /// `sbproxy/reserve/`, so the reserve can share a bucket
+        /// without colliding with anything else in it.
+        #[serde(default)]
+        prefix: Option<String>,
+        /// Optional at-rest sealing, applied before an entry leaves the
+        /// process. Absent or `enabled: false` writes payloads as the
+        /// cache produced them.
+        #[serde(default)]
+        encryption: Option<CacheReserveEncryptionConfig>,
+    },
+    /// Catch-all for backends registered out-of-tree. The in-tree
+    /// pipeline ignores these with a warning; an out-of-tree startup
+    /// hook intercepts the variant before the warning fires.
     #[serde(other)]
     Other,
 }
+
+/// At-rest sealing for the object-storage cache reserve (WOR-2673).
+///
+/// The same reference syntax, the same rotation shape, and the same
+/// no-plaintext-fallback rule as
+/// [`ResponseCacheEncryptionConfig`]: a key that is missing,
+/// unresolvable, or shorter than 16 bytes aborts startup rather than
+/// being used verbatim or silently skipped.
+///
+/// Derived under its own HKDF purpose, so pointing this and the response
+/// cache at one operator secret still yields two unrelated keys.
+///
+/// This is deliberately not a cloud KMS integration. A KMS call to
+/// unwrap a data key would put a network round trip on the read path of
+/// a tier whose purpose is to be cheaper than the origin, and would make
+/// a reachable KMS a hard requirement for reading the cache at all.
+/// Bucket-level SSE-KMS is configured on the bucket and composes with
+/// this setting rather than competing with it.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CacheReserveEncryptionConfig {
+    /// Master switch. Defaults to `false`.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Secret reference for the active key, used to seal new entries and
+    /// to open entries sealed under it. Required when `enabled` is
+    /// `true`.
+    ///
+    /// Resolved like every other config secret: a provider URI
+    /// (`secret://backend/name`, `vault://...`), a `file:/path`
+    /// reference, or a whole-value `${ENV_VAR}`. The resolved value
+    /// should be 32 random bytes (base64 or hex encoded), not a
+    /// passphrase.
+    #[serde(default)]
+    pub key: Option<String>,
+
+    /// Retired keys, used only to open entries sealed before a rotation.
+    /// Same reference syntax as [`Self::key`].
+    ///
+    /// To rotate: move the current `key` into this list and name the new
+    /// one as `key`. Entries reseal under the active key as they are
+    /// rewritten; entries whose key leaves this list stop opening and
+    /// are treated as misses.
+    #[serde(default)]
+    pub previous_keys: Vec<String>,
+}
+
+fn default_reserve_object_backend() -> String {
+    "s3".to_string()
+}
+
+/// Default key prefix for the object-storage reserve.
+pub const DEFAULT_RESERVE_OBJECT_PREFIX: &str = "sbproxy/reserve/";
 
 fn default_reserve_sample_rate() -> f64 {
     0.1

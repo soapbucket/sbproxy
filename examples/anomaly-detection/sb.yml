@@ -1,0 +1,136 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Behavioral anomaly detection over the signals the proxy already has.
+#
+# The detector keeps a rolling 28-day histogram per tenant and agent
+# class of the TLS fingerprint, the resolver source, the
+# headless-library detection, and the per-address request rate, and
+# flags what sits in the long tail. It is comparative, not a rule list:
+# it catches a crawler claiming to be GPTBot whose TLS fingerprint no
+# GPTBot has ever used, without anyone having written that fingerprint
+# down first.
+#
+# The cost of that is stated plainly: it says nothing until it has a
+# baseline. `min_observations` is the floor, and the window is in
+# memory, so a restart empties it and the detector is quiet again until
+# it has re-learned one. There is no persistence option, because the
+# alternative is a database the proxy cannot start without.
+#
+# # What this example can and cannot show you
+#
+# Three of the four arms need a TLS handshake or an agent-class
+# catalog, neither of which a plain-HTTP walkthrough has: `ja4_outlier`
+# and `headless_library` both read a JA4 fingerprint, and
+# `ml_inconsistency` reads the resolver source, which is `None` until a
+# catalog resolves the caller. So this example drives the fourth arm,
+# `request_rate_spike`, which needs neither, and it drives it with two
+# distinct client addresses rather than one: with a single address the
+# per-address mean *is* that address's rate and the spike condition can
+# never be met. `trusted_proxies` below is what lets `X-Forwarded-For`
+# stand in for two callers.
+#
+# It also uses a real upstream. The detector is dispatched from the
+# response phase, so a `static` or `mock` origin, which writes its
+# response in the request phase, is never judged at all.
+#
+# Run:
+#   python3 examples/cache-reserve/fixture.py &
+#   make run CONFIG=examples/anomaly-detection/sb.yml
+#
+# Test:
+#   # 1. Five requests from one address. Nothing is flagged: this is
+#   #    the baseline the spike will be measured against, and it stays
+#   #    under `rate_spike_min_mean` on purpose.
+#   for i in $(seq 1 5); do
+#     curl -s -o /dev/null -H 'Host: anomaly.local' \
+#       -H 'X-Forwarded-For: 198.51.100.7' http://127.0.0.1:8080/a
+#   done
+#
+#   # 2. Eight from a second address. The eighth is the one that fires:
+#   #    at that point the class has seen 5 from one address and 7 from
+#   #    the other, a mean of 6.0, and an eighth from the second is past
+#   #    it. `warn`, because it is nowhere near five times the mean.
+#   for i in $(seq 1 8); do
+#     curl -s -o /dev/null -H 'Host: anomaly.local' \
+#       -H 'X-Forwarded-For: 203.0.113.9' http://127.0.0.1:8080/a
+#   done
+#
+#   # 3. Exactly these two lines should be there:
+#   #      sbproxy_anomaly_detected_total{kind="request_rate_spike",severity="warn"} 1
+#   #      sbproxy_agent_reputation_score{agent_class="unknown",tenant_id="__default__"} 0.99
+#   curl -s http://127.0.0.1:9090/metrics | \
+#     grep -E 'sbproxy_anomaly_detected_total|sbproxy_agent_reputation_score'
+#
+#   # 4. And the log line, which carries the count and the mean and
+#   #    never the address.
+#
+# Those numbers are pinned by
+# `anomaly::tests::the_shipped_example_walkthrough_produces_the_numbers_it_prints`,
+# so a change to the detector that moves them fails the build rather
+# than quietly making this file wrong.
+
+proxy:
+  http_bind_port: 8080
+  admin:
+    enabled: true
+    port: 9090
+
+  # Only so the walkthrough can present two client addresses from one
+  # machine. A real deployment lists the addresses of its own load
+  # balancers here and nothing else: whatever is in this list can
+  # rewrite the client address the detector counts.
+  trusted_proxies:
+    - "127.0.0.1/32"
+    - "::1/128"
+
+  anomaly:
+    enabled: true
+
+    # Observations a dimension needs before anything is called an
+    # outlier. Five is a demo number: below the default of 50 the
+    # histogram cannot tell "rare" from "first time ever", and a
+    # detector that flags every first sighting is one nobody reads.
+    # It does not gate the rate-spike arm, which has its own floor
+    # below.
+    min_observations: 5
+
+    # Share of the window below which a value is an outlier. The
+    # default of 0.01 means a fingerprint has to have been under 1% of
+    # its class's traffic before it is flagged.
+    outlier_frequency: 0.01
+
+    # One address past its class's per-address mean by this multiple
+    # today is a rate spike. Past five times this, it is critical.
+    # 1.0 is the floor and a demo number: ten is the default, and it is
+    # the one to leave in place for traffic that is not thirteen curls.
+    rate_spike_multiplier: 1.0
+
+    # Mean per-address rate below which the spike check does not
+    # engage, so a single burst against an idle class is not a spike.
+    #
+    # 6.0 is chosen so the walkthrough's first loop stays silent. The
+    # mean is read before the request is counted, so with a single
+    # address the count is always one past the mean and any floor the
+    # first loop can reach would fire on it. Five requests from one
+    # address take the mean to 4.0, which is under this.
+    rate_spike_min_mean: 6.0
+
+    # Reputation admission. Both unset by default, which leaves the
+    # score advisory: published, and acted on by nothing. Uncomment to
+    # turn the number into a decision, and read the "Read this before
+    # picking a number" section of docs/anomaly-detection.md first: the
+    # agent class is a claim unless the resolver source was a verified
+    # one, and `unknown` is a shared bucket holding most of the web.
+    # reputation:
+    #   challenge_below: 0.6
+    #   deny_below: 0.2
+
+origins:
+  "anomaly.local":
+    action:
+      type: proxy
+      # The example ships its own upstream:
+      #   python3 examples/cache-reserve/fixture.py
+      # A `static` or `mock` origin would not work here: those write
+      # their response in the request phase and never reach the
+      # response filter the detector runs from.
+      url: http://127.0.0.1:18090

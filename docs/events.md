@@ -2,7 +2,7 @@
 
 *Last modified: 2026-08-27*
 
-SBproxy hands a SIEM three different things, and this page is the map of how they fit together: typed proxy events (the `events:` block, a closed set of twenty-three), decision-audit records (`observability.log.decision_audit`, nineteen pipeline decisions normalized to OCSF), and four audit channels that write to their own tracing targets (`security_audit`, `config_audit`, `key_audit`, and the admin action ring). Two of those four, `security_audit` and `config_audit`, can additionally be hash-chained and Ed25519-signed for tamper evidence.
+SBproxy hands a SIEM three different things, and this page is the map of how they fit together: typed proxy events (the `events:` block, a closed set of twenty-three), decision-audit records (`observability.log.decision_audit`, twenty pipeline decisions normalized to OCSF), and four audit channels that write to their own tracing targets (`security_audit`, `config_audit`, `key_audit`, and the admin action ring). Two of those four, `security_audit` and `config_audit`, can additionally be hash-chained and Ed25519-signed for tamper evidence.
 
 If you only read one section, read [How the four audit channels relate to the event stream](#how-the-four-audit-channels-relate-to-the-event-stream). It is the piece that is easy to miss: `events:` is a delivery mechanism, not a source of truth, and most of what it delivers is a typed copy of a record another channel already produced.
 
@@ -83,20 +83,22 @@ Eight of the twenty wired events are worth being explicit about, because "wired"
 - **`ai_evaluation_operation`** records one terminal bounded evaluation run, not dataset registration. Its data is exactly `origin_id`, `dataset`, `dataset_version`, `experiment_id`, `outcome`, `cases`, and `duration_ms`. Dataset entries, model or judge response content, scores, judge endpoints, credentials, and secret references are excluded.
 - **`ai_prompt_rollout_selected`** records the concrete version selected by an admin dry-run or on a real AI request before provider dispatch. Its data is exactly `origin_id`, `prompt`, `version`, `outcome`, and `cohort_digest`. It never carries prompt content, request content, rollout salt, or the raw cohort key; the digest must be 64-character lowercase SHA-256 hex before the payload builder accepts it.
 
-## Decision-audit: the other nineteen
+## Decision-audit: the other twenty
 
 Most of the twenty-three typed proxy events map onto request lifecycle and infrastructure facts. The gateway's actual security decisions, "did the WAF block this," "did the AI guardrail block this," "did this MCP tool dispatch succeed," live on a separate, wider channel: `DecisionEvent`, configured under `proxy.observability.log.decision_audit` and documented in full in [observability.md](observability.md#decision-audit-records) and the generated [decision-records.md](decision-records.md).
 
 The short version, because this page is where the two channels need to be told apart:
 
-- **Nineteen named decision points.** `auth`, `policy`, `rate_limit`, `waf`, `cache.key`, `cache.admit`, `route.decide`, `ai.guardrail.input`, `ai.guardrail.output`, `ai.tool_call`, `ai.stream.event`, `ai.close`, `ai.failure`, `ai.admission`, `transform`, `action`, `log.custom_field`, `mcp.tool`, `payment.lifecycle`.
+- **Twenty named decision points.** `auth`, `policy`, `rate_limit`, `waf`, `cache.key`, `cache.admit`, `route.decide`, `ai.guardrail.input`, `ai.guardrail.output`, `ai.tool_call`, `ai.stream.event`, `ai.close`, `ai.failure`, `ai.admission`, `transform`, `action`, `log.custom_field`, `mcp.tool`, `payment.lifecycle`, `anomaly`.
 - **Six coverage states**, because "wired or not" turned out to be the wrong question for at least four of these:
-  - *Emitted*: publishes its own record. As of this sweep that is `auth`, `cache.key`, `cache.admit`, `route.decide`, `ai.guardrail.input`, `ai.guardrail.output`, `ai.tool_call`, `ai.close`, `ai.failure`, `ai.admission`, and `mcp.tool`.
+  - *Emitted*: publishes its own record. As of this sweep that is `auth`, `cache.key`, `cache.admit`, `route.decide`, `ai.guardrail.input`, `ai.guardrail.output`, `ai.tool_call`, `ai.close`, `ai.failure`, `ai.admission`, `mcp.tool`, and `anomaly`.
   - *SupersededByPolicy*: `waf` and `rate_limit` compile to policy modules, so their decisions already publish as `policy` records carrying a `policy_id`. A second emitter under their own label would double-record one decision.
   - *ConfigDependent*: `policy` always reaches the bus, but arrives as the legacy `policy_verdict_event` shape until `policy_record_format: decision` moves it onto this feed.
   - *DurableElsewhere*: `payment.lifecycle` is recorded by the settlement store, which is non-lossy by design. This queue drops records under load (a sound trade for a security decision, the wrong one for money), so publishing the same event here would offer a second, weaker answer beside an authoritative one.
   - *NeverPublishes*: `ai.stream.event` fires once per streamed chunk. Enabling it is refused at config load, not warned about, because there is no configuration under which it will ever emit.
   - *Unwired*: `transform`, `action`, and `log.custom_field` accept configuration and publish nothing, on purpose for now. Transforms rewrite response bodies with no deny/allow semantics to record. Most of what `action` would report already has its own event under a more specific label. `log.custom_field` is operator-authored telemetry that belongs in the access log it was configured into, not a second copy on this bus.
+
+`anomaly` carries two decisions on one label, because they are two halves of one mechanism: a behavioral verdict is what moves the reputation score, and the score is what an admission threshold reads. A detection record carries `anomaly_kind` and a severity, and its outcome is an allow, because a verdict is an observation and the request proceeds. An admission record carries `reputation_bucket` and an action, and its outcome is a deny. Both carry `identity_source`, and neither carries the raw score, the fingerprint, or the client address. See [anomaly-detection.md](anomaly-detection.md).
 
 `ai.close` and `ai.failure` are new to the *Emitted* set as of this sweep. `ai.failure` fires at the one funnel every provider-response failure classification already ran through, carrying `selected_provider` and a closed failure kind (`rate_limited`, `content_filter`, `upstream_5xx`, `provider_error`) under `unmapped`. `ai.close` fires once a streamed response finishes, carrying the terminal `finish_reason`, and is the intentional counterweight to `ai.stream.event`'s refusal: without it, the per-chunk feed that gets refused on volume grounds would have no summary anywhere in SIEM-land either.
 

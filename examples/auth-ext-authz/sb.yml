@@ -1,0 +1,63 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# External authorization: an authorization service you run decides.
+#
+# Every request is paused while the proxy POSTs a check document to
+# `url`. The service answers `{"allowed": true}` to admit it, or a
+# refusal it shapes itself:
+#
+#   {"allowed": false, "status": 402, "body": "quota exhausted",
+#    "headers": {"x-quota-reset": "3600"}}
+#
+# This is the JSON shape Envoy's ext_authz HTTP service filter speaks,
+# so a service written for Envoy answers this provider unchanged.
+#
+# `headers_to_forward` is an allowlist and it starts empty: nothing from
+# the request reaches the authorization service until you name it here.
+# Naming `authorization` is what lets the service read the caller's
+# credential; leave it out and the service sees only the method, the
+# path, and `x-tenant`.
+#
+# This example needs an authorization service listening at `url`; the
+# README has one in five lines of Python. Without it every request
+# answers 503, which is the fail-closed default doing its job.
+#
+# Run:
+#   make run CONFIG=examples/auth-ext-authz/sb.yml
+#
+# Test (with the stub service running; see README):
+#   # 200 - the service allowed the request
+#   curl -i -H 'Host: authz.local' -H 'X-Tenant: acme' \
+#        http://127.0.0.1:8080/get
+#
+#   # 402 - the service refused it, and picked the status and body
+#   curl -i -H 'Host: authz.local' -H 'X-Tenant: over-quota' \
+#        http://127.0.0.1:8080/get
+#
+#   # 503 - stop the service: the proxy refuses rather than failing open
+#   curl -i -H 'Host: authz.local' http://127.0.0.1:8080/get
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "authz.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    authentication:
+      type: ext_authz
+      url: http://127.0.0.1:9002/check
+      # 250ms is Envoy's own default for this callout. The service sits
+      # next to the proxy; one across the internet shows up as auth
+      # latency on every request to this origin.
+      timeout_ms: 250
+      # Leave this false in production unless you have decided, in
+      # writing, that serving unauthorized traffic beats refusing it
+      # while the authorization service is down. Every request a
+      # fail-open admits is counted on
+      # sbproxy_ext_authz_decisions_total{outcome="fail_open"}.
+      failure_mode_allow: false
+      headers_to_forward:
+        - authorization
+        - x-tenant

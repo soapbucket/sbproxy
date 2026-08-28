@@ -158,6 +158,10 @@ sbproxy-billing = { workspace = true, optional = true }
 # for serve: providers) as a process-global built at dispatch time.
 sbproxy-model-host.workspace = true
 sbproxy-cache.workspace = true
+# WOR-2673: builds the object-storage cache-reserve client from config.
+# Already in this crate's dependency graph through sbproxy-modules' storage
+# action, so naming it here adds no new external crate.
+object_store = { workspace = true }
 sbproxy-platform.workspace = true
 # Agent identity: the signed catalog subscriber and the owner-approval
 # queue. The admin listener owns the routes; that crate owns what they mean.
@@ -214,6 +218,10 @@ arc-swap.workspace = true
 # parking_lot: no-poison mutexes on the request-path budget/mesh
 # counters so a panic while held cannot cascade (WOR-1691).
 parking_lot.workspace = true
+# lru: the anomaly detector's per-day distinct-value sets are keyed on
+# client-controlled strings, so they need bounded memory and O(1)
+# eviction rather than a map that grows with whatever arrives.
+lru.workspace = true
 compact_str.workspace = true
 smallvec.workspace = true
 bytes.workspace = true
