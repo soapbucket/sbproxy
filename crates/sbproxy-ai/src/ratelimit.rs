@@ -707,6 +707,64 @@ mod tests {
         }
     }
 
+    /// Sample count on `sbproxy_ai_token_estimate_error_ratio` for one
+    /// model label. Read from the default registry rather than from a
+    /// handle, because the recorder's histogram is private to
+    /// `ai_metrics`; the model name is unique per test so the shared
+    /// process-wide registry cannot make this order-dependent.
+    fn estimate_error_samples(model: &str) -> u64 {
+        prometheus::gather()
+            .iter()
+            .filter(|family| family.name() == "sbproxy_ai_token_estimate_error_ratio")
+            .flat_map(|family| family.get_metric())
+            .find(|metric| {
+                metric
+                    .get_label()
+                    .iter()
+                    .any(|label| label.name() == "model" && label.value() == model)
+            })
+            .map(|metric| metric.get_histogram().sample_count())
+            .unwrap_or(0)
+    }
+
+    /// WOR-2622: reconciling from an estimate must not sample the
+    /// estimate-error histogram.
+    ///
+    /// `actual_tokens` on that path comes from the same request-path
+    /// estimator that produced `reserved_tokens`, so observing the pair
+    /// reports a near-zero error on exactly the traffic where nothing
+    /// was measured. That histogram is what operators tune TPM headroom
+    /// against, so a perfect score there is worse than no score.
+    #[test]
+    fn an_unmeasured_reconcile_does_not_sample_the_estimate_error_histogram() {
+        let limiter = ModelRateLimiter::new();
+        let c = cfg(None, Some(10_000), None, None, None);
+        let model = "wor2622-unmeasured-probe";
+        let before = estimate_error_samples(model);
+
+        let admission = limiter
+            .admit("k-unmeasured", model, &c, Some(100))
+            .expect("the first reservation is admitted");
+        admission.reconcile_unmeasured(80);
+        assert_eq!(
+            estimate_error_samples(model),
+            before,
+            "an estimate was compared against itself"
+        );
+
+        // The measured twin still samples, so the assertion above is
+        // about provenance rather than about the metric being dead.
+        let admission = limiter
+            .admit("k-unmeasured", model, &c, Some(100))
+            .expect("the second reservation is admitted");
+        admission.reconcile(80);
+        assert_eq!(
+            estimate_error_samples(model),
+            before + 1,
+            "a measured reconcile still has to sample"
+        );
+    }
+
     #[test]
     fn rpm_independently_triggers_rejection() {
         let limiter = ModelRateLimiter::new();

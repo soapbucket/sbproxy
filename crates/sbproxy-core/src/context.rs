@@ -1305,9 +1305,11 @@ pub struct RequestContext {
     /// * `absent` - a 2xx AI response whose usage could be neither read
     ///   nor estimated. The counts stay `None` and nothing is billed.
     ///
-    /// `None` on requests the AI gateway did not settle. This is the
-    /// per-request answer to "was this line measured or estimated?",
-    /// which no counter can give.
+    /// `None` whenever the two count fields beside it are `None`, which
+    /// includes an AI origin with no `budget:` block, since the buffered
+    /// relay stamps all three together. This is the per-request answer
+    /// to "was this line measured or estimated?", which no counter can
+    /// give.
     pub ai_usage_source: Option<&'static str>,
     /// WOR-1499: estimated prompt tokens computed on the request path
     /// from the inbound body (before any upstream usage is known). Used

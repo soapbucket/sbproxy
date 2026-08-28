@@ -367,21 +367,33 @@ no surface carries the URL.
 find the `webhook` row for your collector, and add that host (and its port, if
 it is not 80 or 443) to `egress.usage_sinks.hosts`.
 
-### A streamed AI response with no provider usage frame is now billed from an estimate
+### An AI response with no provider usage frame now moves your spend caps
 
-**Who this reaches.** Any origin with `action.type: ai_proxy` serving
-streaming requests, whatever `usage_parser` is set to, `none` included.
+**Who this reaches.** Any origin with `action.type: ai_proxy` and a
+`budget:` block, whatever `usage_parser` is set to, `none` included.
+Streaming and non-streaming requests both, for different halves of this:
+the estimate itself is new on streams, and pricing an estimate against
+`max_usd` is new on both.
 
-**What changed.** A stream whose provider sent no `usage` frame used to
-settle at zero: no cap moved, every reservation was refunded, and a
-caller could stream indefinitely against a `max_tokens` cap that never
-budged. It is now priced from this gateway's own tokenizer count of the
-assistant text the stream delivered, plus the request-path prompt
-estimate, and marked `estimated`.
+**What changed.** Two things, and they compound.
 
-**What that changes for you.** Token caps and `max_usd` caps on such
-origins start moving where they did not before, so a cap that never fired
-may now fire. The estimate is enforcement only: the payment bridge, the
+A stream whose provider sent no `usage` frame used to settle at zero: no
+cap moved, every reservation was refunded, and a caller could stream
+indefinitely against a `max_tokens` cap that never budged. It is now
+priced from this gateway's own tokenizer count of the assistant text the
+stream delivered, plus the request-path prompt estimate, and marked
+`estimated`.
+
+Separately, an estimated debit now carries a dollar figure priced from
+the model catalog, on the **buffered** relay as well as the streaming
+one. A usage-less non-streaming 2xx has debited the token caps from an
+estimate since WOR-1146, but it reported that spend as `PerCall`, which
+the catalog prices at zero, so `max_usd` saw nothing move. It does now.
+
+**What that changes for you.** Token caps on streaming origins and
+`max_usd` caps on every AI origin start moving where they did not before,
+so a cap that never fired may now fire. If your only cap is `max_usd` and
+your provider omits usage, this is the change to size against. The estimate is enforcement only: the payment bridge, the
 usage sinks, the verifiable ledger and the `AiBillingEvent` skip a
 request marked `estimated`, so nothing you invoice changes. The access
 log gains a `usage_source` field (`measured`, `estimated`, `absent`) and
@@ -391,6 +403,9 @@ label, which is how you see how much of an origin's traffic this is.
 `usage_parser: none` is the case worth naming twice: it still disables
 reading the provider's frame, but it no longer means the origin is billed
 nothing.
+
+The estimate is enforcement only on both relays. The billing event still
+reports what the provider reported, so nothing you invoice changes.
 
 **What to do.** Nothing, if your caps were sized against measured
 traffic. If an origin's caps were effectively unenforced because its

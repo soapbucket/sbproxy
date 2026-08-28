@@ -208,7 +208,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_boilerplate_stripped_bytes_total` | Counter | `stable` | `beta` | `hostname` | Bytes removed by the boilerplate transform, by hostname. |
 | `sbproxy_bot_auth_directory_fetch_failures_total` | Counter | `stable` | `beta` | `url` | Bot-auth hosted key-directory fetches that failed (the verifier serves stale or fails per nonce_policy). |
 | `sbproxy_bot_auth_nonce_replay_total` | Counter | `stable` | `beta` | `policy` | Web Bot Auth signatures rejected (or logged) because the nonce was already observed. |
-| `sbproxy_budget_share_fail_open_total` | Counter | `stable` | `beta` | `op` | Shared budget store operations that failed and fell open to per-instance enforcement, by operation. |
+| `sbproxy_budget_share_fail_open_total` | Counter | `stable` | `beta` | `op` | Shared budget store operations that failed and fell open to per-instance enforcement, by operation: `read`, `write`, or `mirror_dropped` (a streamed settlement handed its mirror write to a detached task that never ran, which a shutting-down runtime does). |
 | `sbproxy_budget_share_unavailable` | Gauge | `stable` | `beta` | none | 1 while shared budget enforcement is degraded to per-instance tracking, 0 when the shared store answered. |
 | `sbproxy_bytes_total` | Counter | `stable` | `stable` | `origin`, `direction` | Bytes transferred. |
 | `sbproxy_cache_reserve_evictions_total` | Counter | `stable` | `stable` | `origin` | Cache Reserve explicit deletions. |

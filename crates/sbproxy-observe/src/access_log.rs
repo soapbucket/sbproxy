@@ -200,7 +200,8 @@ pub struct AccessLogEntry {
     /// `measured` (the provider reported them), `estimated` (it did not,
     /// so the gateway counted the delivered text with the model's
     /// tokenizer) or `absent` (neither was possible, and nothing was
-    /// billed). Omitted on requests the AI gateway did not settle.
+    /// billed). Omitted whenever `tokens_in` and `tokens_out` are
+    /// themselves omitted.
     ///
     /// This is the per-request answer to whether an invoice line was
     /// measured or estimated. `sbproxy_ai_usage_parse_miss_total` gives

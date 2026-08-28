@@ -893,6 +893,17 @@ const STREAM_ESTIMATE_SAMPLE_MAX_BYTES: usize = 32 * 1024;
 /// from the estimate entirely. A megabyte is past any frame the
 /// documented providers emit, and one frame larger than this is skipped
 /// (with the rest of the stream still counted) rather than buffered.
+///
+/// What the raise costs, per concurrent stream, so the next reader does
+/// not have to multiply it: the splitter's `carry` can reach this bound
+/// plus one chunk before it gives up on a frame, against 16 KiB before,
+/// and a Bedrock frame adds a transient base64 decode of roughly three
+/// quarters of the frame plus the `serde_json::Value` it parses into,
+/// both freed before the next frame. What survives across frames is
+/// unchanged: [`STREAM_ESTIMATE_SAMPLE_MAX_BYTES`], 32 KiB. So the
+/// steady state per stream is still 32 KiB and the peak is set by the
+/// largest frame a provider actually sends; this constant is the
+/// refusal point, not an allocation.
 const STREAM_ESTIMATE_LINE_MAX_BYTES: usize = 1024 * 1024;
 
 /// WOR-2622: the assistant text a stream actually delivered, kept so the

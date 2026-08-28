@@ -2378,7 +2378,7 @@ pub fn record_budget_share_fail_open(op: &str) {
     let counter = C.get_or_init(|| {
         register_int_counter_vec!(
             "sbproxy_budget_share_fail_open_total",
-            "Shared budget store operations that failed and fell open to per-instance enforcement, by operation",
+            "Shared budget store operations that failed and fell open to per-instance enforcement, by operation (`read`, `write`, `mirror_dropped`)",
             &["op"],
         )
         .ok()

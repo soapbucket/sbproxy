@@ -1957,7 +1957,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["op"],
-        description: "Shared budget store operations that failed and fell open to per-instance enforcement, by operation.",
+        description: "Shared budget store operations that failed and fell open to per-instance enforcement, by operation: `read`, `write`, or `mirror_dropped` (a streamed settlement handed its mirror write to a detached task that never ran, which a shutting-down runtime does).",
         dead_reason: None,
     },
     MetricCapability {
