@@ -668,7 +668,6 @@ async fn a_bundle_assembling_a_host_reference_from_a_default_is_refused() {
     let (mut subscriber, stub) =
         applied_baseline(dir, "default-local.test", "default-authority.test").await;
     let identity_before = pipeline_identity();
-    let mut refused_before = fetch_total("confinement_refused");
 
     for payload in [
         // The secret reference, assembled in value position.
@@ -694,6 +693,7 @@ origins:
       "${SB_NOPE_2433:-path}": /etc
 "#,
     ] {
+        let refused_before = fetch_total("confinement_refused");
         stub.serve(
             sign(6, BundleMode::Overlay, payload)
                 .to_json()
@@ -704,7 +704,6 @@ origins:
             CycleResult::ConfinementRefused
         );
         assert_eq!(fetch_total("confinement_refused"), refused_before + 1);
-        refused_before += 1;
         assert_eq!(pipeline_identity(), identity_before, "no reload may happen");
         assert_eq!(subscriber.revision(), 5, "the cursor must not move");
     }
