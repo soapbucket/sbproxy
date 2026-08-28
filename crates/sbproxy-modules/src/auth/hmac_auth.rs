@@ -52,9 +52,11 @@
 //! bound. AWS SigV4 (`X-Amz-Date`, 5-15 minute windows)
 //! and Stripe webhook signatures (`t=` timestamp, 5 minute default
 //! tolerance) use the same defense; GitHub's `X-Hub-Signature-256`
-//! omits it and is the weaker shape. A single-use nonce ledger
-//! (`bot_auth`'s WOR-502 machinery) can be layered on later without a
-//! wire change because RFC 9421 already carries a `nonce` parameter.
+//! omits it and is the weaker shape. Set `nonce_store: memory` (or
+//! inject a [`crate::policy::quote_token::NonceStore`] via [`HmacAuth::with_nonce_store`]) to add
+//! exactly-once replay defense inside that window: RFC 9421 already
+//! carries a `nonce` parameter, and a wired store requires one and
+//! consumes it. Store errors fail closed.
 //!
 //! # Body binding
 //!
@@ -71,6 +73,14 @@
 //! [`crate::auth::bot_auth`] uses; the wiring that arms it is
 //! `sbproxy_core::server::request_phase::arm_deferred_body_digest_binding`.
 //!
+//! Covering `content-digest` is opt-in by default. Set
+//! `require_body_digest: true` (provider-wide, with a per-key
+//! override) to refuse a header-only signature on a request that
+//! carries a body. The auth phase detects a body from Content-Length
+//! or chunked Transfer-Encoding, matching Apache APISIX
+//! `hmac-auth`'s `validate_request_body`. Bodyless requests are not
+//! required to cover the digest.
+//!
 //! Comparing the covered digest against the empty body the auth phase
 //! can offer is not a conservative alternative to this. It inverts the
 //! check: an honest client sending the true digest of its body is
@@ -78,6 +88,9 @@
 //! sends a body anyway is admitted.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use sbproxy_middleware::signatures::{
     parse_signature_input, MessageSignatureConfig, MessageSignatureVerifier, SignatureAlgorithm,
@@ -86,6 +99,7 @@ use sbproxy_middleware::signatures::{
 use serde::Deserialize;
 
 use crate::auth::CredentialAttrs;
+use crate::policy::quote_token::{NonceCheck, NonceError, NonceStore};
 
 /// Default clock-skew / staleness window in seconds. Matches APISIX
 /// `hmac-auth`'s `clock_skew` default of 300, the ticket's stated
@@ -131,6 +145,10 @@ struct HmacKeyEntry {
     /// time (WOR-2301). The resolved material is decoded hex-first,
     /// then base64, then raw UTF-8 bytes.
     secret: String,
+    /// Per-key override for the provider-wide `require_body_digest`
+    /// flag. `None` inherits the provider-wide value.
+    #[serde(default)]
+    require_body_digest: Option<bool>,
     /// Operator-attached metadata copied onto the matched principal.
     #[serde(flatten, default)]
     attrs: CredentialAttrs,
@@ -158,6 +176,32 @@ struct HmacAuthConfig {
     /// default rather than allowing a signature bound to nothing.
     #[serde(default)]
     required_components: Vec<String>,
+    /// When true, a signature that omits `content-digest` on a request
+    /// that carries a body is refused. Bodyless requests (GET, or
+    /// Content-Length 0 with no Transfer-Encoding) are not required to
+    /// cover the digest. Matches Apache APISIX `hmac-auth`'s
+    /// `validate_request_body`, which runs only when a body is present
+    /// (<https://apisix.apache.org/docs/apisix/plugins/hmac-auth/>).
+    /// Default false keeps existing configs header-only. A per-key
+    /// `require_body_digest` on a key entry overrides this.
+    #[serde(default)]
+    require_body_digest: bool,
+    /// Optional in-process nonce ledger. `memory` consumes RFC 9421
+    /// `nonce` parameters for exactly-once replay defense inside
+    /// `clock_skew_seconds`. Omit it to keep timestamp-window-only
+    /// replay defense. Durable backends are injected with
+    /// [`HmacAuth::with_nonce_store`] (the same seam `bot_auth` uses);
+    /// this tree does not take a filesystem or Redis URL here, so a
+    /// path-shaped key never reaches the confined-template allowlist.
+    #[serde(default)]
+    nonce_store: Option<HmacNonceStoreKind>,
+}
+
+/// Operator-selectable nonce ledger for `nonce_store`.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum HmacNonceStoreKind {
+    Memory,
 }
 
 /// Compiled per-key state: the verifier holding the decoded secret,
@@ -165,6 +209,9 @@ struct HmacAuthConfig {
 struct HmacKey {
     verifier: MessageSignatureVerifier,
     attrs: CredentialAttrs,
+    /// Resolved `require_body_digest` for this key (per-key override
+    /// or the provider-wide default).
+    require_body_digest: bool,
 }
 
 /// Verdict surfaced by [`HmacAuth::verify`].
@@ -211,6 +258,11 @@ pub struct HmacAuth {
     by_key_id: HashMap<String, HmacKey>,
     /// Symmetric freshness window in seconds.
     clock_skew_seconds: u64,
+    /// Optional single-use nonce ledger. `None` is timestamp-window
+    /// only, matching shipped behaviour. When `Some`, a missing nonce
+    /// is refused and a replay is `nonce_replay`; a store error is
+    /// `nonce_store_error` (fail closed, WOR-1148's lesson).
+    nonce_store: Option<Arc<dyn NonceStore>>,
 }
 
 impl std::fmt::Debug for HmacAuth {
@@ -220,6 +272,7 @@ impl std::fmt::Debug for HmacAuth {
         f.debug_struct("HmacAuth")
             .field("key_ids", &keys)
             .field("clock_skew_seconds", &self.clock_skew_seconds)
+            .field("nonce_store", &self.nonce_store.is_some())
             .finish()
     }
 }
@@ -270,12 +323,42 @@ impl HmacAuth {
             // flattened attrs block never carries one of its own
             // because the outer field consumes the YAML key.
             attrs.key_id = Some(entry.key_id.clone());
-            by_key_id.insert(entry.key_id, HmacKey { verifier, attrs });
+            let require_body_digest = entry.require_body_digest.unwrap_or(cfg.require_body_digest);
+            by_key_id.insert(
+                entry.key_id,
+                HmacKey {
+                    verifier,
+                    attrs,
+                    require_body_digest,
+                },
+            );
         }
+        let nonce_store = match cfg.nonce_store {
+            Some(HmacNonceStoreKind::Memory) => Some(Arc::new(HmacMemoryNonceStore::with_ttl(
+                cfg.clock_skew_seconds,
+            )) as Arc<dyn NonceStore>),
+            None => None,
+        };
         Ok(Self {
             by_key_id,
             clock_skew_seconds: cfg.clock_skew_seconds,
+            nonce_store,
         })
+    }
+
+    /// Inject a [`NonceStore`] for exactly-once replay defense inside
+    /// the `clock_skew_seconds` window.
+    ///
+    /// When set, every verified signature must carry an RFC 9421
+    /// `nonce` and that value is consumed through
+    /// [`NonceStore::check_and_consume_with_expiry`]. A hit is
+    /// `nonce_replay`; a store error is `nonce_store_error` (fail
+    /// closed). Callers that never inject a store keep today's
+    /// timestamp-window-only behaviour, including `from_config`
+    /// without `nonce_store: memory`.
+    pub fn with_nonce_store(mut self, store: Arc<dyn NonceStore>) -> Self {
+        self.nonce_store = Some(store);
+        self
     }
 
     /// Number of configured keys.
@@ -325,9 +408,9 @@ impl HmacAuth {
                 .keyid
                 .as_deref()
                 .filter(|kid| self.by_key_id.contains_key(*kid))
-                .map(|kid| (kid.to_string(), entry.params.created))
+                .map(|kid| (kid.to_string(), entry))
         });
-        let (kid, created) = match matched {
+        let (kid, entry) = match matched {
             Some(m) => m,
             None => {
                 let claimed = entries
@@ -348,7 +431,7 @@ impl HmacAuth {
         // direction. It enforces both now, with the same
         // `clock_skew_seconds` this provider passes it, so the window is
         // owned in one place and `bot_auth` gets it too.
-        if created.is_none() {
+        if entry.params.created.is_none() {
             return HmacVerdict::Failed {
                 key_id: kid,
                 reason: "missing required `created` parameter".to_string(),
@@ -373,7 +456,29 @@ impl HmacAuth {
         // proof is completed in the request body filter instead; see
         // "Body binding" in the module docs.
         match key.verifier.verify_request_deferring_body_binding(req) {
-            VerifyVerdict::Ok { .. } => HmacVerdict::Verified { key_id: kid },
+            VerifyVerdict::Ok { .. } => {
+                if key.require_body_digest && request_carries_a_body(req) {
+                    let covers = entry
+                        .components
+                        .iter()
+                        .any(|c| c.eq_ignore_ascii_case("content-digest"));
+                    if !covers {
+                        return HmacVerdict::Failed {
+                            key_id: kid,
+                            reason: "missing required content-digest coverage".to_string(),
+                        };
+                    }
+                }
+                if let Err(reason) =
+                    self.check_nonce(entry.params.nonce.as_deref(), entry.params.created)
+                {
+                    return HmacVerdict::Failed {
+                        key_id: kid,
+                        reason: reason.to_string(),
+                    };
+                }
+                HmacVerdict::Verified { key_id: kid }
+            }
             VerifyVerdict::Failed { reason } => HmacVerdict::Failed {
                 key_id: kid,
                 reason,
@@ -406,6 +511,146 @@ impl HmacAuth {
             attrs,
         })
     }
+
+    /// Consume `nonce` when a store is wired. No store is a no-op so
+    /// existing configs stay timestamp-window-only. A wired store
+    /// requires a nonce: without one the ledger cannot provide
+    /// exactly-once. Store errors fail closed (WOR-1148).
+    fn check_nonce(&self, nonce: Option<&str>, created: Option<i64>) -> Result<(), &'static str> {
+        let Some(store) = self.nonce_store.as_ref() else {
+            return Ok(());
+        };
+        let Some(nonce) = nonce else {
+            return Err("missing required nonce");
+        };
+        let expires_at = created
+            .and_then(|c| u64::try_from(c).ok())
+            .unwrap_or(0)
+            .saturating_add(self.clock_skew_seconds);
+        match store.check_and_consume_with_expiry(nonce, expires_at) {
+            Ok(NonceCheck::Fresh) | Ok(NonceCheck::Unknown) => Ok(()),
+            Ok(NonceCheck::AlreadyConsumed) => Err("nonce_replay"),
+            Err(_) => {
+                tracing::warn!("hmac_auth nonce store error; failing closed");
+                Err("nonce_store_error")
+            }
+        }
+    }
+}
+
+/// Process-local nonce ledger whose entries die at `expires_at`.
+///
+/// Used when the operator sets `nonce_store: memory`. TTL is the
+/// signature's `created` plus `clock_skew_seconds` (passed in via
+/// [`NonceStore::check_and_consume_with_expiry`]), so the ledger stays
+/// bounded by the same window that already refuses a stale `created`.
+#[derive(Clone, Debug)]
+struct HmacMemoryNonceStore {
+    entries: Arc<parking_lot::Mutex<HashMap<String, u64>>>,
+    now_secs: Arc<AtomicU64>,
+    ttl_secs: u64,
+}
+
+impl HmacMemoryNonceStore {
+    fn with_ttl(ttl_secs: u64) -> Self {
+        Self {
+            entries: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            now_secs: Arc::new(AtomicU64::new(0)),
+            ttl_secs,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_clock(now: u64) -> Self {
+        Self {
+            entries: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            now_secs: Arc::new(AtomicU64::new(now)),
+            ttl_secs: DEFAULT_CLOCK_SKEW_SECONDS,
+        }
+    }
+
+    #[cfg(test)]
+    fn set_now(&self, now: u64) {
+        self.now_secs.store(now, Ordering::SeqCst);
+    }
+
+    fn now(&self) -> u64 {
+        let pinned = self.now_secs.load(Ordering::SeqCst);
+        if pinned == 0 {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        } else {
+            pinned
+        }
+    }
+}
+
+impl NonceStore for HmacMemoryNonceStore {
+    fn check_and_consume(&self, nonce: &str) -> Result<NonceCheck, NonceError> {
+        let expires = self.now().saturating_add(self.ttl_secs);
+        self.check_and_consume_with_expiry(nonce, expires)
+    }
+
+    fn check_and_consume_with_expiry(
+        &self,
+        nonce: &str,
+        expires_at_unix_secs: u64,
+    ) -> Result<NonceCheck, NonceError> {
+        let now = self.now();
+        let expires_at = if expires_at_unix_secs > now {
+            expires_at_unix_secs
+        } else {
+            now.saturating_add(self.ttl_secs.max(1))
+        };
+        let mut map = self.entries.lock();
+        map.retain(|_, exp| *exp > now);
+        if map.get(nonce).is_some_and(|exp| *exp > now) {
+            return Ok(NonceCheck::AlreadyConsumed);
+        }
+        map.insert(nonce.to_string(), expires_at);
+        Ok(NonceCheck::Fresh)
+    }
+}
+
+/// True when the request advertises a body the auth phase can see
+/// without buffering it.
+///
+/// Auth runs before the body is read, so `req.body()` is empty on the
+/// live path (`check_auth` synthesizes the request from headers).
+/// Content-Length greater than zero and chunked Transfer-Encoding are
+/// the signals APISIX uses for `validate_request_body`. HTTP/2 and
+/// HTTP/3 omit Content-Length and do not use chunked TE, so when
+/// neither header is present this falls back to the method, matching
+/// `request_carries_no_body` in the request phase: GET/HEAD/OPTIONS/
+/// DELETE are bodyless, everything else is treated as carrying a body.
+/// A non-empty body on `req` still counts so unit tests that pass
+/// bytes through `HmacAuth::verify` stay honest.
+fn request_carries_a_body(req: &http::Request<bytes::Bytes>) -> bool {
+    if !req.body().is_empty() {
+        return true;
+    }
+    if let Some(length) = req
+        .headers()
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    {
+        return length > 0;
+    }
+    if req
+        .headers()
+        .get(http::header::TRANSFER_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("chunked"))
+        })
+    {
+        return true;
+    }
+    !matches!(req.method().as_str(), "GET" | "HEAD" | "OPTIONS" | "DELETE")
 }
 
 #[cfg(test)]
@@ -417,16 +662,22 @@ mod tests {
     const SECRET_HEX: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
     fn provider(clock_skew: Option<u64>) -> HmacAuth {
-        let mut cfg = serde_json::json!({
-            "keys": [
-                {
-                    "key_id": "svc-billing",
-                    "secret": SECRET_HEX,
-                    "project": "billing",
-                    "team": "payments",
-                }
-            ]
-        });
+        provider_from(
+            serde_json::json!({
+                "keys": [
+                    {
+                        "key_id": "svc-billing",
+                        "secret": SECRET_HEX,
+                        "project": "billing",
+                        "team": "payments",
+                    }
+                ]
+            }),
+            clock_skew,
+        )
+    }
+
+    fn provider_from(mut cfg: serde_json::Value, clock_skew: Option<u64>) -> HmacAuth {
         if let Some(skew) = clock_skew {
             cfg["clock_skew_seconds"] = serde_json::json!(skew);
         }
@@ -452,6 +703,7 @@ mod tests {
         created: i64,
         extra_headers: &'a [(&'a str, &'a str)],
         body: &'a [u8],
+        nonce: Option<&'a str>,
     }
 
     impl Default for SignSpec<'_> {
@@ -465,6 +717,7 @@ mod tests {
                 created: now_epoch(),
                 extra_headers: &[],
                 body: b"",
+                nonce: None,
             }
         }
     }
@@ -473,8 +726,12 @@ mod tests {
     /// construction, so the tests stay honest if the base builder
     /// shifts. Components and extra headers ride along verbatim.
     fn sign(spec: SignSpec<'_>) -> http::Request<bytes::Bytes> {
+        let nonce_param = spec
+            .nonce
+            .map(|n| format!(";nonce=\"{n}\""))
+            .unwrap_or_default();
         let sig_input = format!(
-            "sig1=({});created={};keyid=\"{}\";alg=\"hmac-sha256\"",
+            "sig1=({});created={};keyid=\"{}\";alg=\"hmac-sha256\"{nonce_param}",
             spec.components, spec.created, spec.key_id
         );
         let entries = parse_signature_input(&sig_input).unwrap();
@@ -875,6 +1132,301 @@ mod tests {
         .unwrap();
         assert!(!format!("{auth:?}").contains(marker));
         assert_eq!(auth.key_count(), 1);
+    }
+
+    /// WOR-2547: a POST with a Content-Length (the production auth-phase
+    /// shape: headers present, body not yet buffered) and a header-only
+    /// signature must be refused when `require_body_digest` is on.
+    fn header_only_post_advertising_a_body() -> http::Request<bytes::Bytes> {
+        sign(SignSpec {
+            method: "POST",
+            target_uri: "/api/invoices",
+            extra_headers: &[("content-length", "13")],
+            body: b"",
+            ..SignSpec::default()
+        })
+    }
+
+    #[test]
+    fn require_body_digest_refuses_a_header_only_signature_when_the_request_carries_a_body() {
+        let auth = provider_from(
+            serde_json::json!({
+                "require_body_digest": true,
+                "keys": [{ "key_id": "svc-billing", "secret": SECRET_HEX }]
+            }),
+            None,
+        );
+        match auth.verify(&header_only_post_advertising_a_body()) {
+            HmacVerdict::Failed { reason, key_id } => {
+                assert_eq!(key_id, "svc-billing");
+                assert!(
+                    reason.contains("content-digest"),
+                    "reason names the missing coverage: {reason}"
+                );
+                assert!(
+                    !reason.contains(SECRET_HEX),
+                    "reason must never echo key material: {reason}"
+                );
+            }
+            other => panic!("expected Failed on missing body coverage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn require_body_digest_refuses_a_header_only_http2_post_without_content_length() {
+        let auth = provider_from(
+            serde_json::json!({
+                "require_body_digest": true,
+                "keys": [{ "key_id": "svc-billing", "secret": SECRET_HEX }]
+            }),
+            None,
+        );
+        let req = sign(SignSpec {
+            method: "POST",
+            target_uri: "/api/invoices",
+            body: b"",
+            ..SignSpec::default()
+        });
+        match auth.verify(&req) {
+            HmacVerdict::Failed { reason, .. } => {
+                assert!(
+                    reason.contains("content-digest"),
+                    "HTTP/2 POST has no Content-Length; method fallback must still require coverage: {reason}"
+                );
+            }
+            other => panic!("expected Failed on header-only HTTP/2 POST, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn require_body_digest_admits_a_content_digest_covering_signature() {
+        let auth = provider_from(
+            serde_json::json!({
+                "require_body_digest": true,
+                "keys": [{ "key_id": "svc-billing", "secret": SECRET_HEX }]
+            }),
+            None,
+        );
+        let body = br#"{"amount":10}"#;
+        let digest = sbproxy_middleware::digest::compute_content_digest(
+            sbproxy_middleware::digest::Algorithm::Sha256,
+            body,
+        );
+        let req = sign(SignSpec {
+            method: "POST",
+            target_uri: "/api/invoices",
+            components: "\"@method\" \"@target-uri\" \"content-digest\"",
+            extra_headers: &[
+                ("content-digest", digest.as_str()),
+                ("content-length", "13"),
+            ],
+            body: b"",
+            ..SignSpec::default()
+        });
+        assert!(
+            matches!(auth.verify(&req), HmacVerdict::Verified { .. }),
+            "covering content-digest satisfies the knob; the body half is deferred"
+        );
+    }
+
+    #[test]
+    fn require_body_digest_does_not_apply_to_a_bodyless_request() {
+        let auth = provider_from(
+            serde_json::json!({
+                "require_body_digest": true,
+                "keys": [{ "key_id": "svc-billing", "secret": SECRET_HEX }]
+            }),
+            None,
+        );
+        let req = default_signed("/api/invoices");
+        assert!(
+            matches!(auth.verify(&req), HmacVerdict::Verified { .. }),
+            "APISIX validates only when a body is present; GET without one stays header-only"
+        );
+    }
+
+    #[test]
+    fn require_body_digest_off_admits_a_header_only_signature_on_a_bodied_request() {
+        let auth = provider(None);
+        assert!(
+            matches!(
+                auth.verify(&header_only_post_advertising_a_body()),
+                HmacVerdict::Verified { .. }
+            ),
+            "default false must keep today's header-only POST behaviour"
+        );
+    }
+
+    #[test]
+    fn require_body_digest_per_key_override_wins() {
+        let auth = provider_from(
+            serde_json::json!({
+                "require_body_digest": true,
+                "keys": [
+                    {
+                        "key_id": "svc-billing",
+                        "secret": SECRET_HEX,
+                        "require_body_digest": false
+                    }
+                ]
+            }),
+            None,
+        );
+        assert!(
+            matches!(
+                auth.verify(&header_only_post_advertising_a_body()),
+                HmacVerdict::Verified { .. }
+            ),
+            "a per-key false must override the provider-wide true"
+        );
+    }
+
+    fn signed_with_nonce(nonce: &str) -> http::Request<bytes::Bytes> {
+        sign(SignSpec {
+            nonce: Some(nonce),
+            ..SignSpec::default()
+        })
+    }
+
+    #[test]
+    fn nonce_store_first_presentation_verifies() {
+        let auth = provider(None).with_nonce_store(std::sync::Arc::new(
+            crate::policy::quote_token::InMemoryNonceStore::new(),
+        )
+            as std::sync::Arc<dyn crate::policy::quote_token::NonceStore>);
+        assert!(matches!(
+            auth.verify(&signed_with_nonce("n-first")),
+            HmacVerdict::Verified { .. }
+        ));
+    }
+
+    #[test]
+    fn nonce_store_refuses_a_signature_without_a_nonce() {
+        let auth = provider(None).with_nonce_store(std::sync::Arc::new(
+            crate::policy::quote_token::InMemoryNonceStore::new(),
+        )
+            as std::sync::Arc<dyn crate::policy::quote_token::NonceStore>);
+        match auth.verify(&default_signed("/")) {
+            HmacVerdict::Failed { reason, .. } => {
+                assert!(
+                    reason.contains("missing required nonce"),
+                    "a wired store cannot provide exactly-once without a nonce: {reason}"
+                );
+            }
+            other => panic!("expected Failed on missing nonce, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nonce_store_replay_inside_the_window_is_refused() {
+        let auth = provider(None).with_nonce_store(std::sync::Arc::new(
+            crate::policy::quote_token::InMemoryNonceStore::new(),
+        )
+            as std::sync::Arc<dyn crate::policy::quote_token::NonceStore>);
+        let req = signed_with_nonce("n-replay");
+        assert!(matches!(auth.verify(&req), HmacVerdict::Verified { .. }));
+        match auth.verify(&req) {
+            HmacVerdict::Failed { reason, .. } => {
+                assert!(
+                    reason.contains("nonce_replay"),
+                    "reason names the replay: {reason}"
+                );
+                assert!(
+                    !reason.contains(SECRET_HEX),
+                    "reason must never echo key material: {reason}"
+                );
+            }
+            other => panic!("expected Failed on nonce replay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_nonce_store_admits_a_replay_inside_the_window() {
+        let auth = provider(None);
+        let req = signed_with_nonce("n-window-only");
+        assert!(matches!(auth.verify(&req), HmacVerdict::Verified { .. }));
+        assert!(
+            matches!(auth.verify(&req), HmacVerdict::Verified { .. }),
+            "without a store the only replay defense is the created window"
+        );
+    }
+
+    #[derive(Debug)]
+    struct FailingNonceStore;
+
+    impl crate::policy::quote_token::NonceStore for FailingNonceStore {
+        fn check_and_consume(
+            &self,
+            _nonce: &str,
+        ) -> Result<crate::policy::quote_token::NonceCheck, crate::policy::quote_token::NonceError>
+        {
+            Err(crate::policy::quote_token::NonceError::new(
+                "injected store failure",
+            ))
+        }
+    }
+
+    #[test]
+    fn nonce_store_error_fails_closed() {
+        let auth = provider(None).with_nonce_store(std::sync::Arc::new(FailingNonceStore)
+            as std::sync::Arc<dyn crate::policy::quote_token::NonceStore>);
+        match auth.verify(&signed_with_nonce("n-store-err")) {
+            HmacVerdict::Failed { reason, .. } => {
+                assert!(
+                    reason.contains("nonce_store_error"),
+                    "store errors fail closed: {reason}"
+                );
+                assert!(
+                    !reason.contains("injected store failure"),
+                    "client-facing reason must not echo the backend error: {reason}"
+                );
+            }
+            other => panic!("expected Failed on store error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nonce_store_memory_config_wires_the_ledger() {
+        let auth = provider_from(
+            serde_json::json!({
+                "nonce_store": "memory",
+                "keys": [{ "key_id": "svc-billing", "secret": SECRET_HEX }]
+            }),
+            None,
+        );
+        let req = signed_with_nonce("n-cfg-memory");
+        assert!(matches!(auth.verify(&req), HmacVerdict::Verified { .. }));
+        match auth.verify(&req) {
+            HmacVerdict::Failed { reason, .. } => {
+                assert!(reason.contains("nonce_replay"), "{reason}")
+            }
+            other => panic!("memory nonce_store must refuse the replay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nonce_entry_expires_on_the_skew_window_boundary() {
+        let store = HmacMemoryNonceStore::with_clock(1_700_000_000);
+        assert_eq!(
+            store
+                .check_and_consume_with_expiry("n-ttl", 1_700_000_300)
+                .expect("store answers"),
+            crate::policy::quote_token::NonceCheck::Fresh
+        );
+        assert_eq!(
+            store
+                .check_and_consume_with_expiry("n-ttl", 1_700_000_300)
+                .expect("store answers"),
+            crate::policy::quote_token::NonceCheck::AlreadyConsumed
+        );
+        store.set_now(1_700_000_301);
+        assert_eq!(
+            store
+                .check_and_consume_with_expiry("n-ttl", 1_700_000_601)
+                .expect("store answers"),
+            crate::policy::quote_token::NonceCheck::Fresh,
+            "after clock_skew_seconds the ledger must forget the nonce"
+        );
     }
 
     #[test]

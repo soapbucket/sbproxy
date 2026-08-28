@@ -12,6 +12,7 @@ The config names a `key_id` and points the secret at the environment, so the fil
 authentication:
   type: hmac_auth
   clock_skew_seconds: 300
+  require_body_digest: true
   keys:
     - key_id: svc-billing
       secret: env:SBPROXY_HMAC_SECRET
@@ -73,7 +74,9 @@ $ curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: hmac.local' \
 401
 ```
 
-Replay the untouched request after the window and the `created` timestamp is stale, so the same 401 comes back. That window is the replay defense: `created` is mandatory, at most `clock_skew_seconds` old, and at most `clock_skew_seconds` in the future.
+Replay the untouched request after the window and the `created` timestamp is stale, so the same 401 comes back. That window is the replay defense: `created` is mandatory, at most `clock_skew_seconds` old, and at most `clock_skew_seconds` in the future. Set `nonce_store: memory` (commented in `sb.yml`) when callers send an RFC 9421 `nonce` and you want exactly-once inside that window.
+
+`require_body_digest: true` does not change this GET demo. A POST that omits `content-digest` from its covered components is refused; covering the digest binds the body, and a mismatch after the signature verified is recorded as an auth deny.
 
 ## What this shows
 
@@ -81,12 +84,13 @@ Replay the untouched request after the window and the `created` timestamp is sta
 - The `WWW-Authenticate: Signature` challenge on unsigned and failed requests, with no key material in the response
 - Method and path bound into the signature, so a captured request cannot be redirected
 - A mandatory `created` timestamp window (default 300 seconds) as the replay defense
+- `require_body_digest` so a POST cannot skip body coverage; GET stays header-only
 - `hmac-sha256` pinned: the only symmetric algorithm in the RFC 9421 registry, so there is no SHA-1 to negotiate down to
 
 On a match the request's principal gets `sub: svc-billing`, `principal_kind: hmac_auth`, and the entry's metadata (`project: billing` here) for per-credential reporting in the access log.
 
 ## See also
 
-- [docs/configuration.md](../../docs/configuration.md) documents the `hmac_auth` type, its `keys` and `required_components` fields, and the freshness rules.
+- [docs/configuration.md](../../docs/configuration.md) documents the `hmac_auth` type, its `keys`, `required_components`, `require_body_digest`, and `nonce_store` fields, and the freshness rules.
 - [examples/auth-api-key](../auth-api-key/) is the simpler static-credential form when per-request signing is more than the caller can do.
 - [examples/web-bot-auth](../web-bot-auth/) uses the same RFC 9421 signatures with public-key crypto and a published agent directory.

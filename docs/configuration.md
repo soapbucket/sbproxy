@@ -3307,6 +3307,8 @@ origins:
     authentication:
       type: hmac_auth
       clock_skew_seconds: 300
+      require_body_digest: true
+      nonce_store: memory
       keys:
         - key_id: svc-billing
           secret: ${BILLING_HMAC_SECRET}
@@ -3319,8 +3321,12 @@ origins:
 | `keys` | list | required | Accepted signing keys, at least one. Each entry needs a unique `key_id` (the RFC 9421 `keyid` the signer advertises) and a `secret`. Entries also accept the per-credential metadata fields (`project`, `user`, `team`, `tags`, `metadata`). |
 | `clock_skew_seconds` | int | 300 | Freshness window for the mandatory `created` signature parameter, applied in both directions. A `created` older than the window is refused as a replay; one further in the future is refused as skewed. |
 | `required_components` | list | `["@method", "@target-uri"]` | Components every accepted signature must cover. The default binds the verb and the full target URI, so a captured signature cannot be replayed against a different route. Add `content-digest` to bind the request body as well. |
+| `require_body_digest` | bool | `false` | When true, a signature that omits `content-digest` on a request that carries a body is refused. A body is detected from Content-Length greater than zero, chunked Transfer-Encoding, a non-empty body the verifier can already see, or (when those headers are absent) any method other than GET, HEAD, OPTIONS, or DELETE. HTTP/2 and HTTP/3 POSTs often omit Content-Length and never use chunked TE; the method fallback is what still requires coverage there. GET and other bodyless requests are not required to cover the digest (the Apache APISIX `hmac-auth` `validate_request_body` precedent). Each key entry may set `require_body_digest` to override this. |
+| `nonce_store` | string | unset | Set to `memory` to consume the RFC 9421 `nonce` parameter for exactly-once replay defense inside `clock_skew_seconds`. A wired store requires a nonce and fails closed on a store error. Omit it to keep timestamp-window-only replay defense. Durable backends use the same `NonceStore` trait `bot_auth` uses; this config takes no filesystem path or Redis URL. |
 
 The `secret` resolves through the secret resolver like every other signing-key field: an inline literal, `${VAR}`, `env:NAME`, `file:PATH`, or a backend URI such as `vault://...`. A reference nothing can resolve refuses to boot rather than becoming the key. Verification failures answer `401` with a `WWW-Authenticate: Signature` challenge that carries no key material, and the failure reason is logged, never returned to the client.
+
+A content-digest mismatch after the signature has already verified is recorded as an auth deny, not an allow followed by a later 401, so SIEM and `sbproxy_auth_results_total` see the true outcome. `GET /admin/config/effective` shows the compiled `hmac_auth` block, including these knobs; a dedicated console page is not shipped yet.
 
 Clients send the standard RFC 9421 header pair. The signature base covers the declared components plus the `@signature-params` line, `created` is required, and `alg` must be `hmac-sha256` (the only symmetric algorithm in the RFC 9421 registry; HMAC-SHA1 does not exist here to be negotiated down to):
 
@@ -3350,7 +3356,7 @@ Signature-Input: sig1=("@method" "@target-uri" "content-digest");created=1723800
 Signature: sig1=:BASE64_HMAC_SHA256_OF_SIGNATURE_BASE:
 ```
 
-The check runs in two steps, because authentication happens before the proxy has read the body. The signature base binds the `Content-Digest` header value; the proxy then buffers the request body, hashes it, and answers `401` if the hash and the header disagree. Put `content-digest` in `required_components` to make that binding mandatory, and a signature that omits it is refused before the body is read.
+The check runs in two steps, because authentication happens before the proxy has read the body. The signature base binds the `Content-Digest` header value; the proxy then buffers the request body, hashes it, and answers `401` if the hash and the header disagree. Put `content-digest` in `required_components` to make that binding mandatory on every request, including bodyless ones. `require_body_digest: true` is the body-aware form (APISIX `validate_request_body`): a header-only signature is refused only when the request carries a body.
 
 Buffering is what makes the second step possible, so a body-covering signature caps the request at the 8 MiB request-body buffer. A larger body answers `413`. Leave `content-digest` out of the covered components for routes that carry more than that, and accept that those routes are not body-bound.
 
