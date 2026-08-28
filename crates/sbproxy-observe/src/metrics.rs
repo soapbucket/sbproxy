@@ -4511,7 +4511,7 @@ pub fn record_rate_limit_suspend(workspace: &str) {
 /// Called when the bounded mpsc audit bus is full and the
 /// dispatcher must drop a [`PolicyVerdictEvent`](crate::events::PolicyVerdictEvent)
 /// to avoid blocking the hot path. Per
-/// `docs/adr-policy-audit-binding.md`, this is a paging signal:
+/// `docs/events.md`, this is a paging signal:
 /// operators should alert on a non-zero rate so they get warning
 /// before audit coverage degrades.
 pub fn record_policy_audit_event_dropped(tenant: &str) {

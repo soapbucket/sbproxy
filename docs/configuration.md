@@ -2104,7 +2104,7 @@ origins:
 | `grpc_web` | bool | false | Allow browser gRPC-Web clients (HTTP/1.1 with base64 or binary framing) to reach the native gRPC upstream. |
 | `transcode` | object | unset | REST-to-gRPC transcoding: `descriptor_set` (path to a compiled protobuf `FileDescriptorSet`) and `routes[]`, each a `{method, path, grpc_method, body}` binding an HTTP route to a unary gRPC call. `path` uses `google.api.http`-style templates; `body` names the field the HTTP body decodes into, or is omitted (or `"*"`) to decode the whole body as the request message. |
 
-`grpc_web` and `transcode` both read the gRPC message frames, so both send `grpc-accept-encoding: identity` upstream and neither supports gRPC message compression. There is no field to change that. Plain passthrough (neither field set) forwards frames untouched and is unaffected. See [gRPC limits](routing.md#grpc-limits).
+`grpc_web` and `transcode` both read the gRPC message frames, so both send `grpc-accept-encoding: identity` upstream and neither supports gRPC message compression. There is no field to change that. Plain passthrough (neither field set) forwards frames untouched and is unaffected. Dedicated page: [grpc.md](grpc.md). Limits: [gRPC limits](routing.md#grpc-limits). Runnable at [`examples/grpc-h2c/`](../examples/grpc-h2c/).
 
 ### ai_proxy
 
@@ -2899,6 +2899,7 @@ origins:
 | `dual_llm_quarantine` | object | unset | Optional LLM review gate for suspicious tool output. |
 | `tool_pricing` | map | `{}` | USD price per advertised tool name for cost attribution. |
 | `usage_sinks` | list | `[]` | JSONL, webhook, ledger, Langfuse, or Datadog tool-usage destinations. |
+| `cedar_policies` | object | unset | Optional Cedar ABAC set compiled at config load and installed as a built-in MCP `tools/call` hook. `policies` is the Cedar source (required). `schema_override` appends workspace schema that must not collide with the default MCP schema. Match `principal == Agent::"<id>"` (or `Agent::"anonymous"`); `principal in AgentClass::"..."` never matches because the hook evaluates against an empty entity store. Confirm-annotated forbids currently refuse with `confirmation required: …`; there is no parked-approval flow. Does not run on `type: local` tools. See [cedar-policy.md](cedar-policy.md). |
 
 See [mcp.md](mcp.md) for federation, RBAC, OpenAPI-backed tools, sessions,
 versioning, and cost attribution, and [mcp-compose.md](mcp-compose.md) for
@@ -3289,6 +3290,8 @@ authentication:
 ```
 
 The algorithm is negotiated, not merely declared. The challenge carries `algorithm=`, and a response that names a different algorithm, or omits the parameter on a SHA-256 realm, is rejected. A client cannot talk a SHA-256 realm down to MD5 by dropping the parameter. Only `SHA-256` and `MD5` are implemented; the `-sess` variants and `SHA-512-256` are refused at config compile rather than silently downgraded.
+
+A runnable SHA-256 challenge, a successful `curl --digest` retry, and a wrong-password 401 are in [`examples/auth-digest/`](../examples/auth-digest/).
 
 ### hmac_auth
 
@@ -4041,7 +4044,7 @@ The intake accepts up to 64 KiB per report via `POST /__sbproxy/csp-report` and 
 
 ### dlp
 
-Data Loss Prevention scan over the request URI and headers. Matches against the configured detector catalog (or every default when `detectors: []`) and either tags the upstream request with `dlp-detection: <names>` (`action: tag`, default) or rejects with `403` (`action: block`).
+Data Loss Prevention scan over the request URI, headers, and (on by default) the buffered request body. Matches against the configured detector catalog (or every default when `detectors: []`) and either tags the upstream request with `dlp-detection: <names>` (`action: tag`, default) or rejects with `403` (`action: block`). The scan does not mask or rewrite anything it finds; `action: tag` stamps a header, `action: block` refuses. `replacement` on a custom `rules:` entry is accepted because the rule type is shared with the `pii:` redactor, and DLP does not apply it. Response bodies are out of scope. Runnable at [`examples/dlp-catalog/`](../examples/dlp-catalog/).
 
 ```yaml
 policies:

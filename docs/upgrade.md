@@ -1,6 +1,6 @@
 # Upgrade SBproxy
 
-*Last modified: 2026-08-27*
+*Last modified: 2026-08-28*
 
 Use this procedure for the Rust v1 release line. Upgrade a test or canary instance before the rest of a fleet, and keep the previous binary or image available until the new process has served traffic.
 
@@ -31,23 +31,23 @@ sbproxy validate proposed-sb.yml
 
 ## Install the target release
 
-For an installer-managed node, pin the target tag instead of taking whatever release is latest:
+For an installer-managed node, pin the tag you approved on the [GitHub releases page](https://github.com/soapbucket/sbproxy/releases). Do not take whatever the installer calls latest, and do not copy a version number out of this page: it will rot. The changelog for that tag is [CHANGELOG.md](../CHANGELOG.md); this page only lists the classes of change `validate` cannot see.
 
 ```bash
-export TARGET_VERSION=v1.12.0
+export TARGET_VERSION=vX.Y.Z   # the tag you approved
 curl -fsSL https://download.sbproxy.dev | SBPROXY_VERSION="$TARGET_VERSION" sh
 sbproxy --version
 ```
 
-Replace `v1.12.0` (the newest tag when this page was last updated) with the release tag you approved. The installer verifies the published SHA-256 checksum and verifies the Sigstore bundle when `cosign` is installed. See [SUPPLY-CHAIN.md](../SUPPLY-CHAIN.md) for the verification model.
+The installer verifies the published SHA-256 checksum and verifies the Sigstore bundle when `cosign` is installed. See [SUPPLY-CHAIN.md](../SUPPLY-CHAIN.md) for the verification model.
 
 For Docker, pull the same release tag, update the pinned image reference in your deployment manifest, and keep the explicit configuration command:
 
 ```bash
-docker pull soapbucket/sbproxy:1.12.0
+docker pull soapbucket/sbproxy:X.Y.Z
 docker run --rm -p 8080:8080 \
   -v "$PWD/sb.yml:/etc/sbproxy/sb.yml:ro" \
-  soapbucket/sbproxy:1.12.0 serve -f /etc/sbproxy/sb.yml
+  soapbucket/sbproxy:X.Y.Z serve -f /etc/sbproxy/sb.yml
 ```
 
 The published image has no default configuration command. In Kubernetes, update the `SBProxy.spec.image` tag and use the rollout procedure in [kubernetes.md](kubernetes.md).
@@ -82,9 +82,47 @@ For Kubernetes, restore the previous approved image tag and wait for the Deploym
 
 After the fleet is stable on the intended version, remove the temporary `sb.yml.before-upgrade` copy according to your secret-retention policy.
 
+## Restart vs reload
+
+`sbproxy plan` classifies every changed path as Hitless, Reload, Restart, or Breaking. `validate` compiles the file; it does not tell you whether a key you just added takes effect on a reload or only on the next process start. `plan` does. The matrix lives in `crates/sbproxy-config/src/plan.rs` (`BLAST_RADIUS_MATRIX`); do not treat this table as a second copy of that list.
+
+Classes:
+
+| Class | What happens |
+|---|---|
+| Hitless | The running process already reads the field per request. No reload required. |
+| Reload | A config reload (`POST /admin/reload`, `sbproxy reload`, or SIGHUP where documented) picks it up. |
+| Restart | The process owns a socket, store, or set-once slot built at boot. Reload accepts the YAML and then does nothing with it until you restart. |
+| Breaking | The new config cannot serve in-flight requests the old one started. |
+
+Boot-only keys that operators hit on upgrade, all Restart in that matrix:
+
+| Path | Why a reload is not enough |
+|---|---|
+| `proxy.config_history` | The applied-config ring opens once at boot. Off by default. Enabling it in YAML and reloading leaves the ring closed. |
+| `proxy.http_bind_port`, `proxy.https_bind_port`, `proxy.http2_cleartext`, `proxy.http3` | Listeners bind once. |
+| `proxy.admin` (the whole block) | Credentials, TLS, bind, and allowlist are read once into the admin task. |
+| `proxy.cluster` except snapshot cadence | Process identity, discovery, and peer security. |
+| `proxy.config_authority` | Subscriber and poll loop are built once. |
+| `proxy.compression_state` | Embedded DB handle is process-owned. |
+| `proxy.l2_cache.driver` | Driver swap rebuilds the KV handle. Parameters under the driver are Reload. |
+| `request_events`, `proxy.agent_registry`, `proxy.notifications` | Each opens an embedded store or a set-once sink. A reload that changes one of these now fails rather than silently keeping the old sink. |
+
+A config authority is separately forbidden from writing some of the same paths (`AUTHORITY_DENIED_PATHS` in `crates/sbproxy-config/src/config_merge.rs`), including `proxy.config_history`. That is a write-path restriction, not a blast-radius class.
+
+## After you upgrade, re-read
+
+Release-specific behavior lives in [CHANGELOG.md](../CHANGELOG.md). These surfaces changed default or restart posture in the 1.12 and 1.13 line and are easy to miss if you only run `validate`:
+
+- **Applied-config history** is off until you set `proxy.config_history` and restart. See [configuration.md](configuration.md#config_history) and [`examples/config-history/`](../examples/config-history/).
+- **DLP scans request bodies** by default (`scan_body: true`, 16 KiB cap). A POST that used to pass can 403. See [configuration.md](configuration.md#dlp) and [`examples/dlp-catalog/`](../examples/dlp-catalog/).
+- **Rate-limit workspace label** for single-tenant traffic is `__default__`, not `default`. See [multi-tenant.md](multi-tenant.md).
+- **Payment clustering** and `state_path` limits: [payment-clustering.md](payment-clustering.md).
+- **Admin playground** dispatch path is `/dispatch`, not `/chat`. See [admin-ui.md](admin-ui.md).
+
 ## Notable changes by version
 
-What follows is not the changelog; it is the subset that changes behavior under an existing config, refuses a config that used to load, or moves a metric label a dashboard might key on. Skipping versions compounds the list: upgrading 1.9.0 to 1.12.0 means reading all three sections below.
+What follows is not the changelog; it is the subset that changes behavior under an existing config, refuses a config that used to load, or moves a metric label a dashboard might key on. Skipping versions compounds the list: upgrading 1.9.0 to 1.13.0 means reading every section below.
 
 ### Unreleased
 

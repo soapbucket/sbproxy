@@ -1,7 +1,7 @@
 //! Chain reducer + Plugin verdict translation.
 //!
 //! This module isolates the multi-policy resolution rules from
-//! `docs/adr-policy-verdict-shape.md`:
+//! `docs/policy.md`:
 //!
 //! 1. Any `Deny` in the chain wins; the first `Deny` short-circuits
 //!    the rest. The dispatcher in `server.rs` enforces this via

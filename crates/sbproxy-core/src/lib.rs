@@ -95,7 +95,7 @@ pub mod billing_runtime;
 /// ports (1c.1 / 1c.2 / 1c.3) will populate. Today every
 /// built-in arm returns `BuiltinEnforcerError::NotYetPorted`; the
 /// `check_policies` enum-arm dispatch in `server.rs` is unchanged.
-/// See `docs/adr-policy-engine-unification.md`.
+/// See `docs/policy.md`.
 pub mod builtin_enforcers;
 /// P0 edge capture wired into the request pipeline.
 pub mod capture_envelope;
@@ -237,12 +237,12 @@ pub mod pipeline;
 /// Bounded mpsc channel + drain stub for the OSS scope; enterprise
 /// extends the consumer with a NATS-backed audit-chain subscriber
 /// that hash-chains and KMS-signs Merkle roots downstream. See
-/// `docs/adr-policy-audit-binding.md`.
+/// `docs/events.md`.
 pub mod policy_bus;
 /// Chain reducer + Plugin verdict translation.
 ///
 /// Multi-policy resolution rules from
-/// `docs/adr-policy-verdict-shape.md` (Deny wins, first Confirm
+/// `docs/policy.md` (Deny wins, first Confirm
 /// wins via the OSS bridge, AllowWithHeaders accumulate). Lives
 /// in its own module so the helpers can be exercised by
 /// integration tests in `crates/sbproxy-core/tests/`.

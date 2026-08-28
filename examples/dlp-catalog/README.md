@@ -1,6 +1,6 @@
 # DLP catalog
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-28*
 
 ![DLP catalog](../../docs/assets/dlp-catalog.gif)
 
@@ -36,7 +36,19 @@ curl -i -H 'Host: tag.local' \
 # HTTP/1.1 200 OK
 # The request is forwarded unchanged, with a `dlp-detection: internal_ticket`
 # header stamped on it so the upstream can react. Tag mode never rewrites
-# header values; the `replacement` field is reserved for body redaction.
+# header or body values. `replacement` on a custom rule is the `pii:` redactor
+# field on the shared rule type; DLP does not apply it.
+
+# Block path: an AWS access key in the POST body trips the same detector.
+# Body scanning is on by default (`scan_body: true`, `body_max_bytes: 16384`).
+curl -i -H 'Host: api.local' \
+  -H 'Content-Type: application/json' \
+  -d '{"key":"AKIAIOSFODNN7EXAMPLE"}' \
+  http://127.0.0.1:8080/build
+# HTTP/1.1 403 Forbidden
+# content-type: application/json
+#
+# {"error":"dlp: detector aws_access matched"}
 
 # Clean request -> no tag, no block.
 curl -i -H 'Host: tag.local' http://127.0.0.1:8080/anything

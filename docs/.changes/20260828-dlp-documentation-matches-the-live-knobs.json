@@ -1,0 +1,4 @@
+{
+  "type": "fixed",
+  "message": "**DLP documentation matches the live knobs.** Request bodies are scanned by default (`scan_body: true`, 16 KiB cap). There is no body rewrite. See [docs/configuration.md](docs/configuration.md#dlp) and [examples/dlp-catalog/](examples/dlp-catalog/)."
+}

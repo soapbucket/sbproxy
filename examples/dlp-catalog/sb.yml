@@ -21,6 +21,13 @@
 #     'http://127.0.0.1:8080/build?key=AKIAIOSFODNN7EXAMPLE'
 #   # => 403; "dlp: detector aws_access matched"
 #
+# Test (block path - AWS key in the POST body; scan_body is on by default):
+#   curl -i -H 'Host: api.local' \
+#     -H 'Content-Type: application/json' \
+#     -d '{"key":"AKIAIOSFODNN7EXAMPLE"}' \
+#     http://127.0.0.1:8080/build
+#   # => 403; "dlp: detector aws_access matched"
+#
 # Test (tag path - upstream sees `dlp-detection` header):
 #   curl -i -H 'Host: tag.local' \
 #     -H 'X-Notes: leaked xoxb-1234567890-abc' http://127.0.0.1:8080/anything
