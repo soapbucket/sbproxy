@@ -255,6 +255,14 @@ const EXEMPT: &[Exemption] = &[
                  span, so there is no context to read yet. WOR-2318.",
     },
     Exemption {
+        file: "crates/sbproxy-core/src/config_soak.rs",
+        reason: "Background timer with no scheduling request. The config soak's operator \
+                 probe fires on its own interval to judge a config revision that has \
+                 already applied, so it belongs to no caller's trace and there is nothing \
+                 to propagate rather than something missing. The same reasoning as the AI \
+                 provider health probe beside it. WOR-2318.",
+    },
+    Exemption {
         file: "crates/sbproxy-core/src/config_subscriber.rs",
         reason: "Background poll on a dedicated thread with its own runtime. The config \
                  authority is polled on a timer with no scheduling request, so there is \

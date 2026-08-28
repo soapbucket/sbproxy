@@ -314,12 +314,50 @@ pub(crate) fn upstream_health_signal(
             sample.unobserved.join(", ")
         ));
     }
-    if sample.observed == 0 {
-        return SignalOutcome::Abstain(
-            "the running config declares no origins to observe".to_string(),
-        );
-    }
+    // Nothing left to be blind to and nothing unhealthy. `observed ==
+    // 0` here means the config declares no upstream-bearing origin at
+    // all, which is vacuously healthy rather than unknown: there is no
+    // upstream that could be down, and unlike the unobserved case above
+    // nothing is hidden.
     SignalOutcome::Pass
+}
+
+/// Whether one action forwards to an upstream at all.
+///
+/// Exhaustive by construction, so a new [`sbproxy_modules::Action`]
+/// variant cannot be added without deciding which side of this line it
+/// falls on. The distinction matters because the two answers are not
+/// "observed" and "unobserved" but "there is an upstream I cannot see"
+/// and "there is no upstream": only the first may make this signal
+/// abstain.
+#[must_use]
+pub(crate) fn bears_an_upstream(action: &sbproxy_modules::Action) -> bool {
+    use sbproxy_modules::Action;
+    match action {
+        // Forwards somewhere.
+        Action::Proxy(_)
+        | Action::LoadBalancer(_)
+        | Action::AiProxy(_)
+        | Action::WebSocket(_)
+        | Action::Grpc(_)
+        | Action::GraphQL(_)
+        | Action::Storage(_)
+        | Action::A2a(_)
+        | Action::Mcp(_)
+        // A plugin is dynamic dispatch into third-party code: this
+        // cannot see what it dials, and "I cannot see" is exactly the
+        // unobserved answer.
+        | Action::Plugin(_) => true,
+        // Answers from this process. No upstream exists, so none can be
+        // unhealthy. `proxy.synthetic_probe` requires its origin to be
+        // one of these.
+        Action::Redirect(_)
+        | Action::Static(_)
+        | Action::Echo(_)
+        | Action::Mock(_)
+        | Action::Beacon(_)
+        | Action::Noop => false,
+    }
 }
 
 /// The request-outcome signal.
@@ -720,8 +758,15 @@ pub(crate) fn judge(
     // downgrades to an absence here, and an operator-declared probe,
     // which dials a real URL the operator chose, is unaffected
     // (WOR-2458 fix round, Blocker 3).
+    // An operator who set `require_upstream_health: false` has said they
+    // are not judging on upstream health, so there is nothing for a
+    // synthetic pass to be masking and the downgrade does not apply.
     let synthetic = match window.synthetic_probe.as_ref() {
-        Some(ProbeObservation::Ok) if !health.unobserved.is_empty() => None,
+        Some(ProbeObservation::Ok)
+            if config.require_upstream_health && !health.unobserved.is_empty() =>
+        {
+            None
+        }
         other => other,
     };
     let reports = vec![
@@ -815,9 +860,23 @@ fn finish(window: &SoakWindow) -> SoakOutcome {
         SoakVerdict::Inconclusive => tracing::warn!(
             revision = window.revision,
             digest = %window.digest,
+            abstentions = %reports
+                .iter()
+                .map(|(signal, outcome)| format!(
+                    "{}: {}",
+                    signal.as_str(),
+                    outcome.detail().unwrap_or("no detail")
+                ))
+                .collect::<Vec<_>>()
+                .join("; "),
             "every soak signal abstained, so this window measured nothing: the revision is \
-             neither promoted nor failed. enable the synthetic probe driver or declare a \
-             soak probe on a node this quiet",
+             neither promoted nor failed and this node still has no rollback target. the \
+             abstentions above say which kind of nothing it is. if upstream_health abstained, \
+             the synthetic probe driver alone cannot fix it: its origin is a non-network \
+             action, so its pass says nothing about your upstreams and is discarded while \
+             this signal is blind. declare soak.probe.url against a real upstream, or give \
+             the origin a health_check, circuit_breaker, or outlier_detection block, or set \
+             require_upstream_health: false to judge without it",
         ),
     }
     SoakOutcome {
@@ -934,10 +993,21 @@ pub(crate) fn sample_upstream_health_of(
             |origin| format!("{}/{}", origin.workspace_id, origin.origin_id),
         );
         let sbproxy_modules::Action::LoadBalancer(load_balancer) = action else {
-            // Every other action type (`proxy`, `ai_proxy`, `static`,
-            // ...) carries no health instrumentation at all, so this
-            // signal has nothing to say about it and must say so.
-            sample.unobserved.push(identity);
+            if bears_an_upstream(action) {
+                // A `proxy`, `ai_proxy`, `grpc`, ... origin forwards
+                // somewhere and carries no health instrumentation, so
+                // this signal has something to be blind to and must say
+                // so.
+                sample.unobserved.push(identity);
+            }
+            // A non-network action has no upstream at all: it cannot be
+            // unhealthy and it hides nothing, so it belongs in neither
+            // column. Counting one as unobserved was not a rounding
+            // error, it was the ticket's own scenario breaking:
+            // `proxy.synthetic_probe` *requires* its origin to be one of
+            // these, so every node running the driver had the very
+            // signal the driver feeds poisoned by the driver's own
+            // origin (re-review, WOR-2458 coverage).
             continue;
         };
         let breakers = load_balancer.circuit_breakers.as_ref();
@@ -1356,6 +1426,31 @@ mod tests {
         // An operator-declared probe dials a real URL the operator
         // chose, so it does promote.
         quiet.operator_probe = Some(ProbeObservation::Ok);
+        let (verdict, _) = judge(
+            &quiet,
+            RequestCounts {
+                requests: 4,
+                errors: 0,
+            },
+            &opaque("shop/api"),
+        );
+        assert_eq!(verdict, SoakVerdict::Successful);
+    }
+
+    /// The documented escape from a permanently inconclusive node: an
+    /// operator who turns the upstream-health signal off has said they
+    /// are not judging on it, so there is nothing for a synthetic pass
+    /// to mask and it promotes again.
+    #[test]
+    fn turning_the_upstream_signal_off_lets_the_synthetic_driver_promote_again() {
+        let mut quiet = window(
+            ConfigSoakConfig {
+                require_upstream_health: false,
+                ..soak(50)
+            },
+            Vec::new(),
+        );
+        quiet.synthetic_probe = Some(ProbeObservation::Ok);
         let (verdict, _) = judge(
             &quiet,
             RequestCounts {

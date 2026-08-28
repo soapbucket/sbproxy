@@ -974,6 +974,7 @@ mod tests {
             SourceCycle::Invalid,
             SourceCycle::CompileFailed,
             SourceCycle::ReloadBusy,
+            SourceCycle::Suspended,
         ]
         .iter()
         .map(|cycle| cycle.as_str())
@@ -990,6 +991,7 @@ mod tests {
                 "invalid",
                 "compile_failed",
                 "reload_busy",
+                "suspended",
             ],
         );
     }

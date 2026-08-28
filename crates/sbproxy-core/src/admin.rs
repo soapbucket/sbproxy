@@ -3538,10 +3538,29 @@ fn handle_config_fallback_clear(state: &AdminState) -> (u16, &'static str, Strin
     // reading that says everything is fine. So the clear applies the
     // file itself, through the same path `POST /admin/reload` uses
     // (WOR-2459 fix round, Major 9).
-    let reload = state
-        .config_path
-        .as_ref()
-        .map(|path| crate::server::reload_from_config_path(&path.to_string_lossy()));
+    let reload = state.config_path.as_ref().map(|path| {
+        let outcome = crate::server::reload_from_config_path(&path.to_string_lossy());
+        // Audited here, at the admin call site, with the actor the HTTP
+        // layer has. `reload_from_config_path` stamps its own entry under
+        // `source: "file_watcher"`, which is right for a filesystem event
+        // and wrong for the single most consequential operator action in
+        // this feature: clearing the pin is a deliberate recovery, and
+        // the audit trail has to name who did it rather than blame the
+        // watcher (re-review, new Minor 7).
+        let mut entry =
+            sbproxy_observe::ConfigAuditEntry::new("api", Vec::new(), Vec::new(), Vec::new());
+        if let Some(actor) = current_admin_actor() {
+            entry = entry.with_actor(actor);
+        }
+        if let Err(error) = &outcome {
+            entry = entry.with_rejection_reason(crate::path_redact::sanitise_path_in_error(
+                &format!("{error:#}"),
+                path,
+            ));
+        }
+        entry.emit();
+        outcome
+    });
     let (reloaded, reload_error) = match reload {
         Some(Ok(_)) => (true, None),
         Some(Err(error)) => (

@@ -1233,6 +1233,73 @@ impl RevisionStore {
         Ok(candidate)
     }
 
+    /// Refuse this ring when any file in it is readable or writable by
+    /// anyone but its owner.
+    ///
+    /// The boot fallback is the first thing in the process that turns
+    /// ring content into *executing* configuration, and the ring is
+    /// trusted purely by filesystem location: the blobs are unsigned and
+    /// `index.json` is unauthenticated. Two properties carry that trust.
+    ///
+    /// **Ownership.** [`Self::open`] runs `create_private_dir_all`,
+    /// which `chmod`s the directory to `0700`. On every Unix only the
+    /// file's owner or root may `chmod` it, so an open that succeeded has
+    /// already proved the process owns the directory. That is why there
+    /// is no `geteuid` here and why only the permission half is left.
+    ///
+    /// **Exclusivity.** Any group or other bit on `index.json`, its
+    /// backup, or a blob means somebody else could have written the
+    /// document this node is about to boot on. This store never creates
+    /// a file that way ([`create_private_file`] opens at `0600`), so a
+    /// bit set here was set from outside, and refusing is the only safe
+    /// reading of it.
+    ///
+    /// Lives on the store rather than in the caller so it reads the same
+    /// [`INDEX_FILE`], [`INDEX_BACKUP_FILE`], and [`BLOBS_DIR`] constants
+    /// the writer uses: a layout rename moves both together instead of
+    /// quietly turning the guard into a no-op. Non-Unix targets have no
+    /// mode to inspect and this is a no-op there, stated rather than
+    /// silently true.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RevisionStoreError::Corrupt`] naming the offending file
+    /// and its mode.
+    #[cfg(unix)]
+    pub fn refuse_shared_files(&self) -> Result<(), RevisionStoreError> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mut checked = vec![
+            self.directory.join(INDEX_FILE),
+            self.directory.join(INDEX_BACKUP_FILE),
+        ];
+        if let Ok(listing) = std::fs::read_dir(self.directory.join(BLOBS_DIR)) {
+            checked.extend(listing.flatten().map(|entry| entry.path()));
+        }
+        for path in checked {
+            let Ok(metadata) = std::fs::metadata(&path) else {
+                continue;
+            };
+            let mode = metadata.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                return Err(RevisionStoreError::Corrupt(format!(
+                    "{} is mode {mode:o}; a ring a node is about to boot from must be \
+                     readable and writable by its owner only, and this one is not, so its \
+                     contents cannot be trusted as configuration",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// No mode to inspect on a non-Unix target. See the Unix version for
+    /// what this checks and why.
+    #[cfg(not(unix))]
+    pub fn refuse_shared_files(&self) -> Result<(), RevisionStoreError> {
+        Ok(())
+    }
+
     /// Every stored rejected candidate, oldest refusal first.
     ///
     /// Ordered by `last_seen_at`, the same key eviction uses: a
@@ -2098,6 +2165,58 @@ mod tests {
                 .any(|entry| entry.revision == newer_broken.revision),
             "a failed revision is demoted, not deleted",
         );
+    }
+
+    /// Re-review, new Major 1. The Major-12 security control shipped with
+    /// no test on its refusal path: nothing had ever watched it fire. It
+    /// also hard-coded this module's file names across a crate boundary,
+    /// where a layout rename would have turned it into a silent no-op.
+    /// It lives here now, beside the constants it reads.
+    #[cfg(unix)]
+    #[test]
+    fn a_ring_whose_index_anyone_can_read_is_refused_as_untrusted() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let mut store = RevisionStore::open(temp.path(), 8, None).expect("open");
+        store.append(b"a: 1\n", metadata(1)).expect("append");
+
+        // An ordinary ring, exactly as this store writes it, boots.
+        store
+            .refuse_shared_files()
+            .expect("a 0600/0700 ring is the shape this store creates");
+
+        // Someone widened the index. The store never creates a file that
+        // way, so the bit was set from outside and the contents cannot be
+        // trusted as configuration.
+        let index = temp.path().join(INDEX_FILE);
+        std::fs::set_permissions(&index, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let error = store
+            .refuse_shared_files()
+            .expect_err("a world-readable index must refuse the walk");
+        let rendered = format!("{error}");
+        assert!(rendered.contains(INDEX_FILE), "{rendered}");
+        assert!(rendered.contains("644"), "the mode is named: {rendered}");
+        std::fs::set_permissions(&index, std::fs::Permissions::from_mode(0o600)).expect("restore");
+        store.refuse_shared_files().expect("restored");
+
+        // The same for the backup copy...
+        let backup = temp.path().join(INDEX_BACKUP_FILE);
+        std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o640)).expect("chmod");
+        let error = store
+            .refuse_shared_files()
+            .expect_err("a group-readable backup must refuse the walk");
+        assert!(format!("{error}").contains(INDEX_BACKUP_FILE), "{error}");
+        std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o600)).expect("restore");
+
+        // ... and for a blob, which is the document that would actually
+        // be compiled and served.
+        let digest = store.entries()[0].digest.clone();
+        let blob = blob_path(temp.path(), &digest);
+        std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o666)).expect("chmod");
+        let error = store
+            .refuse_shared_files()
+            .expect_err("a world-writable blob must refuse the walk");
+        assert!(format!("{error}").contains(&digest), "{error}");
     }
 
     /// WOR-2459. A retired entry drops out of the boot walk, and the

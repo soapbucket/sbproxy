@@ -279,7 +279,12 @@ pub fn walk_for_bootable(
     );
     let mut store = RevisionStore::open(&history.dir, history.keep, None)
         .map_err(|error| BootWalkFailure::StoreUnavailable(error.to_string()))?;
-    refuse_a_shared_ring(&history.dir)?;
+    // Asked of the store rather than re-derived here: it reads the same
+    // layout constants the writer uses, so a rename moves both together
+    // (re-review, new Major 1).
+    store
+        .refuse_shared_files()
+        .map_err(|error| BootWalkFailure::StoreUnavailable(error.to_string()))?;
     let candidates = store.boot_candidates();
     if candidates.is_empty() {
         return Err(BootWalkFailure::RingEmpty);
@@ -360,66 +365,6 @@ pub fn walk_for_bootable(
         }
     }
     Err(BootWalkFailure::Exhausted(tried))
-}
-
-/// Refuse a ring directory whose files anyone but the owner can read or
-/// write.
-///
-/// This branch is the first thing in the process that turns ring content
-/// into *executing* configuration, and the ring is trusted purely by
-/// filesystem location: the blobs are unsigned and `index.json` is
-/// unauthenticated. Two properties carry that trust, and both are
-/// checked here rather than assumed.
-///
-/// **Ownership.** [`RevisionStore::open`] runs `create_private_dir_all`,
-/// which `chmod`s the directory to `0700`. On every Unix only the file's
-/// owner or root may `chmod` it, so an open that got this far has
-/// already proved the process owns the directory. That is why there is
-/// no `geteuid` here, and why this function only has the permission half
-/// left to check.
-///
-/// **Exclusivity.** Any group or other bit on `index.json`, its backup,
-/// or a blob means somebody else could have written the document this
-/// node is about to boot on. The store never creates a file that way
-/// (`create_private_file` opens at `0600`), so a bit set here was set
-/// from outside, and refusing is the only safe reading of it.
-///
-/// Non-Unix targets have no mode to inspect and this is a no-op there,
-/// which is stated rather than silently true (WOR-2459 fix round,
-/// Major 12).
-#[cfg(unix)]
-fn refuse_a_shared_ring(directory: &str) -> Result<(), BootWalkFailure> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let root = std::path::Path::new(directory);
-    let mut checked = Vec::new();
-    checked.push(root.join("index.json"));
-    checked.push(root.join("index.json.bak"));
-    if let Ok(listing) = std::fs::read_dir(root.join("blobs")) {
-        checked.extend(listing.flatten().map(|entry| entry.path()));
-    }
-    for path in checked {
-        let Ok(metadata) = std::fs::metadata(&path) else {
-            continue;
-        };
-        let mode = metadata.permissions().mode() & 0o777;
-        if mode & 0o077 != 0 {
-            return Err(BootWalkFailure::StoreUnavailable(format!(
-                "{} is mode {mode:o}; a ring this node is about to boot from must be readable \
-                 and writable by its owner only, and this one is not, so its contents cannot \
-                 be trusted as configuration",
-                path.display()
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// No mode to inspect on a non-Unix target. See the Unix version for
-/// what this checks and why.
-#[cfg(not(unix))]
-fn refuse_a_shared_ring(_directory: &str) -> Result<(), BootWalkFailure> {
-    Ok(())
 }
 
 /// Retire one entry, logging rather than failing: a walk that cannot

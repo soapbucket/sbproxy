@@ -1248,8 +1248,7 @@ const fn default_soak_probe_expect_status() -> u16 {
 /// node that opted into the ring but not into the soak would record
 /// revisions whose `lkg` pointer never moves, which leaves the boot
 /// fallback (`proxy.config_history.boot`) with nothing to boot from. So
-/// this
-/// block defaults on inside a block that defaults off.
+/// this block defaults on inside a block that defaults off.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigSoakConfig {
@@ -1341,8 +1340,21 @@ impl ConfigSoakConfig {
 /// An operator-declared HTTP probe the soak window runs alongside its
 /// other three signals (WOR-2458).
 ///
-/// Deliberately separate from `proxy.synthetic_probe`
-/// (`proxy.synthetic_probe`), which the soak also reads. The synthetic
+/// # This dials whatever URL you name, with no allowlist
+///
+/// The probe client is a plain HTTP client. It does **not** route
+/// through the egress guard that screens the proxy's other outbound
+/// dials, so `url` is a config-reachable fetch to any address this host
+/// can reach, loopback and link-local included. What keeps that bounded
+/// is that `proxy.config_history` sits on
+/// [`crate::config_merge::AUTHORITY_DENIED_PATHS`]: a config-authority
+/// document cannot set this key, so the only writer is an operator with
+/// write access to the node's own configuration file, who can already
+/// point an origin anywhere. Treat it the way you treat an origin URL,
+/// and prefer a loopback health endpoint on this node.
+///
+/// Deliberately separate from `proxy.synthetic_probe`, which the soak
+/// also reads. The synthetic
 /// driver fires an in-process request through the compiled handler chain
 /// against a non-network origin, so a passing run proves the chain
 /// executes and proves nothing about whether any upstream is reachable.
@@ -1451,8 +1463,8 @@ const fn default_boot_success_secs() -> u64 {
 /// that tightened validation. Borrowed from systemd-boot's boot
 /// counting: `boot_attempts` on the entry being tried is incremented on
 /// disk *before* the attempt and cleared once the process has bound its
-/// listeners and served for [`Self::success_secs`]. An entry that fails
-/// [`Self::max_attempts`] times is retired as unbootable and the walk
+/// listeners and served for `success_secs`. An entry that fails
+/// `max_attempts` times is retired as unbootable and the walk
 /// continues down the ring. The ring is finite, so the walk terminates.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1551,8 +1563,8 @@ pub struct ConfigHistoryConfig {
     pub keep_rejected: usize,
     /// The soak window a newly applied revision must survive before it
     /// is promoted to last known good (WOR-2458). Defaults to a soak
-    /// that is on; see [`ConfigSoakConfig`] for why an opt-in block
-    /// defaults its soak on.
+    /// that is on; see the `soak` block's own documentation for why an
+    /// opt-in block defaults its soak on.
     #[serde(default)]
     pub soak: ConfigSoakConfig,
     /// What this node does when the config it was told to boot on does

@@ -950,14 +950,18 @@ per-signal labels to find out which kind of nothing it is:
 
 * `signal="request_outcome",verdict="abstain"` means too little traffic.
   Lower `soak.min_requests`, or accept that another signal has to carry it.
-* `signal="upstream_health",verdict="abstain"` means an origin exposes no
-  health signal at all. A `type: proxy` origin with no `health_check:`,
-  `circuit_breaker:`, or `outlier_detection:` block is invisible to this
-  soak, and it will not report health it never looked for. While that is
-  true, `proxy.synthetic_probe` alone cannot promote either, because the
-  synthetic origin is a non-network action and its pass says nothing about
-  your upstreams. Declare `soak.probe.url` against a real upstream, or give
-  the origin one of the three health blocks.
+* `signal="upstream_health",verdict="abstain"` means a forwarding origin
+  exposes no health signal at all. A `type: proxy` origin with no
+  `health_check:`, `circuit_breaker:`, or `outlier_detection:` block is
+  invisible to this soak, and it will not report health it never looked
+  for. While that is true, `proxy.synthetic_probe` alone cannot promote
+  either, because the synthetic origin is a non-network action and its pass
+  says nothing about your upstreams. Three ways out, all named in the
+  warning: declare `soak.probe.url` against a real upstream, give the origin
+  one of the three health blocks, or set `require_upstream_health: false`.
+  An origin that answers from the proxy itself (`static`, `mock`, `echo`)
+  is not counted here at all, so the synthetic driver's own origin never
+  causes this.
 * `signal="operator_probe",verdict="abstain"` means neither probe is
   running, or the synthetic driver has not produced an outcome yet.
 

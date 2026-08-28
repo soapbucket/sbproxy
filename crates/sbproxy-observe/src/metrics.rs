@@ -3641,6 +3641,7 @@ pub fn record_config_bundle_applied_degraded() {
 /// | `invalid` | The source block, the resolved path, or the resolved document itself is unusable. |
 /// | `compile_failed` | The resolved document did not compile, could not be constructed, or left a node-local `${VAR}` unresolved. |
 /// | `reload_busy` | Another reload held the reload lock; the cycle was skipped and the next interval retries. |
+/// | `suspended` | This node is pinned to a configuration its boot fallback restored, so the poller is deliberately inert (WOR-2459). Its own value rather than `not_modified`: the commit did move, and the operator's fix is being held back rather than absent. |
 pub fn record_config_source_fetch(kind: &'static str, result: &'static str) {
     use prometheus::{register_int_counter_vec, IntCounterVec};
     use std::sync::OnceLock;

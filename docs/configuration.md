@@ -1293,7 +1293,7 @@ The four signals, and what each of them catches:
 | Signal | Source | Catches |
 |---|---|---|
 | Degraded subsystems | The reload's own outcome | A pipeline that published while the key plane, a sink, or the model runtime stayed on prior state. Reports immediately, so a degraded reload fails without waiting the window out. |
-| Upstream health | Per-target circuit breakers, active `health_check:` state, and outlier ejections, across every origin | A config that repointed an origin at a dead address, on a node with almost no traffic. It passes only when it could see every origin: an origin that declares none of the three exposes nothing, and this abstains rather than reporting health it never looked for. |
+| Upstream health | Per-target circuit breakers, active `health_check:` state, and outlier ejections, across every origin that forwards somewhere | A config that repointed an origin at a dead address, on a node with almost no traffic. It passes only when it could see every forwarding origin: one that declares none of the three exposes nothing, and this abstains rather than reporting health it never looked for. An origin that answers from this process (`static`, `mock`, `echo`, `redirect`, `beacon`) has no upstream at all, so it is neither observed nor unobserved, and a config with no forwarding origin passes vacuously. |
 | Request outcome | `sbproxy_requests_total` by status class, plus the upstream retry and timeout counters | A policy that denies everything, an auth block that rejects every caller, a transform that corrupts bodies. |
 | Operator probe | `probe:` above, and `proxy.synthetic_probe` when it is running | Whatever you know and the proxy does not. Both feed this one signal, and either of them failing fails it: a passing synthetic run never covers for an operator probe that is failing. A driver that has not produced an outcome yet, or whose outcome is older than its own `stale_after_secs`, abstains rather than failing, because a driver that has said nothing is not evidence against your config. |
 
@@ -1330,11 +1330,18 @@ revision on a node whose upstreams this soak cannot see. The synthetic
 origin is a non-network action by construction, so a passing run proves
 the compiled handler chain executes and says nothing about whether any
 upstream is reachable. While the upstream-health signal is abstaining
-because an origin exposes no health signal, a synthetic pass is treated
-as an absence rather than as evidence, and the window reaches
-`inconclusive`. Declare a `probe:` that dials a real upstream, or give
-your origins a `health_check:`, a `circuit_breaker:`, or an
-`outlier_detection:` block, and the soak has something to promote on.
+because a forwarding origin exposes no health signal, a synthetic pass is
+treated as an absence rather than as evidence, and the window reaches
+`inconclusive`. Three things change that, and the `inconclusive` warning
+names all three: declare a `probe:` that dials a real upstream, give the
+origin a `health_check:`, a `circuit_breaker:`, or an
+`outlier_detection:` block, or set `require_upstream_health: false` to
+say you are not judging on upstream health at all.
+
+The driver's own origin does not count against you. `proxy.synthetic_probe`
+requires a non-network origin, which has no upstream to be blind to, so a
+node whose origins are all non-network reaches a real verdict on the
+driver alone.
 
 On a node with little organic traffic, turn on `proxy.synthetic_probe`.
 Flagger's field experience is the
@@ -7502,6 +7509,7 @@ The interval carries jitter, so a fleet that restarts together does not hit your
 | `confine` unset and the document reaches for this host | Serve it, and warn once naming the source and the first finding. |
 | Resolved document does not compile or cannot be constructed | Refuse the document. `compile_failed`. |
 | Another reload in flight | Skip the cycle. `reload_busy`. |
+| This node is pinned to a fallback configuration | Skip the cycle, and say which commit is being held back. `suspended`. |
 | Resolved commit unchanged | Nothing at all. `not_modified`. |
 
 **Observability.** `sbproxy_config_source_fetch_total{kind,result}` counts one label per cycle, and `sbproxy_config_source_revision_info{sha}` carries the commit currently serving as a label with a constant value of `1`, so you can join "which config" onto every other series from that node.
