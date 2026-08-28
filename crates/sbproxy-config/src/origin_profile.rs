@@ -996,7 +996,17 @@ pub fn validate_origin_defaults(defaults: &Mapping) -> Result<(), OriginResolveE
 }
 
 /// [`validate_origin_defaults`] with the caller saying whether this
-/// document declares an extension bundle source. See [`UnknownTypes`].
+/// document declares an extension bundle source.
+///
+/// A `type:` this build does not recognize is a refusal when the answer
+/// is `false` and a warning when it is `true`. The built-in
+/// `KNOWN_POLICY_TYPES` is not the whole vocabulary: an installed
+/// extension bundle provides types that are by construction absent from
+/// it, and nothing here can resolve the installed set, because bundle
+/// sources are paths and URLs this crate deliberately does not fetch. A
+/// document that declares no source has no way to acquire such a type,
+/// so an unrecognized one there is a typo; a document that declares one
+/// may legitimately name a type only the running proxy can see.
 ///
 /// # Errors
 ///
@@ -1216,7 +1226,11 @@ pub fn validate_origin_sources(sources: &OriginSourcesConfig) -> Result<(), Orig
 ///
 /// Split out rather than folded in because `compile_config` is the only
 /// caller that can answer that question, and every other caller (a test,
-/// a tool reading one block) legitimately cannot. See [`UnknownTypes`].
+/// a tool reading one block) legitimately cannot.
+///
+/// The flag governs an unrecognized `policies:` or `transforms:`
+/// `type:` in an entry's `overrides:`, the same way it does for
+/// `origin_defaults`; see [`validate_origin_defaults_with`].
 ///
 /// # Errors
 ///
