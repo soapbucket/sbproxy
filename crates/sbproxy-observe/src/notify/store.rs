@@ -572,9 +572,10 @@ pub(super) fn validate_subscription(
             return Err(NotifyError::Invalid {
                 field: "event_types",
                 detail: format!(
-                    "{candidate:?}* selects a per-request lifecycle event, which is one \
-                     webhook delivery per request; name the events you want, or set \
-                     allow_firehose: true to say you meant it"
+                    "{:?} selects a per-request lifecycle event, which is one webhook \
+                     delivery per request; name the events you want, or set \
+                     allow_firehose: true to say you meant it",
+                    sanitize_filter(filter)
                 ),
             });
         }

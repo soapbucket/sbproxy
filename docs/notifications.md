@@ -70,6 +70,7 @@ curl -s -u admin:admin -X POST \
     "event_types": ["key_minted", "key_revoked", "agent_registration_decided"],
     "signing_key_id": "k_01J8ZK5R3TA6P8N4M2K0J9H7G5",
     "active": true,
+    "allow_firehose": false,
     "created_at": "2026-08-27T10:14:03Z",
     "updated_at": "2026-08-27T10:14:03Z"
   },
