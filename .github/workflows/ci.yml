@@ -355,13 +355,6 @@ jobs:
       # scripts/check.sh until now. notice_coverage.py is the parser
       # behind the check-notice step below, so a regression there made
       # that step pass vacuously with nothing in CI able to say so.
-      # TEMPORARY, REVERTED IN THE NEXT COMMIT. Reproduces C1 in the
-      # environment that had it: the lint job's checkout has no
-      # fetch-depth, so on a pull_request event no base resolves. Before
-      # the fix this printed a note and exited 0. It must now fail.
-      - name: C1 PROOF - ratchet in a shallow checkout must fail closed
-        run: bash scripts/check-stack-budget-ratchet.sh
-
       - name: gate helper self-tests
         run: |
           bash scripts/tests/workspace_bin_test.sh
