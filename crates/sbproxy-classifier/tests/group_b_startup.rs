@@ -15,6 +15,72 @@ const PIPE_CAPTURE_BYTES: usize = 16 * 1024;
 const HTTP_CAPTURE_BYTES: usize = 1024 * 1024;
 const EXTERNAL_WAIT: Duration = Duration::from_secs(5);
 
+/// How long the very first exec of the shipped binary may take.
+///
+/// Two orders of magnitude above `EXTERNAL_WAIT` on purpose: this bounds an
+/// operating-system assessment, not anything this workspace computes.
+const FIRST_EXEC_WAIT: Duration = Duration::from_secs(120);
+
+/// Pay the shipped binary's first-exec cost once, on its own thread, with a
+/// deadline.
+///
+/// On macOS the FIRST exec of a freshly linked Mach-O blocks inside
+/// `posix_spawn` while `syspolicyd` assesses the binary's provenance and
+/// caches the verdict by cdhash. The block is in the PARENT and it happens
+/// before any of the child's own code runs, so it is invisible to every
+/// deadline in this file: they all start counting after `spawn` returns.
+/// That is why the two listener tests below stalled for more than thirty
+/// minutes on a cold binary on one machine and then passed in 0.3 seconds on
+/// the retry that found the verdict cached. Nothing in the test was slow;
+/// the test never started.
+///
+/// So the wait is moved here, where it can be bounded and named. `--help` is
+/// what gets executed: clap answers it and exits, so if the deadline is
+/// exceeded and this process leaves the exec behind, what it leaves behind
+/// terminates on its own and holds no listener.
+///
+/// This never skips anything. On timeout it fails, loudly, with the
+/// diagnosis, and the run that follows it finds a warm cache.
+fn warm_shipped_binary() {
+    static WARM: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    WARM.get_or_init(|| {
+        let started = Instant::now();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let status = Command::new(env!("CARGO_BIN_EXE_sbproxy-classifier"))
+                .arg("--help")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let _ = sender.send(status);
+        });
+        match receiver.recv_timeout(FIRST_EXEC_WAIT) {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                panic!("the shipped classifier binary could not be executed at all: {error}")
+            }
+            Err(_) => panic!(
+                "the shipped classifier binary did not answer `--help` within {}s \
+                 (waited {}s).\n\
+                 \n\
+                 This is almost certainly not a bug in this test. On macOS the first \
+                 exec of a freshly linked binary blocks in posix_spawn while \
+                 syspolicyd assesses its provenance, and a wedged daemon turns that \
+                 into tens of minutes. Confirm it with `ps aux | grep -iE \
+                 'syspolicyd|XprotectService'` (sustained CPU) and `sample <pid>` on \
+                 a stuck child (parked at _dyld_start +0).\n\
+                 \n\
+                 Clear it with `sudo spctl --global-disable` (no reboot; re-enable \
+                 with --global-enable) or by rebooting, then run this test again. \
+                 The verdict is cached by cdhash, so the second exec is instant.",
+                FIRST_EXEC_WAIT.as_secs(),
+                started.elapsed().as_secs()
+            ),
+        }
+    });
+}
+
 #[derive(Debug)]
 struct Capture {
     retained: Vec<u8>,
@@ -709,6 +775,7 @@ signal.pause()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shipped_binary_uses_production_http_tcp_and_grpc_startup_owners() {
+    warm_shipped_binary();
     let addresses = reserve_addresses(4);
     let (grpc, public, admin, http) = (addresses[0], addresses[1], addresses[2], addresses[3]);
     let token_dir = tempfile::tempdir().expect("admin token tempdir creates");
@@ -802,6 +869,7 @@ async fn shipped_binary_uses_production_http_tcp_and_grpc_startup_owners() {
 /// shipped code path is the executor's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shipped_binary_bounds_public_classify_with_its_configured_inference_deadline() {
+    warm_shipped_binary();
     let addresses = reserve_addresses(4);
     let (grpc, public, admin, http) = (addresses[0], addresses[1], addresses[2], addresses[3]);
     let token_dir = tempfile::tempdir().expect("admin token tempdir creates");

@@ -1512,6 +1512,19 @@ hooks:
         assert_eq!(auth.auth_type(), "hmac_auth");
     }
 
+    #[test]
+    fn compile_auth_hmac_accepts_require_body_digest_and_memory_nonce_store() {
+        let json = serde_json::json!({
+            "type": "hmac_auth",
+            "require_body_digest": true,
+            "nonce_store": "memory",
+            "keys": [{"key_id": "svc-a", "secret": "0011223344556677"}]
+        });
+        let auth =
+            compile_auth(&json).expect("hmac_auth compiles with body-digest and nonce knobs");
+        assert_eq!(auth.auth_type(), "hmac_auth");
+    }
+
     /// WOR-2667: the three providers ported out of the enterprise tree
     /// are built-ins now. Before this, each of these configs compiled
     /// only in a binary that had linked a plugin crate registering the

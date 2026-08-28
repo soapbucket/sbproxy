@@ -2571,6 +2571,60 @@
         }
       ],
       "description": "Concrete weighted prompt-version selections made before the existing renderer on real AI requests. `success` means the selected version reached normal rendering; invalid or missing rollout state stays visible without putting prompt names, prompt content, raw cohort keys, or request IDs in metric labels."
+    },
+    {
+      "id": 44,
+      "title": "Held Tool Frames Discarded",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 189
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "bars",
+            "pointSize": 5,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (cause) (rate(sbproxy_ai_stream_tool_frames_discarded_total[5m]))",
+          "legendFormat": "{{cause}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Tool-call frames an enforcing ai_tool_call hook or an agent-alignment guard held back that never reached the client. cause=blocked is by design: a guardrail or extension ended the stream and the held frames went with it. cause=unjudged should be flat zero; any rate there means a client received an assistant turn whose tool call the gateway silently deleted. Runbook: docs/operator-runbook.md#ai-gateway. When unjudged is non-zero, check the stream for an upstream that ends without a finish_reason and confirm the guard session is judging every call."
     }
   ],
   "templating": {

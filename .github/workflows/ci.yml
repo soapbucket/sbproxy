@@ -324,54 +324,6 @@ jobs:
           bash scripts/check-metrics-stability.sh
           bash scripts/check-decision-contract.sh
 
-      # dead_code cannot see a `pub` item inside a `pub mod` of a library
-      # crate, so write-only code lands with a green build. This ratchet
-      # stops the count from growing while the existing backlog is worked
-      # down. Runs without the enterprise cross-check, which is fine: the
-      # count is the same either way, and the cross-check only matters
-      # before a deletion.
-      - name: no new pub items whose only consumer is a test (WOR-2065)
-        run: bash scripts/check-pub-item-ratchet.sh
-
-      # The pub-item ratchet's twin, and until now the only one of the
-      # pair that ran here. `scripts/check.sh` ran both, so the local gate
-      # was the only place an added `.unwrap()` was refused, and a branch
-      # that never ran it merged green: #1185 landed with main at 784
-      # against a committed baseline of 782, and every branch that merged
-      # main afterwards inherited the red for about two hours. A ratchet
-      # nothing enforces at the merge is a number in a file.
-      #
-      # In this job rather than a lane of its own because it is pure
-      # python over the source tree, it shares the ratchet vocabulary with
-      # the step above, and a reviewer reading either failure wants the
-      # other's count in the same log.
-      - name: no new unwrap/expect/panic in production code (WOR-2252)
-        run: bash scripts/check-unwrap-ratchet.sh
-
-      # The third ratchet of the same family, and the same reason for
-      # living in this job: pure python over the source tree, sharing the
-      # ratchet vocabulary with the two steps above.
-      #
-      # An operator URL at a log line is a credential in whatever system
-      # collects those logs: the password sits in the authority and a
-      # Slack or Teams webhook's secret sits in the path. The second count
-      # this script holds is at zero rather than at a backlog, because
-      # `error = %e` on a `reqwest::Error` writes the request URL out of
-      # the error's own Display with no `url` field in sight, and every
-      # site the detector can see was converted (WOR-2629, WOR-2640).
-      #
-      # "Every site the detector can see" is the whole claim. The
-      # detector is a proximity heuristic over a fifteen-line window,
-      # extended one hop to same-file helpers that make the request
-      # themselves. It resolves no imports and reads no types, so a
-      # reqwest error laundered through another crate is outside it. The
-      # scanner's module header carries the seen and unseen sets in full,
-      # and the step below runs that scanner's own fixtures plus this
-      # script's, so neither can quietly stop detecting and read as a
-      # clean tree.
-      - name: no new operator URL at a log line (WOR-2629)
-        run: bash scripts/check-log-url-ratchet.sh
-
       - name: install.sh verifies its download (WOR-1914)
         run: sh scripts/tests/install_verify.sh
 
@@ -411,6 +363,7 @@ jobs:
           python3 scripts/tests/test_cert_record.py
           python3 scripts/lib/notice_coverage.py --self-test
           python3 scripts/tests/test_notice_coverage.py
+          python3 scripts/gate-scope.py --self-test
 
       # clippy-driver and rustdoc write artifacts the `test` lane cannot link
       # against, so this job keeps its own cache entry rather than fighting
@@ -507,6 +460,65 @@ jobs:
       # behind a build.
       - name: no hand-rolled secret-reference parsing (WOR-2287)
         run: python3 scripts/check-secret-resolver-drift.py
+
+      # The three ratchets below moved here from the `test` lane on
+      # 2026-08-28. Measured on run 33169288096: they cost 32s, 23s, and
+      # 36s, 91 seconds sitting on the pull request's critical path behind
+      # a 197s workspace build and an 842s nextest run they do not need.
+      # None of them compiles anything; they are python and grep over the
+      # source tree, which is what every other step in this half of the
+      # lane already is. `lint` and `test` share the same
+      # `changes.outputs.code` condition, so nothing runs on fewer pull
+      # requests than before, and `lint` at 386s has fifteen minutes of
+      # slack against `test` at 1272s.
+
+      # dead_code cannot see a `pub` item inside a `pub mod` of a library
+      # crate, so write-only code lands with a green build. This ratchet
+      # stops the count from growing while the existing backlog is worked
+      # down. Runs without the enterprise cross-check, which is fine: the
+      # count is the same either way, and the cross-check only matters
+      # before a deletion.
+      - name: no new pub items whose only consumer is a test (WOR-2065)
+        run: bash scripts/check-pub-item-ratchet.sh
+
+      # The pub-item ratchet's twin, and until now the only one of the
+      # pair that ran here. `scripts/check.sh` ran both, so the local gate
+      # was the only place an added `.unwrap()` was refused, and a branch
+      # that never ran it merged green: #1185 landed with main at 784
+      # against a committed baseline of 782, and every branch that merged
+      # main afterwards inherited the red for about two hours. A ratchet
+      # nothing enforces at the merge is a number in a file.
+      #
+      # In this job rather than a lane of its own because it is pure
+      # python over the source tree, it shares the ratchet vocabulary with
+      # the step above, and a reviewer reading either failure wants the
+      # other's count in the same log.
+      - name: no new unwrap/expect/panic in production code (WOR-2252)
+        run: bash scripts/check-unwrap-ratchet.sh
+
+      # The third ratchet of the same family, and the same reason for
+      # living in this job: pure python over the source tree, sharing the
+      # ratchet vocabulary with the two steps above.
+      #
+      # An operator URL at a log line is a credential in whatever system
+      # collects those logs: the password sits in the authority and a
+      # Slack or Teams webhook's secret sits in the path. The second count
+      # this script holds is at zero rather than at a backlog, because
+      # `error = %e` on a `reqwest::Error` writes the request URL out of
+      # the error's own Display with no `url` field in sight, and every
+      # site the detector can see was converted (WOR-2629, WOR-2640).
+      #
+      # "Every site the detector can see" is the whole claim. The
+      # detector is a proximity heuristic over a fifteen-line window,
+      # extended one hop to same-file helpers that make the request
+      # themselves. It resolves no imports and reads no types, so a
+      # reqwest error laundered through another crate is outside it. The
+      # scanner's module header carries the seen and unseen sets in full,
+      # and the step below runs that scanner's own fixtures plus this
+      # script's, so neither can quietly stop detecting and read as a
+      # clean tree.
+      - name: no new operator URL at a log line (WOR-2629)
+        run: bash scripts/check-log-url-ratchet.sh
 
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
