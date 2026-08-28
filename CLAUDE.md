@@ -41,7 +41,7 @@ ten-minute build.
 | Doctest | `cargo test --workspace --exclude sbproxy-e2e --locked --doc` |
 | Clippy | `cargo clippy --workspace --all-targets -- -D warnings` |
 | Docs | `RUSTDOCFLAGS="-D warnings -D missing_docs" cargo doc --workspace --no-deps --locked` |
-| Payment features (opt-in) | `SBPROXY_CHECK_PAYMENTS=1 bash scripts/check.sh` |
+| Payment features (on by default) | `bash scripts/check.sh`; `SBPROXY_CHECK_PAYMENTS=0` skips it |
 
 Two rows in that table are easy to get subtly wrong.
 
@@ -127,7 +127,7 @@ section.
 |---|---|
 | `SBPROXY_RELEASE_TESTS=1` | compile test binaries in release mode |
 | `SBPROXY_CHECK_E2E=1` | include the `sbproxy-e2e` package |
-| `SBPROXY_CHECK_PAYMENTS=1` | clippy + test the settlement feature union |
+| `SBPROXY_CHECK_PAYMENTS=0` | skip the settlement feature union (it runs by default) |
 | `SBPROXY_CLEAN_AFTER_BUILD=0` | keep every build artifact after the run |
 | `SBPROXY_ALLOW_DIRTY_TREE=1` | do not fail on an uncommitted working tree |
 | `SBPROXY_ALLOW_CARGO_TEST_FALLBACK=1` | permit the serial `cargo test` fallback |

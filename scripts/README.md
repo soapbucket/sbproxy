@@ -32,12 +32,16 @@ lane to keep local disk growth bounded. Set `SBPROXY_RELEASE_TESTS=1`
 for release-profile test binaries and `SBPROXY_CHECK_E2E=1` when you
 need to include the full e2e package locally.
 
-`SBPROXY_CHECK_PAYMENTS=1` adds the settlement feature union, which no
-other phase compiles because no payment feature is in any default set.
-CI requires the matching `payments` lane, so leaving it off is a real
-gap rather than a shortcut, and the run says so in `SKIPPED PHASES`. It
-is opt-in only because that union recompiles the graph instead of
-reusing the rest of the gate's artifacts.
+The settlement feature union runs by default. No other phase compiles it,
+because no payment feature is in any default set, and CI requires the
+matching `payments` lane. It was opt-in until an
+`clippy::items_after_test_module` failure landed on main from a lane no
+local run had ever executed, which is what an env var everyone forgets
+buys you. `SBPROXY_CHECK_PAYMENTS=0` still skips it, and the run reprints
+that choice in `SKIPPED PHASES` naming the CI lanes that will catch what
+was missed. The union recompiles the graph rather than reusing the rest of
+the gate's artifacts, so `--scope-to-diff` drops it when no Rust file
+changed.
 
 It fails when the working tree is dirty at the end of the run, because
 the gate validates the working tree while `git push` ships HEAD. Set

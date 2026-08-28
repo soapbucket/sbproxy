@@ -29,9 +29,15 @@
 #                                        flavor this gate does not build are
 #                                        skipped with the build command that
 #                                        would enable them (WOR-2291).
-#   SBPROXY_CHECK_PAYMENTS=1             clippy + test the settlement feature
-#                                        union (a required CI lane; see that
-#                                        phase for why it is opt-in here)
+#   SBPROXY_CHECK_PAYMENTS=0             skip the settlement feature union.
+#                                        It runs by DEFAULT: it is a required
+#                                        CI lane and the only place
+#                                        clippy::items_after_test_module and
+#                                        the feature-gated half of
+#                                        sbproxy-billing are compiled at all.
+#                                        Setting this to 0 is a deliberate
+#                                        choice and is reprinted in the
+#                                        SKIPPED PHASES block.
 #   SBPROXY_CLEAN_AFTER_BUILD=0          keep all build artifacts after the run
 #   SBPROXY_ALLOW_DIRTY_TREE=1           do not fail on an uncommitted tree
 #   SBPROXY_ALLOW_CARGO_TEST_FALLBACK=1  permit the serial cargo test fallback
@@ -1053,24 +1059,30 @@ fi
 # most expensive thing in this file, so every cheaper failure above is found
 # first.
 #
-# Opt-in, and opt-in is not the same as optional. Every cargo call above
-# resolves the workspace's default union, and no payment feature is in any
-# default set, so without this phase the gate compiles none of the settlement
-# path: not sbproxy-core's inline settle gate, not the recovery worker or the
+# On by default since 2026-08-28. Every cargo call above resolves the
+# workspace's default union, and no payment feature is in any default set, so
+# without this phase the gate compiles none of the settlement path: not
+# sbproxy-core's inline settle gate, not the recovery worker or the
 # reconciliation sweep in billing_runtime, not the usage bridge's runtime
 # half, and not the feature-gated majority of sbproxy-billing, which is most
-# of that crate plus eleven of its twelve integration test files. That is why
-# the else branch records a skip instead of saying nothing: this is a required
-# CI lane, so a local run without it has not checked what it appears to have
-# checked.
+# of that crate plus eleven of its twelve integration test files.
 #
-# It is opt-in rather than default because the settlement union has a
+# It was opt-in until it cost a CI round trip. The settlement union has a
 # different fingerprint from every cargo call above, so both commands below
-# recompile the graph from scratch and reuse nothing. ci.yml pays the same
-# rebuild by giving the lane its own job and its own cache key.
+# recompile the graph from scratch and reuse nothing, and that price bought
+# an env var everyone forgot. clippy::items_after_test_module then landed on
+# main from a lane no local run had ever executed. A gate whose most
+# expensive check is the one people skip is not measuring what it claims to.
+#
+# `SBPROXY_CHECK_PAYMENTS=0` still skips it, and the skip is reprinted in the
+# SKIPPED PHASES block naming the two CI lanes that will catch what was
+# missed. `--scope-to-diff` skips it too when no Rust file changed, which is
+# the case that made it expensive for no reason.
 if ! phase_wanted PAYMENTS; then
   scope_skip "payment settlement features (clippy + test)"
-elif [ "${SBPROXY_CHECK_PAYMENTS:-0}" = "1" ]; then
+elif [ "${SBPROXY_CHECK_PAYMENTS:-1}" != "1" ]; then
+  note_skip "payment settlement features (SBPROXY_CHECK_PAYMENTS=0 was set explicitly). No other phase in this gate compiles crates/sbproxy-billing's runtime, sbproxy-core's settlement gate, or the ~217 tests inside them, so all of it stayed unbuilt. CI's 'payments' and 'payments clippy (settlement features)' lanes both require it, and they are where clippy::items_after_test_module surfaces."
+else
   # One feature selection for both commands, matching ci.yml's
   # PAYMENT_FEATURES exactly. It names the `sbproxy` binary's flags rather
   # than sbproxy-core's so the union is the released payments binary's:
@@ -1107,8 +1119,6 @@ elif [ "${SBPROXY_CHECK_PAYMENTS:-0}" = "1" ]; then
     note_skip "payment test narrowing (no nextest, so the serial fallback ran the whole workspace selection instead of the three payment-gated crates)"
     cargo test --workspace --exclude sbproxy-e2e --locked --features "$payment_features"
   fi
-else
-  note_skip "payment settlement features (set SBPROXY_CHECK_PAYMENTS=1 to run it). No other phase in this gate compiles crates/sbproxy-billing's runtime, sbproxy-core's settlement gate, or the ~217 tests inside them, so all of it stayed unbuilt. CI requires this lane."
 fi
 
 # Closes the SBPROXY_SKIP_CARGO guard around every cargo phase.
