@@ -52,7 +52,7 @@ use serde::Deserialize;
 /// allowlist key fails the config instead of silently leaving that
 /// control at its default. `type:` is stripped by
 /// `crate::auth::provider_config_from_value` before this parses.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OidcAuth {
     /// IdP `authorization_endpoint`. The proxy redirects
@@ -160,6 +160,49 @@ pub struct OidcAuth {
     /// Operators write it as a nested `attrs:` block in YAML.
     #[serde(default)]
     pub attrs: CredentialAttrs,
+}
+
+/// Redacted `Debug` (WOR-2640). Two reusable secrets live here, and
+/// the field docs above say why each is one: `client_secret` is what
+/// the proxy presents on the token-endpoint POST, and the resolver
+/// substitutes the real value into it, so by the time anything formats
+/// this struct the `vault://` reference is gone and the credential is
+/// in its place. `cookie_secret` signs the session cookie, so reading
+/// it is enough to mint a session for any user.
+///
+/// Every endpoint, the client id, the issuer, and the cookie names
+/// stay: they are what a misconfigured-IdP diagnostic is about and
+/// none authenticates anything.
+impl std::fmt::Debug for OidcAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OidcAuth")
+            .field("authorization_endpoint", &self.authorization_endpoint)
+            .field("token_endpoint", &self.token_endpoint)
+            .field("jwks_uri", &self.jwks_uri)
+            .field("issuer", &self.issuer)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"[REDACTED]")
+            .field("redirect_path", &self.redirect_path)
+            .field("logout_path", &self.logout_path)
+            .field("end_session_endpoint", &self.end_session_endpoint)
+            .field("userinfo_endpoint", &self.userinfo_endpoint)
+            .field(
+                "post_logout_redirect_default",
+                &self.post_logout_redirect_default,
+            )
+            .field(
+                "post_logout_redirect_allowlist",
+                &self.post_logout_redirect_allowlist,
+            )
+            .field("scope", &self.scope)
+            .field("cookie_secret", &"[REDACTED]")
+            .field("session_ttl_secs", &self.session_ttl_secs)
+            .field("tx_ttl_secs", &self.tx_ttl_secs)
+            .field("session_cookie_name", &self.session_cookie_name)
+            .field("tx_cookie_name", &self.tx_cookie_name)
+            .field("attrs", &self.attrs)
+            .finish()
+    }
 }
 
 fn default_redirect_path() -> String {
@@ -355,5 +398,31 @@ mod tests {
         assert_eq!(principal.source, PrincipalSource::Oidc);
         assert_eq!(principal.sub, "ada@example.com");
         assert_eq!(principal.attrs.project.as_deref(), Some("foundation"));
+    }
+
+    /// WOR-2640: the OIDC provider config holds two reusable secrets.
+    /// The resolver substitutes the real `client_secret` into it, so a
+    /// `{:?}` after config load prints the credential rather than the
+    /// `vault://` reference an operator wrote.
+    #[test]
+    fn debug_never_renders_the_oidc_client_or_cookie_secret() {
+        const SENTINEL: &str = "SENTINEL-SECRET-9f3a";
+        let mut auth = OidcAuth::from_config(good_config()).expect("fixture config");
+        auth.client_secret = SENTINEL.to_string();
+        auth.cookie_secret = format!("{SENTINEL}-cookie");
+
+        let rendered = format!("{auth:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "an OIDC secret reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains(&auth.client_id),
+            "the client id must survive so the IdP entry is nameable: {rendered}"
+        );
+        assert!(
+            rendered.contains(&auth.issuer),
+            "the issuer must survive: {rendered}"
+        );
     }
 }

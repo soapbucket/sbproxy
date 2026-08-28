@@ -276,6 +276,19 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+// `put_if_absent_with_ttl` is deliberately left at the erroring
+// default here, which is why this backend reports
+// `supports_atomic_create() == false` and a caller building
+// single-flight on it degrades on purpose (WOR-2609).
+//
+// `O_CREAT | O_EXCL` would give the create half honestly enough. The
+// swap half is the problem: taking over a lapsed claim is a conditional
+// replace of exact bytes, and this store has no conditional replace
+// outside the lock protocol above, which is keyed on a lock token
+// rather than on a payload. A backend with the create half and not the
+// swap half is worse than one with neither, because every key whose
+// holder died wedges permanently instead of degrading to a duplicate
+// call.
 impl KVStore for FileKVStore {
     fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         let path = self.path_for(key);

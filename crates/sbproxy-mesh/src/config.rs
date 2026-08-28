@@ -390,7 +390,7 @@ pub struct CloudDiscoveryConfig {
 
 /// Consul service-catalog-based peer discovery. Mirrors
 /// [`crate::discovery::consul::ConsulDiscovery`].
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct ConsulDiscoveryConfig {
     /// Consul HTTP API address.
     pub addr: String,
@@ -402,6 +402,21 @@ pub struct ConsulDiscoveryConfig {
     /// ACL token for the Consul API, if the cluster requires one.
     #[serde(default)]
     pub token: Option<String>,
+}
+
+/// Redacted `Debug` (WOR-2606). A Consul ACL token reads and writes the
+/// service catalog this mesh discovers its peers through. The
+/// address, the service name and the datacenter stay: they name which
+/// Consul a failed discovery was talking to.
+impl std::fmt::Debug for ConsulDiscoveryConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConsulDiscoveryConfig")
+            .field("addr", &self.addr)
+            .field("service", &self.service)
+            .field("datacenter", &self.datacenter)
+            .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .finish_non_exhaustive()
+    }
 }
 
 // --- EncryptionConfig ---
@@ -767,5 +782,32 @@ swim_suspect_timeout_secs: 2
         assert_eq!(cfg.swim_ping_timeout_ms, 50);
         assert_eq!(cfg.swim_indirect_probes, 4);
         assert_eq!(cfg.swim_suspect_timeout_secs, 2);
+    }
+
+    /// The Consul ACL token, pinned (WOR-2606).
+    ///
+    /// It reads and writes the service catalog this mesh discovers its
+    /// peers through. Discovery failures are logged with the config in
+    /// hand, which is what formats this.
+    #[test]
+    fn debug_never_renders_the_consul_acl_token() {
+        const SENTINEL: &str = "SENTINEL-CONSUL-1a55";
+
+        let consul = ConsulDiscoveryConfig {
+            addr: "http://consul.internal:8500".to_string(),
+            service: "sbproxy".to_string(),
+            datacenter: Some("dc1".to_string()),
+            token: Some(SENTINEL.to_string()),
+        };
+        let rendered = format!("{consul:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the Consul ACL token reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("consul.internal:8500") && rendered.contains("dc1"),
+            "the address and datacenter must survive: they name which Consul \
+             a failed discovery was talking to: {rendered}"
+        );
     }
 }

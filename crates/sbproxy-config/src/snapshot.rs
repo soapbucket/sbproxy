@@ -131,7 +131,8 @@ pub struct CompiledOrigin {
     /// `/.well-known/web-bot-auth/agent-card`. See
     /// [`WebBotAuthPublishConfig`].
     pub web_bot_auth_publish: Option<WebBotAuthPublishConfig>,
-    /// RFC 8594-style idempotency middleware configuration. When
+    /// `Idempotency-Key` middleware configuration, per
+    /// `draft-ietf-httpapi-idempotency-key-header`. When
     /// `Some` with `enabled = true`, the request body filter buffers
     /// the request body for the configured methods, hashes it, and
     /// short-circuits cache hits / conflicts before the action runs.

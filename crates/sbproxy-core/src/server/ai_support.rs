@@ -3304,13 +3304,20 @@ pub(super) enum AiIdempotencyEngagement {
     /// Cache hit with a different body hash. The 409 conflict body
     /// has already been written to the session. Caller short-circuits.
     Conflict,
+    /// Another request holds this key and did not publish inside the
+    /// wait budget. The 409 in-flight body has already been written to
+    /// the session; the caller short-circuits without contacting a
+    /// provider (WOR-2609).
+    InFlight,
     /// Cache miss. The caller proceeds with the upstream call, then
     /// invokes `record_ai_idempotency` with the captured response so
     /// the next retry hits the cache.
     Miss {
         idem: std::sync::Arc<crate::pipeline::CompiledIdempotency>,
-        workspace_id: String,
-        key: String,
+        /// The held claim on the key. Publishing through
+        /// [`AiIdempotencyCapture::record`] consumes it; dropping it
+        /// releases the key so the next retry is not left waiting.
+        claim: sbproxy_middleware::idempotency::IdempotencyClaim,
         body_hash: [u8; 32],
         /// Permit on the per-origin pool semaphore. Held until the
         /// response side records (or abandons) the capture; dropped
@@ -3407,12 +3414,20 @@ pub(super) async fn engage_ai_idempotency(
     };
 
     let workspace_id = pipeline.config.origins[origin_idx].workspace_id.to_string();
-    let outcome = sbproxy_middleware::idempotency::check_request(
-        idem.cache.as_ref(),
+    // WOR-2609: this takes the key rather than reading it, and a request
+    // that finds another one holding it waits for that response instead
+    // of calling the provider a second time. Boxed because the AI
+    // request path sits at the worker's stack budget and an inline
+    // future here grows every caller's state machine.
+    let outcome = Box::pin(sbproxy_middleware::idempotency::check_request(
+        &idem.cache,
         &workspace_id,
         &session.req_header().headers,
         body_bytes,
-    );
+        idem.claim_lease_secs,
+        idem.claim_wait,
+    ))
+    .await;
 
     match outcome {
         sbproxy_middleware::idempotency::IdempotencyOutcome::NotApplicable => {
@@ -3422,18 +3437,25 @@ pub(super) async fn engage_ai_idempotency(
             Ok(AiIdempotencyEngagement::NotApplicable)
         }
         sbproxy_middleware::idempotency::IdempotencyOutcome::CacheHit(response) => {
-            Ok(AiIdempotencyEngagement::Replayed { response })
+            Ok(AiIdempotencyEngagement::Replayed {
+                response: *response,
+            })
         }
         sbproxy_middleware::idempotency::IdempotencyOutcome::Conflict => {
             let (status, content_type, body) = sbproxy_middleware::idempotency::conflict_response();
             send_response(session, status.as_u16(), content_type, &body).await?;
             Ok(AiIdempotencyEngagement::Conflict)
         }
-        sbproxy_middleware::idempotency::IdempotencyOutcome::Miss { key, body_hash } => {
+        sbproxy_middleware::idempotency::IdempotencyOutcome::InFlight => {
+            let (status, content_type, body) =
+                sbproxy_middleware::idempotency::in_flight_response();
+            send_response(session, status.as_u16(), content_type, &body).await?;
+            Ok(AiIdempotencyEngagement::InFlight)
+        }
+        sbproxy_middleware::idempotency::IdempotencyOutcome::Miss { claim, body_hash } => {
             Ok(AiIdempotencyEngagement::Miss {
                 idem,
-                workspace_id,
-                key,
+                claim,
                 body_hash,
                 permit,
             })
@@ -3491,8 +3513,9 @@ pub(super) async fn write_ai_cached_response(
 /// to keep five locals alive across the upstream call.
 pub(super) struct AiIdempotencyCapture {
     pub(super) idem: std::sync::Arc<crate::pipeline::CompiledIdempotency>,
-    pub(super) workspace_id: String,
-    pub(super) key: String,
+    /// The held claim. Dropping the capture without recording releases
+    /// the key rather than leaving retries to wait out the lease.
+    pub(super) claim: sbproxy_middleware::idempotency::IdempotencyClaim,
     pub(super) body_hash: [u8; 32],
     /// Per-origin pool permit held for the lifetime of the capture.
     /// Dropped here (on success or abandonment) so a new buffered
@@ -3504,17 +3527,22 @@ impl AiIdempotencyCapture {
     /// Persist the recorded response under `(workspace_id, key)`.
     /// `body` contains the final client-wire bytes after format adaptation
     /// and reversible restoration, so retries replay byte-identically.
+    /// The publish goes through `record_response_detached` because the
+    /// shared backend's write is a network round trip and this runs on
+    /// a proxy worker (WOR-2609). An in-process backend still writes
+    /// inline, so a caller that publishes and then looks is not racing
+    /// itself.
     pub(super) fn record(self, status: u16, headers: Vec<(String, String)>, body: Vec<u8>) {
-        sbproxy_middleware::idempotency::record_response(
-            self.idem.cache.as_ref(),
-            &self.workspace_id,
-            &self.key,
+        let ttl_secs = self.idem.ttl_secs;
+        let body_hash = self.body_hash;
+        sbproxy_middleware::idempotency::record_response_detached(
+            self.claim,
             sbproxy_middleware::idempotency::RecordedResponse {
                 status,
                 headers,
                 body,
-                body_hash: self.body_hash,
-                ttl_secs: self.idem.ttl_secs,
+                body_hash,
+                ttl_secs,
             },
         );
     }

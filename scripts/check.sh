@@ -324,6 +324,18 @@ batch_durable_file_modes() {
   bash "$ROOT/scripts/check-durable-file-modes.sh"
 }
 
+# CI: ci.yml guards lane, "secret-bearing types do not derive Debug"
+# (WOR-2640). Pure grep over a committed registry, plus fixtures that
+# prove the detector still detects. Every type listed in
+# scripts/secret-debug-registry.txt must keep all three of: no `Debug`
+# in its derive, a hand-written redacting impl, and the test that
+# pushes a sentinel through it. Putting the derive back is a one-line
+# change that compiles and reads like tidying, which is what this
+# stops.
+batch_secret_debug_registry() {
+  bash "$ROOT/scripts/check-secret-debug-registry.sh"
+}
+
 # CI: ci.yml guards lane, "every stable metric has somewhere to be seen".
 # A metric an operator can be alerted on but cannot look at is a gap the
 # registry cannot see: it knows the family exists, not whether any
@@ -389,6 +401,7 @@ run_batch "read-only source and doc scans" \
   batch_spec_citations "spec citation hygiene" \
   batch_env_mutation "no process-global env mutation outside test helpers" \
   batch_durable_file_modes "durable sinks create files owner-only" \
+  batch_secret_debug_registry "secret-bearing types do not derive Debug" \
   batch_metric_visibility "every stable metric has a dashboard panel (ratchet)" \
   batch_notice_coverage "NOTICE covers Apache-2.0-only crates" \
   batch_secret_resolver_drift "secret-resolver drift (no new ad-hoc secret parsers)" \

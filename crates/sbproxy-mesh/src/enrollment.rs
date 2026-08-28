@@ -224,7 +224,7 @@ impl IssuedEnrollmentToken {
 }
 
 /// Bounded public request sent from a worker to the authority.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EnrollmentRequest {
     /// One-time token.
@@ -237,6 +237,30 @@ pub struct EnrollmentRequest {
     pub labels: BTreeMap<String, String>,
     /// PKCS#10 PEM CSR whose private key remains on the worker.
     pub csr_pem: String,
+}
+
+/// Redacted `Debug` (WOR-2640). The enrollment token is what
+/// authorizes a worker to join the mesh and be issued a certificate;
+/// an attacker who reads one out of an authority's log enrolls a node
+/// of their own with the roles and labels it grants. One-time is not
+/// the same as harmless: the window is between the log line and the
+/// legitimate worker's redemption, and a request that failed to
+/// deserialize never redeemed it at all.
+///
+/// The node id, roles and labels stay: they are what a refused
+/// enrollment is about. The CSR is a public key and a subject, so it
+/// stays too, but it is long enough to bury the rest of the line, so
+/// only its length is printed.
+impl std::fmt::Debug for EnrollmentRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnrollmentRequest")
+            .field("token", &"[REDACTED]")
+            .field("node_id", &self.node_id)
+            .field("roles", &self.roles)
+            .field("labels", &self.labels)
+            .field("csr_pem", &format_args!("<{} bytes>", self.csr_pem.len()))
+            .finish()
+    }
 }
 
 /// Successful enrollment response. It never contains a worker private key.
@@ -1341,4 +1365,33 @@ fn set_directory_permissions(_path: &Path) -> Result<(), EnrollmentError> {
 fn sync_directory(path: &Path) -> Result<(), EnrollmentError> {
     File::open(path)?.sync_all()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    /// WOR-2640: an enrollment token authorizes a worker to join the
+    /// mesh and be issued a certificate. One-time is not the same as
+    /// harmless: a request that failed to deserialize never redeemed
+    /// its token, and the authority's log is where it lands.
+    #[test]
+    fn debug_never_renders_an_enrollment_token() {
+        let request = EnrollmentRequest {
+            token: "SENTINEL-SECRET-9f3a".to_string(),
+            node_id: "worker-7".to_string(),
+            roles: BTreeSet::new(),
+            labels: BTreeMap::new(),
+            csr_pem: "-----BEGIN CERTIFICATE REQUEST-----".to_string(),
+        };
+        let rendered = format!("{request:?}");
+        assert!(
+            !rendered.contains("SENTINEL-SECRET-9f3a"),
+            "the enrollment token reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("worker-7"),
+            "the node id must survive so a refused enrollment is nameable: {rendered}"
+        );
+    }
 }

@@ -336,7 +336,7 @@ impl<P: LedgerPayload> AuditChain<P> {
         let key = channel.config_key();
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|error| {
+                sbproxy_util::secure_fs::create_dir_all_owner_only(parent).map_err(|error| {
                     anyhow::anyhow!(
                         "{key} {}: cannot create the directory {}: {error}",
                         path.display(),

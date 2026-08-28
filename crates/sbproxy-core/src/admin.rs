@@ -40,7 +40,7 @@ pub use prompt_persistence::{prompt_key_ring, PromptPersistence, PromptSealer};
 // --- Config ---
 
 /// Configuration for the admin server.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AdminConfig {
     /// Whether the admin endpoint is exposed.
     pub enabled: bool,
@@ -109,6 +109,35 @@ pub struct AdminOperator {
     /// is a normal arrangement for a reseller, and collapsing the two
     /// questions into one field would make it unexpressible.
     pub tenant: Option<String>,
+}
+
+/// Redacted `Debug` (WOR-2606). The runtime twin of
+/// `sbproxy_config::AdminConfig`, which was given a redacting `Debug` in
+/// the first half of WOR-2640 while this one kept the derive: the same
+/// Basic-auth password authenticates the admin API, and this is the
+/// copy the running server holds and formats.
+///
+/// The username, the bind address, the port and the allowlist all stay.
+/// None of them authenticates and each is what tells one misconfigured
+/// admin server from another. `operators` renders through
+/// [`AdminOperator`], whose `password_hash` is a peppered hash rather
+/// than a credential.
+impl std::fmt::Debug for AdminConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminConfig")
+            .field("enabled", &self.enabled)
+            .field("bind", &self.bind)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field("max_log_entries", &self.max_log_entries)
+            .field("rate_limit_per_minute", &self.rate_limit_per_minute)
+            .field("tls", &self.tls)
+            .field("allow_ips", &self.allow_ips)
+            .field("cors_origins", &self.cors_origins)
+            .field("operators", &self.operators)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for AdminConfig {
@@ -14893,6 +14922,32 @@ origins:
             origins.keys().collect::<Vec<_>>(),
             vec!["packed.example.com"],
             "origin without the pack must be absent, not present with an empty entry"
+        );
+    }
+
+    /// The running admin server's Basic-auth password, pinned (WOR-2606).
+    ///
+    /// The config-side twin was redacted in the first half of WOR-2640
+    /// while this one, the copy the server actually holds, kept the
+    /// derive.
+    #[test]
+    fn debug_never_renders_the_admin_password() {
+        const SENTINEL: &str = "SENTINEL-ADMINPW-7c31";
+
+        let config = AdminConfig {
+            username: "operator".to_string(),
+            password: SENTINEL.to_string(),
+            ..AdminConfig::default()
+        };
+        let rendered = format!("{config:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the admin password reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("operator") && rendered.contains("127.0.0.1"),
+            "the username and bind address must survive: they name which admin \
+             server the diagnostic is about: {rendered}"
         );
     }
 }

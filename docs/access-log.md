@@ -493,5 +493,29 @@ writing the next line. Rotated files use suffixes like
 `access.log.1` or `access.log.1.gz`; `max_backups` caps how many
 rotated files are retained. `compress: true` gzips rotated files.
 
+The active file and every rotated copy are created owner-only
+(`0600`), and a directory SBproxy creates for them is `0700`. An
+access-log line carries the path, the identity, and the decision for
+one request, which is a record an operator asked to keep rather than
+to publish. A file that is already on disk at a wider mode is
+tightened when the sink next opens it rather than inherited, so a log
+shipper or backup job running as a different user loses access the
+first time that happens after an upgrade. Run those readers as the
+proxy user, or point `path` at a fifo or `/dev/stdout`, which are left
+exactly as the operator set them. A directory that already exists
+keeps its mode, so a shared `/var/log` is never narrowed.
+
+Rotated backups are swept as well as created. An uncompressed rotation
+is a rename, which keeps the inode and therefore the mode, so backups
+written by a build that predates this behavior would otherwise carry
+their old `0644` forward for as many rotations as `max_backups`
+allows: ten weekly files, each holding a week of every request's path
+and identity, world-readable for ten more weeks. Every backup from
+`.1` to `.max_backups` is made owner-only at each rotation. A backup
+that cannot be tightened, because it sits on a filesystem without
+permission bits or is owned by another account, is logged by name with
+a warning and does not stop the rotation that keeps the live log
+bounded.
+
 Omitting `output` keeps the default behavior: emit JSON through the
 `access_log` tracing target.

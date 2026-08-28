@@ -7,7 +7,7 @@ use crate::ids::{ModelId, ProviderName};
 use crate::providers::get_provider_info;
 
 /// Provider configuration from YAML/JSON.
-#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Deserialize, schemars::JsonSchema)]
 pub struct ProviderConfig {
     /// Unique provider name used to reference this provider.
     pub name: ProviderName,
@@ -214,6 +214,49 @@ pub struct ProviderConfig {
     // the AI request path where the Pingora worker stack is already at
     // its 2MB ceiling.
     pub bedrock_guardrail: Option<Box<BedrockGuardrailPassthrough>>,
+}
+
+/// Redacted `Debug` (WOR-2640). `api_key` is the upstream provider
+/// credential, billed to the operator's account, and a provider that
+/// fails to dispatch is what formats this struct into a warning or an
+/// `anyhow` chain.
+///
+/// This one lists a curated set of fields and ends
+/// `finish_non_exhaustive` rather than enumerating all twenty-seven,
+/// and that is the safer direction rather than the lazier one: a field
+/// added later is *absent* from the output instead of printed, so the
+/// next credential-shaped field somebody adds here is redacted by
+/// default and has to be opted into. An exhaustive list would leak it
+/// the moment it landed.
+///
+/// What stays is what names the provider a diagnostic is about: the
+/// entry name, its type, the deployment, the base URL, and the models
+/// it serves. None authenticates anything. Presence rather than a flat
+/// marker for the key itself, because "no key configured" and "wrong
+/// key configured" are different faults with the same 401.
+impl std::fmt::Debug for ProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderConfig")
+            .field("name", &self.name)
+            .field("provider_type", &self.provider_type)
+            .field("deployment", &self.deployment)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "accept_native_credentials_for",
+                &self.accept_native_credentials_for,
+            )
+            .field("base_url", &self.base_url)
+            .field("models", &self.models)
+            .field("default_model", &self.default_model)
+            .field("enabled", &self.enabled)
+            .field("weight", &self.weight)
+            .field("priority", &self.priority)
+            .field("organization", &self.organization)
+            .field("api_version", &self.api_version)
+            .field("on_key_failure", &self.on_key_failure)
+            .field("fallback_credential_id", &self.fallback_credential_id)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Inline Bedrock Converse guardrail settings.
@@ -1209,5 +1252,40 @@ mod tests {
         ] {
             assert!(json.contains(needle), "schema is missing {needle}");
         }
+    }
+
+    /// WOR-2640: `api_key` is the upstream provider credential, billed
+    /// to the operator's account. A provider that fails to dispatch is
+    /// what formats this struct into a warning or an `anyhow` chain.
+    #[test]
+    fn debug_never_renders_the_provider_api_key() {
+        const SENTINEL: &str = "SENTINEL-SECRET-9f3a";
+        let mut provider = make_provider("openai-primary");
+        provider.api_key = Some(SENTINEL.to_string());
+        provider.base_url = Some("https://api.openai.com/v1".to_string());
+
+        let rendered = format!("{provider:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the provider API key reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("openai-primary"),
+            "the provider name must survive so the entry is nameable: {rendered}"
+        );
+        assert!(
+            rendered.contains("https://api.openai.com/v1"),
+            "the base URL must survive: {rendered}"
+        );
+        // Presence, not value: a missing key and a wrong key both 401.
+        assert!(
+            rendered.contains("REDACTED"),
+            "a configured key must render as present: {rendered}"
+        );
+        let absent = format!("{:?}", make_provider("openai-secondary"));
+        assert!(
+            absent.contains("api_key: None"),
+            "an absent key must be distinguishable: {absent}"
+        );
     }
 }

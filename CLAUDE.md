@@ -22,6 +22,7 @@ ten-minute build.
 | Spec citations | `bash scripts/check-spec-citations.sh` |
 | Env mutation | `bash scripts/check-env-mutation.sh` |
 | Durable file modes | `bash scripts/check-durable-file-modes.sh` |
+| Secret-bearing Debug registry | `bash scripts/check-secret-debug-registry.sh` |
 | NOTICE (Apache-2.0-only) | `bash scripts/check-notice.sh` |
 | Doc drift | `bash scripts/check-doc-drift.sh` |
 | Tapes + GIF wiring | `make tapes-check` |
