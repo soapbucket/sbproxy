@@ -227,6 +227,17 @@ pub async fn token(
     // `Option<&str>` is `Copy`, so this stays available for the CIMD ->
     // DCR translation branch further down without re-deriving whether
     // the client_id is CIMD-shaped or re-unwrapping `cid_str`.
+    // The same bound `/authorize` applies. `/token` had none, so the
+    // cache key `MAX_CIMD_CLIENT_ID_LEN` exists to bound was still
+    // unbounded on this, the second of its two callers.
+    if cid_str.is_some_and(|s| s.len() > crate::config::MAX_CIMD_CLIENT_ID_LEN && is_https_url(s)) {
+        crate::metrics::record_broker_decision("token", "client_id_too_long");
+        return oauth_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_client",
+            "client_id is longer than this broker accepts",
+        );
+    }
     let cimd_url: Option<&str> = cid_str
         .filter(|_| cfg.cimd_enabled)
         .filter(|s| is_https_url(s));
@@ -914,10 +925,10 @@ pub fn inject_cnf_jkt(
 
 // --- CIMD helpers ---
 
-/// True when `s` parses as an https URL. Used at /token-time to
-/// detect CIMD-shaped client_ids without dragging url::Url into every
-/// branch.
-fn is_https_url(s: &str) -> bool {
+/// True when `s` parses as an https URL. Used at `/token` and
+/// `/authorize` to detect CIMD-shaped client_ids without dragging
+/// `url::Url` into every branch.
+pub(crate) fn is_https_url(s: &str) -> bool {
     match url::Url::parse(s) {
         Ok(u) => u.scheme() == "https",
         Err(_) => false,

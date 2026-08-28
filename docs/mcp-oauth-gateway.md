@@ -196,7 +196,7 @@ does (`prometheus::TextEncoder` over `prometheus::gather()`).
 | `sbproxy_mcp_gateway_token_requests_total` | counter | `outcome` (`issued`, `rejected`, `upstream_error`) | `/token` decisions. |
 | `sbproxy_mcp_gateway_dpop_proofs_total` | counter | `outcome` (`verified`, `rejected`, `nonce_required`) | RFC 9449 proof verification at `/token`. |
 | `sbproxy_mcp_gateway_revocation_introspection_requests_total` | counter | `endpoint` (`revoke`, `introspect`), `outcome` (`ok`, `error`) | `/revoke` and `/introspect` decisions. |
-| `sbproxy_mcp_gateway_decisions_total` | counter | `surface`, `decision` | Enforcement decisions no HTTP status alone reports. `resource_server`/`unauthenticated` is the verifier's 401. `scope`/`refused` is a token missing the operation's scope; `scope`/`admitted_unadvertised` is the fail-open where `oauth.scopes_supported` does not advertise it, so the check did not run. `authorize`/`rate_limited` and `par`/`rate_limited` are the fixed-window limiter; `authorize`/`session_capacity` is the session store full. `as_metadata`/`stale_fallback` is one request served from an upstream metadata document past its refresh interval, up to `metadata_max_staleness_secs` (3600 by default), which is a fail-open on the issuer the RFC 9207 `iss` check compares against: alert on it. `verify`/`csrf_refused` is a device-consent POST that failed its origin or form-token check. |
+| `sbproxy_mcp_gateway_decisions_total` | counter | `surface`, `decision` | Enforcement decisions no HTTP status alone reports. `resource_server`/`unauthenticated` is the verifier's 401. `scope`/`refused` is a token missing the operation's scope; `scope`/`admitted_unadvertised` is the fail-open where `oauth.scopes_supported` does not advertise it, so the check did not run. `authorize`/`rate_limited` and `par`/`rate_limited` are the fixed-window limiter; `authorize`/`session_capacity` is the session store full. `as_metadata`/`stale_fallback` is one request served from an upstream metadata document past its refresh interval, up to `max_metadata_staleness_secs` (3600 by default), which is a fail-open on the issuer the RFC 9207 `iss` check compares against: alert on it. `verify`/`csrf_refused` is a device-consent POST that failed its origin or form-token check. |
 | `sbproxy_mcp_gateway_sessions_active` | gauge | none | In-flight authorization sessions held by the in-memory session store, written on every put, take, and expiry sweep. A deployment on the storage-backed session store reads zero here, because counting those needs a `SCAN`; read the gauge as "in-memory sessions", not as "sessions". A caller keeping its own ledger can write it with `metrics::record_sessions_active(live)`. |
 
 The outcome labels are deliberately coarse: recovering the specific
@@ -240,8 +240,11 @@ line).
 
 ## Admin status surface
 
-`GET {base_path}/admin/status` (unauthenticated, mounted
-unconditionally) returns which optional collaborators are wired up:
+`GET {base_path}/admin/status` returns which optional collaborators
+are wired up. It is **standalone only**: a host embedding this crate's
+axum router gets it, and it is unauthenticated there by design. The
+colocated form inside sbproxy does not mount it, for the reason under
+the sample body.
 
 ```json
 {
@@ -262,17 +265,22 @@ unconditionally) returns which optional collaborators are wired up:
 }
 ```
 
-The same endpoint is available from the integrated MCP action and the
-standalone axum router. It is a small JSON surface an operator or
-script can poll without a Prometheus query client.
+It is a small JSON surface an operator or script can poll without a
+Prometheus query client.
 
-`/admin/status` is mounted only for a standalone embedding. Inside
-sbproxy the whole broker route tree is dispatched on the public MCP
-origin ahead of the resource-server check, and the OAuth routes have to
-stay unauthenticated for the flow to work at all, so the route would
-answer "which security controls are off" to anyone who asked. The
-colocated form does not mount it; the proxy's own authenticated admin
-API is where that belongs.
+Why standalone only: inside sbproxy the whole broker route tree is
+dispatched on the public MCP origin ahead of the resource-server
+check, and the OAuth routes have to stay unauthenticated for the flow
+to work at all. Mounting this one there would answer "which security
+controls are off" to anyone who asked. The colocated form does not
+mount it, and
+[`action_dispatch.rs`](../crates/sbproxy-core/src/server/action_dispatch.rs)
+carries a test pinning that a real broker route answers while this one
+returns 404. The proxy's own authenticated admin API is where an
+operator-facing status surface belongs; the federation half of this
+branch does exactly that with
+[`GET /admin/federation`](admin-api-reference.md#get-adminfederation),
+and the equivalent for the broker is not shipped.
 
 ## The device-consent page
 

@@ -121,21 +121,43 @@ fn verify_form_token_key(app: &AppState, token: &str) -> String {
 /// this form sends `Origin` on a cross-site POST and on a same-origin
 /// one; a request carrying neither header is not the consent page.
 fn verify_same_origin(app: &AppState, headers: &HeaderMap) -> bool {
-    // The consent page's own URL, which is what a browser reports as
-    // the origin when it submits the form. That is
-    // `device_code_verification_uri` when the operator set one, and the
-    // broker's own base URL otherwise.
-    let Ok(expected) = url::Url::parse(&resolve_verification_uri(&app.config)) else {
+    // Two origins are legitimate, and accepting only one of them broke
+    // the shipped page.
+    //
+    // 1. The broker's own external origin. This is where the built-in
+    //    consent page is served from, so it is what a browser reports
+    //    when that page submits.
+    // 2. The configured `device_code_verification_uri`, when an
+    //    operator points users at a branded page of their own. Naming
+    //    one used to *replace* the expected origin, so the moment a
+    //    custom page was configured the broker's own page stopped
+    //    working against itself.
+    //
+    // `validate_startup` refuses `device_code_enabled` without a
+    // parseable base URL, so the first entry is present whenever this
+    // handler can run. The empty-list case therefore cannot be
+    // reached from a booted broker, and failing closed on it is the
+    // right answer if it ever is.
+    let mut expected = Vec::with_capacity(2);
+    if let Ok(base) = url::Url::parse(&app.config.external_base_url) {
+        expected.push(base.origin());
+    }
+    if let Ok(configured) = url::Url::parse(&resolve_verification_uri(&app.config)) {
+        let origin = configured.origin();
+        if !expected.contains(&origin) {
+            expected.push(origin);
+        }
+    }
+    if expected.is_empty() {
         return false;
-    };
-    let expected = expected.origin();
+    }
     let stated = headers
         .get(header::ORIGIN)
         .or_else(|| headers.get(header::REFERER))
         .and_then(|value| value.to_str().ok())
         .and_then(|value| url::Url::parse(value).ok());
     match stated {
-        Some(url) => url.origin() == expected,
+        Some(url) => expected.contains(&url.origin()),
         None => false,
     }
 }

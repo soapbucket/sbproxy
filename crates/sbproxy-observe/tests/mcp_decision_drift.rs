@@ -143,6 +143,21 @@ const PROMISED: &[(&str, &str, &str)] = &[
         "cimd_unresolved",
         "crates/sbproxy-mcp-gateway/src/token.rs",
     ),
+    // A URL-shaped client_id over the length bound, on each of the two
+    // endpoints that resolve one. Refused rather than downgraded: the
+    // bound used to be applied by returning `None` from the detector,
+    // which fell through to the pre-registered branch and admitted the
+    // request with the CIMD document's own checks skipped.
+    (
+        "authorize",
+        "client_id_too_long",
+        "crates/sbproxy-mcp-gateway/src/authorize.rs",
+    ),
+    (
+        "token",
+        "client_id_too_long",
+        "crates/sbproxy-mcp-gateway/src/token.rs",
+    ),
 ];
 
 /// Production files that may write the family. Everything else is
@@ -263,6 +278,19 @@ fn recorded_sites(root: &Path) -> Vec<Site> {
             .to_string_lossy()
             .replace('\\', "/");
         let mut cursor = 0usize;
+        // Lines are reported against the real file. Counting newlines
+        // in the stripped copy points at whatever moved up to fill the
+        // gap where a test body used to be, which sends a reader to the
+        // wrong place in the one message this guard exists to print.
+        let line_of = |needle_at: usize| -> usize {
+            let snippet = &source[..needle_at];
+            let tail = snippet
+                .rfind('\n')
+                .map_or(snippet, |idx| &snippet[idx + 1..]);
+            raw.find(tail)
+                .map(|found| raw[..found].matches('\n').count() + 1)
+                .unwrap_or_else(|| snippet.matches('\n').count() + 1)
+        };
         while let Some(idx) = source[cursor..].find(RECORDER) {
             let call_start = cursor + idx;
             let start = call_start + RECORDER.len();
@@ -273,8 +301,18 @@ fn recorded_sites(root: &Path) -> Vec<Site> {
             // The definition names its parameters rather than calling
             // anything, so skip it by its `fn ` prefix rather than by
             // its argument shape.
+            //
+            // `get` rather than an index: `call_start - 8` is a byte
+            // offset with no guarantee of landing on a char boundary,
+            // and a multi-byte character within eight bytes of a call
+            // site would panic the guard rather than fail it. A `None`
+            // here means the boundary did not line up, which is not a
+            // definition, so the call is scanned.
             let prefix_start = call_start.saturating_sub(8);
-            if source[prefix_start..call_start].contains("fn ") {
+            if source
+                .get(prefix_start..call_start)
+                .is_some_and(|prefix| prefix.contains("fn "))
+            {
                 continue;
             }
             let args = &source[start..start + close];
@@ -294,7 +332,7 @@ fn recorded_sites(root: &Path) -> Vec<Site> {
                     rel.clone(),
                 ));
             } else {
-                let line = source[..call_start].matches('\n').count() + 1;
+                let line = line_of(call_start);
                 found.push(Site::Opaque(format!("{rel}:{line}")));
             }
         }
@@ -377,6 +415,88 @@ fn every_production_decision_write_is_a_promised_surface() {
     );
 }
 
+/// The `(surface, decision)` pairs the crate's own `DECISIONS_TOTAL`
+/// rustdoc table publishes.
+///
+/// Parsed out of the source rather than duplicated here: this table is
+/// a second promise about the same family, in a second place, and it
+/// had already drifted from the code once (`token`/`cimd_unresolved`
+/// was emitted and unlisted). The registry description is prose an
+/// operator reads in the catalogue; this table is what a developer
+/// reads at the call site. Both have to be true.
+fn rustdoc_table_pairs(root: &Path) -> Vec<(String, String)> {
+    let path = root.join("crates/sbproxy-mcp-gateway/src/metrics.rs");
+    let raw = std::fs::read_to_string(&path).expect("mcp-gateway metrics.rs is readable");
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        let Some(row) = line.strip_prefix("/// |") else {
+            continue;
+        };
+        let cells: Vec<&str> = row.split('|').map(str::trim).collect();
+        // A data row is `| `surface` | `decision` | meaning |`, so
+        // three cells before the trailing empty one. The header and
+        // the `| --- |` separator do not carry backticks.
+        if cells.len() < 3 {
+            continue;
+        }
+        let unquote = |cell: &str| -> Option<String> {
+            cell.strip_prefix('`')
+                .and_then(|c| c.strip_suffix('`'))
+                .map(str::to_string)
+        };
+        if let (Some(surface), Some(decision)) = (unquote(cells[0]), unquote(cells[1])) {
+            // The header row is backtick-quoted too, so it parses as a
+            // data row. It names the label keys rather than a pair.
+            if (surface.as_str(), decision.as_str()) == ("surface", "decision") {
+                continue;
+            }
+            out.push((surface, decision));
+        }
+    }
+    out
+}
+
+#[test]
+fn the_crate_rustdoc_table_names_every_promised_surface() {
+    let root = repo_root();
+    let documented = rustdoc_table_pairs(&root);
+    assert!(
+        documented.len() >= PROMISED.len(),
+        "the DECISIONS_TOTAL rustdoc table parsed as {} rows against {} promised surfaces;          the parser probably stopped seeing the table",
+        documented.len(),
+        PROMISED.len()
+    );
+    let mut missing = Vec::new();
+    for (surface, decision, _) in PROMISED {
+        if !documented
+            .iter()
+            .any(|(s, d)| s == surface && d == decision)
+        {
+            missing.push(format!("{surface}/{decision}"));
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "the DECISIONS_TOTAL rustdoc table in crates/sbproxy-mcp-gateway/src/metrics.rs does not \
+         list {missing:?}. A developer reading the call site sees that table, not the observe \
+         registry, so a surface missing from it is undocumented where it is written."
+    );
+    let mut extra = Vec::new();
+    for (surface, decision) in &documented {
+        if !PROMISED
+            .iter()
+            .any(|(s, d, _)| s == surface && d == decision)
+        {
+            extra.push(format!("{surface}/{decision}"));
+        }
+    }
+    assert!(
+        extra.is_empty(),
+        "the DECISIONS_TOTAL rustdoc table lists {extra:?}, which nothing writes"
+    );
+}
+
 #[test]
 fn the_registry_description_names_every_promised_surface() {
     let entry = sbproxy_observe::metric_registry::METRICS
@@ -396,6 +516,7 @@ fn the_registry_description_names_every_promised_surface() {
         ("as_metadata", "as-metadata"),
         ("verify", "csrf"),
         ("cimd_unresolved", "client-id metadata document"),
+        ("client_id_too_long", "longer than this broker accepts"),
     ];
     let missing: Vec<&str> = expected
         .iter()

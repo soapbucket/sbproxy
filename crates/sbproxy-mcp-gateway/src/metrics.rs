@@ -151,6 +151,9 @@ pub static SESSIONS_ACTIVE: LazyLock<Option<IntGauge>> = LazyLock::new(|| {
 /// | `surface` | `decision` | meaning |
 /// | --- | --- | --- |
 /// | `authorize` | `cimd_unresolved` | a URL-shaped `client_id` did not resolve to a usable metadata document |
+/// | `token` | `cimd_unresolved` | the same, on `/token` |
+/// | `authorize` | `client_id_too_long` | a URL-shaped `client_id` over `MAX_CIMD_CLIENT_ID_LEN`, refused rather than downgraded to the pre-registered path |
+/// | `token` | `client_id_too_long` | the same, on `/token` |
 /// | `authorize` | `rate_limited` | the per-window `/authorize` limiter refused |
 /// | `authorize` | `session_capacity` | the session store is full, so no new authorization can start |
 /// | `par` | `rate_limited` | the same limiter on `/par` |
@@ -159,6 +162,13 @@ pub static SESSIONS_ACTIVE: LazyLock<Option<IntGauge>> = LazyLock::new(|| {
 /// | `scope` | `admitted_unadvertised` | the resource does not advertise that scope, so the check did not apply: a fail-open, counted as one |
 /// | `as_metadata` | `stale_fallback` | an upstream metadata refresh failed and the cached document was served past its refresh interval |
 /// | `verify` | `csrf_refused` | the device-code consent form failed its origin or nonce check |
+///
+/// This table drifted from the code once already. It is now checked:
+/// `crates/sbproxy-observe/tests/mcp_decision_drift.rs` scans every
+/// `record_broker_decision` call site in production source and asserts
+/// the set matches its own `PROMISED` table **and** the rows here, in
+/// both directions, so a surface added without a row fails and a row
+/// with no writer fails.
 pub static DECISIONS_TOTAL: LazyLock<Option<IntCounterVec>> = LazyLock::new(|| {
     registered(
         register_int_counter_vec!(

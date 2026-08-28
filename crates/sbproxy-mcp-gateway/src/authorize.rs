@@ -207,6 +207,22 @@ pub async fn authorize(State(app): State<AppState>, Query(q): Query<AuthorizeQue
     //
     // Pre-registered (opaque-string) client_ids continue to use the
     // existing allowlist check.
+    // An over-length URL-shaped client_id is refused, not downgraded.
+    // Returning `None` from the detector used to fall through to the
+    // pre-registered branch, whose only gate is the redirect_uri
+    // allowlist, so a deployment running both pre-registered clients
+    // and CIMD admitted the request with the document's own
+    // redirect_uris and scope checks skipped entirely.
+    if client_id.len() > crate::config::MAX_CIMD_CLIENT_ID_LEN
+        && crate::token::is_https_url(client_id)
+    {
+        crate::metrics::record_broker_decision("authorize", "client_id_too_long");
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_client",
+            "client_id is longer than this broker accepts",
+        );
+    }
     let cimd_doc = match detect_cimd_client_id(client_id) {
         Some(_url) if cfg.cimd_enabled => match &app.cimd_cache {
             Some(cache) => match cache.get_or_fetch(client_id, cfg.cimd_max_doc_bytes).await {
@@ -485,13 +501,6 @@ pub(crate) fn is_resource_bound(requested: &str, cfg: &crate::config::McpGateway
 /// reference (an https URL); returns `None` otherwise. Pre-registered
 /// opaque-string client_ids continue down the existing path.
 fn detect_cimd_client_id(client_id: &str) -> Option<url::Url> {
-    // Bound the value before it becomes a cache key. An over-length
-    // client_id is not a CIMD identifier as far as the broker is
-    // concerned; it falls through to the pre-registered allowlist,
-    // which cannot contain it, so the request is refused either way.
-    if client_id.len() > crate::config::MAX_CIMD_CLIENT_ID_LEN {
-        return None;
-    }
     let parsed = url::Url::parse(client_id).ok()?;
     if parsed.scheme() == "https" {
         Some(parsed)

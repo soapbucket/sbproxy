@@ -1750,9 +1750,22 @@ pub(super) async fn request_filter(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
+        // The raw socket peer, deliberately not `ctx.client_ip`: by this
+        // point a trusted forwarding header may have replaced that with
+        // a client-supplied value, and this address is the key of the
+        // rate limit that stops a caller rotating the entity id it
+        // claims from driving one chain walk per request. A limit an
+        // attacker can re-key is not one. A connection with no inet
+        // peer (a unix socket) shares one bucket rather than escaping
+        // the limit.
+        let walk_source = session
+            .client_addr()
+            .and_then(|addr| addr.as_inet())
+            .map(|addr| addr.ip().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
         match claimed {
             Some(entity_id) => {
-                match verifier.verify(&entity_id).await {
+                match verifier.verify(&walk_source, &entity_id).await {
                     crate::federation_peer::PeerVerdict::Trusted {
                         entity_id,
                         trust_anchor_id,

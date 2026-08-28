@@ -74,6 +74,72 @@ pub enum FederationError {
         /// Configured maximum.
         max: usize,
     },
+    /// The walk spent its whole fetch budget without reaching a
+    /// configured trust anchor. Distinct from [`Self::ChainTooLong`],
+    /// which is a depth cap: a chain can stay shallow and still burn
+    /// an unbounded number of fetches by fanning out `authority_hints`
+    /// at every level, which is what this refuses.
+    #[error("trust-chain walk exhausted its budget of {max} fetches")]
+    ChainFetchBudgetExhausted {
+        /// Configured maximum number of outbound fetches per walk.
+        max: usize,
+    },
+    /// The walk read more bytes than its budget allows. A peer that
+    /// serves a maximum-size document at every hop can exhaust memory
+    /// and bandwidth while staying inside the fetch count.
+    #[error("trust-chain walk read {got} bytes, over the budget of {max}")]
+    ChainByteBudgetExhausted {
+        /// Bytes read across every fetch in this walk so far.
+        got: u64,
+        /// Configured maximum.
+        max: u64,
+    },
+    /// The walk ran past its wall-clock deadline. Each individual
+    /// fetch has its own timeout, so a peer that answers just inside
+    /// it at every hop can hold a request open for the product of the
+    /// two without this.
+    #[error("trust-chain walk exceeded its deadline of {max_ms} ms")]
+    ChainDeadlineExceeded {
+        /// Configured wall-clock budget for the whole walk.
+        max_ms: u64,
+    },
+    /// One entity published more `authority_hints` than the walk will
+    /// follow. Refused rather than truncated: a truncated walk that
+    /// finds no anchor is indistinguishable from an honest failure,
+    /// and silently ignoring an operator's superiors is worse than
+    /// saying the document is unreasonable.
+    #[error("entity `{entity_id}` publishes {got} authority_hints, over the cap of {max}")]
+    TooManyAuthorityHints {
+        /// Entity whose configuration carries the oversized array.
+        entity_id: String,
+        /// Number of hints published.
+        got: usize,
+        /// Configured maximum.
+        max: usize,
+    },
+    /// An Entity Configuration did not verify against the keys it
+    /// publishes in its own `jwks`. §9 requires an entity
+    /// configuration to be self-signed, so this is the cheapest
+    /// authentication available before any fan-out, and the walk
+    /// refuses to spend a fetch on the hints inside an unsigned or
+    /// forged document.
+    #[error("entity configuration for `{entity_id}` is not validly self-signed: {reason}")]
+    EntityConfigurationNotSelfVerified {
+        /// Entity whose configuration failed the check.
+        entity_id: String,
+        /// Why the signature check failed.
+        reason: String,
+    },
+    /// An Entity Configuration served at one entity URL claims to be
+    /// a different entity. OpenID Federation 1.0 §9 requires
+    /// `sub` to identify the entity the document was fetched from.
+    #[error("entity configuration fetched from `{fetched_from}` claims to be `{claims_to_be}`")]
+    EntityConfigurationSubjectMismatch {
+        /// Entity URL the document was fetched from.
+        fetched_from: String,
+        /// Entity the document's `sub` claims.
+        claims_to_be: String,
+    },
     /// A leaf Entity Configuration MUST have `iss == sub` (§9). When
     /// the validator sees a leaf with mismatched `iss` / `sub`, the
     /// caller probably handed it a Subordinate Statement by mistake.
@@ -178,3 +244,23 @@ pub enum FederationError {
 
 /// Convenience alias the crate's public functions return.
 pub type FederationResult<T> = Result<T, FederationError>;
+
+impl FederationError {
+    /// Whether this refusal means the trust-chain walk has run out of
+    /// its allowance and cannot succeed by trying another branch.
+    ///
+    /// The walker's per-hint loop treats most errors as "this
+    /// superior did not work out, try the next one". A spent budget
+    /// is not that: continuing would call a refusal that can only
+    /// fail again, and would report whichever per-hint error happened
+    /// to be last instead of the real cause. So the loop returns
+    /// early on exactly these three.
+    pub fn is_budget_exhausted(&self) -> bool {
+        matches!(
+            self,
+            Self::ChainFetchBudgetExhausted { .. }
+                | Self::ChainByteBudgetExhausted { .. }
+                | Self::ChainDeadlineExceeded { .. }
+        )
+    }
+}

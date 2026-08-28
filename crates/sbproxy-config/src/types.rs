@@ -2049,6 +2049,31 @@ const fn default_federation_peer_cache_ttl_secs() -> u64 {
     600
 }
 
+/// Default total fetch budget for one trust-chain walk.
+fn default_federation_max_chain_fetches() -> usize {
+    16
+}
+
+/// Default total byte budget for one trust-chain walk (2 MiB).
+fn default_federation_max_chain_bytes() -> u64 {
+    2 * 1024 * 1024
+}
+
+/// Default wall-clock budget for one trust-chain walk.
+fn default_federation_max_chain_duration_ms() -> u64 {
+    5_000
+}
+
+/// Default cap on `authority_hints` per entity configuration.
+fn default_federation_max_authority_hints() -> usize {
+    8
+}
+
+/// Default per-source chain-walk rate, in walks per minute.
+fn default_federation_peer_walks_per_minute() -> u32 {
+    30
+}
+
 const fn default_federation_max_chain_depth() -> usize {
     5
 }
@@ -2099,6 +2124,47 @@ pub struct FederationPeerTrustConfig {
     /// this proxy's request path.
     #[serde(default = "default_federation_peer_cache_ttl_secs")]
     pub cache_ttl_secs: u64,
+    /// Total outbound fetches one chain walk may spend.
+    ///
+    /// This is the bound that matters, and it is not `max_chain_depth`.
+    /// `authority_hints` is an array: one entity naming five thousand
+    /// superiors costs five thousand fetches at depth 1, and a depth
+    /// cap never fires. A well-formed chain spends about two fetches
+    /// per level, so the default covers a four-level federation that
+    /// has to try a second superior at one level.
+    #[serde(default = "default_federation_max_chain_fetches")]
+    pub max_chain_fetches: usize,
+    /// Total bytes one chain walk may read across every fetch.
+    ///
+    /// Each fetch is separately capped at 1 MiB by the fetcher; this
+    /// bounds the sum, so a peer serving a maximum-size document at
+    /// every hop cannot make one request hold the product of the two.
+    #[serde(default = "default_federation_max_chain_bytes")]
+    pub max_chain_bytes: u64,
+    /// Wall-clock budget for one chain walk, in milliseconds.
+    ///
+    /// Every fetch has its own connect and read timeout. Without an
+    /// aggregate deadline, a peer that answers just inside the
+    /// per-fetch timeout at every hop holds the request open for the
+    /// product of the two. The walk stops here whatever it has found.
+    #[serde(default = "default_federation_max_chain_duration_ms")]
+    pub max_chain_duration_ms: u64,
+    /// Most `authority_hints` a single entity configuration may
+    /// publish before the walk refuses the document.
+    ///
+    /// Refused rather than truncated: silently ignoring an operator's
+    /// superiors turns a configuration error into an unexplained
+    /// refusal further down.
+    #[serde(default = "default_federation_max_authority_hints")]
+    pub max_authority_hints: usize,
+    /// Chain walks one source address may start per minute.
+    ///
+    /// The decision cache is keyed on the peer address and the claimed
+    /// entity id, so a caller that rotates the entity id it claims
+    /// misses the cache every time. This is what stops that from
+    /// becoming one walk per request.
+    #[serde(default = "default_federation_peer_walks_per_minute")]
+    pub walks_per_minute: u32,
 }
 
 /// One pinned OpenID Federation trust anchor.

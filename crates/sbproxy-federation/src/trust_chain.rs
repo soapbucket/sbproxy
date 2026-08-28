@@ -147,9 +147,40 @@ impl ResolvedTrustChain {
     /// Convenience iterator over the metadata-policy claims along
     /// the chain, in anchor-to-leaf order the policy applicator
     /// consumes to compose the seven operators.
+    ///
+    /// This includes the leaf's **own** `metadata_policy`. A caller
+    /// deciding whether the leaf satisfies what its superiors demanded
+    /// wants [`Self::metadata_policies_from_superiors`] instead; see
+    /// there for why the difference is a security property and not a
+    /// preference.
     pub fn metadata_policies(&self) -> impl Iterator<Item = &crate::MetadataPolicy> {
         self.statements
             .iter()
+            .rev()
+            .filter_map(|s| s.claims.metadata_policy.as_ref())
+    }
+
+    /// The metadata policies the leaf's **superiors** imposed, in
+    /// anchor-to-leaf order, excluding the leaf's own.
+    ///
+    /// A leaf publishes its own `metadata_policy` to constrain the
+    /// entities *below* it. Composing it into the policy the leaf is
+    /// then judged against lets the leaf relax a constraint its
+    /// superior set: `compose_policies` inserts an operator the
+    /// superior did not name (the `None => val.clone()` arm in
+    /// `metadata_policy.rs`), so a leaf can add its own `add` beside a
+    /// superior's `superset_of` and satisfy a requirement its
+    /// published metadata does not meet. §6.1 composition is a
+    /// top-down narrowing between an entity and its subordinates; the
+    /// subject of a policy is never one of its authors.
+    ///
+    /// `statements[0]` is the leaf by construction (the chain is
+    /// leaf-to-anchor), so the exclusion is a `skip(1)` before the
+    /// reverse.
+    pub fn metadata_policies_from_superiors(&self) -> impl Iterator<Item = &crate::MetadataPolicy> {
+        self.statements
+            .iter()
+            .skip(1)
             .rev()
             .filter_map(|s| s.claims.metadata_policy.as_ref())
     }

@@ -77,7 +77,11 @@ pub mod trust_marks;
 /// §9 well-known entity-configuration issuer.
 pub mod well_known;
 
-pub use chain_composer::{compose_trust_chain, DEFAULT_MAX_CHAIN_FETCHES};
+pub use chain_composer::{
+    compose_trust_chain, compose_trust_chain_budgeted, FetchBudget, DEFAULT_MAX_AUTHORITY_HINTS,
+    DEFAULT_MAX_CHAIN_FETCHES, DEFAULT_MAX_WALK_BYTES, DEFAULT_MAX_WALK_FETCHES,
+    DEFAULT_WALK_DEADLINE_MS,
+};
 pub use entity_statement::{
     peek_claims_pub, sign_entity_statement, verify_entity_statement, EntityMetadata,
     EntityStatement, EntityStatementClaims, FederationEntityMetadata, MetadataPolicy,

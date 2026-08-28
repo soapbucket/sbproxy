@@ -51,6 +51,14 @@ use sbproxy_federation::{FederationKeySet, TrustAnchor, TrustAnchorStore, TrustC
 /// oldest entry goes rather than the map growing.
 const PEER_CACHE_CAPACITY: usize = 512;
 
+/// Maximum source addresses tracked by the walk rate limiter.
+///
+/// Bounded for the same reason the decision cache is: the map is keyed
+/// on something the network supplies. Full means the oldest window
+/// goes, which costs that source its accounting rather than the
+/// process its memory.
+const WALK_RATE_SOURCES_CAPACITY: usize = 4096;
+
 /// Maximum length of an entity id this verifier will act on. An entity
 /// id is a URL; anything longer is not one, and refusing early keeps a
 /// long header out of the cache key and the log line.
@@ -86,9 +94,33 @@ pub(crate) struct FederationPeerVerifier {
     required_trust_marks: Vec<String>,
     /// Anchor entity id to published JWKS, for trust-mark verification.
     anchor_jwks: HashMap<String, FederationKeySet>,
-    max_fetches: usize,
+    /// Depth cap handed to the composer.
+    max_depth: usize,
+    /// Total fetches one walk may spend.
+    max_chain_fetches: usize,
+    /// Total bytes one walk may read.
+    max_chain_bytes: u64,
+    /// Wall-clock budget for one walk.
+    max_chain_duration_ms: u64,
+    /// Cap on `authority_hints` per entity configuration.
+    max_authority_hints: usize,
+    /// Chain walks one source address may start per minute.
+    walks_per_minute: u32,
     cache_ttl: Duration,
-    cache: Mutex<HashMap<String, (Instant, PeerVerdict)>>,
+    /// Decision cache.
+    ///
+    /// Keyed on **(source address, entity id)**, not the entity id
+    /// alone. The entity id is attacker-chosen on an unauthenticated
+    /// request, so a single-key cache is defeated by rotating it, and
+    /// the cache was being described as the thing that stopped a
+    /// caller driving one chain walk per request. Including the
+    /// source means a rotating caller pays its own rate limit rather
+    /// than everyone's, and one peer's cached verdict cannot be
+    /// evicted by another source's churn.
+    cache: Mutex<HashMap<(String, String), (Instant, PeerVerdict)>>,
+    /// Per-source fixed-window walk counter: source address to
+    /// (window start, walks started in this window).
+    walk_rate: Mutex<HashMap<String, (Instant, u32)>>,
 }
 
 impl FederationPeerVerifier {
@@ -126,12 +158,15 @@ impl FederationPeerVerifier {
             fetcher: Arc::new(sbproxy_federation::ReqwestFederationFetcher::new()),
             required_trust_marks: config.required_trust_marks.clone(),
             anchor_jwks,
-            // One fetch per chain step plus the leaf's own
-            // configuration, so the composer's budget tracks the
-            // resolver's depth cap rather than being a second knob.
-            max_fetches: config.max_chain_depth.saturating_add(1),
+            max_depth: config.max_chain_depth,
+            max_chain_fetches: config.max_chain_fetches,
+            max_chain_bytes: config.max_chain_bytes,
+            max_chain_duration_ms: config.max_chain_duration_ms,
+            max_authority_hints: config.max_authority_hints,
+            walks_per_minute: config.walks_per_minute,
             cache_ttl: Duration::from_secs(config.cache_ttl_secs),
             cache: Mutex::new(HashMap::new()),
+            walk_rate: Mutex::new(HashMap::new()),
         })
     }
 
@@ -164,32 +199,82 @@ impl FederationPeerVerifier {
     /// peer that just failed to chain would otherwise get a fresh set
     /// of outbound fetches on every request it sends, which is a way
     /// for an unverified caller to make this proxy generate traffic.
-    pub(crate) async fn verify(&self, entity_id: &str) -> PeerVerdict {
+    /// `source` is the peer address the request arrived from. It is
+    /// half of the cache key and the whole of the rate-limit key, so
+    /// a caller that rotates the entity id it claims is limited by
+    /// where it is calling from rather than by what it calls itself.
+    pub(crate) async fn verify(&self, source: &str, entity_id: &str) -> PeerVerdict {
         if entity_id.len() > MAX_ENTITY_ID_LEN || !entity_id.starts_with("https://") {
             return PeerVerdict::Refused("malformed_entity_id");
         }
-        if let Some(cached) = self.cached(entity_id) {
+        if let Some(cached) = self.cached(source, entity_id) {
             return cached;
         }
+        // Only a cache miss reaches the walk, so the limit counts
+        // walks rather than requests. A refusal is cached too, which
+        // is what keeps a repeat caller off this path entirely.
+        if !self.claim_walk(source) {
+            return PeerVerdict::Refused("walk_rate_limited");
+        }
         let verdict = self.resolve(entity_id).await;
-        self.store(entity_id, verdict.clone());
+        self.store(source, entity_id, verdict.clone());
         verdict
     }
 
-    fn cached(&self, entity_id: &str) -> Option<PeerVerdict> {
+    /// Claim one walk for `source` in the current fixed window.
+    ///
+    /// Fixed window rather than a token bucket, matching
+    /// `RevocationRateLimiter` in the broker: the burst at a window
+    /// edge is bounded by twice the rate, and the walks this guards
+    /// are already bounded individually by [`FetchBudget`].
+    fn claim_walk(&self, source: &str) -> bool {
+        let mut rates = self
+            .walk_rate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let window = Duration::from_secs(60);
+        rates.retain(|_, (at, _)| at.elapsed() < window);
+        // The map is keyed on the source address, which is bounded by
+        // the connection table rather than by anything a single caller
+        // picks, but a proxy behind a wide NAT range still sees many.
+        if rates.len() >= WALK_RATE_SOURCES_CAPACITY && !rates.contains_key(source) {
+            if let Some(oldest) = rates
+                .iter()
+                .min_by_key(|(_, (at, _))| *at)
+                .map(|(key, _)| key.clone())
+            {
+                rates.remove(&oldest);
+            }
+        }
+        let entry = rates
+            .entry(source.to_string())
+            .or_insert_with(|| (Instant::now(), 0));
+        if entry.0.elapsed() >= window {
+            *entry = (Instant::now(), 0);
+        }
+        if entry.1 >= self.walks_per_minute {
+            return false;
+        }
+        entry.1 += 1;
+        true
+    }
+
+    fn cached(&self, source: &str, entity_id: &str) -> Option<PeerVerdict> {
         let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
-        let (at, verdict) = cache.get(entity_id)?;
+        let key = (source.to_string(), entity_id.to_string());
+        let (at, verdict) = cache.get(&key)?;
         if at.elapsed() < self.cache_ttl {
             return Some(verdict.clone());
         }
-        cache.remove(entity_id);
+        cache.remove(&key);
         None
     }
 
-    fn store(&self, entity_id: &str, verdict: PeerVerdict) {
+    fn store(&self, source: &str, entity_id: &str, verdict: PeerVerdict) {
         let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
         cache.retain(|_, (at, _)| at.elapsed() < self.cache_ttl);
-        if cache.len() >= PEER_CACHE_CAPACITY && !cache.contains_key(entity_id) {
+        let key = (source.to_string(), entity_id.to_string());
+        if cache.len() >= PEER_CACHE_CAPACITY && !cache.contains_key(&key) {
             if let Some(oldest) = cache
                 .iter()
                 .min_by_key(|(_, (at, _))| *at)
@@ -198,15 +283,22 @@ impl FederationPeerVerifier {
                 cache.remove(&oldest);
             }
         }
-        cache.insert(entity_id.to_string(), (Instant::now(), verdict));
+        cache.insert(key, (Instant::now(), verdict));
     }
 
     async fn resolve(&self, entity_id: &str) -> PeerVerdict {
-        let chain = match sbproxy_federation::compose_trust_chain(
+        let mut budget = sbproxy_federation::FetchBudget::new(
+            self.max_chain_fetches,
+            self.max_chain_bytes,
+            self.max_chain_duration_ms,
+            self.max_authority_hints,
+        );
+        let chain = match sbproxy_federation::compose_trust_chain_budgeted(
             self.fetcher.clone(),
             &self.resolver,
             entity_id,
-            self.max_fetches,
+            self.max_depth,
+            &mut budget,
         )
         .await
         {
@@ -241,7 +333,12 @@ impl FederationPeerVerifier {
         leaf: &sbproxy_federation::EntityStatement,
     ) -> bool {
         let mut composed: Option<serde_json::Value> = None;
-        for policy in chain.metadata_policies() {
+        // Superiors only. The leaf is the subject of this policy, not
+        // one of its authors: composing the leaf's own
+        // `metadata_policy` in would let it insert an operator its
+        // superior never named and satisfy a constraint its published
+        // metadata does not meet.
+        for policy in chain.metadata_policies_from_superiors() {
             composed = Some(match composed {
                 None => policy.0.clone(),
                 Some(superior) => {

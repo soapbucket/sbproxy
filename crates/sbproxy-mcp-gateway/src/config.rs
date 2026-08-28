@@ -34,8 +34,9 @@ pub enum StartupConfigError {
         "DPoP is enabled (dpop_supported or dpop_require_nonce) but \
          neither external_base_url nor MCP_GATEWAY_BASE_URL is a canonical HTTP(S) origin; \
          refusing to boot. Set external_base_url to the broker's externally visible \
-         origin without credentials, path, query, or fragment (e.g. https://broker.example) so DPoP htu validation \
-         can compose the canonical token endpoint URL."
+         origin without credentials, path, query, or fragment (e.g. https://broker.example). DPoP htu validation \
+         composes the canonical token endpoint URL from it, and the device-code consent page compares the \
+         browser's Origin header against it."
     )]
     DpopRequiresBaseUrl,
     /// Replay entries would expire while an otherwise fresh proof can
@@ -62,7 +63,10 @@ pub enum StartupConfigError {
     /// including this crate's own resource server, rejects every token
     /// the broker issues.
     #[error(
-        "broker_signing_key is a PEM with no public_jwk, so          {base_path}/.well-known/jwks.json would serve an empty key set while AS metadata          advertises it; set broker_signing_key.public_jwk to the public half of the same key          (same kid, same alg), or supply the key as a JWK instead of a PEM"
+        "broker_signing_key is a PEM with no public_jwk, so {base_path}/.well-known/jwks.json \
+         would serve an empty key set while AS metadata advertises it; set \
+         broker_signing_key.public_jwk to the public half of the same key (same kid, same alg), \
+         or supply the key as a JWK instead of a PEM"
     )]
     SigningKeyHasNoPublicHalf {
         /// The broker's configured base path, so the message names the
@@ -138,6 +142,15 @@ pub fn validate_startup(cfg: &McpGatewayConfig) -> Result<(), StartupConfigError
                 minimum,
             });
         }
+    }
+    // A canonical origin is needed by DPoP (to compose `htu`) and by
+    // the device-code consent page (to compare against the browser's
+    // `Origin`). It used to be checked only for DPoP, so
+    // `device_code_enabled: true` with `dpop_supported: false` and no
+    // base URL booted cleanly and then refused every consent POST as
+    // cross-origin, because the expected origin was the relative path
+    // `/mcp/oauth/verify` and `Url::parse` on it fails.
+    if cfg.dpop_supported || cfg.dpop_require_nonce || cfg.device_code_enabled {
         let base = std::env::var("MCP_GATEWAY_BASE_URL")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -181,10 +194,29 @@ pub const DEFAULT_CIMD_MAX_DOC_BYTES: usize = 16 * 1024;
 /// The `client_id` on `/authorize` is unauthenticated caller input, and
 /// it becomes the cache key verbatim in
 /// [`crate::cimd::EphemeralKvCimdCache`], so an unbounded value is an
-/// unbounded key on the shared store. 2048 bytes is the de facto URL
-/// ceiling browsers and reverse proxies already enforce, so no real
-/// client is near it.
-pub const MAX_CIMD_CLIENT_ID_LEN: usize = 2048;
+/// unbounded key on the shared store.
+///
+/// The value is set by the tightest consumer rather than by the URL
+/// ceiling. `LocalStore`'s key budget is 1024 bytes and the cache
+/// prefixes the URL with `cimd:doc:`, so a 2048-byte bound was inert
+/// on that backend: the store's own `KeyTooLarge` fired first, at
+/// roughly 1015 bytes, and surfaced to the caller as "client_id
+/// metadata document could not be resolved", which names the wrong
+/// cause. 900 leaves headroom under the prefix and is still far past
+/// any real client id.
+///
+/// Raising this means raising `LocalStore`'s key budget with it, or
+/// the refusal moves back into the store and stops naming what is
+/// wrong.
+pub const MAX_CIMD_CLIENT_ID_LEN: usize = 900;
+
+/// The cache-key prefix `MAX_CIMD_CLIENT_ID_LEN` has to leave room
+/// for, plus a margin. Compile-time so the pair cannot drift.
+const _: () = assert!(
+    MAX_CIMD_CLIENT_ID_LEN + "cimd:doc:".len() < 1_024,
+    "MAX_CIMD_CLIENT_ID_LEN plus the cimd:doc: prefix must fit LocalStore's 1024-byte key budget, \
+     or an over-length client_id is refused by the store with a message naming the wrong cause"
+);
 
 /// Default TTL applied to a cached CIMD entry when the response has no
 /// `Cache-Control: max-age` header. 1 hour matches the AS metadata

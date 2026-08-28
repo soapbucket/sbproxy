@@ -2874,7 +2874,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["surface", "decision"],
-        description: "MCP OAuth enforcement decisions that no HTTP status alone reports: the resource server's 401, the per-operation scope refusal and its fail-open twin, the /authorize and /par limiter, the session-capacity refusal, the AS-metadata stale fallback, the device-consent CSRF refusal, and an unresolvable client-id metadata document on /authorize or /token. The last one answers a fixed string on the wire, because the detail would name the address a client-chosen URL resolved to, so this counter is the only place its rate is visible.",
+        description: "MCP OAuth enforcement decisions that no HTTP status alone reports: the resource server's 401, the per-operation scope refusal and its fail-open twin, the /authorize and /par limiter, the session-capacity refusal, the AS-metadata stale fallback, the device-consent CSRF refusal, an unresolvable client-id metadata document on /authorize or /token, and a URL-shaped client_id longer than this broker accepts on either. The unresolvable case answers a fixed string on the wire, because the detail would name the address a client-chosen URL resolved to, so this counter is the only place its rate is visible.",
         dead_reason: None,
     },
     MetricCapability {

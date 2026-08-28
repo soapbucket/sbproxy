@@ -884,10 +884,14 @@ impl CimdCache for InMemoryCimdCache {
 ///
 /// `cimd:doc:{client_id_url}`. The URL is used verbatim. It is
 /// client-controlled (the `client_id` on an unauthenticated
-/// `/authorize`), and no guard bounds its length, so the caller is
-/// responsible for the bound: `/authorize` refuses a `client_id`
-/// longer than [`crate::config::MAX_CIMD_CLIENT_ID_LEN`] before it
-/// reaches the cache.
+/// `/authorize`), and this type bounds nothing itself, so the caller
+/// is responsible: both `/authorize` and `/token` answer
+/// `invalid_client` for a URL-shaped `client_id` longer than
+/// [`crate::config::MAX_CIMD_CLIENT_ID_LEN`] before it reaches the
+/// cache. That constant is sized to fit under `LocalStore`'s key
+/// budget once `cimd:doc:` is prepended, so the refusal comes from
+/// the handler with a message about the client id rather than from
+/// the store with one about a document it never fetched.
 pub struct EphemeralKvCimdCache {
     store: std::sync::Arc<dyn sbproxy_storage::EphemeralKv>,
     default_ttl: Duration,

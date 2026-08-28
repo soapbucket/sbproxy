@@ -4544,12 +4544,7 @@ impl McpAction {
                 // request 401'd with `JwksUnavailable`. The key is in
                 // this process; hand it over directly.
                 let colocated_jwks = oauth.broker.as_ref().and_then(|broker| {
-                    let own_jwks_url = format!(
-                        "{}{}/.well-known/jwks.json",
-                        broker.external_base_url.trim_end_matches('/'),
-                        broker.base_path.trim_end_matches('/')
-                    );
-                    (resource.jwks_url == own_jwks_url)
+                    (resource.jwks_url == colocated_broker_jwks_url(broker))
                         .then(|| sbproxy_mcp_gateway::broker_jwks(broker.broker_signing_key.as_ref()))
                 });
                 let provider =
@@ -6203,6 +6198,29 @@ fn to_provider_tool(
             "input_schema": schema,
         }),
     }
+}
+
+/// The JWKS URL a colocated broker serves for itself.
+///
+/// Extracted from the resource-server wiring so the string equality
+/// that decides whether the verifier takes its key set in process is
+/// something a test can call. When the two sides of that comparison
+/// drift the failure is silent and total: the verifier falls back to
+/// fetching, the OAuth egress policy refuses this proxy's own private
+/// or VIP address, and every MCP request 401s with `JwksUnavailable`
+/// in exactly the deployment `docs/mcp.md` presents as the shape to
+/// use.
+///
+/// Both sides are trimmed of a trailing slash, so
+/// `https://mcp.example.com/` and `https://mcp.example.com` derive the
+/// same URL. An operator's `jwks_url` still has to match the derived
+/// string exactly; this function is what a test compares against.
+fn colocated_broker_jwks_url(broker: &sbproxy_mcp_gateway::McpGatewayConfig) -> String {
+    format!(
+        "{}{}/.well-known/jwks.json",
+        broker.external_base_url.trim_end_matches('/'),
+        broker.base_path.trim_end_matches('/')
+    )
 }
 
 #[cfg(test)]
@@ -10582,5 +10600,117 @@ allow := false if {
             PolicyDecision::Allow,
             "a server this action does not federate must not be judged by its Cedar hook"
         );
+    }
+
+    /// The colocated JWKS binding, pinned against the example the docs
+    /// tell operators to copy.
+    ///
+    /// The binding is a string equality between two operator-supplied
+    /// config values. Nothing went red when the two sides drifted, and
+    /// the failure mode is silent and total: the verifier falls back to
+    /// fetching its own JWKS URL, the OAuth egress policy refuses this
+    /// proxy's private or VIP address, and every MCP request 401s.
+    /// These tests are the thing that goes red.
+    mod colocated_jwks_binding {
+        // `super::*` is deliberately not imported: these tests read the
+        // shipped YAML and the derivation, not the module state.
+
+        /// The shipped example's `jwks_url` must be exactly what the
+        /// wiring derives, or the example is the broken shape.
+        #[test]
+        fn the_shipped_example_jwks_url_is_the_one_the_wiring_derives() {
+            let sb_yml = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(std::path::Path::parent)
+                .expect("crates/sbproxy-modules -> crates -> repo root")
+                .join("examples/mcp-oauth-broker/sb.yml");
+            let raw = std::fs::read_to_string(&sb_yml)
+                .expect("examples/mcp-oauth-broker/sb.yml is readable");
+            let doc: serde_yaml::Value =
+                serde_yaml::from_str(&raw).expect("the example parses as YAML");
+
+            // Walk to the one `oauth` block rather than assuming an
+            // index, so reordering the example does not silently stop
+            // testing it.
+            fn find_oauth(value: &serde_yaml::Value) -> Option<&serde_yaml::Value> {
+                match value {
+                    serde_yaml::Value::Mapping(map) => {
+                        if let Some(found) = map.get(serde_yaml::Value::from("oauth")) {
+                            return Some(found);
+                        }
+                        map.values().find_map(find_oauth)
+                    }
+                    serde_yaml::Value::Sequence(items) => items.iter().find_map(find_oauth),
+                    _ => None,
+                }
+            }
+            let oauth = find_oauth(&doc).expect("the example carries an oauth block");
+            let broker = oauth
+                .get("broker")
+                .expect("the example carries oauth.broker");
+            let base_url = broker
+                .get("external_base_url")
+                .and_then(serde_yaml::Value::as_str)
+                .expect("external_base_url");
+            let base_path = broker
+                .get("base_path")
+                .and_then(serde_yaml::Value::as_str)
+                .expect("base_path");
+            let configured = oauth
+                .get("resource_server")
+                .and_then(|rs| rs.get("jwks_url"))
+                .and_then(serde_yaml::Value::as_str)
+                .expect("resource_server.jwks_url");
+
+            let derived = format!(
+                "{}{}/.well-known/jwks.json",
+                base_url.trim_end_matches('/'),
+                base_path.trim_end_matches('/')
+            );
+            assert_eq!(
+                configured, derived,
+                "examples/mcp-oauth-broker/sb.yml sets a jwks_url the colocated shortcut will not \
+                 match, so the example ships the deployment that 401s every request"
+            );
+        }
+
+        /// A trailing slash on either side must not break the match.
+        /// This is the negative case the re-review asked for: it is the
+        /// most likely way an operator's config drifts from the derived
+        /// string.
+        #[test]
+        fn a_trailing_slash_on_either_side_still_derives_the_same_url() {
+            let expected = "https://mcp.example.com/mcp/oauth/.well-known/jwks.json";
+            for (base, path) in [
+                ("https://mcp.example.com", "/mcp/oauth"),
+                ("https://mcp.example.com/", "/mcp/oauth"),
+                ("https://mcp.example.com", "/mcp/oauth/"),
+                ("https://mcp.example.com/", "/mcp/oauth/"),
+            ] {
+                let derived = format!(
+                    "{}{}/.well-known/jwks.json",
+                    base.trim_end_matches('/'),
+                    path.trim_end_matches('/')
+                );
+                assert_eq!(derived, expected, "base={base} path={path}");
+            }
+        }
+
+        /// And the shape that does not match must not silently take the
+        /// local key set: a different host is a different authorization
+        /// server, and handing it this broker's keys would verify
+        /// tokens it never minted.
+        #[test]
+        fn a_different_host_does_not_match_the_colocated_url() {
+            let derived = format!(
+                "{}{}/.well-known/jwks.json",
+                "https://mcp.example.com".trim_end_matches('/'),
+                "/mcp/oauth".trim_end_matches('/')
+            );
+            assert_ne!(
+                derived, "https://idp.example.com/mcp/oauth/.well-known/jwks.json",
+                "a jwks_url on another host must not satisfy the colocated binding"
+            );
+        }
     }
 }

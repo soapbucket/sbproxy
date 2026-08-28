@@ -18,8 +18,11 @@
 //!
 //! 1. Prefer [`validate_url_resolved`], which returns the resolved
 //!    [`SocketAddr`] list. Pin the dial to one of those addresses.
-//! 2. Re-check the chosen address with [`is_private_ip`] immediately
-//!    before the dial.
+//! 2. Re-check the chosen address with [`validate_dialable_addrs`]
+//!    immediately before the dial. Not [`is_private_ip`]: that answers
+//!    "is this the operator's internal network", and a dial-time guard
+//!    needs "may a socket reach this at all", which also covers
+//!    `0.0.0.0/8`, `240.0.0.0/4`, and the IPv4-embedding v6 forms.
 //! 3. If the dial path is owned by Pingora (or any other component that
 //!    re-resolves on its own), emit `tracing::error!` if the dialed peer
 //!    address turns out to be private and abort the upstream call.
@@ -144,6 +147,28 @@ fn is_link_local_v6(ip: &Ipv6Addr) -> bool {
 /// for instance) must run its input through here first; the shared
 /// checks [`is_private_ip`] and [`validate_dialable_addrs`] already do.
 ///
+/// # The other IPv4-embedding forms are refused, not unwrapped
+///
+/// `::ffff:a.b.c.d` is the only one this function translates, and the
+/// list is deliberately short rather than incomplete. Four more forms
+/// carry an IPv4 address inside a v6 one, and unwrapping each would
+/// mean deciding what the embedded address means on a network whose
+/// translation policy this crate cannot see. They are refused outright
+/// by [`is_reserved_non_dialable`] instead:
+///
+/// * `::a.b.c.d`, the deprecated IPv4-compatible form.
+/// * `64:ff9b::/96` and `64:ff9b:1::/48`, the NAT64 well-known
+///   prefixes. On an IPv6-only cluster these are a live route to the
+///   embedded v4 address, link-local metadata endpoints included.
+/// * `::ffff:0:a.b.c.d`, the IPv4-translated (SIIT) form, where the
+///   `ffff` sits one group earlier than in the mapped form.
+/// * `2002::/16`, 6to4, refused when the embedded address is itself
+///   private or reserved.
+///
+/// So a caller must not read "unwraps the mapped form" as "handles
+/// every v6 spelling of a v4 address". It handles one; the dial-time
+/// check handles the rest by refusing them.
+///
 /// ```
 /// # use std::net::IpAddr;
 /// # use sbproxy_security::ssrf::canonical_ip;
@@ -204,8 +229,66 @@ fn is_reserved_non_dialable(ip: &IpAddr) -> bool {
                 // `0.0.0.1` and lose the loopback match. The whole
                 // `::/96` block is reserved, so refuse it outright.
                 || (v6.to_ipv4().is_some() && v6.to_ipv4_mapped().is_none())
+                // The other three IPv4-embedding forms a real network
+                // routes. `canonical_ip` unwraps only `::ffff:a.b.c.d`,
+                // so on a network that carries any of these an embedded
+                // private or link-local v4 address reaches the dial with
+                // every range check having seen an unrelated v6 value.
+                //
+                // `64:ff9b::/96` and `64:ff9b:1::/48`, the RFC 6052 and
+                // RFC 8215 NAT64 prefixes. This is not exotic: it is how
+                // an IPv6-only Kubernetes cluster reaches IPv4, so
+                // `64:ff9b::a9fe:a9fe` is a live route to
+                // `169.254.169.254` there.
+                || is_nat64(v6)
+                // `::ffff:0:a.b.c.d`, the RFC 6052 IPv4-translated form
+                // (SIIT). The `ffff` sits one group earlier than in the
+                // mapped form, so `to_ipv4_mapped` returns `None`.
+                || v6.segments()[..5] == [0, 0, 0, 0, 0xffff]
+                // `2002::/16`, 6to4 (RFC 3056). The embedded v4 is the
+                // relay's address, so refuse only when that address is
+                // one a socket has no business reaching.
+                || is_6to4_over_reserved_v4(v6)
         }
     }
+}
+
+/// Whether `v6` is in a NAT64 well-known prefix.
+///
+/// `64:ff9b::/96` (RFC 6052 s2.1) and `64:ff9b:1::/48` (RFC 8215).
+/// Refused wholesale rather than unwrapped: on a network that routes
+/// them the embedded address is reachable, and on one that does not
+/// the address is unreachable anyway, so there is no traffic to lose.
+fn is_nat64(v6: &std::net::Ipv6Addr) -> bool {
+    let seg = v6.segments();
+    // 64:ff9b:0000:0000:0000:0000::/96
+    if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2..6] == [0, 0, 0, 0] {
+        return true;
+    }
+    // 64:ff9b:1::/48
+    seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0x0001
+}
+
+/// Whether `v6` is a 6to4 address (`2002::/16`, RFC 3056) whose
+/// embedded IPv4 address is one this workspace refuses to dial.
+///
+/// 6to4 is a global unicast prefix, so refusing the whole block would
+/// drop legitimate destinations. The embedded address is the second
+/// through fifth octets, and it is the one a packet ultimately reaches,
+/// so that is what gets the range test.
+fn is_6to4_over_reserved_v4(v6: &std::net::Ipv6Addr) -> bool {
+    let seg = v6.segments();
+    if seg[0] != 0x2002 {
+        return false;
+    }
+    let embedded = std::net::Ipv4Addr::new(
+        (seg[1] >> 8) as u8,
+        (seg[1] & 0xff) as u8,
+        (seg[2] >> 8) as u8,
+        (seg[2] & 0xff) as u8,
+    );
+    let embedded = IpAddr::V4(embedded);
+    is_private_ip(&embedded) || is_reserved_non_dialable(&embedded)
 }
 
 /// Re-check a set of already-resolved addresses immediately before a dial.
@@ -310,9 +393,12 @@ pub fn validate_url_with_allowlist(url: &str, allowlist: &[String]) -> Result<()
 /// 1. Pin the dial to one of the returned [`SocketAddr`]s rather than
 ///    re-resolving the hostname via the OS resolver (which is what
 ///    enables DNS rebinding).
-/// 2. Re-check the chosen address with [`is_private_ip`] immediately
-///    before the dial, since the result of validation is not bound to
-///    the dial in time.
+/// 2. Re-check the chosen address with [`validate_dialable_addrs`]
+///    immediately before the dial, since the result of validation is
+///    not bound to the dial in time. [`is_private_ip`] is the weaker
+///    of the two: it answers "is this the operator's internal
+///    network", which is the question the `allowlist` below is about,
+///    not "may a socket reach this at all".
 ///
 /// Hosts in `allowlist` short-circuit the private-IP block, mirroring
 /// [`validate_url_with_allowlist`]. The returned `ResolvedUrl` carries
@@ -796,6 +882,15 @@ mod tests {
 /// - Whether a caller listed as pinned actually pins. The pinned /
 ///   not-pinned split in the block is prose, and only the count and the
 ///   membership are checked here.
+/// - **A caller that hand-rolls its own range check and calls none of
+///   [`VALIDATORS`].** This is the blind spot with a track record: the
+///   two `sbproxy-mcp-gateway` guards that shipped their own
+///   `is_disallowed_ip` copies were invisible here for exactly as long
+///   as they existed, and both missed the IPv4-mapped form the shared
+///   check has always handled. A reviewer reading this block as an
+///   exhaustive audit list would have seen nothing wrong. Grepping for
+///   `is_private`, `is_loopback`, and `octets()` in a crate that dials
+///   is what finds them; the block cannot.
 #[cfg(test)]
 mod caller_status_guard {
     use std::path::{Path, PathBuf};

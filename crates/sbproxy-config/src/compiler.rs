@@ -2307,6 +2307,35 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
                     "config compile: proxy.federation.peer_trust.max_chain_depth must be greater than zero"
                 );
             }
+            if peer_trust.max_chain_fetches == 0 {
+                anyhow::bail!(
+                    "config compile: proxy.federation.peer_trust.max_chain_fetches must be \
+                     greater than zero; a walk with no fetch budget is the unbounded walk \
+                     this key exists to stop"
+                );
+            }
+            if peer_trust.max_chain_bytes == 0 {
+                anyhow::bail!(
+                    "config compile: proxy.federation.peer_trust.max_chain_bytes must be greater than zero"
+                );
+            }
+            if peer_trust.max_chain_duration_ms == 0 {
+                anyhow::bail!(
+                    "config compile: proxy.federation.peer_trust.max_chain_duration_ms must be greater than zero"
+                );
+            }
+            if peer_trust.max_authority_hints == 0 {
+                anyhow::bail!(
+                    "config compile: proxy.federation.peer_trust.max_authority_hints must be greater than zero"
+                );
+            }
+            if peer_trust.walks_per_minute == 0 {
+                anyhow::bail!(
+                    "config compile: proxy.federation.peer_trust.walks_per_minute must be \
+                     greater than zero; the per-source rate limit is what stops a caller \
+                     that rotates the entity id it claims from driving one chain walk per request"
+                );
+            }
             if peer_trust.cache_ttl_secs == 0 {
                 anyhow::bail!(
                     "config compile: proxy.federation.peer_trust.cache_ttl_secs must be greater than zero"
