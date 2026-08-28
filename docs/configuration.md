@@ -4044,7 +4044,7 @@ The intake accepts up to 64 KiB per report via `POST /__sbproxy/csp-report` and 
 
 ### dlp
 
-Data Loss Prevention scan over the request URI, headers, and (on by default) the buffered request body. Matches against the configured detector catalog (or every default when `detectors: []`) and either tags the upstream request with `dlp-detection: <names>` (`action: tag`, default) or rejects with `403` (`action: block`). The scan does not mask or rewrite anything it finds; `action: tag` stamps a header, `action: block` refuses. `replacement` on a custom `rules:` entry is accepted because the rule type is shared with the `pii:` redactor, and DLP does not apply it. Response bodies are out of scope. Runnable at [`examples/dlp-catalog/`](../examples/dlp-catalog/).
+Data Loss Prevention scan over the request URI and headers. Matches against the configured detector catalog (or every default when `detectors: []`) and either tags the upstream request with `dlp-detection: <names>` (`action: tag`, default) or rejects with `403` (`action: block`). The scan does not mask or rewrite anything it finds; `action: tag` stamps a header, `action: block` refuses. `replacement` on a custom `rules:` entry is accepted because the rule type is shared with the `pii:` redactor, and DLP does not apply it. Response bodies are out of scope. Runnable at [`examples/dlp-catalog/`](../examples/dlp-catalog/).
 
 ```yaml
 policies:
@@ -4066,13 +4066,13 @@ policies:
 | `action` | string | `tag` | `tag` stamps `<header>: <detector_csv>` on the upstream. `block` returns `403`. |
 | `direction` | string | `request` | `request` is the only path enforced today; `response` and `both` are accepted for forward compatibility. |
 | `header` | string | `dlp-detection` | Header name when `action: tag`. |
-| `scan_body` | bool | `true` | Include the buffered request body in the scan, in addition to the URI and headers. |
-| `body_max_bytes` | int | `16384` | Maximum bytes of the request body scanned when `scan_body` is true. |
+| `scan_body` | bool | `true` | When the snapshot carries a body, include it in the scan. The live request-filter chain currently always snapshots an empty body, so this knob does not change what an operator sees on the wire today. |
+| `body_max_bytes` | int | `16384` | Maximum bytes of that body scanned when `scan_body` is true and a body is present in the snapshot. |
 | `rules` | list | `[]` | Custom regex rules layered on top of the catalog. Same shape as the `pii.rules` block on `ai_proxy` origins. |
 
-The scan covers the request URI (path + query), request headers, and, unless `scan_body: false`, the buffered request body. Auth-class headers (`Authorization`, `Cookie`, `Set-Cookie`) are excluded so tokens carried by design don't self-flag. The body is capped at `body_max_bytes` and decoded lossily, so a non-text payload with a regulated shape near the head is still caught.
+The scan covers the request URI (path + query) and request headers. Auth-class headers (`Authorization`, `Cookie`, `Set-Cookie`) are excluded so tokens carried by design don't self-flag. `scan_body` defaults true and `body_max_bytes` defaults 16384; those knobs are what the enforcer uses when a body is present in the snapshot it receives. The request-filter policy chain currently snapshots with an empty body and DLP does not opt into body buffering, so a secret that appears only in the POST body is not seen. URI and header matches still fire.
 
-Every hit also carries bounded detection spans: an entity type plus a byte offset and length for each match, never the matched value itself. Offsets are relative to the segment that produced the span: the URI text (path + query), the individual header value that matched, or the capped, lossily decoded body text. A span does not name its segment, so treat offsets as evidence within one of those three coordinate spaces rather than positions in the raw request. The merged list is capped at 32 spans across the whole scan, filled round-robin across the URI, header, and body matches so no one segment can crowd the others out of the cap; everything past the cap is counted, not carried. `action: block` folds a compact summary of the count (and how many were dropped past the cap) into the `403` message, which is also what lands in the admin console's per-request `deny_reason` column.
+Every hit also carries bounded detection spans: an entity type plus a byte offset and length for each match, never the matched value itself. Offsets are relative to the segment that produced the span: the URI text (path + query), the individual header value that matched, or the capped, lossily decoded body text when a body is in the snapshot. A span does not name its segment, so treat offsets as evidence within one of those three coordinate spaces rather than positions in the raw request. The merged list is capped at 32 spans across the whole scan, filled round-robin across the URI, header, and body matches so no one segment can crowd the others out of the cap; everything past the cap is counted, not carried. `action: block` folds a compact summary of the count (and how many were dropped past the cap) into the `403` message, which is also what lands in the admin console's per-request `deny_reason` column.
 
 ### prompt_injection_v2
 

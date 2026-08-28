@@ -1,9 +1,8 @@
 # yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Data Loss Prevention catalog.
 #
-# The dlp policy scans the request URI, headers, and (on by default,
-# capped at 16 KiB via `body_max_bytes`) the buffered body for
-# matches against the configured detector set, then either tags the
+# The dlp policy scans the request URI and headers for matches
+# against the configured detector set, then either tags the
 # upstream request (`action: tag`, default) or blocks the call
 # (`action: block`). Detectors are drawn from the built-in regex
 # catalogue with optional inline `rules:` layered on top.
@@ -11,7 +10,9 @@
 # Request-side only: dlp has no response-scanning phase, and no
 # other built-in control fills that gap today. The `pii:` block on
 # `ai_proxy` origins redacts request bodies with the same regex
-# catalogue for that surface.
+# catalogue for that surface. `scan_body` defaults true, but the
+# header-phase policy chain snapshots an empty body, so a secret
+# that appears only in the POST body is not seen.
 #
 # Run:
 #   make run CONFIG=examples/dlp-catalog/sb.yml
@@ -19,13 +20,6 @@
 # Test (block path - request that smuggles an AWS key in the URL):
 #   curl -i -H 'Host: api.local' \
 #     'http://127.0.0.1:8080/build?key=AKIAIOSFODNN7EXAMPLE'
-#   # => 403; "dlp: detector aws_access matched"
-#
-# Test (block path - AWS key in the POST body; scan_body is on by default):
-#   curl -i -H 'Host: api.local' \
-#     -H 'Content-Type: application/json' \
-#     -d '{"key":"AKIAIOSFODNN7EXAMPLE"}' \
-#     http://127.0.0.1:8080/build
 #   # => 403; "dlp: detector aws_access matched"
 #
 # Test (tag path - upstream sees `dlp-detection` header):

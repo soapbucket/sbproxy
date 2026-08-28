@@ -24,7 +24,7 @@ Type `curl -i -H 'Host: api.local' 'http://127.0.0.1:8080/build?key=AKIAIOSFODNN
 Enter
 Sleep 1.6s
 
-Type `curl -i -H 'Host: api.local' -H 'Content-Type: application/json' -d '{"key":"AKIAIOSFODNN7EXAMPLE"}' http://127.0.0.1:8080/build`
+Type `curl -i -H 'Host: tag.local' -H 'X-Notes: leaked xoxb-1234567890-abc' http://127.0.0.1:8080/anything`
 Enter
 Sleep 1.6s
 

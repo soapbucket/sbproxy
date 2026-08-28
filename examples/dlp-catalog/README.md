@@ -4,7 +4,7 @@
 
 ![DLP catalog](../../docs/assets/dlp-catalog.gif)
 
-The `dlp` policy scans the request URI, headers, and (on by default, capped at 16 KiB via `body_max_bytes`) the buffered body for matches against the configured detector set, then either tags the upstream request with a `dlp-detection` header (`action: tag`, default) or rejects with 403 (`action: block`). Detectors come from the built-in regex catalogue (AWS keys, GitHub tokens, Slack tokens, IBANs, etc.) with optional inline `rules:` layered on top. This example ships two origins. `api.local` blocks on AWS, GitHub, Slack, or IBAN matches. `tag.local` enables every default detector (empty `detectors: []`) and adds a custom `internal_ticket` rule that redacts `TICKET-NNNNNN` strings. Scanning is request-side only; `dlp` has no response-scanning phase.
+The `dlp` policy scans the request URI and headers for matches against the configured detector set, then either tags the upstream request with a `dlp-detection` header (`action: tag`, default) or rejects with 403 (`action: block`). Detectors come from the built-in regex catalogue (AWS keys, GitHub tokens, Slack tokens, IBANs, etc.) with optional inline `rules:` layered on top. This example ships two origins. `api.local` blocks on AWS, GitHub, Slack, or IBAN matches. `tag.local` enables every default detector (empty `detectors: []`) and adds a custom `internal_ticket` rule that tags `TICKET-NNNNNN` strings. Scanning is request-side only; `dlp` has no response-scanning phase. `scan_body` defaults true, but the header-phase policy chain snapshots an empty body, so a secret that appears only in the POST body is not seen.
 
 ## Run
 
@@ -38,17 +38,6 @@ curl -i -H 'Host: tag.local' \
 # header stamped on it so the upstream can react. Tag mode never rewrites
 # header or body values. `replacement` on a custom rule is the `pii:` redactor
 # field on the shared rule type; DLP does not apply it.
-
-# Block path: an AWS access key in the POST body trips the same detector.
-# Body scanning is on by default (`scan_body: true`, `body_max_bytes: 16384`).
-curl -i -H 'Host: api.local' \
-  -H 'Content-Type: application/json' \
-  -d '{"key":"AKIAIOSFODNN7EXAMPLE"}' \
-  http://127.0.0.1:8080/build
-# HTTP/1.1 403 Forbidden
-# content-type: application/json
-#
-# {"error":"dlp: detector aws_access matched"}
 
 # Clean request -> no tag, no block.
 curl -i -H 'Host: tag.local' http://127.0.0.1:8080/anything

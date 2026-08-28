@@ -37,7 +37,7 @@ If you are deciding which policy stops which threat, start with the group headin
 - `sri`: enforces Subresource Integrity on scripts the origin serves. [api-security.md](api-security.md#browser-facing-misconfiguration).
 - `content_digest`: verifies an inbound body against its RFC 9530 `Content-Digest` header. [content-digest.md](content-digest.md).
 - `page_shield`: watches for third-party script drift on pages the origin serves. [api-security.md](api-security.md#browser-facing-misconfiguration).
-- `dlp`: scans the request URI, headers, and (on by default, capped at 16 KiB) the buffered request body for regulated-data shapes and tags or blocks. Requests only, and it detects rather than masks. [api-security.md](api-security.md#data-leaving-that-should-not).
+- `dlp`: scans the request URI and headers for regulated-data shapes and tags or blocks. `scan_body` defaults true, but the live request-filter chain snapshots an empty body, so a secret that appears only in the POST body is not seen. Requests only, and it detects rather than masks. [api-security.md](api-security.md#data-leaving-that-should-not).
 - `exposed_credentials` (alias `leaked_credentials`): detects a known-leaked basic-auth password and tags or blocks. [exposed-credentials.md](exposed-credentials.md).
 
 **AI-specific.** Policies with no equivalent in an ordinary API gateway.

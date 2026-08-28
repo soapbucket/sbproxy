@@ -106,7 +106,8 @@ Boot-only keys that operators hit on upgrade, all Restart in that matrix:
 | `proxy.config_authority` | Subscriber and poll loop are built once. |
 | `proxy.compression_state` | Embedded DB handle is process-owned. |
 | `proxy.l2_cache.driver` | Driver swap rebuilds the KV handle. Parameters under the driver are Reload. |
-| `request_events`, `proxy.agent_registry`, `proxy.notifications` | Each opens an embedded store or a set-once sink. A reload that changes one of these now fails rather than silently keeping the old sink. |
+
+`sbproxy plan` classifies unmatched paths as Reload. `request_events`, `proxy.agent_registry`, and `proxy.notifications` are not in `BLAST_RADIUS_MATRIX`, so plan reports Reload for them. A reload that changes one of those three is then refused in `reconcile_boot_only_blocks` (`crates/sbproxy-core/src/server/lifecycle.rs`): the node keeps serving the previous config. That is not Restart. Restart means the reload accepts the YAML and then does nothing with the new value until the next process start. See Unreleased below.
 
 A config authority is separately forbidden from writing some of the same paths (`AUTHORITY_DENIED_PATHS` in `crates/sbproxy-config/src/config_merge.rs`), including `proxy.config_history`. That is a write-path restriction, not a blast-radius class.
 
@@ -115,7 +116,7 @@ A config authority is separately forbidden from writing some of the same paths (
 Release-specific behavior lives in [CHANGELOG.md](../CHANGELOG.md). These surfaces changed default or restart posture in the 1.12 and 1.13 line and are easy to miss if you only run `validate`:
 
 - **Applied-config history** is off until you set `proxy.config_history` and restart. See [configuration.md](configuration.md#config_history) and [`examples/config-history/`](../examples/config-history/).
-- **DLP scans request bodies** by default (`scan_body: true`, 16 KiB cap). A POST that used to pass can 403. See [configuration.md](configuration.md#dlp) and [`examples/dlp-catalog/`](../examples/dlp-catalog/).
+- **DLP live path is URI and headers.** `scan_body` defaults true and `body_max_bytes` defaults 16384, but the header-phase policy chain snapshots an empty body, so a secret that appears only in the POST body is not refused. See [configuration.md](configuration.md#dlp) and [`examples/dlp-catalog/`](../examples/dlp-catalog/).
 - **Rate-limit workspace label** for single-tenant traffic is `__default__`, not `default`. See [multi-tenant.md](multi-tenant.md).
 - **Payment clustering** and `state_path` limits: [payment-clustering.md](payment-clustering.md).
 - **Admin playground** dispatch path is `/dispatch`, not `/chat`. See [admin-ui.md](admin-ui.md).
