@@ -100,7 +100,16 @@ while [ "$#" -gt 0 ]; do
       shift
       ;;
     -h|--help)
-      sed -n '2,55p' "$0"
+      # The header, up to the first line of code. A fixed line number
+      # went stale the first time the header grew and started printing
+      # `set -euo pipefail` as if it were documentation.
+      sed -n '2,/^set -euo pipefail/p' "$0" | sed '$d'
+      printf 'usage: check.sh [--scope-to-diff [<base>]] [--explain]\n\n'
+      printf '  --scope-to-diff [<base>]  run only the phases the diff against <base>\n'
+      printf '                            (default origin/main) can reach. An\n'
+      printf '                            unrecognized path runs everything.\n'
+      printf '  --explain                 print that decision per changed path and\n'
+      printf '                            run nothing.\n'
       exit 0
       ;;
     *)
