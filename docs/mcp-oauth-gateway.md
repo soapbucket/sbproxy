@@ -56,7 +56,7 @@ That reconstruction is available to a **standalone** embedding only.
 The broker an `mcp` action compiles from `sb.yml` always uses the
 in-process store, because `oauth.broker` carries no key to point it
 somewhere else. Run that form on one replica; see
-[mcp.md](mcp.md#oauth-2-1-broker-and-resource-server).
+[mcp.md](mcp.md#oauth-auth-discovery-rfc-9728).
 
 ## Quickstart
 
