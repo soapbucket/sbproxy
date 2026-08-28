@@ -6078,6 +6078,70 @@ fn apply_operator_service_tier(
     }
 }
 
+/// WOR-2622: ask an OpenAI-compatible provider for a terminal usage
+/// frame, when the operator has opted in.
+///
+/// A free function reading `config.stream_include_usage` rather than a
+/// method, because the config-reader guard reads the source for the key
+/// name and cannot see a trait `impl`.
+///
+/// Six things have to hold before the field is injected, and each of
+/// them is a way the injection would otherwise break a working stream:
+///
+/// 1. The operator set the key. Off by default: with it on the caller
+///    receives one extra terminal chunk whose `choices` is `[]`, and a
+///    client that indexes `choices[0]` unconditionally throws on it.
+/// 2. The request is streaming. `stream_options` is meaningless
+///    otherwise and some servers reject it on a unary request.
+/// 3. The provider speaks OpenAI's wire format. Anthropic, Vertex /
+///    Gemini, Bedrock, Cohere and Ollama have no `stream_options` at
+///    all, and their translators would carry an unknown key upstream.
+/// 4. The surface is one that streams chat-shaped completions.
+/// 5. The caller did not send `stream_options` itself. A caller that
+///    asked for something specific keeps what it asked for.
+/// 6. The body is a JSON object.
+///
+/// Applied to the per-attempt body, after the model remap and beside the
+/// service-tier and reasoning rewrites, so it never moves
+/// `ctx.ai_prompt_fingerprint`, the semantic-cache key or
+/// `extract_prefix_key`'s hash: all three are derived from the caller's
+/// own body, and moving them would invalidate every cache entry the
+/// moment an operator turned this on.
+///
+/// Returns whether the field was injected, for the caller's log line.
+fn apply_stream_include_usage(
+    config: &sbproxy_ai::AiHandlerConfig,
+    provider: &sbproxy_ai::provider::ProviderConfig,
+    surface: &sbproxy_ai::handler::AiSurface,
+    attempt_body: &mut serde_json::Value,
+) -> bool {
+    if !config.stream_include_usage {
+        return false;
+    }
+    if !matches!(surface, sbproxy_ai::handler::AiSurface::ChatCompletions) {
+        return false;
+    }
+    if sbproxy_ai::client::provider_format(provider)
+        != sbproxy_ai::providers::ProviderFormat::OpenAi
+    {
+        return false;
+    }
+    let Some(object) = attempt_body.as_object_mut() else {
+        return false;
+    };
+    if object.get("stream") != Some(&serde_json::Value::Bool(true)) {
+        return false;
+    }
+    if object.contains_key("stream_options") {
+        return false;
+    }
+    object.insert(
+        "stream_options".to_string(),
+        serde_json::json!({"include_usage": true}),
+    );
+    true
+}
+
 /// Derive one caller-scoped prompt-cache lease identity for a request.
 ///
 /// Reads the caller's own cache key: `prompt_cache_key` first, then `user`,
@@ -12238,6 +12302,7 @@ pub(super) async fn handle_ai_proxy(
             // The raced path never takes the native bypass, so the resolved
             // pair has no second consumer here.
             let _ = apply_operator_service_tier(&provider, &surface, &mut attempt_body);
+            apply_stream_include_usage(config, &provider, &surface, &mut attempt_body);
             let resolved_model = if !model.is_empty() {
                 let mapped = provider.map_model(&model);
                 if mapped != model {
@@ -12594,6 +12659,12 @@ pub(super) async fn handle_ai_proxy(
         // Map model name for this provider.
         let mut attempt_body = body.clone();
         let operator_tier = apply_operator_service_tier(provider, &surface, &mut attempt_body);
+        if apply_stream_include_usage(config, provider, &surface, &mut attempt_body) {
+            debug!(
+                provider = %provider.name,
+                "AI proxy: asked the provider for a terminal usage frame (stream_include_usage)"
+            );
+        }
         let resolved_model = if !model.is_empty() {
             let mapped = provider.map_model(&model);
             if mapped != model {
@@ -21565,6 +21636,131 @@ mod external_guardrail_context_tests {
     /// real SSE, because the thing under test is the seam between the
     /// relay's exits and the settlement, and an in-process call to the
     /// relay would not have a downstream write that can fail.
+    /// WOR-2622: `stream_include_usage`, the opt-in that asks an
+    /// OpenAI-compatible provider for a terminal usage frame.
+    mod stream_include_usage_tests {
+        use crate::server::ai_dispatch::apply_stream_include_usage;
+
+        fn config(include_usage: bool, provider_type: &str) -> sbproxy_ai::AiHandlerConfig {
+            sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+                "providers": [{
+                    "name": "upstream",
+                    "provider_type": provider_type,
+                    "base_url": "http://127.0.0.1:1/v1",
+                    "allow_private_base_url": true,
+                    "api_key": "fixture-key"
+                }],
+                "stream_include_usage": include_usage
+            }))
+            .expect("include-usage fixture config")
+        }
+
+        fn streaming_body() -> serde_json::Value {
+            serde_json::json!({
+                "model": "gpt-4o-mini",
+                "stream": true,
+                "messages": [{"role": "user", "content": "hello"}]
+            })
+        }
+
+        /// The default has to leave the caller's body alone: with the
+        /// field injected the provider appends a terminal chunk whose
+        /// `choices` is `[]`, and a client that indexes `choices[0]`
+        /// throws on it.
+        #[test]
+        fn the_field_is_not_injected_until_an_operator_asks() {
+            let config = config(false, "openai");
+            let mut body = streaming_body();
+            assert!(!apply_stream_include_usage(
+                &config,
+                &config.providers[0],
+                &sbproxy_ai::handler::AiSurface::ChatCompletions,
+                &mut body,
+            ));
+            assert!(body.get("stream_options").is_none());
+        }
+
+        #[test]
+        fn an_opted_in_openai_stream_asks_for_the_usage_frame() {
+            let config = config(true, "openai");
+            let mut body = streaming_body();
+            assert!(apply_stream_include_usage(
+                &config,
+                &config.providers[0],
+                &sbproxy_ai::handler::AiSurface::ChatCompletions,
+                &mut body,
+            ));
+            assert_eq!(
+                body["stream_options"],
+                serde_json::json!({"include_usage": true})
+            );
+        }
+
+        /// Anthropic, Vertex, Bedrock, Cohere and Ollama have no
+        /// `stream_options`, and several OpenAI-compatible servers 400 on
+        /// an unknown top-level key, so a blanket injection would turn a
+        /// working stream into a hard failure.
+        #[test]
+        fn a_provider_without_stream_options_is_left_alone() {
+            let config = config(true, "anthropic");
+            let mut body = streaming_body();
+            assert!(!apply_stream_include_usage(
+                &config,
+                &config.providers[0],
+                &sbproxy_ai::handler::AiSurface::ChatCompletions,
+                &mut body,
+            ));
+            assert!(body.get("stream_options").is_none());
+        }
+
+        #[test]
+        fn a_caller_that_set_stream_options_keeps_what_it_asked_for() {
+            let config = config(true, "openai");
+            let mut body = streaming_body();
+            body["stream_options"] = serde_json::json!({"include_usage": false});
+            assert!(!apply_stream_include_usage(
+                &config,
+                &config.providers[0],
+                &sbproxy_ai::handler::AiSurface::ChatCompletions,
+                &mut body,
+            ));
+            assert_eq!(
+                body["stream_options"],
+                serde_json::json!({"include_usage": false})
+            );
+        }
+
+        #[test]
+        fn a_unary_request_is_left_alone() {
+            let config = config(true, "openai");
+            let mut body = streaming_body();
+            body["stream"] = serde_json::Value::Bool(false);
+            assert!(!apply_stream_include_usage(
+                &config,
+                &config.providers[0],
+                &sbproxy_ai::handler::AiSurface::ChatCompletions,
+                &mut body,
+            ));
+            assert!(body.get("stream_options").is_none());
+        }
+
+        /// Embeddings and the image surfaces have no `stream_options`
+        /// either, and the injection runs on the per-attempt body for
+        /// every surface the dispatcher handles.
+        #[test]
+        fn a_non_chat_surface_is_left_alone() {
+            let config = config(true, "openai");
+            let mut body = streaming_body();
+            assert!(!apply_stream_include_usage(
+                &config,
+                &config.providers[0],
+                &sbproxy_ai::handler::AiSurface::Embeddings,
+                &mut body,
+            ));
+            assert!(body.get("stream_options").is_none());
+        }
+    }
+
     mod stream_usage_finalizer_tests {
         use super::*;
 
