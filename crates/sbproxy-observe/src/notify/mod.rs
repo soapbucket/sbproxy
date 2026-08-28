@@ -265,6 +265,29 @@ pub struct Notifier {
     /// other way to hear about an admin mutation. A mutation now publishes
     /// here and the worker just loads.
     subscriptions: Arc<arc_swap::ArcSwap<Vec<Subscription>>>,
+    /// Which event types any active subscription selects, as one bitmask
+    /// republished whenever a subscription changes.
+    ///
+    /// [`Self::wants`] runs on the publish path for every event the process
+    /// produces, including the per-request ones, and scanning every
+    /// subscription times every filter there costs more than the answer is
+    /// worth. This turns it into one relaxed load and a bit test.
+    wanted: Arc<std::sync::atomic::AtomicU32>,
+}
+
+/// Fold the active subscriptions' filters into one event-type bitmask.
+fn wanted_mask(subscriptions: &[Subscription]) -> u32 {
+    let mut bits = 0u32;
+    for event_type in crate::events::ALL_EVENT_TYPES {
+        let name = event_type.as_str();
+        if subscriptions
+            .iter()
+            .any(|subscription| subscription.active && subscription.selects(name))
+        {
+            bits |= 1 << event_type.index();
+        }
+    }
+    bits
 }
 
 impl std::fmt::Debug for Notifier {
@@ -300,6 +323,7 @@ impl Notifier {
     ) -> Result<Self> {
         let store = Arc::new(NotifyStore::open_with_capacity(store, deadletter_capacity).await?);
         let loaded = store.list_subscriptions().await?;
+        let wanted = Arc::new(std::sync::atomic::AtomicU32::new(wanted_mask(&loaded)));
         let subscriptions = Arc::new(arc_swap::ArcSwap::from_pointee(loaded));
 
         let (tx, rx) = channel(queue_capacity.max(1));
@@ -315,6 +339,7 @@ impl Notifier {
             handle: Some(handle),
             store,
             subscriptions,
+            wanted,
         };
         metrics::set_subscriptions(notifier.subscriptions.load().len() as i64);
         // Both collections, both at boot. `docs/notifications.md` tells
@@ -329,14 +354,18 @@ impl Notifier {
 
     /// Whether any active subscription selects `event_type`.
     ///
-    /// The publish path calls this before building an event, so a proxy with
-    /// no subscription pays one atomic load and a filter scan rather than a
-    /// serialization.
+    /// The publish path calls this before building an event, so a proxy
+    /// with no subscription pays one relaxed load and a bit test rather
+    /// than a serialization or a scan.
+    ///
+    /// A name the enum does not carry answers `false`. Nothing publishes
+    /// one, and answering `true` would be building an event for a type no
+    /// subscription can have selected.
     pub fn wants(&self, event_type: &str) -> bool {
-        self.subscriptions
-            .load()
-            .iter()
-            .any(|subscription| subscription.active && subscription.selects(event_type))
+        let Some(known) = crate::events::EventType::from_name(event_type) else {
+            return false;
+        };
+        self.wanted.load(std::sync::atomic::Ordering::Relaxed) & (1 << known.index()) != 0
     }
 
     /// Hand an event to the worker under a fresh event id. Never blocks; a
@@ -379,6 +408,11 @@ impl Notifier {
     async fn reload(&self) -> Result<()> {
         let loaded = self.store.list_subscriptions().await?;
         metrics::set_subscriptions(loaded.len() as i64);
+        // The mask first, then the snapshot: `wants` gating an event the
+        // snapshot does not yet select costs one skipped delivery, while
+        // the other order would drop one.
+        self.wanted
+            .store(wanted_mask(&loaded), std::sync::atomic::Ordering::Relaxed);
         self.subscriptions.store(Arc::new(loaded));
         Ok(())
     }
