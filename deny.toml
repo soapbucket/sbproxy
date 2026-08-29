@@ -182,6 +182,31 @@ ignore = [
   # 0.3 client. WOR-2673 retired that backend in favor of the object-storage
   # one, and with it the whole legacy stack: the lockfile now holds one h2
   # (0.4.16) and one hyper (1.9.0). Entry removed 2026-08-27.
+
+  # --- ttf-parser unmaintained (transitive via lopdf) ----------------------
+  # RUSTSEC-2026-0192 is `informational = "unmaintained"`, not a
+  # vulnerability: the author has said the crate will get no further fixes
+  # and points at `skrifa` as the replacement. There is no patched version
+  # to move to, because there is nothing to patch.
+  #
+  # Path: ttf-parser -> lopdf 0.42 -> `pdf-extract` and the `pdf_markdown`
+  # transform (WOR-2670), both behind the optional, off-by-default
+  # `transform-pdf` cargo feature. A build that does not turn that feature
+  # on does not compile this crate at all, so the default binary and every
+  # CI lane except the pdf one carry none of it.
+  #
+  # Why not simply avoid it: `ttf-parser` is an unconditional dependency of
+  # lopdf (no feature gates it), and 0.43 and 0.44 still declare it, so no
+  # lopdf release drops it. The alternative is staying on lopdf 0.38, which
+  # carries RUSTSEC-2026-0187: an unbounded-recursion stack overflow that
+  # aborts the process on a ~21 KB crafted PDF and cannot be caught. Trading
+  # a remotely triggerable process kill for an unmaintained-crate notice is
+  # the right direction, and the notice is what is recorded here.
+  #
+  # Owner: whoever next touches the `pdf_markdown` transform. Revisit when
+  # lopdf moves to `skrifa` or another maintained font parser, or if this
+  # advisory is ever reclassified from informational to a vulnerability.
+  "RUSTSEC-2026-0192",
 ]
 
 # --- Advisories this file structurally CANNOT gate -----------------------
