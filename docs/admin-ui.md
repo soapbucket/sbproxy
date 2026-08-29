@@ -1,6 +1,6 @@
 # Admin UI
 
-*Last modified: 2026-08-27*
+*Last modified: 2026-08-29*
 
 The built-in admin UI is a Vue 3 + Vite single-page app that drives the
 same [admin API](admin-api-reference.md) any curl script can call. It
@@ -114,12 +114,86 @@ that makes a browser prompt (see
 [admin-api-guide.md](admin-api-guide.md#what-a-refused-request-gets-back)),
 so signing back in always happens on the app's own form.
 
-The UI does not hide pages or controls based on role: a `read_only`
-operator sees every page and every button. Attempting a mutation as
-`read_only` still round-trips to the server, which returns `403`; the
-page's error state renders that response rather than pre-empting it
-client-side. See [admin-api-guide.md](admin-api-guide.md#authenticating-basic-vs-session--csrf)
+See [admin-api-guide.md](admin-api-guide.md#authenticating-basic-vs-session--csrf)
 for the full login/CSRF contract this drives.
+
+## What a role gates in the console
+
+Read this section before relying on anything in it, because the honest
+summary is short: **the console hides controls, and the admin server
+authorizes.** Those are different jobs, and only one of them is
+security.
+
+### The server is the enforcer
+
+Three rules, and they run whatever the console does:
+
+- Every state-changing method (`POST`, `PUT`, `PATCH`, `DELETE`) from a
+  `read_only` operator is refused with `403`, on every admin route. The
+  rule is keyed off the method, not off a list of paths, so a route
+  added tomorrow is covered the day it lands.
+- `GET /api/requests/{id}/content` requires the `admin` role. This is a
+  **read** that a `read_only` operator may not make, because it returns
+  captured caller content. Every such read is audited before the content
+  is returned.
+- The compression content record is refused the same way, for the same
+  reason.
+
+One more scoping rule is server-side only and the console does not
+pre-empt it: an operator carrying a `tenant` narrows `/api/meter/*` to
+that billing tenant and is refused a request for any other. That
+surfaces as the server's `403`.
+
+Reach any of those with curl, a typed URL, or a script and you get the
+same refusal. Nothing in the browser changes the answer.
+
+### The console mirrors those rules so it can explain them
+
+Until this release the console showed every page and every button to
+every role, and a `read_only` operator learned what they could not do by
+pressing a button and reading a `403` toast. The console now knows the
+two rules above and does three things with them:
+
+1. **Refuses to send the call.** The admin API client checks the
+   session's role before it reaches the network, so a gated call from a
+   `read_only` session never leaves the browser. This covers both of the
+   client's request paths, the JSON one and the raw-body one the config
+   editor uses.
+2. **Disables the control and says why.** A disabled button carries the
+   server's own rule in its tooltip rather than a bare greyed-out state.
+3. **Says it once at the top.** A page whose controls are all
+   state-changing shows a "read only" banner under its header instead of
+   making the operator discover it one button at a time.
+
+**None of that is authorization.** Every path through the console's copy
+of the rule can only refuse; there is no branch that grants anything. A
+call the console permits is still evaluated from scratch by the server.
+So a bug in the mirror costs an operator an affordance, which is visible
+and reportable, and can never hand one access, which would be silent.
+That asymmetry is the only reason it is acceptable to keep a copy of the
+rule on the client at all.
+
+Two consequences worth stating plainly:
+
+- **Hiding a nav link is not a security control, and the console does
+  not pretend otherwise.** Nothing is removed from the sidebar by role.
+  A `read_only` operator may read every page in this document except the
+  two content-inspection surfaces above, so hiding pages would take away
+  access they actually have.
+- **A role the console does not recognize gets nothing.** The mirror
+  matches exactly `admin` and `read_only`. Any other value, including a
+  differently-cased spelling, is treated as carrying no capability at
+  all, so a role added to the server after a console build cannot
+  silently render as full admin.
+
+### What the role set is today
+
+Two roles, `read_only` and `admin`, configured per operator under
+`proxy.admin.operators` (see [admin.md](admin.md)). There is no
+per-route or per-resource role model: "this operator can rotate keys but
+not edit config" is not expressible today, and the console cannot
+express it either, because the underlying role enum has two variants.
+Adding named roles beyond these two is open work.
 
 ## Overview (`/`)
 
@@ -395,12 +469,53 @@ message naming the config key rather than rendering an error.
   `lkg_revision` pointer in the section header. Clicking a row fetches
   `GET /admin/config/history/{digest}` and expands a detail row showing
   the `plan_text` diff between that revision and the config running now.
-- **No mutations.** There is no button here to promote a revision to
-  last-known-good or to roll one back; `mark_good` is storage with no
-  caller yet, so the panel is a diagnostic and audit trail, not a rollback
-  control. See [configuration.md](configuration.md#config_history) and
-  [admin-api-reference.md](admin-api-reference.md#get-adminconfighistory)
-  for what the ring records today and what it does not do yet.
+- **Roll back.** Expanding a row offers "Roll back to revision N", which
+  calls `POST /admin/config/rollback`. A `restart` or `breaking`
+  rollback, and one whose blast radius is unknown, will not submit until
+  the operator types the target revision back into the field beside the
+  button. That typed confirmation is an affordance: the route's own
+  `confirm_revision` check is the enforcer, and the two do not read the
+  same radius. The panel is handed the radius the history entry stored,
+  measured against the revision before it at the time it applied; the
+  route measures the running document against the target at the moment
+  of the call. They can disagree in either direction and the route
+  decides, so the console sends `confirm_revision` on every submission
+  rather than only when its own gate asked for one.
+
+  A rollback restores a revision **into the running process and leaves
+  this node's config file alone**, which the console repeats in the
+  result line rather than reporting a bare success. The next file-watcher
+  event, SIGHUP, source poll, or authority bundle re-applies whatever the
+  source of truth still says. Fix that before then.
+
+  `mark_good` is still storage with no caller: there is no button here to
+  promote a revision to last-known-good.
+
+### Config timeline
+
+The applied revisions and the candidates this node **refused**, in one
+list, newest first, from the same `GET /admin/config/history` call (its
+`timeline` array).
+
+The applied table above answers "what is running". This answers "why has
+nothing changed", and they are different questions during an incident.
+"The config stopped updating three hours ago" and "a candidate has been
+refused every poll cycle for three hours" look identical in an
+applied-only table, and they send an operator to opposite places.
+
+- **Shows:** each row's kind (`applied` or `rejected`), when it happened
+  (`applied_at` for a revision, `last_seen_at` for a refusal, which is
+  the refusal currently in force rather than the first one), the
+  provenance, and for a refusal the reason, the stage it was refused at,
+  how many polls have been refused with it, and the secret-redacted
+  detail. The section header carries `soak_revision` when a candidate is
+  mid-soak, so an `lkg_revision` that has not moved can be told apart
+  from one that is stuck.
+- **No mutations.**
+
+See [configuration.md](configuration.md#config_history) and
+[admin-api-reference.md](admin-api-reference.md#get-adminconfighistory)
+for what the ring records.
 
 ## Extensions (`/extensions`)
 
@@ -1365,6 +1480,71 @@ admin credential in the table.
 - **Empty/error notes:** an empty list means no delegated operators
   are configured; the top-level admin credential can still sign in.
   Passwords never leave the server and are not returned by this route.
+
+## Federation (`/federation`)
+
+The OpenID Federation identity this proxy publishes, and what it
+requires of a peer. Backed by `GET /admin/federation`.
+
+The route exists because the federation crate's own `/admin/status` is
+never mounted in this process: sbproxy serves the well-known endpoints
+off the request path rather than the crate's router, so before this page
+the only way to read it was curl.
+
+- **Shows:** the entity id, the signing key by `kid` and algorithm, how
+  many keys are published, the authority hints and trust marks, whether
+  a metadata policy is configured, the statement lifetime and refresh
+  margin, and how long the current statement is still cacheable.
+- **Peer trust is the second half, and the one people forget.** What
+  this proxy publishes is discoverable by anyone. What it requires of a
+  peer is not. The page distinguishes three postures rather than two: no
+  verifier configured, a verifier that is configured and **required**,
+  and a verifier that is configured but **not** required, which verifies
+  a peer statement when one is presented and admits a peer that presents
+  none. The third looks configured and enforces nothing, so it is
+  labeled rather than left to a missing checkmark.
+- **A node with no `federation` block** renders "not configured", not an
+  error. The route answers `{"enabled": false}` with a 200 for exactly
+  this reason.
+- **`cacheable for: unavailable`** means the entity statement could not
+  be built, which is the same failure the well-known route answers 503
+  with. The rest of the page stays readable while it is broken, on
+  purpose: the static configuration is usually what the operator came to
+  check.
+- **No key material.** The route names the signing key by `kid` and
+  never emits it, and the page reads named fields rather than rendering
+  the response.
+- **No mutations.**
+
+## Licensing (`/licensing`)
+
+CoMP marketplace bridges and OLP issuers, per origin. Backed by
+`GET /admin/licensing`.
+
+- **Shows, per origin:** for a CoMP bridge, the publisher name and
+  domain, the tier counts, the active quote-signing `kid` and how many
+  are trusted, the manifest hash and when it was generated, and the
+  manifest, quote, and redeem endpoints. For an OLP issuer, the issuer,
+  the signing `kid`, the default scope and token TTL, whether the
+  content-key claim is stamped, and whether the RFC 7662 / RFC 7009
+  introspection and revocation pair is mounted.
+- **An unactivated rotation is promoted to a banner.**
+  `active_signing_kid` is null until a rotation has been activated, and
+  every quote request fails closed until one is. From the buyer side
+  that reads as a total outage with no explanation; in a table it reads
+  as an empty cell.
+- **Two tier counts, not one.** A catalog carrying `cap` or `public`
+  tiers reports a larger total than the number redeemable for a token.
+  An operator reading "12 tiers" and seeing one redeem a day needs to
+  know eleven of them were never redeemable.
+- **The revocation store is named by variant only** (`memory`, `redb`,
+  or `redis`), never by its URL. A Redis URL routinely carries a
+  password in its userinfo. When a revocation did not take on the
+  replica you are looking at, the variant is the field you want.
+- **No key material and no license payload.** The content-key seed is
+  reported as configured or not, never by value, and no minted token is
+  retained anywhere this route can read.
+- **No mutations.**
 
 ## Cluster (`/cluster`)
 
