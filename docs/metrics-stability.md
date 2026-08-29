@@ -1,5 +1,5 @@
 # Metrics stability
-*Last modified: 2026-08-26*
+*Last modified: 2026-08-28*
 
 *Generated from the executable metric registry. Do not hand-edit; run `cargo run -q -p sbproxy-observe --bin generate-metrics-stability > docs/metrics-stability.md`.*
 
@@ -134,6 +134,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_ai_failovers_total` | Counter | `stable` | `beta` | `from_provider`, `to_provider`, `reason` | Provider failover events. |
 | `sbproxy_ai_gateway_decisions_total` | Counter | `stable` | `beta` | `decision`, `reason` | AI gateway admission decisions, including pre-provider rejections. |
 | `sbproxy_ai_guardrail_blocks_total` | Counter | `stable` | `stable` | `category` | Guardrail block events. |
+| `sbproxy_ai_parallel_moderation_total` | Counter | `stable` | `beta` | `outcome` | Inspect-only input hooks that ran alongside the upstream call, by allow, block, cancelled_upstream, or refused. |
 | `sbproxy_ai_safety_guardrail_verdicts_total` | Counter | `stable` | `beta` | `guardrail`, `class`, `backend`, `verdict` | Built-in safety guardrail evaluations by class, backend, and verdict. |
 | `sbproxy_ai_external_guardrail_verdicts_total` | Counter | `stable` | `beta` | `provider`, `phase`, `outcome` | External guardrail evaluations by provider, phase, and outcome. |
 | `sbproxy_ai_inter_token_latency_seconds` | Histogram | `stable` | `beta` | `provider`, `model` | AI streaming average inter-token latency (TPOT). |
@@ -171,7 +172,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_ai_output_throughput_tokens_per_second` | Histogram | `stable` | `beta` | `provider`, `model` | AI streaming output throughput (completion tokens / generation duration). |
 | `sbproxy_ai_price_ceiling_total` | Counter | `stable` | `alpha` | `outcome` | Per-request price-ceiling guard outcomes: `candidate_excluded` (a routing candidate priced over the ceiling and dropped), `refused` (every candidate over it, so the request answered 402), `invalid_header` (an unusable `x-sbproxy-max-price`), and `unsupported_surface` (a header ceiling on a surface the estimate cannot price). |
 | `sbproxy_ai_price_source_total` | Counter | `stable` | `alpha` | `source` | Cost estimates by the price-table layer that produced the price. |
-| `sbproxy_ai_provider_attempts_total` | Counter | `stable` | `beta` | `provider`, `outcome` | AI provider attempts during failover/selection, by provider and outcome. |
+| `sbproxy_ai_provider_attempts_total` | Counter | `stable` | `beta` | `provider`, `outcome` | AI provider attempts during failover/selection, by provider and outcome (`success`, `error`, `client_disconnected`, `moderation_cancelled`). |
 | `sbproxy_ai_provider_cooldowns_total` | Counter | `stable` | `beta` | `provider`, `cause` | Providers parked out of rotation by `resilience.cooldown_policy`, by the classified failure that parked them. The circuit breaker's counterpart for the cooldown axis; without it a rotated credential parks the whole pool on a log line nobody can alert on. |
 | `sbproxy_ai_provider_errors_total` | Counter | `stable` | `stable` | `provider`, `error_kind` | Per-provider AI error events. |
 | `sbproxy_ai_rag_context_bytes` | Histogram | `stable` | `beta` | none | Bytes of rendered RAG context injected into the request body. |

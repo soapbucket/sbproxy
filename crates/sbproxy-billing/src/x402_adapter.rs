@@ -367,6 +367,14 @@ impl SettleDispatchGate for ContextGate<'_> {
     async fn stamp_settle_dispatch(&self) -> Result<(), BillingError> {
         self.dispatch.stamp_write().await
     }
+
+    async fn attribute_facilitator_payer(
+        &self,
+        intent_id: &str,
+        payer: &str,
+    ) -> Result<(), BillingError> {
+        self.dispatch.attribute_x402_payer(intent_id, payer).await
+    }
 }
 
 /// Reports whether a requirement is one this rail can settle.

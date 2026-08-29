@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use sbproxy_config::{BundleHookKind, BundleRuntime, EnforcementMode, FailureMode};
+use sbproxy_config::{
+    BundleExecutionMode, BundleHookKind, BundleRuntime, EnforcementMode, FailureMode,
+};
 use sbproxy_observe::metrics::record_channel_drop;
 use sbproxy_plugin::{
     collect_linked_ai_extension_hooks, AiExtensionDecision, AiExtensionEnforcement,
@@ -59,6 +61,8 @@ struct PreparedAiHook {
     mutates: bool,
     /// Cap on a mutate body, from the manifest sandbox.
     max_buffer_bytes: usize,
+    /// Inspect-only input hook that runs alongside the upstream call.
+    parallel: bool,
     runner: PreparedAiRunner,
 }
 
@@ -100,6 +104,7 @@ impl AiExtensionChain {
                 // grows the flag. Inspect-only is the safe default.
                 mutates: false,
                 max_buffer_bytes: 0,
+                parallel: false,
                 runner: PreparedAiRunner::Linked((registration.factory)()),
             }));
 
@@ -145,6 +150,34 @@ impl AiExtensionChain {
             .any(|hook| hook.kind == kind && hook.enforcement == AiExtensionEnforcement::Block)
     }
 
+    /// True when a sequential (pre-dispatch) hook receives this event kind.
+    ///
+    /// Parallel inspect-only input hooks are excluded: they run alongside
+    /// the upstream call, not on the session [`Self::start_session`] builds.
+    #[cfg(test)]
+    #[must_use]
+    fn has_sequential_kind(&self, kind: ExtensionHookKind) -> bool {
+        self.hooks
+            .iter()
+            .any(|hook| hook.kind == kind && !hook.parallel)
+    }
+
+    /// True when a sequential enforcing hook receives this event kind.
+    #[cfg(test)]
+    #[must_use]
+    fn has_sequential_enforcing(&self, kind: ExtensionHookKind) -> bool {
+        self.hooks.iter().any(|hook| {
+            hook.kind == kind && !hook.parallel && hook.enforcement == AiExtensionEnforcement::Block
+        })
+    }
+
+    /// True when at least one inspect-only input hook runs alongside dispatch.
+    #[cfg(test)]
+    #[must_use]
+    fn has_parallel_input(&self) -> bool {
+        self.hooks.iter().any(|hook| hook.parallel)
+    }
+
     /// Start request-local runtime state and a bounded observation drain.
     ///
     /// # Panics
@@ -155,12 +188,14 @@ impl AiExtensionChain {
     pub fn start_session(&self) -> AiExtensionSession {
         let mut enforcing = Vec::new();
         let mut observing = Vec::new();
+        let mut parallel = Vec::new();
         for hook in self.hooks.iter().cloned() {
-            let active = ActiveAiHook::from(hook);
-            if active.enforcement == AiExtensionEnforcement::Observe {
-                observing.push(active);
+            if hook.enforcement == AiExtensionEnforcement::Observe {
+                observing.push(ActiveAiHook::from(hook));
+            } else if hook.parallel {
+                parallel.push(hook);
             } else {
-                enforcing.push(active);
+                enforcing.push(ActiveAiHook::from(hook));
             }
         }
 
@@ -173,6 +208,8 @@ impl AiExtensionChain {
         };
         AiExtensionSession {
             enforcing,
+            parallel,
+            parallel_task: None,
             observer,
             last_sequence: None,
             finished: false,
@@ -226,6 +263,7 @@ fn prepare_dynamic_hook(
         mutates: hook.hook().execution.mutates,
         max_buffer_bytes: usize::try_from(hook.manifest().sandbox.max_buffer_bytes)
             .unwrap_or(usize::MAX),
+        parallel: hook.hook().execution.mode == BundleExecutionMode::Parallel,
         runner,
     })
 }
@@ -242,7 +280,6 @@ enum ActiveAiRunner {
 struct ActiveAiHook {
     id: String,
     kind: ExtensionHookKind,
-    enforcement: AiExtensionEnforcement,
     failure_posture: FailureMode,
     /// Whether the manifest declared this hook may return `Mutate`. A
     /// linked Rust hook declares through its registration; a hook that
@@ -274,7 +311,6 @@ impl From<PreparedAiHook> for ActiveAiHook {
             kind: hook.kind,
             mutates,
             max_buffer_bytes,
-            enforcement: hook.enforcement,
             failure_posture: hook.failure_posture,
             runner,
         }
@@ -342,6 +378,8 @@ pub enum AiChainVerdict {
 /// Request-local AI extension state.
 pub struct AiExtensionSession {
     enforcing: Vec<ActiveAiHook>,
+    parallel: Vec<PreparedAiHook>,
+    parallel_task: Option<tokio::task::JoinHandle<PluginResult<AiChainVerdict>>>,
     observer: Option<mpsc::Sender<AiExtensionEvent>>,
     last_sequence: Option<u64>,
     finished: bool,
@@ -352,6 +390,7 @@ impl std::fmt::Debug for AiExtensionSession {
         formatter
             .debug_struct("AiExtensionSession")
             .field("enforcing_hooks", &self.enforcing.len())
+            .field("parallel_hooks", &self.parallel.len())
             .field("observing", &self.observer.is_some())
             .field("last_sequence", &self.last_sequence)
             .field("finished", &self.finished)
@@ -483,9 +522,63 @@ impl AiExtensionSession {
             }
         }
         if mutated {
+            self.arm_parallel_input(event);
             return Ok(AiChainVerdict::Mutated);
         }
+        self.arm_parallel_input(event);
         Ok(AiChainVerdict::Release)
+    }
+
+    /// Start inspect-only input hooks alongside the rest of dispatch.
+    ///
+    /// Serial enforcing hooks have already run. A later `guard_input`
+    /// (RAG's second scan) aborts the previous task so the last
+    /// pre-dispatch body is the one that is judged.
+    fn arm_parallel_input(&mut self, event: &AiExtensionEvent) {
+        if event.hook_kind() != ExtensionHookKind::AiGuardrailInput || self.parallel.is_empty() {
+            return;
+        }
+        self.abort_parallel();
+        let hooks = self.parallel.clone();
+        let event = event.clone();
+        self.parallel_task = Some(tokio::spawn(run_parallel_input(hooks, event)));
+    }
+
+    fn abort_parallel(&mut self) {
+        if let Some(task) = self.parallel_task.take() {
+            task.abort();
+        }
+    }
+
+    /// Take the in-flight parallel input task so the provider path can race it.
+    ///
+    /// Tokio's [`tokio::task::JoinHandle`] does not abort on drop. The caller must
+    /// abort the task (or wrap the handle so drop does) or the inspect
+    /// work keeps the prompt-bearing event until sandbox budget.
+    #[must_use]
+    pub fn take_parallel_task(
+        &mut self,
+    ) -> Option<tokio::task::JoinHandle<PluginResult<AiChainVerdict>>> {
+        self.parallel_task.take()
+    }
+
+    /// Await the parallel input task, if one is armed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a plugin error when the task was cancelled or a closed-posture
+    /// hook failed.
+    #[cfg(test)]
+    async fn wait_parallel(&mut self) -> PluginResult<AiChainVerdict> {
+        let Some(task) = self.take_parallel_task() else {
+            return Ok(AiChainVerdict::Release);
+        };
+        match task.await {
+            Ok(result) => result,
+            Err(_) => Err(PluginError::Config(
+                "parallel AI input hook task was cancelled".to_owned(),
+            )),
+        }
     }
 
     /// Validate and apply one hook's mutation to the event in place.
@@ -522,6 +615,7 @@ impl AiExtensionSession {
             return Ok(());
         }
         self.finished = true;
+        self.abort_parallel();
         self.observer.take();
         for hook in &mut self.enforcing {
             if let Err(error) = hook.finish() {
@@ -544,6 +638,82 @@ impl AiExtensionSession {
 impl Drop for AiExtensionSession {
     fn drop(&mut self) {
         let _ = self.finish();
+    }
+}
+
+async fn run_parallel_input(
+    hooks: Vec<PreparedAiHook>,
+    event: AiExtensionEvent,
+) -> PluginResult<AiChainVerdict> {
+    let mut hooks: Vec<ActiveAiHook> = hooks.into_iter().map(ActiveAiHook::from).collect();
+    let mut verdict = AiChainVerdict::Release;
+    for hook in &mut hooks {
+        match hook.invoke(&event).await {
+            Ok(AiExtensionDecision::Block {
+                status,
+                code,
+                message,
+            }) => {
+                verdict = AiChainVerdict::Block {
+                    status,
+                    code,
+                    message,
+                };
+                break;
+            }
+            Ok(AiExtensionDecision::Flag { code, message }) => {
+                tracing::info!(hook = %hook.id, %code, %message, "AI extension hook flagged an event");
+            }
+            Ok(AiExtensionDecision::Release) => {}
+            Ok(AiExtensionDecision::Mutate { .. }) => {
+                if hook.failure_posture.admits() {
+                    tracing::warn!(
+                        hook = %hook.id,
+                        posture = hook.failure_posture.as_label(),
+                        "parallel AI input hook returned mutate under an admitting posture"
+                    );
+                } else {
+                    let id = hook.id.clone();
+                    finish_parallel_hooks(&mut hooks);
+                    return Err(PluginError::Config(format!(
+                        "parallel AI input hook `{id}` returned mutate, which parallel mode cannot apply",
+                    )));
+                }
+            }
+            Ok(_) => {
+                let id = hook.id.clone();
+                finish_parallel_hooks(&mut hooks);
+                return Err(PluginError::Config(format!(
+                    "AI extension hook `{id}` returned a decision this host does not support",
+                )));
+            }
+            Err(error) if hook.failure_posture.admits() => {
+                tracing::warn!(
+                    hook = %hook.id,
+                    posture = hook.failure_posture.as_label(),
+                    error = %error,
+                    "AI extension hook failed under an admitting posture"
+                );
+            }
+            Err(error) => {
+                finish_parallel_hooks(&mut hooks);
+                return Err(error);
+            }
+        }
+    }
+    finish_parallel_hooks(&mut hooks);
+    Ok(verdict)
+}
+
+fn finish_parallel_hooks(hooks: &mut [ActiveAiHook]) {
+    for hook in hooks {
+        if let Err(error) = hook.finish() {
+            tracing::warn!(
+                hook = %hook.id,
+                error = %error,
+                "parallel AI input hook cleanup failed"
+            );
+        }
     }
 }
 
@@ -946,7 +1116,6 @@ mod tests {
         let hook = ActiveAiHook {
             id: "fixture".to_owned(),
             kind: ExtensionHookKind::AiGuardrailOutput,
-            enforcement: AiExtensionEnforcement::Block,
             failure_posture: FailureMode::Closed,
             mutates: false,
             max_buffer_bytes: 4,
@@ -1025,5 +1194,43 @@ mod tests {
             Err(mpsc::error::TrySendError::Full(_))
         ));
         assert_eq!(receiver.try_recv().unwrap(), first);
+    }
+
+    #[tokio::test]
+    async fn parallel_input_is_not_awaited_by_serial_dispatch() {
+        let registry = load_bundle(
+            "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: parallel-input\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nhooks:\n  - kind: ai_guardrail_input\n    type: inspect_input\n    export: inspect\n    execution:\n      mode: parallel\n",
+            "entry.js",
+            br#"export function inspect(input) { if (input.event.event !== "guardrail_input") throw new Error("wrong event"); return {version:"sbproxy-envelope/v1",decision:"block",status:451,code:"fixture_parallel",message:"blocked in parallel"}; }"#,
+        );
+        let chain = AiExtensionChain::from_registry(&registry).unwrap();
+        assert!(chain.has_enforcing(ExtensionHookKind::AiGuardrailInput));
+        assert!(chain.has_parallel_input());
+        assert!(
+            !chain.has_sequential_kind(ExtensionHookKind::AiGuardrailInput),
+            "parallel input must not occupy the sequential session"
+        );
+        assert!(!chain.has_sequential_enforcing(ExtensionHookKind::AiGuardrailInput));
+        let mut session = chain.start_session();
+        let mut input = event(
+            1,
+            AiExtensionEventPayload::GuardrailInput {
+                stage: "original".to_owned(),
+                messages: Vec::new(),
+            },
+        );
+        assert_eq!(
+            session.dispatch(&mut input).await.unwrap(),
+            AiChainVerdict::Release,
+            "parallel input must not block serial dispatch"
+        );
+        assert_eq!(
+            session.wait_parallel().await.unwrap(),
+            AiChainVerdict::Block {
+                status: 451,
+                code: "fixture_parallel".to_owned(),
+                message: "blocked in parallel".to_owned(),
+            }
+        );
     }
 }

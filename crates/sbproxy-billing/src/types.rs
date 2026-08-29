@@ -36,6 +36,8 @@ const REQUIREMENT_DIGEST_DOMAIN: &[u8] = b"sbproxy-payment-requirement-v1";
 const PROOF_DIGEST_DOMAIN: &[u8] = b"sbproxy-payment-proof-v1";
 /// Domain separator for durable intent identifiers.
 const INTENT_ID_DOMAIN: &[u8] = b"sbproxy-settlement-intent-v1";
+/// Domain separator for a facilitator-supplied x402 payer scope key (WOR-2302).
+const X402_PAYER_SCOPE_DOMAIN: &[u8] = b"sbproxy-settlement-x402-payer-v1";
 /// Domain separator for durable attempt identifiers.
 const ATTEMPT_ID_DOMAIN: &[u8] = b"sbproxy-settlement-attempt-v1";
 /// Domain separator for durable receipt keys.
@@ -1247,6 +1249,24 @@ pub fn derive_intent_id(tenant_id: &str, request_idempotency_key: &str) -> Strin
         &[tenant_id.as_bytes(), request_idempotency_key.as_bytes()],
     );
     format!("sbpi_{}", URL_SAFE_NO_PAD.encode(digest))
+}
+
+/// Opaque 16-byte hex scope key for a facilitator-supplied x402 payer.
+///
+/// WOR-2302 persists this on the intent after a successful `/verify`, so a
+/// later stranded payment withholds from that payer's hash and not from
+/// every unidentified caller of the route. The raw address never reaches a
+/// column, a log line, or a metric label. Billing cannot import
+/// `sbproxy-security`, so this uses the same domain-separated SHA-256 the
+/// rest of this module already uses for durable identifiers rather than the
+/// request-path HKDF; the two keyspaces are never compared.
+#[must_use]
+pub fn x402_facilitator_payer_hash(tenant_id: &str, payer: &str) -> String {
+    let digest = domain_digest(
+        X402_PAYER_SCOPE_DOMAIN,
+        &[tenant_id.as_bytes(), payer.as_bytes()],
+    );
+    hex::encode(&digest[..16])
 }
 
 /// Derives the durable attempt identifier.

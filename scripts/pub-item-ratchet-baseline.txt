@@ -1240,3 +1240,7 @@ used from tests, and reading AbTestSelection::sticky_cookie from
 response_filter gave a cross-file caller to a field that had none.
 Nothing was renamed and nothing was narrowed; both counts are locked so
 the ground is not handed back on the next branch.
+
+2026-08-29 (WOR-2421): unreferenced 1525 -> 1524. Parallel-input chain
+predicates and the session wait helper are cfg(test) rather than pub, so
+they leave this bucket and rustc polices them.

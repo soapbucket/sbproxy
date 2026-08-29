@@ -2628,13 +2628,67 @@
     },
     {
       "id": 45,
+      "title": "Parallel Moderation Outcomes",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 197
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "bars",
+            "pointSize": 5,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(sbproxy_ai_parallel_moderation_total[5m]))",
+          "legendFormat": "{{outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Inspect-only input hooks that ran alongside the upstream call. allow is the zero-latency path. cancelled_upstream is a reject that dropped an in-flight generation, which the provider may still bill. block is a reject that landed after the provider had already answered. refused is a reject on a path that never dialed a provider (cache hit, idempotency replay, or raced fan-out wait). Runbook: docs/operator-runbook.md#ai-gateway."
+    },
+    {
+      "id": 46,
       "title": "License-Leak Guardrail Findings",
       "type": "timeseries",
       "gridPos": {
         "h": 8,
         "w": 9,
         "x": 0,
-        "y": 197
+        "y": 205
       },
       "datasource": {
         "type": "prometheus",

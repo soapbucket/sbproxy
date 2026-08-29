@@ -1024,6 +1024,25 @@ pub trait SettleDispatchGate: Send + Sync {
     /// Returns the durable store's error. A failure here means no
     /// settle is sent at all, which is the safe direction.
     async fn stamp_settle_dispatch(&self) -> Result<(), BillingError>;
+
+    /// Persists a hashed facilitator payer after `/verify` succeeds.
+    ///
+    /// `payer` is the raw address. Implementations must hash it before
+    /// it reaches a column and must never log it. An empty value is a
+    /// no-op. Default does nothing so a test gate that is not exercising
+    /// WOR-2302 stays a stamp-only mock.
+    ///
+    /// # Errors
+    ///
+    /// Returns the durable store's error. The settler fails closed
+    /// before stamping settle.
+    async fn attribute_facilitator_payer(
+        &self,
+        _intent_id: &str,
+        _payer: &str,
+    ) -> Result<(), BillingError> {
+        Ok(())
+    }
 }
 
 // --- Settler ---
@@ -1234,6 +1253,16 @@ impl<T: FacilitatorTransport> X402ExactSettler<T> {
             PaymentLifecyclePhase::Verify,
             PaymentLifecycleOutcome::Succeeded,
         );
+
+        if let Some(payer) = verified
+            .payer
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            gate.attribute_facilitator_payer(request.challenge.intent_id, payer)
+                .await?;
+        }
 
         if gate.payment_started(PaymentLifecyclePhase::Settle).await
             == PaymentLifecycleDecision::Reject
