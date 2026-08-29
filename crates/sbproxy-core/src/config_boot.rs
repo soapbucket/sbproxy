@@ -99,8 +99,11 @@ fn pinned() -> &'static Mutex<Option<PinnedRevision>> {
 /// node's configuration a kilobyte at a time.
 ///
 /// This used to bound only the copy the admin surface serves, on the
-/// stated grounds that the boot path logged the failure in full. That
-/// is still true, and it is true on the mode most nodes run.
+/// stated grounds that the failure was available in full elsewhere.
+/// That is still true on the default mode, where the binary prints it
+/// on stderr rather than logging it, and false on the other one, where
+/// the boot path's own `error!` is scrubbed and bounded like every
+/// other rendering.
 ///
 /// Which mode carries the untruncated text, exactly:
 ///

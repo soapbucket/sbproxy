@@ -2243,12 +2243,16 @@ mod tests {
     /// What this cannot see, and what covers each. Whether the one call
     /// site is reachable: the driven reconcile tests. **Which of the two
     /// delivered labels it records**, because this counts call sites and
-    /// not their arguments, so hardcoding `unowned_skipped: 0` in a
+    /// not their arguments, so hardcoding `unowned_skipped: 0` in either
     /// workload `Ok` arm would make `delivered_unowned_skipped`
-    /// unreachable and leave this green:
+    /// unreachable and leave this green. There are two such arms and
+    /// each has its own witness, because covering one and claiming both
+    /// is how that gap survived a round:
     /// `the_workload_pass_carries_the_count_that_picks_the_delivery_label`
-    /// drives the real workload function and asserts the count survives
-    /// the trip. And a second call added inside a helper the workload
+    /// drives `reconcile_deployment_workload` and
+    /// `the_clustered_workload_pass_carries_the_count_that_picks_the_delivery_label`
+    /// drives `reconcile_clustered_workload`, each asserting the count
+    /// survives the trip on its own arm. And a second call added inside a helper the workload
     /// functions call rather than in their own bodies: the total
     /// assertion below still catches that, because it counts the whole
     /// production half of this file, but the per-function assertion does
@@ -2438,18 +2442,25 @@ mod tests {
         );
     }
 
-    /// J3: which label the pass records, not merely that one is
+    /// Which label the pass records, not merely that one is
     /// recorded.
     ///
     /// `the_delivery_metric_is_recorded_once_per_pass` counts call
     /// sites, so it cannot see the argument. Hardcoding
     /// `unowned_skipped: 0` in either workload `Ok` arm makes
     /// `delivered_unowned_skipped` unreachable and leaves that test, and
-    /// every other, green. This drives the real workload function down
-    /// the hot-reload path with one owned pod and one impostor and
-    /// asserts the count that picks the label survives the trip, which
-    /// is the whole wiring between `try_hot_reload` and the recording
-    /// site.
+    /// every other, green.
+    ///
+    /// **This one covers the Deployment arm.** The clustered arm is
+    /// covered by
+    /// `the_clustered_workload_pass_carries_the_count_that_picks_the_delivery_label`,
+    /// and the two are siblings because the first version of this test
+    /// covered one arm while its own doc claimed both.
+    ///
+    /// It drives the real workload function down the hot-reload path
+    /// with one owned pod and one impostor and asserts the count that
+    /// picks the label survives the trip, which is the whole wiring
+    /// between `try_hot_reload` and the recording site.
     ///
     /// Self-discriminating in both directions: the rollout path
     /// hardcodes `unowned_skipped: 0`, so a fixture that failed to enter
@@ -2564,6 +2575,131 @@ mod tests {
         );
     }
 
+    /// The clustered arm of the same wiring.
+    ///
+    /// `reconcile_clustered_workload` carries an identical
+    /// `unowned_skipped: outcome.unowned_skipped`, and until this test
+    /// existed nothing drove it at all: hardcoding `0` there left every
+    /// test green and made `delivered_unowned_skipped` unreachable for
+    /// every clustered `SBProxy`. That is the one-of-two-arms shape this
+    /// branch has now hit three times, so the two tests are siblings on
+    /// purpose and each names its arm.
+    #[tokio::test]
+    async fn the_clustered_workload_pass_carries_the_count_that_picks_the_delivery_label() {
+        use tower::ServiceExt as _;
+
+        let stub = FallbackStub::start(r#"{"reloaded":true}"#);
+        let (mut sbp, _cfg) =
+            suspension_fixtures(i32::from(stub.port), "proxy:\n  http_bind_port: 8080\n");
+        sbp.status = Some(sbproxy_k8s_operator::crd::SBProxyStatus {
+            config_hash: "old-hash".to_string(),
+            observed_config_hash: "old-hash".to_string(),
+            ..Default::default()
+        });
+        let existing = serde_json::to_value(reconcile::desired_statefulset(&sbp, "old-hash"))
+            .expect("serialize the existing StatefulSet");
+
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let path = request.uri().path().to_string();
+            let existing = existing.clone();
+            async move {
+                // No Deployment to garbage collect. A 404 rather than a
+                // decode failure, so the absence is the fixture saying
+                // so rather than an accident of deserialization.
+                if path.contains("/deployments/") {
+                    return Ok::<_, std::convert::Infallible>(
+                        http::Response::builder()
+                            .status(404)
+                            .header("content-type", "application/json")
+                            .body(http_body_util::Full::new(bytes::Bytes::from(
+                                serde_json::json!({"kind": "Status", "code": 404}).to_string(),
+                            )))
+                            .expect("build a 404"),
+                    );
+                }
+                let answer = if path.ends_with("/secrets/admin-auth") {
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Secret",
+                        "metadata": { "name": "admin-auth", "namespace": "sbproxy" },
+                        "data": { "authorization": "QmFzaWMgWVdSdGFXNDZjSGM9" },
+                    })
+                } else if path.ends_with("/pods") {
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "PodList",
+                        "metadata": {},
+                        "items": [
+                            {
+                                "apiVersion": "v1",
+                                "kind": "Pod",
+                                "metadata": {
+                                    "name": "edge-proxy-0",
+                                    "namespace": "sbproxy",
+                                    // A StatefulSet owns its pods by
+                                    // exact name, which is the other
+                                    // half of `pod_is_operator_owned`.
+                                    "ownerReferences": [{
+                                        "apiVersion": "apps/v1",
+                                        "kind": "StatefulSet",
+                                        "name": "edge-proxy",
+                                        "uid": "sts-uid",
+                                        "controller": true,
+                                    }],
+                                },
+                                "status": { "podIP": "127.0.0.1" },
+                            },
+                            {
+                                "apiVersion": "v1",
+                                "kind": "Pod",
+                                "metadata": {
+                                    "name": "impostor-0",
+                                    "namespace": "sbproxy",
+                                    "ownerReferences": [],
+                                },
+                                "status": { "podIP": "127.0.0.1" },
+                            },
+                        ],
+                    })
+                } else if path.contains("/statefulsets/") {
+                    existing
+                } else {
+                    serde_json::json!({
+                        "metadata": { "name": "applied", "namespace": "sbproxy" },
+                    })
+                };
+                Ok::<_, std::convert::Infallible>(json_response(&answer))
+            }
+        });
+        let ctx = Ctx {
+            client: Client::new(service.boxed_clone(), "sbproxy"),
+            write_gate: WriteGate::always(),
+        };
+
+        let pass = reconcile_clustered_workload(
+            &ctx,
+            &sbp,
+            "sbproxy",
+            "edge",
+            "new-hash",
+            &PatchParams::apply(FIELD_MANAGER).force(),
+            None,
+        )
+        .await
+        .expect("the owned pod reloads, so the pass succeeds");
+
+        assert_eq!(
+            pass.unowned_skipped, 1,
+            "the clustered arm has to carry the count too: at zero the label is `delivered` \
+             and `delivered_unowned_skipped` is unreachable for every clustered SBProxy",
+        );
+        assert_eq!(
+            stub.requests(),
+            1,
+            "and it really went down the hot-reload path, reloading only the owned pod",
+        );
+    }
+
     /// A Blocker from the WOR-2467 review. A pod is selected for the
     /// probe by label, and a label is a value anyone with pod-create in
     /// the namespace can type. Before the owner gate, any pod answering
@@ -2600,7 +2736,7 @@ mod tests {
         );
     }
 
-    /// M9's second half: the refusal is permanent until somebody edits
+    /// The refusal is permanent until somebody edits
     /// the config, so returning before the condition block left a
     /// `ConfigFallbackActive` from an earlier pass frozen on the CR with
     /// nothing able to move it. The condition is refreshed first now.
@@ -2702,14 +2838,25 @@ mod tests {
     /// assertion is what makes adding one a deliberate edit here. It
     /// also cannot see whether a counted check actually *gates* its
     /// send, because it counts occurrences and not control flow. Three
-    /// tests cover that half, and the split matters.
+    /// tests cover that half, and the split follows the two paths'
+    /// different shapes rather than being symmetric.
+    ///
+    /// The **probe** gates inside its loop: it iterates `&pods.items`
+    /// and `continue`s on an unowned pod, so there is no filter step to
+    /// empty and the loop is always entered.
+    /// `a_labeled_pod_the_operator_did_not_create_is_neither_probed_nor_obeyed`
+    /// therefore exercises the in-loop gate directly with a single
+    /// unowned pod, and asserting the stub was asked nothing is proof
+    /// the gate holds.
+    ///
+    /// The **hot reload** filters first and returns `NoPodsFound` when
+    /// nothing survives, so an all-unowned fixture returns before the
+    /// request loop:
     /// `the_reload_credential_never_reaches_a_pod_the_operator_did_not_create`
-    /// and `a_labeled_pod_the_operator_did_not_create_is_neither_probed_nor_obeyed`
-    /// cover the all-unowned case on each credential path, where the
-    /// filter empties the list and the loop is never entered.
+    /// covers that early return, and
     /// `a_partial_owner_filter_reloads_only_the_owned_pod_and_reports_the_rest`
-    /// is the one that enters it, with one owned pod and one impostor,
-    /// and it is what catches iterating the unfiltered list after
+    /// is the one that reaches the loop, with one owned pod and one
+    /// impostor, and catches iterating the unfiltered list after
     /// computing `owned`. All three drive the real code against a stub
     /// that counts what it was asked.
     #[test]

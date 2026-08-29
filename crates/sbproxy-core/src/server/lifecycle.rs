@@ -9261,19 +9261,23 @@ origins:
         crate::config_boot::reset_for_test();
         let temp = tempfile::tempdir().expect("temp dir");
 
-        // A ring directory whose own name carries a control character.
-        // Legal on every filesystem this runs on, and the shortest way
-        // to get operator-controlled bytes into the store error. It has
-        // to reach the config through a YAML escape rather than a raw
-        // byte, because a raw one fails the parse and the store is never
-        // reached at all, which would make this test pass without the
-        // production change.
         // A real ring at a path whose own name carries a control
-        // character, with a world-readable index. That is the one
-        // store error that names the path, so it is the only way an
-        // operator-controlled byte reaches this arm; a store that
-        // simply fails to open reports an errno and no path, and a
-        // missing ring reports `RingEmpty`, whose text is fixed.
+        // character, with a world-readable index, so `refuse_shared_files`
+        // refuses and names the widened file.
+        //
+        // Two things about the fixture are load bearing. The escape
+        // reaches the config through a YAML escape rather than a raw
+        // byte, because a raw one fails the parse before the store is
+        // opened at all and falls back to the default ring directory,
+        // which would make this test pass without the production change.
+        // And the store error has to be one that carries the path:
+        // `RevisionStoreError::Io` renders an errno and no path, so the
+        // permission-denied open this was first written against proved
+        // nothing. Other store errors do carry it, including
+        // `RevisionStore::open`'s own `Corrupt` arms for a missing blob
+        // and an oversized file, so this is one of several routes rather
+        // than the only one; `refuse_shared_files` is simply the
+        // cheapest to set up.
         use std::os::unix::fs::PermissionsExt as _;
         let ring = temp.path().join("ring\u{1b}[2Jdir");
         let _history = ring_with_a_good_revision(&ring, "proxy:\n  http_bind_port: 8080\n");
