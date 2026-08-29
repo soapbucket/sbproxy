@@ -2345,6 +2345,18 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_config_authority_rollback_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_config_authority_rollback"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["target", "result"],
+        description:
+            "Config authority rollback attempts, by target and result.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_config_bundle_age_seconds",
         kind: MetricKind::Gauge,
         writer: Writer::Recorder("set_config_bundle_age_seconds"),

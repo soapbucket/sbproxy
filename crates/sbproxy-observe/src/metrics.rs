@@ -4145,6 +4145,47 @@ pub fn record_config_authority_announce(result: &'static str) {
     counter.with_label_values(&[result]).inc();
 }
 
+/// Count one config-authority rollback attempt on
+/// `sbproxy_config_authority_rollback_total{target,result}` (WOR-2463).
+///
+/// The node-side `sbproxy_config_apply_total{outcome}` counts what one
+/// node did with a document. This counts what the *authority* was asked
+/// to do with the fleet, which is a different question during an
+/// incident: an operator watching a rollback that reached nobody needs
+/// to know whether the authority refused it or whether the fleet has not
+/// converged yet, and only this series answers the first half.
+///
+/// `target` is a closed string:
+///
+/// | Target | Meaning |
+/// |---|---|
+/// | `previous` | The one-step rollback: republish `previous.json`. |
+/// | `archived` | `to_revision` named a revision from the archive ring. |
+///
+/// `result` is a closed string:
+///
+/// | Result | Meaning |
+/// |---|---|
+/// | `published` | The payload revalidated and went out under a new revision. |
+/// | `refused` | Nothing was published: no target, a revision the ring does not hold, or a payload that no longer validates. The revision counter did not move. |
+pub fn record_config_authority_rollback(target: &'static str, result: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_config_authority_rollback_total",
+            "Config authority rollback attempts, by target and result",
+            &["target", "result"],
+        )
+        .ok()
+    });
+    let Some(counter) = counter else {
+        return;
+    };
+    counter.with_label_values(&[target, result]).inc();
+}
+
 /// Count one read of the cluster's config-revision announcement on
 /// `sbproxy_config_bundle_gossip_total{outcome}`.
 ///

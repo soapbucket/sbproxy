@@ -7883,6 +7883,7 @@ proxy:
         key_file: /etc/sbproxy/authority-key.pem
       rate_limit_per_subscriber_per_minute: 30
       rate_limit_total_per_minute: 1200
+      archive_keep: 20
 ```
 
 | Field | Type | Default | Description |
@@ -7896,6 +7897,7 @@ proxy:
 | `tls.key_file` | path | | PEM private key (PKCS#8 or RSA). Required when `bind` is not loopback. |
 | `rate_limit_per_subscriber_per_minute` | int | `30` | Requests one subscriber may make per minute before a `429`. 1 to 1000000; cannot be turned off. |
 | `rate_limit_total_per_minute` | int | `1200` | Requests served per minute across the whole fleet before a `429`. Must be at least the per-subscriber cap. |
+| `archive_keep` | int | `20` | How many earlier revisions the archive ring keeps, so `rollback` can name one of them. `0` keeps no ring and leaves the one-step rollback exactly as it was. Maximum 200. |
 
 Two rules refuse a publishing node at startup, both checked by `sbproxy validate`:
 
@@ -7910,9 +7912,10 @@ The listener serves exactly one path. `/admin/*`, `/metrics`, and the admin UI a
 
 ```text
 <store_dir>/
-  authority-state.json      revision counters + subscriber registry
-  revisions/current.json    the signed bundle subscribers fetch
-  revisions/previous.json   the one before it
+  authority-state.json        revision counters + subscriber registry + the archive list
+  revisions/current.json      the signed bundle subscribers fetch
+  revisions/previous.json     the one before it
+  revisions/archive/<n>.json  the bounded ring of earlier bundles
 ```
 
 Every file is written to a temporary name in the same directory, flushed, then renamed over the target, so a crash mid-write leaves the old file or the new one and never a truncated one.
@@ -7922,6 +7925,16 @@ Every file is written to a temporary name in the same directory, flushed, then r
 The bundle file is written before the state file names it, so the other crash window leaves a bundle nothing points at. That one is repaired at startup rather than refused: the reservation already covered the number, so nothing else can claim it, and the file on disk is the one that was signed. A bundle claiming a number above `high_water_revision`, or a state file naming a bundle that is not there, is refused, because both mean the two files came from different places.
 
 An invalid payload consumes nothing at all, because every validation step runs before the reservation.
+
+### The archive ring
+
+`revisions/archive/` sits beside the two slots rather than replacing them. `current.json` and `previous.json` hold exactly the bytes they always did, and the crash-repair rules above are unchanged. The ring exists for the question `previous.json` cannot answer: not "undo the last publish" but "go back to what we were running on Tuesday".
+
+Every commit writes the same signed bundle into `revisions/archive/<revision>.json`, and the ring keeps the newest `archive_keep` of them. The archive file is written before `authority-state.json` names it, matching the ordering the current bundle already uses, so a crash between the two leaves a file nothing points at; startup adopts it and trims back to the bound. Eviction persists the shorter list before it unlinks anything, so the only residue a crash can leave is a file the list no longer names, which the next startup adopts and evicts again. A file naming a revision above `high_water_revision` is refused for the same reason a bundle claiming one is: it came from a different store.
+
+Lowering `archive_keep` takes effect at the next start rather than waiting for enough publications to push the old entries out.
+
+**Disk.** One archived file is bounded by the same envelope limit a subscriber applies on the wire: twice the 4 MiB configuration limit plus 64 KiB, so 8.06 MiB. At the default of 20 the ring is bounded at 161 MiB, and at the maximum of 200 it is bounded at 1.57 GiB. Those are ceilings for a document at the wire limit; a real `sb.yml` is four orders of magnitude smaller, so the default ring costs kilobytes.
 
 The store directory is pinned to its `authority_id`. Pointing a second authority at a directory the first wrote is refused rather than adopted, since the revision counter and the subscriber registry belong to whoever created them.
 
@@ -7942,7 +7955,7 @@ All five sit on the admin listener behind operator auth and RBAC.
 | Route | Method | Purpose |
 |---|---|---|
 | `/admin/config-authority/publish` | `POST` | Body is the YAML payload; `?mode=overlay\|replace` selects how subscribers apply it (default `overlay`). |
-| `/admin/config-authority/rollback` | `POST` | Republish the previous stored revision's payload. No body, no query. |
+| `/admin/config-authority/rollback` | `POST` | Republish an earlier revision's payload. No body for the previous one; `{"to_revision": N}` for an archived one. |
 | `/admin/config-authority/status` | `GET` | Current revision, digest, ETag, key ID, the verifying-key file to distribute, and per-subscriber last-seen revision. |
 | `/admin/config-authority/subscribers` | `GET` / `POST` | List subscribers, or register one with `{"subscriber_id":"edge-01"}`. |
 | `/admin/config-authority/subscribers/revoke` | `POST` | `{"credential_id":"..."}` for one credential, `{"subscriber_id":"..."}` for every credential that node holds. |
@@ -7963,6 +7976,37 @@ through, since a payload that published cleanly before a binary upgrade
 need not still construct after one. With nothing to go back to, the route
 answers `400` with code `no_previous_revision` and
 `"revision_consumed": false`.
+
+`{"to_revision": N}` names an archived revision instead, which is how a
+fleet rolls back further than one step:
+
+```console
+$ sbproxy config authority status --admin-url http://127.0.0.1:9090 --format json | jq .archived_revisions
+[
+  9,
+  10,
+  11,
+  12
+]
+$ sbproxy config authority rollback --to-revision 10 --admin-url http://127.0.0.1:9090
+config authority rollback: republished revision 10's payload as revision 13, replacing revision 12
+config authority rollback: the number moves forward because a subscriber refuses a revision that is not greater than the one it applied. Subscribers take it on their next poll.
+```
+
+The mechanism is identical: revision 10's payload is revalidated and
+published as a new revision above the current one. A revision the ring no
+longer holds is `400` with code `revision_not_archived`, and the answer
+lists what is available in both the sentence and an `archived_revisions`
+array, so the next attempt is informed rather than another guess. An
+archived payload that no longer validates is refused with its own
+validation code and nothing is published.
+
+`sbproxy_config_authority_rollback_total{target,result}` counts what the
+authority was asked to do, with `target` of `previous` or `archived` and
+`result` of `published` or `refused`. It answers the half of an incident
+that the node-side `sbproxy_config_apply_total` cannot: whether the
+rollback was refused at the authority or is still on its way to the
+fleet.
 
 Registration returns the clear credential exactly once. The authority stores only a SHA-256 fingerprint of it, so the registry file is not a credential store: someone who reads it cannot authenticate with it. Credentials look like `sbca1.<credential-id>.<secret>` and are long-lived and reusable, unlike the single-use `sbce1` cluster enrollment tokens.
 

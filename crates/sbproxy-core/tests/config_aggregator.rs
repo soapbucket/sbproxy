@@ -1475,6 +1475,7 @@ fn publish_config(dir: &Path) -> ConfigAuthorityPublishConfig {
         tls: None,
         rate_limit_per_subscriber_per_minute: 1_000,
         rate_limit_total_per_minute: 1_000,
+        archive_keep: sbproxy_config::config_authority::DEFAULT_ARCHIVE_KEEP,
     };
     publish.validate().expect("fixture publish validates");
     publish

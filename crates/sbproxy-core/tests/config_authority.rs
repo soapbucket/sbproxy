@@ -116,6 +116,7 @@ fn publish_config(dir: &Path, port: u16) -> ConfigAuthorityPublishConfig {
         tls: None,
         rate_limit_per_subscriber_per_minute: 1_000,
         rate_limit_total_per_minute: 1_000,
+        archive_keep: sbproxy_config::config_authority::DEFAULT_ARCHIVE_KEEP,
     };
     // Every fixture must be a block an operator could actually write, so
     // the same validation `sbproxy validate` runs applies here.
@@ -563,6 +564,250 @@ fn rollback_republishes_the_previous_payload_as_a_new_revision() {
         serde_json::json!(digest_of_good),
     );
     assert_eq!(authority.status()["previous_revision"], 2);
+}
+
+// --- WOR-2463: the archive ring and rollback to a named revision -------
+
+/// Publish `count` distinct payloads and hand back the authority.
+fn published_series(dir: &Path, count: u64) -> ConfigAuthority {
+    let authority = authority(dir);
+    for revision in 1..=count {
+        let outcome = authority
+            .publish(
+                &payload("api.test", &format!("body-{revision}")),
+                BundleMode::Overlay,
+            )
+            .expect("publish");
+        assert_eq!(outcome.revision, revision);
+    }
+    authority
+}
+
+#[test]
+fn rollback_to_an_archived_revision_republishes_it_above_the_current_one() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let authority = published_series(temp.path(), 4);
+    let keys = key_set(&authority);
+    let credential = authority
+        .register_subscriber("edge-01")
+        .expect("register")
+        .into_token();
+
+    let status = authority.status();
+    assert_eq!(
+        status["archived_revisions"],
+        serde_json::json!([1, 2, 3, 4]),
+        "the status page names what a rollback may target",
+    );
+    assert_eq!(
+        status["archive_keep"],
+        serde_json::json!(sbproxy_config::config_authority::DEFAULT_ARCHIVE_KEEP),
+    );
+
+    // Three publishes ago, which `previous.json` alone cannot reach.
+    let rolled_back = authority.rollback_to(2).expect("rollback to revision 2");
+    assert_eq!(rolled_back.restored_from_revision, 2);
+    assert_eq!(rolled_back.replaced_revision, 4);
+    assert_eq!(
+        rolled_back.outcome.revision, 5,
+        "an archive rollback moves forward for the same anti-replay reason the one-step \
+         rollback does",
+    );
+    let digest_of_two = sbproxy_config::config_bundle::ConfigBundle::content_digest_of(&payload(
+        "api.test", "body-2",
+    ));
+    assert_eq!(rolled_back.outcome.content_digest, digest_of_two);
+
+    // A real subscriber takes it, which is the half that proves the
+    // republication is a bundle and not just a bookkeeping entry.
+    let reply = authority.serve_bundle(&fetch(&credential, None));
+    assert_eq!(reply.status, 200);
+    assert_eq!(reply.revision, Some(5));
+    let signed = SignedConfigBundle::from_json(&reply.body).expect("decode");
+    let verified = signed.verify(&keys).expect("the served bundle verifies");
+    assert_eq!(verified.revision, 5);
+    assert!(
+        verified.config_yaml.contains("body-2"),
+        "the payload is revision 2's: {}",
+        verified.config_yaml,
+    );
+    // And the republication itself is archived, so the next rollback can
+    // name it too.
+    assert_eq!(
+        authority.status()["archived_revisions"],
+        serde_json::json!([1, 2, 3, 4, 5]),
+    );
+}
+
+#[test]
+fn a_rollback_to_a_revision_the_archive_does_not_hold_is_refused_by_name() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let authority = published_series(temp.path(), 2);
+    let error = authority
+        .rollback_to(9)
+        .expect_err("revision 9 was never published");
+    assert_eq!(error.code(), "revision_not_archived", "{error}");
+    assert!(error.is_request_fault(), "{error}");
+    let message = error.to_string();
+    assert!(message.contains("revision 9 is not in the archive"), "{message}");
+    assert!(
+        message.contains("available revisions are 1, 2"),
+        "the refusal lists what an operator may pick instead: {message}",
+    );
+    assert_eq!(
+        authority.current_revision(),
+        2,
+        "a refused rollback publishes nothing and burns no number",
+    );
+}
+
+#[test]
+fn an_archived_payload_that_no_longer_validates_is_refused_with_its_validation_error() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let authority = published_series(temp.path(), 2);
+    // Stand in for "this payload stopped constructing after a binary
+    // upgrade" by rewriting the archived bundle's payload to one the
+    // current binary refuses. The file is the authority's own, signed by
+    // its own key, so nothing but the validation pass can reject it, which
+    // is exactly the property under test: a rollback revalidates rather
+    // than trusting that a payload which published once still publishes.
+    let archive = temp
+        .path()
+        .join("authority-store")
+        .join("revisions")
+        .join("archive")
+        .join("1.json");
+    let signed: sbproxy_config::SignedConfigBundle =
+        sbproxy_config::SignedConfigBundle::from_json(&std::fs::read(&archive).expect("read"))
+            .expect("decode");
+    let signer = sbproxy_config::ConfigBundleSigner::ed25519_from_seed_file(
+        KEY_ID,
+        &write_signing_key(temp.path()),
+    )
+    .expect("signer");
+    let denied = signer
+        .sign(
+            sbproxy_config::ConfigBundle::new(
+                AUTHORITY_ID,
+                signed.bundle.revision,
+                signed.bundle.mode,
+                "proxy:\n  admin:\n    enabled: true\n",
+                signed.bundle.issued_at_unix_ms,
+                None,
+            )
+            .expect("bundle"),
+        )
+        .expect("sign");
+    std::fs::write(&archive, denied.to_json().expect("encode")).expect("rewrite archive");
+
+    let error = authority
+        .rollback_to(1)
+        .expect_err("an archived payload this binary refuses must not reach the fleet");
+    assert_eq!(error.code(), "denied_path", "{error}");
+    assert!(
+        error.is_request_fault(),
+        "the stored payload is at fault, not the authority: {error}",
+    );
+    assert_eq!(
+        authority.current_revision(),
+        2,
+        "nothing was published, so the fleet is still on revision 2",
+    );
+}
+
+#[test]
+fn the_rollback_route_takes_an_optional_to_revision_and_refuses_a_malformed_one() {
+    fn call(body: Option<&str>) -> (u16, serde_json::Value) {
+        let (status, _content_type, body) = sbproxy_core::config_authority::dispatch(
+            "POST",
+            "/admin/config-authority/rollback",
+            body,
+        )
+        .expect("the route must be owned by this dispatcher");
+        (
+            status,
+            serde_json::from_str::<serde_json::Value>(&body).expect("a JSON body"),
+        )
+    }
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let authority = std::sync::Arc::new(published_series(temp.path(), 3));
+    sbproxy_core::config_authority::install_process_authority(std::sync::Arc::clone(&authority));
+
+    // No body is the one-step rollback it has always been.
+    let (status, one_step) = call(None);
+    assert_eq!(status, 200, "{one_step}");
+    assert_eq!(one_step["restored_from_revision"], 2);
+    assert_eq!(one_step["revision"], 4);
+
+    // An empty object is the same thing: `to_revision` is optional.
+    let (status, still_one_step) = call(Some("{}"));
+    assert_eq!(status, 200, "{still_one_step}");
+    assert_eq!(still_one_step["restored_from_revision"], 3);
+
+    // Naming a revision reaches past the one-step window.
+    let (status, named) = call(Some(r#"{"to_revision":1}"#));
+    assert_eq!(status, 200, "{named}");
+    assert_eq!(named["restored_from_revision"], 1);
+    assert_eq!(named["revision"], 6);
+
+    // A revision the ring does not hold is a 400 that lists the choices,
+    // in the body as well as in the sentence.
+    let (status, refused) = call(Some(r#"{"to_revision":99}"#));
+    assert_eq!(status, 400, "{refused}");
+    assert_eq!(refused["code"], "revision_not_archived");
+    assert_eq!(refused["revision_consumed"], false);
+    assert_eq!(
+        refused["archived_revisions"],
+        serde_json::json!([1, 2, 3, 4, 5, 6]),
+    );
+
+    // A body that is present but unusable is refused rather than silently
+    // treated as the one-step rollback, which would roll the fleet to a
+    // document the operator did not name.
+    for (body, code) in [
+        ("not json", "invalid_body"),
+        ("[1]", "invalid_body"),
+        (r#"{"to_revision":0}"#, "invalid_to_revision"),
+        (r#"{"to_revision":"3"}"#, "invalid_to_revision"),
+        (r#"{"to_revision":-1}"#, "invalid_to_revision"),
+    ] {
+        let (status, answer) = call(Some(body));
+        assert_eq!(status, 400, "{body}: {answer}");
+        assert_eq!(answer["code"], code, "{body}");
+    }
+
+    sbproxy_core::config_authority::clear_process_authority();
+}
+
+#[test]
+fn a_zero_archive_keep_leaves_the_one_step_rollback_and_refuses_a_named_one() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut publish = publish_config(temp.path(), free_port());
+    publish.archive_keep = 0;
+    publish.validate().expect("archive_keep of zero validates");
+    let authority = ConfigAuthority::from_config(&publish).expect("authority");
+    for revision in 1..=2u64 {
+        authority
+            .publish(
+                &payload("api.test", &format!("body-{revision}")),
+                BundleMode::Overlay,
+            )
+            .expect("publish");
+    }
+    assert!(authority.archived_revisions().is_empty());
+    // The behavior that predates the ring is untouched.
+    assert_eq!(
+        authority.rollback().expect("one-step rollback").restored_from_revision,
+        1,
+    );
+    assert_eq!(
+        authority
+            .rollback_to(1)
+            .expect_err("nothing is archived")
+            .code(),
+        "revision_not_archived",
+    );
 }
 
 #[test]

@@ -880,6 +880,60 @@
         }
       ],
       "description": "Rollback attempts, by outcome. outcome=\"reverted\" is the one to alert on: it means a node undid a config change on its own after a failed soak, with soak.auto_revert armed, and nobody asked it to. outcome=\"applied\" is an operator using POST /admin/config/rollback, and the two are disjoint so this query is unambiguous. outcome=\"rejected\" climbing during an incident means rollbacks are being refused: read the config_rollback events for the reason, which is usually an unknown revision, a stale expected_current, or a restart-class change nobody confirmed."
+    },
+    {
+      "id": 14,
+      "title": "Config Authority Rollbacks",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 48
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (target, result) (increase(sbproxy_config_authority_rollback_total[1h]))",
+          "legendFormat": "{{target}} {{result}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Fleet rollbacks the config authority was asked to run, by target and result. target=\"previous\" is the one-step undo; target=\"archived\" is POST /admin/config-authority/rollback with a to_revision naming an entry in the archive ring. result=\"refused\" means nothing was published and the revision counter did not move: usually a revision the ring no longer holds, or an older payload that stopped validating after a binary upgrade. Read the authority log for which. This is the authority's own view; sbproxy_config_apply_total on each node says whether the fleet took the new revision."
     }
   ],
   "templating": {

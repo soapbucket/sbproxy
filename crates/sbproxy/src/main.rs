@@ -584,12 +584,19 @@ struct AuthorityStatusArgs {
     format: OutputFormat,
 }
 
-/// `sbproxy config authority rollback`: republish the previous revision.
+/// `sbproxy config authority rollback`: republish an earlier revision.
 #[derive(clap::Args, Debug)]
 struct AuthorityRollbackArgs {
     /// Admin endpoint and Basic Auth credentials of the authority.
     #[command(flatten)]
     admin: ModelsAdminArgs,
+    /// Republish this archived revision instead of the previous one.
+    ///
+    /// Omit it for the one-step rollback. The revisions available are on
+    /// `sbproxy config authority status` as `archived_revisions`, and a
+    /// refusal lists them too.
+    #[arg(long = "to-revision", value_name = "N")]
+    to_revision: Option<u64>,
     /// Output format.
     #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
@@ -10406,14 +10413,25 @@ fn handle_authority_status(args: &AuthorityStatusArgs) -> anyhow::Result<i32> {
 /// taken the revision being undone, which is the opposite of what an
 /// operator wants at that moment.
 ///
+/// `--to-revision N` names an archived revision instead of the previous
+/// one, which is what makes a fleet rollback to a document from several
+/// publishes ago possible. The mechanism is the same either way: the
+/// chosen payload is revalidated and republished under a fresh number.
+///
 /// Exit codes: 0 rolled back, 1 CLI or IO error, 4 the authority refused
-/// (typically no previous revision to return to), 7 unreachable.
+/// (no previous revision to return to, or a `--to-revision` the archive
+/// does not hold), 7 unreachable.
 fn handle_authority_rollback(args: &AuthorityRollbackArgs) -> anyhow::Result<i32> {
+    // No body at all for the one-step rollback, so an older authority that
+    // does not read one behaves exactly as it did.
+    let request_body = args
+        .to_revision
+        .map(|revision| AdminRequestBody::Json(serde_json::json!({ "to_revision": revision })));
     let body = match admin_request_parts(
         &args.admin,
         reqwest::Method::POST,
         sbproxy_core::config_authority::ROLLBACK_PATH,
-        None,
+        request_body,
     )? {
         AdminOutcome::Unreachable(reason) => {
             return Ok(report_admin_unreachable(

@@ -320,6 +320,23 @@ pub enum RollbackError {
         /// Revision currently served. Zero means nothing was ever published.
         published: u64,
     },
+    /// The archive does not hold the named revision.
+    ///
+    /// Lists what is available rather than only saying no, because an
+    /// operator who guessed once will otherwise guess again.
+    #[error(
+        "config authority rollback rejected: revision {requested} is not in the archive; \
+         available revisions are {available}"
+    )]
+    NotArchived {
+        /// Revision the caller asked for.
+        requested: u64,
+        /// Revisions the ring holds, ascending, rendered for the message.
+        available: String,
+    },
+    /// An archived bundle is on disk but could not be read back.
+    #[error("config authority rollback failed: {0}")]
+    Store(#[from] sbproxy_config::config_authority::AuthorityStoreError),
     /// The previous payload no longer publishes, or could not be signed or
     /// stored.
     ///
@@ -337,6 +354,8 @@ impl RollbackError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::NoPreviousRevision { .. } => "no_previous_revision",
+            Self::NotArchived { .. } => "revision_not_archived",
+            Self::Store(_) => "archive_unreadable",
             Self::Publish(error) => error.code(),
         }
     }
@@ -346,7 +365,8 @@ impl RollbackError {
     #[must_use]
     pub fn is_request_fault(&self) -> bool {
         match self {
-            Self::NoPreviousRevision { .. } => true,
+            Self::NoPreviousRevision { .. } | Self::NotArchived { .. } => true,
+            Self::Store(_) => false,
             Self::Publish(error) => error.is_payload_fault(),
         }
     }
@@ -559,13 +579,17 @@ impl ConfigAuthority {
                 publish.signing_key_file
             )
         })?;
-        let store =
-            AuthorityStore::open(&publish.store_dir, &publish.authority_id).map_err(|error| {
-                anyhow::anyhow!(
-                    "open config authority store '{}': {error}",
-                    publish.store_dir
-                )
-            })?;
+        let store = AuthorityStore::open_with_archive_keep(
+            &publish.store_dir,
+            &publish.authority_id,
+            publish.archive_keep,
+        )
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "open config authority store '{}': {error}",
+                publish.store_dir
+            )
+        })?;
         let served = match store.current() {
             Some(signed) => Some(Arc::new(ServedBundle::new(signed)?)),
             None => None,
@@ -802,6 +826,9 @@ impl ConfigAuthority {
             let store = self.lock_store();
             let replaced_revision = store.current_revision();
             let Some(previous) = store.previous() else {
+                sbproxy_observe::metrics::record_config_authority_rollback(
+                    "previous", "refused",
+                );
                 return Err(RollbackError::NoPreviousRevision {
                     published: replaced_revision,
                 });
@@ -813,7 +840,10 @@ impl ConfigAuthority {
                 replaced_revision,
             )
         };
-        let outcome = self.publish(&config_yaml, mode)?;
+        let outcome = self.publish(&config_yaml, mode).inspect_err(|_| {
+            sbproxy_observe::metrics::record_config_authority_rollback("previous", "refused");
+        })?;
+        sbproxy_observe::metrics::record_config_authority_rollback("previous", "published");
         tracing::warn!(
             revision = outcome.revision,
             restored_from_revision,
@@ -827,6 +857,79 @@ impl ConfigAuthority {
             replaced_revision,
             outcome,
         })
+    }
+
+    /// Republish an archived revision's payload under a new revision
+    /// number.
+    ///
+    /// [`Self::rollback`] answers "undo the last publish"; this answers
+    /// "go back to the document we were running three publishes ago". The
+    /// mechanism is identical and deliberately so: the payload goes out
+    /// as a **new** revision above the current one, because a
+    /// subscriber's anti-replay cursor refuses anything that is not
+    /// greater than what it applied. Nothing about the numbering changes
+    /// just because the target is further back.
+    ///
+    /// The archived payload is revalidated on the way through, for the
+    /// same reason a one-step rollback is: an older payload is a *more*
+    /// likely candidate to have stopped constructing across a binary
+    /// upgrade, not a less likely one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RollbackError::NotArchived`] when the ring does not hold
+    /// `to_revision`, naming what it does hold;
+    /// [`RollbackError::Store`] when the archived file cannot be read
+    /// back; and [`RollbackError::Publish`] when the archived payload no
+    /// longer validates or cannot be signed or stored. Nothing about the
+    /// served bundle changes unless the whole call succeeds.
+    pub fn rollback_to(&self, to_revision: u64) -> Result<RollbackOutcome, RollbackError> {
+        let (mode, config_yaml, replaced_revision) = {
+            let store = self.lock_store();
+            let replaced_revision = store.current_revision();
+            let archived = store.archived(to_revision).inspect_err(|_| {
+                sbproxy_observe::metrics::record_config_authority_rollback("archived", "refused");
+            })?;
+            match archived {
+                Some(archived) => (
+                    archived.bundle.mode,
+                    archived.bundle.config_yaml.clone(),
+                    replaced_revision,
+                ),
+                None => {
+                    sbproxy_observe::metrics::record_config_authority_rollback(
+                        "archived", "refused",
+                    );
+                    return Err(RollbackError::NotArchived {
+                        requested: to_revision,
+                        available: render_revisions(store.archived_revisions()),
+                    });
+                }
+            }
+        };
+        let outcome = self.publish(&config_yaml, mode).inspect_err(|_| {
+            sbproxy_observe::metrics::record_config_authority_rollback("archived", "refused");
+        })?;
+        sbproxy_observe::metrics::record_config_authority_rollback("archived", "published");
+        tracing::warn!(
+            revision = outcome.revision,
+            restored_from_revision = to_revision,
+            replaced_revision,
+            authority_id = %self.authority_id,
+            "config authority rolled back to an archived revision: its payload is republished \
+             under a new revision number",
+        );
+        Ok(RollbackOutcome {
+            restored_from_revision: to_revision,
+            replaced_revision,
+            outcome,
+        })
+    }
+
+    /// Revisions the archive ring holds, ascending.
+    #[must_use]
+    pub fn archived_revisions(&self) -> Vec<u64> {
+        self.lock_store().archived_revisions().to_vec()
     }
 
     /// Answer one bundle fetch.
@@ -1140,6 +1243,12 @@ impl ConfigAuthority {
             "current_issued_at_unix_ms": served.as_ref().map(|served| served.issued_at_unix_ms),
             "current_etag": served.as_ref().map(|served| served.etag.clone()),
             "previous_revision": store.previous().map(|signed| signed.bundle.revision),
+            // WOR-2463: what `rollback --to-revision N` can name. An
+            // operator planning a fleet rollback reads this before
+            // choosing a target, so it is on the status page rather than
+            // only in an error message they have to provoke first.
+            "archived_revisions": store.archived_revisions(),
+            "archive_keep": store.archive_keep(),
             "high_water_revision": store.high_water_revision(),
             "store_dir": store.directory().display().to_string(),
             "subscriber_count": store.subscriber_count(),
@@ -1338,7 +1447,7 @@ pub fn dispatch(method: &str, path: &str, body: Option<&str>) -> Option<AdminRes
     let path_only = path.split('?').next().unwrap_or(path);
     match path_only {
         PUBLISH_PATH => Some(dispatch_publish(method, query, body)),
-        ROLLBACK_PATH => Some(dispatch_rollback(method)),
+        ROLLBACK_PATH => Some(dispatch_rollback(method, body)),
         STATUS_PATH => Some(dispatch_status(method)),
         SUBSCRIBERS_PATH => Some(dispatch_subscribers(method, body)),
         SUBSCRIBER_REVOKE_PATH => Some(dispatch_revoke(method, body)),
@@ -1414,19 +1523,34 @@ fn dispatch_publish(method: &str, query: Option<&str>, body: Option<&str>) -> Ad
     }
 }
 
-/// `POST /admin/config-authority/rollback`: republish the previous stored
+/// `POST /admin/config-authority/rollback`: republish an earlier stored
 /// revision's payload under a new revision number.
 ///
-/// No body and no query parameters. There is exactly one revision to go back
-/// to, so there is nothing to name.
-fn dispatch_rollback(method: &str) -> AdminResponse {
+/// The body is optional. With none, or with `{}`, this is the one-step
+/// rollback it has always been: the previous revision. With
+/// `{"to_revision": N}` it republishes archived revision `N`, which is
+/// what makes a fleet rollback to a revision from several publishes ago
+/// possible (WOR-2463). A body that is present but not an object, or
+/// whose `to_revision` is not a positive integer, is a `400` rather than
+/// a silently ignored field: an operator who meant to name a revision
+/// and got the one-step rollback instead would have rolled the fleet to
+/// the wrong document.
+fn dispatch_rollback(method: &str, body: Option<&str>) -> AdminResponse {
     if !method.eq_ignore_ascii_case("POST") {
         return method_not_allowed();
     }
     let Some(authority) = current_authority() else {
         return not_publishing();
     };
-    match authority.rollback() {
+    let to_revision = match parse_to_revision(body) {
+        Ok(to_revision) => to_revision,
+        Err(response) => return response,
+    };
+    let attempt = match to_revision {
+        Some(revision) => authority.rollback_to(revision),
+        None => authority.rollback(),
+    };
+    match attempt {
         Ok(rolled_back) => json(
             200,
             serde_json::json!({
@@ -1455,10 +1579,73 @@ fn dispatch_rollback(method: &str) -> AdminResponse {
                     // Nothing moved, so the operator retrying after fixing
                     // whatever this names is not skipping a number.
                     "revision_consumed": false,
+                    // Machine-readable alongside the sentence, so a
+                    // console can offer the choices rather than asking
+                    // the operator to parse an error string.
+                    "archived_revisions": authority.archived_revisions(),
                 }),
             )
         }
     }
+}
+
+/// Read an optional `{"to_revision": N}` rollback body.
+///
+/// `Ok(None)` is "no target named", which is the one-step rollback.
+fn parse_to_revision(body: Option<&str>) -> Result<Option<u64>, AdminResponse> {
+    let Some(body) = body.map(str::trim).filter(|body| !body.is_empty()) else {
+        return Ok(None);
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Err(json(
+            400,
+            serde_json::json!({
+                "error": "the rollback body must be JSON; send no body for the one-step \
+                          rollback, or {\"to_revision\": N} to name an archived revision",
+                "code": "invalid_body",
+                "revision_consumed": false,
+            }),
+        ));
+    };
+    let Some(object) = parsed.as_object() else {
+        return Err(json(
+            400,
+            serde_json::json!({
+                "error": "the rollback body must be a JSON object",
+                "code": "invalid_body",
+                "revision_consumed": false,
+            }),
+        ));
+    };
+    match object.get("to_revision") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => match value.as_u64().filter(|revision| *revision > 0) {
+            Some(revision) => Ok(Some(revision)),
+            None => Err(json(
+                400,
+                serde_json::json!({
+                    "error": "to_revision must be a positive integer naming an archived \
+                              revision",
+                    "code": "invalid_to_revision",
+                    "revision_consumed": false,
+                }),
+            )),
+        },
+    }
+}
+
+/// Render a revision list for an error message.
+fn render_revisions(revisions: &[u64]) -> String {
+    if revisions.is_empty() {
+        return "none (the archive is empty; publish at least once, or raise \
+                proxy.config_authority.publish.archive_keep)"
+            .to_string();
+    }
+    revisions
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// `GET /admin/config-authority/status`.
