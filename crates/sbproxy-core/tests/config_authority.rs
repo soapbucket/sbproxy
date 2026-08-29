@@ -639,6 +639,35 @@ fn rollback_to_an_archived_revision_republishes_it_above_the_current_one() {
     );
 }
 
+/// The wire half of `revision_consumed`: the refusal an operator
+/// actually reads carries the computed value. The per-variant
+/// classification is pinned in the module's own tests, where the
+/// private method is reachable.
+#[test]
+fn revision_consumed_tells_a_validation_refusal_from_a_spent_number() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let authority = std::sync::Arc::new(published_series(temp.path(), 2));
+    sbproxy_core::config_authority::install_process_authority(std::sync::Arc::clone(&authority));
+    let (status, refused) = {
+        let (status, _content_type, body) = sbproxy_core::config_authority::dispatch(
+            "POST",
+            "/admin/config-authority/publish",
+            Some("proxy:\n  admin:\n    enabled: true\n"),
+        )
+        .expect("the route must be owned by this dispatcher");
+        (
+            status,
+            serde_json::from_str::<serde_json::Value>(&body).expect("a JSON body"),
+        )
+    };
+    assert_eq!(status, 400, "{refused}");
+    assert_eq!(
+        refused["revision_consumed"], false,
+        "a denied path is caught before the reservation: {refused}",
+    );
+    sbproxy_core::config_authority::clear_process_authority();
+}
+
 #[test]
 fn a_rollback_to_a_revision_the_archive_does_not_hold_is_refused_by_name() {
     let temp = tempfile::tempdir().expect("temp dir");

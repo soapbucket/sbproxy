@@ -4038,9 +4038,13 @@ pub struct ConfigAuthorityPublishConfig {
     /// `POST /admin/config-authority/rollback` accept a `to_revision`
     /// from further back than one step.
     ///
+    /// This counts revisions a rollback can name, so the revision
+    /// currently being served does not use up a slot and the ring holds
+    /// `archive_keep + 1` files.
+    ///
     /// Zero keeps no ring and leaves the one-step rollback exactly as it
     /// was. The maximum is 200. At the maximum, and with a configuration
-    /// document at the 4 MiB wire limit, the ring is bounded at 1.57 GiB
+    /// document at the 4 MiB wire limit, the ring is bounded at 1.58 GiB
     /// of disk; a real document makes the default ring cost kilobytes.
     #[serde(default = "default_publish_archive_keep")]
     pub archive_keep: usize,

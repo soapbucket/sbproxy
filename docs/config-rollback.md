@@ -56,31 +56,47 @@ Before undoing anything, read what the node thinks it is running.
 $ sbproxy config history --admin-url http://127.0.0.1:9090 --password "$SB_ADMIN_PASSWORD"
 lineage 4f2a0b18-6c11-4b7a-9a3e-2d1f6c8e0b44, last-known-good revision 41
 REVISION	STATE	BLAST RADIUS	PROVENANCE	APPLIED AT	ACTOR	DIGEST
-43	applied	reload	file_watcher	2026-08-28T09:12:04Z	-	9f86d081884c7d65
-42	reverted	reload	api	2026-08-28T08:57:31Z	admin	b3a10c77a1e4f0d2
-41	good	hitless	file_watcher	2026-08-27T22:04:19Z	-	2c26b46b68ffc68f
+43	failed	reload	local_file	2026-08-28T09:12:04.311Z	admin	9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+42	reverted	reload	local_file	2026-08-28T08:57:31.084Z	admin	b3a10c77a1e4f0d2b0b822cd15d6c15b0f00a08c55ad015a3bf4f1b2b0b822cd
+41	good	hitless	git	2026-08-27T22:04:19.902Z	-	2c26b46b68ffc68ff99b453c1d3041341340d0d0d0d0d0d0d0d0d0d0d0d0d0d0
 ```
 
 The columns are tab separated, so `| column -t` renders it and `| cut -f1,2`
 scripts it.
 
-`state` is the whole story. `applied` means recorded but not yet
-promoted. `good` means it survived its soak, and the `lkg` pointer names
-exactly one of them. `reverted` means the node undid it.
+`state` is the whole story:
 
-A `lkg` several revisions behind the newest `applied` entry is the signal
-to act on: revisions are landing and none of them is surviving its soak.
+| State | Means |
+|---|---|
+| `applied` | recorded and serving, but its soak window has not closed yet |
+| `good` | it survived its soak. The `lkg` pointer names exactly one of these |
+| `failed` | its soak closed on a failing verdict. Still serving unless something moved it |
+| `reverted` | the node undid it, which only happens with `soak.auto_revert` armed |
+
+**`failed` is the row to look for.** A revision that broke traffic and
+lost its soak is `failed`, not `applied`, and that is the situation this
+page is about. An `lkg` several revisions behind, with `failed` rows
+above it, is changes landing and none of them surviving.
+
+`PROVENANCE` is where the *base* document came from, and this release
+emits only `local_file` or `git`. It does not say what triggered the
+apply; `ACTOR` does, and it is `-` for a file-watcher or boot apply.
 
 Then diff the two:
 
 ```console
 $ sbproxy config diff 41 --admin-url http://127.0.0.1:9090 --password "$SB_ADMIN_PASSWORD"
---- revision 43 (running)
-+++ revision 41 (last known good)
-@@ origins."api.example.com".action @@
--  url: http://payments-v2.internal:8080
-+  url: http://payments.internal:8080
+config diff: the running configuration -> revision 41, largest blast radius reload
+  ~ origins."api.example.com".action [reload] upstream url changed
+
+Plan: 0 added, 1 changed, 0 removed. max-blast-radius: reload
 ```
+
+This is a plan, not a unified diff: one line per changed path with the
+blast radius that change carries, and a summary. It answers *what would
+move and how disruptively*, which is the question before a rollback. It
+does not print the old and new values; `sbproxy config show 41` prints
+the stored document itself when you need them.
 
 The stored document is pre-resolution bytes: exactly what was read off
 disk before `${VAR}`, `vault://`, and `secret://` references resolved. A
@@ -149,7 +165,7 @@ $ curl -su "admin:$SB_ADMIN_PASSWORD" http://127.0.0.1:9090/admin/config/fallbac
 {
   "active": true,
   "revision": 41,
-  "digest": "2c26b46b68ffc68ff99b453c1d3041341340d0d0d0d0d0d0d0d0d0d0d0d0d0d",
+  "digest": "2c26b46b68ffc68ff99b453c1d3041341340d0d0d0d0d0d0d0d0d0d0d0d0d0d0",
   "reason": "unknown action type: proxyy",
   "suspended": ["file_watcher", "sighup", "config_refresh_poller"]
 }

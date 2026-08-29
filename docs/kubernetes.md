@@ -65,7 +65,14 @@ What that suspends, precisely:
 | Still reconciled | Held |
 |---|---|
 | the Service | the ConfigMap |
-| the CR status and the condition below | the Deployment or StatefulSet, so `image:`, `replicas:` and `resources:` wait too |
+| `observedConfigHash` and the condition below | the Deployment or StatefulSet, so `image:`, `replicas:` and `resources:` wait too |
+| | `configHash`, and the `lastError` clear that rides with it |
+
+`configHash` and `lastError` are written together by the end-of-rollout
+patch, which is after the suspension, so a `lastError` from an earlier
+pass stays on the CR for the whole suspension. Read the
+`ConfigFallbackActive` condition first: while it is `True`, `lastError`
+is history rather than the current reason nothing is moving.
 
 The Service is exempt because it is a name and a port selector: recreating a deleted one cannot put a document on a pod, and leaving it unreconciled would turn a config incident into an outage. The workload is not exempt, because applying it rolls pods, and a rolled pod re-reads the ConfigMap the operator is not allowed to update, so it restarts into the very document that pinned it.
 

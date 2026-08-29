@@ -152,10 +152,14 @@ To see whether your change would move anything at all, without writing:
 
 ```console
 $ sbproxy aggregate runtime.yml --out composed.yml --dry-run
-aggregate: composed.yml would change: 1 origin modified, 0 added, 0 removed
+aggregate: composed.yml would change:
+  -      requests_per_minute: 1200
+  +      requests_per_minute: 2400
 ```
 
-Exit code 2 means there are changes, which is what a CI job checks.
+A line diff against the file already there, and exit code `2` when there
+are changes, which is what a CI job checks. `0` means your edit composed
+to exactly what was already committed.
 
 ## When the aggregator refuses you
 

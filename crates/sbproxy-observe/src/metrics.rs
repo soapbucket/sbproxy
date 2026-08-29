@@ -4243,7 +4243,7 @@ pub fn record_operator_fallback_probe(outcome: &'static str) {
 /// | Result | Meaning |
 /// |---|---|
 /// | `published` | The payload revalidated and went out under a new revision. |
-/// | `refused` | Nothing was published: no target, a revision the ring does not hold, or a payload that no longer validates. The revision counter did not move. |
+/// | `refused` | Nothing was published: no target, a revision the ring does not hold, or a payload that no longer validates. The served bundle is untouched. Whether a revision number was spent depends on how far it got: every validation refusal costs nothing, a signing or store failure has already reserved. The admin response's `revision_consumed` says which. |
 pub fn record_config_authority_rollback(target: &'static str, result: &'static str) {
     use prometheus::{register_int_counter_vec, IntCounterVec};
     use std::sync::OnceLock;

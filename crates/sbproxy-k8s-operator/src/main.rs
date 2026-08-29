@@ -516,7 +516,14 @@ async fn reconcile_one_inner(
     // from. Accepting the key and losing that race, or refusing it
     // quietly, are both worse than saying so at validation time
     // (WOR-2467).
-    if let Err(msg) = reconcile::check_auto_revert_under_operator_ownership(&cfg.spec.config) {
+    // Recorded now and acted on *after* the condition block below. This
+    // refusal is permanent until somebody edits the config, so returning
+    // here left whatever `ConfigFallbackActive` an earlier pass wrote
+    // frozen on the CR for the whole time: a node that had since cleared
+    // its pin still read `True`, forever, with nothing to move it.
+    let auto_revert_refusal =
+        reconcile::check_auto_revert_under_operator_ownership(&cfg.spec.config).err();
+    if let Some(msg) = auto_revert_refusal.as_deref() {
         tracing::warn!(
             name = %name,
             namespace = %ns,
@@ -531,13 +538,6 @@ async fn reconcile_one_inner(
             serde_json::json!({ "status": { "lastError": msg } }),
         )
         .await;
-        // Counted, because this refusal is permanent until somebody
-        // edits the config and the pass itself completes cleanly:
-        // `sbproxy_operator_reconcile_total{result}` reads `ok` for it,
-        // so without this series an SBProxy whose image bumps are all
-        // being dropped looks healthy in operator metrics.
-        sbproxy_observe::metrics::record_operator_config_delivery("refused_auto_revert");
-        return Ok(Action::requeue(Duration::from_secs(60)));
     }
 
     // --- Suspend config delivery while a pod is on its boot fallback ---
@@ -583,6 +583,16 @@ async fn reconcile_one_inner(
             "SBProxy has a pod on a fallback configuration; suspending config delivery until \
              the pin is cleared"
         );
+    }
+
+    // Now the refusal acts, with the condition already refreshed above.
+    // Counted, because the pass itself completes cleanly and
+    // `sbproxy_operator_reconcile_total{result}` reads `ok` for it, so
+    // without this series an SBProxy whose image bumps are all being
+    // dropped looks healthy in operator metrics.
+    if auto_revert_refusal.is_some() {
+        sbproxy_observe::metrics::record_operator_config_delivery("refused_auto_revert");
+        return Ok(Action::requeue(Duration::from_secs(60)));
     }
 
     // --- Refuse a fleet that drives ACME from a pod-local cert store ---
@@ -1166,12 +1176,44 @@ async fn try_hot_reload(
 
 /// Most pods one pass probes before it gives up and applies.
 ///
-/// Each probe costs up to the client's 5s timeout, so an unbounded
-/// serial fan-out over a large `replicas` with a NetworkPolicy in the
-/// way would keep the SBProxy from ever converging: its ConfigMap and
-/// workload are applied *after* this. Fifty is far above any fleet that
-/// shares one SBProxy and bounds the worst case at four minutes.
+/// A count bound alone is not enough, and setting it at fifty was
+/// setting it at exactly the failure case: fifty pods behind a
+/// NetworkPolicy, each costing the full per-request timeout, is over
+/// four minutes in which the SBProxy's ConfigMap and workload are not
+/// applied, because both happen after this. [`FALLBACK_PROBE_BUDGET`]
+/// is the bound that actually holds; this one stays as a second limit
+/// for a large fleet whose pods all answer instantly.
 const MAX_FALLBACK_PROBES: usize = 50;
+
+/// Largest fallback answer this operator will read off a pod.
+///
+/// The pod is the untrusted end of this call. `reqwest` caps nothing,
+/// so `resp.json()` would buffer whatever arrives before any bound this
+/// operator applies could look at it: `FallbackReport::bounded` fixes
+/// what reaches the CR, not what reaches the heap. A real answer is a
+/// few hundred bytes; 64 KiB is generous for one and small enough that
+/// a hostile pod cannot make it matter.
+const MAX_FALLBACK_BODY_BYTES: usize = 64 * 1024;
+
+/// Wall clock one pass spends probing before it gives up and applies.
+///
+/// The overall budget the count bound could not provide. Giving up is
+/// safe and is the posture already documented: a pod that does not
+/// answer contributes no report and does not suspend anything, so the
+/// worst case of an exhausted budget is one pass that fails open on a
+/// pod it never asked, counted as `budget_exhausted`, and a pin that is
+/// noticed on the next loop 30 seconds later.
+///
+/// Fifteen seconds is three unreachable pods at the 5s per-request
+/// timeout. The check runs before each request rather than cancelling
+/// one in flight, so a pass can overshoot by a single timeout; the real
+/// ceiling is 20 seconds.
+///
+/// Deliberately still serial. Concurrency would need a `Semaphore` to
+/// avoid a thundering herd against a large fleet, and serial issuance
+/// is what keeps exactly one response body in the operator's heap at a
+/// time, which is the other half of bounding an untrusted pod's answer.
+const FALLBACK_PROBE_BUDGET: Duration = Duration::from_secs(15);
 
 /// Ask every running proxy pod whether it is serving a configuration
 /// its boot fallback restored (WOR-2467).
@@ -1217,6 +1259,7 @@ async fn read_fallback_reports(
     };
     let mut reports = Vec::new();
     let mut probed = 0usize;
+    let deadline = std::time::Instant::now() + FALLBACK_PROBE_BUDGET;
     for pod in &pods.items {
         let name = pod.metadata.name.clone().unwrap_or_else(|| "?".to_string());
         // The credential goes only to a pod this operator's own
@@ -1237,12 +1280,12 @@ async fn read_fallback_reports(
         // timeout, so an unreachable fleet would otherwise pin a
         // reconcile worker for `replicas * 5s` before anything is
         // applied.
-        if probed >= MAX_FALLBACK_PROBES {
+        if probed >= MAX_FALLBACK_PROBES || std::time::Instant::now() >= deadline {
             tracing::warn!(
                 namespace = %namespace,
                 probed,
                 "reached the per-pass fallback probe budget; the remaining pods are treated \
-                 as not pinned this pass",
+                 as not pinned this pass and are asked again on the next loop",
             );
             sbproxy_observe::metrics::record_operator_fallback_probe("budget_exhausted");
             break;
@@ -1288,7 +1331,20 @@ async fn read_fallback_reports(
             sbproxy_observe::metrics::record_operator_fallback_probe("refused");
             continue;
         }
-        match resp.json::<reconcile::FallbackReport>().await {
+        let body = match read_capped_body(resp, MAX_FALLBACK_BODY_BYTES).await {
+            Ok(body) => body,
+            Err(reason) => {
+                sbproxy_observe::metrics::record_operator_fallback_probe("unreadable");
+                tracing::debug!(
+                    pod = %name,
+                    reason,
+                    "a proxy pod's fallback answer was refused before it was parsed; treating \
+                     it as not pinned",
+                );
+                continue;
+            }
+        };
+        match serde_json::from_slice::<reconcile::FallbackReport>(&body) {
             Ok(report) => {
                 sbproxy_observe::metrics::record_operator_fallback_probe(if report.active {
                     "pinned"
@@ -1308,7 +1364,7 @@ async fn read_fallback_reports(
                 sbproxy_observe::metrics::record_operator_fallback_probe("unreadable");
                 tracing::debug!(
                     pod = %name,
-                    error = %error.without_url(),
+                    error = %error,
                     "a proxy pod answered the fallback route with a body this operator cannot \
                      read; treating it as not pinned",
                 );
@@ -1316,6 +1372,35 @@ async fn read_fallback_reports(
         }
     }
     reports
+}
+
+/// Read at most `cap` bytes of a response body, refusing a larger one
+/// rather than buffering it.
+///
+/// Streamed chunk by chunk, because `Content-Length` is absent on a
+/// chunked response and is attacker-supplied on any other: the only
+/// bound that holds is the one applied while reading.
+async fn read_capped_body(
+    response: reqwest::Response,
+    cap: usize,
+) -> Result<Vec<u8>, &'static str> {
+    let mut response = response;
+    let mut body = Vec::new();
+    loop {
+        // `without_url` on the error path: no reqwest Display reaches a
+        // log line with its URL attached (WOR-2629). The caller logs the
+        // `&'static str` this returns instead.
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if body.len() + chunk.len() > cap {
+                    return Err("the answer is larger than this operator will read");
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => return Ok(body),
+            Err(_) => return Err("the answer could not be read to the end"),
+        }
+    }
 }
 
 /// Refuse to push configuration to an `SBProxy` whose pods rescued
@@ -2025,6 +2110,32 @@ mod tests {
             0,
             "the admin credential must not be sent to a pod this operator did not create",
         );
+    }
+
+    /// M9's second half: the refusal is permanent until somebody edits
+    /// the config, so returning before the condition block left a
+    /// `ConfigFallbackActive` from an earlier pass frozen on the CR with
+    /// nothing able to move it. The condition is refreshed first now.
+    #[tokio::test]
+    async fn an_auto_revert_refusal_still_refreshes_the_fallback_condition() {
+        let stub = FallbackStub::start(r#"{"active":false}"#);
+        let requests = drive_one_reconcile_with(
+            stub.port,
+            "proxy:\n  config_history:\n    enabled: true\n    soak:\n      auto_revert: true\n",
+        )
+        .await;
+        // The pods were still asked, which is what refreshes the
+        // condition, and the refusal still stopped the rollout.
+        assert!(
+            requests.iter().any(|request| request.contains("/pods")),
+            "the condition cannot be refreshed without asking: {requests:?}",
+        );
+        for kind in ["configmaps", "deployments", "statefulsets"] {
+            assert!(
+                !requests.iter().any(|request| request.contains(kind)),
+                "an auto_revert config must not roll out; saw {kind} in {requests:?}",
+            );
+        }
     }
 
     /// The guard every config write site calls. The early return in

@@ -73,7 +73,7 @@ A lock binds what an entry does, not what it is called. Refusing only a same-nam
 
 `OriginProfileSpec` names exactly the fields a project may write. Everything else on an origin is unrepresentable in a profile, not merely rejected: there is no field that could hold it, so the parser refuses the document and names the key.
 
-That is an allowlist rather than a deny list on purpose. An origin has 52 fields and gains more regularly, so a deny list would make every future field a silent privilege grant to every project repository. A test enumerates the origin's fields and fails when one appears that is on neither side, and the failure says to classify it.
+That is an allowlist rather than a deny list on purpose. An origin has 53 fields and gains more regularly, so a deny list would make every future field a silent privilege grant to every project repository. A test enumerates the origin's fields and fails when one appears that is on neither side, and the failure says to classify it.
 
 A deny list written today would already have missed `filters[].failure_posture` (a project flipping a platform security filter to fail-open while the config still advertises protection), `force_ssl: false`, `response_cache` (an authenticated response cached and served to somebody else), the `on_request` and `on_response` extension hooks, and `allowed_methods` (an empty list allows every method).
 

@@ -2996,12 +2996,13 @@ fn resolve_or_default_admin_operator_pepper(
 /// the caller's own compile report any problem, so `fallback: off`
 /// behavior is byte identical to what shipped before.
 ///
-/// The "does it work" test the walk applies is `source:` resolution plus
-/// `compile_config`, the same two steps `run` performs on the primary
-/// document immediately after this returns. A candidate that passes them
-/// and then fails later in `run` (a port already bound, a model runtime
-/// that will not start) leaves its boot counter incremented, which is
-/// what makes the next boot move past it after `max_attempts`.
+/// The "does it work" test the walk applies is `source:` resolution,
+/// `compile_config`, and a construct check, the same three steps `run`
+/// performs on the primary document immediately after this returns. A
+/// candidate that passes them and then fails later in `run` (a port
+/// already bound, a model runtime that will not start) leaves its boot
+/// counter incremented, which is what makes the next boot move past it
+/// after `max_attempts`.
 fn boot_document(
     config_path: &str,
     fallback: Option<sbproxy_config::BootFallbackMode>,
@@ -3040,7 +3041,7 @@ fn boot_document(
 
     // Only a node that asked for a fallback pays the pre-check, and it
     // has to: the walk cannot know the configured document failed
-    // without trying it, and it applies the same two steps to a
+    // without trying it, and it applies the same three steps to a
     // candidate so "works" means the same thing on both sides.
     // The configured document's own directory: a relative
     // extension-bundle path resolves against it at boot, so the
@@ -3123,13 +3124,35 @@ fn boot_document(
 /// exited fatally with no pin, no boot counter, and no walk, and every
 /// restart repeated it.
 ///
-/// [`CompiledPipeline::from_config_for_validation_at`] is the
-/// purpose-built, side-effect-free construct check the config authority
-/// already runs before it publishes a payload to a fleet, under
+/// [`crate::pipeline::CompiledPipeline::from_config_for_validation_at`]
+/// is the purpose-built construct check the config authority already
+/// runs before it publishes a payload to a fleet, under
 /// `PipelineConstructionMode::Validation` with no background tasks
-/// started. Using it here makes the boot fallback's "does this work"
-/// test the same question every other pre-apply gate in this workspace
-/// asks.
+/// started and no listener bound. Using it here makes the boot
+/// fallback's "does this work" test the same question every other
+/// pre-apply gate in this workspace asks.
+///
+/// # What it is not
+///
+/// It is **not** side-effect free, and its own documentation says so:
+/// module construction reads the AI provider registry, resolves secret
+/// references through the process secret resolver, populates the shared
+/// JWKS cache, and loads extension bundles, which for a `Git` source is
+/// a real fetch that can block for the source timeout. Those are reads
+/// and idempotent inserts rather than installs, so repeated calls are
+/// safe, but a caller cannot treat this as a pure function and this one
+/// does not.
+///
+/// Two consequences worth stating rather than discovering. A
+/// fallback-enabled node with a git-sourced extension bundle pays that
+/// fetch here and again in `run`, and each ring candidate the walk
+/// tries pays it once; the cost is bounded by the source timeout and by
+/// `max_attempts`, and it is the price of knowing a candidate
+/// constructs before booting onto it. And a candidate whose bundle
+/// source is unreachable fails this check, so a network partition
+/// during a rescue boot makes a candidate look unbootable when it is
+/// only unfetchable. Both are on the fallback path only: a node with
+/// `fallback: off` never reaches this function.
 ///
 /// `base_dir` is the configured document's own directory, because a
 /// relative extension-bundle path in a candidate resolves against it

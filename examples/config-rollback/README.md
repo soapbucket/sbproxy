@@ -63,7 +63,7 @@ curl -s -u admin:demo-change-me -X POST http://127.0.0.1:9090/admin/reload \
 
 ```json
 {
-  "config_revision": "2",
+  "config_revision": "8cb4b33d8ffc",
   "fully_applied": true,
   "degraded": []
 }
