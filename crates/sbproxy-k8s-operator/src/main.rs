@@ -1941,6 +1941,17 @@ mod tests {
                 while !stop.load(std::sync::atomic::Ordering::SeqCst) {
                     match listener.accept() {
                         Ok((mut socket, _)) => {
+                            // This counts accepts, not requests, which
+                            // is only the same number because of the
+                            // `connection: close` below. reqwest pools
+                            // by default, so without that header two
+                            // requests to the same pod IP would ride one
+                            // connection and arrive as a single accept.
+                            // `a_partial_owner_filter_reloads_only_the_owned_pod_and_reports_the_rest`
+                            // discriminates on exactly that difference,
+                            // one reload against two, so removing the
+                            // header would leave that test green while
+                            // it stopped testing anything. Load bearing.
                             counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             let mut buf = [0u8; 2048];
                             socket.set_nonblocking(false).ok();
@@ -2229,10 +2240,19 @@ mod tests {
     /// series stopped counting passes. Nothing failed, because nothing
     /// asserted a count.
     ///
-    /// What this cannot see: whether the one call site is reachable, and
-    /// a call added to a helper the workload functions call. The driven
-    /// reconcile tests cover reachability; the helper case would need a
-    /// registry read, which this crate has no dependency for.
+    /// What this cannot see, and what covers each. Whether the one call
+    /// site is reachable: the driven reconcile tests. **Which of the two
+    /// delivered labels it records**, because this counts call sites and
+    /// not their arguments, so hardcoding `unowned_skipped: 0` in a
+    /// workload `Ok` arm would make `delivered_unowned_skipped`
+    /// unreachable and leave this green:
+    /// `the_workload_pass_carries_the_count_that_picks_the_delivery_label`
+    /// drives the real workload function and asserts the count survives
+    /// the trip. And a second call added inside a helper the workload
+    /// functions call rather than in their own bodies: the total
+    /// assertion below still catches that, because it counts the whole
+    /// production half of this file, but the per-function assertion does
+    /// not.
     #[test]
     fn the_delivery_metric_is_recorded_once_per_pass() {
         let src = production_source();
@@ -2240,7 +2260,7 @@ mod tests {
             src.matches("record_operator_config_delivery(").count(),
             6,
             "five refusal or suspension states plus the one success at the end of \
-             reconcile_one; a sixth call site needs a line here saying which pass it counts",
+             reconcile_one; a seventh call site needs a line here saying which pass it counts",
         );
         for name in [
             "async fn reconcile_deployment_workload",
@@ -2250,7 +2270,7 @@ mod tests {
                 .find(name)
                 .expect("the workload function is in this file");
             let rest = &src[start + name.len()..];
-            let end = rest.find("\nasync fn ").map_or(rest.len(), |at| at);
+            let end = rest.find("\nasync fn ").unwrap_or(rest.len());
             assert_eq!(
                 rest[..end]
                     .matches("record_operator_config_delivery(")
@@ -2418,6 +2438,132 @@ mod tests {
         );
     }
 
+    /// J3: which label the pass records, not merely that one is
+    /// recorded.
+    ///
+    /// `the_delivery_metric_is_recorded_once_per_pass` counts call
+    /// sites, so it cannot see the argument. Hardcoding
+    /// `unowned_skipped: 0` in either workload `Ok` arm makes
+    /// `delivered_unowned_skipped` unreachable and leaves that test, and
+    /// every other, green. This drives the real workload function down
+    /// the hot-reload path with one owned pod and one impostor and
+    /// asserts the count that picks the label survives the trip, which
+    /// is the whole wiring between `try_hot_reload` and the recording
+    /// site.
+    ///
+    /// Self-discriminating in both directions: the rollout path
+    /// hardcodes `unowned_skipped: 0`, so a fixture that failed to enter
+    /// the hot-reload path would fail this assertion rather than pass
+    /// it.
+    #[tokio::test]
+    async fn the_workload_pass_carries_the_count_that_picks_the_delivery_label() {
+        use tower::ServiceExt as _;
+
+        let stub = FallbackStub::start(r#"{"reloaded":true}"#);
+        let (mut sbp, _cfg) =
+            suspension_fixtures(i32::from(stub.port), "proxy:\n  http_bind_port: 8080\n");
+        // Gate 4 of `should_hot_reload`: the pods are running an older
+        // config than the one this pass is delivering.
+        // `delivered_config_hash` returns `None` unless both are set,
+        // so both are, or gate 4 reads "no hash recorded yet" instead of
+        // "the config changed" and the test would pass for a reason it
+        // is not testing.
+        sbp.status = Some(sbproxy_k8s_operator::crd::SBProxyStatus {
+            config_hash: "old-hash".to_string(),
+            observed_config_hash: "old-hash".to_string(),
+            ..Default::default()
+        });
+        // Gate 2 and 3: an existing Deployment whose operator-owned spec
+        // matches the desired one. Built with the same builder the
+        // operator uses, so a change to the template cannot silently
+        // drop this test onto the rollout path.
+        let existing = serde_json::to_value(reconcile::desired_deployment(&sbp, "old-hash"))
+            .expect("serialize the existing Deployment");
+
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let path = request.uri().path().to_string();
+            let existing = existing.clone();
+            async move {
+                let answer = if path.ends_with("/secrets/admin-auth") {
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Secret",
+                        "metadata": { "name": "admin-auth", "namespace": "sbproxy" },
+                        "data": { "authorization": "QmFzaWMgWVdSdGFXNDZjSGM9" },
+                    })
+                } else if path.ends_with("/pods") {
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "PodList",
+                        "metadata": {},
+                        "items": [
+                            {
+                                "apiVersion": "v1",
+                                "kind": "Pod",
+                                "metadata": {
+                                    "name": "edge-proxy-abc123-0",
+                                    "namespace": "sbproxy",
+                                    "ownerReferences": [{
+                                        "apiVersion": "apps/v1",
+                                        "kind": "ReplicaSet",
+                                        "name": "edge-proxy-abc123",
+                                        "uid": "rs-uid",
+                                        "controller": true,
+                                    }],
+                                },
+                                "status": { "podIP": "127.0.0.1" },
+                            },
+                            {
+                                "apiVersion": "v1",
+                                "kind": "Pod",
+                                "metadata": {
+                                    "name": "impostor-0",
+                                    "namespace": "sbproxy",
+                                    "ownerReferences": [],
+                                },
+                                "status": { "podIP": "127.0.0.1" },
+                            },
+                        ],
+                    })
+                } else if path.contains("/deployments/") {
+                    existing
+                } else {
+                    serde_json::json!({
+                        "metadata": { "name": "applied", "namespace": "sbproxy" },
+                    })
+                };
+                Ok::<_, std::convert::Infallible>(json_response(&answer))
+            }
+        });
+        let ctx = Ctx {
+            client: Client::new(service.boxed_clone(), "sbproxy"),
+            write_gate: WriteGate::always(),
+        };
+
+        let pass = reconcile_deployment_workload(
+            &ctx,
+            &sbp,
+            "sbproxy",
+            "edge",
+            "new-hash",
+            &PatchParams::apply(FIELD_MANAGER).force(),
+            None,
+        )
+        .await
+        .expect("the owned pod reloads, so the pass succeeds");
+
+        assert_eq!(
+            pass.unowned_skipped, 1,
+            "the impostor has to reach the recording site: at zero the label is `delivered` \
+             and `delivered_unowned_skipped` is unreachable on every path",
+        );
+        assert_eq!(
+            stub.requests(),
+            1,
+            "and it really went down the hot-reload path, reloading only the owned pod",
+        );
+    }
+
     /// A Blocker from the WOR-2467 review. A pod is selected for the
     /// probe by label, and a label is a value anyone with pod-create in
     /// the namespace can type. Before the owner gate, any pod answering
@@ -2555,12 +2701,17 @@ mod tests {
     /// invisible to it; none exists in this crate today, and this
     /// assertion is what makes adding one a deliberate edit here. It
     /// also cannot see whether a counted check actually *gates* its
-    /// send, because it counts occurrences and not control flow. That
-    /// half is covered by
+    /// send, because it counts occurrences and not control flow. Three
+    /// tests cover that half, and the split matters.
     /// `the_reload_credential_never_reaches_a_pod_the_operator_did_not_create`
-    /// and `a_labeled_pod_the_operator_did_not_create_is_neither_probed_nor_obeyed`,
-    /// one per credential path, which drive the real code against a
-    /// stub that counts what it was asked.
+    /// and `a_labeled_pod_the_operator_did_not_create_is_neither_probed_nor_obeyed`
+    /// cover the all-unowned case on each credential path, where the
+    /// filter empties the list and the loop is never entered.
+    /// `a_partial_owner_filter_reloads_only_the_owned_pod_and_reports_the_rest`
+    /// is the one that enters it, with one owned pod and one impostor,
+    /// and it is what catches iterating the unfiltered list after
+    /// computing `owned`. All three drive the real code against a stub
+    /// that counts what it was asked.
     #[test]
     fn every_credentialed_pod_request_is_filtered_by_ownership() {
         let src = production_source();

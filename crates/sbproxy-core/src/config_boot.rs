@@ -99,16 +99,28 @@ fn pinned() -> &'static Mutex<Option<PinnedRevision>> {
 /// node's configuration a kilobyte at a time.
 ///
 /// This used to bound only the copy the admin surface serves, on the
-/// stated grounds that the boot path logged the failure in full
-/// somewhere. It no longer does: the bound moved into
-/// [`scrub_boot_failure`], which every rendering of a boot failure now
-/// goes through, so **no surface carries the untruncated text**. That is
-/// the deliberate trade and it is stated rather than left to be
-/// discovered: a failure longer than this is unrecoverable from the
-/// node's own output, and the remedy is `sbproxy validate` against the
-/// document, which prints the whole thing and is the tool for reading
-/// it. The alternative, one unbounded copy in the log, is the surface
-/// the bound exists to close.
+/// stated grounds that the boot path logged the failure in full. That
+/// is still true, and it is true on the mode most nodes run.
+///
+/// Which mode carries the untruncated text, exactly:
+///
+/// * `--config-fallback=off`, **the default**, never reaches this bound
+///   at all. `boot_document` returns the file's bytes untouched, the
+///   compile failure surfaces from `run_with_fallback`, and the binary
+///   prints it whole with `eprintln!("Fatal: {e:#}")`. Unscrubbed and
+///   unbounded, exactly as it was before any of this existed.
+/// * `--config-fallback=last-known-good` bounds every rendering,
+///   because they all go through [`scrub_boot_failure`]: the pin, the
+///   boot walk's `error!`, each ring candidate's reason, and the fatal
+///   error on the ring-empty and store-unavailable paths.
+///
+/// So the trade is scoped to the mode that asked for a fallback, and it
+/// is the right way round: that mode is the one whose failure text
+/// becomes a product surface, served on `GET /admin/config/fallback`
+/// and copied into a Kubernetes condition. A node on it that needs the
+/// untruncated failure runs `sbproxy validate` against the document,
+/// which prints the whole thing. A node on the default already has it
+/// on stderr.
 ///
 /// Characters rather than bytes, deliberately, because the cut has to
 /// land on a character boundary and a byte budget would have to walk

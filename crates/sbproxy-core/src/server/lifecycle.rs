@@ -9247,6 +9247,84 @@ origins:
         crate::config_boot::reset_for_test();
     }
 
+    /// The failure half of the fatal line is sanitized too, not only the
+    /// primary.
+    ///
+    /// `StoreUnavailable` carries a store-open error that names the ring
+    /// path, and that string is the operator's, so it can carry whatever
+    /// a path can. Reverting the second `scrub_boot_failure` at the
+    /// ring-empty and store-unavailable exits leaves the raw text in the
+    /// error that reaches `eprintln!("Fatal: ...")`, and before this
+    /// nothing noticed.
+    #[test]
+    fn the_store_unavailable_half_of_the_fatal_error_is_sanitized() {
+        crate::config_boot::reset_for_test();
+        let temp = tempfile::tempdir().expect("temp dir");
+
+        // A ring directory whose own name carries a control character.
+        // Legal on every filesystem this runs on, and the shortest way
+        // to get operator-controlled bytes into the store error. It has
+        // to reach the config through a YAML escape rather than a raw
+        // byte, because a raw one fails the parse and the store is never
+        // reached at all, which would make this test pass without the
+        // production change.
+        // A real ring at a path whose own name carries a control
+        // character, with a world-readable index. That is the one
+        // store error that names the path, so it is the only way an
+        // operator-controlled byte reaches this arm; a store that
+        // simply fails to open reports an errno and no path, and a
+        // missing ring reports `RingEmpty`, whose text is fixed.
+        use std::os::unix::fs::PermissionsExt as _;
+        let ring = temp.path().join("ring\u{1b}[2Jdir");
+        let _history = ring_with_a_good_revision(&ring, "proxy:\n  http_bind_port: 8080\n");
+        std::fs::set_permissions(
+            ring.join("index.json"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .expect("widen the index so the walk refuses and names the path");
+        let quoted = format!(
+            "{}/ring\\u001B[2Jdir",
+            temp.path().display().to_string().replace('\\', "\\\\")
+        );
+
+        let config_path = temp.path().join("sb.yml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "proxy:\n  http2_cleartextt: true\n  config_history:\n    enabled: true\n    \
+                 dir: \"{quoted}\"\n",
+            ),
+        )
+        .expect("write");
+
+        let error = boot_document(
+            config_path.to_str().expect("utf-8"),
+            Some(sbproxy_config::BootFallbackMode::LastKnownGood),
+        )
+        .expect_err("a ring that will not open cannot rescue this boot");
+        let rendered = format!("{error:#}");
+
+        assert!(
+            !rendered.chars().any(char::is_control),
+            "no control character reaches the fatal line: {rendered:?}",
+        );
+        assert!(
+            rendered.contains("http2_cleartextt"),
+            "the original failure is still the headline: {rendered}",
+        );
+        assert!(
+            rendered.contains("could not be opened"),
+            "and this really took the store-unavailable arm, which is the one that carries an \
+             operator-controlled string: {rendered}",
+        );
+        assert!(
+            rendered.contains("2Jdir"),
+            "the ring path reached this line, which is what makes the scrub load bearing \
+             rather than decorative: {rendered}",
+        );
+        crate::config_boot::reset_for_test();
+    }
+
     /// Re-review, WOR-2458's last partial line. "With the synthetic
     /// probe driver enabled on a node with no organic traffic, the soak
     /// reaches a real verdict rather than Inconclusive."
