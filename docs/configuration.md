@@ -3141,6 +3141,13 @@ A cookie naming a variant that has since been removed from `variants`
 falls through to a fresh roll, so shrinking an experiment does not strand
 the clients pinned to the variant you dropped.
 
+`abtest` cannot be combined with `response_cache` on the same origin, and
+the config is refused at load if you try. The cache lookup runs before
+the variant is picked, and the variant is not part of the cache key, so a
+cache hit would serve one variant's body to clients assigned another and
+the split would report weights it never applied. Disable
+`response_cache` on this origin, or put the cached content on its own.
+
 A request carrying the sticky cookie with a value matching a configured
 variant's `name` always routes to that variant. Everything else gets a
 fresh weighted-random pick: a variant's share of traffic is its `weight`

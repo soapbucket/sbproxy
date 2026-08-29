@@ -3571,6 +3571,53 @@ impl CompiledPipeline {
                         dependent.transform.transform_type()
                     );
                 }
+                // WOR-2671: the same rule, one level up, for an action
+                // rather than a transform.
+                //
+                // `abtest` picks a variant per client, and the pick
+                // happens in `handle_action`, which runs *after* the
+                // cache lookup in `request_filter`. The variant is not a
+                // dimension of the cache key
+                // (`sbproxy_cache::compute_cache_key`: workspace,
+                // tenant, hostname, method, path, caller identity,
+                // query, Vary, config fingerprint), and it cannot
+                // usefully become one, because nothing has chosen it yet
+                // when the key is built.
+                //
+                // So a hit replays whichever variant's body the first
+                // caller in that key partition happened to be assigned.
+                // Callers with no cookie share one partition, which is
+                // exactly the first-visit traffic an experiment is
+                // measuring. Two cohorts merge into one and the split
+                // reports weights it never applied.
+                //
+                // This is refused rather than mitigated because there is
+                // no cookie-level or header-level remedy for it: the
+                // wrong bytes are already in the entry. Stripping
+                // `Set-Cookie` from stored entries, which was tried and
+                // reverted, removes the cross-client pin and leaves the
+                // mis-served body untouched.
+                //
+                // Deliberately narrower than "every action that mints a
+                // per-client cookie". `sessions` and `csrf` mint in the
+                // same function and have their own cross-client exposure
+                // on this seam, but their *bodies* are correct: the
+                // response a cookie-less caller gets is the same
+                // whichever cookie-less caller asked. That is a cache
+                // storage-posture problem with a general fix, and it is
+                // tracked separately. `abtest` is the only one of the
+                // three where the cached body itself is wrong.
+                if origin_action_type == "abtest" {
+                    anyhow::bail!(
+                        "origin `{}`: an `abtest` action picks a variant per client, after the \
+                         response-cache lookup has already run, and the variant is not part of \
+                         the cache key; a cache hit would serve one variant's body to clients \
+                         assigned another and the split would report weights it never applied. \
+                         Remove the action, disable `response_cache`, or split the cached \
+                         content onto its own origin",
+                        origin.origin_id
+                    );
+                }
             }
             // WOR-2630: a `cel` transform's `headers:` rules run in
             // whichever response phase can still change a header, and

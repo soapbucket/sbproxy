@@ -1118,6 +1118,74 @@ origins:
     );
 }
 
+/// The action-level sibling of the refusal above (WOR-2671).
+///
+/// An `abtest` action picks its variant in `handle_action`, which runs
+/// after the cache lookup in `request_filter`, and the variant is not a
+/// dimension of the cache key. A hit would therefore replay whichever
+/// variant's body the first caller in that key partition drew, to
+/// callers assigned a different one. Callers with no cookie share one
+/// partition, and that is precisely the first-visit traffic an
+/// experiment measures, so the split would report weights it never
+/// applied.
+///
+/// Refused at config load, because there is no response-side remedy:
+/// the wrong bytes are already in the entry by the time anything could
+/// look at a header.
+#[test]
+fn an_abtest_action_on_a_cached_origin_refuses_at_boot() {
+    let config = r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "cache.localhost":
+    action:
+      type: abtest
+      variants:
+        - name: control
+          url: "http://127.0.0.1:9"
+          weight: 50
+        - name: experiment
+          url: "http://127.0.0.1:9"
+          weight: 50
+    response_cache:
+      enabled: true
+      ttl: 60
+"#;
+    let error = ProxyHarness::start_with_yaml(config)
+        .err()
+        .map(|e| e.to_string())
+        .expect("an abtest action on a cached origin must refuse to boot");
+    assert!(
+        error.contains("abtest") && error.contains("cache"),
+        "the refusal must name the action and the cache: {error}"
+    );
+}
+
+/// And the same origin without `response_cache` still boots, so the
+/// refusal is specific to the pairing rather than to `abtest`.
+#[test]
+fn an_abtest_action_without_a_response_cache_still_boots() {
+    let config = r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "abtest-nocache.localhost":
+    action:
+      type: abtest
+      variants:
+        - name: control
+          url: "http://127.0.0.1:9"
+          weight: 50
+        - name: experiment
+          url: "http://127.0.0.1:9"
+          weight: 50
+"#;
+    let proxy = ProxyHarness::start_with_yaml(config)
+        .expect("abtest without response_cache is a supported pairing");
+    drop(proxy);
+}
+
 #[test]
 fn swr_refresh_stores_the_transformed_refresh_body() {
     // TTL=2s, SWR=60s, with a redacting transform attached. Prime the
