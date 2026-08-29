@@ -538,6 +538,16 @@ batch_env_mutation() {
   bash "$ROOT/scripts/check-env-mutation.sh"
 }
 
+# CI: ci.yml lint lane, "every ONNX load refuses external tensor data"
+# (WOR-2694). Pure grep. Nothing may call tract's model_for_path /
+# model_for_read: those parse and translate in one call, leaving no
+# point at which a caller can refuse an external_data reference, and
+# model_for_path additionally hands tract the model's directory, which
+# is the state GHSA-h668-6x6g-f8r5 turns into an arbitrary file read.
+batch_onnx_model_loaders() {
+  bash "$ROOT/scripts/check-onnx-model-loaders.sh"
+}
+
 # CI: ci.yml lint lane, "durable sinks create files owner-only"
 # (WOR-2626). Pure grep, plus fixtures that prove the detector still
 # detects. Production code in the four sink crates must reach
@@ -625,6 +635,7 @@ run_batch "read-only source and doc scans" \
   batch_stack_budget_ratchet "AI dispatch path stack budget (ratchet)" \
   batch_spec_citations "spec citation hygiene" \
   batch_env_mutation "no process-global env mutation outside test helpers" \
+  batch_onnx_model_loaders "every ONNX load refuses external tensor data" \
   batch_durable_file_modes "durable sinks create files owner-only" \
   batch_secret_debug_registry "secret-bearing types do not derive Debug" \
   batch_metric_visibility "every stable metric has a dashboard panel (ratchet)" \

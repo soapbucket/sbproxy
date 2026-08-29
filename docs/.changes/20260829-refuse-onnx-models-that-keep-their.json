@@ -1,0 +1,4 @@
+{
+  "type": "fixed",
+  "message": "Refuse ONNX models that keep their tensors in a separate file. An operator-supplied model could name any path in an `external_data` reference and have the proxy read it (GHSA-h668-6x6g-f8r5); every loader now refuses such a model before opening anything, and the ONNX runtime floor moved to a release carrying that fix and the NNEF tensor-parser overflow fix (GHSA-x5mv-8wgw-29hg)."
+}
