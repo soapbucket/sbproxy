@@ -2849,6 +2849,7 @@ impl McpFederation {
                 "",
                 None,
                 upstream_headers,
+                false,
             )
             .await?
         {
@@ -2989,8 +2990,55 @@ impl McpFederation {
             workspace_id,
             audit_cause,
             upstream_headers,
+            false,
         )
         .await
+    }
+
+    /// Same as [`Self::call_tool_with_upstream_headers_from_snapshot`],
+    /// but skips registered policy hooks. Used after an operator
+    /// approval has been consumed so a Cedar `@confirm` does not park
+    /// the same snapshot again (WOR-2454).
+    pub async fn call_tool_from_snapshot_after_approval(
+        &self,
+        catalog: &ToolCatalogSnapshot,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        upstream_headers: &[(String, String)],
+    ) -> anyhow::Result<serde_json::Value> {
+        if !Arc::ptr_eq(&self.tool_catalog_owner, &catalog.owner) {
+            anyhow::bail!("tool catalogue snapshot belongs to another federation");
+        }
+        let (held_tool, version_blocked) = catalog.resolve_tool_with_version_block(tool_name);
+        if version_blocked.is_some() {
+            anyhow::bail!("tool is blocked by the held catalogue version gate");
+        }
+        match self
+            .call_tool_with_policy_cause_and_headers_from_held_tool(
+                held_tool,
+                tool_name,
+                arguments,
+                None,
+                "",
+                "",
+                None,
+                upstream_headers,
+                true,
+            )
+            .await?
+        {
+            McpCallOutcome::Allowed(value) => Ok(value),
+            McpCallOutcome::DeniedByPolicy {
+                code,
+                message,
+                kind,
+            } => Err(McpPolicyDeniedError {
+                code,
+                message,
+                kind,
+            }
+            .into()),
+        }
     }
 
     #[allow(clippy::too_many_arguments)] // policy identity + held catalog entry seam
@@ -3004,6 +3052,7 @@ impl McpFederation {
         workspace_id: &str,
         audit_cause: Option<&str>,
         upstream_headers: &[(String, String)],
+        skip_policy_hooks: bool,
     ) -> anyhow::Result<McpCallOutcome> {
         let federated = federated.ok_or_else(|| anyhow::anyhow!("unknown tool: {}", tool_name))?;
         if federated.name != tool_name {
@@ -3055,8 +3104,14 @@ impl McpFederation {
         // OSS default no-op produces Allow. When no hooks are
         // registered at all, the federation falls through to the
         // [`default_no_op_hook`] and Allow is returned.
-        let hooks = registered_hooks_or_default();
-        let verdict = {
+        //
+        // WOR-2454: after an operator approval is consumed, the caller
+        // skips this walk so a Cedar `@confirm` cannot park the same
+        // snapshot again.
+        let verdict = if skip_policy_hooks {
+            PolicyDecision::Allow
+        } else {
+            let hooks = registered_hooks_or_default();
             let mut chosen = PolicyDecision::Allow;
             for hook in &hooks {
                 let ctx = McpToolCallCtx {
@@ -3078,6 +3133,8 @@ impl McpFederation {
         };
 
         match verdict {
+            PolicyDecision::Allow | PolicyDecision::AllowWithHeaders { .. }
+                if skip_policy_hooks => {}
             PolicyDecision::Allow | PolicyDecision::AllowWithHeaders { .. } => {
                 sbproxy_observe::metrics::record_mcp_policy_hook_invocation(
                     "allow",
@@ -3110,10 +3167,10 @@ impl McpFederation {
                 });
             }
             PolicyDecision::Confirm { reason, .. } => {
-                // PR β temporary: treat Confirm as Deny until the
-                // PendingConfirmStore (PR ζ) is wired. Verdict label
-                // stays "confirm" so dashboards can spot when the
-                // store eventually flips the path live.
+                // When no gateway approval store is configured, Confirm
+                // stays a refusal. When one is, `action_dispatch` parks
+                // the call (WOR-2454). The verdict label stays "confirm"
+                // either way so the two outcomes stay distinguishable.
                 sbproxy_observe::metrics::record_mcp_policy_hook_invocation(
                     "confirm",
                     server.name.as_str(),
@@ -3123,11 +3180,8 @@ impl McpFederation {
                     tool = tool_name,
                     server = %server.name,
                     reason = %reason,
-                    "MCP tool call held by policy hook; PR β denies pending PendingConfirmStore"
+                    "MCP tool call held by policy hook (Confirm)"
                 );
-                // WOR-2538: same INVALID_PARAMS reasoning as the Deny
-                // arm above -- a held-for-confirmation call is denied
-                // for now, not internally broken.
                 return Ok(McpCallOutcome::DeniedByPolicy {
                     code: super::types::INVALID_PARAMS,
                     message: format!("confirmation required: {}", reason),

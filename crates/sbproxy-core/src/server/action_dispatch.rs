@@ -4207,8 +4207,8 @@ pub(super) async fn handle_mcp_action(
 ) -> Result<()> {
     use sbproxy_extension::mcp::types::{
         negotiate_protocol_version, InitializeResult, JsonRpcResponse, ServerCapabilities,
-        ServerInfo, HEADER_MISMATCH, INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST,
-        LATEST_PROTOCOL_VERSION, METHOD_NOT_FOUND,
+        ServerInfo, GRANT_EXPIRED, HEADER_MISMATCH, INTERNAL_ERROR, INVALID_PARAMS,
+        INVALID_REQUEST, LATEST_PROTOCOL_VERSION, METHOD_NOT_FOUND,
     };
     use sbproxy_extension::mcp::{
         classify_http_era, decode_http_request_with_scan, DecodedRequestId, McpProtocolCodec,
@@ -4690,13 +4690,7 @@ pub(super) async fn handle_mcp_action(
         let tools: Vec<sbproxy_extension::mcp::discovery::DiscoveryTool> =
             mcp_unblocked_catalog_tools(&catalog)
                 .filter(|t| mcp.is_tool_allowed(&t.name))
-                .filter(|t| match mcp.policy_for_server(&t.server_name) {
-                    Some(policy) => matches!(
-                        policy.check(&ctx.principal, &t.name),
-                        sbproxy_extension::mcp::ToolAccessDecision::Allow,
-                    ),
-                    None => true,
-                })
+                .filter(|t| mcp.tool_is_granted(&ctx.principal, &t.server_name, &t.name))
                 .map(|t| sbproxy_extension::mcp::discovery::DiscoveryTool {
                     name: t.name.clone(),
                     description: t.description.clone(),
@@ -5387,13 +5381,9 @@ pub(super) async fn handle_mcp_action(
                             {
                                 continue;
                             }
-                            if let Some(policy) = mcp.policy_for_server(&entry.server_name) {
-                                if !matches!(
-                                    policy.check(&ctx.principal, &entry.name),
-                                    sbproxy_extension::mcp::ToolAccessDecision::Allow,
-                                ) {
-                                    continue;
-                                }
+                            if !mcp.tool_is_granted(&ctx.principal, &entry.server_name, &entry.name)
+                            {
+                                continue;
                             }
                             match serde_json::from_str::<serde_json::Value>(&entry.json) {
                                 Ok(tool) => tools.push(tool),
@@ -5514,13 +5504,8 @@ pub(super) async fn handle_mcp_action(
                         ) {
                             continue;
                         }
-                        if let Some(policy) = mcp.policy_for_server(&entry.server_name) {
-                            if !matches!(
-                                policy.check(&ctx.principal, &entry.name),
-                                sbproxy_extension::mcp::ToolAccessDecision::Allow,
-                            ) {
-                                continue;
-                            }
+                        if !mcp.tool_is_granted(&ctx.principal, &entry.server_name, &entry.name) {
+                            continue;
                         }
                         if !first {
                             out.push(',');
@@ -6376,16 +6361,20 @@ pub(super) async fn handle_mcp_action(
                             // 3. Wrap `federation.call_tool` in
                             //    `tokio::time::timeout(server.timeout, ...)`
                             //    when a per-server timeout is configured.
+                            let rbac_decision = federated
+                                .as_ref()
+                                .map(|t| mcp.authorize_tool(&ctx.principal, &t.server_name, &name));
+                            let grant_expired = matches!(
+                                rbac_decision,
+                                Some(sbproxy_extension::mcp::ToolAccessDecision::Expired)
+                            );
+                            let denied_by_rbac = matches!(
+                                rbac_decision,
+                                Some(sbproxy_extension::mcp::ToolAccessDecision::Deny)
+                            ) || grant_expired;
                             let server_policy = federated
                                 .as_ref()
                                 .and_then(|t| mcp.policy_for_server(&t.server_name));
-                            let denied_by_rbac = match server_policy {
-                                Some(policy) => matches!(
-                                    policy.check(&ctx.principal, &name),
-                                    sbproxy_extension::mcp::ToolAccessDecision::Deny,
-                                ),
-                                None => false,
-                            };
                             // WOR-2384: shared by the pre-dispatch
                             // denial branches below (RBAC, argument
                             // policy, quota), which all emit a
@@ -6434,7 +6423,50 @@ pub(super) async fn handle_mcp_action(
                             } else {
                                 None
                             };
-                            if denied_by_rbac {
+                            if grant_expired {
+                                tracing::warn!(
+                                    target: "sbproxy::mcp::grant",
+                                    tool = %name,
+                                    tenant = %ctx.principal.tenant_id,
+                                    principal = %ctx.principal.sub,
+                                    "MCP tools/call refused because the time-boxed grant elapsed",
+                                );
+                                sbproxy_observe::metrics::record_mcp_grant_expired(
+                                    ctx.tenant_id.as_str(),
+                                    server_policy
+                                        .and_then(|_| {
+                                            federated.as_ref().and_then(|t| {
+                                                mcp.prefix_for(&t.server_name)
+                                                    .and_then(|p| p.rbac.as_deref())
+                                            })
+                                        })
+                                        .unwrap_or(""),
+                                );
+                                if emit_mcp_governance_evidence(
+                                    ctx,
+                                    &name,
+                                    governed_server,
+                                    mcp_session_id.as_deref(),
+                                    is_modern,
+                                    None,
+                                    McpGovernanceVerdict::Deny(
+                                        sbproxy_modules::action::mcp::MCP_GRANT_EXPIRED_REASON,
+                                    ),
+                                    Some("grant_ttl"),
+                                    governance_tool_arguments.as_deref(),
+                                ) {
+                                    mcp_evidence_unavailable_response(request.id.clone())
+                                } else {
+                                    JsonRpcResponse::error(
+                                        request.id.clone(),
+                                        GRANT_EXPIRED,
+                                        &format!(
+                                            "tool '{}' grant has expired; renew it to continue",
+                                            name,
+                                        ),
+                                    )
+                                }
+                            } else if denied_by_rbac {
                                 tracing::warn!(
                                     target: "sbproxy::mcp::rbac",
                                     tool = %name,
@@ -6578,6 +6610,130 @@ pub(super) async fn handle_mcp_action(
                                     )
                                 }
                             } else {
+                                let mut skip_policy_hooks = false;
+                                if let (Some(approval), Some(tool)) =
+                                    (mcp.approval.as_ref(), federated.as_ref())
+                                {
+                                    let digest = sbproxy_modules::action::mcp::McpAction::federated_tool_digest(
+                                        tool,
+                                    );
+                                    let snapshot =
+                                        sbproxy_extension::mcp::PendingConfirmStore::snapshot(
+                                            &digest, &arguments,
+                                        );
+                                    let tools_match = approval
+                                        .tools
+                                        .iter()
+                                        .any(|selector| selector.matches(&name, &digest));
+                                    let live = approval
+                                        .store
+                                        .has_live_hold(&snapshot, std::time::SystemTime::now());
+                                    if tools_match || live {
+                                        match approval.store.park(
+                                            &digest,
+                                            &name,
+                                            ctx.hostname.as_str(),
+                                            &sbproxy_extension::mcp::principal_id_for(
+                                                &ctx.principal,
+                                            ),
+                                            if tools_match {
+                                                "configured approval.tools selector"
+                                            } else {
+                                                "prior hold for this snapshot"
+                                            },
+                                            &arguments,
+                                            approval.hold_ttl,
+                                            std::time::SystemTime::now(),
+                                        ) {
+                                            sbproxy_extension::mcp::ParkOutcome::Held {
+                                                hold_id,
+                                                expires_at_unix,
+                                                snapshot,
+                                            } => {
+                                                tracing::warn!(
+                                                    target: "sbproxy::mcp::approval",
+                                                    tool = %name,
+                                                    tenant = %ctx.tenant_id,
+                                                    hold_id = %hold_id,
+                                                    "MCP tools/call parked for operator approval",
+                                                );
+                                                sbproxy_observe::metrics::record_mcp_approval_hold(
+                                                    ctx.tenant_id.as_str(),
+                                                    "held",
+                                                );
+                                                mcp_notify_approval_webhook(
+                                                    approval.webhook.as_ref(),
+                                                    &hold_id,
+                                                    ctx.hostname.as_str(),
+                                                    &name,
+                                                    &snapshot,
+                                                );
+                                                if emit_mcp_governance_evidence(
+                                                    ctx,
+                                                    &name,
+                                                    governed_server,
+                                                    mcp_session_id.as_deref(),
+                                                    is_modern,
+                                                    None,
+                                                    McpGovernanceVerdict::Deny(
+                                                        sbproxy_modules::action::mcp::MCP_APPROVAL_HOLD_REASON,
+                                                    ),
+                                                    Some(
+                                                        sbproxy_modules::action::mcp::MCP_APPROVAL_HOLD_RULE_ID,
+                                                    ),
+                                                    governance_tool_arguments.as_deref(),
+                                                ) {
+                                                    let response = mcp_evidence_unavailable_response(
+                                                        request.id.clone(),
+                                                    );
+                                                    return write_mcp_application_response(
+                                                        session,
+                                                        &response,
+                                                        &request_id,
+                                                        &rpc_method,
+                                                        modern_server.as_ref(),
+                                                        None,
+                                                    )
+                                                    .await;
+                                                }
+                                                let response = mcp_approval_pending_response(
+                                                    request.id.clone(),
+                                                    &hold_id,
+                                                    &snapshot,
+                                                    expires_at_unix,
+                                                );
+                                                return write_mcp_application_response(
+                                                    session,
+                                                    &response,
+                                                    &request_id,
+                                                    &rpc_method,
+                                                    modern_server.as_ref(),
+                                                    None,
+                                                )
+                                                .await;
+                                            }
+                                            sbproxy_extension::mcp::ParkOutcome::Resume => {
+                                                skip_policy_hooks = true;
+                                            }
+                                            sbproxy_extension::mcp::ParkOutcome::Saturated => {
+                                                let response = JsonRpcResponse::error(
+                                                    request.id.clone(),
+                                                    INTERNAL_ERROR,
+                                                    "approval store is at capacity",
+                                                );
+                                                return write_mcp_application_response(
+                                                    session,
+                                                    &response,
+                                                    &request_id,
+                                                    &rpc_method,
+                                                    modern_server.as_ref(),
+                                                    None,
+                                                )
+                                                .await;
+                                            }
+                                        }
+                                    }
+                                }
                                 // WOR-2384 (MCP05): a `mode: warn`
                                 // argument-policy violation still lets
                                 // the call proceed, but the governance
@@ -7335,18 +7491,27 @@ pub(super) async fn handle_mcp_action(
                                             mcp.execute_local_tool(
                                                 governed_server,
                                                 local_tool_name,
-                                                outbound_arguments,
+                                                outbound_arguments.clone(),
                                                 &ctx.principal,
                                                 ctx.tenant_id.as_str(),
                                                 mcp_session_id.as_deref(),
                                             )
                                             .await
+                                        } else if skip_policy_hooks {
+                                            mcp.federation
+                                                .call_tool_from_snapshot_after_approval(
+                                                    &tool_catalog,
+                                                    &name,
+                                                    outbound_arguments.clone(),
+                                                    &upstream_headers,
+                                                )
+                                                .await
                                         } else {
                                             mcp.federation
                                                 .call_tool_with_upstream_headers_from_snapshot(
                                                     &tool_catalog,
                                                     &name,
-                                                    outbound_arguments,
+                                                    outbound_arguments.clone(),
                                                     &upstream_headers,
                                                 )
                                                 .await
@@ -7377,6 +7542,157 @@ pub(super) async fn handle_mcp_action(
                                     },
                                     None => call.await,
                                 };
+
+                                // WOR-2454: a Cedar `@confirm` after
+                                // dispatch. When `approval:` is set,
+                                // park (or, if an approval was
+                                // consumed in a race, re-dispatch
+                                // without policy hooks so the
+                                // consume is not wasted).
+                                if let Err(error) = &outcome {
+                                    if let Some(denied) = error.downcast_ref::<
+                                        sbproxy_extension::mcp::McpPolicyDeniedError,
+                                    >() {
+                                        if matches!(
+                                            denied.kind,
+                                            sbproxy_extension::mcp::McpPolicyDenialKind::Confirm
+                                        ) {
+                                            if let (Some(approval), Some(tool)) =
+                                                (mcp.approval.as_ref(), federated.as_ref())
+                                            {
+                                                let digest = sbproxy_modules::action::mcp::McpAction::federated_tool_digest(
+                                                    tool,
+                                                );
+                                                match approval.store.park(
+                                                    &digest,
+                                                    &name,
+                                                    ctx.hostname.as_str(),
+                                                    &sbproxy_extension::mcp::principal_id_for(
+                                                        &ctx.principal,
+                                                    ),
+                                                    &denied.message,
+                                                    &result_policy_arguments,
+                                                    approval.hold_ttl,
+                                                    std::time::SystemTime::now(),
+                                                ) {
+                                                    sbproxy_extension::mcp::ParkOutcome::Held {
+                                                        hold_id,
+                                                        expires_at_unix,
+                                                        snapshot,
+                                                    } => {
+                                                        tracing::warn!(
+                                                            target: "sbproxy::mcp::approval",
+                                                            tool = %name,
+                                                            tenant = %ctx.tenant_id,
+                                                            hold_id = %hold_id,
+                                                            "MCP tools/call parked after policy-hook Confirm",
+                                                        );
+                                                        sbproxy_observe::metrics::record_mcp_approval_hold(
+                                                            ctx.tenant_id.as_str(),
+                                                            "held",
+                                                        );
+                                                        mcp_notify_approval_webhook(
+                                                            approval.webhook.as_ref(),
+                                                            &hold_id,
+                                                            ctx.hostname.as_str(),
+                                                            &name,
+                                                            &snapshot,
+                                                        );
+                                                        if emit_mcp_governance_evidence(
+                                                            ctx,
+                                                            &name,
+                                                            governed_server,
+                                                            mcp_session_id.as_deref(),
+                                                            is_modern,
+                                                            None,
+                                                            McpGovernanceVerdict::Deny(
+                                                                sbproxy_modules::action::mcp::MCP_APPROVAL_HOLD_REASON,
+                                                            ),
+                                                            Some(
+                                                                sbproxy_modules::action::mcp::MCP_POLICY_HOOK_CONFIRM_RULE_ID,
+                                                            ),
+                                                            governance_tool_arguments.as_deref(),
+                                                        ) {
+                                                            let response =
+                                                                mcp_evidence_unavailable_response(
+                                                                    request.id.clone(),
+                                                                );
+                                                            return write_mcp_application_response(
+                                                                session,
+                                                                &response,
+                                                                &request_id,
+                                                                &rpc_method,
+                                                                modern_server.as_ref(),
+                                                                None,
+                                                            )
+                                                            .await;
+                                                        }
+                                                        let response =
+                                                            mcp_approval_pending_response(
+                                                                request.id.clone(),
+                                                                &hold_id,
+                                                                &snapshot,
+                                                                expires_at_unix,
+                                                            );
+                                                        return write_mcp_application_response(
+                                                            session,
+                                                            &response,
+                                                            &request_id,
+                                                            &rpc_method,
+                                                            modern_server.as_ref(),
+                                                            None,
+                                                        )
+                                                        .await;
+                                                    }
+                                                    sbproxy_extension::mcp::ParkOutcome::Resume => {
+                                                        let retry = mcp
+                                                            .federation
+                                                            .call_tool_from_snapshot_after_approval(
+                                                                &tool_catalog,
+                                                                &name,
+                                                                outbound_arguments,
+                                                                &upstream_headers,
+                                                            );
+                                                        outcome = match timeout {
+                                                            Some(d) => {
+                                                                match tokio::time::timeout(
+                                                                    d, retry,
+                                                                )
+                                                                .await
+                                                                {
+                                                                    Ok(result) => result,
+                                                                    Err(_elapsed) => {
+                                                                        Err(anyhow::anyhow!(
+                                                                            "tool call exceeded per-server timeout of {}ms",
+                                                                            d.as_millis(),
+                                                                        ))
+                                                                    }
+                                                                }
+                                                            }
+                                                            None => retry.await,
+                                                        };
+                                                    }
+                                                    sbproxy_extension::mcp::ParkOutcome::Saturated => {
+                                                        let response = JsonRpcResponse::error(
+                                                            request.id.clone(),
+                                                            INTERNAL_ERROR,
+                                                            "approval store is at capacity",
+                                                        );
+                                                        return write_mcp_application_response(
+                                                            session,
+                                                            &response,
+                                                            &request_id,
+                                                            &rpc_method,
+                                                            modern_server.as_ref(),
+                                                            None,
+                                                        )
+                                                        .await;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
 
                                 // WOR-2384 (MCP06): captured before any
                                 // later validation or quarantine pass can
@@ -8075,24 +8391,11 @@ pub(super) async fn handle_mcp_action(
                                             if let Some(denied) = e.downcast_ref::<
                                                 sbproxy_extension::mcp::McpPolicyDeniedError,
                                             >() {
-                                                // WOR-2587 review: RBAC and
-                                                // argument-policy denials both
-                                                // reach the
-                                                // mcp_governance_decision
-                                                // evidence bus (see the
-                                                // WOR-2384 comment on the RBAC
-                                                // branch above); a generic
-                                                // McpPolicyHook denial --
-                                                // Cedar's built-in hook is
-                                                // the only in-tree producer
-                                                // today -- used to only
-                                                // record a metric and a debug
-                                                // log, leaving a security
-                                                // review of "was this call
-                                                // blocked and why" blind to
-                                                // every ABAC refusal. Same
-                                                // evidence call, same
-                                                // fail-closed contract.
+                                                // Confirm with `approval:` already parked
+                                                // (or re-dispatched) immediately after
+                                                // federation returned. Reaching here is
+                                                // Confirm without `approval:`, or a
+                                                // non-Confirm policy-hook denial.
                                                 let rule_id = match denied.kind {
                                                     sbproxy_extension::mcp::McpPolicyDenialKind::Deny => {
                                                         sbproxy_modules::action::mcp::MCP_POLICY_HOOK_DENY_RULE_ID
@@ -10331,13 +10634,7 @@ fn mcp_synthesized_rollout_tool_is_visible_to_principal(
     if !mcp.is_tool_allowed(&target.name) {
         return false;
     }
-    match mcp.policy_for_server(&target.server_name) {
-        Some(policy) => matches!(
-            policy.check(principal, &target.name),
-            sbproxy_extension::mcp::ToolAccessDecision::Allow,
-        ),
-        None => true,
-    }
+    mcp.tool_is_granted(principal, &target.server_name, &target.name)
 }
 
 /// Search the federated tool catalogue for entries whose name or
@@ -10355,13 +10652,7 @@ fn mcp_progressive_search(
     let catalog = mcp.federation.tool_catalog_snapshot();
     mcp_unblocked_catalog_tools(&catalog)
         .filter(|t| mcp.is_tool_allowed(&t.name))
-        .filter(|t| match mcp.policy_for_server(&t.server_name) {
-            Some(policy) => matches!(
-                policy.check(&ctx.principal, &t.name),
-                sbproxy_extension::mcp::ToolAccessDecision::Allow,
-            ),
-            None => true,
-        })
+        .filter(|t| mcp.tool_is_granted(&ctx.principal, &t.server_name, &t.name))
         // WOR-2384 (MCP09) fix round 1: progressive discovery's
         // `search` meta-tool is a listing surface like `tools/list`,
         // and previously filtered RBAC/allowlist but not approval
@@ -10451,10 +10742,7 @@ fn mcp_prompt_server_reachable_in_snapshot(
             continue;
         }
         saw_tool = true;
-        if matches!(
-            policy.check(principal, &entry.name),
-            sbproxy_extension::mcp::ToolAccessDecision::Allow,
-        ) {
+        if mcp.tool_is_granted(principal, server_name, &entry.name) {
             return true;
         }
     }
@@ -10734,6 +11022,65 @@ mod mcp_scope_enforcement_tests {
 /// human-readable reason (including an `@confirm` annotation's text)
 /// the legacy era's frozen `{legacy_context}: {error}` formatting
 /// already happened to retain.
+fn mcp_approval_pending_response(
+    id: Option<serde_json::Value>,
+    hold_id: &str,
+    snapshot: &str,
+    expires_at_unix: u64,
+) -> sbproxy_extension::mcp::types::JsonRpcResponse {
+    sbproxy_extension::mcp::types::JsonRpcResponse::error_with_data(
+        id,
+        sbproxy_extension::mcp::types::APPROVAL_PENDING,
+        "tool call is held for operator approval",
+        Some(serde_json::json!({
+            "hold_id": hold_id,
+            "snapshot": snapshot,
+            "expires_at": expires_at_unix,
+        })),
+    )
+}
+
+/// Fire-and-forget operator webhook after a hold is parked. The body
+/// never carries arguments or secrets. SSRF was checked at compile.
+fn mcp_notify_approval_webhook(
+    webhook: Option<&url::Url>,
+    hold_id: &str,
+    origin: &str,
+    tool: &str,
+    snapshot: &str,
+) {
+    let Some(url) = webhook.cloned() else {
+        return;
+    };
+    let webhook_origin = sbproxy_security::url_redact::redacted_url(url.as_str());
+    tracing::info!(
+        target: "sbproxy::mcp::approval",
+        url = %webhook_origin,
+        hold_id = %hold_id,
+        origin = %origin,
+        tool = %tool,
+        "MCP approval hold webhook queued",
+    );
+    let body = serde_json::json!({
+        "hold_id": hold_id,
+        "origin": origin,
+        "tool": tool,
+        "snapshot": snapshot,
+        "reason": "approval_hold",
+    });
+    tokio::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+        {
+            Ok(client) => client,
+            Err(_) => return,
+        };
+        let _ = client.post(url).json(&body).send().await;
+    });
+}
+
 fn mcp_upstream_failure_response(
     id: Option<serde_json::Value>,
     is_modern: bool,
@@ -19413,6 +19760,248 @@ allow := false if {
                 .unwrap_or_default()
                 .contains("denied by RBAC policy"),
             "got: {rbac_denied:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wor_2386_time_boxed_grant_expires_until_renewed() {
+        const SERVER: &str = "wor2386-grant-server";
+        const TOOL: &str = "wor2386-hello";
+        let dir = tempfile::tempdir().expect("grant ledger tempdir");
+        let ledger_path = dir.path().join("grants.json");
+        let origin = scripted_responses_server(vec![
+            scripted_tool_call_response(),
+            scripted_tool_call_response(),
+        ]);
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "wor2386-grant-fixture", "version": "1.0.0"},
+            "grant_ledger": { "path": ledger_path.to_string_lossy() },
+            "rbac_policies": {
+                "gate": {
+                    "default_allow": false,
+                    "tool_access": [{
+                        "principals": [],
+                        "allowed": [TOOL],
+                        "ttl": "1s"
+                    }]
+                }
+            },
+            "federated_servers": [{
+                "origin": origin,
+                "prefix": SERVER,
+                "rbac": "gate"
+            }]
+        }))
+        .expect("wor-2386 grant fixture compiles");
+        action.federation.seed_tools_for_test(
+            HashMap::from([(TOOL.to_string(), tool(TOOL, SERVER))]),
+            None,
+        );
+
+        let first = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": TOOL, "arguments": {}}
+            }),
+        )
+        .await;
+        assert!(
+            first.get("error").is_none(),
+            "first call within the grant window must dispatch: {first:?}"
+        );
+
+        // The ledger stores ttl in whole seconds (minimum 1s), so a
+        // sub-second config cannot expire this call. Wait past the 1s
+        // window the fixture compiled.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        let expired = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": TOOL, "arguments": {}}
+            }),
+        )
+        .await;
+        assert_eq!(
+            expired["error"]["code"],
+            json!(sbproxy_extension::mcp::types::GRANT_EXPIRED),
+            "elapsed grant must use JSON-RPC -32098: {expired:?}"
+        );
+        assert!(
+            expired["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("expired"),
+            "got: {expired:?}"
+        );
+
+        let listed = mcp_handler_exchange(
+            &action,
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}}),
+        )
+        .await;
+        let listed_names: Vec<String> = listed["result"]["tools"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_string))
+            .collect();
+        assert!(
+            !listed_names.iter().any(|n| n == TOOL),
+            "expired grant must be hidden from tools/list: {listed:?}"
+        );
+
+        let key = sbproxy_extension::mcp::GrantKey {
+            origin: action.server_name.clone(),
+            policy: "gate".to_string(),
+            tool: TOOL.to_string(),
+            principal_id: sbproxy_extension::mcp::principal_id_for(
+                &sbproxy_plugin::Principal::anonymous(),
+            ),
+        };
+        action
+            .grant_ledger
+            .renew(
+                &key,
+                std::time::Duration::from_secs(60),
+                std::time::SystemTime::now(),
+            )
+            .expect("renew after expiry");
+
+        let third = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {"name": TOOL, "arguments": {}}
+            }),
+        )
+        .await;
+        assert!(
+            third.get("error").is_none(),
+            "call after renew must dispatch: {third:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wor_2454_approval_hold_resumes_once_and_binds_to_snapshot() {
+        const SERVER: &str = "wor2454-approval-server";
+        const TOOL: &str = "wor2454-risky";
+        let dir = tempfile::tempdir().expect("approval store tempdir");
+        let store_path = dir.path().join("holds.json");
+        let origin = scripted_responses_server(vec![scripted_tool_call_response()]);
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "wor2454-approval-fixture", "version": "1.0.0"},
+            "approval": {
+                "store": store_path.to_string_lossy(),
+                "hold_ttl": "15m",
+                "tools": [{ "name": TOOL }]
+            },
+            "federated_servers": [{
+                "origin": origin,
+                "prefix": SERVER
+            }]
+        }))
+        .expect("wor-2454 approval fixture compiles");
+        action.federation.seed_tools_for_test(
+            HashMap::from([(TOOL.to_string(), tool(TOOL, SERVER))]),
+            None,
+        );
+
+        let held = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": TOOL, "arguments": {"x": 1}}
+            }),
+        )
+        .await;
+        assert_eq!(
+            held["error"]["code"],
+            json!(sbproxy_extension::mcp::types::APPROVAL_PENDING),
+            "configured approval.tools must park: {held:?}"
+        );
+        let hold_id = held["error"]["data"]["hold_id"]
+            .as_str()
+            .expect("hold_id on error.data")
+            .to_string();
+        assert!(
+            held["error"]["data"].get("arguments").is_none(),
+            "hold error must not echo arguments: {held:?}"
+        );
+
+        action
+            .approval
+            .as_ref()
+            .expect("approval compiled")
+            .store
+            .approve(&hold_id, "operator", std::time::SystemTime::now())
+            .expect("admin approve");
+
+        let resumed = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": TOOL, "arguments": {"x": 1}}
+            }),
+        )
+        .await;
+        assert!(
+            resumed.get("error").is_none(),
+            "retry after approve must dispatch once: {resumed:?}"
+        );
+
+        let again = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": TOOL, "arguments": {"x": 1}}
+            }),
+        )
+        .await;
+        assert_eq!(
+            again["error"]["code"],
+            json!(sbproxy_extension::mcp::types::APPROVAL_PENDING),
+            "approval is single-use: {again:?}"
+        );
+
+        let renamed = "wor2454-renamed";
+        action.federation.seed_tools_for_test(
+            HashMap::from([(renamed.to_string(), tool(renamed, SERVER))]),
+            None,
+        );
+        let other = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {"name": renamed, "arguments": {"x": 1}}
+            }),
+        )
+        .await;
+        assert!(
+            other.get("error").is_none()
+                || other["error"]["code"] != json!(sbproxy_extension::mcp::types::APPROVAL_PENDING)
+                || other["error"]["data"]["hold_id"] != held["error"]["data"]["hold_id"],
+            "a renamed tool must not consume the prior snapshot: {other:?}"
         );
     }
 }

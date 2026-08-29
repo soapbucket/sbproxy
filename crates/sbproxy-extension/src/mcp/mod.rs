@@ -17,6 +17,8 @@
 //! - [`openapi_convert`] - Convert OpenAPI 3.x specs to MCP tools and routes.
 //! - [`compat`] - Tool-versioning compatibility oracle.
 //! - [`access_control`] - Principal-aware tool ACLs and per-tool quotas.
+//! - [`grant_ledger`] - Time-boxed RBAC grants with renewal (WOR-2386).
+//! - [`pending_confirm`] - Gateway-originated approval holds (WOR-2454).
 //! - [`cedar_hook`] - `CedarMcpHook`, the built-in Cedar-backed
 //!   `McpPolicyHook` (WOR-2587). Runs alongside `access_control`'s
 //!   RBAC gate, not instead of it.
@@ -41,8 +43,10 @@ pub mod concealed_text;
 pub mod discovery;
 pub mod egress;
 pub mod federation;
+pub mod grant_ledger;
 pub mod openapi_convert;
 pub mod peer_profile;
+pub mod pending_confirm;
 pub mod poisoned_text;
 pub mod protocol;
 pub mod quarantine;
@@ -64,9 +68,9 @@ pub mod streamable;
 pub mod types;
 
 pub use access_control::{
-    parse_quota_window, McpPrincipalSelector, QuotaClock, QuotaExceeded, QuotaKey, SystemClock,
-    ToolAccessDecision, ToolAccessPolicy, ToolAccessRule, ToolQuotaRate, ToolQuotaRule,
-    ToolQuotaStore,
+    parse_quota_window, principal_id_for, McpPrincipalSelector, QuotaClock, QuotaExceeded,
+    QuotaKey, SystemClock, ToolAccessDecision, ToolAccessPolicy, ToolAccessRule, ToolQuotaRate,
+    ToolQuotaRule, ToolQuotaStore,
 };
 pub use cassette_drift::{
     cassette_contract_from_value, diff_cassette_against_tools, diff_cassette_values,
@@ -81,11 +85,13 @@ pub use federation::{
     OpenApiBacking, PromptCatalogSnapshot, SerializedToolEntry, SerializedTools,
     ToolVersioningGate, VersioningMode,
 };
+pub use grant_ledger::{parse_grant_ttl, GrantKey, GrantLedger, GrantRecord, GrantStatus};
 pub use openapi_convert::{openapi_to_mcp_tools, openapi_to_routes, OpenApiRoute};
 pub use peer_profile::{
     McpPeerProfile, ObservationVerdict, PeerDowngradeKind, PeerDowngradePolicy, PinMismatch,
     PEER_DOWNGRADE_RULE_ID, PROTOCOL_PIN_MISMATCH_RULE_ID,
 };
+pub use pending_confirm::{ApprovalSelector, Hold, HoldState, ParkOutcome, PendingConfirmStore};
 pub use protocol::{
     classify_http_era, decode_header_value, decode_http_request, decode_http_request_with_scan,
     encode_header_value, DecodedMcpRequest, DecodedRequestId, HeaderValueError,

@@ -1,6 +1,6 @@
 # MCP governance pack
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-28*
 
 Every governance surface described in [docs/mcp-security.md](../../docs/mcp-security.md), turned on at once. Nothing here is on by default in the product. Bearer auth, default-deny RBAC, a pinned tool allowlist, a checked-in tool-versioning lockfile, streamable HTTP sessions, per-upstream egress gating, registry approval status, protocol pinning, argument policies in CEL and Rego, deterministic session-flow enforcement, response-side content filtering, and a fail-closed governance-evidence feed all have to be configured, one line at a time, before any of them do anything. This example is that configuration written out. If you have been reading the coverage table in the docs and wondering what "full (config-reachable)" actually looks like assembled, this is it.
 
@@ -10,7 +10,7 @@ It is also opinionated on purpose. `mode: block` where the docs default to `warn
 
 - `authentication: bearer` - a caller needs `Authorization: Bearer <token>` before the gateway looks at anything else. The first example in this repo to pair auth with `action.type: mcp`.
 - `sessions.enabled` - the gateway issues an `Mcp-Session-Id` on `initialize` and requires it on every request after. Also what gives the session-flow guardrail below cross-call memory.
-- `rbac_policies` - default-deny. A caller matching no rule is refused, and adding a tool upstream never silently widens who can call it.
+- `rbac_policies` - default-deny. A caller matching no rule is refused, and adding a tool upstream never silently widens who can call it. `tool_access[].ttl` plus `grant_ledger.path` expire a reviewed grant unless an operator renews it (`POST /api/mcp/grants/renew`). This example uses `720h` so the walkthrough still works.
 - `guardrails: [tool_allowlist, lethal_trifecta]` - a second, coarser allowlist on top of RBAC, plus a session-scoped guardrail that denies a session the moment it has touched tool access, private data, and external communication all at once. The trifecta's patterns here (`billing.*`, `notify.*`) name no tool this walkthrough advertises, on purpose: the guardrail is genuinely evaluated on every call, it just never sees all three legs from this config. Point it at your own tool names to make it live.
 - `tool_versioning` - every advertised tool is checked against a committed contract digest on each catalog refresh. `block_unlocked: true` means a tool with no lockfile entry is blocked, not just flagged.
 - `federated_servers[].egress` - deny-by-default per upstream. A federated server's connect is authorized the same way an `ai_proxy` provider dial is, and every dial's outcome (allowed, denied, ungated) is recorded.

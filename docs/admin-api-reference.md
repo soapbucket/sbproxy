@@ -3675,6 +3675,11 @@ model-host artifact cache above:
 | GET | `/admin/licensing` | CoMP marketplace bridges: what each configured origin publishes and which quote-signing key is live. |
 | GET | `/admin/mcp-oauth` | Every colocated MCP OAuth broker this proxy runs, and what each has wired in. |
 | GET | `/admin/mcp-runtime` | Federated MCP server runtime state and in-flight tool-call auth challenges. |
+| GET | `/api/mcp/grants` | Time-boxed MCP RBAC grants. A console page is deferred. |
+| POST | `/api/mcp/grants/renew` | Reset `renewed_at` for a grant. Body: `{origin, policy, tool, principal?}`. |
+| GET | `/api/mcp/approvals` | Pending and decided MCP approval holds. A console page is deferred. |
+| POST | `/api/mcp/approvals/{id}/approve` | Approve a hold. Body: `{approved_by}`. The next matching retry consumes it once. |
+| POST | `/api/mcp/approvals/{id}/deny` | Deny a hold. Body: `{approved_by}`. |
 
 ### `GET /admin/cache`
 
@@ -3968,6 +3973,57 @@ or `stopped`. A tool call blocked on a step-up challenge appears under
 `tool_calls` and does not move the owning server out of `ready`.
 `requiredScopes` is parsed from `WWW-Authenticate: Bearer scope="..."`,
 not from metadata `scopes_supported`. See [mcp.md](mcp.md).
+
+### `GET /api/mcp/grants`
+
+Time-boxed MCP RBAC grants for every compiled `mcp` action. A console
+page is deferred; this JSON is the operator surface. Both `admin` and
+`read_only` operators may call it.
+
+```json
+{
+  "enabled": true,
+  "grants": [
+    {
+      "origin": "mcp.example.com",
+      "mcp_server": "governed-mcp",
+      "policy": "analyst",
+      "tool": "reports.hello",
+      "principal_id": "analyst-1",
+      "renewed_at": 1756400000,
+      "ttl_secs": 28800,
+      "expires_at": 1756428800
+    }
+  ],
+  "console_page": "deferred"
+}
+```
+
+### `POST /api/mcp/grants/renew`
+
+Reset `renewed_at` for a grant. `admin` only. Body:
+
+```json
+{ "origin": "mcp.example.com", "policy": "analyst", "tool": "reports.hello" }
+```
+
+`principal` is optional. When omitted, every matching row renews. A
+tool with no `ttl` on that policy is a 400.
+
+### `GET /api/mcp/approvals`
+
+Gateway-originated MCP approval holds. A console page is deferred. Both
+`admin` and `read_only` operators may call it. Arguments and secrets are
+never listed.
+
+### `POST /api/mcp/approvals/{id}/approve`
+
+Approve a pending hold. `admin` only. Body `{ "approved_by": "alice" }`.
+The next `tools/call` with the same snapshot consumes the approval once.
+
+### `POST /api/mcp/approvals/{id}/deny`
+
+Deny a pending hold. `admin` only. Same body as approve.
 
 ### `POST /admin/cache/purge`
 
