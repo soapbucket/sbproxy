@@ -10727,6 +10727,9 @@ pub(super) async fn handle_ai_proxy(
     .await?
     {
         AiIdempotencyEngagement::Replayed { response } => {
+            if refuse_if_parallel_input_blocks(&mut ai_extensions, session, ctx, &ai_span).await? {
+                return Ok(());
+            }
             if let Some(block) = ai_output_guardrail_block(
                 Some(ctx),
                 response.status,
@@ -11055,6 +11058,16 @@ pub(super) async fn handle_ai_proxy(
                         .await;
                     match outcome {
                         Ok(sbproxy_ai::SemanticLookupOutcome::Hit(hit)) => {
+                            if refuse_if_parallel_input_blocks(
+                                &mut ai_extensions,
+                                session,
+                                ctx,
+                                &ai_span,
+                            )
+                            .await?
+                            {
+                                return Ok(());
+                            }
                             ctx.admin_cache_status
                                 .record(crate::context::AdminCacheStatus::SemanticHit);
                             sbproxy_ai::ai_metrics::record_cache_result(
@@ -12625,14 +12638,10 @@ pub(super) async fn handle_ai_proxy(
     // does not also run the sequential failover loop afterward.
     let race_mode =
         router.is_race() && !is_stream && provider_order.len() >= 2 && !has_managed_local;
-    if race_mode {
-        if let Some(extensions) = ai_extensions.as_mut() {
-            if let Err(block) = extensions.wait_parallel().await {
-                sbproxy_ai::ai_metrics::record_ai_parallel_moderation("block");
-                send_ai_extension_block_response(session, ctx, &ai_span, block).await?;
-                return Ok(());
-            }
-        }
+    if race_mode
+        && refuse_if_parallel_input_blocks(&mut ai_extensions, session, ctx, &ai_span).await?
+    {
+        return Ok(());
     }
     if race_mode {
         use futures::stream::{FuturesUnordered, StreamExt as _};
@@ -15511,6 +15520,33 @@ async fn send_guardrail_block_response(
         .request_id(ctx.request_id.as_str())
         .to_bytes();
     send_response(session, status, "application/json", &body).await
+}
+
+/// Join an armed parallel input hook before a path that will not race a
+/// provider.
+///
+/// `guard_input` only arms the inspect task. Semantic-cache hits,
+/// idempotency replay, and raced fan-out all skip `race_provider_attempt`,
+/// so without this join a prompt the hook would refuse is served from
+/// stored bytes (WOR-2421). Returns `true` when the client has already
+/// been refused.
+async fn refuse_if_parallel_input_blocks(
+    ai_extensions: &mut Option<crate::ai_extensions::AiRequestExtensions>,
+    session: &mut Session,
+    ctx: &mut RequestContext,
+    ai_span: &tracing::Span,
+) -> Result<bool> {
+    let Some(extensions) = ai_extensions.as_mut() else {
+        return Ok(false);
+    };
+    match extensions.wait_parallel().await {
+        Ok(()) => Ok(false),
+        Err(block) => {
+            sbproxy_ai::ai_metrics::record_ai_parallel_moderation("refused");
+            send_ai_extension_block_response(session, ctx, ai_span, block).await?;
+            Ok(true)
+        }
+    }
 }
 
 async fn send_ai_extension_block_response(

@@ -1874,15 +1874,17 @@ pub fn record_guardrail_block(category: &str) {
 /// Record one inspect-only input hook that ran alongside the upstream call.
 ///
 /// `outcome` is a closed set: `allow`, `block` (the hook refused after
-/// the provider had already answered), and `cancelled_upstream` (the
-/// hook blocked first and the in-flight call was dropped). A cancelled
-/// call may still be billed by the provider.
+/// the provider had already answered), `cancelled_upstream` (the hook
+/// blocked first and the in-flight call was dropped), and `refused`
+/// (the hook blocked on a path that never dialed a provider: cache
+/// hit, idempotency replay, or raced fan-out wait). A cancelled call
+/// may still be billed by the provider.
 pub fn record_ai_parallel_moderation(outcome: &str) {
     let Some(counter) = &*AI_PARALLEL_MODERATION else {
         return;
     };
     let outcome = match outcome {
-        "allow" | "block" | "cancelled_upstream" => outcome,
+        "allow" | "block" | "cancelled_upstream" | "refused" => outcome,
         _ => "unknown",
     };
     counter.with_label_values(&[outcome]).inc();
@@ -4031,6 +4033,7 @@ mod tests {
         record_ai_parallel_moderation("allow");
         record_ai_parallel_moderation("block");
         record_ai_parallel_moderation("cancelled_upstream");
+        record_ai_parallel_moderation("refused");
         let families = prometheus::gather();
         let family = families
             .iter()

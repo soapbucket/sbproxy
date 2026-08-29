@@ -2678,7 +2678,7 @@
           }
         }
       ],
-      "description": "Inspect-only input hooks that ran alongside the upstream call. allow is the zero-latency path. cancelled_upstream is a reject that dropped an in-flight generation, which the provider may still bill. block is a reject that landed after the provider had already answered. Runbook: docs/operator-runbook.md#ai-gateway."
+      "description": "Inspect-only input hooks that ran alongside the upstream call. allow is the zero-latency path. cancelled_upstream is a reject that dropped an in-flight generation, which the provider may still bill. block is a reject that landed after the provider had already answered. refused is a reject on a path that never dialed a provider (cache hit, idempotency replay, or raced fan-out wait). Runbook: docs/operator-runbook.md#ai-gateway."
     }
   ],
   "templating": {

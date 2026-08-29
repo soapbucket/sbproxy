@@ -1,5 +1,5 @@
 # Metrics stability
-*Last modified: 2026-08-26*
+*Last modified: 2026-08-28*
 
 *Generated from the executable metric registry. Do not hand-edit; run `cargo run -q -p sbproxy-observe --bin generate-metrics-stability > docs/metrics-stability.md`.*
 
@@ -132,7 +132,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_ai_failovers_total` | Counter | `stable` | `beta` | `from_provider`, `to_provider`, `reason` | Provider failover events. |
 | `sbproxy_ai_gateway_decisions_total` | Counter | `stable` | `beta` | `decision`, `reason` | AI gateway admission decisions, including pre-provider rejections. |
 | `sbproxy_ai_guardrail_blocks_total` | Counter | `stable` | `stable` | `category` | Guardrail block events. |
-| `sbproxy_ai_parallel_moderation_total` | Counter | `stable` | `beta` | `outcome` | Inspect-only input hooks that ran alongside the upstream call, by allow, block, or cancelled_upstream. |
+| `sbproxy_ai_parallel_moderation_total` | Counter | `stable` | `beta` | `outcome` | Inspect-only input hooks that ran alongside the upstream call, by allow, block, cancelled_upstream, or refused. |
 | `sbproxy_ai_safety_guardrail_verdicts_total` | Counter | `stable` | `beta` | `guardrail`, `class`, `backend`, `verdict` | Built-in safety guardrail evaluations by class, backend, and verdict. |
 | `sbproxy_ai_external_guardrail_verdicts_total` | Counter | `stable` | `beta` | `provider`, `phase`, `outcome` | External guardrail evaluations by provider, phase, and outcome. |
 | `sbproxy_ai_inter_token_latency_seconds` | Histogram | `stable` | `beta` | `provider`, `model` | AI streaming average inter-token latency (TPOT). |
