@@ -98,6 +98,16 @@ fn pinned() -> &'static Mutex<Option<PinnedRevision>> {
 /// reaches the admin surface keeps a pathological error (a parser that
 /// echoes a large document back) from turning a status route into a way
 /// to read the node's configuration a kilobyte at a time.
+///
+/// Characters rather than bytes, deliberately, because the cut has to
+/// land on a character boundary and a byte budget would have to walk
+/// back to one anyway. What that costs is stated rather than left to be
+/// discovered: a reason made entirely of four-byte scalars is 2 KiB on
+/// the wire, so this is a bound on how much of a document can be echoed
+/// and not a bound on response size. The operator edge applies the same
+/// character bound again over what a pod returns
+/// (`sbproxy-k8s-operator`'s `bounded_reason`), and the pod response
+/// body itself is capped in bytes there.
 const MAX_FALLBACK_REASON_CHARS: usize = 512;
 
 /// The ring entry a fallback boot is serving.
@@ -107,8 +117,8 @@ pub struct PinnedRevision {
     pub revision: u64,
     /// Its content digest.
     pub digest: String,
-    /// Why the configured document did not boot, bounded to 512
-    /// characters.
+    /// Why the configured document did not boot, credential-scrubbed,
+    /// flattened of control characters, and bounded to 512 characters.
     ///
     /// `None` on a pin an operator or a test set directly rather than
     /// one a boot walk produced. A controller that owns this node's
@@ -133,8 +143,21 @@ const REDACTED: &str = "[REDACTED]";
 const SECRET_ECHO_MARKER: &str = "references the secret '";
 
 impl PinnedRevision {
-    /// A pin carrying the failure that caused the fallback, scrubbed
-    /// and truncated to 512 characters on a character boundary.
+    /// A pin carrying the failure that caused the fallback, scrubbed,
+    /// flattened of control characters, and truncated to 512 characters
+    /// on a character boundary.
+    ///
+    /// # Why this flattens control characters
+    ///
+    /// The reason is quoted from an operator-authored document, so it
+    /// can carry whatever that document contained: a newline, a `\r`,
+    /// or an ANSI escape introducer. It is served by
+    /// `GET /admin/config/fallback` and copied into a Kubernetes
+    /// condition, and both reach a terminal verbatim through `curl` and
+    /// `kubectl describe`. The operator applies the same flattening at
+    /// its own edge, because it cannot trust a pod; this one is here
+    /// because the node's own admin route is a consumer too and had no
+    /// such edge in front of it.
     ///
     /// # Why this scrubs
     ///
@@ -156,7 +179,17 @@ impl PinnedRevision {
     #[must_use]
     pub fn with_reason(revision: u64, digest: String, reason: &str) -> Self {
         let scrubbed = redact_secret_echo(&sbproxy_config::scrub_credentials(reason));
-        let trimmed = scrubbed.trim();
+        let flattened: String = scrubbed
+            .chars()
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect();
+        let trimmed = flattened.trim();
         let bounded = match trimmed.char_indices().nth(MAX_FALLBACK_REASON_CHARS) {
             Some((cut, _)) => format!("{}...", &trimmed[..cut]),
             None => trimmed.to_string(),
@@ -1048,6 +1081,29 @@ mod tests {
             PinnedRevision::with_reason(1, "digest".to_string(), "   ").reason,
             None,
             "an empty reason is absent rather than an empty string",
+        );
+    }
+
+    #[test]
+    fn a_fallback_reason_carries_no_control_character_to_a_terminal() {
+        // The reason is quoted from an operator-authored document and
+        // is served raw by the admin route, so an escape introducer in
+        // that document would reach whatever renders the answer.
+        let hostile = "unknown action type:\u{1b}[2Jstatik\r\nsecond line\u{0}";
+        let reason = PinnedRevision::with_reason(7, "digest".to_string(), hostile)
+            .reason
+            .expect("a reason");
+        assert!(
+            !reason.chars().any(char::is_control),
+            "no control character survives: {reason:?}"
+        );
+        assert!(
+            reason.starts_with("unknown action type:"),
+            "the diagnosable part survives: {reason:?}"
+        );
+        assert!(
+            reason.contains("statik") && reason.contains("second line"),
+            "flattened rather than truncated at the first control character: {reason:?}"
         );
     }
 }

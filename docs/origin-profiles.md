@@ -138,12 +138,12 @@ Then ask where each leaf came from:
 ```console
 $ sbproxy aggregate runtime.yml --explain checkout.example.com
 checkout.example.com
-  action.host_override                spec.environments[prod]  entry checkout  https://git.example.com/acme/checkout@a1b2c3d4
-  action.type                         spec.base                entry checkout  https://git.example.com/acme/checkout@a1b2c3d4
-  action.url                          spec.base                entry checkout  https://git.example.com/acme/checkout@a1b2c3d4
+  action.host_override                spec.environments[prod]  entry checkout  https://git.example.com/acme/checkout@a1b2c3d4e5f6
+  action.type                         spec.base                entry checkout  https://git.example.com/acme/checkout@a1b2c3d4e5f6
+  action.url                          spec.base                entry checkout  https://git.example.com/acme/checkout@a1b2c3d4e5f6
   policies[platform_waf].type         origin_defaults
   policies[rate_limit].burst          origin_defaults
-  policies[rate_limit].requests_per_minute  spec.base          entry checkout  https://git.example.com/acme/checkout@a1b2c3d4
+  policies[rate_limit].requests_per_minute  spec.base          entry checkout  https://git.example.com/acme/checkout@a1b2c3d4e5f6
 ```
 
 The second column is the whole review: it names the layer that set each leaf, so it tells you which of your changes actually reached the composed origin and which the floor kept. No value is ever printed, only where it came from; the value is in the composed document beside it.

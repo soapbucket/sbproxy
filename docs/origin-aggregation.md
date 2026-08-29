@@ -225,6 +225,7 @@ A composed document that reached the fleet is undone at the authority, not on a 
 $ sbproxy config authority rollback --to-revision 10 \
     --admin-url https://authority.internal:9443 --password "$SB_ADMIN_PASSWORD"
 config authority rollback: republished revision 10's payload as revision 13, replacing revision 12
+config authority rollback: the number moves forward because a subscriber refuses a revision that is not greater than the one it applied. Subscribers take it on their next poll.
 ```
 
 Fix the project repository before the next poll, or the aggregator composes the same thing again. See [config-rollback.md](config-rollback.md#4-the-whole-fleet-took-the-change).
