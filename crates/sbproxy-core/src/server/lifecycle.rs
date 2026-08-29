@@ -3699,18 +3699,36 @@ pub fn run_with_fallback(
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(auto_threads);
+    // WOR-2699: worker stack size. Unset means the fork's
+    // `DEFAULT_THREAD_STACK_SIZE`, which is 8 MiB. A worker polls the
+    // whole request path on this stack, and the debug binary CI's smoke
+    // lane builds needs several times what the release binary does, so
+    // the ceiling has to be sized for the deeper of the two.
+    //
+    // Environment-only, like `SB_WORKER_THREADS` beside it: rarely
+    // changed, and the right value is deployment-shaped. Raising it
+    // costs reserved address space per worker thread and no resident
+    // memory, because a thread stack is committed page by page as it is
+    // touched. `docs/manual.md` carries the arithmetic.
+    //
+    let worker_stack_bytes =
+        resolve_worker_stack_bytes(std::env::var("SB_WORKER_STACK_BYTES").ok().as_deref());
     let conf = PingoraServerConf {
         threads,
         upstream_keepalive_pool_size: 256,
         upstream_connect_offload_threadpools: Some(2),
         grace_period_seconds: Some(grace_seconds),
         graceful_shutdown_timeout_seconds: Some(grace_seconds),
+        runtime_thread_stack_size: worker_stack_bytes,
         ..PingoraServerConf::default()
     };
     tracing::info!(
         threads = %conf.threads,
         upstream_pool = %conf.upstream_keepalive_pool_size,
         connect_offload = ?conf.upstream_connect_offload_threadpools,
+        worker_stack_bytes = conf
+            .runtime_thread_stack_size
+            .unwrap_or(pingora_runtime::DEFAULT_THREAD_STACK_SIZE),
         "pingora server config"
     );
     let mut server = Server::new_with_opt_and_conf(None, conf);
@@ -4688,6 +4706,58 @@ pub(crate) static OP_REDACT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::
 ///
 /// Called once at boot (from `run`) and on every config reload (from
 /// `reload_from_config_path`) so SIGHUP picks up new tenant caps.
+/// Smallest worker stack sbproxy accepts from `SB_WORKER_STACK_BYTES`.
+///
+/// One 4 KiB page, matching pingora's own floor. It rules out one thing:
+/// a value written in the wrong unit, `SB_WORKER_STACK_BYTES=8` meaning
+/// megabytes. It is not a safe lower bound, because the real floor is
+/// whatever the deepest request path needs, which is what
+/// `server::stack_probe` exists to report.
+const MIN_WORKER_STACK_BYTES: usize = 4 * 1024;
+
+/// Resolve `SB_WORKER_STACK_BYTES` into pingora's
+/// `runtime_thread_stack_size`.
+///
+/// `None` means "use pingora's default", which is 8 MiB.
+///
+/// A free function, not inline at the call site, for two reasons. It is
+/// the only way to test the parsing without standing up a server, and
+/// the config-reader guard cannot see a key read from inside a larger
+/// function.
+///
+/// # Why a bad value is ignored rather than fatal
+///
+/// `SB_WORKER_THREADS` beside it ignores what it cannot parse, and an
+/// environment typo should not stop a proxy from starting. But the
+/// previous version ignored only unparseable values and zero, and
+/// passed everything else through to a `ServerConf` struct literal.
+/// `ServerConf::validate()` runs from `from_yaml` and nothing else, so
+/// the below-a-page refusal that `docs/manual.md` documented never ran:
+/// `SB_WORKER_STACK_BYTES=8` started a server whose workers had a stack
+/// the platform rounded up to something arbitrary, and aborted on the
+/// first request with no diagnosis. Refusing here is what makes the
+/// documented behavior real.
+pub(crate) fn resolve_worker_stack_bytes(raw: Option<&str>) -> Option<usize> {
+    let raw = raw?;
+    let Ok(bytes) = raw.trim().parse::<usize>() else {
+        tracing::warn!(
+            value = %raw,
+            "SB_WORKER_STACK_BYTES is not a positive integer; using the default worker stack"
+        );
+        return None;
+    };
+    if bytes < MIN_WORKER_STACK_BYTES {
+        tracing::warn!(
+            value = bytes,
+            minimum = MIN_WORKER_STACK_BYTES,
+            "SB_WORKER_STACK_BYTES is below one page, which is a value written in the wrong \
+             unit rather than a stack any thread can run on; using the default worker stack"
+        );
+        return None;
+    }
+    Some(bytes)
+}
+
 fn install_tenant_cardinality_state(server: &sbproxy_config::ProxyServerConfig) {
     use sbproxy_config::TENANT_CARDINALITY_DEFAULT_MAX_SERIES;
     let limiter = sbproxy_observe::metrics::global_limiter();
@@ -9880,4 +9950,63 @@ fn build_notifier(
         "outbound notifier opened"
     );
     Ok(std::sync::Arc::new(notifier))
+}
+
+/// `SB_WORKER_STACK_BYTES` (WOR-2699).
+///
+/// The knob had no test at all: the stack budget test builds its own
+/// runtime, so the whole hunk that reads this key could be reverted and
+/// every test still passed.
+#[cfg(test)]
+mod worker_stack_env_tests {
+    use super::{resolve_worker_stack_bytes, MIN_WORKER_STACK_BYTES};
+
+    #[test]
+    fn an_unset_key_leaves_pingora_its_default() {
+        assert_eq!(resolve_worker_stack_bytes(None), None);
+    }
+
+    #[test]
+    fn a_real_size_is_passed_through() {
+        assert_eq!(
+            resolve_worker_stack_bytes(Some("16777216")),
+            Some(16 * 1024 * 1024)
+        );
+        // Whitespace from a shell export or a compose file.
+        assert_eq!(
+            resolve_worker_stack_bytes(Some(" 16777216 ")),
+            Some(16 * 1024 * 1024)
+        );
+    }
+
+    /// The typo the floor exists for.
+    ///
+    /// `SB_WORKER_STACK_BYTES=8` reads as bytes and means megabytes.
+    /// Before this, it reached a `ServerConf` struct literal, which
+    /// `validate()` never sees, so the server started and aborted on its
+    /// first request with nothing to say why.
+    #[test]
+    fn a_size_written_in_the_wrong_unit_is_refused() {
+        assert_eq!(resolve_worker_stack_bytes(Some("8")), None);
+        assert_eq!(
+            resolve_worker_stack_bytes(Some(&(MIN_WORKER_STACK_BYTES - 1).to_string())),
+            None
+        );
+        assert_eq!(
+            resolve_worker_stack_bytes(Some(&MIN_WORKER_STACK_BYTES.to_string())),
+            Some(MIN_WORKER_STACK_BYTES),
+            "the floor itself is allowed; it is a floor and not an exclusion"
+        );
+    }
+
+    #[test]
+    fn junk_and_zero_fall_back_rather_than_stopping_the_proxy() {
+        for raw in ["", "0", "-1", "8mb", "eight", "1e6"] {
+            assert_eq!(
+                resolve_worker_stack_bytes(Some(raw)),
+                None,
+                "{raw:?} has to fall back to the default, not stop startup"
+            );
+        }
+    }
 }

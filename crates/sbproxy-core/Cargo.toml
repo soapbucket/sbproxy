@@ -210,6 +210,7 @@ pingora-core.workspace = true
 pingora-proxy.workspace = true
 pingora-http.workspace = true
 pingora-error.workspace = true
+pingora-runtime.workspace = true
 
 # Bloom filter for hostname pre-check
 bloomfilter.workspace = true

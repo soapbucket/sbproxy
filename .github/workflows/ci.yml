@@ -520,6 +520,7 @@ jobs:
       - name: no new operator URL at a log line (WOR-2629)
         run: bash scripts/check-log-url-ratchet.sh
 
+
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -587,6 +588,32 @@ jobs:
           # already gated.
           CHANGELOG_BASE_REF: ${{ github.event.pull_request.base.sha || github.sha }}
         run: python3 scripts/changelog-fragments.py --check
+
+      # The fourth ratchet of the unwrap/pub-item/log-url family, but it
+      # lives here rather than in the lint lane with its three siblings,
+      # and the reason is worth writing down because the first version
+      # of this got it wrong.
+      #
+      # Those three count source sites, so a depth-1 checkout serves
+      # them. This one compares a committed number against the same
+      # number at the merge base, which needs history the lint lane's
+      # checkout does not fetch. Wired there, it resolved no base on
+      # every `pull_request` event, printed a note, and exited 0: a
+      # guard that ran on every pull request and checked nothing,
+      # shipped inside the change whose subject is guards that cannot
+      # fail. It now fails closed, and it is here because this job's
+      # checkout is full depth for precisely this reason.
+      - name: stack-budget ratchet fixtures
+        run: bash scripts/check-stack-budget-ratchet.sh --self-test
+
+      - name: AI dispatch path stack budget only falls (WOR-2699)
+        env:
+          # Same shape and same reason as CHANGELOG_BASE_REF above: the
+          # script takes the merge base of this ref with HEAD itself, so
+          # a base gone stale behind a direct push to main cannot
+          # attribute main's commits to this branch.
+          STACK_BUDGET_BASE_REF: ${{ github.event.pull_request.base.sha || github.sha }}
+        run: bash scripts/check-stack-budget-ratchet.sh
 
       # A merge that commits its own conflict markers ships corrupted
       # files. One reached main's CHANGELOG on 2026-08-19 through a gate

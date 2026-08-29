@@ -259,6 +259,10 @@ pingora-core = { version = "0.8", features = ["rustls"] }
 pingora-proxy = "0.8"
 pingora-http = "0.8"
 pingora-error = "0.8"
+# Direct dependency for `worker_stack`, which records where each worker
+# thread's stack starts. The request path reads it back to measure how
+# much of that stack it actually uses.
+pingora-runtime = "0.8"
 
 # URL parsing
 url = "2"
@@ -516,12 +520,32 @@ inherits = "release"
 lto = "off"
 codegen-units = 16
 
-# WOR-1772: fork of Cloudflare Pingora 0.8.0 adding
-# `TlsSettings::with_cert_resolver` so the rustls HTTPS listener selects the
-# server cert from the dynamic CertResolver (ACME certs served live, renewals
-# swap with no restart). All pingora-* crates are patched to the one fork so
-# the workspace resolves a single consistent copy. Re-sync on a pingora
-# upgrade: rebase soapbucket/pingora sbproxy-0.8.0 onto the new tag.
+# Fork of Cloudflare Pingora, adding `TlsSettings::with_cert_resolver` so the
+# rustls HTTPS listener selects the server cert from the dynamic CertResolver
+# (ACME certs served live, renewals swap with no restart), plus six other
+# commits. All pingora-* crates are patched to the one fork so the workspace
+# resolves a single consistent copy.
+#
+# The crates declare 0.8.0, and that number is not what we run. The fork
+# tracks upstream `main`, so the tree here carries 167 upstream commits that
+# the 0.8.0 tag does not, plus our seven. Read the version as an API
+# generation, not as a thing to match against an advisory. What we actually
+# run, as of the 2026-08-28 lockfile:
+#
+#   base:   0046038 (2026-08-07), the merge base with upstream main
+#   ahead:  7 commits of ours
+#   behind: 23 upstream commits
+#   files:  20 differ, 14 of them outside .github/
+#
+# Refresh those numbers with `scripts/divergence.sh` in the fork; the fork's
+# CI prints the same report on every PR.
+#
+# Re-sync on a pingora upgrade: rebase soapbucket/pingora sbproxy-0.8.0 onto
+# a newer upstream `main`, and never onto a release tag. Cloudflare cuts
+# releases on a release branch, so 0.8.1 is not an ancestor of main: it holds
+# 8 commits main lacks while main holds 190 it lacks. Rebasing onto a tag
+# moves this fork to a different line rather than an older point on the same
+# one, and strands the fixes we have upstreamed.
 [patch.crates-io]
 pingora-core = { git = "https://github.com/soapbucket/pingora", branch = "sbproxy-0.8.0" }
 pingora-proxy = { git = "https://github.com/soapbucket/pingora", branch = "sbproxy-0.8.0" }
