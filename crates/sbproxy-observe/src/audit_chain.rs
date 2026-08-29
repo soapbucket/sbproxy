@@ -1398,6 +1398,42 @@ fn fingerprint_named_field(name: &str, value: &serde_json::Value) -> Option<(Str
 /// only their digests under a key only the operator's master secret can
 /// derive, and only when a fingerprint key has actually been installed
 /// (this omits the entry rather than fingerprinting with a placeholder).
+/// Fingerprint one non-secret-but-identifying value under the key-audit
+/// fingerprint key (WOR-2570).
+///
+/// The read audit's selective-hash posture, borrowed from HashiCorp
+/// Vault's audit devices: a sensitive string identifier is replaced by a
+/// keyed HMAC, everything that is not an identifier (timestamps, outcomes,
+/// tenant) passes through readable, and an investigator who suspects a
+/// specific value confirms it by hashing that value the same way rather
+/// than by reading it out of the trail.
+///
+/// The `hmac-sha256:` prefix is Vault's own spelling and is load bearing
+/// here: it makes a hashed identifier impossible to mistake for a real
+/// one, in a field whose other records carry real ones.
+///
+/// Returns `None` before a fingerprint key is installed, so a caller can
+/// tell "not hashed because the key was missing" from "hashed to this",
+/// and refuse to emit rather than emit the value in the clear.
+pub fn fingerprint_key_audit_value(field: &str, value: &str) -> Option<String> {
+    // Reuses `hmac_value`, the same construction the before/after
+    // fingerprint maps run through, rather than opening a second one. A
+    // second construction here would mean an investigator hashing an id
+    // through this function and comparing it to a `before_fingerprint`
+    // entry for the same field silently never matches.
+    let key = KEY_AUDIT_FINGERPRINT_KEY.get()?;
+    let digest = hmac_value(key, field, &serde_json::Value::String(value.to_string()))?;
+    Some(format!("hmac-sha256:{digest}"))
+}
+
+/// The fingerprint epoch tag, for callers outside this module.
+///
+/// Two fingerprints are only comparable when they carry the same epoch;
+/// see [`crate::audit::KeyAuditChainEntry::key_epoch`].
+pub fn fingerprint_epoch() -> String {
+    key_audit_fingerprint_epoch()
+}
+
 pub(crate) fn fingerprint_key_audit_snapshot(
     value: Option<&serde_json::Value>,
 ) -> BTreeMap<String, String> {
@@ -1970,6 +2006,8 @@ mod tests {
             key_epoch: "test-epoch".to_string(),
             before_fingerprint,
             after_fingerprint,
+            outcome: Some("applied".to_string()),
+            context: None,
         }
     }
 
