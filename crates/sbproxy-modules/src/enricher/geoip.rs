@@ -23,7 +23,7 @@
 
 use std::net::IpAddr;
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use maxminddb::Reader;
 use serde::Deserialize;
@@ -32,8 +32,23 @@ use serde::Deserialize;
 /// module docs.
 const EMBEDDED_IPINFO_MMDB: &[u8] = include_bytes!("../../data/ipinfo.mmdb");
 
-/// Configuration for the `geoip` policy.
-#[derive(Debug, Clone, Deserialize)]
+/// Configuration for the `geoip` policy, plus the database it
+/// resolved to.
+///
+/// The reader is built in [`GeoIpPolicy::from_config`], which runs at
+/// config compile time on the config thread, and never on a request.
+/// That placement is the whole point: loading a GeoLite2 database is a
+/// `std::fs::read` of tens of megabytes followed by an MMDB parse, and
+/// `PolicyEnforcer::enforce` runs its prologue synchronously on a
+/// tokio worker. Doing it there stalled every request already in
+/// flight on that thread, not just the one that triggered it.
+///
+/// Resolving per compile rather than into a process-wide cache also
+/// fixes what happens after a bad path. The previous shape interned
+/// the failure for the life of the process, so an operator who
+/// corrected a typo, a permission, or a truncated download had to
+/// restart. Now a config reload builds a fresh policy and retries.
+#[derive(Clone, Deserialize)]
 pub struct GeoIpPolicy {
     /// Optional override path to a MaxMind-compatible `.mmdb` file.
     /// When set and readable, replaces the embedded database.
@@ -44,6 +59,24 @@ pub struct GeoIpPolicy {
     /// default.
     #[serde(default = "default_headers")]
     pub inject_headers: bool,
+    /// The database this policy resolved to, or `None` when neither
+    /// `database_path` nor the embedded copy yielded a usable one.
+    /// Never deserialized; filled in by [`GeoIpPolicy::from_config`].
+    #[serde(skip)]
+    reader: Option<Arc<Reader<Vec<u8>>>>,
+}
+
+impl std::fmt::Debug for GeoIpPolicy {
+    /// Hand-written because `maxminddb::Reader` is not `Debug`, and
+    /// because printing a whole GeoIP database into a log line would
+    /// be a poor idea even if it were.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeoIpPolicy")
+            .field("database_path", &self.database_path)
+            .field("inject_headers", &self.inject_headers)
+            .field("database_loaded", &self.reader.is_some())
+            .finish()
+    }
 }
 
 fn default_headers() -> bool {
@@ -51,31 +84,40 @@ fn default_headers() -> bool {
 }
 
 impl GeoIpPolicy {
-    /// Deserialize a `geoip` policy config block.
+    /// Deserialize a `geoip` policy config block and load its
+    /// database.
+    ///
+    /// This is where the file read happens, on the config thread, so
+    /// that [`Self::lookup`] is pure memory access. A database that
+    /// cannot be read or parsed is logged and leaves the policy with
+    /// no reader; it is never an error, because this policy does not
+    /// deny and an origin should not fail to compile over a missing
+    /// geo database.
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
-        Ok(serde_json::from_value(value)?)
+        let mut policy: Self = serde_json::from_value(value)?;
+        policy.reader = build_reader(&policy);
+        Ok(policy)
     }
 
-    /// Check whether the policy has a usable database (override path
-    /// or non-empty embedded slice). Does not attempt to parse it;
-    /// [`Self::lookup`] does that on demand.
+    /// Whether a database actually loaded.
+    ///
+    /// This is the resolved answer, not a guess from the config: the
+    /// load has already been attempted by the time anyone can call
+    /// this.
     pub fn has_database(&self) -> bool {
-        self.database_path
-            .as_ref()
-            .map(|p| !p.is_empty())
-            .unwrap_or(false)
-            || !EMBEDDED_IPINFO_MMDB.is_empty()
+        self.reader.is_some()
     }
 
-    /// Run a lookup for `ip`, honoring `database_path` then the
-    /// embedded database. Returns an empty [`GeoLookup`] when no
-    /// database is available or the database has no record for the
-    /// address.
+    /// Run a lookup for `ip` against the already-loaded database.
+    /// Returns an empty [`GeoLookup`] when no database loaded or the
+    /// database has no record for the address.
+    ///
+    /// No I/O. The database was read in [`Self::from_config`].
     pub fn lookup(&self, ip: IpAddr) -> GeoLookup {
-        let Some(reader) = resolve_reader(self) else {
+        let Some(reader) = self.reader.as_ref() else {
             return GeoLookup::default();
         };
-        lookup(&reader, ip)
+        lookup(reader, ip)
     }
 
     /// Extract the client IP from standard proxy headers, preferring
@@ -105,38 +147,15 @@ impl GeoIpPolicy {
     }
 }
 
-// --- Lazy reader cache ---
-
-/// Cached MaxMind reader handle. `None` means a previous attempt for
-/// the same source could not load the database and should not be
-/// retried.
-type CachedReader = Option<Arc<Reader<Vec<u8>>>>;
-
-/// Process-wide reader cache keyed by source path (or the literal
-/// `"<embedded>"` token). The reader is expensive to build but cheap
-/// to share; requests get an `Arc` clone.
-static READER_CACHE: OnceLock<dashmap::DashMap<String, CachedReader>> = OnceLock::new();
-
-fn cache() -> &'static dashmap::DashMap<String, CachedReader> {
-    READER_CACHE.get_or_init(dashmap::DashMap::new)
-}
-
-/// Resolve a [`maxminddb::Reader`] for the given policy config,
-/// honoring the override path then the embedded database. Returns
-/// `None` when no usable database is available.
-fn resolve_reader(policy: &GeoIpPolicy) -> Option<Arc<Reader<Vec<u8>>>> {
-    let key = policy
-        .database_path
-        .clone()
-        .unwrap_or_else(|| "<embedded>".to_string());
-    let cache = cache();
-    if let Some(entry) = cache.get(&key) {
-        return entry.clone();
-    }
-    let reader = build_reader(policy);
-    cache.insert(key, reader.clone());
-    reader
-}
+// --- Database loading ---
+//
+// Called once per policy compile, from `from_config`, on the config
+// thread. There is deliberately no process-wide cache here: the one
+// that used to live in this file keyed on the path string and interned
+// its failures, so a wrong path stayed wrong until the process
+// restarted even after the operator fixed it. Reloading the config now
+// reloads the database, which is what an operator expects, and the cost
+// is a re-read per reload rather than per request.
 
 fn build_reader(policy: &GeoIpPolicy) -> Option<Arc<Reader<Vec<u8>>>> {
     if let Some(path) = policy.database_path.as_deref() {
@@ -353,23 +372,28 @@ mod tests {
         assert!(policy.inject_headers);
     }
 
+    /// A configured path that does not resolve reports `false`, which
+    /// is the whole difference between this and the old shape: the old
+    /// `has_database` answered from the config string alone and said
+    /// `true` for a path that had never been opened.
     #[test]
-    fn has_database_with_path() {
-        let policy = GeoIpPolicy {
-            database_path: Some("/opt/geoip/GeoLite2-City.mmdb".to_string()),
-            inject_headers: true,
-        };
-        assert!(policy.has_database());
+    fn a_configured_path_that_does_not_load_reports_no_database() {
+        let policy = GeoIpPolicy::from_config(serde_json::json!({
+            "database_path": "/opt/geoip/definitely-not-here.mmdb",
+            "inject_headers": true
+        }))
+        .expect("an unreadable database is not a config error");
+        assert!(!policy.has_database() || !EMBEDDED_IPINFO_MMDB.is_empty());
     }
 
     #[test]
     fn has_database_without_path_and_empty_embedded() {
         // The embedded slice is empty in this checkout; without a
         // path, the policy has no database.
-        let policy = GeoIpPolicy {
-            database_path: None,
-            inject_headers: true,
-        };
+        let policy = GeoIpPolicy::from_config(serde_json::json!({
+            "inject_headers": true
+        }))
+        .expect("valid geoip config");
         assert_eq!(policy.has_database(), !EMBEDDED_IPINFO_MMDB.is_empty());
     }
 
@@ -416,34 +440,60 @@ mod tests {
         assert!(GeoIpPolicy::extract_client_ip(&req).is_none());
     }
 
+    /// The database is loaded by `from_config`, so `has_database`
+    /// reports what actually resolved rather than guessing from the
+    /// config. This checkout's embedded slice is empty, so with no
+    /// override path nothing loads.
     #[test]
-    fn resolve_reader_returns_none_when_no_db_available() {
-        // This checkout's embedded slice is empty; with no override
-        // path, resolve_reader must return None.
-        let policy = GeoIpPolicy {
-            database_path: None,
-            inject_headers: true,
-        };
-        let reader = resolve_reader(&policy);
+    fn no_database_loads_without_a_path_or_an_embedded_copy() {
+        let policy = GeoIpPolicy::from_config(serde_json::json!({
+            "inject_headers": true
+        }))
+        .expect("valid geoip config");
         assert!(
-            reader.is_none() || !EMBEDDED_IPINFO_MMDB.is_empty(),
-            "expected no reader without a path or embedded MMDB"
+            !policy.has_database() || !EMBEDDED_IPINFO_MMDB.is_empty(),
+            "expected no database without a path or embedded MMDB"
         );
     }
 
+    /// An unreadable path is not an error: this policy never denies, so
+    /// an origin does not fail to compile over a missing geo database.
+    /// It simply has no reader, and every lookup is empty.
+    ///
+    /// The load is attempted here, in `from_config`, and not again on
+    /// the request path, so a lookup does no I/O whatever the path was.
     #[test]
-    fn resolve_reader_returns_none_for_unreadable_path() {
-        let policy = GeoIpPolicy {
-            database_path: Some("/tmp/sbproxy-test-nonexistent.mmdb".to_string()),
-            inject_headers: true,
-        };
-        // With no embedded fallback, the missing path leaves us
-        // empty-handed; with an embedded DB it falls through to it.
-        let reader = resolve_reader(&policy);
+    fn an_unreadable_path_leaves_the_policy_without_a_database() {
+        let policy = GeoIpPolicy::from_config(serde_json::json!({
+            "database_path": "/tmp/sbproxy-test-nonexistent.mmdb",
+            "inject_headers": true
+        }))
+        .expect("an unreadable database is not a config error");
         assert!(
-            reader.is_none() || !EMBEDDED_IPINFO_MMDB.is_empty(),
-            "missing override path should produce no reader without an embedded fallback"
+            !policy.has_database() || !EMBEDDED_IPINFO_MMDB.is_empty(),
+            "missing override path should produce no database without an embedded fallback"
         );
+        assert!(policy
+            .lookup("203.0.113.10".parse().expect("test address"))
+            .is_empty());
+    }
+
+    /// A second compile against the same bad path retries the load
+    /// rather than reusing an interned failure. The shape this
+    /// replaced kept a process-wide `None` per path string, so an
+    /// operator who fixed a typo, a permission, or a truncated download
+    /// had to restart the process before a reload would pick it up.
+    #[test]
+    fn a_second_compile_retries_a_path_that_failed_the_first_time() {
+        let cfg = serde_json::json!({
+            "database_path": "/tmp/sbproxy-test-nonexistent.mmdb",
+            "inject_headers": true
+        });
+        let first = GeoIpPolicy::from_config(cfg.clone()).expect("first compile");
+        let second = GeoIpPolicy::from_config(cfg).expect("second compile");
+        // Both agree, and neither consulted a cache to get there: the
+        // reader lives on the policy, so nothing outlives it.
+        assert_eq!(first.has_database(), second.has_database());
     }
 
     #[test]
@@ -472,10 +522,10 @@ mod tests {
 
     #[test]
     fn lookup_returns_empty_without_database() {
-        let policy = GeoIpPolicy {
-            database_path: None,
-            inject_headers: true,
-        };
+        let policy = GeoIpPolicy::from_config(serde_json::json!({
+            "inject_headers": true
+        }))
+        .expect("valid geoip config");
         let result = policy.lookup("1.2.3.4".parse().unwrap());
         assert!(result.is_empty() || !EMBEDDED_IPINFO_MMDB.is_empty());
     }

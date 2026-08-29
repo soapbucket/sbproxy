@@ -743,7 +743,16 @@ fn compression_lever_endpoint_is_a_host_path(value: &str, _sibling_type: Option<
 /// `crates/sbproxy-core/src/server/ai_classifier.rs:404-410`)), plus
 /// `rule_pack_path` and `onnx_model_path`
 /// (`crates/sbproxy-core/src/pipeline.rs:1481,1486`, loaded at
-/// `crates/sbproxy-core/src/server/lifecycle.rs:1051`). Scoped
+/// `crates/sbproxy-core/src/server/lifecycle.rs:1051`), plus the
+/// `geoip` policy's `database_path`
+/// (`crates/sbproxy-modules/src/enricher/geoip.rs`, declared on
+/// `GeoIpPolicy` and read with `std::fs::read` in `build_reader`).
+/// That last one is why this list is a list rather than a rule: it sits
+/// inside a `policies:` block, which the generated schema types as
+/// `{"items": true}`, so `every_path_shaped_schema_key_is_covered_or_explained`
+/// cannot see it and cannot be the thing that notices it is missing.
+/// It has to be added by hand, exactly as the four detector paths above
+/// it were. Scoped
 /// `Anywhere` on purpose: the names are the same class one parent key
 /// over, and parent-scoping them is what left two of the three
 /// spellings uncovered.
@@ -1005,6 +1014,12 @@ const HOST_FILE_KEYS: &[HostFileKey] = &[
         scope: KeyScope::Anywhere,
         key: "onnx_model_path",
         remedy: "leave the agent-detect model to the layer this node owns",
+        host_path_value: None,
+    },
+    HostFileKey {
+        scope: KeyScope::Anywhere,
+        key: "database_path",
+        remedy: "leave the GeoIP database to the layer this node owns",
         host_path_value: None,
     },
     // --- extension code -----------------------------------------------
@@ -2965,6 +2980,10 @@ mod tests {
         (
             "agent_detect.onnx_model_path",
             "proxy:\n  extensions:\n    agent_detect:\n      onnx_model_path: /etc/sbproxy/agents.onnx\n",
+        ),
+        (
+            "geoip.database_path",
+            "origins:\n  api:\n    policies:\n      - type: geoip\n        database_path: /opt/geoip/GeoLite2-City.mmdb\n",
         ),
         (
             "extensions.bundles_dir",

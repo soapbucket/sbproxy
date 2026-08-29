@@ -3749,12 +3749,29 @@ impl ProxyHttp for SbProxy {
                 forwarding = fc;
                 disable_forwarded_host = forwarding.disable_forwarded_host_header;
 
-                if let Action::Proxy(proxy) = effective_action {
+                // The upstream URL whose path, if it has one, prefixes
+                // the request path. WOR-2671: `abtest` belongs here as
+                // well as `proxy`. Its variants take the same `url:`
+                // an operator writes for a `proxy` action, so
+                // `url: https://b.example.com/v2` has to reach the same
+                // backend path it would there. Gating this on
+                // `Action::Proxy` alone meant a variant path was parsed
+                // and then dropped, and the experiment quietly measured
+                // the wrong path on the right host.
+                let path_bearing_url = match effective_action {
+                    Action::Proxy(proxy) => Some(proxy.url.as_str()),
+                    Action::AbTest(_) => ctx
+                        .ab_test_selection
+                        .as_ref()
+                        .map(|selection| selection.url.as_str()),
+                    _ => None,
+                };
+                if let Some(url) = path_bearing_url {
                     // WOR-1698: read the memoized path instead of
                     // re-parsing the fixed upstream URL. A URL that does
                     // not parse yields an empty path, so the guard below
                     // skips it, matching the old `if let Ok(..)` behavior.
-                    let p = &parsed_upstream_url(&proxy.url).path;
+                    let p = &parsed_upstream_url(url).path;
                     if p != "/" && !p.is_empty() {
                         upstream_url_path = Some(p.clone());
                     }

@@ -1248,13 +1248,26 @@ pub(super) async fn handle_action(
             // `resolve_variant` consumes the header, because it is the
             // difference between honoring an assignment and minting one.
             let already_pinned = ab.sticky_variant(cookie_header).is_some();
+            // `None` here is unreachable: `AbTestAction::from_config`
+            // refuses an empty `variants`, and `select_variant` returns
+            // `Some` for any non-empty list, including the
+            // all-zero-weight case, which falls back to the first entry.
+            //
+            // What used to sit here was a 502 and a `warn!` for that
+            // impossible case, which is an operator-facing error path a
+            // reader has to evaluate and rule out before concluding it
+            // can never fire. A `debug_assert` says the same thing to
+            // the person reading the code and to every test run, and
+            // release builds fall through to the ordinary proxy flow
+            // rather than inventing a status for a state that cannot
+            // occur.
             let Some(variant) = ab.resolve_variant(cookie_header) else {
-                warn!(
-                    hostname = %ctx.hostname,
-                    "abtest: action has no configured variants"
+                debug_assert!(
+                    false,
+                    "abtest variants are non-empty by construction; \
+                     AbTestAction::from_config refuses an empty list"
                 );
-                send_error(session, 502, "abtest action has no configured variants").await?;
-                return Ok(true);
+                return Ok(false);
             };
             match ab.parse_variant_upstream(variant) {
                 Ok((host, port, tls)) => {

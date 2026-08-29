@@ -129,17 +129,24 @@ origins:
     );
 }
 
-/// The wire half of the sticky pin.
+/// The wire half of the sticky pin: the `Set-Cookie` reaches the
+/// client, and the value it carries is one the pinning path accepts.
 ///
 /// `abtest_mints_a_sticky_pin_for_a_client_that_arrives_without_one` in
 /// `action_dispatch.rs` proves the request phase decides to set a
 /// cookie. It cannot prove the response phase emits it, because that
 /// append happens in `response_filter` against a real Pingora session.
-/// This is the test that reads the header off the wire and then spends
-/// it, which is the property an operator running an experiment actually
-/// depends on: two requests from the same client land on one variant.
+///
+/// Deliberately not named "routes the next request": the weights here
+/// are 0 and 1, so the second call would land on `experiment` whether
+/// or not the pin were honored, and asserting that it did would be
+/// vacuous. The pin-decides direction is proved by
+/// `abtest_existing_sticky_cookie_pins_its_variant_and_is_not_restamped`
+/// above, which pins to the *zero-weight* variant so the weighted roll
+/// cannot produce the same answer by chance. What this test adds is the
+/// half that one cannot reach: that the proxy issues the pin at all.
 #[test]
-fn abtest_first_visit_is_handed_a_pin_that_routes_the_next_request() {
+fn abtest_first_visit_is_handed_a_pin_the_client_can_spend() {
     let control = MockUpstream::start(json!({"variant": "control"})).expect("control upstream");
     let experiment =
         MockUpstream::start(json!({"variant": "experiment"})).expect("experiment upstream");
@@ -212,7 +219,7 @@ origins:
     assert_eq!(
         experiment.captured().len(),
         2,
-        "both requests must land on the pinned variant"
+        "both requests reach the weighted-selected variant"
     );
     assert!(
         control.captured().is_empty(),

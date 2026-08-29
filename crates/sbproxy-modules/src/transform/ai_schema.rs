@@ -19,19 +19,52 @@
 use bytes::BytesMut;
 use serde::Deserialize;
 
+/// What a schema violation does.
+///
+/// A closed enum rather than a free string, so serde refuses an
+/// unknown value at config load. The value this replaced was a bare
+/// `String` matched with a `_ => Ok(())` fall-through, which meant
+/// `on_failure: bock` (or `Block`, since the comparison was
+/// case-sensitive) compiled, validated, ran, and silently downgraded a
+/// refusing structured-output check to a no-op. There was no load
+/// error, no log line, and no metric to notice it by. Every other type
+/// added alongside this one uses a refusing enum; this now matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AiSchemaOnFailure {
+    /// Refuse the response. The transform returns `Err`, surfaced as a
+    /// `500`/`502` with `x-sbproxy-transform-error: ai_schema`.
+    #[default]
+    Block,
+    /// Forward the response and log every violated path at `WARN`.
+    Warn,
+    /// Forward the response and say nothing. Spelled out so an
+    /// operator who wants a schema recorded but not enforced has a
+    /// value to write, rather than reaching it by typo.
+    Passthrough,
+}
+
+impl AiSchemaOnFailure {
+    /// Stable string for logs and error text.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Warn => "warn",
+            Self::Passthrough => "passthrough",
+        }
+    }
+}
+
 /// Configuration for the AI schema validation transform.
 #[derive(Debug, Deserialize)]
 pub struct AiSchemaConfig {
     /// JSON Schema that AI responses must conform to.
     pub schema: serde_json::Value,
-    /// Action on validation failure: `"block"` refuses the response,
-    /// `"warn"` logs and forwards it, anything else forwards silently.
-    #[serde(default = "default_on_failure")]
-    pub on_failure: String,
-}
-
-fn default_on_failure() -> String {
-    "block".to_string()
+    /// Action on validation failure. Defaults to `block`. An
+    /// unrecognized value is refused at config load rather than
+    /// treated as "forward silently".
+    #[serde(default)]
+    pub on_failure: AiSchemaOnFailure,
 }
 
 /// AI response schema validation transform.
@@ -128,19 +161,25 @@ impl AiSchemaTransform {
     /// Validate the response body against the configured schema and
     /// apply `on_failure`.
     pub fn apply(&self, body: &mut BytesMut) -> anyhow::Result<()> {
-        let on_failure = self.config.on_failure.as_str();
+        let on_failure = self.config.on_failure;
 
         let value: serde_json::Value = match serde_json::from_slice(body) {
             Ok(v) => v,
             Err(e) => {
+                // `serde_json::Error` carries a line and column, never
+                // the bytes it was reading, so this is safe to log.
                 let msg = format!("body is not valid JSON: {}", e);
                 return match on_failure {
-                    "block" => Err(anyhow::anyhow!(msg)),
-                    "warn" => {
-                        tracing::warn!(transform = "ai_schema", on_failure, "{msg}");
+                    AiSchemaOnFailure::Block => Err(anyhow::anyhow!(msg)),
+                    AiSchemaOnFailure::Warn => {
+                        tracing::warn!(
+                            transform = "ai_schema",
+                            on_failure = on_failure.as_str(),
+                            "{msg}"
+                        );
                         Ok(())
                     }
-                    _ => Ok(()),
+                    AiSchemaOnFailure::Passthrough => Ok(()),
                 };
             }
         };
@@ -151,19 +190,21 @@ impl AiSchemaTransform {
             return Ok(());
         }
 
+        // Every string in `errors` is built from schema-declared names
+        // and a fixed type word; none of it comes from the body.
         let msg = format!("schema validation failed: {}", errors.join(", "));
         match on_failure {
-            "block" => Err(anyhow::anyhow!(msg)),
-            "warn" => {
+            AiSchemaOnFailure::Block => Err(anyhow::anyhow!(msg)),
+            AiSchemaOnFailure::Warn => {
                 tracing::warn!(
                     transform = "ai_schema",
-                    on_failure,
+                    on_failure = on_failure.as_str(),
                     errors = errors.join(", "),
                     "{msg}"
                 );
                 Ok(())
             }
-            _ => Ok(()),
+            AiSchemaOnFailure::Passthrough => Ok(()),
         }
     }
 }
@@ -201,7 +242,40 @@ mod tests {
     fn deserialize_config() {
         let cfg: AiSchemaConfig = serde_json::from_value(sample_config()).unwrap();
         assert!(cfg.schema.is_object());
-        assert_eq!(cfg.on_failure, "warn");
+        assert_eq!(cfg.on_failure, AiSchemaOnFailure::Warn);
+    }
+
+    /// The whole point of the enum: a typo is refused at load rather
+    /// than silently turning a blocking schema check into a no-op.
+    #[test]
+    fn an_unknown_on_failure_value_is_refused_at_config_load() {
+        for typo in ["bock", "Block", "BLOCK", "ignore", "allow", ""] {
+            let result = AiSchemaTransform::from_config(serde_json::json!({
+                "type": "ai_schema",
+                "schema": {"type": "object"},
+                "on_failure": typo,
+            }));
+            assert!(
+                result.is_err(),
+                "`on_failure: {typo:?}` must be refused, not treated as passthrough"
+            );
+        }
+    }
+
+    /// `passthrough` is the value an operator writes to mean "record
+    /// the schema, do not enforce it". It exists so that outcome is
+    /// reachable deliberately rather than only by typo.
+    #[test]
+    fn passthrough_forwards_an_invalid_body_without_erroring() {
+        let t = AiSchemaTransform::from_config(serde_json::json!({
+            "type": "ai_schema",
+            "schema": {"type": "object", "required": ["answer"]},
+            "on_failure": "passthrough",
+        }))
+        .expect("passthrough is a valid on_failure");
+        let mut body = BytesMut::from(&b"{}"[..]);
+        assert!(t.apply(&mut body).is_ok());
+        assert_eq!(&body[..], b"{}", "passthrough leaves the body alone");
     }
 
     #[test]
@@ -210,7 +284,7 @@ mod tests {
             "schema": { "type": "object" }
         });
         let cfg: AiSchemaConfig = serde_json::from_value(val).unwrap();
-        assert_eq!(cfg.on_failure, "block");
+        assert_eq!(cfg.on_failure, AiSchemaOnFailure::Block);
     }
 
     #[test]

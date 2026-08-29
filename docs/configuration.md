@@ -3100,10 +3100,11 @@ and response shaping.
 
 ([config](../examples/ab-test-routing/))
 
-Split traffic across weighted backend variants for an A/B test. A returning
-client carrying a matching sticky cookie stays pinned to that variant so a
-multi-request user journey never sees a different variant mid-flight. The
-action does not issue the cookie.
+Split traffic across weighted backend variants for an A/B test. A request
+that arrives without the sticky cookie takes a weighted pick and the
+response hands the client its pin; a returning client carrying that cookie
+stays on the same variant, so a multi-request user journey never sees a
+different variant mid-flight.
 
 ```yaml
 origins:
@@ -3143,18 +3144,27 @@ variant's `name` always routes to that variant. Everything else gets a
 fresh weighted-random pick: a variant's share of traffic is its `weight`
 divided by the sum of all weights, and a total weight of `0` (every
 variant weighted `0`) falls back to the first configured variant rather
-than dividing by zero. The action does not set the sticky cookie itself;
-pair it with a `static`/`json_body` response or an upstream that reads
-`x-sbproxy-variant`-style signals if you need the client to see which
-variant it landed on. Each variant's `url` accepts the same host as a
-`proxy` action; `host_override`, `retry`, and `service_discovery` are not
+than dividing by zero. Do not set the sticky cookie from your
+application as well: the proxy already stamps it, and a second
+`Set-Cookie` with the same name leaves it to the browser which one wins.
+If the backend needs to know which variant served a request, read it from
+the cookie the proxy set rather than minting your own.
+
+Each variant's `url` accepts the same host **and path** as a `proxy`
+action: `https://b.example.com/v2` sends the request to `/v2` prefixed
+onto the client's own path, exactly as a `proxy` action with that URL
+would. `host_override`, `retry`, and `service_discovery` are not
 supported on a per-variant basis.
 
-Every request that reaches this action records
+Every request that reaches this action **and resolves to a usable
+upstream** records
 `sbproxy_action_abtest_variant_selected_total{origin, variant}`, whether
 the pick came from the sticky cookie or a fresh roll, so the observed
 ratio between variants reflects the configured weights over time (absent
-a skew in how often sticky-cookie holders return).
+a skew in how often sticky-cookie holders return). A request whose
+selected variant has a `url` that does not parse is refused with `502`
+and is not counted, so a gap between this counter and the origin's
+request count is a malformed variant URL rather than a routing bug.
 
 ### https_proxy
 

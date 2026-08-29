@@ -55,6 +55,16 @@
 //! (`max_eval_ms`) is exceeded, so a slow evaluation and a fast
 //! confident one can be dispositioned independently.
 //!
+//! # What bounds the work
+//!
+//! `max_scan_bytes` (default 256 KiB), not `max_eval_ms`. The
+//! detectors allocate per character position and the scan is not
+//! preemptible, so the time budget is read only after `evaluate`
+//! returns: it picks a disposition, it does not stop any work. The byte
+//! cap is applied to the response text before the first allocation.
+//! Text past it is not examined, so an oversize response can be
+//! under-detected and never falsely blocked.
+//!
 //! # Streaming
 //!
 //! [`streaming_safe`](super::Guardrail::streaming_safe) returns
@@ -238,6 +248,29 @@ const HEURISTIC_LONG_QUOTE_CHARS: usize = 200;
 /// same document that qualifies as a "structural copy across spans"
 /// heuristic signal.
 const HEURISTIC_DISTINCT_MATCH_COUNT: usize = 3;
+
+/// Default hard cap on the response text this guardrail will scan, in
+/// bytes.
+///
+/// The detectors are not cheap per byte. `build_substring_shingles`
+/// materializes one 32-character `String` per character position, and
+/// it runs twice per evaluation; tokenization and token shingling run
+/// three more times. On a 1 MiB response that is on the order of a
+/// million short heap allocations, twice, synchronously on the response
+/// path, per concurrent request.
+///
+/// `max_eval_ms` cannot stand in for this. The detector is not
+/// preemptible mid-scan, so that budget is read after `evaluate`
+/// returns and picks a disposition rather than bounding any work. The
+/// cap has to come first, which is what the neighboring guardrails do:
+/// `stream::MAX_STREAM_GUARD_BUFFER_BYTES` is 1 MiB and
+/// `ClassifierConfig::bounded_text` truncates before tokenizing.
+///
+/// 256 KiB is well past any prose response a licensed-text detector is
+/// meant to catch, and matching against a prefix is the right failure
+/// mode: verbatim reproduction of a licensed document shows up early,
+/// and a truncated scan can only under-detect, never falsely block.
+const DEFAULT_MAX_SCAN_BYTES: usize = 256 * 1024;
 
 /// Which detector(s) fired for a verdict.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -553,6 +586,9 @@ fn default_max_eval_ms() -> u32 {
 fn default_timeout_action() -> LicenseLeakTimeoutAction {
     LicenseLeakTimeoutAction::Warn
 }
+fn default_max_scan_bytes() -> usize {
+    DEFAULT_MAX_SCAN_BYTES
+}
 
 /// Per-route YAML config.
 #[derive(Clone, Debug, Deserialize)]
@@ -576,12 +612,40 @@ pub struct LicenseLeakGuardrailConfig {
     /// exceeded on a confident match.
     #[serde(default = "default_timeout_action")]
     pub timeout_action: LicenseLeakTimeoutAction,
+    /// Hard cap, in bytes, on how much of a response is scanned. Text
+    /// past the cap is not examined, so an oversize response can only
+    /// be under-detected, never falsely blocked. Clamped to at least
+    /// one substring shingle so a cap of `0` cannot silently disable
+    /// the guardrail. Defaults to 256 KiB; see
+    /// [`DEFAULT_MAX_SCAN_BYTES`] for why a byte cap and not only a
+    /// time budget.
+    #[serde(default = "default_max_scan_bytes")]
+    pub max_scan_bytes: usize,
     /// Licensed documents this guardrail instance protects. Empty by
     /// default, which makes the guardrail a documented no-op (an
     /// operator who configures `license_leak` with no `documents:` is
     /// staging the integration before publishing a corpus).
     #[serde(default)]
     pub documents: Vec<LicensedDocument>,
+}
+
+/// Borrow at most `max_bytes` of `text`, ending on a character
+/// boundary so the result is still a `&str`.
+///
+/// Truncating rather than refusing is deliberate: this guardrail's job
+/// is to catch reproduced licensed text, and a prefix scan can only
+/// miss a match, never invent one. Refusing an oversize response
+/// instead would let response size become a denial-of-service against
+/// the caller's own traffic.
+fn bounded_prefix(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// Pick the disposition a confident match resolves to: `mode` on a
@@ -610,6 +674,7 @@ pub struct LicenseLeakGuardrail {
     confidence_threshold: f32,
     max_eval_ms: u32,
     timeout_action: LicenseLeakTimeoutAction,
+    max_scan_bytes: usize,
     corpus: LicenseCorpus,
 }
 
@@ -625,6 +690,10 @@ impl LicenseLeakGuardrail {
             confidence_threshold: threshold,
             max_eval_ms: cfg.max_eval_ms,
             timeout_action: cfg.timeout_action,
+            // Floor at one substring shingle: below that the substring
+            // detector has nothing to hash and the guardrail would be
+            // off while still reading as configured.
+            max_scan_bytes: cfg.max_scan_bytes.max(SUBSTRING_SHINGLE_LEN),
             corpus: LicenseCorpus::build(cfg.documents),
         })
     }
@@ -639,7 +708,11 @@ impl LicenseLeakGuardrail {
             return None;
         }
 
-        let verdict = evaluate(content, &self.corpus, self.confidence_threshold);
+        // Bound the work before any of it happens, rather than
+        // measuring it afterwards. `bounded` borrows; nothing is copied
+        // to apply the cap.
+        let bounded = bounded_prefix(content, self.max_scan_bytes);
+        let verdict = evaluate(bounded, &self.corpus, self.confidence_threshold);
         let timed_out = verdict.elapsed_ms > self.max_eval_ms;
 
         if !verdict.confident_match {
@@ -995,6 +1068,60 @@ mod tests {
         // that); this only confirms `check()` never panics and stays
         // internally consistent when it does.
         let _ = g.check(&big_body);
+    }
+
+    /// The cap is applied before the detectors allocate, not measured
+    /// after them. `max_eval_ms` cannot do this job: the detector is
+    /// not preemptible mid-scan, so that budget only picks a
+    /// disposition once the allocation has already happened.
+    #[test]
+    fn scan_is_capped_before_the_detectors_allocate() {
+        assert_eq!(bounded_prefix("abcdef", 3), "abc");
+        assert_eq!(bounded_prefix("abc", 99), "abc");
+        assert_eq!(bounded_prefix("", 8), "");
+        // Never splits a codepoint: a 3-byte char capped at 2 bytes
+        // yields the empty prefix rather than a panic.
+        assert_eq!(bounded_prefix("\u{4e00}\u{4e01}", 2), "");
+        assert_eq!(bounded_prefix("\u{4e00}\u{4e01}", 3), "\u{4e00}");
+    }
+
+    /// A response past the cap is scanned only up to it, so an
+    /// oversize body can under-detect and never falsely block.
+    #[test]
+    fn text_past_the_cap_is_not_scanned() {
+        let g = LicenseLeakGuardrail::from_config(&serde_json::json!({
+            "type": "license_leak",
+            "mode": "block",
+            "max_scan_bytes": 64,
+            "documents": [{"license_urn": "urn:rsl:capped:001", "body": nyt_article()}],
+        }))
+        .expect("valid config compiles");
+
+        // The licensed text sits entirely past a 64-byte cap.
+        let padded = format!("{}{}", "z".repeat(4096), nyt_article());
+        assert!(
+            g.check(&padded).is_none(),
+            "text past max_scan_bytes must not be scanned"
+        );
+        // The same text inside the cap still blocks, so the cap is what
+        // changed the outcome rather than the detector going quiet.
+        assert!(
+            g.check(nyt_article()).is_some(),
+            "the same licensed text within the cap still blocks"
+        );
+    }
+
+    /// A cap below one substring shingle would leave the detector with
+    /// nothing to hash while the config still read as enabled.
+    #[test]
+    fn a_zero_cap_is_floored_at_one_shingle_rather_than_disabling_the_guardrail() {
+        let g = LicenseLeakGuardrail::from_config(&serde_json::json!({
+            "type": "license_leak",
+            "max_scan_bytes": 0,
+            "documents": [{"license_urn": "urn:rsl:floor:001", "body": nyt_article()}],
+        }))
+        .expect("valid config compiles");
+        assert_eq!(g.max_scan_bytes, SUBSTRING_SHINGLE_LEN);
     }
 
     #[test]

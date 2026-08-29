@@ -123,18 +123,30 @@ fn https_proxy_action_type_string_compiles_to_the_https_proxy_variant() {
 /// goes red and asks whether the decision was revisited on purpose.
 #[test]
 fn the_four_declined_module_types_are_not_config_surface() {
+    // Asserting `is_err()` alone would not do. `compile_transform` and
+    // `compile_action` also fail on a malformed body, so the day
+    // someone lands `ai_cache` with a required field, a config naming
+    // it would still error, on the missing field, and this test would
+    // stay green through exactly the change it exists to catch. Match
+    // the compiler's own unknown-type wording instead.
     for declined in ["ai_cache", "token_count"] {
-        let result = compile_transform(&serde_json::json!({ "type": declined }));
+        let error = compile_transform(&serde_json::json!({ "type": declined }))
+            .expect_err("`{declined}` was declined in WOR-2670 but compiles as a transform")
+            .to_string();
         assert!(
-            result.is_err(),
-            "`{declined}` was declined in WOR-2670 but compiles as a transform"
+            error.contains("unknown transform type"),
+            "`{declined}` must be refused as an unknown type, not for some other \
+             reason that would mask its arrival: {error}"
         );
     }
     for declined in ["loadbalancer_adv", "advanced_lb", "orchestration"] {
-        let result = compile_action(&serde_json::json!({ "type": declined }));
+        let error = compile_action(&serde_json::json!({ "type": declined }))
+            .expect_err("`{declined}` was declined in WOR-2671 but compiles as an action")
+            .to_string();
         assert!(
-            result.is_err(),
-            "`{declined}` was declined in WOR-2671 but compiles as an action"
+            error.contains("unknown action type"),
+            "`{declined}` must be refused as an unknown type, not for some other \
+             reason that would mask its arrival: {error}"
         );
     }
 }

@@ -1,9 +1,10 @@
 # A/B test routing
 
-*Last modified: 2026-08-22*
+*Last modified: 2026-08-28*
 
-A weighted 50/50 traffic split between two backend variants. An existing sticky
-cookie pins a returning client; the action does not issue that cookie. To make the
+A weighted 50/50 traffic split between two backend variants. The first request
+from a client takes a weighted pick and the response hands back a sticky cookie;
+every request after it that returns the cookie stays on the same variant. To make the
 split visible without local infrastructure, the two variants point at the
 same pair of keyless public APIs [`load-balancer-deployment`](../load-balancer-deployment/) uses: `fakestoreapi.com` (control) and `dummyjson.com` (experiment), which return different response shapes for the same `/products/1` path.
 
@@ -38,10 +39,27 @@ done
 # ... (five identical experiment hits)
 ```
 
-The action never sets the sticky cookie on the response; there is no
-response-side hook for it. A caller (typically the app itself, on first
-visit) sets the cookie explicitly once it knows which variant it landed
-on, and every later request carrying it pins deterministically.
+Look at the response headers on that first call and you will see the pin
+the proxy set:
+
+```bash
+curl -si -H 'Host: app.local' http://127.0.0.1:8080/products/1 | grep -i set-cookie
+# set-cookie: sb_ab_variant=experiment; Path=/; Max-Age=2592000; SameSite=Lax; HttpOnly
+```
+
+Send it back and the assignment holds:
+
+```bash
+curl -s -H 'Host: app.local' -H 'Cookie: sb_ab_variant=control' \
+  http://127.0.0.1:8080/products/1 | head -c 120
+# the control backend's response shape, on every repeat
+```
+
+A client that already carries the cookie is not restamped, so the
+thirty-day window counts from its first visit rather than sliding forward
+on every request. Do not set the same cookie from your application as
+well: two `Set-Cookie` headers with one name leave it to the browser
+which pin survives.
 
 ## What this exercises
 
@@ -50,7 +68,8 @@ on, and every later request carrying it pins deterministically.
   handed a `Set-Cookie`, and every request after it that sends the cookie
   back reaches the same variant
 - `sbproxy_action_abtest_variant_selected_total{origin, variant}` incrementing
-  once per request, whether the pick came from the cookie or a fresh roll
+  once per request that resolves to a usable upstream, whether the pick came
+  from the cookie or a fresh roll
 
 ## See also
 

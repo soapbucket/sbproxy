@@ -108,7 +108,7 @@ impl ParsedUserAgent {
             };
         }
 
-        let ua_lower = ua.to_lowercase();
+        let ua_lower = ua.to_ascii_lowercase();
 
         // --- Bot detection ---
         let is_bot = ua_lower.contains("bot")
@@ -182,7 +182,7 @@ impl ParsedUserAgent {
     /// tooling adds to (or fails to change from) the underlying
     /// browser's own UA string.
     pub fn headless_library(ua: &str) -> Option<&'static str> {
-        let ua_lower = ua.to_lowercase();
+        let ua_lower = ua.to_ascii_lowercase();
         // Order matters only where one token could shadow another;
         // none do today, so this list is unordered otherwise.
         const TOKENS: &[(&str, &str)] = &[
@@ -279,10 +279,24 @@ fn detect_os(ua: &str, ua_lower: &str) -> (String, String) {
 
 /// Extract the version string that follows `token` in the UA string.
 /// Stops at the first space, semicolon, or `)`.
+///
+/// `ua_lower` must be `ua.to_ascii_lowercase()`, never
+/// `ua.to_lowercase()`. The byte offset `find` returns is measured
+/// against the lowercased string and then applied to `ua`, which is
+/// sound only while the two have the same length. `str::to_lowercase`
+/// does not promise that: U+0130 is two bytes and lowercases to three,
+/// so a UA built from a few of those would produce an offset past the
+/// end of `ua`. `to_ascii_lowercase` leaves every non-ASCII byte alone
+/// and is length-preserving by construction.
 fn extract_version_after(ua: &str, ua_lower: &str, token: &str) -> Option<String> {
     let pos = ua_lower.find(token)?;
     let start = pos + token.len();
-    let rest = &ua[start..];
+    // Defense in depth against a caller that builds `ua_lower` some
+    // other way: an offset that is out of range, or that lands
+    // mid-codepoint, yields no version rather than a panic. `parse` is
+    // `pub` and re-exported from the crate root, so this is reachable
+    // from outside this module.
+    let rest = ua.get(start..)?;
     let end = rest.find([' ', ';', ')']).unwrap_or(rest.len());
     let version = &rest[..end];
     if version.is_empty() {
@@ -471,6 +485,41 @@ mod tests {
         let policy = UserAgentPolicy::from_config(val).unwrap();
         assert_eq!(policy.inject_header, "x-ua-info");
         assert!(!policy.inject);
+    }
+
+    /// `parse` is `pub` and re-exported from the crate root, so it has
+    /// to survive a `&str` that is not visible ASCII, whatever
+    /// `HeaderValue::to_str` does or does not guarantee at the one call
+    /// site inside this workspace.
+    ///
+    /// The specific hazard is byte-offset arithmetic across a case
+    /// conversion. U+0130 is two bytes and `str::to_lowercase` maps it
+    /// to three, so with the old `to_lowercase` the offset found in the
+    /// lowercased string ran past the end of the original and
+    /// `&ua[start..]` panicked. Four of them are enough to push the
+    /// offset past `ua.len()`; a shorter run lands mid-codepoint and
+    /// panics on the boundary assertion instead. Both are covered here.
+    #[test]
+    fn parse_survives_a_user_agent_whose_case_conversion_changes_its_length() {
+        for prefix_len in 1..=6 {
+            let ua = format!("{}Chrome/120.0.0.0", "\u{130}".repeat(prefix_len));
+            let parsed = ParsedUserAgent::parse(&ua);
+            // The only property under test is that this returns rather
+            // than panicking. What it extracts from a UA like this is
+            // not something a caller should rely on.
+            assert!(
+                !parsed.device_type.is_empty(),
+                "parse must return a device_type for {ua:?}"
+            );
+        }
+
+        // The same hazard through the other entry point that searches a
+        // lowercased copy.
+        assert_eq!(
+            ParsedUserAgent::headless_library("\u{130}\u{130}HeadlessChrome/120"),
+            Some("headless_chrome"),
+            "an ASCII token is still found past a non-ASCII prefix"
+        );
     }
 
     #[test]

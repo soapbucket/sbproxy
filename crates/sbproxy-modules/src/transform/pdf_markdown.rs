@@ -37,6 +37,18 @@
 //! is worse than no label. See
 //! `dashboards/grafana/sbproxy-overview.json` for the paired panel.
 //!
+//! # Where the projection goes
+//!
+//! `sbproxy-core`'s ctx-aware transform dispatch calls
+//! [`PdfToMarkdownTransform::decode`] directly and puts the result on
+//! `ctx.markdown_projection` and `ctx.markdown_token_estimate`, the
+//! same two fields `html_to_markdown` populates. That is what makes the
+//! "same shape whichever source format the origin served" claim true:
+//! `json_envelope` reads `ctx.markdown_projection.title`, so a PDF
+//! origin now fills the envelope's `title` the way an HTML one does.
+//! [`PdfToMarkdownTransform::apply`] is the plain `Transform` path,
+//! which has no context to write to and keeps only the body.
+//!
 //! # What a decode failure does not say
 //!
 //! `error_kind` is a closed enum and [`PdfDecodeError::detail`] is a
@@ -75,8 +87,8 @@ pub struct PdfConfig {
     pub extract_text: bool,
 
     /// Reserved. Table-layout reconstruction is not implemented;
-    /// setting this to `true` logs a `tracing::warn!` and is
-    /// otherwise a no-op.
+    /// setting this to `true` logs one `tracing::warn!` at config load
+    /// and is otherwise a no-op.
     #[serde(default)]
     pub extract_tables: bool,
 
@@ -252,6 +264,17 @@ impl PdfToMarkdownTransform {
     /// Build a transform from a YAML-shaped JSON config.
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
         let config: PdfConfig = serde_json::from_value(value)?;
+        if config.extract_tables {
+            // Once, at config load, rather than once per decoded PDF.
+            // This is a fact about the operator's config, not about any
+            // request, and a `warn` on the response path is kept in
+            // release builds and cannot be turned down without editing
+            // the config it is complaining about.
+            tracing::warn!(
+                transform = "pdf_markdown",
+                "extract_tables is not implemented; treating it as false"
+            );
+        }
         Ok(Self { config })
     }
 
@@ -260,15 +283,27 @@ impl PdfToMarkdownTransform {
     /// Pure synchronous function, exposed so unit tests can drive the
     /// decoder directly.
     pub fn decode(&self, bytes: &[u8]) -> Result<MarkdownProjection, PdfDecodeError> {
+        // The metric and the log live here rather than in `apply`
+        // because `apply` is no longer the only caller: `sbproxy-core`'s
+        // ctx-aware transform dispatch calls `decode` directly so it can
+        // keep the projection's title and token estimate. Recording at
+        // the point of failure keeps both paths counted.
+        self.decode_inner(bytes).inspect_err(|err| {
+            record_pdf_decode_error(err.kind);
+            tracing::error!(
+                kind = err.kind.as_str(),
+                detail = %err.detail,
+                "pdf_markdown decode failed"
+            );
+        })
+    }
+
+    fn decode_inner(&self, bytes: &[u8]) -> Result<MarkdownProjection, PdfDecodeError> {
         if bytes.is_empty() {
             return Err(PdfDecodeError {
                 kind: DecodeErrorKind::EmptyBody,
                 detail: "response body has zero bytes".to_string(),
             });
-        }
-
-        if self.config.extract_tables {
-            tracing::warn!("pdf_markdown: extract_tables is not implemented; treating as false");
         }
 
         // Read metadata + page count via lopdf even when `extract_text`
@@ -327,7 +362,10 @@ impl PdfToMarkdownTransform {
         let ratio = self.config.token_bytes_ratio.clamp(0.0, 4.0);
         let token_estimate = (body.len() as f32 * ratio) as u32;
 
-        tracing::info!(
+        // `debug`, not `info`: this fires once per decoded PDF response,
+        // and the operator-facing record of a successful decode is
+        // `sbproxy_transform_pdf_pages_decoded_total` above.
+        tracing::debug!(
             pages_decoded = kept.len(),
             truncated = truncated,
             token_estimate = token_estimate,
@@ -358,22 +396,12 @@ impl PdfToMarkdownTransform {
             return Ok(());
         }
 
-        match self.decode(body.as_ref()) {
-            Ok(projection) => {
-                body.clear();
-                body.extend_from_slice(projection.body.as_bytes());
-                Ok(())
-            }
-            Err(err) => {
-                record_pdf_decode_error(err.kind);
-                tracing::error!(
-                    kind = err.kind.as_str(),
-                    detail = %err.detail,
-                    "pdf_markdown decode failed"
-                );
-                Err(err.into())
-            }
-        }
+        // `decode` records and logs its own failures, so this only has
+        // to carry the error outward.
+        let projection = self.decode(body.as_ref())?;
+        body.clear();
+        body.extend_from_slice(projection.body.as_bytes());
+        Ok(())
     }
 }
 

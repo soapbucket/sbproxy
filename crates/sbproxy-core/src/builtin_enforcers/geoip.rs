@@ -71,6 +71,12 @@ impl PolicyEnforcer for GeoIpEnforcer {
             }
         };
 
+        // `has_database` and `lookup` below are both pure memory
+        // access: the database was read in `GeoIpPolicy::from_config`,
+        // on the config thread. That matters because everything up to
+        // the `Box::pin` at the end of this function runs synchronously
+        // on a tokio worker, so a file read here would stall every
+        // request in flight on that thread rather than only this one.
         if !policy.has_database() {
             record_lookup("no_database");
             return Box::pin(async move { Ok(PolicyDecision::Allow) });
@@ -129,10 +135,12 @@ mod tests {
     use sbproxy_modules::GeoIpPolicy;
 
     fn enforcer(inject_headers: bool) -> GeoIpEnforcer {
-        GeoIpEnforcer(Arc::new(GeoIpPolicy {
-            database_path: None,
-            inject_headers,
-        }))
+        GeoIpEnforcer(Arc::new(
+            GeoIpPolicy::from_config(serde_json::json!({
+                "inject_headers": inject_headers
+            }))
+            .expect("valid geoip config"),
+        ))
     }
 
     #[tokio::test]
