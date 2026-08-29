@@ -668,6 +668,81 @@ fn revision_consumed_tells_a_validation_refusal_from_a_spent_number() {
     sbproxy_core::config_authority::clear_process_authority();
 }
 
+/// The other direction, which is the one that was never asserted.
+///
+/// Without this the wire value could be hardcoded `false` again and every
+/// test in the tree would stay green: the refusal above is the direction
+/// the old code already gave. So this drives a real failure *after*
+/// `reserve_revision` has returned and asserts the operator is told the
+/// number is gone.
+#[test]
+fn a_store_failure_after_the_reservation_reports_the_number_as_spent() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let authority = std::sync::Arc::new(published_series(temp.path(), 2));
+
+    // The archive write is the first write `commit` makes, and `commit`
+    // runs after the reservation has already persisted the new
+    // high-water mark. Making that directory read-and-traverse only is
+    // the shape ENOSPC and EACCES both present to `write_atomically`.
+    let archive_dir = temp
+        .path()
+        .join("authority-store")
+        .join("revisions")
+        .join("archive");
+    let original = std::fs::metadata(&archive_dir)
+        .expect("archive dir")
+        .permissions();
+    std::fs::set_permissions(&archive_dir, std::fs::Permissions::from_mode(0o500))
+        .expect("make the archive unwritable");
+
+    // Root bypasses the mode bits, and so do some filesystems. Skipping
+    // is honest; asserting a refusal that never happened is not.
+    let probe = archive_dir.join(".writability-probe");
+    if std::fs::write(&probe, b"x").is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        std::fs::set_permissions(&archive_dir, original).expect("restore permissions");
+        return;
+    }
+
+    sbproxy_core::config_authority::install_process_authority(std::sync::Arc::clone(&authority));
+    let (status, refused) = {
+        let (status, _content_type, body) = sbproxy_core::config_authority::dispatch(
+            "POST",
+            "/admin/config-authority/publish",
+            Some(&payload("api.test", "body-3")),
+        )
+        .expect("the route must be owned by this dispatcher");
+        (
+            status,
+            serde_json::from_str::<serde_json::Value>(&body).expect("a JSON body"),
+        )
+    };
+    sbproxy_core::config_authority::clear_process_authority();
+    std::fs::set_permissions(&archive_dir, original).expect("restore permissions");
+
+    assert_eq!(
+        status, 500,
+        "the authority is at fault, not the payload: {refused}"
+    );
+    assert_eq!(refused["code"], "store_failed", "{refused}");
+    assert_eq!(
+        refused["revision_consumed"], true,
+        "the reservation returned before the store failed, so the number is gone: {refused}",
+    );
+
+    // And it really is gone: the next publication takes the number after
+    // the one that failed, rather than reusing it.
+    let next = authority
+        .publish(&payload("api.test", "body-4"), BundleMode::Overlay)
+        .expect("the store is writable again");
+    assert_eq!(
+        next.revision, 4,
+        "revision 3 was reserved and never reissued, which is what revision_consumed reports",
+    );
+}
+
 #[test]
 fn a_rollback_to_a_revision_the_archive_does_not_hold_is_refused_by_name() {
     let temp = tempfile::tempdir().expect("temp dir");

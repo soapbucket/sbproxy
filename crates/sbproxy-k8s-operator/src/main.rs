@@ -1128,8 +1128,21 @@ async fn try_hot_reload(
 
     let auth_header = read_admin_auth(client, namespace, secret_ref).await?;
 
-    // Find every Pod owned by the proxy Deployment via the standard
-    // selector (`app.kubernetes.io/instance=<sbproxy-name>`).
+    // Select by the standard instance label, then keep only the pods
+    // this operator's own workload created.
+    //
+    // The label alone is a value anyone with `pods/create` in the
+    // namespace can type, and this loop posts the admin Basic credential
+    // in cleartext to every pod it keeps. That is the same disclosure
+    // the fallback probe was fixed for; this is the second path carrying
+    // it, and a fix on one of two paths is not the fix the release note
+    // describes.
+    //
+    // Over-filtering is safe here in a way it would not be elsewhere: a
+    // hot reload that reaches no pod returns `NoPodsFound`, and every
+    // `HotReloadError` falls back to a rollout restart, which reloads
+    // the configuration by replacing the pods. The cost of being wrong
+    // is a restart, not a fleet left on a stale document.
     let pods_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
     let sbp_name = sbproxy
         .metadata
@@ -1139,7 +1152,26 @@ async fn try_hot_reload(
     let lp = ListParams::default().labels(&format!("app.kubernetes.io/instance={sbp_name}"));
     let pods = pods_api.list(&lp).await.map_err(HotReloadError::ListPods)?;
 
-    if pods.items.is_empty() {
+    let deployment = reconcile::deployment_name(sbproxy);
+    let statefulset = reconcile::statefulset_name(sbproxy);
+    let owned: Vec<&Pod> = pods
+        .items
+        .iter()
+        .filter(|pod| {
+            let owned = reconcile::pod_is_operator_owned(pod, &deployment, &statefulset);
+            if !owned {
+                tracing::warn!(
+                    pod = %pod.metadata.name.as_deref().unwrap_or("?"),
+                    namespace = %namespace,
+                    "a pod carries this SBProxy's instance label but was not created by its \
+                     workload; not reloading it and not sending it the admin credential",
+                );
+            }
+            owned
+        })
+        .collect();
+
+    if owned.is_empty() {
         return Err(HotReloadError::NoPodsFound);
     }
 
@@ -1149,13 +1181,22 @@ async fn try_hot_reload(
         .build()
         .map_err(HotReloadError::HttpClient)?;
 
-    for pod in &pods.items {
+    for pod in owned {
         let pod_ip = pod
             .status
             .as_ref()
             .and_then(|s| s.pod_ip.as_deref())
             .ok_or(HotReloadError::PodHasNoIp)?;
-        let url = format!("http://{pod_ip}:{admin_port}/admin/reload");
+        // A bare IPv6 literal has to be bracketed or the URL does not
+        // parse, and the whole fleet would fall back to a rollout
+        // restart on every config change. The probe sibling carries the
+        // same bracketing.
+        let authority = if pod_ip.contains(':') {
+            format!("[{pod_ip}]")
+        } else {
+            pod_ip.to_string()
+        };
+        let url = format!("http://{authority}:{admin_port}/admin/reload");
         let resp = http
             .post(&url)
             .header("authorization", &auth_header)
@@ -1362,9 +1403,22 @@ async fn read_fallback_reports(
             }
             Err(error) => {
                 sbproxy_observe::metrics::record_operator_fallback_probe("unreadable");
+                // Serde's classification, not its message. `invalid
+                // type` and friends quote the offending value, so
+                // `%error` would put pod-supplied bytes on this line.
+                // The pod is the untrusted end of this call and the
+                // reason it hands back is already re-bounded below;
+                // this is the same rule applied to the parse failure.
                 tracing::debug!(
                     pod = %name,
-                    error = %error,
+                    error_line = error.line(),
+                    error_column = error.column(),
+                    error_class = %match error.classify() {
+                        serde_json::error::Category::Io => "io",
+                        serde_json::error::Category::Syntax => "syntax",
+                        serde_json::error::Category::Data => "data",
+                        serde_json::error::Category::Eof => "eof",
+                    },
                     "a proxy pod answered the fallback route with a body this operator cannot \
                      read; treating it as not pinned",
                 );
@@ -2189,6 +2243,41 @@ mod tests {
             7,
             "the leader fence guards the five config write sites plus the credentialed pod \
              probe, plus its own definition",
+        );
+    }
+
+    /// The detector has to be as wide as the thing it protects.
+    ///
+    /// The round-one Blocker was that the operator sent its admin
+    /// credential to any pod carrying the instance label. The fix added
+    /// `pod_is_operator_owned` to the fallback probe and stopped there,
+    /// while `try_hot_reload` went on posting the same credential to the
+    /// same unfiltered list. One of two paths fixed reads as fixed to
+    /// anyone checking the path the finding cited, which is how it
+    /// survived two rounds.
+    ///
+    /// So this counts the credential sends rather than the check: every
+    /// place that puts `authorization` on a request to a pod must have
+    /// an ownership filter, and adding a third sender without one moves
+    /// these two numbers apart.
+    ///
+    /// What it cannot see: a credential sent from another crate, or one
+    /// built with a differently spelled header call. Both are caught by
+    /// the driven-reconcile tests rather than here.
+    #[test]
+    fn every_credentialed_pod_request_is_filtered_by_ownership() {
+        let src = production_source();
+        let senders = src.matches("header(\"authorization\"").count();
+        let checks = src.matches("pod_is_operator_owned(").count();
+        assert_eq!(
+            senders, 2,
+            "the credentialed pod requests are the fallback probe and the hot reload; a third \
+             needs an ownership filter and a line here saying so",
+        );
+        assert_eq!(
+            checks, senders,
+            "every path that sends a pod the admin credential must first check the pod is one \
+             this operator's own workload created",
         );
     }
 }

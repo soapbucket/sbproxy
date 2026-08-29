@@ -221,7 +221,13 @@ pub fn etag_for(revision: u64, content_digest: &str) -> String {
 }
 
 /// Why a publication was refused.
+///
+/// Marked `#[non_exhaustive]` like the sibling `AggregateError` and
+/// [`RollbackError`], for the same reason: a publish has more than
+/// these ways to fail and a caller that matches exhaustively would
+/// break on the next one.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum PublishError {
     /// The payload was empty or past the accepted size.
     #[error("config authority publish rejected: {0}")]
@@ -243,8 +249,24 @@ pub enum PublishError {
     #[error("config authority publish failed while signing: {0}")]
     Signing(String),
     /// The durable store refused or could not persist the publication.
+    ///
+    /// Reached only **after** the revision number was reserved, so the
+    /// number is spent. A store failure while reserving it is
+    /// [`Self::Reserve`], which is a different answer to
+    /// `revision_consumed` and the reason the two are separate variants
+    /// rather than one `#[from]`.
     #[error("config authority publish failed at the store: {0}")]
     Store(#[from] AuthorityStoreError),
+    /// The durable store could not reserve a revision number.
+    ///
+    /// Carries the same `store_failed` code on the wire as
+    /// [`Self::Store`], because an operator's remedy is identical, but
+    /// reports `revision_consumed: false`: `reserve_revision` persists
+    /// the new high-water mark before it returns, so a failure inside it
+    /// leaves the counter exactly where it was. ENOSPC is the case that
+    /// reaches this.
+    #[error("config authority publish failed at the store: {0}")]
+    Reserve(AuthorityStoreError),
     /// The payload reaches for a host resource only the subscriber's own
     /// operator may reach (WOR-2433).
     #[error("config authority publish rejected: {0}")]
@@ -270,7 +292,7 @@ impl PublishError {
             Self::ModelRuntime(_) => "model_runtime_invalid",
             Self::Confinement(_) => "confinement_refused",
             Self::Signing(_) => "signing_failed",
-            Self::Store(_) => "store_failed",
+            Self::Store(_) | Self::Reserve(_) => "store_failed",
             Self::Internal(_) => "internal",
         }
     }
@@ -281,10 +303,18 @@ impl PublishError {
     /// Every validation step runs before [`AuthorityStore::reserve_revision`],
     /// so a payload the operator has to fix costs nothing and the next
     /// publication takes the number this one would have had. Everything
-    /// from signing onward happens after the reservation, and a
-    /// reservation is never given back: the counter is a promise that a
-    /// number is never reissued, which is what makes a subscriber's
-    /// anti-replay cursor safe.
+    /// after the reservation returns is spent, and a reservation is
+    /// never given back: the counter is a promise that a number is never
+    /// reissued, which is what makes a subscriber's anti-replay cursor
+    /// safe.
+    ///
+    /// The boundary is the reservation *returning*, not the call being
+    /// made. `reserve_revision` persists the new high-water mark before
+    /// it returns, so a failure inside it leaves the counter untouched;
+    /// that case is [`Self::Reserve`] and answers `false`, while
+    /// [`Self::Store`] is only reachable from `commit`, after the number
+    /// is already spent. Collapsing the two into one `#[from]` made an
+    /// ENOSPC during reservation claim a gap that is not there.
     ///
     /// The admin response reports this as `revision_consumed`. Reporting
     /// `false` unconditionally was wrong for exactly these three
@@ -750,7 +780,10 @@ impl ConfigAuthority {
 
         // Validation passed, so the number is now safe to spend.
         let mut store = self.lock_store();
-        let revision = store.reserve_revision()?;
+        // Not the `#[from]`: a failure *inside* the reservation leaves the
+        // counter where it was, and reporting it as a spent number would
+        // tell an operator to expect a gap that is not there.
+        let revision = store.reserve_revision().map_err(PublishError::Reserve)?;
         let bundle = ConfigBundle::new(
             self.authority_id.as_str(),
             revision,
@@ -2591,12 +2624,28 @@ origins:
             PublishError::Construct("nope".to_string()),
             PublishError::ModelRuntime("nope".to_string()),
             PublishError::Confinement("nope".to_string()),
+            // The reservation's own failure. `reserve_revision` persists
+            // the new high-water mark before it returns, so a failure
+            // inside it leaves the counter where it was; this is the
+            // variant that exists to keep it out of `Store`.
+            PublishError::Reserve(AuthorityStoreError::Corrupt("no space".to_string())),
         ] {
             assert!(
                 !costs_nothing.consumed_revision(),
                 "{costs_nothing:?} is refused before the reservation",
             );
+            assert_ne!(
+                costs_nothing.code(),
+                "",
+                "every variant keeps a wire code: {costs_nothing:?}",
+            );
         }
+        // Both store variants answer the operator's remedy identically,
+        // so they share a code and differ only on what was spent.
+        assert_eq!(
+            PublishError::Reserve(AuthorityStoreError::Corrupt("x".to_string())).code(),
+            "store_failed",
+        );
         for spends in [
             PublishError::Signing("no key".to_string()),
             PublishError::Internal("unreachable".to_string()),

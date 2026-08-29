@@ -3067,8 +3067,14 @@ fn boot_document(
         &std::fs::read_to_string(config_path).unwrap_or_default(),
     );
 
+    // Scrubbed for the same reason the pin four lines below is: this
+    // string is a compile or resolve failure over an operator-authored
+    // document, and the secret resolver echoes an inlined literal
+    // credential verbatim into it. The pin was scrubbed when it became a
+    // product surface and this log line was left, which made the
+    // unscrubbed twin the easier of the two to read.
     tracing::error!(
-        error = %format!("{primary:#}"),
+        error = %crate::config_boot::scrub_boot_failure(&format!("{primary:#}")),
         "the configured document did not boot; walking the config revision ring for the last \
          known good configuration",
     );

@@ -178,7 +178,7 @@ impl PinnedRevision {
     /// anyone with read access to the namespace.
     #[must_use]
     pub fn with_reason(revision: u64, digest: String, reason: &str) -> Self {
-        let scrubbed = redact_secret_echo(&sbproxy_config::scrub_credentials(reason));
+        let scrubbed = scrub_boot_failure(reason);
         let flattened: String = scrubbed
             .chars()
             .map(|character| {
@@ -200,6 +200,18 @@ impl PinnedRevision {
             reason: (!bounded.is_empty()).then_some(bounded),
         }
     }
+}
+
+/// Both scrubs a boot failure needs, in one place.
+///
+/// The pin serves this string on `GET /admin/config/fallback` and the
+/// boot walk logs it at `error!`, and the two have to remove the same
+/// things. They did not: the pin was scrubbed when it became a product
+/// surface and the log line beside it was left echoing an inlined
+/// credential verbatim. One function rather than two call sites is what
+/// keeps the next one from drifting the same way.
+pub(crate) fn scrub_boot_failure(reason: &str) -> String {
+    redact_secret_echo(&sbproxy_config::scrub_credentials(reason))
 }
 
 /// Replace the value the secret resolver echoes between single quotes.

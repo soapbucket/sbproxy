@@ -169,9 +169,7 @@ In CI, to fail a pull request that would change the composed document without sa
 ```console
 $ sbproxy aggregate runtime.yml --out composed.yml --dry-run
 aggregate: composed.yml would change:
-  -    action:
   -      url: https://checkout-us-east-1.internal.example.com
-  +    action:
   +      url: https://checkout-us-west-2.internal.example.com
 $ echo $?
 2
@@ -182,6 +180,17 @@ count, so a CI job asserts on the **exit code**: `2` means the composed
 document would change, `0` means it would not. A file that does not
 exist yet exits `2` with `composed.yml does not exist; composing would
 create it with 3 origins`.
+
+The diff trims the lines the two documents share at the top and at the
+bottom and prints what is left, so a change to one leaf prints that leaf
+and nothing around it: the `action:` line above the url is identical on
+both sides and never appears. The run above is a platform-side edit,
+which leaves every project's resolved commit alone. When the change came
+from a **project** repository instead, its new commit lands in the
+provenance header at the top of the file, so the diff starts there and
+runs down to the last changed line. That is why the exit code, not the
+shape of the output, is what a CI job asserts on. The diff is capped at
+200 lines.
 
 ## When a project pushes something broken
 

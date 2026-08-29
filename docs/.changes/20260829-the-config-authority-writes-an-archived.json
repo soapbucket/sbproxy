@@ -1,4 +1,4 @@
 {
   "type": "fixed",
-  "message": "The config authority writes an archived revision before it rotates the served bundle, so a disk-full or permission error on the ring cannot leave a publish the operator was told had failed to be adopted at the next start. proxy.config_authority.publish.archive_keep now counts revisions a rollback can name, so a ring of one offers one real target rather than none, and the store writes owner-only files and directories."
+  "message": "The config authority store writes owner-only files and directories. Every bundle it persists was created with the process umask, so a signed configuration document was world-readable to any local account on the authority host; files are now 0600 and the store's own directories 0700."
 }

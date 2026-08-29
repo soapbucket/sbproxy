@@ -58,7 +58,7 @@ lineage 4f2a0b18-6c11-4b7a-9a3e-2d1f6c8e0b44, last-known-good revision 41
 REVISION	STATE	BLAST RADIUS	PROVENANCE	APPLIED AT	ACTOR	DIGEST
 43	failed	reload	local_file	2026-08-28T09:12:04.311Z	admin	9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
 42	reverted	reload	local_file	2026-08-28T08:57:31.084Z	admin	b3a10c77a1e4f0d2b0b822cd15d6c15b0f00a08c55ad015a3bf4f1b2b0b822cd
-41	good	hitless	git	2026-08-27T22:04:19.902Z	-	2c26b46b68ffc68ff99b453c1d3041341340d0d0d0d0d0d0d0d0d0d0d0d0d0d0
+41	good	hitless	git	2026-08-27T22:04:19.902Z	boot	2c26b46b68ffc68ff99b453c1d3041341340d0d0d0d0d0d0d0d0d0d0d0d0d0d0
 ```
 
 The columns are tab separated, so `| column -t` renders it and `| cut -f1,2`
@@ -68,19 +68,29 @@ scripts it.
 
 | State | Means |
 |---|---|
-| `applied` | recorded and serving, but its soak window has not closed yet |
+| `applied` | recorded and serving, and no soak verdict has moved it. Usually the window is still open; an inconclusive verdict also closes without moving it, and `soak_revision` on the JSON route is what tells those two apart |
 | `good` | it survived its soak. The `lkg` pointer names exactly one of these |
 | `failed` | its soak closed on a failing verdict. Still serving unless something moved it |
-| `reverted` | the node undid it, which only happens with `soak.auto_revert` armed |
+| `reverted` | a rollback moved off it. Either an operator ran one or a failed soak with `soak.auto_revert` armed did, because both go through the same path and write the same mark |
 
 **`failed` is the row to look for.** A revision that broke traffic and
 lost its soak is `failed`, not `applied`, and that is the situation this
 page is about. An `lkg` several revisions behind, with `failed` rows
 above it, is changes landing and none of them surviving.
 
+`state` is one field, so a revert writes `reverted` over a `failed` mark
+rather than beside it. The soak's own answer is not lost: it stays on
+`soak_verdict`, which is what the boot walk reads when it decides what
+may boot. A `reverted` row is not evidence the soak passed.
+
 `PROVENANCE` is where the *base* document came from, and this release
 emits only `local_file` or `git`. It does not say what triggered the
-apply; `ACTOR` does, and it is `-` for a file-watcher or boot apply.
+apply; `ACTOR` does. Its values are `file_watcher`, `boot`,
+`boot_fallback`, `config_authority`, `config_refresh_poller`,
+`auto_revert`, `rollback` or `rollback:<operator>`, and `api` or the
+authenticated operator's own id. The CLI prints `-` only when the field
+is absent, which no apply path produces, so a `-` in this column means
+you are reading a record this release did not write.
 
 Then diff the two:
 
@@ -260,7 +270,7 @@ boot read; this one is what the fleet rolls back through.
 | Signal | Means |
 |---|---|
 | `sbproxy_config_fallback_active == 1` | a node is serving a configuration nobody applied |
-| `sbproxy_config_apply_total{outcome="reverted"}` moving | a node undid a change on its own, with `auto_revert` armed |
+| `sbproxy_config_apply_total{outcome="reverted"}` moving | a node undid a change on its own, with `auto_revert` armed. This label is narrower than the ring state of the same name: the metric is keyed on the trigger, so an operator-run rollback counts as `applied` here while still writing `reverted` in the history |
 | `sbproxy_config_soak_verdict_total{verdict="failed"}` moving | changes are landing and failing their windows |
 | `sbproxy_config_lkg_revision` flat while revisions land | nothing is being promoted; the fallback target is going stale |
 | `sbproxy_config_authority_rollback_total{result="refused"}` moving | a fleet rollback is being refused at the authority |
