@@ -1471,7 +1471,7 @@
           }
         }
       ],
-      "description": "Whether the customer's key service still answers and still authorizes this proxy. A zero on `sbproxy_root_of_trust_liveness` means credential decryption stops as soon as the unwrap cache lapses, bounded by `key_management.crypto.root_of_trust.unwrap_cache_ttl_secs`. That is the intended outcome after a customer revokes their grant, and an incident otherwise; check `GET /admin/crypto/root-of-trust` to tell them apart. The `unwrap` to `unwrap_cached` ratio is what the cache is actually buying, and the absolute `unwrap` rate is what the key service's own rate limit is sized against. Runbook: docs/key-management.md#customer-managed-root-of-trust."
+      "description": "Whether the customer's key service still answers and still authorizes this proxy. A zero on `sbproxy_root_of_trust_liveness` stops credential decryption immediately: the failed probe drops the cached data keys and every credential this root had opened, so the wait is the probe interval rather than `key_management.crypto.root_of_trust.unwrap_cache_ttl_secs`, which is the worst case with no probe running. Note that the series is only written by the probe itself, so `liveness_interval_secs: 0` leaves it absent and this panel cannot alert. That is the intended outcome after a customer revokes their grant, and an incident otherwise; check `GET /admin/crypto/root-of-trust` to tell them apart. The `unwrap` to `unwrap_cached` ratio is what the cache is actually buying, and the absolute `unwrap` rate is what the key service's own rate limit is sized against. Runbook: docs/key-management.md#customer-managed-root-of-trust."
     },
     {
       "id": 24,

@@ -2474,7 +2474,12 @@ fn rotate_credential(id: &str, body: Option<&str>) -> Resp {
 // --- Break-glass (WOR-2573) and root of trust (WOR-2568) ---
 
 /// Body of `POST /admin/break-glass`.
-#[derive(Deserialize)]
+///
+/// `Default` only so this can go through `parse_body`, which carries
+/// the serde-message scrub. The empty-body case is refused above it,
+/// before a default could be used: a grant with no justification, no
+/// scope, and a zero TTL is exactly what the route rejects.
+#[derive(Deserialize, Default)]
 struct BreakGlassRequestBody {
     /// Why this grant is needed. Read by the post-access reviewer.
     justification: String,
@@ -2487,7 +2492,7 @@ struct BreakGlassRequestBody {
 }
 
 /// Body of `POST /admin/break-glass/{id}/review`.
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct BreakGlassReviewBody {
     /// The reviewer's note. Bounded and non-secret; it lands in the audit
     /// chain beside the grant.
@@ -2516,9 +2521,15 @@ fn break_glass_subroute(method: &str, rest: &str, body: Option<&str>) -> Resp {
         Some("review") => {
             let note = match body {
                 Some(raw) if !raw.trim().is_empty() => {
-                    match serde_json::from_str::<BreakGlassReviewBody>(raw) {
+                    // Through `parse_body`'s scrub, not a raw `{e}`.
+                    // `parse_body`'s own doc says the point of putting
+                    // the scrub there is that "a route added later
+                    // gets it without anyone remembering", and these
+                    // two break-glass bodies were the two routes that
+                    // parsed on their own path and did not.
+                    match parse_body::<BreakGlassReviewBody>(Some(raw)) {
                         Ok(v) => v.note,
-                        Err(e) => return bad_request(&format!("invalid JSON body: {e}")),
+                        Err(resp) => return resp,
                     }
                 }
                 _ => String::new(),
@@ -2537,9 +2548,10 @@ fn create_break_glass_grant(body: Option<&str>) -> Resp {
         return break_glass_error(&crate::break_glass::BreakGlassError::NoActor);
     };
     let request: BreakGlassRequestBody = match body {
-        Some(raw) if !raw.trim().is_empty() => match serde_json::from_str(raw) {
+        // As the review route below: `parse_body` carries the scrub.
+        Some(raw) if !raw.trim().is_empty() => match parse_body(Some(raw)) {
             Ok(v) => v,
-            Err(e) => return bad_request(&format!("invalid JSON body: {e}")),
+            Err(resp) => return resp,
         },
         _ => return bad_request("break-glass requires justification, scope, and ttl_secs"),
     };

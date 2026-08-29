@@ -280,4 +280,24 @@ check_one raw-request-error \
   "$ROOT_DIR/scripts/request-error-ratchet-baseline.count" \
   "raw reqwest errors at a log site" || fail=1
 
+# What these two counts cannot see, printed every run rather than left in
+# a header nobody opens. A guard narrower than its claim is worse than no
+# guard, because the green line reads as coverage.
+#
+# The raw-request-error count is `reqwest`-only, by construction: it keys
+# on `reqwest::Error` at a log site. `sbproxy-vault` reaches Vault, Azure
+# Key Vault, and GCP Secret Manager through `ureq` instead, and `ureq`'s
+# own `Display for Transport` ends with the URL it dialed, userinfo and
+# all. Those four call sites are covered by tests rather than by this
+# ratchet: `transit.rs` has one that dials a real closed port and asserts
+# the address never reaches the rendered error, and `hashicorp.rs`,
+# `azure.rs`, and `gcp.rs` have none.
+cat <<'NOTE'
+  not covered: `ureq` clients. The raw-request-error count keys on
+  reqwest::Error, so the four ureq call sites in sbproxy-vault
+  (transit.rs, hashicorp.rs, azure.rs, gcp.rs) are outside it. ureq's
+  Transport Display carries the dialed URL including userinfo. Only
+  transit.rs has a test pinning that today.
+NOTE
+
 exit "$fail"

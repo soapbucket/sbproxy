@@ -344,7 +344,17 @@ pub(crate) fn note_key_store_outage(plane: &KeyPlane, entrypoint: &'static str) 
 }
 
 /// An upstream credential resolved into the exact header the proxy writes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is hand-written and redacts, because `value` is the full header
+/// value and `material` is the bare decrypted upstream secret: this type is
+/// the plaintext, not a reference to it. Nothing formats it today, which is
+/// exactly the state every one of this workspace's `Debug` leaks was in the
+/// day before it was formatted. It is the type at the centre of the
+/// customer-managed claim, since `resolved_credentials` is the cache a
+/// failed liveness probe exists to purge, so it gets the same treatment as
+/// the five types in `scripts/secret-debug-registry.txt` and a line of its
+/// own there.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ResolvedCredential {
     /// Lowercase header name to set on the upstream request.
     pub header: String,
@@ -361,6 +371,22 @@ pub struct ResolvedCredential {
     /// site would make every such caller re-derive a fact this
     /// resolution already had.
     pub material: String,
+}
+
+impl std::fmt::Debug for ResolvedCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedCredential")
+            .field("header", &self.header)
+            .field(
+                "value",
+                &format_args!("[REDACTED] ({} bytes)", self.value.len()),
+            )
+            .field(
+                "material",
+                &format_args!("[REDACTED] ({} bytes)", self.material.len()),
+            )
+            .finish()
+    }
 }
 
 /// Why a key's bound credential could not be presented.
@@ -546,6 +572,39 @@ pub fn invalidate_all_resolved_credentials() {
     }
 }
 
+/// Drop every cached resolved secret that carries an externally imposed
+/// deadline, and leave the rest alone.
+///
+/// This is what a failed root-of-trust liveness probe calls. The
+/// distinction is the whole point, and getting it wrong costs an outage.
+///
+/// An entry's `max_hold` is `Some` exactly when something outside this
+/// cache set its expiry: a customer-managed envelope carrying the time left
+/// on the data key that opened it, or a leased credential carrying its
+/// lease. Every credential the customer's root ever opened is in that set,
+/// so purging it keeps the published clause "or at the next failed liveness
+/// probe" true.
+///
+/// `None` covers plaintext, `vault_ref`, and locally-sealed credentials, and
+/// those are also the entries `proxy.secrets.rotation`'s grace window serves
+/// stale from. Dropping them on a Transit failure would discard the
+/// stale-serve safety net for credentials the customer's root never touched,
+/// and the two outages coincide: a Vault outage usually takes the Transit
+/// mount and the KV backend down together, which is precisely the outage the
+/// grace window exists for. A global purge turns "serve stale inside the
+/// grace window" into a hard fail for the whole process, on the tick of a
+/// probe that has nothing to say about those credentials.
+///
+/// The set is a superset of "root-backed" rather than exactly it, because a
+/// lease has a `Some` too. Over-purging a leased entry costs one re-lease;
+/// under-purging a root-backed one costs the product claim. The superset is
+/// the safe side of that.
+pub fn invalidate_root_backed_resolved_credentials() {
+    if let Some(plane) = current_key_plane() {
+        plane.invalidate_root_backed_resolved_credentials();
+    }
+}
+
 impl KeyPlane {
     /// Drop one resolved upstream secret from this plane generation.
     pub(crate) fn invalidate_resolved_credential(&self, id: &str) {
@@ -565,6 +624,14 @@ impl KeyPlane {
     /// Drop every resolved upstream secret from this plane generation.
     pub(crate) fn invalidate_all_resolved_credentials(&self) {
         self.resolved_credentials.lock().clear();
+    }
+
+    /// Drop the resolved secrets whose expiry was set outside this cache.
+    /// See [`invalidate_root_backed_resolved_credentials`].
+    pub(crate) fn invalidate_root_backed_resolved_credentials(&self) {
+        self.resolved_credentials
+            .lock()
+            .retain(|_, entry| entry.max_hold.is_none());
     }
 
     /// Claim the right to announce one stale-serving episode for `id`.
@@ -4485,9 +4552,13 @@ mod resolve_credential_secret_tests {
         }
         // The liveness five are required on the trait, so this double
         // states its trivial answers instead of inheriting them. It runs
-        // no probe and holds no cache of its own.
+        // no probe and holds no cache of its own, and it says the first
+        // half out loud: `Ok(())` beside `last_liveness_ok() == false` is
+        // a probe that succeeded and recorded nothing, which is the exact
+        // wrong-trivial-answer shape whose removal from the trait was the
+        // point of the round.
         async fn probe_liveness(&self) -> anyhow::Result<()> {
-            Ok(())
+            Err(anyhow::anyhow!("this double runs no probe"))
         }
         fn last_liveness_unix(&self) -> Option<u64> {
             None
@@ -4584,9 +4655,94 @@ mod resolve_credential_secret_tests {
         assert_eq!(ceiling, None);
     }
 
+    /// `ResolvedCredential` is the plaintext, not a handle to it: `value`
+    /// is the whole header and `material` is the bare upstream secret.
+    /// Nothing formats it today, which is the state every `Debug` leak in
+    /// `scripts/secret-debug-registry.txt` was in the day before something
+    /// did, and it is the type the customer-managed claim is about.
+    ///
+    /// Restoring `#[derive(Debug)]` reddens this on both fields.
+    #[test]
+    fn debug_never_renders_a_resolved_credential() {
+        let rendered = format!(
+            "{:?}",
+            ResolvedCredential {
+                header: "authorization".to_string(),
+                value: "Bearer RESOLVEDMUSTNOTAPPEAR".to_string(),
+                material: "RESOLVEDMUSTNOTAPPEAR".to_string(),
+            }
+        );
+        assert!(
+            !rendered.contains("RESOLVEDMUSTNOTAPPEAR"),
+            "a resolved credential leaked its secret: {rendered}"
+        );
+        assert!(
+            rendered.contains("ResolvedCredential") && rendered.contains("[REDACTED]"),
+            "the identifier and the mask both have to survive, or a log line stops naming \
+             what failed: {rendered}"
+        );
+        assert!(
+            rendered.contains("authorization"),
+            "the header name is not a secret and is what makes the line useful: {rendered}"
+        );
+    }
+
+    /// A root of trust whose probe always fails, and which counts its own
+    /// purges, so a test can assert the probe's failure arm rather than
+    /// assert that a function it called by hand exists.
+    #[derive(Debug)]
+    struct FailingProbeRoot {
+        window: std::time::Duration,
+        purged: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl sbproxy_keystore::crypto::RootOfTrust for FailingProbeRoot {
+        fn kek_name(&self) -> &str {
+            "stub/failing-probe"
+        }
+        async fn wrap_dek(&self, dek: &[u8]) -> anyhow::Result<String> {
+            Ok(format!("stub:v1:{}", hex::encode(dek)))
+        }
+        async fn unwrap_dek(
+            &self,
+            wrapped: &str,
+        ) -> anyhow::Result<sbproxy_keystore::crypto::UnwrappedDek> {
+            let body = wrapped
+                .strip_prefix("stub:v1:")
+                .ok_or_else(|| anyhow::anyhow!("not a stub ciphertext"))?;
+            Ok(sbproxy_keystore::crypto::UnwrappedDek {
+                dek: hex::decode(body)?,
+                valid_for: self.window,
+            })
+        }
+        fn revocation_window(&self) -> std::time::Duration {
+            self.window
+        }
+        // The point of the double: the customer revoked, so the probe
+        // fails. Everything else answers honestly.
+        async fn probe_liveness(&self) -> anyhow::Result<()> {
+            Err(anyhow::anyhow!("grant revoked"))
+        }
+        fn last_liveness_unix(&self) -> Option<u64> {
+            None
+        }
+        fn last_liveness_ok(&self) -> bool {
+            false
+        }
+        fn cached_dek_count(&self) -> usize {
+            0
+        }
+        fn purge_cache(&self) {
+            self.purged
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     /// The published clause "or at the next failed liveness probe,
     /// whichever comes first" has to be true of the cache the customer is
-    /// actually testing.
+    /// actually testing, and false of the credentials that root never
+    /// opened.
     ///
     /// `purge_cache` drops wrapped data keys. The resolved-credential
     /// cache holds credentials this process already decrypted and serves
@@ -4597,50 +4753,109 @@ mod resolve_credential_secret_tests {
     /// Three published sentences and a runnable walkthrough are built on
     /// that clause.
     ///
-    /// So this test asserts the probe's failure arm empties the
-    /// resolved-credential cache, through the real
-    /// `resolve_credential_secret` path: warm it, run the failure arm,
-    /// and require a second resolution to go back to the store.
+    /// This test drives `key_root_of_trust::probe_once`, which is the
+    /// real failure arm, with a root whose probe returns `Err`. The
+    /// version it replaces called `invalidate_all_resolved_credentials()`
+    /// by hand: that function was `pub` and pre-existing, so the test
+    /// asserted something that already worked and deleting the line the
+    /// whole round exists to add left it green.
+    ///
+    /// Two assertions, and the second is not decoration. A customer-managed
+    /// entry must go, and a plaintext entry must **stay**: it is what
+    /// `proxy.secrets.rotation`'s grace window serves stale from, the
+    /// customer's root never opened it, and a Vault outage takes the
+    /// Transit mount and the KV backend down together, so a global purge
+    /// cancels the grace window at exactly the moment it is needed.
     #[tokio::test]
-    async fn a_failed_liveness_probe_drops_already_decrypted_credentials() {
+    async fn a_failed_liveness_probe_drops_the_credentials_the_root_opened() {
         let _guard = crate::key_plane::test_plane_guard();
-        let plane = Arc::new(plane());
+        let root = Arc::new(FailingProbeRoot {
+            window: std::time::Duration::from_secs(600),
+            purged: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let crypto =
+            KeyCrypto::new(b"pep".to_vec(), b"master".to_vec()).with_root_of_trust(root.clone());
+        let store = Arc::new(MemoryKeyStore::new());
+        let cache = Arc::new(TtlCache::new(
+            store as Arc<dyn KeyStore>,
+            TtlCacheConfig::default(),
+        ));
+        let plane = Arc::new(KeyPlane::from_parts(crypto, cache, false, false, None));
         crate::key_plane::install_key_plane_for_test(plane.clone());
 
+        // One credential the customer's root opened, and one it never
+        // touched.
+        let envelope = plane
+            .crypto()
+            .seal_async("cred-cmk", b"cmk-secret")
+            .await
+            .expect("seal under the customer-managed root");
+        assert!(
+            envelope.kek.is_some(),
+            "the envelope must name its root, or this test is not exercising the CMK path"
+        );
+        put(
+            &plane,
+            credential("cred-cmk", CredentialMaterial::Envelope { envelope }),
+        )
+        .await;
         put(
             &plane,
             credential(
-                "cred-probe-purge",
+                "cred-plain",
                 CredentialMaterial::Plaintext {
-                    value: "upstream-secret".into(),
+                    value: "local-secret".into(),
                 },
             ),
         )
         .await;
 
-        // Warm the resolved-credential cache: this is the entry a revoked
-        // deployment would keep serving upstream.
-        let first = plane
-            .resolve_credential_secret("cred-probe-purge", None)
-            .await
-            .expect("resolves");
-        assert_eq!(first.material, "upstream-secret");
-        assert!(
-            plane.resolved_credential_count() > 0,
-            "the cache must be warm, or this test proves nothing"
+        // Warm both through the real resolution path.
+        assert_eq!(
+            plane
+                .resolve_credential_secret("cred-cmk", None)
+                .await
+                .expect("resolves through the root")
+                .material,
+            "cmk-secret"
         );
-
-        // What the probe's failure arm does. Called directly rather than
-        // through the timer so the test is deterministic; the arm itself
-        // is two calls and this is the one that was missing.
-        crate::key_plane::invalidate_all_resolved_credentials();
-
+        assert_eq!(
+            plane
+                .resolve_credential_secret("cred-plain", None)
+                .await
+                .expect("resolves locally")
+                .material,
+            "local-secret"
+        );
         assert_eq!(
             plane.resolved_credential_count(),
-            0,
-            "a failed probe must drop every already-decrypted credential. Purging only the \
+            2,
+            "both entries must be warm, or this test proves nothing"
+        );
+
+        // The real arm, with a real failing probe behind it.
+        let dyn_root: Arc<dyn sbproxy_keystore::crypto::RootOfTrust> = root.clone();
+        crate::key_root_of_trust::probe_once(&dyn_root).await;
+
+        assert_eq!(
+            root.purged.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the failure arm must purge the wrapped data keys"
+        );
+        assert_eq!(
+            plane.resolved_credential_count(),
+            1,
+            "a failed probe must drop every credential the root opened. Purging only the \
              wrapped data keys leaves the credential the customer is testing being served from \
              a cache the probe never touched, which is the published clause being false"
+        );
+        assert!(
+            plane
+                .resolve_credential_secret("cred-plain", None)
+                .await
+                .is_ok(),
+            "the plaintext entry must survive: the customer's root never opened it, and it is \
+             what the stale-serve grace window serves from during the same outage"
         );
     }
 
@@ -4734,9 +4949,10 @@ mod resolve_credential_secret_tests {
             std::time::Duration::from_secs(60)
         }
         // Same reason as `ShortWindowRoot`: no defaults to inherit, so the
-        // double writes down that it neither probes nor caches.
+        // double writes down that it neither probes nor caches, and says
+        // so with an `Err` that matches the `false` below it.
         async fn probe_liveness(&self) -> anyhow::Result<()> {
-            Ok(())
+            Err(anyhow::anyhow!("this double runs no probe"))
         }
         fn last_liveness_unix(&self) -> Option<u64> {
             None

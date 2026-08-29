@@ -244,9 +244,23 @@ impl RootOfTrust for CustomerManagedRoot {
         // Empty trace: the probe runs on a timer with no request behind it,
         // so there is no trace for it to join. The wrap and unwrap paths do
         // have one and carry it.
-        let result = tokio::task::spawn_blocking(move || client.liveness(&[]))
-            .await
-            .context("root-of-trust liveness probe task panicked")?;
+        //
+        // The join is not `?`'d straight through. A panicked probe task
+        // used to propagate before `last_liveness_ok` was stored, so the
+        // caller purged both caches while the admin surface still read
+        // `probe: "ok"` from the previous tick. A join failure is a failed
+        // probe like any other and is recorded as one.
+        let joined = tokio::task::spawn_blocking(move || client.liveness(&[])).await;
+        let result = match joined {
+            Ok(result) => result,
+            Err(join) => {
+                self.last_liveness_ok.store(false, Ordering::Relaxed);
+                sbproxy_observe::metrics::record_root_of_trust_liveness(false);
+                return Err(
+                    anyhow::Error::new(join).context("root-of-trust liveness probe task panicked")
+                );
+            }
+        };
         let ok = result.is_ok();
         self.last_liveness_ok.store(ok, Ordering::Relaxed);
         if ok {
@@ -325,40 +339,59 @@ pub async fn run_liveness_probe(root: Arc<dyn RootOfTrust>, interval: Duration) 
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
-        if let Err(error) = root.probe_liveness().await {
-            // The mount and the key name are operator-chosen non-secrets;
-            // the token never appears.
-            tracing::warn!(
-                kek = %root.kek_name(),
-                error = %error,
-                "customer-managed root of trust is not answering; dropping cached data keys and \
-                 every already-decrypted credential so decryption stops now rather than at the \
-                 end of each cache window"
-            );
-            // Both caches, and the second one is the point.
-            //
-            // `purge_cache` drops the wrapped data keys. It does not touch
-            // the resolved-credential cache, which holds credentials this
-            // process already decrypted and serves them upstream without
-            // consulting the root of trust at all. Purging only the first
-            // makes the published clause "or at the next failed liveness
-            // probe, whichever comes first" false by up to the whole
-            // revocation window: a credential resolved before the
-            // revocation keeps going upstream for its full inherited
-            // deadline while `GET /admin/crypto/root-of-trust` reports
-            // `cached_data_keys: 0`, which reads as "nothing left to age
-            // out" and is backwards.
-            //
-            // Dropping every resolved credential rather than only the
-            // customer-managed ones is deliberate: this cache is keyed by
-            // credential id and does not record which root opened each
-            // entry, and a probe failure is rare and cheap to over-react
-            // to. The cost is one re-resolution per credential in flight;
-            // the alternative is a published sentence that is not true.
-            root.purge_cache();
-            crate::key_plane::invalidate_all_resolved_credentials();
-        }
+        probe_once(&root).await;
     }
+}
+
+/// One tick of [`run_liveness_probe`]: probe, and on failure drop what a
+/// revocation has to reach.
+///
+/// A free function rather than the body of the loop, and that is the
+/// difference between a test and a claim. The loop above has no seam: a
+/// test can only reach it by spawning it against a clock, so the failure
+/// arm shipped for a whole round with a test named after it that called
+/// [`crate::key_plane::invalidate_root_backed_resolved_credentials`]
+/// directly and therefore asserted a function that already worked.
+/// Deleting either call below now reddens
+/// `a_failed_liveness_probe_drops_the_credentials_the_root_opened`.
+pub(crate) async fn probe_once(root: &Arc<dyn RootOfTrust>) {
+    let Err(error) = root.probe_liveness().await else {
+        return;
+    };
+    // The mount and the key name are operator-chosen non-secrets;
+    // the token never appears.
+    tracing::warn!(
+        kek = %root.kek_name(),
+        error = %error,
+        "customer-managed root of trust is not answering; dropping cached data keys and every \
+         credential it opened so decryption stops now rather than at the end of each cache window"
+    );
+    // Both caches, and the second one is the point.
+    //
+    // `purge_cache` drops the wrapped data keys. It does not touch the
+    // resolved-credential cache, which holds credentials this process
+    // already decrypted and serves them upstream without consulting the
+    // root of trust at all. Purging only the first makes the published
+    // clause "or at the next failed liveness probe, whichever comes
+    // first" false by up to the whole revocation window: a credential
+    // resolved before the revocation keeps going upstream for its full
+    // inherited deadline while `GET /admin/crypto/root-of-trust` reports
+    // `cached_data_keys: 0`, which reads as "nothing left to age out"
+    // and is backwards.
+    //
+    // The second call is scoped rather than global, and the scope is
+    // load-bearing in the other direction. It drops every entry carrying
+    // an externally imposed deadline, which is a superset of everything
+    // this root ever opened, and leaves plaintext, `vault_ref`, and
+    // locally-sealed entries alone. Those are what
+    // `proxy.secrets.rotation`'s grace window serves stale from, and a
+    // Vault outage usually takes the Transit mount and the KV backend
+    // down together: a global purge would turn "serve stale inside the
+    // grace window" into a hard fail for credentials this probe has
+    // nothing to say about, on the tick of the outage the grace window
+    // exists for.
+    root.purge_cache();
+    crate::key_plane::invalidate_root_backed_resolved_credentials();
 }
 
 fn now_unix() -> u64 {

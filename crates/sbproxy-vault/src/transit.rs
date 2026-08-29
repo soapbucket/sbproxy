@@ -232,7 +232,44 @@ impl TransitClient {
             .context("vault transit: decrypt returned plaintext that is not base64")
     }
 
-    /// Confirm the key exists and this token is still authorized for it.
+    /// Confirm this token is still authorized for the two operations the
+    /// credential path actually performs.
+    ///
+    /// A wrap and an unwrap of a fixed non-secret probe value, not a read
+    /// of the key. That distinction is the whole point and it was wrong in
+    /// both directions before.
+    ///
+    /// `GET transit/keys/<name>` needs `read` on `transit/keys/<name>`.
+    /// Encrypt and decrypt need `update` on `transit/encrypt/<name>` and
+    /// `transit/decrypt/<name>`. Those are different capabilities, and the
+    /// least-privilege policy a customer is told to write, the one in
+    /// `docs/key-management.md`, grants the second pair and not the first.
+    /// So a key-read probe:
+    ///
+    /// * **fails forever on a healthy deployment.** The 403 maps to
+    ///   `Unauthorized`, so every `liveness_interval_secs` the proxy
+    ///   dropped its data keys and, as of this branch, every credential the
+    ///   root had opened, then re-resolved all of them against the
+    ///   customer's Vault. A permanent warn, a permanent
+    ///   `probe: "failed_or_never_run"` on the admin surface, and a
+    ///   revocation signal that means nothing because it never stops.
+    /// * **succeeds forever through a real revocation.** A customer who
+    ///   revokes by dropping the encrypt and decrypt paths from the policy,
+    ///   which is the narrowest way to do it, leaves the key readable. The
+    ///   probe stays green and "or at the next failed liveness probe" never
+    ///   fires. The published `unwrap_cache_ttl_secs` bound still holds, so
+    ///   nothing is unsafe, but the clause the walkthrough demonstrates is
+    ///   dead.
+    ///
+    /// A round trip closes both. It needs exactly the grant the feature
+    /// needs, no more, so it cannot fail on a correctly-scoped policy and
+    /// cannot pass on a revoked one.
+    ///
+    /// The probe value is a constant string, not key material: it is
+    /// encrypted and immediately decrypted, and the ciphertext is
+    /// discarded. Round-tripping it rather than only encrypting is what
+    /// covers `transit/decrypt`, which is the capability a revocation
+    /// usually takes first.
     ///
     /// `trace` as [`Self::wrap`]. The background probe passes an empty
     /// slice: it runs on a timer with no request behind it, so there is no
@@ -240,18 +277,35 @@ impl TransitClient {
     ///
     /// # Errors
     ///
-    /// Any transport failure or non-2xx status. A 403 here is the signal an
-    /// operator wants: the customer revoked the grant and the deployment's
-    /// remaining decrypt capability is bounded by whatever unwrap cache is
-    /// still warm.
+    /// Any transport failure or non-2xx status on either leg. A 403 is the
+    /// signal an operator wants: the customer revoked the grant and the
+    /// deployment's remaining decrypt capability is bounded by whatever
+    /// unwrap cache is still warm.
     pub fn liveness(&self, trace: &[(&'static str, String)]) -> Result<()> {
-        let url = self.url("keys");
-        self.stamp(ureq::get(&url), trace)
-            .call()
-            .map_err(|e| transit_error("keys", &self.config.mount, &self.config.key_name, e))?;
+        let ciphertext = self.wrap(LIVENESS_PROBE_VALUE, trace)?;
+        let roundtrip = self.unwrap(&ciphertext, trace)?;
+        if roundtrip != LIVENESS_PROBE_VALUE {
+            // Not reachable through a correct Transit mount, and worth
+            // failing closed on anyway: an endpoint that answers both legs
+            // with different bytes is not the key this deployment sealed
+            // its credentials under.
+            return Err(anyhow!(
+                "vault transit liveness on '{}/{}': the probe value did not round-trip; the \
+                 endpoint answered but is not the key this deployment wrapped with",
+                self.config.mount.trim_matches('/'),
+                self.config.key_name
+            ));
+        }
         Ok(())
     }
 }
+
+/// The fixed, non-secret value [`TransitClient::liveness`] round-trips.
+///
+/// A constant rather than a random draw so the probe is identical on every
+/// tick and an operator reading a Vault audit log sees one repeated
+/// request rather than traffic they have to account for.
+const LIVENESS_PROBE_VALUE: &[u8] = b"sbproxy root-of-trust liveness probe";
 
 /// Why a Transit call could not complete.
 ///
@@ -430,9 +484,16 @@ mod tests {
     #[test]
     fn a_transit_error_never_carries_the_address_or_ureq_text() {
         let address = "https://sbproxy:hvs.MUSTNOTAPPEAR@vault.internal:8200";
-        // Every arm of the classifier, including the transport arm whose
-        // `ureq::Error` Display writes the URL, and the status arm whose
-        // Display writes it too.
+        // The three status arms of the classifier. These pin the mapping
+        // and the `detail()` wording; they do **not** pin the address,
+        // and the version of this comment that claimed they did was
+        // wrong. `transit_error` takes no `url` and no `self`, and
+        // `ureq::Response::new` synthesizes `https://example.com/`, so no
+        // arm here can carry the operator's address whatever the body of
+        // the function does. The address is pinned by
+        // `a_transit_failure_from_a_real_dial_never_carries_the_address`
+        // below, which is the one that goes red if `{url}` or ureq's own
+        // Display comes back.
         let errors = [
             transit_error(
                 "decrypt",
@@ -494,5 +555,68 @@ mod tests {
             revoked.contains("no longer authorized"),
             "a 403 is the revoked-grant case and must say so: {revoked}"
         );
+    }
+
+    /// The pin that can actually fail, for the property round one's M1 was
+    /// about: the operator's `address` must not reach a rendered error.
+    ///
+    /// The status-arm test above cannot see it. `transit_error`'s
+    /// signature is `(operation, mount, key_name, ureq::Error)`, so the
+    /// address is not reachable from inside the function, and every
+    /// `ureq::Error` it is handed is built from `Response::new`, which
+    /// synthesizes `https://example.com/`. Restoring `{url}` to the
+    /// `anyhow!`, which is the revert this was supposed to hold, leaves it
+    /// green.
+    ///
+    /// This one goes through the real client against a closed port, so the
+    /// `ureq::Error` is a genuine `Transport` whose own `Display` ends
+    /// with the URL it dialed, userinfo included. Two reverts redden it:
+    /// formatting `{url}` into the message, and appending `{error}` or
+    /// `{error:#}` instead of `kind.detail()`.
+    ///
+    /// `127.0.0.1:1` is refused immediately rather than timing out, so
+    /// this costs a connect syscall and no wall clock.
+    #[test]
+    fn a_transit_failure_from_a_real_dial_never_carries_the_address() {
+        let config = TransitConfig {
+            address: "http://sbproxy:hvs.DIALMUSTNOTAPPEAR@127.0.0.1:1".to_string(),
+            mount: "transit".to_string(),
+            key_name: "sbproxy-root".to_string(),
+            token: "hvs.TOKENMUSTNOTAPPEAR".to_string(),
+            namespace: None,
+        };
+        let client = TransitClient::new(config).expect("builds");
+
+        // Both legs of the probe and the two credential-path calls, since
+        // each maps its own `ureq::Error` through `transit_error`.
+        let failures = [
+            client.wrap(b"probe", &[]).expect_err("port 1 refuses"),
+            client.unwrap("stub", &[]).expect_err("port 1 refuses"),
+            client.liveness(&[]).expect_err("port 1 refuses"),
+        ];
+
+        for error in failures {
+            let rendered = format!("{error:#}");
+            for forbidden in [
+                "sbproxy:hvs",
+                "hvs.DIALMUSTNOTAPPEAR",
+                "hvs.TOKENMUSTNOTAPPEAR",
+                "127.0.0.1",
+                ":1",
+            ] {
+                assert!(
+                    !rendered.contains(forbidden),
+                    "a Transit error from a real dial leaked '{forbidden}': {rendered}"
+                );
+            }
+            assert!(
+                rendered.contains("transit") && rendered.contains("sbproxy-root"),
+                "the mount and key name still have to survive: {rendered}"
+            );
+            assert!(
+                rendered.contains("could not be reached"),
+                "a refused connection is the unreachable case: {rendered}"
+            );
+        }
     }
 }

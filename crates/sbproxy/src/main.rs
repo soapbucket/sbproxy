@@ -9318,10 +9318,26 @@ fn handle_config_print(
         .map_err(|e| anyhow::anyhow!("parse config '{}': {e}", path.display()))?;
     let mut value = serde_json::to_value(&config)?;
     mask_secrets(&mut value);
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&value)?);
+    // Then the same pattern pass `GET /admin/config` runs
+    // (`admin.rs:2990`). `mask_secrets` is a key-name allowlist and there
+    // are fields it cannot cover by name: `root_of_trust.address` is an
+    // unparsed URL that may carry userinfo, and `address` is a
+    // non-secret key name almost everywhere else in the schema, so
+    // adding it to the allowlist would mask a dozen fields that are not
+    // secrets to hide one that is. The pattern pass masks the userinfo
+    // by position instead, and leaves the host readable. It preserves
+    // key separators by construction, so the printed document still
+    // parses either way.
+    let rendered = if args.json {
+        serde_json::to_string_pretty(&value)?
     } else {
-        print!("{}", serde_yaml::to_string(&value)?);
+        serde_yaml::to_string(&value)?
+    };
+    let rendered = sbproxy_observe::redact::redact_secrets(&rendered);
+    if args.json {
+        println!("{rendered}");
+    } else {
+        print!("{rendered}");
     }
     Ok(0)
 }

@@ -357,6 +357,15 @@ const MAX_TRACKED_GRANTS: usize = 1024;
 /// 256 bytes where it is truncated.
 const MAX_SCOPE_ENTRIES: usize = 64;
 
+/// How long a reviewer's sign-off note is kept, in bytes.
+const MAX_NOTE_BYTES: usize = 1024;
+
+/// Appended when a note hits [`MAX_NOTE_BYTES`], so the record says a tail
+/// was dropped instead of looking like a note that ended there. A sign-off
+/// silently missing its last sentence is the same defect the note field
+/// exists to fix, one order of magnitude up.
+const NOTE_TRUNCATED_MARKER: &str = "... [truncated]";
+
 /// Process-wide break-glass state.
 #[derive(Default)]
 struct Registry {
@@ -507,9 +516,11 @@ pub(crate) fn approve(id: &str, approver: &str) -> Result<Grant, BreakGlassError
     // person can satisfy is not a two-person rule, and the roster is the
     // place somebody would otherwise "fix" this by adding themselves.
     if grant.requested_by == approver {
+        audit_refusal(grant, "break_glass_approve", approver, "self_approval");
         return Err(BreakGlassError::SelfApproval);
     }
     if !is_approver(&cfg, approver) {
+        audit_refusal(grant, "break_glass_approve", approver, "not_an_approver");
         return Err(BreakGlassError::NotAnApprover(approver.to_string()));
     }
     let state = grant.state(now, cfg.quorum);
@@ -546,15 +557,30 @@ pub(crate) fn approve(id: &str, approver: &str) -> Result<Grant, BreakGlassError
 /// An unknown id, or a grant that never reached the review queue.
 pub(crate) fn review(id: &str, reviewer: &str, note: &str) -> Result<Grant, BreakGlassError> {
     let cfg = config().ok_or(BreakGlassError::Disabled)?;
-    // The same kill-switch guard `request`, `approve`, and `tag_action`
-    // carry. Symmetry rather than behavior: an operator reading whether
-    // the switch is complete should not have to notice that one of four
-    // routes stays live. Grants do not survive a reload that disables the
-    // block anyway, because the registry is process-local and `config()`
-    // reads the installed plane.
-    if !cfg.enabled {
-        return Err(BreakGlassError::Disabled);
-    }
+    // **No `enabled` guard here, and the asymmetry with `request`,
+    // `approve`, and `tag_action` is deliberate.** Those three create or
+    // extend access, so the kill switch has to stop them. This one closes
+    // access out, and a kill switch that blocks the closing-out is not a
+    // kill switch, it is a trap.
+    //
+    // A round of this branch added the guard for symmetry, on the reasoning
+    // that "grants do not survive a reload that disables the block anyway".
+    // That reasoning was simply wrong, and it is written down here because
+    // it is the kind of wrong that reads as obviously true. `registry()` is
+    // a process-global `OnceLock` that nothing outside `reset_for_test`
+    // clears, and a config reload replaces the key plane, not the process,
+    // so every grant survives it. `config()` returns `Some` whenever a
+    // plane is installed, whatever `enabled` says.
+    //
+    // So the guard made every grant awaiting review **permanently
+    // unreviewable**: no grant could reach `Reviewed`, `list()` has no such
+    // guard and kept publishing the queue, and
+    // `sbproxy_break_glass_open{state="awaiting_review"}` (the one alert
+    // `docs/key-management.md` tells operators to build) stayed pinned above
+    // zero forever. `MAX_TRACKED_GRANTS`' retain evicts only terminal
+    // grants, so removing `Reviewed` as a reachable state also removed the
+    // eviction class and the registry grew monotonically to its refusal
+    // ceiling.
     if reviewer.trim().is_empty() {
         return Err(BreakGlassError::NoActor);
     }
@@ -572,9 +598,11 @@ pub(crate) fn review(id: &str, reviewer: &str, note: &str) -> Result<Grant, Brea
     // these off `review` while `approve` has them made the quorum
     // theatre for anyone willing to wait for their own grant to expire.
     if grant.requested_by == reviewer {
+        audit_refusal(grant, "break_glass_review", reviewer, "self_review");
         return Err(BreakGlassError::SelfReview);
     }
     if !is_approver(&cfg, reviewer) {
+        audit_refusal(grant, "break_glass_review", reviewer, "not_an_approver");
         return Err(BreakGlassError::NotAnApprover(reviewer.to_string()));
     }
     let state = grant.state(now, cfg.quorum);
@@ -583,8 +611,13 @@ pub(crate) fn review(id: &str, reviewer: &str, note: &str) -> Result<Grant, Brea
     }
     grant.reviewed_by = Some(reviewer.to_string());
     grant.reviewed_at = Some(now);
-    grant.reviewed_note =
-        (!note.trim().is_empty()).then(|| sbproxy_util::truncate_utf8(note, 1024).to_owned());
+    // With a marker, not silently. Dropping the tail of a sign-off with no
+    // sign that anything was dropped is the same defect one order of
+    // magnitude up from the one this field exists to fix.
+    grant.reviewed_note = (!note.trim().is_empty()).then(|| {
+        sbproxy_util::truncate_utf8_with_marker(note, MAX_NOTE_BYTES, NOTE_TRUNCATED_MARKER)
+            .into_owned()
+    });
     let snapshot = grant.clone();
     drop(grants);
     sbproxy_observe::metrics::record_break_glass("reviewed");
@@ -694,22 +727,67 @@ fn audit(grant: &Grant, op: &str, outcome: &str) {
     audit_with_note(grant, op, outcome, "");
 }
 
+/// Record a **refused** approval or review on the same channel.
+///
+/// The controls this feature is bought for are the two refusals: a
+/// requester cannot approve their own grant and cannot close it out. Both
+/// return before [`audit`] is reached and `record_break_glass` counts
+/// successes only, so an operator caught trying to self-review left an
+/// HTTP 403 and nothing else. That is precisely the event a security
+/// reviewer opens this feature to find, and it was the one event the
+/// feature did not record.
+///
+/// `actor` is the operator who was refused, which is not
+/// `grant.requested_by` in the roster case, so it is passed rather than
+/// read off the grant. The reason is a closed vocabulary of this module's
+/// own literals, never a formatted error, so nothing variable-length
+/// competes for the 256-byte context budget.
+fn audit_refusal(grant: &Grant, op: &str, actor: &str, reason: &'static str) {
+    sbproxy_observe::KeyAuditEntry::new(op, "break_glass", grant.id.clone())
+        .with_actor(actor.to_string())
+        .with_outcome("refused")
+        .with_context(format!(
+            "reason={reason} requested_by={} approvals={}",
+            grant.requested_by,
+            grant.approvals.len()
+        ))
+        .emit();
+    sbproxy_observe::metrics::record_break_glass("refused");
+}
+
 fn audit_with_note(grant: &Grant, op: &str, outcome: &str, note: &str) {
-    // Bounded counters only. `with_context` truncates the whole string to
-    // 256 bytes, and `scope` is bounded two orders of magnitude higher, so
-    // anything variable-length in here evicts whatever follows it. The
-    // scope, the justification, and the reviewer's note all ride the
-    // structured diff below, which is not competing for that budget.
-    let mut entry = sbproxy_observe::KeyAuditEntry::new(op, "break_glass", grant.id.clone())
+    let (context, after) = audit_payload(grant, note);
+    sbproxy_observe::KeyAuditEntry::new(op, "break_glass", grant.id.clone())
         .with_actor(grant.requested_by.clone())
         .with_outcome(outcome)
-        .with_context(format!(
-            "scope_entries={} approvals={} ttl_secs={} actions={}",
-            grant.scope.len(),
-            grant.approvals.len(),
-            grant.ttl_secs,
-            grant.actions_taken,
-        ));
+        .with_context(context)
+        .with_diff(None, Some(after))
+        .emit();
+}
+
+/// The context string and the structured diff for one break-glass record.
+///
+/// A pure function returning both halves, rather than the body of
+/// [`audit_with_note`], because the property that matters here is a
+/// relationship between them and nothing else could see it. `with_context`
+/// truncates to 256 bytes and `scope` is bounded two orders of magnitude
+/// higher, so a grant with a large scope used to evict `approvals=`,
+/// `ttl_secs=` and the reviewer's note out of the record: it dropped the
+/// sign-off on exactly the grants most likely to want one. The fix is the
+/// split below, and putting `scope.join(",")` or ` note={note}` back into
+/// the context reddens `the_context_string_carries_counters_and_the_note_rides_the_diff`.
+/// The route-level test can only see the `Grant` field and stays green
+/// through that revert, which is why this exists.
+fn audit_payload(grant: &Grant, note: &str) -> (String, serde_json::Value) {
+    // Bounded counters only. Everything variable-length rides the diff,
+    // which is not competing for the 256-byte budget.
+    let context = format!(
+        "scope_entries={} approvals={} ttl_secs={} actions={}",
+        grant.scope.len(),
+        grant.approvals.len(),
+        grant.ttl_secs,
+        grant.actions_taken,
+    );
     let mut after = json!({
         "justification": grant.justification,
         "scope": grant.scope,
@@ -721,13 +799,16 @@ fn audit_with_note(grant: &Grant, op: &str, outcome: &str, note: &str) {
     if let Some(recorded) = grant.reviewed_note.as_ref().filter(|n| !n.is_empty()) {
         after["review_note"] = json!(recorded);
     } else if !note.trim().is_empty() {
-        after["review_note"] = json!(sbproxy_util::truncate_utf8(note, 1024));
+        after["review_note"] = json!(sbproxy_util::truncate_utf8_with_marker(
+            note,
+            MAX_NOTE_BYTES,
+            NOTE_TRUNCATED_MARKER
+        ));
     }
     if let Some(reviewer) = &grant.reviewed_by {
         after["reviewed_by"] = json!(reviewer);
     }
-    entry = entry.with_diff(None, Some(after));
-    entry.emit();
+    (context, after)
 }
 
 /// Drop every grant. Test-only; a running process has no reason to forget
@@ -740,6 +821,75 @@ pub(crate) fn reset_for_test() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The split the reviewer's note depends on, at the only level that
+    /// can see it.
+    ///
+    /// `with_context` truncates to 256 bytes. `scope` is bounded at 64
+    /// entries of 256 bytes each, so a grant with a large scope used to
+    /// evict `approvals=`, `ttl_secs=`, and the note itself out of the
+    /// record: the sign-off vanished on exactly the grants most likely to
+    /// want one. The fix moved everything variable-length onto the diff
+    /// and left counters in the context.
+    ///
+    /// Putting `scope.join(",")` or ` note={note}` back into the context
+    /// reddens this. The route-level test
+    /// (`admin_keys::tests::a_reviewers_note_survives_a_large_scope`)
+    /// reads `grant.reviewed_note` off the JSON response and stays green
+    /// through that revert, which is why this test exists beside it.
+    #[test]
+    fn the_context_string_carries_counters_and_the_note_rides_the_diff() {
+        let mut grant = grant_at("alice", 900);
+        grant.scope = (0..40)
+            .map(|i| format!("cred-with-a-long-name-{i:03}"))
+            .collect();
+        grant.approvals.insert("bob".to_string());
+        grant.reviewed_by = Some("dave".to_string());
+
+        let note = "SENTINEL-NOTE-4f2a rotation confirmed, no other credential touched";
+        let (context, after) = audit_payload(&grant, note);
+
+        assert!(
+            context.len() < 256,
+            "the context has to fit the 256-byte budget whole, or the fields after the \
+             overflowing one are simply gone: {context}"
+        );
+        assert_eq!(
+            context, "scope_entries=40 approvals=1 ttl_secs=900 actions=0",
+            "counters only: anything variable-length here evicts what follows it"
+        );
+        for evicted in ["cred-with-a-long-name-000", "SENTINEL-NOTE-4f2a"] {
+            assert!(
+                !context.contains(evicted),
+                "'{evicted}' must not compete for the context budget: {context}"
+            );
+        }
+
+        assert_eq!(
+            after["review_note"], note,
+            "the sign-off is the artifact the review exists to produce and must reach the \
+             record whole: {after}"
+        );
+        assert_eq!(after["scope"].as_array().map(Vec::len), Some(40), "{after}");
+        assert_eq!(after["reviewed_by"], "dave", "{after}");
+    }
+
+    /// A note past the cap says so rather than ending mid-sentence.
+    #[test]
+    fn an_over_long_note_is_marked_rather_than_silently_cut() {
+        let mut grant = grant_at("alice", 900);
+        grant.reviewed_by = Some("dave".to_string());
+        let note = "x".repeat(MAX_NOTE_BYTES + 500);
+
+        let (_, after) = audit_payload(&grant, &note);
+        let recorded = after["review_note"].as_str().expect("a note");
+        assert!(recorded.len() <= MAX_NOTE_BYTES, "{}", recorded.len());
+        assert!(
+            recorded.ends_with(NOTE_TRUNCATED_MARKER),
+            "a sign-off missing its tail with no sign of it is the same defect this field \
+             exists to fix, one order of magnitude up"
+        );
+    }
 
     fn grant_at(requested_by: &str, ttl: u64) -> Grant {
         Grant {

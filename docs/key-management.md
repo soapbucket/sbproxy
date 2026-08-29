@@ -1773,6 +1773,43 @@ The `vault:v1:` prefix on Vault's ciphertext carries the key version, so the
 customer can rotate their Transit key without re-wrapping a single stored
 envelope: old ciphertext names the version that made it.
 
+### The Vault policy, which is the customer's half
+
+The customer creates the Transit key and owns it. sbproxy never creates it and
+never reads it. What the customer grants is a token with exactly two
+capabilities:
+
+```hcl
+# The whole grant. sbproxy needs `update` on encrypt and decrypt, and
+# nothing else: not `read` on the key, not `create`, not `delete`.
+path "transit/encrypt/sbproxy-root" {
+  capabilities = ["update"]
+}
+
+path "transit/decrypt/sbproxy-root" {
+  capabilities = ["update"]
+}
+```
+
+Attach it to whatever auth method mints the token in
+`root_of_trust.token`, and mount path and key name follow `mount:` and
+`key_name:` if you changed them.
+
+**Revoking is the point, so it is worth saying exactly what to revoke.** Any of
+these stops decryption inside the bound below: delete the policy, delete or
+revoke the token, remove the two `path` stanzas, or delete the Transit key.
+Dropping only `transit/decrypt/...` is the narrowest form and still works.
+
+The liveness probe deliberately needs nothing beyond that policy. It encrypts a
+fixed non-secret probe value and decrypts it again, which is the same pair of
+capabilities the credential path uses, so it cannot fail on a correctly-scoped
+policy and cannot keep passing through a revocation. An earlier version read
+`transit/keys/sbproxy-root` instead, which needs `read` on a third path the
+policy above deliberately does not grant: against a least-privilege policy that
+probe failed forever on a healthy deployment, and against a revocation that
+dropped only encrypt and decrypt it passed forever. Neither is a thing you have
+to configure around now, and the policy above is the whole grant.
+
 ### The revocation-latency bound
 
 `unwrap_cache_ttl_secs` is the number, and it is the product claim. An unwrap
@@ -2082,7 +2119,20 @@ Rules the endpoints enforce rather than document:
 * **No self-approval and no self-review**, both refused before the roster is
   consulted, so adding yourself to `approvers` does not close either gap. A
   two-person rule one person can satisfy is not a two-person rule, and a review
-  queue its own subject can clear is not a review queue.
+  queue its own subject can clear is not a review queue. **A refusal is
+  recorded**, on the same `key_audit` channel as the transitions, with
+  `outcome: refused` and a closed-vocabulary `reason` of `self_approval`,
+  `self_review`, or `not_an_approver`, and counted on
+  `sbproxy_break_glass_grants_total{event="refused"}`. An operator caught
+  trying to close their own grant is the event this feature is bought for, so
+  it leaves more than an HTTP 403.
+* **`review` has no `enabled` guard, and that is deliberate.** `request`,
+  `approve`, and `tag_action` all refuse when `break_glass.enabled` is false,
+  because those three create or extend access. `review` closes access out. A
+  kill switch that also blocks the closing-out would strand every open grant:
+  grants live in process memory and survive a config reload, so nothing could
+  ever reach `reviewed`, and the `awaiting_review` gauge below would stay
+  pinned above zero for the life of the process.
 * **`quorum` is validated at config compile.** Zero is refused, because a grant
   would activate on its first approval while the admin surface reported it as
   quorate; a quorum above the roster is refused too, because you would discover

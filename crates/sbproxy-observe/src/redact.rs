@@ -17,7 +17,10 @@
 //! * One *positional* rule, `mask_url_userinfo`. A credential embedded
 //!   in a URL's userinfo has neither a recognizable shape nor a key
 //!   name in front of it; what identifies it is where it sits, between
-//!   `://` and `@`.
+//!   `://` and the last `@` of the authority. The authority is matched
+//!   by an allowlist of bytes that are legal in one and are not
+//!   structure in JSON, YAML flow style, or logfmt, which is what keeps
+//!   a positional rule inside a single field.
 //!
 //! A credential that is neither a known shape nor under a known name
 //! is returned as written. In particular there is no JWT pattern: a
@@ -68,20 +71,94 @@ use std::sync::LazyLock;
 /// name worth not shipping either, and telling the two apart costs a
 /// branch that buys nothing.
 ///
-/// Hand-written rather than a regex. A `LazyLock<Regex>` here would be one
-/// more `.expect("valid regex")` on a ratchet that only falls, and the
-/// workspace's alternative shape, `LazyLock<Option<_>>`, fails *open*
-/// here: a redactor that quietly stops redacting is worse than one nobody
-/// added. The scan is also the cheaper of the two on a path that runs over
-/// every access-log line.
+/// # The authority run is an allowlist, and that is the load-bearing part
 ///
-/// The authority run stops at whitespace, `/`, and `@`, which is what
-/// keeps a `@` in a path or a query (`.../data?to=a@b`) from pulling the
-/// match across it: the first `/` ends the run before the `@` is reached.
+/// The first version of this stopped the run at three bytes, `@`, `/`, and
+/// whitespace, which is a denylist and was wrong in the way this module
+/// has already been wrong three times. On a rendered JSON line a URL with
+/// no path, `{"src":"https://ref.example"}`, ran straight through the
+/// closing quote and the comma and the next key and deleted everything up
+/// to some later `@` in the record. That does not merely mangle one field:
+/// [`crate::logging::redact_json_line`] applies the field-key denylist only
+/// when the secret pass left something that still parses, so a line this
+/// broke shipped its `prompt`, its `cookie`, and any bundle secret var on
+/// the same record verbatim. `user_agent` and `referer` are client-set and
+/// serialize before `user`, `metadata`, `attribution`, and
+/// `request_headers`, so a caller could reach it from a request header.
+///
+/// So the run is now an allowlist: a byte continues the authority only if
+/// it is **both** legal in a URL authority (RFC 3986) **and** not structure
+/// in JSON, in YAML flow style, or in logfmt. Concretely that is
+/// alphanumerics, `-._~` (unreserved), `%` (percent-encoding),
+/// `!$&*+=` (the sub-delims that are not structure), `:` (userinfo
+/// separator and port), `[` and `]` (IPv6 literal host), and `@` itself.
+///
+/// Everything else ends the run, and the exclusions are the point:
+///
+/// * `'`, `(`, `)`, `,`, `;` are legal in userinfo and are structure in the
+///   three serializations above. `'`, `,` and `;` are three of the same
+///   four bytes [`RE_PASSWORD`] stops at, for the same reason.
+/// * `/`, `?`, `#` end the authority per RFC 3986. This is what makes
+///   `https://api.example.com?notify=ops@example.com` come back untouched:
+///   the `?` ends the run before the `@` is reached.
+/// * `"`, `{`, `}`, `\`, backtick, `|`, `<`, `>`, and whitespace are
+///   structure or cannot appear in an authority. The closing `"` is the
+///   one that matters most: inside a rendered JSON string value it always
+///   terminates the run, so this rule can never reach the key separator of
+///   the next field.
+///
+/// Because every byte the mask deletes is an allowed byte, and no allowed
+/// byte is structure in any of the three serializations, **this rule cannot
+/// produce a line that stops parsing.** That invariant is pinned by
+/// `a_url_in_a_json_field_keeps_the_line_parseable`, in the test family
+/// this module already keeps for exactly this.
+///
+/// The stated cost, the same one [`RE_PASSWORD`] documents: userinfo that
+/// literally contains one of the excluded bytes ends the run there, so the
+/// URL is not masked at all rather than masked halfway. Failing to mask is
+/// the safe direction here; deleting a key separator is not.
+///
+/// # The last `@`, not the first
+///
+/// The run continues past an `@` and remembers the most recent one, because
+/// `@` is legal in a password and common in generated ones. Stopping at the
+/// first left `https://user:p@ssw0rd@vault.internal:8200` masked to
+/// `https://[REDACTED]@ssw0rd@vault.internal:8200`, publishing six bytes of
+/// the password on the one field this rule exists for.
+///
+/// # Boundaries
+///
 /// The arithmetic is byte-wise and stays on character boundaries, because
 /// every byte it compares or splits at is ASCII and no UTF-8 continuation
-/// byte matches one.
+/// byte matches one. The scheme run must open with a letter, so a URL glued
+/// directly to a preceding `[0-9+.-]` with no separator
+/// (`8080https://u:p@h`, `v1.2https://u:p@h`) is not masked; every real
+/// separator ends the scheme run correctly.
 fn mask_url_userinfo(input: &str) -> std::borrow::Cow<'_, str> {
+    // Legal in a URL authority *and* not structure in JSON, YAML flow
+    // style, or logfmt. See the allowlist section above: the exclusions
+    // are what keep this rule inside one field.
+    fn continues_authority(c: u8) -> bool {
+        c.is_ascii_alphanumeric()
+            || matches!(
+                c,
+                b'-' | b'.'
+                    | b'_'
+                    | b'~'
+                    | b'%'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'*'
+                    | b'+'
+                    | b'='
+                    | b':'
+                    | b'['
+                    | b']'
+                    | b'@'
+            )
+    }
+
     let bytes = input.as_bytes();
     let mut out: Option<String> = None;
     let mut copied = 0usize;
@@ -110,16 +187,12 @@ fn mask_url_userinfo(input: &str) -> std::borrow::Cow<'_, str> {
             continue;
         }
 
+        // Walk the whole authority and keep the LAST `@`, not the first.
         let mut at = None;
         let mut i = authority;
-        while i < bytes.len() {
-            let c = bytes[i];
-            if c == b'@' {
+        while i < bytes.len() && continues_authority(bytes[i]) {
+            if bytes[i] == b'@' {
                 at = Some(i);
-                break;
-            }
-            if c == b'/' || c.is_ascii_whitespace() {
-                break;
             }
             i += 1;
         }
@@ -1167,9 +1240,25 @@ mod tests {
             "amqp://[REDACTED]@broker.internal:5672"
         );
 
-        // The boundary. An `@` after the authority is not userinfo, and
-        // a URL without one is returned as written.
+        // A password with an unencoded `@` in it. The run keeps the
+        // LAST `@`, not the first: stopping at the first published
+        // `ssw0rd` on the one field this rule exists for.
+        assert_eq!(
+            redact_secrets("address: https://user:p@ssw0rd@vault.internal:8200"),
+            "address: https://[REDACTED]@vault.internal:8200",
+            "the mask must run to the last @ of the authority"
+        );
+
+        // The boundary, and every case here has to be able to fail.
+        // The first three carry the `@` after a `?`, a `#`, and a `/`
+        // respectively, which are the three RFC 3986 authority
+        // terminators; the earlier version of this test asserted only
+        // the `/` shape, so the `?` and `#` claims its doc comment made
+        // were held up by cases that could not fail. The fourth has no
+        // `@` at all.
         for untouched in [
+            "GET https://api.example.com?notify=ops@example.com 200",
+            "GET https://api.example.com#ops@example.com 200",
             "GET https://api.example.com/v1/data?notify=ops@example.com 200",
             "https://vault.internal:8200/v1/transit/decrypt/sbproxy-root",
             "vault://primary/upstream?key=openai",
@@ -1180,5 +1269,65 @@ mod tests {
                 "no userinfo here, so nothing to mask: {untouched}"
             );
         }
+    }
+
+    /// The invariant the whole module is built on, for the one rule that
+    /// matches by position: **a redacted line still parses.**
+    ///
+    /// This is the fourth entry in the family above and it exists because
+    /// the first version of this rule was the fourth pattern to break the
+    /// rule the family holds. Its authority run stopped at three bytes,
+    /// `@`, `/`, and whitespace, so a URL with no path ran through the
+    /// closing quote of its own JSON string and deleted every byte up to
+    /// some later `@` in the record. `redact_json_line` applies the
+    /// field-key denylist only on the `Ok` arm, so the line below did not
+    /// merely lose `attribution`: it shipped `prompt` in the clear.
+    ///
+    /// Reverting `continues_authority` to `!matches!(c, b'@' | b'/')`
+    /// plus a whitespace check reddens the first assertion here and
+    /// nothing else in the file.
+    #[test]
+    fn a_url_in_a_json_field_keeps_the_line_parseable() {
+        // A path-less URL, a later `@` in a different field, and a
+        // denylisted key after both. This is the exact shape a client can
+        // produce: `user_agent` and `referer` are client-set and
+        // serialize before `user` and `prompt`.
+        let line = r#"{"user_agent":"https://ref.example","referer":"b@c","user":"ops@corp.com","prompt":"leak me"}"#;
+        let out = redact_secrets(line);
+        let parsed: serde_json::Value = serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("redacted line is not JSON ({e}): {out}"));
+        assert_eq!(parsed["user_agent"], "https://ref.example", "{out}");
+        assert_eq!(parsed["referer"], "b@c", "{out}");
+        assert_eq!(parsed["user"], "ops@corp.com", "{out}");
+        assert_eq!(parsed["prompt"], "leak me", "{out}");
+
+        // And the case the rule is actually for, in the same shape: the
+        // userinfo goes, the field keeps its quotes, and the record still
+        // parses with every other field intact.
+        let line = r#"{"address":"https://sbproxy:tok3n@vault.internal:8200","user":"ops@corp.com","status":200}"#;
+        let out = redact_secrets(line);
+        let parsed: serde_json::Value = serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("redacted line is not JSON ({e}): {out}"));
+        assert_eq!(
+            parsed["address"], "https://[REDACTED]@vault.internal:8200",
+            "{out}"
+        );
+        assert_eq!(parsed["user"], "ops@corp.com", "{out}");
+        assert_eq!(parsed["status"], 200, "{out}");
+        assert!(!out.contains("tok3n"), "{out}");
+
+        // The same invariant in the other two serializations the stop
+        // set names, because a positional rule has no key to anchor on
+        // and these are where it would run off the end.
+        assert_eq!(
+            redact_secrets("{url: https://ref.example, user: ops@corp.com}"),
+            "{url: https://ref.example, user: ops@corp.com}",
+            "YAML flow style"
+        );
+        assert_eq!(
+            redact_secrets("url=https://ref.example user=ops@corp.com"),
+            "url=https://ref.example user=ops@corp.com",
+            "logfmt"
+        );
     }
 }

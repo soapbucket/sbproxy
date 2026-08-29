@@ -429,9 +429,30 @@ It also masks a credential carried in a URL's userinfo, which is the one
 thing it recognizes by position rather than by shape or by name:
 `https://sbproxy:hvs.MUSTNOTAPPEAR...@vault.internal:8200` comes out as
 `https://[REDACTED]@vault.internal:8200`. The scheme and everything from
-the `@` on survive, so the host stays readable. The user is masked along
-with the password, and an `@` that appears after the authority, in a path
-or a query, is not touched.
+the last `@` of the authority on survive, so the host stays readable, and
+a password containing its own `@` does not leak its tail. The user is
+masked along with the password.
+
+The authority is matched by an allowlist rather than by scanning to the
+next delimiter: a byte continues it only if it is legal in a URL authority
+*and* is not structure in JSON, YAML flow style, or logfmt. So
+alphanumerics, `-._~`, `%`, `!$&*+=`, `:`, `[`, `]`, and `@` continue it,
+and everything else ends it, including `"`, `,`, `;`, `'`, `}`, `/`, `?`,
+`#` and whitespace. Two consequences worth knowing:
+
+* An `@` outside the authority is never reached, so
+  `https://api.example.com?notify=ops@example.com` and the same URL with a
+  path or a `#fragment` come back untouched.
+* The closing `"` of a JSON string always ends the run, so this pass
+  cannot reach the next field of a record. That is not incidental: the
+  field pass below only runs on a line that still parses, so a value pass
+  that ran past a key separator would drop the whole record's field
+  denylist, and this rule is the only one here with no key name to anchor
+  on.
+
+The stated cost, the same one the `password` pattern carries: userinfo that
+literally contains one of the excluded bytes ends the run there, so the URL
+is emitted unmasked rather than masked halfway.
 
 The **field pass** then parses the line as JSON and masks whole values
 by field name. That is the layer covering `prompt`, `messages`,
