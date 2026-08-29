@@ -208,9 +208,30 @@ impl Node {
         args: &[&str],
         dir: &Path,
     ) -> Self {
+        Self::start_with_env(config_path, http_port, admin_port, args, dir, &[])
+    }
+
+    /// [`Self::start`] with extra environment for the child.
+    ///
+    /// Scoped to the child, so two nodes in one test can differ in what
+    /// a `${VAR}` in a published bundle resolves to. That divergence is
+    /// how the fleet arc below gets one subscriber to refuse a bundle
+    /// its sibling applies, with no misbehave switch in production code.
+    fn start_with_env(
+        config_path: &Path,
+        http_port: u16,
+        admin_port: u16,
+        args: &[&str],
+        dir: &Path,
+        env: &[(&str, &str)],
+    ) -> Self {
         let stdout = dir.join(format!("node-{admin_port}.out"));
         let stderr = dir.join(format!("node-{admin_port}.err"));
-        let child = Command::new(proxy_binary_path())
+        let mut command = Command::new(proxy_binary_path());
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        let child = command
             .arg("--config")
             .arg(config_path)
             .args(args)
@@ -705,4 +726,350 @@ fn the_same_broken_config_promotes_once_the_upstream_signal_is_switched_off() {
         0.0,
         "and the signal that caught it in the sibling test never reported: {entries}",
     );
+}
+
+// ---------------------------------------------------------------------------
+// The fleet arc: a real authority, two subscribers, one of which refuses
+// ---------------------------------------------------------------------------
+
+/// Publish, watch one subscriber refuse, read the refusal off the status
+/// page, roll back to a named revision, and watch both converge.
+///
+/// The node-side arc above proves one process. This proves the fleet
+/// half of the same feature: that a refusal is visible to the operator
+/// who has to decide, and that `rollback --to-revision N` is what
+/// resolves it.
+///
+/// One subscriber refuses because the published payload names a `${VAR}`
+/// that resolves on one node and not on the other. That is the shipped
+/// refusal path (a subscriber that cannot resolve a reference refuses
+/// the bundle rather than applying the literal text), reached by giving
+/// two child processes different environments rather than by adding a
+/// misbehave switch to production code.
+#[test]
+fn a_fleet_refusal_is_reported_and_a_named_rollback_converges_every_subscriber() {
+    let _guard = suite_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().expect("temp dir");
+    let upstream = StubUpstream::start("fleet-upstream");
+
+    // --- The authority.
+    let (signing_key, verifying_keys) = init_authority_keys(dir.path());
+    let store_dir = dir.path().join("authority-store");
+    std::fs::create_dir_all(&store_dir).expect("create store dir");
+    let authority_admin = pick_port();
+    let bundle_port = pick_port();
+    let authority_config = dir.path().join("authority.yml");
+    std::fs::write(
+        &authority_config,
+        authority_yaml(authority_admin, bundle_port, &signing_key, &store_dir),
+    )
+    .expect("write authority config");
+    let _authority = Node::start(
+        &authority_config,
+        pick_port(),
+        authority_admin,
+        &[],
+        dir.path(),
+    );
+    ProxyHarness::wait_for_port(bundle_port, CONVERGE).expect("bundle listener never bound");
+
+    // --- Two subscribers. Only one can resolve ${FLEET_BODY}.
+    let mut nodes = Vec::new();
+    for (index, env) in [
+        vec![("FLEET_BODY", "resolved-on-both")],
+        // The second node is not given the variable at all.
+        vec![],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let subscriber_id = format!("edge-{index}");
+        let token = register_fleet_subscriber(authority_admin, dir.path(), &subscriber_id);
+        let http_port = pick_port();
+        let admin_port = pick_port();
+        let config = dir.path().join(format!("subscriber-{index}.yml"));
+        std::fs::write(
+            &config,
+            subscriber_yaml(
+                http_port,
+                admin_port,
+                bundle_port,
+                &token,
+                &verifying_keys,
+                &dir.path().join(format!("cache-{index}.json")),
+                &subscriber_id,
+            ),
+        )
+        .expect("write subscriber config");
+        nodes.push(Node::start_with_env(
+            &config,
+            http_port,
+            admin_port,
+            &[],
+            dir.path(),
+            &env,
+        ));
+    }
+
+    // --- A first publication both nodes can apply, so the refusal below
+    // is a change and not the starting state.
+    publish(
+        authority_admin,
+        &fleet_payload(upstream.port, "everyone-applies"),
+    );
+    for node in &nodes {
+        wait_until("both subscribers to take the first revision", || {
+            node.serves("fleet.local").as_deref() == Some("everyone-applies")
+        });
+    }
+    let good_revision = authority_status(authority_admin)["current_revision"]
+        .as_u64()
+        .expect("a current revision");
+
+    // --- A payload only one node can resolve.
+    publish(
+        authority_admin,
+        &fleet_payload(upstream.port, "${FLEET_BODY}"),
+    );
+
+    // The node that has the variable applies it.
+    wait_until("the node that can resolve it to apply", || {
+        nodes[0].serves("fleet.local").as_deref() == Some("resolved-on-both")
+    });
+
+    // The other refuses, and the authority's status page says so with a
+    // reason. That is the half an operator reads before deciding.
+    wait_until(
+        "the authority to report the refusal with its reason",
+        || {
+            let status = authority_status(authority_admin);
+            status["subscribers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|row| {
+                    row["subscriber_id"] == "edge-1"
+                        && row["apply_status"] == "failed"
+                        && row["apply_error"].as_str().is_some_and(|e| !e.is_empty())
+                })
+        },
+    );
+    let status = authority_status(authority_admin);
+    assert_eq!(
+        status["apply_failed_count"], 1,
+        "exactly one subscriber refused: {status}",
+    );
+    let refusal = status["subscribers"]
+        .as_array()
+        .expect("subscribers")
+        .iter()
+        .find(|row| row["subscriber_id"] == "edge-1")
+        .expect("edge-1 on the status page")
+        .clone();
+    let reason = refusal["apply_error"].as_str().expect("a reason");
+    assert!(
+        reason.contains("FLEET_BODY") || reason.to_lowercase().contains("resolve"),
+        "the refusal names what could not be resolved: {reason}",
+    );
+    assert_eq!(
+        nodes[1].serves("fleet.local").as_deref(),
+        Some("everyone-applies"),
+        "and the refusing node keeps serving the revision it did apply",
+    );
+
+    // --- Roll back to the named revision. Both converge.
+    let rollback = Command::new(proxy_binary_path())
+        .args([
+            "config",
+            "authority",
+            "rollback",
+            "--to-revision",
+            &good_revision.to_string(),
+            "--admin-url",
+            &format!("http://127.0.0.1:{authority_admin}"),
+            "--username",
+            ADMIN_USER,
+            "--password",
+            ADMIN_PASSWORD,
+        ])
+        .output()
+        .expect("run rollback");
+    assert!(
+        rollback.status.success(),
+        "rollback: {}",
+        String::from_utf8_lossy(&rollback.stderr),
+    );
+
+    for (index, node) in nodes.iter().enumerate() {
+        wait_until(&format!("subscriber edge-{index} to converge"), || {
+            node.serves("fleet.local").as_deref() == Some("everyone-applies")
+        });
+    }
+    wait_until("the authority to report both subscribers applied", || {
+        let status = authority_status(authority_admin);
+        status["apply_failed_count"] == serde_json::json!(0)
+            && status["applied_current_count"] == serde_json::json!(2)
+    });
+}
+
+fn authority_yaml(
+    admin_port: u16,
+    bundle_port: u16,
+    signing_key: &Path,
+    store_dir: &Path,
+) -> String {
+    format!(
+        r#"proxy:
+  http_bind_port: 0
+  admin:
+    enabled: true
+    bind: 127.0.0.1
+    port: {admin_port}
+    username: {ADMIN_USER}
+    password: {ADMIN_PASSWORD}
+    rate_limit_per_minute: 100000
+  config_authority:
+    publish:
+      authority_id: fleet-authority
+      key_id: fleet-key-1
+      signing_key_file: {signing}
+      store_dir: {store}
+      bind: 127.0.0.1:{bundle_port}
+      archive_keep: 10
+origins:
+  "authority.local":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: authority
+"#,
+        signing = signing_key.display(),
+        store = store_dir.display(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn subscriber_yaml(
+    http_port: u16,
+    admin_port: u16,
+    bundle_port: u16,
+    token_file: &Path,
+    verifying_keys: &Path,
+    cache_path: &Path,
+    subscriber_id: &str,
+) -> String {
+    format!(
+        r#"proxy:
+  http_bind_port: {http_port}
+  admin:
+    enabled: true
+    bind: 127.0.0.1
+    port: {admin_port}
+    username: {ADMIN_USER}
+    password: {ADMIN_PASSWORD}
+    rate_limit_per_minute: 100000
+  extensions:
+    upstream:
+      allow_private_cidrs:
+        - '127.0.0.1/32'
+  config_authority:
+    upstream:
+      url: http://127.0.0.1:{bundle_port}
+      mode: overlay
+      subscriber_id: {subscriber_id}
+      credential: file:{token}
+      verifying_keys_file: {keys}
+      poll_interval: 5s
+      cache_path: {cache}
+      allow_insecure_http: true
+"#,
+        token = token_file.display(),
+        keys = verifying_keys.display(),
+        cache = cache_path.display(),
+    )
+}
+
+/// A payload whose body is `body`, which may be a `${VAR}` reference.
+fn fleet_payload(upstream_port: u16, body: &str) -> String {
+    let _ = upstream_port;
+    format!(
+        r#"origins:
+  "fleet.local":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "{body}"
+"#
+    )
+}
+
+fn init_authority_keys(dir: &Path) -> (PathBuf, PathBuf) {
+    let output = Command::new(proxy_binary_path())
+        .args([
+            "config",
+            "authority",
+            "init",
+            "--dir",
+            dir.to_str().expect("utf8"),
+            "--key-id",
+            "fleet-key-1",
+            "--authority-id",
+            "fleet-authority",
+        ])
+        .output()
+        .expect("run authority init");
+    assert!(
+        output.status.success(),
+        "authority init failed: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    (
+        dir.join("authority-signing.key"),
+        dir.join("authority-keys.json"),
+    )
+}
+
+fn register_fleet_subscriber(admin_port: u16, dir: &Path, subscriber_id: &str) -> PathBuf {
+    let reply = admin(
+        admin_port,
+        "POST",
+        "/admin/config-authority/subscribers",
+        Some(&format!(r#"{{"subscriber_id":"{subscriber_id}"}}"#)),
+    );
+    assert_eq!(
+        reply.status, 200,
+        "register {subscriber_id}: {}",
+        reply.body
+    );
+    let credential = reply.json()["credential"]
+        .as_str()
+        .expect("a credential")
+        .to_string();
+    let path = dir.join(format!("{subscriber_id}.token"));
+    std::fs::write(&path, credential.as_bytes()).expect("write token");
+    path
+}
+
+fn publish(admin_port: u16, payload: &str) {
+    let url = format!("http://127.0.0.1:{admin_port}/admin/config-authority/publish");
+    let response = client()
+        .post(url)
+        .header("authorization", basic_auth())
+        .header("content-type", "application/yaml")
+        .body(payload.to_string())
+        .send()
+        .expect("publish");
+    let status = response.status().as_u16();
+    let body = response.text().unwrap_or_default();
+    assert_eq!(status, 200, "publish: {body}");
+}
+
+fn authority_status(admin_port: u16) -> serde_json::Value {
+    let reply = admin(admin_port, "GET", "/admin/config-authority/status", None);
+    assert_eq!(reply.status, 200, "status: {}", reply.body);
+    reply.json()
 }

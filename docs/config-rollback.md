@@ -91,7 +91,7 @@ diff never shows you a secret that a resolution step produced.
 ```console
 $ sbproxy config rollback --to last-known-good \
     --admin-url http://127.0.0.1:9090 --password "$SB_ADMIN_PASSWORD"
-config rollback: restored revision 41 (2c26b46b68ffc68f...), blast radius hitless
+config rollback: restored revision 41 (2c26b46b68ffc68ff99b453c1d3041341340d0d0d0d0d0d0d0d0d0d0d0d0d0d0), blast radius hitless
 config rollback: revision 43 is marked reverted
 config rollback: appended as revision 44; history is append-only, so this rollback is itself in the history
 config rollback: the restored revision is soaking like any other candidate. POST /admin/config/confirm promotes it early; a failed soak leaves the last-known-good pointer where it is
@@ -150,7 +150,7 @@ $ curl -su "admin:$SB_ADMIN_PASSWORD" http://127.0.0.1:9090/admin/config/fallbac
   "active": true,
   "revision": 41,
   "digest": "2c26b46b68ffc68ff99b453c1d3041341340d0d0d0d0d0d0d0d0d0d0d0d0d0d",
-  "reason": "origins.\"api.example.com\": unknown action type `proxyy`",
+  "reason": "unknown action type: proxyy",
   "suspended": ["file_watcher", "sighup", "config_refresh_poller"]
 }
 ```
@@ -173,6 +173,7 @@ $ curl -su "admin:$SB_ADMIN_PASSWORD" -X DELETE http://127.0.0.1:9090/admin/conf
 {
   "cleared": true,
   "revision": 41,
+  "digest": "2c26b46b68ffc68ff99b453c1d3041341340d0d0d0d0d0d0d0d0d0d0d0d0d0d0",
   "resumed": ["file_watcher", "sighup", "config_refresh_poller"],
   "reloaded": true,
   "reload_error": null
@@ -211,6 +212,7 @@ Then undo one step, or name a revision from further back:
 ```console
 $ sbproxy config authority rollback --admin-url http://127.0.0.1:9443 --password "$SB_ADMIN_PASSWORD"
 config authority rollback: republished revision 42's payload as revision 44, replacing revision 43
+config authority rollback: the number moves forward because a subscriber refuses a revision that is not greater than the one it applied. Subscribers take it on their next poll.
 
 $ sbproxy config authority rollback --to-revision 41 \
     --admin-url http://127.0.0.1:9443 --password "$SB_ADMIN_PASSWORD"
@@ -218,27 +220,44 @@ config authority rollback: republished revision 41's payload as revision 45, rep
 config authority rollback: the number moves forward because a subscriber refuses a revision that is not greater than the one it applied. Subscribers take it on their next poll.
 ```
 
+`--to-revision` is a body field, not a query parameter. A
+`?to_revision=41` on the URL is refused with `400` and
+`invalid_to_revision` rather than quietly running the one-step rollback.
+
 The number always moves forward. A subscriber's anti-replay cursor
 refuses any revision that is not greater than the one it applied, so
 re-serving revision 41 under its old number would reach only the nodes
 that had not yet taken 43, which is a rollback that reaches nobody.
 
 How far back you can go is `proxy.config_authority.publish.archive_keep`,
-20 by default. A revision the ring no longer holds is refused by name,
-and the refusal lists what is available.
+20 by default, and it counts revisions you can roll back *to*: the one
+currently serving does not use up a slot. A revision the ring no longer
+holds is refused by name, and the refusal lists what is available in
+both the message and an `archived_revisions` array.
+
+This is the **authority's** ring, distinct from `proxy.config_history` on
+each node. The node's ring is what a node-side rollback and a fallback
+boot read; this one is what the fleet rolls back through.
 
 ## What to alert on
 
 | Signal | Means |
 |---|---|
-| `sbproxy_config_fallback_active == 1` | a node is serving a configuration nobody applied. Page. |
-| `sbproxy_config_apply_total{outcome="reverted"}` moving | a node undid a change on its own, with `auto_revert` armed. Page. |
+| `sbproxy_config_fallback_active == 1` | a node is serving a configuration nobody applied |
+| `sbproxy_config_apply_total{outcome="reverted"}` moving | a node undid a change on its own, with `auto_revert` armed |
 | `sbproxy_config_soak_verdict_total{verdict="failed"}` moving | changes are landing and failing their windows |
 | `sbproxy_config_lkg_revision` flat while revisions land | nothing is being promoted; the fallback target is going stale |
 | `sbproxy_config_authority_rollback_total{result="refused"}` moving | a fleet rollback is being refused at the authority |
+| `sbproxy_operator_config_delivery_total{state!="delivered"}` moving | under Kubernetes, config is not reaching a fleet's pods, and `state` says why |
 
-The bundled Grafana dashboard draws all five on
+The bundled Grafana dashboard draws all of these on
 `dashboards/grafana/sbproxy-overview.json`.
+
+These are signals worth alerting on, not shipped alert rules. Every
+paging alert in `deploy/alerts/alerting-rules.yml` resolves through a
+`runbook_id` in [operator-runbook.md](operator-runbook.md), and none of
+these has one yet; wire them with your own severity and runbook mapping
+rather than pointing a pager at a rule that does not exist.
 
 ## `auto_revert` and why it ships off
 
@@ -260,9 +279,12 @@ fallback and a manual rollback, and the node says so with a
 `config_rollback` event carrying `outcome: "declined"` and a reason of
 `not_arc_swappable`.
 
-Under the Kubernetes operator, `auto_revert` is refused outright at
-validation. The operator reapplies the ConfigMap on every reconcile, so a
-node that reverts loses that race and the two take turns. See
+Under the Kubernetes operator, `auto_revert` is refused at validation on
+the document the `SBProxyConfig` carries inline. The operator reapplies
+the ConfigMap on every reconcile, so a node that reverts loses that race
+and the two take turns. A `spec.config` that is a bare `source:` pointer
+is not read through, so a document that arms it behind a pointer is not
+caught there; the node still ships it off by default. See
 [kubernetes.md](kubernetes.md#auto_revert-is-refused-under-operator-ownership).
 
 ## Try it

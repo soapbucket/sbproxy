@@ -1,0 +1,4 @@
+{
+  "type": "fixed",
+  "message": "Boot fallback now construct-checks the configured document, not just its parse. A config that compiles and whose modules fail to build, which is where most operator typos land, previously exited fatally with no pin, no boot counter and no walk on every restart even with --config-fallback=last-known-good; it is now rescued from the revision ring like any other failure, and the pin names the construction error."
+}

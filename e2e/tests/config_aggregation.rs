@@ -498,6 +498,31 @@ struct LiveAuthority {
     admin_port: u16,
     bundle_port: u16,
     verifying_keys: PathBuf,
+    /// The CA a subscriber has to trust when the bundle listener runs
+    /// TLS, or `None` when it is plaintext loopback.
+    ca_file: Option<PathBuf>,
+}
+
+/// Mint a self-signed leaf for `127.0.0.1` and write the PEM pair.
+///
+/// TLS on the bundle listener is the one thing in this feature that can
+/// only break at startup, in a separate process, with real sockets:
+/// nothing in the unit or integration tiers binds a rustls acceptor.
+/// `rcgen` is already an `e2e` dependency and three other suites mint
+/// certificates with it the same way.
+fn write_self_signed(dir: &Path) -> (PathBuf, PathBuf) {
+    let key = rcgen::KeyPair::generate().expect("rcgen keypair");
+    let mut params =
+        rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).expect("rcgen params");
+    params.subject_alt_names.push(rcgen::SanType::IpAddress(
+        "127.0.0.1".parse().expect("loopback literal"),
+    ));
+    let cert = params.self_signed(&key).expect("self-signed cert");
+    let cert_file = dir.join("authority-tls.pem");
+    let key_file = dir.join("authority-tls-key.pem");
+    std::fs::write(&cert_file, cert.pem()).expect("write cert");
+    std::fs::write(&key_file, key.serialize_pem()).expect("write key");
+    (cert_file, key_file)
 }
 
 fn init_authority_keys(dir: &Path) -> (PathBuf, PathBuf) {
@@ -527,11 +552,28 @@ fn init_authority_keys(dir: &Path) -> (PathBuf, PathBuf) {
 }
 
 fn start_authority(dir: &Path) -> LiveAuthority {
+    start_authority_with_tls(dir, false)
+}
+
+fn start_authority_with_tls(dir: &Path, tls: bool) -> LiveAuthority {
     let (signing_key, verifying_keys) = init_authority_keys(dir);
     let store_dir = dir.join("authority-store");
     std::fs::create_dir_all(&store_dir).expect("create store dir");
     let admin_port = pick_port();
     let bundle_port = pick_port();
+    let (tls_block, ca_file) = if tls {
+        let (cert_file, key_file) = write_self_signed(dir);
+        (
+            format!(
+                "\n      tls:\n        cert_file: {}\n        key_file: {}",
+                cert_file.display(),
+                key_file.display(),
+            ),
+            Some(cert_file),
+        )
+    } else {
+        (String::new(), None)
+    };
     let yaml = format!(
         r#"
 proxy:
@@ -549,7 +591,7 @@ proxy:
       signing_key_file: {signing}
       store_dir: {store}
       bind: 127.0.0.1:{bundle_port}
-      archive_keep: 10
+      archive_keep: 10{tls_block}
 origins:
   "authority.localhost":
     action:
@@ -571,6 +613,7 @@ origins:
         admin_port,
         bundle_port,
         verifying_keys,
+        ca_file,
     }
 }
 
@@ -889,6 +932,74 @@ fn two_project_repos_one_aggregator_and_a_node_that_was_handed_no_origins() {
         node_get(&node, CHECKOUT_HOST).0,
         200,
         "and it is still serving traffic on the restored document",
+    );
+}
+
+/// The bundle listener with TLS on, which is the one thing in this
+/// feature that can only break at startup, in a separate process, on a
+/// real socket.
+///
+/// Nothing in the unit or integration tiers binds a rustls acceptor, so
+/// a TLS block that the config accepts and the listener cannot start on
+/// would ship green. Asserted three ways: the port binds, it completes a
+/// real TLS handshake, and a plaintext request to it does not get an
+/// HTTP response.
+///
+/// The subscriber half stays on plaintext loopback, because
+/// `proxy.config_authority.upstream` has no `ca_file` key: a subscriber
+/// trusts the system store, and a self-signed leaf minted in a temp
+/// directory is not in it. What this covers is the listener's own
+/// startup, which is what has shipped broken before.
+#[test]
+fn the_bundle_listener_starts_and_serves_tls() {
+    let _guard = suite_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().expect("temp dir");
+    let authority = start_authority_with_tls(dir.path(), true);
+    assert!(
+        authority.ca_file.is_some(),
+        "the fixture really did configure TLS",
+    );
+
+    // A real handshake, not a port probe. `start_authority_with_tls`
+    // already waited for the port, and a listener that bound and then
+    // failed to build its acceptor would pass that and fail here.
+    let client = reqwest::blocking::Client::builder()
+        // The leaf is self-signed and minted for this run; the point is
+        // that a TLS session establishes at all, not that a public CA
+        // vouches for it.
+        .danger_accept_invalid_certs(true)
+        .timeout(Duration::from_secs(15))
+        .build()
+        .expect("build a TLS client");
+    let response = client
+        .get(format!(
+            "https://127.0.0.1:{}/config-authority/v1/bundle",
+            authority.bundle_port
+        ))
+        .send()
+        .expect("the bundle listener completes a TLS handshake");
+    assert_eq!(
+        response.status().as_u16(),
+        401,
+        "an unauthenticated fetch is refused, which is an answer over TLS",
+    );
+
+    // And it is really TLS: a plaintext request must not get an HTTP
+    // response out of it.
+    let plaintext = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("build a plaintext client")
+        .get(format!(
+            "http://127.0.0.1:{}/config-authority/v1/bundle",
+            authority.bundle_port
+        ))
+        .send();
+    assert!(
+        plaintext.is_err(),
+        "a TLS listener must not answer a plaintext request: {plaintext:?}",
     );
 }
 

@@ -1206,11 +1206,11 @@ pub struct FallbackReport {
 /// message that `kubectl describe` prints raw. Upstream `metav1`
 /// bounds a condition message at 32768; this is far under it, and
 /// matches what a node that is behaving produces.
-pub const MAX_REPORTED_REASON_CHARS: usize = 512;
+const MAX_REPORTED_REASON_CHARS: usize = 512;
 
 impl FallbackReport {
-    /// The same report with every operator-carried string bounded and
-    /// stripped of control characters.
+    /// The same report with every operator-carried string bounded to
+    /// 512 characters and stripped of control characters.
     ///
     /// Applied at the edge, where the value is read, rather than at the
     /// point it is rendered, so nothing downstream has to remember.
@@ -1224,9 +1224,9 @@ impl FallbackReport {
     }
 }
 
-/// Truncate to [`MAX_REPORTED_REASON_CHARS`] on a character boundary
-/// and replace control characters, which reach a terminal verbatim
-/// through `kubectl describe`.
+/// Truncate to 512 characters on a character boundary and replace
+/// control characters, which reach a terminal verbatim through
+/// `kubectl describe`.
 fn bounded_reason(value: &str) -> String {
     let cleaned: String = value
         .chars()
@@ -2422,7 +2422,7 @@ mod tests {
                 active: true,
                 revision: Some(7),
                 digest: Some("sha256:abc".to_string()),
-                reason: Some("origins.\"api.test\": unknown action type `statik`".to_string()),
+                reason: Some("unknown action type: statik".to_string()),
             },
         }
     }
@@ -2485,7 +2485,7 @@ mod tests {
         assert!(message.contains("edge-0"), "{message}");
         assert!(message.contains("revision 7"), "{message}");
         assert!(
-            message.contains("unknown action type `statik`"),
+            message.contains("unknown action type: statik"),
             "the condition has to say why the configured document failed: {message}",
         );
         assert!(
@@ -2730,7 +2730,7 @@ mod tests {
             active: true,
             revision: Some(7),
             digest: Some("sha256:abc".to_string()),
-            reason: Some("origins.\"api.test\": unknown key `statik`".to_string()),
+            reason: Some("unknown action type: statik".to_string()),
         };
         assert_eq!(ordinary.clone().bounded(), ordinary);
     }

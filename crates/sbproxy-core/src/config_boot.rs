@@ -917,11 +917,11 @@ mod tests {
         mark_on_fallback(PinnedRevision::with_reason(
             4,
             "abc".to_string(),
-            "origins.\"api.test\": unknown action type `statik`",
+            "unknown action type: statik",
         ));
         assert_eq!(
             pinned_revision().and_then(|pin| pin.reason).as_deref(),
-            Some("origins.\"api.test\": unknown action type `statik`"),
+            Some("unknown action type: statik"),
             "the pin carries why the configured document failed",
         );
         assert!(on_fallback());
@@ -1017,7 +1017,7 @@ mod tests {
         assert!(!ragged.contains("ghp_exampleunterminated"), "{ragged}");
 
         // An ordinary compile failure is untouched.
-        let ordinary = "origins.\"api.test\": unknown action type: statik";
+        let ordinary = "unknown action type: statik";
         assert_eq!(
             PinnedRevision::with_reason(1, "digest".to_string(), ordinary).reason,
             Some(ordinary.to_string()),

@@ -7899,7 +7899,7 @@ proxy:
 | `tls.key_file` | path | | PEM private key (PKCS#8 or RSA). Required when `bind` is not loopback. |
 | `rate_limit_per_subscriber_per_minute` | int | `30` | Requests one subscriber may make per minute before a `429`. 1 to 1000000; cannot be turned off. |
 | `rate_limit_total_per_minute` | int | `1200` | Requests served per minute across the whole fleet before a `429`. Must be at least the per-subscriber cap. |
-| `archive_keep` | int | `20` | How many earlier revisions the archive ring keeps, so `rollback` can name one of them. `0` keeps no ring and leaves the one-step rollback exactly as it was. Maximum 200. |
+| `archive_keep` | int | `20` | How many **earlier** revisions the archive ring keeps, so `rollback` can name one of them. The revision currently being served does not count against it, so the ring holds `archive_keep + 1` files. `0` keeps no ring and leaves the one-step rollback exactly as it was. Maximum 200. |
 
 Two rules refuse a publishing node at startup, both checked by `sbproxy validate`:
 
@@ -7936,7 +7936,11 @@ Every commit writes the same signed bundle into `revisions/archive/<revision>.js
 
 Lowering `archive_keep` takes effect at the next start rather than waiting for enough publications to push the old entries out.
 
-**Disk.** One archived file is bounded by the same envelope limit a subscriber applies on the wire: twice the 4 MiB configuration limit plus 64 KiB, so 8.06 MiB. At the default of 20 the ring is bounded at 161 MiB, and at the maximum of 200 it is bounded at 1.57 GiB. Those are ceilings for a document at the wire limit; a real `sb.yml` is four orders of magnitude smaller, so the default ring costs kilobytes.
+**Disk.** One archived file is bounded by the same envelope limit a subscriber applies on the wire: twice the 4 MiB configuration limit plus 64 KiB, so 8.06 MiB. The ring holds one file more than `archive_keep`, because the revision being served is stored too and becomes a rollback target the moment anything else publishes. At the default of 20 that is 21 files, so 169 MiB, and at the maximum of 200 it is 201 files, so 1.58 GiB. Those are ceilings for a document at the wire limit; a real `sb.yml` is four orders of magnitude smaller, so the default ring costs kilobytes.
+
+Every file the store writes is owner-only (`0600`), and so are its three directories, because the state file is the subscriber registry and each bundle is a whole signed configuration for the fleet.
+
+This is the **authority's** ring. `proxy.config_history` on each node is a different one with its own `keep`: that ring is what a node-side rollback and a boot fallback read, and this one is what the fleet rolls back through.
 
 The store directory is pinned to its `authority_id`. Pointing a second authority at a directory the first wrote is refused rather than adopted, since the revision counter and the subscriber registry belong to whoever created them.
 
@@ -7957,7 +7961,7 @@ All five sit on the admin listener behind operator auth and RBAC.
 | Route | Method | Purpose |
 |---|---|---|
 | `/admin/config-authority/publish` | `POST` | Body is the YAML payload; `?mode=overlay\|replace` selects how subscribers apply it (default `overlay`). |
-| `/admin/config-authority/rollback` | `POST` | Republish an earlier revision's payload. No body for the previous one; `{"to_revision": N}` for an archived one. |
+| `/admin/config-authority/rollback` | `POST` | Republish an earlier revision's payload. No body for the previous one; `{"to_revision": N}` for an archived one. A `?to_revision=` query parameter is refused with `400`, not honored. |
 | `/admin/config-authority/status` | `GET` | Current revision, digest, ETag, key ID, the verifying-key file to distribute, and per-subscriber last-seen revision. |
 | `/admin/config-authority/subscribers` | `GET` / `POST` | List subscribers, or register one with `{"subscriber_id":"edge-01"}`. |
 | `/admin/config-authority/subscribers/revoke` | `POST` | `{"credential_id":"..."}` for one credential, `{"subscriber_id":"..."}` for every credential that node holds. |
@@ -7983,14 +7987,16 @@ answers `400` with code `no_previous_revision` and
 fleet rolls back further than one step:
 
 ```console
-$ sbproxy config authority status --admin-url http://127.0.0.1:9090 --format json | jq .archived_revisions
+$ sbproxy config authority status --admin-url http://127.0.0.1:9090 \
+    --password "$SB_ADMIN_PASSWORD" --format json | jq .archived_revisions
 [
   9,
   10,
   11,
   12
 ]
-$ sbproxy config authority rollback --to-revision 10 --admin-url http://127.0.0.1:9090
+$ sbproxy config authority rollback --to-revision 10 --admin-url http://127.0.0.1:9090 \
+    --password "$SB_ADMIN_PASSWORD"
 config authority rollback: republished revision 10's payload as revision 13, replacing revision 12
 config authority rollback: the number moves forward because a subscriber refuses a revision that is not greater than the one it applied. Subscribers take it on their next poll.
 ```
@@ -8396,7 +8402,7 @@ A project may set exactly these origin fields:
 
 `action`, `authentication`, `policies`, `transforms`, `request_modifiers`, `response_modifiers`, `cors`, `compression`, `error_pages`, `problem_details`, `deprecation`, `expose_openapi`, `agents_md`, `ai_txt`, `agents_json`, `agent_skills`, `default_content_shape`, `content_signal`, `token_bytes_ratio`.
 
-Everything else on an origin is unrepresentable in a profile rather than merely rejected: there is no field that could hold it, so the parse fails and names the key. That is an allowlist on purpose. An origin has 52 fields and gains more regularly, so a deny list would make every future field a silent privilege grant to every project repository. A test enumerates the origin's fields and fails when one appears on neither side, and the failure says to classify it.
+Everything else on an origin is unrepresentable in a profile rather than merely rejected: there is no field that could hold it, so the parse fails and names the key. That is an allowlist on purpose. An origin has 53 fields and gains more regularly, so a deny list would make every future field a silent privilege grant to every project repository. A test enumerates the origin's fields and fails when one appears on neither side, and the failure says to classify it.
 
 A deny list written today would already have missed `filters[].failure_posture` (a project flipping a platform security filter to fail-open while the config still advertises protection), `force_ssl: false`, `response_cache` (an authenticated response cached and served to somebody else), the `on_request` and `on_response` extension hooks, and `allowed_methods` (an empty list allows every method).
 

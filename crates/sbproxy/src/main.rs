@@ -9967,7 +9967,7 @@ fn handle_aggregate_subcommand(args: &AggregateArgs) -> anyhow::Result<i32> {
         Ok(composed) => composed,
         Err(error) => {
             use sbproxy_core::config_aggregator::AggregateError;
-            eprintln!("aggregate: {error}");
+            eprintln!("aggregate: {}", strip_aggregate_prefix(&error.to_string()));
             // Both classes exit 3 because neither published anything.
             // The second line differs because the next action does: a
             // deadline or an unreachable repository leaves the fleet on
@@ -10115,7 +10115,7 @@ fn handle_aggregate_subcommand(args: &AggregateArgs) -> anyhow::Result<i32> {
             Ok(0)
         }
         Err(error) => {
-            eprintln!("aggregate: {error}");
+            eprintln!("aggregate: {}", strip_aggregate_prefix(&error.to_string()));
             eprintln!("aggregate: nothing changed on the authority.");
             Ok(3)
         }
@@ -10173,6 +10173,19 @@ fn report_aggregate_dry_run(
         println!("  {line}");
     }
     2
+}
+
+/// Drop a leading `aggregate: ` the error's own `Display` already
+/// carries.
+///
+/// Several `AggregateError` variants spell the prefix themselves, which
+/// reads correctly in a `tracing` line but doubles here, where this
+/// command prefixes every line it prints: `aggregate: aggregate:
+/// composition refused: ...`. Stripped at the one place both meet
+/// rather than removed from the errors, which are also logged on their
+/// own inside the aggregator loop.
+fn strip_aggregate_prefix(message: &str) -> &str {
+    message.strip_prefix("aggregate: ").unwrap_or(message)
 }
 
 /// The shared JSON summary for the three `aggregate` output shapes.

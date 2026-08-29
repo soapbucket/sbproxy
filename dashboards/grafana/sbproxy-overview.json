@@ -988,6 +988,60 @@
         }
       ],
       "description": "The Kubernetes operator asking each proxy pod whether it is serving a configuration its boot fallback restored. outcome=\"pinned\" means config delivery to that SBProxy is suspended and an operator has to clear the pin with DELETE /admin/config/fallback. Every other non-configured outcome is a fail-open the operator takes deliberately: \"unreachable\", \"refused\" and \"unreadable\" all mean it could not ask and reconciled anyway, so a series climbing there is a suspension that has silently stopped working. \"unowned\" means a pod carried the SBProxy's instance label but was not created by its workload; it was not probed and was not sent the admin credential, and a non-zero rate is worth looking at. \"budget_exhausted\" means the fleet is larger than one pass can probe."
+    },
+    {
+      "id": 16,
+      "title": "Operator Config Delivery",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 56
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (state) (increase(sbproxy_operator_config_delivery_total[1h]))",
+          "legendFormat": "{{state}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Whether configuration is still reaching each SBProxy's pods, and if not, why. sbproxy_operator_reconcile_total answers \"did the pass finish\", and every refusal here finishes cleanly, so it reads ok; this is the series that says the ConfigMap and workload were not applied. state=\"delivered\" is the healthy one. \"suspended_on_fallback\" means a pod is serving a config its boot fallback restored and an operator has to clear the pin. \"refused_auto_revert\" is permanent until somebody edits the config: the document arms proxy.config_history.soak.auto_revert, which loses a race with this operator. \"refused_acme\" and \"refused_invalid_config\" are the two pre-existing guards, now visible in metrics rather than only on the CR's lastError."
     }
   ],
   "templating": {

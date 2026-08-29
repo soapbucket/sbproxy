@@ -60,6 +60,15 @@ A proxy pod that could not compile the configuration it was given can come up on
 
 A controller that reads that pin as drift would reapply the document the node could not compile and restart it into the same crash loop, which is the failure the fallback exists to prevent, reintroduced one layer up. So the operator does the opposite: while any pod owned by an `SBProxy` reports a pin, the operator stops pushing configuration to that `SBProxy` and says so on the CR.
 
+What that suspends, precisely:
+
+| Still reconciled | Held |
+|---|---|
+| the Service | the ConfigMap |
+| the CR status and the condition below | the Deployment or StatefulSet, so `image:`, `replicas:` and `resources:` wait too |
+
+The Service is exempt because it is a name and a port selector: recreating a deleted one cannot put a document on a pod, and leaving it unreconciled would turn a config incident into an outage. The workload is not exempt, because applying it rolls pods, and a rolled pod re-reads the ConfigMap the operator is not allowed to update, so it restarts into the very document that pinned it.
+
 ```console
 $ kubectl get sbproxy edge -o jsonpath='{.status.conditions}' | jq
 [
@@ -67,25 +76,56 @@ $ kubectl get sbproxy edge -o jsonpath='{.status.conditions}' | jq
     "type": "ConfigFallbackActive",
     "status": "True",
     "reason": "NodeOnFallbackConfig",
-    "message": "pod edge-0 is serving revision 7 from its config revision ring, not the configured document; config reconciliation is suspended for this SBProxy until the pin is cleared with DELETE /admin/config/fallback. the configured document failed with: origins.\"api.test\": unknown action type `statik`",
+    "message": "pod edge-0 is serving revision 7 from its config revision ring, not the configured document; config reconciliation is suspended for this SBProxy until the pin is cleared with DELETE /admin/config/fallback. the configured document failed with: unknown action type: statik",
     "lastTransitionTime": "2026-08-28T09:14:02Z",
     "observedGeneration": 3
   }
 ]
 ```
 
-The condition is the operator-visible signal, so an alert can fire on `a node in this cluster is running on fallback` without scraping the proxy directly:
+`lastTransitionTime` moves only when the status does, so it answers "how long has this been pinned" rather than "when did the operator last look".
+
+The condition is the operator-visible signal, so an alert can fire on `a node in this cluster is running on fallback` without scraping the proxy directly. Exporting a CR condition as a metric needs a kube-state-metrics [`CustomResourceStateMetrics`](https://github.com/kubernetes/kube-state-metrics/blob/main/docs/metrics/extend/customresourcestate-metrics.md) configuration, which this repository does not ship:
 
 ```yaml
-- alert: SBPROXY-NODE-ON-FALLBACK-CONFIG
+# kube-state-metrics --custom-resource-state-config-file
+spec:
+  resources:
+    - groupVersionKind:
+        group: sbproxy.dev
+        version: v1alpha1
+        kind: SBProxy
+      metricNamePrefix: sbproxy_crd
+      metrics:
+        - name: status_condition
+          each:
+            type: Gauge
+            gauge:
+              path: [status, conditions]
+              labelsFromPath:
+                type: [type]
+                status: [status]
+              value: [observedGeneration]
+```
+
+```yaml
+- alert: SBProxyNodeOnFallbackConfig
   expr: |
-    kube_customresource_sbproxy_status_condition{type="ConfigFallbackActive",status="true"} == 1
+    sbproxy_crd_status_condition{type="ConfigFallbackActive",status="True"} == 1
   for: 15m
 ```
 
+The operator also counts the decision directly, which needs no CR scraping at all: `sbproxy_operator_config_delivery_total{state="suspended_on_fallback"}` climbing means config is not reaching a fleet, and `sbproxy_operator_fallback_probes_total{outcome}` says what each pod answered. Neither is wired into `deploy/alerts/alerting-rules.yml`, whose paging alerts all resolve through a `runbook_id`; add your own severity and runbook mapping rather than pointing a pager at a rule that does not exist.
+
 The resume is on the node, not on the CR. `DELETE /admin/config/fallback` clears the pin and reapplies the file; the next reconcile sees no pin, flips the condition to `False`, and pushes config again. Nothing about the `SBProxy` has to change.
 
-Two things this deliberately does not do. It does not suspend on an unhealthy pod: a pod that is merely crash-looping has said nothing about its configuration, and freezing config delivery for it would let one sick replica block a fix from reaching the healthy ones. And it does not suspend when it cannot ask: a pod with no IP yet, an unreachable admin port, or an `SBProxy` with no `spec.adminAuthSecretRef` all contribute no report, and the operator reconciles as it always did. The suspension is keyed on a node actually saying "I am on a fallback", never on silence.
+Three things this deliberately does not do.
+
+It does not suspend on an unhealthy pod: a pod that is merely crash-looping has said nothing about its configuration, and freezing config delivery for it would let one sick replica block a fix from reaching the healthy ones.
+
+It does not suspend when it cannot ask: a pod with no IP yet, an unreachable admin port, or an `SBProxy` with no `spec.adminAuthSecretRef` all contribute no report, and the operator reconciles as it always did. The suspension is keyed on a node actually saying "I am on a fallback", never on silence. Each of those fail-opens is counted on `sbproxy_operator_fallback_probes_total{outcome}`, so a suspension that has quietly stopped working is visible rather than inferred.
+
+And it does not ask a pod it did not create. The probe carries the operator's admin credential, and the `app.kubernetes.io/instance` label alone is a value anyone with pod-create in the namespace can type, so a pod is asked only when its controller owner reference names this `SBProxy`'s own Deployment ReplicaSet or StatefulSet. Anything else is counted as `outcome="unowned"` and skipped. That check removes the accidental collision; it is not proof of provenance, because Kubernetes does not validate owner references on create. Against a hostile principal the boundary is namespace RBAC: `pods/create` in a namespace running an `SBProxy` is equivalent to being in the fleet.
 
 ### `auto_revert` is refused under operator ownership
 
@@ -99,6 +139,10 @@ $ kubectl describe sbproxy edge | grep -A2 'Last Error'
 ```
 
 A node that reverts its own config loses the race with the next reconcile, which reapplies the ConfigMap the node just reverted away from, and the two take turns. Accepting the key and then losing that race is worse than refusing it, and refusing it quietly is worse still, because nothing would tell you why the setting did nothing. Roll back through the control plane instead: `sbproxy config authority rollback --to-revision N` for a fleet, or `POST /admin/config/rollback` on a node this operator does not own.
+
+The check reads the document `spec.config` carries inline. A `spec.config` that is a bare `source:` pointer is not fetched at reconcile time, so a document that arms `auto_revert` behind a pointer is not caught here, the same way the ACME guard beside it only sees an inline document.
+
+The refusal is permanent until the config changes, and the pass itself completes cleanly, so `sbproxy_operator_reconcile_total{result}` reads `ok` for it. `sbproxy_operator_config_delivery_total{state="refused_auto_revert"}` is the series that says image bumps and replica changes are being dropped.
 
 Upgrade the CRDs along with the operator image. `observedConfigHash` is new, and until the CRD carries it the apiserver prunes the field on every status write. The operator only trusts a `configHash` that has an `observedConfigHash` beside it, because an older build wrote `configHash` before applying anything and a hash that means "seen" would read as "delivered". So an operator running against the old CRD reloads the fleet once per requeue instead of skipping the pass, which is wasteful rather than wrong and stops as soon as the CRD is applied. `helm upgrade` handles this; a raw `kubectl apply` needs `deploy/crds/sbproxy.yaml` reapplied too.
 

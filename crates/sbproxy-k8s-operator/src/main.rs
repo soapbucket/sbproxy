@@ -1904,7 +1904,7 @@ mod tests {
     #[tokio::test]
     async fn a_reconcile_writes_no_config_while_a_pod_is_on_its_boot_fallback() {
         let stub = FallbackStub::start(
-            r#"{"active":true,"revision":7,"digest":"sha256:abc","reason":"unknown action type `statik`","suspended":["file_watcher"]}"#,
+            r#"{"active":true,"revision":7,"digest":"sha256:abc","reason":"unknown action type: statik","suspended":["file_watcher"]}"#,
         );
         let requests = drive_one_reconcile(stub.port).await;
 

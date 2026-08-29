@@ -54,7 +54,7 @@ A project may set exactly these origin fields:
 
 `action`, `authentication`, `policies`, `transforms`, `request_modifiers`, `response_modifiers`, `cors`, `compression`, `error_pages`, `problem_details`, `deprecation`, `expose_openapi`, `agents_md`, `ai_txt`, `agents_json`, `agent_skills`, `default_content_shape`, `content_signal`, `token_bytes_ratio`.
 
-Everything else on an origin is unrepresentable rather than merely rejected. There is no field in the profile schema that could hold it, so the parse fails and names the key you typed. That is an allowlist on purpose: an origin has 52 fields and gains more regularly, and a deny list would make every future field a silent grant to every project repository.
+Everything else on an origin is unrepresentable rather than merely rejected. There is no field in the profile schema that could hold it, so the parse fails and names the key you typed. That is an allowlist on purpose: an origin has 53 fields and gains more regularly, and a deny list would make every future field a silent grant to every project repository.
 
 Two things you will reach for and not find:
 

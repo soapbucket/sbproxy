@@ -168,10 +168,20 @@ In CI, to fail a pull request that would change the composed document without sa
 
 ```console
 $ sbproxy aggregate runtime.yml --out composed.yml --dry-run
-aggregate: composed.yml would change: 1 origin modified, 0 added, 0 removed
+aggregate: composed.yml would change:
+  -    action:
+  -      url: https://checkout-us-east-1.internal.example.com
+  +    action:
+  +      url: https://checkout-us-west-2.internal.example.com
 $ echo $?
 2
 ```
+
+It prints a line diff against the file already there, not a summary
+count, so a CI job asserts on the **exit code**: `2` means the composed
+document would change, `0` means it would not. A file that does not
+exist yet exits `2` with `composed.yml does not exist; composing would
+create it with 3 origins`.
 
 ## When a project pushes something broken
 
@@ -180,8 +190,7 @@ Two failure classes, deliberately kept apart.
 **A single entry that will not fetch** is not the same as a composed document that will not compile. One unreachable repository must not discard the other forty-nine entries' last-known-good, so a fetch failure falls back to that entry's last resolved document and is reported by name:
 
 ```
-aggregate: warning: entry `billing` (https://git.example.com/acme/billing) did not resolve:
-  connection timed out after 30s; composing from its last resolved document (commit a1b2c3d4)
+aggregate: warning: entry `billing` (https://git.example.com/acme/billing) did not resolve: connection timed out after 30s; reusing its last resolved document at a1b2c3d4e5f6
 ```
 
 An entry that fails its **first** fetch has no last-known-good, and there the round aborts. Composing without it would publish a document whose `origins:` silently lacks that project's hosts, which is a service taken offline by a network blip.
@@ -191,8 +200,7 @@ An entry that fails its **first** fetch has no last-known-good, and there the ro
 Every refusal names the entry:
 
 ```
-aggregate: entry `checkout`: policy `platform_waf` is locked in origin_defaults and the
-  profile at sbproxy/origin.yaml overrides it
+aggregate: composition refused: entry `checkout`: policy `platform_waf` is locked in origin_defaults and the profile at sbproxy/origin.yaml overrides it
 aggregate: nothing was published and nothing was written.
 ```
 
