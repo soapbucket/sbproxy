@@ -1244,3 +1244,11 @@ the ground is not handed back on the next branch.
 2026-08-29 (WOR-2421): unreferenced 1525 -> 1524. Parallel-input chain
 predicates and the session wait helper are cfg(test) rather than pub, so
 they leave this bucket and rustc polices them.
+
+2026-08-29 (merge of main #1247 into WOR-2668 / WOR-2670 / WOR-2671):
+unreferenced 1524 -> 1523. Both sides of this merge emptied items out of
+this bucket independently, and each recorded 1525 -> 1524 against its own
+base, so the merged tree is one lower than either. Neither branch
+narrowed anything to get there; the count is re-derived from the merged
+tree and locked here rather than carried at whichever number was true
+before the merge.
