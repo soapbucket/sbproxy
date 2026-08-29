@@ -451,6 +451,195 @@
         }
       ],
       "description": "Project repositories this fleet's configuration pulls, split by runtime tier and by whether the entry is pinned to an immutable revision (a full commit sha, or a tag spelled refs/tags/<name>). Set at config load, so a step change means a config was applied rather than that a fetch happened. Two readings to act on: the total dropping to zero means a fleet that should be composing project profiles has quietly stopped, and any non-zero pinned=false series under tier=production means a node is running a document that predates the pinning rule, because config load refuses that combination outright. Runbook: docs/operator-runbook.md#origins."
+    },
+    {
+      "id": 7,
+      "title": "Aggregation Entries by Outcome",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 60
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": true,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "noValue": "No aggregator has reported here. Composition runs in one place; a fleet with no origin_sources block never writes this."
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "lastNotNull",
+            "min",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (sbproxy_aggregate_entries)",
+          "legendFormat": "{{outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "How the last aggregation round ended for each origin_sources entry. resolved is a repository read this round, unchanged is one whose remote sha had not moved so no clone happened, and failed is one that fell back to its last known good document or could not resolve at all. Every outcome is written on every round including the zeroes, so a failure that clears shows as the drop rather than as a series that stops moving. Two readings to act on: a non-zero failed series that persists across rounds names a repository the aggregator cannot reach, and unchanged staying at zero while rounds keep happening means the cheap ls-remote poll is not answering and every round is paying for a full clone. The entry name is deliberately not a label; it is in the aggregate structured log and in the sbproxy aggregate output. Runbook: docs/operator-runbook.md#origins."
+    },
+    {
+      "id": 8,
+      "title": "Aggregation Round Duration and Decision",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 70
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": true,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "noValue": "No aggregator has reported here."
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "lastNotNull",
+            "min",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(sbproxy_aggregate_compose_duration_seconds_bucket[5m])))",
+          "legendFormat": "p95 round duration",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (outcome) (rate(sbproxy_aggregate_rounds_total[5m]))",
+          "legendFormat": "{{outcome}} rounds/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Left axis is the p95 wall clock of one aggregation round, fetches included, and the two rate series are what each round decided. published means a composed document that differed from the last one and went to the config authority; unchanged means a byte-identical composition that published nothing, which is the steady state the change detector exists to produce and not a fault. Two readings to act on: p95 approaching origin_sources.aggregator.deadline_secs means the round is about to start reporting outstanding entries, and published tracking the round rate one for one means the change detector is not suppressing anything, which usually means a profile carries a value that differs on every read. Runbook: docs/operator-runbook.md#origins."
+    },
+    {
+      "id": 9,
+      "title": "Published Config Revision",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 80
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": true,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "noValue": "No aggregator has reported here."
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "lastNotNull",
+            "min",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sbproxy_aggregate_published_revision",
+          "legendFormat": "revision",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "The config-authority revision the aggregator last published. Zero means this aggregator has published nothing yet. A revision that stops advancing while entries keep resolving is the expected steady state, because an unchanged composition publishes nothing; read this panel together with Aggregation Entries by Outcome rather than alone. A revision that advances on every round is the thing to investigate, since each published revision is a full pipeline rebuild on every subscriber. Runbook: docs/operator-runbook.md#origins."
     }
   ],
   "templating": {

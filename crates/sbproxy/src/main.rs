@@ -198,6 +198,12 @@ enum Cmd {
     /// Diff a proposed config against a baseline. Exit 0 no-op, 2
     /// changes present, 3 semantic-validation errors.
     Plan(PlanArgs),
+    /// Fetch every project repository `origin_sources:` names, compose
+    /// the `origins:` map, and either publish it through the config
+    /// authority or write it to a file. Exit 0 published or unchanged,
+    /// 1 CLI error, 2 `--dry-run` found changes, 3 the composition or
+    /// the authority refused it.
+    Aggregate(AggregateArgs),
     /// Validate and reload an sbproxy config in place. Same primitive
     /// the SIGHUP handler and file watcher use.
     Apply(ApplyArgs),
@@ -310,6 +316,85 @@ struct PlanArgs {
     /// with `apply -p <plan-file>`. Atomic via temp-file + rename(2).
     #[arg(long = "out")]
     out: Option<PathBuf>,
+    /// Print the composition provenance for one composed host instead
+    /// of a diff: which layer set each leaf of that origin, and which
+    /// repository and commit it came from. Fetches every project
+    /// repository `origin_sources:` names, so it is refused under
+    /// `--no-fetch`.
+    #[arg(long = "explain-origin", conflicts_with = "against")]
+    explain_origin: Option<String>,
+}
+
+/// `sbproxy aggregate`: compose project-owned origin profiles into the
+/// `origins:` map and publish or write the result.
+#[derive(clap::Args)]
+struct AggregateArgs {
+    /// Positional runtime config path. Equivalent to `-f <path>`. This
+    /// is the document carrying `origin_sources:` and `origin_defaults:`,
+    /// not a project profile.
+    config_path: Option<PathBuf>,
+    /// Compose to this file instead of publishing. The offline path for
+    /// a single node, a self-host, or a CI job that wants to review the
+    /// composed output before it ships.
+    #[arg(long = "out")]
+    out: Option<PathBuf>,
+    /// Print what `--out` would change against the file already there
+    /// and write nothing. Exit 2 when there are changes.
+    #[arg(long = "dry-run", action = ArgAction::SetTrue, requires = "out")]
+    dry_run: bool,
+    /// Print the composition provenance for one host and exit: which
+    /// layer set each leaf, and which repository and commit it came
+    /// from.
+    #[arg(long = "explain")]
+    explain: Option<String>,
+    /// Keep running: poll each entry on the configured interval,
+    /// coalesce a burst of movement into one composition, and publish
+    /// when the composed document actually changed.
+    ///
+    /// Refuses to combine with the one-shot flags rather than ignoring
+    /// them. `--watch --out f.yml` used to drop `--out` without a word
+    /// and loop publishing to the admin API instead, which on a node
+    /// with an admin listener is a fleet publish nobody asked for.
+    #[arg(
+        long = "watch",
+        action = ArgAction::SetTrue,
+        conflicts_with_all = ["dry_run", "out", "explain"]
+    )]
+    watch: bool,
+    /// Stop after this many poll cycles in `--watch`. Zero means run
+    /// until interrupted, which is the operational default; a positive
+    /// value is what a cron-shaped invocation uses. Poll cycles rather
+    /// than compositions, because a fleet where nothing moves composes
+    /// nothing and a bound counting compositions would never be reached.
+    #[arg(long = "polls", default_value_t = 0)]
+    polls: u32,
+    /// How subscribers apply the composed document. Must match the mode
+    /// each subscriber is configured for, or they refuse the bundle.
+    #[arg(long = "mode", value_enum, default_value_t = BundleModeArg::Overlay)]
+    mode: BundleModeArg,
+    /// Admin endpoint and Basic Auth credentials of the config
+    /// authority this publishes through.
+    #[command(flatten)]
+    admin: ModelsAdminArgs,
+    /// Output format. `text` (default) prints a human summary; `json`
+    /// is the stable envelope for tooling.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+impl std::fmt::Debug for AggregateArgs {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AggregateArgs")
+            .field("config_path", &self.config_path)
+            .field("out", &self.out)
+            .field("dry_run", &self.dry_run)
+            .field("explain", &self.explain)
+            .field("watch", &self.watch)
+            .field("polls", &self.polls)
+            .field("admin", &self.admin)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(clap::Args)]
@@ -1941,6 +2026,16 @@ fn main() {
         }
         Some(Cmd::Plan(args)) => {
             run_subcommand("plan", 1, handle_plan_subcommand(&args));
+        }
+        Some(Cmd::Aggregate(args)) => {
+            // `-f/--config` is a global, so it lands in `cli.globals`
+            // rather than in this subcommand's positional, the same way
+            // `validate` has to fall back. The positional still wins.
+            let args = AggregateArgs {
+                config_path: args.config_path.or(global_config_path.clone()),
+                ..args
+            };
+            run_subcommand("aggregate", 1, handle_aggregate_subcommand(&args));
         }
         Some(Cmd::Apply(args)) => {
             run_subcommand("apply", 1, handle_apply_subcommand(&args));
@@ -9677,6 +9772,335 @@ fn handle_authority_init(args: &AuthorityInitArgs) -> anyhow::Result<i32> {
 /// Exit codes: 0 published (or validated under `--validate-only`), 1 CLI or
 /// IO error, 3 the payload was refused locally and nothing was sent, 4 the
 /// authority refused it, 7 the authority was unreachable.
+/// Publish a composed document through the config authority's admin
+/// route.
+///
+/// The same route `sbproxy config authority publish` posts to, so the
+/// composed document goes through `compile_config`, the pipeline
+/// construction, the model-runtime check and the denied-path screen on
+/// the authority side rather than being trusted because the aggregator
+/// produced it.
+struct AdminApiPublisher<'a> {
+    admin: &'a ModelsAdminArgs,
+    mode: BundleModeArg,
+}
+
+impl sbproxy_core::config_aggregator::CompositionPublisher for AdminApiPublisher<'_> {
+    fn publish(&self, config_yaml: &str) -> Result<u64, String> {
+        let route = format!(
+            "{}?mode={}",
+            sbproxy_core::config_authority::PUBLISH_PATH,
+            self.mode.as_str()
+        );
+        let outcome = admin_request_parts(
+            self.admin,
+            reqwest::Method::POST,
+            &route,
+            Some(AdminRequestBody::Yaml(config_yaml.to_string())),
+        )
+        .map_err(|error| format!("{error:#}"))?;
+        match outcome {
+            AdminOutcome::Unreachable(reason) => Err(format!(
+                "could not reach the admin API at {}: {reason}",
+                self.admin.admin_url.as_deref().unwrap_or(DEFAULT_ADMIN_URL)
+            )),
+            AdminOutcome::Answered { status, body } if !status.is_success() => {
+                let error = body
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("the admin API gave no reason");
+                let code = body
+                    .get("code")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                Err(format!("HTTP {status} ({code}): {error}"))
+            }
+            AdminOutcome::Answered { body, .. } => Ok(json_u64(&body, "revision")),
+        }
+    }
+}
+
+/// `sbproxy aggregate`: fetch, compose, and publish or write.
+///
+/// Exit codes: 0 published, written, or unchanged; 1 a CLI or
+/// composition error (through `run_subcommand`); 2 `--dry-run` found
+/// changes; 3 the composition or the authority refused it.
+fn handle_aggregate_subcommand(args: &AggregateArgs) -> anyhow::Result<i32> {
+    let path = args
+        .config_path
+        .clone()
+        .or_else(|| std::env::var("SB_CONFIG_FILE").ok().map(PathBuf::from))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "missing config path: aggregate takes the runtime document that carries \
+                 `origin_sources:`, as a positional argument or through -f / --config"
+            )
+        })?;
+    // `from_path` rather than a read plus `from_document`, so a
+    // `--watch` run re-reads the document each cycle instead of
+    // composing from the one it saw at start-up.
+    let mut aggregator = sbproxy_core::config_aggregator::Aggregator::from_path(
+        &path,
+        sbproxy_config::source::FetchContext::with_git_binary(),
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    aggregator
+        .resolve_credentials()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+    if args.watch {
+        let publisher = AdminApiPublisher {
+            admin: &args.admin,
+            mode: args.mode,
+        };
+        let polls = (args.polls > 0).then_some(args.polls);
+        {
+            let entries = aggregator.entries().len();
+            let timings = aggregator.timings();
+            println!(
+                "aggregate: watching {entries} entr{}; poll {}s, debounce {}s, ceiling {}s",
+                if entries == 1 { "y" } else { "ies" },
+                timings.poll_interval_secs,
+                timings.debounce_secs,
+                timings.max_deferral_secs
+            );
+        }
+        sbproxy_core::config_aggregator::aggregation_loop(&mut aggregator, &publisher, polls);
+        return Ok(0);
+    }
+
+    let composed = match aggregator.compose() {
+        Ok(composed) => composed,
+        Err(error) => {
+            use sbproxy_core::config_aggregator::AggregateError;
+            eprintln!("aggregate: {error}");
+            // Both classes exit 3 because neither published anything.
+            // The second line differs because the next action does: a
+            // deadline or an unreachable repository leaves the fleet on
+            // its last good revision and is worth waiting out, while a
+            // document that will not compose needs somebody to edit it.
+            match error {
+                AggregateError::Deadline { .. } | AggregateError::Unresolvable { .. } => {
+                    eprintln!(
+                        "aggregate: nothing was published; every subscriber is still serving \
+                         the last revision this authority published."
+                    );
+                }
+                _ => eprintln!("aggregate: nothing was published and nothing was written."),
+            }
+            return Ok(3);
+        }
+    };
+    for failure in &composed.failed {
+        eprintln!(
+            "aggregate: warning: entry `{}` ({}) did not resolve: {}{}",
+            failure.entry,
+            failure.repo,
+            failure.reason,
+            failure
+                .reused_commit
+                .as_deref()
+                .map_or_else(String::new, |commit| format!(
+                    "; reusing its last resolved document at {commit}"
+                ))
+        );
+    }
+
+    if let Some(host) = args.explain.as_deref() {
+        let Some(provenance) = composed.provenance.get(host) else {
+            let known: Vec<&str> = composed.provenance.keys().map(String::as_str).collect();
+            eprintln!(
+                "aggregate: nothing composed for '{host}'. This composition produced: {}",
+                if known.is_empty() {
+                    "(no hosts)".to_string()
+                } else {
+                    known.join(", ")
+                }
+            );
+            return Ok(3);
+        };
+        match args.format {
+            OutputFormat::Json => println!(
+                "{}",
+                serde_json::to_string_pretty(&cli_command_envelope(
+                    "aggregate.explain",
+                    serde_json::json!({ "host": host, "provenance": provenance }),
+                ))?
+            ),
+            OutputFormat::Text => print!("{}", provenance.render(host)),
+        }
+        return Ok(0);
+    }
+
+    if let Some(out) = args.out.as_deref() {
+        if args.dry_run {
+            let diff = sbproxy_core::config_aggregator::Aggregator::diff_against(&composed, out)
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            return Ok(report_aggregate_dry_run(
+                args,
+                &composed,
+                out,
+                diff.as_deref(),
+            ));
+        }
+        sbproxy_core::config_aggregator::Aggregator::write_composed(&composed, out)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        // The header goes to stderr as well as into the file, so an
+        // operator watching a CI job sees which revisions produced the
+        // artifact without opening it.
+        eprint!("{}", composed.header());
+        match args.format {
+            OutputFormat::Json => println!(
+                "{}",
+                serde_json::to_string_pretty(&cli_command_envelope(
+                    "aggregate.out",
+                    aggregate_summary_json(&composed, Some(&out.display().to_string()), None),
+                ))?
+            ),
+            OutputFormat::Text => println!(
+                "aggregate: wrote {} origins from {} entries to {} ({} bytes, digest {})",
+                composed.origins,
+                composed.resolved.len(),
+                out.display(),
+                composed.yaml.len(),
+                composed.content_digest
+            ),
+        }
+        return Ok(0);
+    }
+
+    let publisher = AdminApiPublisher {
+        admin: &args.admin,
+        mode: args.mode,
+    };
+    match aggregator.publish_composed(composed, &publisher) {
+        Ok(sbproxy_core::config_aggregator::RoundOutcome::Published { revision, outcome }) => {
+            match args.format {
+                OutputFormat::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&cli_command_envelope(
+                        "aggregate.publish",
+                        aggregate_summary_json(&outcome, None, Some(revision)),
+                    ))?
+                ),
+                OutputFormat::Text => println!(
+                    "aggregate: published revision {revision} ({} origins from {} entries, \
+                     digest {})",
+                    outcome.origins,
+                    outcome.resolved.len(),
+                    outcome.content_digest
+                ),
+            }
+            Ok(0)
+        }
+        Ok(sbproxy_core::config_aggregator::RoundOutcome::Unchanged { outcome }) => {
+            match args.format {
+                OutputFormat::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&cli_command_envelope(
+                        "aggregate.publish",
+                        aggregate_summary_json(&outcome, None, None),
+                    ))?
+                ),
+                OutputFormat::Text => println!(
+                    "aggregate: the composed document is unchanged (digest {}), so nothing was \
+                     published and no subscriber reloaded",
+                    outcome.content_digest
+                ),
+            }
+            Ok(0)
+        }
+        // `RoundOutcome` is `#[non_exhaustive]`, so a decision added
+        // later reaches this arm rather than failing to compile in a
+        // downstream crate. Reporting the digest and exiting 0 is the
+        // conservative reading: nothing about the authority changed that
+        // this binary understands.
+        Ok(other) => {
+            eprintln!("aggregate: the round finished with an outcome this build does not render");
+            let _ = other;
+            Ok(0)
+        }
+        Err(error) => {
+            eprintln!("aggregate: {error}");
+            eprintln!("aggregate: nothing changed on the authority.");
+            Ok(3)
+        }
+    }
+}
+
+/// Print what `--out --dry-run` would change, and pick the exit code.
+fn report_aggregate_dry_run(
+    args: &AggregateArgs,
+    composed: &sbproxy_core::config_aggregator::CompositionOutcome,
+    out: &std::path::Path,
+    diff: Option<&[String]>,
+) -> i32 {
+    let (changed, lines) = match diff {
+        // The file is not there, so writing it is entirely a change.
+        None => (true, Vec::new()),
+        Some(lines) => (!lines.is_empty(), lines.to_vec()),
+    };
+    if matches!(args.format, OutputFormat::Json) {
+        let body = cli_command_envelope(
+            "aggregate.dry-run",
+            serde_json::json!({
+                "out": out.display().to_string(),
+                "exists": diff.is_some(),
+                "changed": changed,
+                "diff": lines,
+                "origins": composed.origins,
+                "content_digest": composed.content_digest,
+            }),
+        );
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string())
+        );
+        return i32::from(changed) * 2;
+    }
+    if diff.is_none() {
+        println!(
+            "aggregate: {} does not exist; composing would create it with {} origins",
+            out.display(),
+            composed.origins
+        );
+        return 2;
+    }
+    if !changed {
+        println!(
+            "aggregate: {} already holds this composition (digest {})",
+            out.display(),
+            composed.content_digest
+        );
+        return 0;
+    }
+    println!("aggregate: {} would change:", out.display());
+    for line in &lines {
+        println!("  {line}");
+    }
+    2
+}
+
+/// The shared JSON summary for the three `aggregate` output shapes.
+fn aggregate_summary_json(
+    composed: &sbproxy_core::config_aggregator::CompositionOutcome,
+    out: Option<&str>,
+    revision: Option<u64>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "out": out,
+        "revision": revision,
+        "origins": composed.origins,
+        "content_digest": composed.content_digest,
+        "bytes": composed.yaml.len(),
+        "duration_ms": composed.duration.as_millis(),
+        "resolved": composed.resolved,
+        "failed": composed.failed,
+        "drops": composed.drops,
+        "provenance_hosts": composed.provenance.keys().collect::<Vec<_>>(),
+    })
+}
+
 fn handle_authority_publish(args: &AuthorityPublishArgs) -> anyhow::Result<i32> {
     let path = args.config.as_deref().ok_or_else(|| {
         anyhow::anyhow!(
@@ -11756,6 +12180,9 @@ fn plan_exit_code(report: &sbproxy_config::PlanReport) -> i32 {
 }
 
 fn handle_plan_subcommand(args: &PlanArgs) -> anyhow::Result<i32> {
+    if let Some(host) = args.explain_origin.as_deref() {
+        return handle_plan_explain_origin(args, host);
+    }
     let (baseline, proposed, construction_error) = load_plan_inputs(args)?;
     let config_path = args
         .config
@@ -11767,6 +12194,68 @@ fn handle_plan_subcommand(args: &PlanArgs) -> anyhow::Result<i32> {
     }
     render_and_write_plan(&report, args, &baseline)?;
     Ok(plan_exit_code(&report))
+}
+
+/// `sbproxy plan --explain-origin <host>`: why is this policy here.
+///
+/// The question a security engineer has when an origin is the product of
+/// four layers and two repositories, answered on the same verb they
+/// already reach for to ask what a config change would do. It composes
+/// exactly as the aggregator does, through the same
+/// [`sbproxy_core::config_aggregator::Aggregator`], so what this prints
+/// and what a publish records cannot disagree.
+///
+/// Exit 0 when the host composed, 3 when it did not, and the refusal
+/// names every host this composition did produce.
+fn handle_plan_explain_origin(args: &PlanArgs, host: &str) -> anyhow::Result<i32> {
+    if args.no_fetch {
+        anyhow::bail!(
+            "--explain-origin composes the project repositories `origin_sources:` names, which \
+             --no-fetch forbids. Drop --no-fetch, or compose on a host that can reach them with \
+             `sbproxy aggregate --out`"
+        );
+    }
+    let path = args
+        .config
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("missing -f / --config"))?;
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| anyhow::anyhow!("read '{}': {error}", path.display()))?;
+    let mut aggregator = sbproxy_core::config_aggregator::Aggregator::from_document(&text)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    aggregator
+        .resolve_credentials()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let composed = match aggregator.compose() {
+        Ok(composed) => composed,
+        Err(error) => {
+            eprintln!("plan: {error}");
+            return Ok(3);
+        }
+    };
+    let Some(provenance) = composed.provenance.get(host) else {
+        let known: Vec<&str> = composed.provenance.keys().map(String::as_str).collect();
+        eprintln!(
+            "plan: nothing composed for '{host}'. This composition produced: {}",
+            if known.is_empty() {
+                "(no hosts)".to_string()
+            } else {
+                known.join(", ")
+            }
+        );
+        return Ok(3);
+    };
+    match args.format {
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&cli_command_envelope(
+                "plan.explain-origin",
+                serde_json::json!({ "host": host, "provenance": provenance }),
+            ))?
+        ),
+        OutputFormat::Text => print!("{}", provenance.render(host)),
+    }
+    Ok(0)
 }
 
 /// Take an exclusive `flock(2)` on the apply lock for `yaml_path`.
@@ -16595,6 +17084,7 @@ origins:
             against: None,
             format: OutputFormat::Text,
             out: None,
+            explain_origin: None,
         };
         assert_eq!(handle_plan_subcommand(&args).unwrap(), 2);
         // Plan against itself: no changes -> exit 0.
@@ -16604,9 +17094,56 @@ origins:
             against: Some(path.clone()),
             format: OutputFormat::Text,
             out: None,
+            explain_origin: None,
         };
         assert_eq!(handle_plan_subcommand(&args).unwrap(), 0);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// `--watch` refuses the one-shot flags rather than dropping them.
+    ///
+    /// It used to return before `--out` and `--explain` were read, so
+    /// `aggregate --out f.yml --watch` looped POSTing composed documents
+    /// to the admin API while the file was never written. On a node with
+    /// an admin listener that is a fleet publish nobody asked for
+    /// (WOR-2432 review, Major 5).
+    #[test]
+    fn aggregate_watch_refuses_the_one_shot_flags() {
+        use clap::Parser as _;
+
+        for conflicting in [
+            vec!["--out", "composed.yml"],
+            vec!["--explain", "api.example.com"],
+            vec!["--out", "composed.yml", "--dry-run"],
+        ] {
+            let mut argv = vec!["sbproxy", "aggregate", "-f", "sb.yml", "--watch"];
+            argv.extend(conflicting.iter().copied());
+            let parsed = Cli::try_parse_from(&argv);
+            assert!(
+                parsed.is_err(),
+                "`{}` must be refused rather than silently dropping a flag",
+                argv.join(" ")
+            );
+        }
+
+        // And each of them still parses on its own, so the conflict is
+        // the pairing rather than the flag.
+        for alone in [
+            vec!["--out", "composed.yml"],
+            vec!["--explain", "api.example.com"],
+        ] {
+            let mut argv = vec!["sbproxy", "aggregate", "-f", "sb.yml"];
+            argv.extend(alone.iter().copied());
+            assert!(
+                Cli::try_parse_from(&argv).is_ok(),
+                "`{}` is a valid one-shot invocation",
+                argv.join(" ")
+            );
+        }
+        assert!(
+            Cli::try_parse_from(["sbproxy", "aggregate", "-f", "sb.yml", "--watch"]).is_ok(),
+            "and --watch on its own is valid"
+        );
     }
 
     #[test]
@@ -16617,6 +17154,7 @@ origins:
             against: None,
             format: OutputFormat::Text,
             out: None,
+            explain_origin: None,
         };
         assert!(handle_plan_subcommand(&args).is_err());
     }

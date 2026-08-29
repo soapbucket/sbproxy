@@ -1975,8 +1975,7 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
     // A document that declares an extension bundle source may name a
     // policy or transform type this build cannot resolve from here; see
     // `origin_profile::UnknownTypes`.
-    let declares_extension_bundles =
-        config_file.extensions.bundles_dir.is_some() || !config_file.extensions.sources.is_empty();
+    let declares_extension_bundles = config_file.extensions.declares_any_source();
     if let Some(defaults) = config_file.origin_defaults.as_ref() {
         crate::origin_profile::validate_origin_defaults_with(defaults, declares_extension_bundles)
             .map_err(|error| anyhow::anyhow!("config compile: {error}"))?;

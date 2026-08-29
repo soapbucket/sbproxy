@@ -543,6 +543,20 @@ impl ConfigAuthority {
         self.served.load_full().map(|served| served.etag.clone())
     }
 
+    /// `sha256:<hex>` of the payload currently served.
+    ///
+    /// Exposed so a producer that composes the payload it publishes can
+    /// tell, after a restart, whether what it just built is already the
+    /// revision this authority is serving. Republishing an identical
+    /// payload is a full pipeline rebuild on every subscriber for no
+    /// configuration change (WOR-2438).
+    #[must_use]
+    pub fn current_content_digest(&self) -> Option<String> {
+        self.served
+            .load_full()
+            .map(|served| served.content_digest.clone())
+    }
+
     /// Validate, sign, store, and begin serving one configuration payload.
     ///
     /// Every check runs before a revision number is reserved, so a payload

@@ -3819,6 +3819,111 @@ pub fn set_origin_source_entries(tier: &str, pinned: bool, count: i64) {
     }
 }
 
+/// Publish one aggregation round's per-outcome entry counts on
+/// `sbproxy_aggregate_entries`.
+///
+/// A gauge rather than a counter because the question an operator has is
+/// "how many of my fifty project repositories are unreachable right
+/// now", not "how many fetches have ever failed". Every outcome is
+/// written on every round, including the zeroes, so a failure that
+/// clears shows as the drop rather than as a series that stops moving.
+///
+/// The label is the outcome and never the entry name: fifty entries
+/// would be fifty series that churn as the block is edited, and the
+/// entry that failed is named in the structured log and in the CLI
+/// output where a name belongs.
+///
+/// Registration failure is swallowed rather than panicked on, matching
+/// the neighbours in this file: an aggregation that died because a gauge
+/// would not register would stop a fleet's config over a number.
+pub fn set_aggregate_entries(outcome: &str, count: i64) {
+    use prometheus::{register_int_gauge_vec, IntGaugeVec};
+    use std::sync::OnceLock;
+    static G: OnceLock<Option<IntGaugeVec>> = OnceLock::new();
+    let gauge = G.get_or_init(|| {
+        register_int_gauge_vec!(
+            "sbproxy_aggregate_entries",
+            "origin_sources entries by the outcome of the last aggregation round",
+            &["outcome"]
+        )
+        .ok()
+    });
+    if let Some(gauge) = gauge.as_ref() {
+        gauge.with_label_values(&[outcome]).set(count);
+    }
+}
+
+/// Record how long one composition took, fetches included, on
+/// `sbproxy_aggregate_compose_duration_seconds`.
+///
+/// The buckets run from a fifth of a second to five minutes because the
+/// whole spread is interesting: a round that resolves nothing new
+/// finishes in milliseconds, and a cold round against fifty
+/// repositories is bounded by `deadline_secs`, whose default is 300.
+pub fn record_aggregate_compose_duration(seconds: f64) {
+    use prometheus::{register_histogram, Histogram};
+    use std::sync::OnceLock;
+    static H: OnceLock<Option<Histogram>> = OnceLock::new();
+    let histogram = H.get_or_init(|| {
+        register_histogram!(
+            "sbproxy_aggregate_compose_duration_seconds",
+            "Wall-clock time for one aggregation round, fetches included",
+            vec![0.2, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0]
+        )
+        .ok()
+    });
+    if let Some(histogram) = histogram.as_ref() {
+        histogram.observe(seconds);
+    }
+}
+
+/// Publish the revision the aggregator last published on
+/// `sbproxy_aggregate_published_revision`.
+///
+/// Zero means this aggregator has published nothing yet. A revision that
+/// stops advancing while `sbproxy_aggregate_entries{outcome="resolved"}`
+/// keeps moving is the steady state the change detector exists to
+/// produce, not a fault, which is why the two are read together.
+pub fn set_aggregate_published_revision(revision: i64) {
+    use prometheus::{register_int_gauge, IntGauge};
+    use std::sync::OnceLock;
+    static G: OnceLock<Option<IntGauge>> = OnceLock::new();
+    let gauge = G.get_or_init(|| {
+        register_int_gauge!(
+            "sbproxy_aggregate_published_revision",
+            "Config-authority revision the aggregator last published"
+        )
+        .ok()
+    });
+    if let Some(gauge) = gauge.as_ref() {
+        gauge.set(revision);
+    }
+}
+
+/// Count one aggregation round's publish decision on
+/// `sbproxy_aggregate_rounds_total`.
+///
+/// The outcomes are `published`, `unchanged`, and `refused`. The middle
+/// one is the point: a round that composes a byte-identical document
+/// publishes nothing, and without a counter for it an operator cannot
+/// tell a working change detector from a stalled aggregator.
+pub fn record_aggregate_round(outcome: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_aggregate_rounds_total",
+            "Aggregation rounds by what the round decided to do",
+            &["outcome"]
+        )
+        .ok()
+    });
+    if let Some(counter) = counter.as_ref() {
+        counter.with_label_values(&[outcome]).inc();
+    }
+}
+
 /// Publish the config revision ring's current entry count on
 /// `sbproxy_config_history_entries`.
 ///

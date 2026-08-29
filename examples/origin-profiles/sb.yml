@@ -15,6 +15,11 @@
 # Try it:
 #
 #   sbproxy validate examples/origin-profiles/sb.yml
+#
+# and, once the repositories below are reachable:
+#
+#   sbproxy aggregate -f examples/origin-profiles/sb.yml --out composed.yml
+#   sbproxy aggregate -f examples/origin-profiles/sb.yml --explain checkout.example.com
 
 proxy:
   http_bind_port: 8080
@@ -67,6 +72,24 @@ origin_sources:
   # that could declare its own tier could declare its way out of the
   # pinning rule.
   tier: production
+
+  # How the aggregator runs. Every value here is the shipped default,
+  # written out so the cost is visible: one `git ls-remote` per unpinned
+  # entry every 120 seconds is 30 requests per hour per repository, and
+  # the entry below is pinned to a tag, so it is polled and its sha
+  # compared rather than cloned on every round.
+  aggregator:
+    poll_interval_secs: 120
+    # Three teams merging inside the same minute is one composed
+    # document and one published revision, not three fleet reloads.
+    debounce_secs: 15
+    # ... and a continuously-changing entry still publishes, because the
+    # window has a ceiling measured from its first movement.
+    max_deferral_secs: 120
+    concurrency: 8
+    # The whole round's budget, distinct from an entry's timeout_secs.
+    deadline_secs: 300
+
   entries:
     - name: checkout
       repo: https://git.example.com/acme/checkout
