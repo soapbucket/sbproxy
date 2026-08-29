@@ -2,7 +2,7 @@
 
 *Last modified: 2026-08-28*
 
-Cedar is the ABAC layer on an `mcp` action's federated `tools/call` path. You write Cedar source under `cedar_policies.policies`. The gateway compiles it once at config load against the built-in MCP schema, installs a hook, and evaluates every non-`local` tool call after RBAC has already allowed it. There is no natural-language-to-Cedar compiler, no parked human-approval flow, and no Cedar console or CLI in this binary.
+Cedar is the ABAC layer on an `mcp` action's federated `tools/call` path. You write Cedar source under `cedar_policies.policies`. The gateway compiles it once at config load against the built-in MCP schema, installs a hook, and evaluates every non-`local` tool call after RBAC has already allowed it. There is no natural-language-to-Cedar compiler and no Cedar console or CLI in this binary. Gateway-originated parked approval is a separate `approval:` block on the same action.
 
 Runnable: [`examples/cedar-mcp-full/`](../examples/cedar-mcp-full/). Catalog of every policy type: [policy.md](policy.md). MCP federation: [mcp.md](mcp.md).
 
@@ -16,7 +16,7 @@ Runnable: [`examples/cedar-mcp-full/`](../examples/cedar-mcp-full/). Catalog of 
 | Hook placement | After RBAC, argument policies, and quotas. An RBAC deny never reaches Cedar. A Cedar forbid can still refuse a call RBAC allowed. |
 | Scope | Non-`local` federated servers (`type: openapi` or a real MCP upstream). `type: local` tools skip this hook. |
 | Entity store | Empty. Match `principal == Agent::"<id>"` or `Agent::"anonymous"`. `principal in AgentClass::"..."` never matches. |
-| Confirm annotation | `@confirm("reason")` on a `forbid` maps to a Confirm verdict, then the federation refuses with `confirmation required: {reason}`. Nothing parks the call for a later approve. |
+| Confirm annotation | `@confirm("reason")` on a `forbid` maps to a Confirm verdict. Without `approval:` on the same action that is still a refusal (`confirmation required: {reason}`). With `approval:`, the call is parked (JSON-RPC `-32097`) until an operator approves the content snapshot. |
 | Policy store / CLI / admin UI | The embedded redb store is in the tree and is not wired to this hook. Policies come from YAML. There is no Cedar JSON Schema field, no Cedar CLI, and no Cedar page in the admin UI. |
 
 ## Entities the hook builds
@@ -61,7 +61,7 @@ Allow is a normal JSON-RPC result from the upstream.
 
 Deny is a JSON-RPC error (`INVALID_PARAMS`) whose message comes from the Cedar forbid.
 
-Confirm is the same error shape, with message `confirmation required: {reason}`. Treat that as a refusal, not a 202 waiting for an approver.
+Confirm without `approval:` is the same error shape, with message `confirmation required: {reason}`. Treat that as a refusal. When `approval:` is also configured, Confirm parks the call and the JSON-RPC error is `-32097` with a hold id.
 
 ## See also
 

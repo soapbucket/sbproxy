@@ -1076,6 +1076,25 @@ caller (no matching rule) is denied; an empty `allowed: []` is
 "deny all". Operators who want the legacy open-by-default behavior
 add `default_allow: true` to the policy.
 
+A `tool_access[]` row may set `ttl` (same duration strings as
+`tool_quotas[].rate.per`). That grant expires unless an operator renews
+it. `grant_ledger.path` is required when any row sets `ttl`: without
+a durable clock, a restart would silently extend every grant. An
+elapsed grant is hidden from `tools/list` and refused on `tools/call`
+with JSON-RPC `-32098`. Renew with `POST /api/mcp/grants/renew`.
+
+```yaml
+      grant_ledger:
+        path: /var/lib/sbproxy/mcp-grants.json
+      rbac_policies:
+        analyst:
+          default_allow: false
+          tool_access:
+            - principals: []
+              allowed: [reports.hello]
+              ttl: 8h
+```
+
 The legacy `key_permissions: { key: [tools] }` shape is gone.
 See [`migration-mcp-rbac.md`](migration-mcp-rbac.md) for upgrade
 walk-throughs.
@@ -1177,6 +1196,33 @@ policy one. A `warn` line naming the tool and which ceiling bound is
 logged once per ceiling per process.
 
 Source: `crates/sbproxy-extension/src/mcp/access_control.rs:ToolAccessPolicy`.
+
+#### Gateway-originated approval (WOR-2454)
+
+High-risk tools can require a human before dispatch. This is a
+gateway hold, not MCP elicitation. TrueFoundry is the surveyed state
+of the art for the same gate.
+
+The hold binds to a **content snapshot** (tool-contract digest plus
+canonical arguments), not the advertised tool name, so a rename
+cannot consume another tool's approval. The caller's HTTP connection
+is never held open: the gateway returns JSON-RPC `-32097` with
+`hold_id`, `snapshot`, and `expires_at`. Retry the same snapshot after
+`POST /api/mcp/approvals/{id}/approve`. Approval is single-use.
+Unanswered holds expire fail-closed. A console page is deferred; the
+JSON routes are the operator surface.
+
+```yaml
+      approval:
+        store: /var/lib/sbproxy/mcp-approvals.json
+        hold_ttl: 15m
+        tools:
+          - digest: "sha256:…"
+          - name: "crm.delete_*"
+```
+
+A Cedar `@confirm` forbid parks the same way when `approval:` is set.
+Without `approval:`, Confirm stays a refusal (`confirmation required:`).
 
 ### `openapi_convert`: OpenAPI-backed servers
 
