@@ -111,6 +111,15 @@ pub struct KeyRecord {
     /// A second hash accepted during a rotation grace window (the prior secret).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prev_secret_hash: Option<String>,
+    /// When this key's secret was last replaced by a rotation (WOR-2567).
+    ///
+    /// Distinct from `updated_at`, which any policy patch moves. Rotation
+    /// age is what an operator alerts on against
+    /// `key_management.crypto.rotation.inbound_key_days`, and a key whose
+    /// budget was edited last week has not been rotated. The credential
+    /// side carries the same field for the same reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotated_at: Option<DateTime<Utc>>,
     /// When the `prev_secret_hash` stops being accepted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prev_hash_expires_at: Option<DateTime<Utc>>,
@@ -249,6 +258,7 @@ impl KeyRecord {
             key_id: key_id.into(),
             policy_revision: default_policy_revision(),
             secret_hash: secret_hash.into(),
+            rotated_at: None,
             prev_secret_hash: None,
             prev_hash_expires_at: None,
             hash_alg: default_hash_alg(),
@@ -627,6 +637,15 @@ pub fn default_cred_scheme() -> String {
     "Bearer ".to_string()
 }
 
+impl KeyRecord {
+    /// Days since this key's secret was last rotated, or since it was
+    /// minted when it never has been (WOR-2567).
+    pub fn rotation_age_days(&self, now: DateTime<Utc>) -> i64 {
+        let since = self.rotated_at.unwrap_or(self.created_at);
+        (now - since).num_days()
+    }
+}
+
 impl CredentialRecord {
     /// Whether the credential is `Active`.
     pub fn is_usable(&self) -> bool {
@@ -640,6 +659,51 @@ impl CredentialRecord {
     /// window has to be checked everywhere the material is: a caller that
     /// reads `prev_material` and forgets `prev_material_expires_at` is a
     /// caller that presents a retired provider key forever.
+    /// Drop the retired material once its overlap window has closed,
+    /// reporting whether anything was dropped (WOR-2567).
+    ///
+    /// The field doc promises the store does not keep the old secret
+    /// indefinitely, and until this existed nothing made that true:
+    /// `usable_prev_material` merely declined to *return* it, so a
+    /// credential rotated because its old provider key leaked kept that
+    /// key on disk for the life of the record, openable by anyone with the
+    /// store and the master key. On a mesh store it was worse than
+    /// untidy: `carries_plaintext` correctly still saw a retired plaintext,
+    /// so a rotated plaintext-seeded credential could never be written
+    /// again.
+    ///
+    /// Retiring on read rather than on a timer, which is this project's
+    /// stated preference and the same shape the lapsed budget-override
+    /// retirement in `list_keys` already uses.
+    pub fn retire_expired_prev_material(&mut self, now: DateTime<Utc>) -> bool {
+        let lapsed = self
+            .prev_material_expires_at
+            .is_some_and(|expires| expires <= now);
+        if !lapsed && self.prev_material_expires_at.is_some() {
+            return false;
+        }
+        // Also covers the inconsistent shape where material was left
+        // behind with no expiry: it can never be served, so it is only a
+        // secret sitting on disk.
+        if self.prev_material.is_none() && self.prev_material_expires_at.is_none() {
+            return false;
+        }
+        self.prev_material = None;
+        self.prev_material_expires_at = None;
+        true
+    }
+
+    /// The previous material, if a rotation left one and its window is
+    /// still open at `now` (WOR-2567).
+    ///
+    /// A method rather than two field reads at the call site because the
+    /// window has to be checked everywhere the material is: a caller that
+    /// reads `prev_material` and forgets `prev_material_expires_at` is a
+    /// caller that presents a retired provider key forever.
+    ///
+    /// This only declines to *return* the retired material. Removing it
+    /// from the record is [`Self::retire_expired_prev_material`], which the
+    /// credential listing calls.
     pub fn usable_prev_material(&self, now: DateTime<Utc>) -> Option<&CredentialMaterial> {
         let expires = self.prev_material_expires_at?;
         (expires > now)

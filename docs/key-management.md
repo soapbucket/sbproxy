@@ -1677,9 +1677,15 @@ for the oldest record it listed, and each credential's detail view carries its
 own `rotation_age_days`. Page when the gauge exceeds the period you named.
 
 ```promql
-sbproxy_key_rotation_age_days{kind="credential"}
-  > on() group_left() 90    # your credential_days
+sbproxy_key_rotation_age_days{kind="credential"} > 90   # your credential_days
+sbproxy_key_rotation_age_days{kind="key"}        > 90   # your inbound_key_days
 ```
+
+Both series are published by their listing route, `GET /admin/credentials` and
+`GET /admin/keys`, rather than by a timer: the gauge is refreshed by the thing
+that was going to look at it anyway, and a deployment that never lists never
+pays for it. A flat line means nothing is polling the admin API, not that
+nothing is ageing.
 
 ## Rotating an upstream credential
 
@@ -1774,20 +1780,27 @@ per request would put a network round trip on the credential path, so an
 unwrapped data key is reused for up to that long. **After the customer revokes
 sbproxy's grant, decryption of customer-managed credentials stops within
 `unwrap_cache_ttl_secs` seconds, or at the next failed liveness probe,
-whichever comes first.** With the defaults above, that is 60 seconds worst case
-and typically 30.
+whichever comes first.** With the defaults above, that is 60 seconds worst
+case, and typically sooner: the liveness probe runs every 30 seconds and purges
+the cache on its first failure.
 
-Two caches that would otherwise extend that number are clamped so they cannot:
+That is the whole exposure, not the first of two, and the distinction is worth
+spelling out because getting it wrong is easy. There are two caches in series:
+this module caches the unwrapped data key, and the resolved-credential cache
+downstream caches the decrypted secret. Clamping each of them to the same
+window W does **not** give you W, it gives you up to 2W, because the second
+clock starts when the first hands over.
 
-* the resolved-credential cache is held to the revocation window for any
-  credential whose envelope names a customer-managed root, so raising
-  `proxy.secrets.rotation.re_resolve_interval_secs` does not lengthen it;
-* the stale-serve grace window in `proxy.secrets.rotation` is clamped the same
-  way, so a grace period bought for a briefly unreachable secret store does not
-  become a grace period for a revoked root of trust.
+So the data key carries its own remaining time, and the credential cache
+inherits that deadline instead of starting a fresh one. A secret decrypted one
+second before its data key lapses is held for one more second, not for another
+full window. The stale-serve grace window in `proxy.secrets.rotation` is
+clamped the same way, so a grace period bought for a briefly unreachable secret
+store does not become a grace period for a revoked root of trust.
 
 A failed liveness probe purges every cached data key immediately, which is what
-turns the TTL into an upper bound rather than a per-entry lottery.
+turns the TTL into an upper bound rather than a per-entry lottery. The probe
+runs every `liveness_interval_secs` and reports on the admin surface below.
 
 ### The dependency you are buying
 
@@ -1873,6 +1886,12 @@ gateway plumbing creates one.
 So leasing here covers exactly what it can: an enterprise buyer's own cloud IAM
 (AWS for Bedrock, GCP for Vertex, Azure for Azure OpenAI) and Vault-fronted
 database credentials, reached through a dynamic-secrets mount sbproxy reads.
+
+One upgrade note: `leased` is a new `CredentialMaterial` variant, so a record
+written by a node that has it and read by one that does not will fail to
+deserialize. Roll the fleet before creating one. The three fields the rotation
+overlap added to a credential record are `serde(default)` and are safe in both
+directions.
 
 ```bash
 curl -sS -u admin:admin -X POST http://127.0.0.1:9901/admin/credentials \
@@ -2023,7 +2042,10 @@ curl -sS -u carol:… -X POST http://127.0.0.1:9901/admin/break-glass/bg_…/app
 
 # 3. Anything alice does now is tagged with the grant id in the key audit chain.
 
-# 4. After it expires, somebody signs off.
+# 4. After it expires, somebody else signs off. The reviewer must be on the
+#    approver roster and must not be the requester, the same two rules
+#    `approve` enforces: a grant its own requester can close is a grant
+#    nobody reviewed.
 curl -sS -u dave:… -X POST http://127.0.0.1:9901/admin/break-glass/bg_…/review \
   -H 'content-type: application/json' -d '{"note":"rotation confirmed, no other access"}'
 
@@ -2033,26 +2055,52 @@ curl -sS -u admin:admin http://127.0.0.1:9901/admin/break-glass
 
 Rules the endpoints enforce rather than document:
 
-* **No self-approval**, and it is refused before the roster is consulted, so
-  adding yourself to `approvers` does not close the gap. A two-person rule one
-  person can satisfy is not a two-person rule.
+* **No self-approval and no self-review**, both refused before the roster is
+  consulted, so adding yourself to `approvers` does not close either gap. A
+  two-person rule one person can satisfy is not a two-person rule, and a review
+  queue its own subject can clear is not a review queue.
+* **`quorum` is validated at config compile.** Zero is refused, because a grant
+  would activate on its first approval while the admin surface reported it as
+  quorate; a quorum above the roster is refused too, because you would discover
+  it during the incident.
 * **A TTL above `max_ttl_secs` is refused, not clamped**, so the requester finds
   out now rather than when the grant expires early.
 * **An unscoped request is refused.** An unscoped break-glass grant is a
-  standing admin credential with extra paperwork.
+  standing admin credential with extra paperwork. The scope is *declared*
+  rather than enforced: it is what the requester said they needed and what the
+  reviewer reads afterwards, and it is not compared against the records the
+  tagged actions touch. Enforcing it would mean a second authorization model,
+  which is what this deliberately is not.
 * **Expiry is computed on read.** There is no sweeper to fail to run.
 * **An expired grant with no sign-off does not close.** It moves to
   `awaiting_review` and stays on the queue and on
   `sbproxy_break_glass_open{state="awaiting_review"}` until a human signs off,
-  and is marked overdue past `review_window_secs`.
+  and is marked overdue past `review_window_secs`. Expiry is time-driven and
+  nothing sweeps, so `GET /admin/break-glass` is what observes it: that read
+  republishes the gauges and emits the `expired` or `denied` transition once.
+  A deployment that never reads the queue never sees it move, which is the same
+  trade the rotation-age gauge makes.
 
-Two limitations to know before relying on it. Grants live in process memory, so
-a restart voids every active grant (which fails safe) and a fleet does not share
-them: a grant approved on one node is not visible on another, and each node
-counts its own quorum. Closing that means a store-backed grant record. And the
-console flow (request, pending approvals, active grants with a countdown, review
-queue) is deferred to the admin-console work; the JSON routes above are complete
-on their own and are what that page will read.
+Two limitations to know before relying on it.
+
+**Break-glass is a single-node feature today.** Grants live in process memory,
+so a restart voids every active grant, which fails safe. The fleet half needs
+stating plainly rather than left to be derived: behind a normal admin load
+balancer the four calls above land on different processes, so alice's request
+goes to node A, bob's approve goes to node B and answers `404 no such
+break-glass grant`, and there is no supported way to pin them together. Point
+this flow at a single admin endpoint. Closing the gap means a store-backed
+grant record, which this does not have.
+
+What that does *not* mean is that a fleet bypasses the control. A grant confers
+no authority: authorization is still admin RBAC, so an operator who wants to act
+on node B can already act on node B, grant or no grant. The quorum is an
+attestation recorded beside the actions, not a gate, which is why a per-node
+quorum is a weaker record rather than an open door.
+
+**No console page.** The request, approval, countdown, and review queue are
+JSON routes; the console flow is deferred to the admin-console work and these
+routes are what that page will read.
 
 ## Key-lifecycle events in CEF
 

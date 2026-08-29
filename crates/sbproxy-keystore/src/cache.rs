@@ -883,6 +883,68 @@ mod tests {
         );
     }
 
+    /// Seam M, replaced, half one: the enforcer, not the predicate.
+    ///
+    /// The original proof for the plaintext-slot defect asserted
+    /// `carries_plaintext()` on a hand-built record and never drove one
+    /// through either guard, so reverting this call site to
+    /// `record.material.is_plaintext()` left it green. That is the same
+    /// detector-narrower-than-the-enforcer shape the fix was written to
+    /// close, one level up.
+    ///
+    /// This one puts a *rotated* record through the real second-tier
+    /// publish: current material is a harmless vault reference, and the
+    /// plaintext the rotation retired is sitting in `prev_material`. A
+    /// guard reading only `material` sees nothing wrong and ships the
+    /// secret to a shared surface.
+    #[tokio::test]
+    async fn a_rotated_records_retired_plaintext_never_reaches_the_second_tier() {
+        let store = MemoryKeyStore::new();
+        let mut rotated = credential(
+            "rotated",
+            serde_json::json!({"kind": "vault_ref", "reference": "vault://new"}),
+        );
+        rotated.prev_material = Some(crate::record::CredentialMaterial::Plaintext {
+            value: "sk-retired-but-still-on-disk".to_string(),
+        });
+        rotated.prev_material_expires_at =
+            Some(chrono::Utc::now() + chrono::Duration::try_seconds(300).expect("representable"));
+        assert!(
+            !rotated.material.is_plaintext(),
+            "the current slot must look clean, or this test cannot tell the two guards apart"
+        );
+        store
+            .put_credential(rotated)
+            .await
+            .expect("put rotated credential");
+
+        let tier = Arc::new(RecordingTier::default());
+        let cache = TtlCache::new(Arc::new(store), TtlCacheConfig::default())
+            .with_tier(tier.clone() as Arc<dyn CacheTier>);
+
+        let resolved = cache
+            .resolve_credential("rotated")
+            .await
+            .expect("resolve rotated")
+            .expect("rotated present");
+        assert!(
+            resolved.carries_plaintext(),
+            "the caller still receives the whole record, overlap included"
+        );
+
+        assert!(
+            tier.published_ids().is_empty(),
+            "a record whose retired material is plaintext must not reach the tier: {:?}",
+            tier.published_ids()
+        );
+        let published = tier.published.lock();
+        let encoded = serde_json::to_string(&*published).expect("encode published records");
+        assert!(
+            !encoded.contains("sk-retired-but-still-on-disk"),
+            "the retired secret must not appear anywhere in what reached the tier: {encoded}"
+        );
+    }
+
     /// WOR-2572: the lookup observer sees which layer answered, with the
     /// full outcome vocabulary, in the order the lookups happened. The
     /// observer is a per-instance `fn` pointer, so this test accumulates

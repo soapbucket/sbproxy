@@ -62,7 +62,13 @@ use base64::Engine as _;
 const TRANSIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Connection settings for a Transit-backed root of trust.
-#[derive(Debug, Clone)]
+///
+/// No derived `Debug`: `token` is a live credential and `address` is
+/// operator-set and may carry userinfo. This crate hand-writes redacting
+/// `Debug` impls for the same value class on `HashiCorpAuth`, and
+/// `RootOfTrust` carries a `Debug` bound, so a derive here is one
+/// `{:?}` away from being a leak.
+#[derive(Clone)]
 pub struct TransitConfig {
     /// Base address of the Vault (or Vault-compatible) server, for example
     /// `https://vault.internal:8200`. No trailing slash required.
@@ -81,9 +87,32 @@ pub struct TransitConfig {
 }
 
 /// A Transit client bound to one mount and one key.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TransitClient {
     config: TransitConfig,
+}
+
+/// Redacting `Debug`: mount and key name are operator-chosen non-secrets,
+/// the address may carry userinfo, and the token is a live credential.
+/// `finish_non_exhaustive` so a later credential-shaped field is omitted by
+/// default rather than by somebody remembering to add an arm.
+impl std::fmt::Debug for TransitConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransitConfig")
+            .field("mount", &self.mount)
+            .field("key_name", &self.key_name)
+            .field("address", &"[REDACTED]")
+            .field("token", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for TransitClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransitClient")
+            .field("config", &self.config)
+            .finish()
+    }
 }
 
 impl TransitClient {
@@ -161,7 +190,7 @@ impl TransitClient {
                 trace,
             )
             .send_json(body)
-            .map_err(|e| transit_error("encrypt", &url, e))?;
+            .map_err(|e| transit_error("encrypt", &self.config.mount, &self.config.key_name, e))?;
         let json: serde_json::Value = response
             .into_json()
             .context("vault transit: encrypt response was not JSON")?;
@@ -189,7 +218,7 @@ impl TransitClient {
                 trace,
             )
             .send_json(body)
-            .map_err(|e| transit_error("decrypt", &url, e))?;
+            .map_err(|e| transit_error("decrypt", &self.config.mount, &self.config.key_name, e))?;
         let json: serde_json::Value = response
             .into_json()
             .context("vault transit: decrypt response was not JSON")?;
@@ -219,31 +248,80 @@ impl TransitClient {
         let url = self.url("keys");
         self.stamp(ureq::get(&url), trace)
             .call()
-            .map_err(|e| transit_error("keys", &url, e))?;
+            .map_err(|e| transit_error("keys", &self.config.mount, &self.config.key_name, e))?;
         Ok(())
     }
 }
 
-/// Turn a `ureq` failure into an operator-readable error.
+/// Why a Transit call could not complete.
 ///
-/// The URL carries no secret (mount, key name, and operation are all
-/// operator-chosen non-secrets) and the response body is deliberately not
-/// included: Vault error bodies echo request context, and this call's
-/// request context is a wrapped data key.
-fn transit_error(operation: &str, url: &str, error: ureq::Error) -> anyhow::Error {
-    match error {
-        ureq::Error::Status(403, _) => anyhow!(
-            "vault transit {operation} at {url} was refused with 403: the token is no longer \
-             authorized for this key. If the customer revoked sbproxy's grant, this is the \
-             expected outcome and credential decryption stops once the unwrap cache lapses."
-        ),
-        ureq::Error::Status(status, _) => {
-            anyhow!("vault transit {operation} at {url} failed with HTTP {status}")
-        }
-        ureq::Error::Transport(t) => {
-            anyhow!("vault transit {operation} at {url} could not be reached: {t}")
+/// A closed set, and deliberately the only thing about a Transit failure
+/// that reaches a message. Two independent sources put the URL in an error
+/// here, and `address` is operator-set and never parsed for userinfo:
+/// `transit_error` used to format `{url}` itself, and ureq's own
+/// `Display for Transport` already ends with the URL it dialed. An operator
+/// who fronts Vault with an authenticating proxy and writes
+/// `address: https://user:token@vault.internal:8200` would then have that
+/// credential land in a per-request warn on the proxy path, a background
+/// warn from the liveness probe, and a `POST /admin/credentials` 400 body.
+///
+/// This workspace already ruled on the identical shape for `reqwest`
+/// (`sbproxy-core`'s `ProbeFailureKind`, WOR-2458 fix round, Blocker 1);
+/// this is the same treatment for `ureq`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransitFailure {
+    /// The token is no longer authorized for this key. After a customer
+    /// revokes sbproxy's grant, this is the expected outcome.
+    Unauthorized,
+    /// The key or the mount does not exist.
+    NotFound,
+    /// Any other non-2xx status.
+    Status,
+    /// The service could not be reached at all.
+    Unreachable,
+}
+
+impl TransitFailure {
+    /// The operator-facing sentence. Never carries the address.
+    fn detail(self) -> &'static str {
+        match self {
+            Self::Unauthorized => {
+                "the token is no longer authorized for this key. If the customer revoked                  sbproxy's grant, this is the expected outcome and credential decryption stops                  once the unwrap cache lapses"
+            }
+            Self::NotFound => {
+                "the mount or key does not exist; check key_management.crypto.root_of_trust.mount                  and .key_name"
+            }
+            Self::Status => "the key service refused the call",
+            Self::Unreachable => "the key service could not be reached",
         }
     }
+}
+
+/// Classify a `ureq` failure without letting its `Display` reach a message.
+///
+/// `operation` is one of this module's own literals and `mount` and
+/// `key_name` are operator-chosen non-secrets, so those are safe to name.
+/// The address is not, and neither is `ureq`'s error text, so neither
+/// appears. Taking the two nameable fields as arguments rather than reading
+/// `self.config` keeps the address out of reach from inside this function.
+fn transit_error(
+    operation: &str,
+    mount: &str,
+    key_name: &str,
+    error: ureq::Error,
+) -> anyhow::Error {
+    let kind = match error {
+        ureq::Error::Status(401 | 403, _) => TransitFailure::Unauthorized,
+        ureq::Error::Status(404, _) => TransitFailure::NotFound,
+        ureq::Error::Status(_, _) => TransitFailure::Status,
+        ureq::Error::Transport(_) => TransitFailure::Unreachable,
+    };
+    anyhow!(
+        "vault transit {operation} on '{}/{}': {}",
+        mount.trim_matches('/'),
+        key_name,
+        kind.detail()
+    )
 }
 
 #[cfg(test)]

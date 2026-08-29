@@ -1042,15 +1042,15 @@ proxy:
 | `key_name` | string | required | Name of the Transit key that wraps sbproxy's data keys. Created and owned by the customer; sbproxy never creates it. |
 | `token` | string | required | Secret reference for the token sbproxy authenticates with. Resolved once at boot. Losing it is a second, independent way for the customer to cut sbproxy off. |
 | `namespace` | string | unset | Optional Vault Enterprise namespace header. |
-| `unwrap_cache_ttl_secs` | int | `60` | How long an unwrapped data key may be reused before the key service is consulted again. **This number is the deployment's revocation-latency bound** and is reported verbatim on `GET /admin/crypto/root-of-trust`. The resolved-credential cache is clamped to it for customer-managed envelopes, so a longer `proxy.secrets.rotation.re_resolve_interval_secs` cannot extend it. |
+| `unwrap_cache_ttl_secs` | int | `60` | How long an unwrapped data key may be reused before the key service is consulted again. **This number is the deployment's revocation-latency bound in full, not the first of two windows** and is reported verbatim on `GET /admin/crypto/root-of-trust`. A decrypted credential inherits the time left on the data key that opened it rather than starting a fresh window, so the two caches in series do not compose: clamping each to the same value would have given up to twice it. |
 | `liveness_interval_secs` | int | `30` | How often to probe the key service for reachability and continued authorization. A failed probe purges every cached data key, which is what turns the TTL above into an upper bound. Zero disables the probe; the on-demand path still fails closed. |
 
 `key_management.crypto.rotation`:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `inbound_key_days` | int | `90` | Named crypto period for minted virtual keys. Nothing enforces it; it is the number to alert `sbproxy_key_rotation_age_days{kind="key"}` against. |
-| `credential_days` | int | `90` | Named crypto period for upstream provider credentials. |
+| `inbound_key_days` | int | `90` | Named crypto period for minted virtual keys. Nothing enforces it; it is the number to alert `sbproxy_key_rotation_age_days{kind="key"}` against, which `GET /admin/keys` publishes from each key's `rotated_at`. |
+| `credential_days` | int | `90` | Named crypto period for upstream provider credentials, alerted the same way on `{kind="credential"}`, which `GET /admin/credentials` publishes. Both gauges are refreshed by the listing rather than by a timer, so a deployment that never lists never pays and never sees them move. |
 | `master_key_days` | int | `365` | Named crypto period for the envelope master key. Under a customer-managed root this is the customer's Transit key cadence, not sbproxy's. |
 | `credential_grace_secs` | int | `300` | Default overlap window for `POST /admin/credentials/{id}/rotate`: how long the previous material stays usable when the new material will not resolve. Zero retires the old material at once, which is what a compromised secret needs. |
 
@@ -1068,7 +1068,7 @@ proxy:
 |-------|------|---------|-------------|
 | `enabled` | bool | `false` | Turn on `/admin/break-glass`. Off by default: an emergency path nobody configured is an emergency path nobody reviews. |
 | `approvers` | list | `[]` | Admin usernames who may approve a grant. A requester is never counted among their own approvers even when listed here. |
-| `quorum` | int | `2` | How many distinct approvers a grant needs before it activates. |
+| `quorum` | int | `2` | How many distinct approvers a grant needs before it activates. Config compile refuses `0` (a grant would activate on its first approval while the admin surface called it quorate) and refuses a value above the number of configured approvers (no grant could ever activate, and you would find out during the incident). |
 | `max_ttl_secs` | int | `3600` | Hard cap on a requested TTL. A request naming more is refused rather than clamped, so the requester finds out at request time instead of at expiry. |
 | `review_window_secs` | int | `86400` | How long after expiry an unreviewed grant is merely open rather than overdue. Drives the overdue marker on `GET /admin/break-glass`, not deletion. |
 

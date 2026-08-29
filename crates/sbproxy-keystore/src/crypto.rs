@@ -353,6 +353,44 @@ fn derive_wrap_key(master: &[u8]) -> [u8; AES256_KEY_LEN] {
         .expect("hkdf returns the requested length")
 }
 
+/// An opened credential envelope, and how long its plaintext may be held.
+///
+/// `hold_for` is `None` for a locally-wrapped envelope, which no external
+/// service bounds, and `Some(remaining)` for one wrapped under a
+/// customer-managed root. A caller that caches the plaintext must clamp its
+/// own entry to `hold_for`, measured from now, so the deployment's stated
+/// revocation window is the whole of the exposure rather than the first of
+/// two consecutive ones.
+#[derive(Debug, Clone)]
+pub struct OpenedEnvelope {
+    /// The decrypted credential material.
+    pub plaintext: Vec<u8>,
+    /// How long the plaintext may be held, when an external root bounds it.
+    pub hold_for: Option<std::time::Duration>,
+}
+
+/// A data key recovered from the external key service, and how long its
+/// plaintext may still be held (WOR-2568).
+///
+/// `valid_for` is the load-bearing half. It is measured from the *external
+/// unwrap that produced this data key*, not from the call that returned it,
+/// so a caller that caches the plaintext downstream inherits the deadline
+/// rather than starting a fresh one.
+///
+/// That distinction is the whole of a bug this shipped with once: two caches
+/// each clamped to the same window W hold a secret for up to 2W, because the
+/// second one starts its clock when the first one hands over. Clamping both
+/// to W is what makes the composition invisible. Carrying the remaining time
+/// instead makes the published revocation bound true by construction, with no
+/// second call site to keep in step.
+#[derive(Debug, Clone)]
+pub struct UnwrappedDek {
+    /// The plaintext data key.
+    pub dek: Vec<u8>,
+    /// How much of the revocation window is left for this data key.
+    pub valid_for: std::time::Duration,
+}
+
 /// The external key service that wraps and unwraps envelope data keys when
 /// `key_management.crypto.root_of_trust` names a customer-managed root
 /// (WOR-2568).
@@ -391,11 +429,15 @@ pub trait RootOfTrust: Send + Sync + std::fmt::Debug {
 
     /// Unwrap a ciphertext previously produced by [`Self::wrap_dek`].
     ///
+    /// Returns the data key *and* how long its plaintext may be held, so a
+    /// caller that caches downstream inherits this root's deadline instead
+    /// of starting a second window of its own. See [`UnwrappedDek`].
+    ///
     /// # Errors
     ///
     /// Any failure to reach or be authorized by the external service,
     /// including a revoked grant. Fail-closed: no cached-forever fallback.
-    async fn unwrap_dek(&self, wrapped: &str) -> Result<Vec<u8>>;
+    async fn unwrap_dek(&self, wrapped: &str) -> Result<UnwrappedDek>;
 
     /// How long this implementation may serve an unwrap from its own cache.
     /// This is the deployment's revocation-latency bound and is reported on
@@ -607,9 +649,12 @@ impl KeyCrypto {
     /// A customer-managed envelope with no configured root, a `kek`
     /// mismatch against the configured root, or any failure of the external
     /// service including a revoked grant.
-    pub async fn open_async(&self, record_id: &str, env: &Envelope) -> Result<Vec<u8>> {
+    pub async fn open_async(&self, record_id: &str, env: &Envelope) -> Result<OpenedEnvelope> {
         let Some(kek) = env.kek.as_deref() else {
-            return self.open(record_id, env);
+            return Ok(OpenedEnvelope {
+                plaintext: self.open(record_id, env)?,
+                hold_for: None,
+            });
         };
         let Some(root) = &self.root else {
             return Err(anyhow!(
@@ -628,11 +673,12 @@ impl KeyCrypto {
         }
         let wrapped = std::str::from_utf8(&env.wrapped_dek)
             .context("customer-managed wrapped DEK is not utf-8 ciphertext")?;
-        let dek_bytes = root
+        let unwrapped = root
             .unwrap_dek(wrapped)
             .await
             .context("unwrap the credential data key under the customer-managed root of trust")?;
-        let dek: [u8; AES256_KEY_LEN] = dek_bytes
+        let dek: [u8; AES256_KEY_LEN] = unwrapped
+            .dek
             .as_slice()
             .try_into()
             .map_err(|_| anyhow!("unwrapped DEK is not {AES256_KEY_LEN} bytes"))?;
@@ -641,8 +687,15 @@ impl KeyCrypto {
             .as_slice()
             .try_into()
             .map_err(|_| anyhow!("envelope nonce is not {AES_GCM_NONCE_LEN} bytes"))?;
-        aes256gcm_decrypt(&dek, &nonce, &env.ciphertext, record_id.as_bytes())
-            .context("open credential envelope")
+        let plaintext = aes256gcm_decrypt(&dek, &nonce, &env.ciphertext, record_id.as_bytes())
+            .context("open credential envelope")?;
+        Ok(OpenedEnvelope {
+            plaintext,
+            // The remaining window on the data key, not a fresh one. A
+            // caller caching this plaintext must not outlive the unwrap
+            // that produced it.
+            hold_for: Some(unwrapped.valid_for),
+        })
     }
 }
 
@@ -916,17 +969,20 @@ mod tests {
             }
             Ok(format!("stub:v1:{}", hex::encode(dek)))
         }
-        async fn unwrap_dek(&self, wrapped: &str) -> Result<Vec<u8>> {
+        async fn unwrap_dek(&self, wrapped: &str) -> Result<UnwrappedDek> {
             if self.is_revoked() {
                 return Err(anyhow!("grant revoked"));
             }
             let body = wrapped
                 .strip_prefix("stub:v1:")
                 .ok_or_else(|| anyhow!("not a stub ciphertext"))?;
-            Ok(hex::decode(body)?)
+            Ok(UnwrappedDek {
+                dek: hex::decode(body)?,
+                valid_for: self.revocation_window(),
+            })
         }
         fn revocation_window(&self) -> std::time::Duration {
-            std::time::Duration::from_secs(0)
+            std::time::Duration::from_secs(42)
         }
     }
 
@@ -964,7 +1020,13 @@ mod tests {
             .open_async("cred-1", &env)
             .await
             .expect("open through the external root");
-        assert_eq!(opened, b"upstream-secret");
+        assert_eq!(opened.plaintext, b"upstream-secret");
+        assert_eq!(
+            opened.hold_for,
+            Some(std::time::Duration::from_secs(42)),
+            "a customer-managed open must hand back the deadline its data key carries, or a \
+             downstream cache starts a second window"
+        );
     }
 
     /// Revoking the customer's grant stops decryption, rather than merely
@@ -976,7 +1038,10 @@ mod tests {
         let crypto =
             KeyCrypto::new(b"pepper".to_vec(), b"master".to_vec()).with_root_of_trust(root.clone());
         let env = crypto.seal_async("cred-2", b"secret").await.expect("seal");
-        assert_eq!(crypto.open_async("cred-2", &env).await.unwrap(), b"secret");
+        assert_eq!(
+            crypto.open_async("cred-2", &env).await.unwrap().plaintext,
+            b"secret"
+        );
 
         root.revoke();
         let err = format!(
@@ -1002,9 +1067,12 @@ mod tests {
         let cmk =
             KeyCrypto::new(b"pepper".to_vec(), b"master".to_vec()).with_root_of_trust(root.clone());
         // Legacy envelopes keep opening after the switch.
+        let legacy_opened = cmk.open_async("cred-3", &legacy).await.unwrap();
+        assert_eq!(legacy_opened.plaintext, b"older-secret");
         assert_eq!(
-            cmk.open_async("cred-3", &legacy).await.unwrap(),
-            b"older-secret"
+            legacy_opened.hold_for, None,
+            "a locally-wrapped envelope is bounded by no external service, so it carries no \
+             deadline"
         );
         // The synchronous seal is refused outright under a customer-managed
         // root, so no later call site can quietly produce a locally-wrapped

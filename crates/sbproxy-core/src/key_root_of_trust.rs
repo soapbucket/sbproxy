@@ -54,7 +54,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use sbproxy_config::types::{RootOfTrustConfig, RootOfTrustProvider};
-use sbproxy_keystore::crypto::RootOfTrust;
+use sbproxy_keystore::crypto::{RootOfTrust, UnwrappedDek};
+
+/// How many unwrapped data keys this root caches at once.
+///
+/// Each entry is a plaintext data key held for at most the revocation
+/// window, so this is a ceiling on how much decrypt capability a revocation
+/// has to age out, and on what a heap dump yields.
+const MAX_CACHED_DEKS: usize = 1024;
 
 /// One cached unwrap: the data key and when it was obtained.
 struct CachedDek {
@@ -122,65 +129,49 @@ impl CustomerManagedRoot {
         })
     }
 
-    /// Probe the key service and record the outcome for the admin surface.
+    /// A cached data key and the time left on it, or `None` when the entry
+    /// is absent or its window has closed.
     ///
-    /// # Errors
-    ///
-    /// Whatever the key service reported. A 403 is the revoked-grant case.
-    pub async fn probe_liveness(&self) -> Result<()> {
-        let client = self.client.clone();
-        // Empty: the probe runs on a timer with no request behind it, so
-        // there is no trace for it to join. The wrap and unwrap paths below
-        // do have one and carry it.
-        let result = tokio::task::spawn_blocking(move || client.liveness(&[]))
-            .await
-            .context("root-of-trust liveness probe task panicked")?;
-        let ok = result.is_ok();
-        self.last_liveness_ok.store(ok, Ordering::Relaxed);
-        if ok {
-            self.last_liveness_unix.store(now_unix(), Ordering::Relaxed);
-        }
-        sbproxy_observe::metrics::record_root_of_trust_liveness(ok);
-        result
-    }
-
-    /// Unix seconds of the last *successful* probe, or `None` when none has
-    /// succeeded in this process.
-    pub fn last_liveness_unix(&self) -> Option<u64> {
-        match self.last_liveness_unix.load(Ordering::Relaxed) {
-            0 => None,
-            v => Some(v),
-        }
-    }
-
-    /// Whether the most recent probe succeeded.
-    pub fn last_liveness_ok(&self) -> bool {
-        self.last_liveness_ok.load(Ordering::Relaxed)
-    }
-
-    /// Number of data keys currently held in the unwrap cache. Reported on
-    /// the admin surface so an operator can see how much decrypt capability
-    /// a revocation still has to age out.
-    pub fn cached_dek_count(&self) -> usize {
-        let now = Instant::now();
-        self.cache
-            .lock()
-            .values()
-            .filter(|e| now.duration_since(e.at) < self.window)
-            .count()
-    }
-
-    /// Drop every cached data key. Called when a liveness probe comes back
-    /// unauthorized, so a revoked grant takes effect at the next probe
-    /// rather than at the end of each entry's own window.
-    pub fn purge_cache(&self) {
-        self.cache.lock().clear();
-    }
-
-    fn cached(&self, wrapped: &str) -> Option<Vec<u8>> {
+    /// Returning the *remaining* window rather than the full one is what
+    /// stops this cache and the resolved-credential cache downstream from
+    /// composing into two consecutive windows.
+    fn cached(&self, wrapped: &str) -> Option<UnwrappedDek> {
         let cache = self.cache.lock();
         let entry = cache.get(wrapped)?;
-        (entry.at.elapsed() < self.window).then(|| entry.dek.clone())
+        let elapsed = entry.at.elapsed();
+        let valid_for = self.window.checked_sub(elapsed)?;
+        (!valid_for.is_zero()).then(|| UnwrappedDek {
+            dek: entry.dek.clone(),
+            valid_for,
+        })
+    }
+
+    /// Cache one unwrapped data key, evicting what has lapsed first.
+    ///
+    /// Bounded, and the bound matters more here than on the other maps this
+    /// change added: every entry is a plaintext data key, and an unbounded
+    /// map of them means a heap dump long after a revocation still yields
+    /// keys the customer believes they took away. Lapsed entries are swept
+    /// before each insert, so steady state is the working set rather than
+    /// every ciphertext ever seen.
+    fn remember(&self, wrapped: &str, dek: &[u8]) {
+        let now = Instant::now();
+        let mut cache = self.cache.lock();
+        cache.retain(|_, entry| now.duration_since(entry.at) < self.window);
+        if cache.len() >= MAX_CACHED_DEKS {
+            // Everything present is still inside its window. Decline to
+            // cache rather than evict a live entry: the cost is an extra
+            // Transit round trip, and the alternative is a longer hold on
+            // material somebody else is about to stop being allowed to read.
+            return;
+        }
+        cache.insert(
+            wrapped.to_string(),
+            CachedDek {
+                dek: dek.to_vec(),
+                at: now,
+            },
+        );
     }
 }
 
@@ -205,10 +196,10 @@ impl RootOfTrust for CustomerManagedRoot {
         wrapped
     }
 
-    async fn unwrap_dek(&self, wrapped: &str) -> Result<Vec<u8>> {
-        if let Some(dek) = self.cached(wrapped) {
+    async fn unwrap_dek(&self, wrapped: &str) -> Result<UnwrappedDek> {
+        if let Some(hit) = self.cached(wrapped) {
             sbproxy_observe::metrics::record_root_of_trust_operation("unwrap_cached", true);
-            return Ok(dek);
+            return Ok(hit);
         }
         let client = self.client.clone();
         let ciphertext = wrapped.to_string();
@@ -218,18 +209,66 @@ impl RootOfTrust for CustomerManagedRoot {
             .context("root-of-trust unwrap task panicked")?;
         sbproxy_observe::metrics::record_root_of_trust_operation("unwrap", result.is_ok());
         let dek = result?;
-        self.cache.lock().insert(
-            wrapped.to_string(),
-            CachedDek {
-                dek: dek.clone(),
-                at: Instant::now(),
-            },
-        );
-        Ok(dek)
+        self.remember(wrapped, &dek);
+        Ok(UnwrappedDek {
+            dek,
+            // A fresh unwrap gets the whole window; a cache hit above gets
+            // whatever is left of it.
+            valid_for: self.window,
+        })
     }
 
     fn revocation_window(&self) -> Duration {
         self.window
+    }
+
+    // The five below are why this impl block exists in the shape it does.
+    // They are not defaults worth inheriting: the trait's defaults answer
+    // "no liveness story", and every runtime caller holds an
+    // `Arc<dyn RootOfTrust>`, so an inherent method with the same name is
+    // invisible to all of them. Leaving these off the trait is what made
+    // the background probe a no-op, the cache un-purgeable, and the admin
+    // surface report a healthy root as never-probed.
+
+    async fn probe_liveness(&self) -> Result<()> {
+        let client = self.client.clone();
+        // Empty trace: the probe runs on a timer with no request behind it,
+        // so there is no trace for it to join. The wrap and unwrap paths do
+        // have one and carry it.
+        let result = tokio::task::spawn_blocking(move || client.liveness(&[]))
+            .await
+            .context("root-of-trust liveness probe task panicked")?;
+        let ok = result.is_ok();
+        self.last_liveness_ok.store(ok, Ordering::Relaxed);
+        if ok {
+            self.last_liveness_unix.store(now_unix(), Ordering::Relaxed);
+        }
+        sbproxy_observe::metrics::record_root_of_trust_liveness(ok);
+        result
+    }
+
+    fn last_liveness_unix(&self) -> Option<u64> {
+        match self.last_liveness_unix.load(Ordering::Relaxed) {
+            0 => None,
+            v => Some(v),
+        }
+    }
+
+    fn last_liveness_ok(&self) -> bool {
+        self.last_liveness_ok.load(Ordering::Relaxed)
+    }
+
+    fn cached_dek_count(&self) -> usize {
+        let now = Instant::now();
+        self.cache
+            .lock()
+            .values()
+            .filter(|e| now.duration_since(e.at) < self.window)
+            .count()
+    }
+
+    fn purge_cache(&self) {
+        self.cache.lock().clear();
     }
 }
 
@@ -325,10 +364,109 @@ mod tests {
         assert_eq!(root.kek_name(), "transit/sbproxy-root");
         assert_eq!(root.last_liveness_unix(), None);
         assert!(!root.last_liveness_ok());
-        // The admin surface reads exactly these, through the trait.
+        // The admin surface reads exactly these, through the trait. A
+        // never-probed root genuinely reports this; see the test below for
+        // why asserting only this shape is not enough.
         let described = describe(&root);
         assert_eq!(described["probe"], "failed_or_never_run");
         assert_eq!(described["cached_data_keys"], 0);
+    }
+
+    /// The liveness half of the product claim has to run *through the
+    /// `dyn`*, because that is the only thing the runtime ever holds.
+    ///
+    /// This shipped once with `probe_liveness`, `last_liveness_ok`,
+    /// `cached_dek_count`, and `purge_cache` as inherent methods that were
+    /// never put on the trait. Every caller went through
+    /// `Arc<dyn RootOfTrust>` and therefore hit the trait's "no liveness
+    /// story" defaults: the background probe returned `Ok(())` without
+    /// contacting Vault, the cache was never purged, and
+    /// `GET /admin/crypto/root-of-trust` reported a healthy root with a
+    /// warm cache as never-probed with zero cached keys. The test that
+    /// existed asserted exactly those defaults through a `dyn` and passed
+    /// for the wrong reason.
+    ///
+    /// So this one asserts the opposite: state recorded through the trait
+    /// object is state the trait object reports back. Any method that
+    /// slips off the impl block reddens it.
+    #[tokio::test]
+    async fn liveness_state_recorded_through_the_dyn_is_reported_through_the_dyn() {
+        let mut c = cfg();
+        c.unwrap_cache_ttl_secs = 600;
+        let root: Arc<dyn RootOfTrust> =
+            Arc::new(CustomerManagedRoot::new(&c, "s.token".to_string()).expect("builds"));
+
+        // The address is unroutable, so this probe fails rather than
+        // reaching a real Vault, which is all this needs: a *default*
+        // `probe_liveness` returns `Ok(())` and records nothing, and a
+        // forwarded one returns `Err` and records the failure.
+        let probed = root.probe_liveness().await;
+        assert!(
+            probed.is_err(),
+            "the probe must actually dial the key service; a trait default returns Ok(())              without contacting anything, which is what made the liveness half a no-op"
+        );
+        assert!(!root.last_liveness_ok());
+
+        // Warm the cache through the trait, then confirm the trait reports
+        // it and can clear it. With `cached_dek_count` and `purge_cache`
+        // left off the impl these are 0 and a no-op, and an operator
+        // watching a revocation reads "no decrypt capability left to age
+        // out" on a cache that is full.
+        root.purge_cache();
+        assert_eq!(root.cached_dek_count(), 0);
+        let concrete = CustomerManagedRoot::new(&c, "s.token".to_string()).expect("builds");
+        concrete.remember("stub:v1:aa", b"0123456789abcdef0123456789abcdef");
+        let warm: Arc<dyn RootOfTrust> = Arc::new(concrete);
+        assert_eq!(
+            warm.cached_dek_count(),
+            1,
+            "a warm cache must be visible through the trait, because that is what the admin              surface holds"
+        );
+        assert_eq!(describe(&warm)["cached_data_keys"], 1);
+        warm.purge_cache();
+        assert_eq!(
+            warm.cached_dek_count(),
+            0,
+            "purge must reach the real cache through the trait, or a failed probe cannot cut a              revocation short"
+        );
+    }
+
+    /// The cache hands back the time *left*, not a fresh window. This is
+    /// the other half of the two-caches-compose bug: a downstream cache
+    /// that inherits a full window from a nearly-expired data key extends
+    /// the deployment's revocation bound without saying so.
+    #[test]
+    fn a_cached_data_key_reports_its_remaining_window() {
+        let mut c = cfg();
+        c.unwrap_cache_ttl_secs = 600;
+        let root = CustomerManagedRoot::new(&c, "s.token".to_string()).expect("builds");
+        root.remember("stub:v1:bb", b"0123456789abcdef0123456789abcdef");
+        let hit = root.cached("stub:v1:bb").expect("a fresh entry is served");
+        assert!(
+            hit.valid_for <= Duration::from_secs(600),
+            "the remaining window can never exceed the configured one: {:?}",
+            hit.valid_for
+        );
+        assert!(
+            hit.valid_for > Duration::from_secs(590),
+            "a just-cached entry has nearly the whole window left: {:?}",
+            hit.valid_for
+        );
+
+        // An entry past its window is not served at all.
+        let expired = CustomerManagedRoot::new(
+            &RootOfTrustConfig {
+                unwrap_cache_ttl_secs: 0,
+                ..cfg()
+            },
+            "s.token".to_string(),
+        )
+        .expect("builds");
+        expired.remember("stub:v1:cc", b"0123456789abcdef0123456789abcdef");
+        assert!(
+            expired.cached("stub:v1:cc").is_none(),
+            "a zero window means every unwrap consults the key service"
+        );
     }
 
     #[test]

@@ -481,6 +481,7 @@ type ResolvedCredentialCache =
 /// [`KeyPlane::resolve_credential_secret_inner`]; naming it makes the two
 /// classes checkable in one place, which matters now that the rotation
 /// fallback (WOR-2567) is a second consumer of the same classification.
+#[derive(Debug)]
 enum MaterialError {
     /// A backend blip. The last known-good cached value may still be
     /// served inside the grace window.
@@ -867,7 +868,7 @@ impl KeyPlane {
                 // envelope names its root of trust and needs the external
                 // key service; a locally-wrapped one still opens locally,
                 // and the envelope decides which, not the config.
-                let bytes = self
+                let opened: sbproxy_keystore::crypto::OpenedEnvelope = self
                     .crypto()
                     .open_async(record_id, envelope)
                     .await
@@ -880,18 +881,21 @@ impl KeyPlane {
                             "envelope did not open under the configured root of trust: {e:#}"
                         ))
                     })?;
-                let secret = String::from_utf8(bytes)
+                let secret = String::from_utf8(opened.plaintext)
                     .map_err(|_| MaterialError::Permanent("secret is not utf-8".to_string()))?;
-                // WOR-2568: a customer-managed envelope's plaintext may
-                // not outlive the root of trust's stated revocation
-                // window in this cache, or the window would be the
-                // window plus however long the credential cache holds.
-                let ceiling = envelope.kek.as_ref().and_then(|_| {
-                    self.crypto()
-                        .root_of_trust()
-                        .map(|root| root.revocation_window())
-                });
-                Ok((secret, "envelope", ceiling))
+                // WOR-2568: the ceiling is the time *left* on the data key
+                // that opened this envelope, handed back by the root of
+                // trust, not a fresh copy of the configured window.
+                //
+                // Reading `root.revocation_window()` here instead is the
+                // bug this shipped with once. The unwrap cache's clock
+                // starts at the Vault round trip and this cache's clock
+                // starts at the resolution, so two caches each clamped to
+                // W hold the secret for up to 2W and the published number
+                // is half the truth. Inheriting the remaining window makes
+                // the total exposure one W by construction, with no second
+                // site to keep in step.
+                Ok((secret, "envelope", opened.hold_for))
             }
             CredentialMaterial::VaultRef { reference } => {
                 let Some(resolver) = sbproxy_vault::process_resolver() else {
@@ -966,8 +970,10 @@ impl KeyPlane {
     /// | resolved material is not utf-8 | `miss` / `error` | none |
     /// | vault-referenced credential with no resolver installed | `miss` / `error` | none |
     /// | full resolution succeeds | `miss` / `ok` | `credential_resolved`, `outcome: resolved` |
+    /// | current material fails, rotation overlap serves | `miss` / `ok` | `credential_resolved`, `outcome: rotation_overlap`, once per serve |
+    /// | leased credential minted from its mount | `miss` / `ok` | `credential_resolved`, `outcome: resolved`, `source: leased` |
     ///
-    /// Ten rows for ten returns, and the last three of the `error` rows
+    /// Twelve rows for twelve returns, and the last three of the `error` rows
     /// are the ones worth naming rather than folding into "the backend is
     /// down". None of them reaches `serve_stale_on_failure` at all, and
     /// that is a ruling, not an oversight: a master key that no longer
@@ -1140,10 +1146,20 @@ impl KeyPlane {
         // fast path above returns before this point, so a request that
         // rode the cache publishes nothing; see
         // [`credential_resolved_event`] for the cardinality ruling.
-        sbproxy_observe::publish_proxy_event(
-            sbproxy_observe::EventType::CredentialResolved,
-            || credential_resolved_event(id, tenant_id, "resolved", Some(source)),
-        );
+        //
+        // The overlap path is the one exception and publishes its own
+        // `rotation_overlap` event inside `open_rotation_grace_material`,
+        // because what a SIEM wants to see there is that a retired secret
+        // was presented, not that a resolution happened. Publishing here
+        // too would put two events on the wire for one read and describe
+        // the same serve twice, once as `resolved` and once as
+        // `rotation_overlap`.
+        if source != "prev_material" {
+            sbproxy_observe::publish_proxy_event(
+                sbproxy_observe::EventType::CredentialResolved,
+                || credential_resolved_event(id, tenant_id, "resolved", Some(source)),
+            );
+        }
         Ok(resolved)
     }
 }
@@ -1164,9 +1180,9 @@ impl KeyPlane {
 /// `outcome` is `resolved` for a fresh resolution and `stale_served`
 /// when the backend failed and the last known-good value was served
 /// inside `proxy.secrets.rotation.grace_period_secs`. `source` names
-/// where fresh material came from (`plaintext`, `envelope`,
-/// `vault_ref`) and is absent on the stale path, where nothing was
-/// freshly read. The per-request cache hit publishes nothing: this
+/// where fresh material came from (`plaintext`, `envelope`, `vault_ref`,
+/// `leased`, or `prev_material` for a rotation overlap) and is absent on
+/// the stale path, where nothing was freshly read. The per-request cache hit publishes nothing: this
 /// event marks material actually being read, not every request that
 /// rode the cached value, the same cardinality ruling that keeps
 /// `cache_hit` unwired on the typed feed. Resolution refusals publish
@@ -1845,8 +1861,18 @@ fn lower_seed_key(
 }
 
 /// Lower a seed credential into a [`CredentialRecord`], envelope-encrypting an
-/// inline secret under the master key.
-fn lower_seed_credential(
+/// inline secret under whichever root of trust is configured.
+///
+/// `async` because the seal may be a network call. WOR-2568 made the
+/// synchronous `KeyCrypto::seal` refuse outright under a customer-managed
+/// root, deliberately, so that no call site can quietly produce a
+/// locally-wrapped envelope while the config claims a customer-held root.
+/// This site was left on the synchronous path when the admin path moved,
+/// which turned that refusal into "every config-seeded `secret:` credential
+/// is logged and skipped at boot" the moment an operator enabled
+/// `root_of_trust`. Boot still succeeded and the records were simply
+/// absent, so the first symptom was a `NotFound` at request time.
+async fn lower_seed_credential(
     seed: &SeedCredentialConfig,
     crypto: &KeyCrypto,
     now: DateTime<Utc>,
@@ -1856,7 +1882,7 @@ fn lower_seed_credential(
             reference: reference.clone(),
         }
     } else if let Some(secret) = &seed.secret {
-        match crypto.seal(&seed.id, secret.as_bytes()) {
+        match crypto.seal_async(&seed.id, secret.as_bytes()).await {
             Ok(envelope) => CredentialMaterial::Envelope { envelope },
             Err(e) => {
                 tracing::error!(id = %seed.id, error = %e, "failed to seal seed credential; skipping");
@@ -1911,7 +1937,7 @@ async fn seed_records(
         if cfg.allow_api_override && store.get_credential(&seed.id).await?.is_some() {
             continue;
         }
-        if let Some(rec) = lower_seed_credential(seed, crypto, now) {
+        if let Some(rec) = lower_seed_credential(seed, crypto, now).await {
             store.put_credential(rec).await?;
         }
     }
@@ -4408,5 +4434,127 @@ mod resolve_credential_secret_tests {
             }
             other => panic!("a closed overlap window must not serve the old material: {other:?}"),
         }
+    }
+
+    /// A root of trust whose data keys carry a deliberately short remaining
+    /// window, so a test can tell "inherited the deadline" from "started a
+    /// fresh one" without waiting.
+    #[derive(Debug)]
+    struct ShortWindowRoot {
+        window: std::time::Duration,
+        remaining: std::time::Duration,
+        unwraps: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl sbproxy_keystore::crypto::RootOfTrust for ShortWindowRoot {
+        fn kek_name(&self) -> &str {
+            "stub/short-window"
+        }
+        async fn wrap_dek(&self, dek: &[u8]) -> anyhow::Result<String> {
+            Ok(format!("stub:v1:{}", hex::encode(dek)))
+        }
+        async fn unwrap_dek(
+            &self,
+            wrapped: &str,
+        ) -> anyhow::Result<sbproxy_keystore::crypto::UnwrappedDek> {
+            self.unwraps
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = wrapped
+                .strip_prefix("stub:v1:")
+                .ok_or_else(|| anyhow::anyhow!("not a stub ciphertext"))?;
+            Ok(sbproxy_keystore::crypto::UnwrappedDek {
+                dek: hex::decode(body)?,
+                // The point: a data key most of whose window has already
+                // been spent in the root's own cache.
+                valid_for: self.remaining,
+            })
+        }
+        fn revocation_window(&self) -> std::time::Duration {
+            self.window
+        }
+    }
+
+    /// Seam G, replaced. The old test asserted `effective_hold(60, Some(5))
+    /// == 5`, which proves `min` and nothing about the wiring, and the
+    /// revocation bound is exactly what lived in that gap: two caches each
+    /// clamped to the same window hold a secret for up to twice it.
+    ///
+    /// This drives the real `open_material` and asserts the ceiling it
+    /// returns is the time *left* on the data key, not a fresh copy of the
+    /// configured window. Reverting that line to
+    /// `root.revocation_window()` reddens this and leaves the `min` unit
+    /// test green, which is the difference between the two tests.
+    #[tokio::test]
+    async fn a_customer_managed_open_inherits_the_data_keys_remaining_window() {
+        let root = Arc::new(ShortWindowRoot {
+            window: std::time::Duration::from_secs(600),
+            remaining: std::time::Duration::from_secs(7),
+            unwraps: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let crypto =
+            KeyCrypto::new(b"pep".to_vec(), b"master".to_vec()).with_root_of_trust(root.clone());
+        let store = Arc::new(MemoryKeyStore::new());
+        let cache = Arc::new(TtlCache::new(
+            store as Arc<dyn KeyStore>,
+            TtlCacheConfig::default(),
+        ));
+        let plane = KeyPlane::from_parts(crypto, cache, false, false, None);
+
+        let envelope = plane
+            .crypto()
+            .seal_async("cred-cmk-ceiling", b"upstream-secret")
+            .await
+            .expect("seal under the customer-managed root");
+        assert!(
+            envelope.kek.is_some(),
+            "the envelope must name its root, or this test is not exercising the CMK path"
+        );
+
+        let (secret, source, ceiling) = plane
+            .open_material(
+                "cred-cmk-ceiling",
+                &CredentialMaterial::Envelope { envelope },
+            )
+            .await
+            .expect("opens through the external root");
+        assert_eq!(secret, "upstream-secret");
+        assert_eq!(source, "envelope");
+        assert_eq!(
+            ceiling,
+            Some(std::time::Duration::from_secs(7)),
+            "the ceiling must be the time left on the data key. Taking the configured window \
+             here instead is how two caches clamped to W end up holding a secret for 2W, which \
+             is the number the admin surface prints"
+        );
+        assert_ne!(
+            ceiling,
+            Some(std::time::Duration::from_secs(600)),
+            "a fresh copy of the configured window is exactly the bug"
+        );
+    }
+
+    /// The other half of the same seam: a locally-wrapped envelope is
+    /// bounded by no external service, so it must carry no ceiling at all.
+    /// Returning one would clamp a local deployment's cache to a window it
+    /// never opted into.
+    #[tokio::test]
+    async fn a_locally_wrapped_envelope_carries_no_ceiling() {
+        let plane = plane();
+        let envelope = plane
+            .crypto()
+            .seal("cred-local-ceiling", b"local-secret")
+            .expect("local seal");
+        assert!(envelope.kek.is_none());
+        let (secret, source, ceiling) = plane
+            .open_material(
+                "cred-local-ceiling",
+                &CredentialMaterial::Envelope { envelope },
+            )
+            .await
+            .expect("opens locally");
+        assert_eq!(secret, "local-secret");
+        assert_eq!(source, "envelope");
+        assert_eq!(ceiling, None);
     }
 }

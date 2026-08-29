@@ -2890,6 +2890,13 @@ pub fn record_root_of_trust_operation(operation: &'static str, ok: bool) {
 /// `expired`, or `reviewed`. An emergency path that is used more than it
 /// is reviewed is the thing worth alerting on, and that alert is
 /// `expired - reviewed` on this one series.
+///
+/// `expired` and `denied` are the two time-driven transitions, and expiry
+/// is computed on read rather than swept, so they are emitted by the first
+/// read that observes them and latched so they fire once. A deployment
+/// that never reads `GET /admin/break-glass` therefore never emits them,
+/// which is the same trade the rotation-age gauge makes: the number is
+/// refreshed by the thing that was going to look at it anyway.
 pub fn record_break_glass(event: &'static str) {
     use prometheus::{register_int_counter_vec, IntCounterVec};
     use std::sync::OnceLock;

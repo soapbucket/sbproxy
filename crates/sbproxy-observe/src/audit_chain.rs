@@ -1387,17 +1387,6 @@ fn fingerprint_named_field(name: &str, value: &serde_json::Value) -> Option<(Str
     Some((map_key, value_fingerprint))
 }
 
-/// Fingerprint every top-level field of a key/credential before/after
-/// snapshot (WOR-2478).
-///
-/// A JSON object fingerprints one entry per key. Anything else a caller
-/// might pass as a snapshot (a scalar, an array, or simply absent)
-/// fingerprints as a single field named `"value"`, so a diff shaped
-/// either way still produces something. Called from
-/// [`crate::audit::KeyAuditEntry::emit`]; never the raw name or value,
-/// only their digests under a key only the operator's master secret can
-/// derive, and only when a fingerprint key has actually been installed
-/// (this omits the entry rather than fingerprinting with a placeholder).
 /// Fingerprint one non-secret-but-identifying value under the key-audit
 /// fingerprint key (WOR-2570).
 ///
@@ -1434,6 +1423,17 @@ pub fn fingerprint_epoch() -> String {
     key_audit_fingerprint_epoch()
 }
 
+/// Fingerprint every top-level field of a key/credential before/after
+/// snapshot (WOR-2478).
+///
+/// A JSON object fingerprints one entry per key. Anything else a caller
+/// might pass as a snapshot (a scalar, an array, or simply absent)
+/// fingerprints as a single field named `"value"`, so a diff shaped
+/// either way still produces something. Called from
+/// [`crate::audit::KeyAuditEntry::emit`]; never the raw name or value,
+/// only their digests under a key only the operator's master secret can
+/// derive, and only when a fingerprint key has actually been installed
+/// (this omits the entry rather than fingerprinting with a placeholder).
 pub(crate) fn fingerprint_key_audit_snapshot(
     value: Option<&serde_json::Value>,
 ) -> BTreeMap<String, String> {

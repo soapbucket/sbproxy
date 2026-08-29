@@ -1203,9 +1203,22 @@ pub(crate) fn key_event_to_cef(event: &crate::events::ProxyEvent) -> String {
     )
 }
 
-/// Escape a CEF header field: backslash and the pipe delimiter.
+/// Escape a CEF header field: backslash, the pipe delimiter, and the
+/// newlines that would end the record early.
+///
+/// The newline arms are unreachable today, because every header input is a
+/// closed vocabulary (`key_lifecycle_event_type` maps four literals) and
+/// the version comes from `CARGO_PKG_VERSION`. They are here because the
+/// module doc presents the escaping as the defense, and a defense that
+/// holds only because of a property two functions away is one refactor
+/// from being wrong. Its sibling `cef_extension_escape` already covers all
+/// four; the asymmetry was the accident.
 fn cef_header_escape(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('|', "\\|")
+    value
+        .replace('\\', "\\\\")
+        .replace('|', "\\|")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 /// Escape a CEF extension value: backslash, the `=` that separates a key

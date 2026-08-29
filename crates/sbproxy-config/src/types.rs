@@ -6044,7 +6044,7 @@ impl Default for KeyCacheConfig {
 /// to audit which reference `master_key` happened to carry, and every
 /// answer that audit could give was "no", because a resolved reference is
 /// a copy.
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RootOfTrustConfig {
     /// Which external key service performs the wrap and unwrap.
@@ -6086,6 +6086,26 @@ pub struct RootOfTrustConfig {
     /// closed.
     #[serde(default = "default_root_liveness_interval_secs")]
     pub liveness_interval_secs: u64,
+}
+
+/// Redacting `Debug` (the rule `HashiCorpBackendAuth` and
+/// `HashiCorpSecretsConfig` already carry in this file). `token` is a secret
+/// reference and `resolve_crypto_field` deliberately exempts inline
+/// literals, so an operator may legitimately write the token itself here;
+/// `address` is unparsed and may carry userinfo. `finish_non_exhaustive`
+/// so a later credential-shaped field is omitted by default.
+impl std::fmt::Debug for RootOfTrustConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RootOfTrustConfig")
+            .field("provider", &self.provider)
+            .field("mount", &self.mount)
+            .field("key_name", &self.key_name)
+            .field("address", &"[REDACTED]")
+            .field("token", &"[REDACTED]")
+            .field("unwrap_cache_ttl_secs", &self.unwrap_cache_ttl_secs)
+            .field("liveness_interval_secs", &self.liveness_interval_secs)
+            .finish_non_exhaustive()
+    }
 }
 
 /// External key services that can hold the root of trust.

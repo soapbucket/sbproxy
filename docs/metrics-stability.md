@@ -298,11 +298,9 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_jwks_unknown_kid_refetch_total` | Counter | `stable` | `beta` | `result` | JWKS refreshes triggered by tokens whose kid was absent from the local cache. |
 | `sbproxy_key_cache_invalidation_failures_total` | Counter | `stable` | `alpha` | `scope` | Keystore cache-tier invalidations that did not reach the shared tier or its peers, by scope (key or all). |
 | `sbproxy_key_lookup_cache_total` | Counter | `stable` | `beta` | `kind`, `outcome` | Keystore TTL-cache lookups, by record kind and which layer answered (hit, negative_hit, tier_hit, miss, error). |
-| `sbproxy_key_rotation_age_days` | Gauge | `stable` | `alpha` | `kind` | Days since the oldest record of this kind was minted or rotated, by kind (key, credential). |
 | `sbproxy_key_operations_total` | Counter | `stable` | `beta` | `operation`, `outcome` | Admin key-lifecycle operations, by operation and by what the handler actually returned (ok, refused, error). |
 | `sbproxy_key_policy_stored_rejections_total` | Counter | `stable` | `alpha` | `reason` | Stored key records rejected while lowering to an effective policy, by reason. |
-| `sbproxy_root_of_trust_liveness` | Gauge | `stable` | `alpha` | none | 1 when the last customer-managed root-of-trust probe reached and was authorized by the external key service, 0 otherwise. |
-| `sbproxy_root_of_trust_operations_total` | Counter | `stable` | `alpha` | `operation`, `outcome` | Customer-managed root-of-trust operations, by operation (wrap, unwrap, unwrap_cached) and outcome. |
+| `sbproxy_key_rotation_age_days` | Gauge | `stable` | `alpha` | `kind` | Days since the oldest record of this kind was minted or rotated, by kind (key, credential). |
 | `sbproxy_key_store_outage_total` | Counter | `stable` | `beta` | `entrypoint`, `posture`, `outcome` | Inbound-key resolutions that could not reach the virtual key store, by entrypoint, configured failure posture, and what the posture decided. |
 | `sbproxy_key_store_unavailable` | Gauge | `stable` | `beta` | `posture` | 1 while the last inbound-key resolution could not reach the virtual key store; the posture label is what that costs. |
 | `sbproxy_kya_verdicts_total` | Counter | `stable` | `beta` | `verdict` | Know Your Agent token verification verdicts; the issuer is deliberately not a label. |
@@ -426,6 +424,8 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_request_duration_seconds` | Histogram | `stable` | `stable` | `hostname` | Request latency. |
 | `sbproxy_requests_total` | Counter | `stable` | `stable` | `hostname`, `method`, `status`, `agent_id`, `agent_class`, `agent_vendor`, `payment_rail`, `content_shape` | Total HTTP requests. |
 | `sbproxy_response_body_bytes` | Histogram | `stable` | `beta` | `direction` | Response body size, by compression direction. |
+| `sbproxy_root_of_trust_operations_total` | Counter | `stable` | `alpha` | `operation`, `outcome` | Customer-managed root-of-trust operations, by operation (wrap, unwrap, unwrap_cached) and outcome. |
+| `sbproxy_root_of_trust_liveness` | Gauge | `stable` | `alpha` | none | 1 when the last customer-managed root-of-trust probe reached and was authorized by the external key service, 0 otherwise. |
 | `sbproxy_script_compile_total` | Counter | `stable` | `beta` | `engine`, `result` | Script-engine compile attempts, by engine and outcome. |
 | `sbproxy_script_duration_seconds` | Histogram | `stable` | `beta` | `engine` | Script-engine invocation duration, by engine. |
 | `sbproxy_script_invocations_total` | Counter | `stable` | `beta` | `engine`, `result` | Script-engine invocations, by engine and outcome. |

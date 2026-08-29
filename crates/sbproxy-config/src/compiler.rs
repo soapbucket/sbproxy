@@ -2031,6 +2031,33 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
             .validate()
             .map_err(|error| anyhow::anyhow!("config compile: {error}"))?;
 
+        // WOR-2573: the quorum's own field doc promises this refusal, and
+        // both ends of the range are reachable and bad. `quorum: 0` makes
+        // `approvals.len() >= quorum` true on the first approval and the
+        // admin surface then reports the grant as legitimately quorate, so
+        // a two-person rule silently becomes a zero-person one. A quorum
+        // above the roster can never be met, and an operator discovers that
+        // during the incident the grant exists for.
+        let break_glass = &key_management.break_glass;
+        if break_glass.enabled {
+            if break_glass.quorum == 0 {
+                anyhow::bail!(
+                    "config compile: proxy.key_management.break_glass.quorum is 0, so a grant \
+                     would activate on its first approval and the admin surface would report it \
+                     as quorate. Set it to at least 1."
+                );
+            }
+            if break_glass.quorum > break_glass.approvers.len() {
+                anyhow::bail!(
+                    "config compile: proxy.key_management.break_glass.quorum is {} but only {} \
+                     approver(s) are configured, so no grant can ever activate. Add approvers or \
+                     lower the quorum.",
+                    break_glass.quorum,
+                    break_glass.approvers.len()
+                );
+            }
+        }
+
         // WOR-2325: two booleans on this block parse and govern nothing.
         // Both are refused on `true` only, the value that misdescribes the
         // build. `false` is the default and is what the build actually

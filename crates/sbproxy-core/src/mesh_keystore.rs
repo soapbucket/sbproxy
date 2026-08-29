@@ -837,6 +837,60 @@ mod tests {
         assert!(!stored.is_usable(Utc::now()));
     }
 
+    /// Seam M, replaced, half two: the mesh enforcer.
+    ///
+    /// A rotation moves the pre-rotation material into `prev_material`, so
+    /// a record whose current slot is a harmless vault reference can still
+    /// be carrying a plaintext secret. `put_credential` reading only
+    /// `record.material` would replicate that secret onto every replica
+    /// shard's disk while the record looked clean.
+    ///
+    /// Reverting `mesh_keystore.rs`'s guard to
+    /// `record.material.is_plaintext()` reddens this and leaves the
+    /// predicate test in `record.rs` green, which is the whole point of
+    /// having this one.
+    #[tokio::test]
+    async fn a_rotated_records_retired_plaintext_is_refused_at_mint() {
+        let store = MeshKeyStore::new(substrate());
+        let mut rotated = credential(
+            "rotated-cred",
+            serde_json::json!({"kind": "vault_ref", "reference": "vault://new"}),
+        );
+        rotated.prev_material = Some(sbproxy_keystore::record::CredentialMaterial::Plaintext {
+            value: "sk-retired-but-still-on-disk".to_string(),
+        });
+        rotated.prev_material_expires_at =
+            Some(Utc::now() + chrono::Duration::try_seconds(300).expect("representable"));
+        // The current slot must look clean, or this test cannot tell the
+        // two guards apart. Asserted through the public shape because
+        // `is_plaintext` is deliberately crate-private to `sbproxy-keystore`
+        // now, which is itself the fix: no out-of-crate caller can reach
+        // the one-slot answer, this test included.
+        assert!(matches!(
+            rotated.material,
+            sbproxy_keystore::record::CredentialMaterial::VaultRef { .. }
+        ));
+
+        let error = store
+            .put_credential(rotated)
+            .await
+            .expect_err("a retired plaintext must not replicate either");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("rotated-cred"),
+            "names the credential: {message}"
+        );
+        assert!(
+            !message.contains("sk-retired-but-still-on-disk"),
+            "the refusal must not echo the retired secret: {message}"
+        );
+        assert!(store
+            .get_credential("rotated-cred")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
     #[tokio::test]
     async fn plaintext_credential_material_is_refused_at_mint() {
         let store = MeshKeyStore::new(substrate());

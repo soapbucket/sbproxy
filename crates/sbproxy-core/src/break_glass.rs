@@ -4,6 +4,15 @@
 //! Break-glass emergency access for the key and credential admin API
 //! (WOR-2573).
 //!
+//! # "Scoped" means declared, not enforced
+//!
+//! A grant's `scope` is what the requester said they needed and what the
+//! reviewer reads afterwards. It is not compared against the record a
+//! tagged action actually touches: [`tag_action`] matches on the actor and
+//! the grant's state and nothing narrower. Enforcing it would mean a second
+//! authorization model, which is precisely what this is not, so the honest
+//! word for the field is "declared".
+//!
 //! # What this is, and what it deliberately is not
 //!
 //! It is not a new authorization model. A break-glass grant is a
@@ -127,13 +136,37 @@ pub(crate) struct Grant {
     pub reviewed_by: Option<String>,
     /// When the post-access review was recorded.
     pub reviewed_at: Option<DateTime<Utc>>,
+    /// Whether this grant's time-driven terminal transition has already
+    /// been counted on `sbproxy_break_glass_grants_total`.
+    ///
+    /// Expiry is computed on read and has no transition to hang a counter
+    /// on, which is why `expired` and `denied` were declared in the metric's
+    /// vocabulary and never written: the runbook's `expired - reviewed`
+    /// alert evaluated to `-reviewed` forever. This flag is the one-shot
+    /// latch that lets a read emit the transition it observes, exactly once.
+    #[serde(default)]
+    pub terminal_counted: bool,
 }
 
 impl Grant {
+    /// A `u64` seconds value as a `chrono::Duration`, refusing what chrono
+    /// cannot represent instead of panicking on it.
+    ///
+    /// `Duration::seconds` is `expect(try_seconds(..))` and a bare
+    /// `as i64` wraps negative on a large `u64`, which here would make a
+    /// grant that reads as active expire in the past. Config validation
+    /// bounds `max_ttl_secs` and `review_window_secs` in practice, but this
+    /// type is the one that does the arithmetic and should not depend on
+    /// that. `None` means "so long it is effectively unbounded", which the
+    /// callers treat as never-reached rather than as immediately-reached.
+    fn checked_duration(seconds: u64) -> Option<Duration> {
+        i64::try_from(seconds).ok().and_then(Duration::try_seconds)
+    }
+
     /// When the grant stops being usable, if it ever started.
     pub(crate) fn expires_at(&self) -> Option<DateTime<Utc>> {
-        self.activated_at
-            .map(|at| at + Duration::seconds(self.ttl_secs as i64))
+        let ttl = Self::checked_duration(self.ttl_secs)?;
+        self.activated_at.map(|at| at + ttl)
     }
 
     /// The grant's state at `now`, recomputed rather than stored.
@@ -145,18 +178,28 @@ impl Grant {
         if self.reviewed_by.is_some() {
             return GrantState::Reviewed;
         }
+        // An unrepresentable TTL cannot expire, so such a grant stays in
+        // its pre-terminal state rather than flipping to a terminal one on
+        // an arithmetic accident.
+        let Some(ttl) = Self::checked_duration(self.ttl_secs) else {
+            return if self.activated_at.is_some() {
+                GrantState::Active
+            } else {
+                GrantState::PendingApproval
+            };
+        };
         let Some(activated) = self.activated_at else {
             // Never activated. A request is only worth holding open for
             // as long as it could still be used, so the TTL bounds the
             // approval window too.
-            return if now > self.requested_at + Duration::seconds(self.ttl_secs as i64) {
+            return if now > self.requested_at + ttl {
                 GrantState::Denied
             } else {
                 GrantState::PendingApproval
             };
         };
         let _ = quorum;
-        if now < activated + Duration::seconds(self.ttl_secs as i64) {
+        if now < activated + ttl {
             GrantState::Active
         } else {
             GrantState::AwaitingReview
@@ -168,9 +211,12 @@ impl Grant {
         if self.reviewed_by.is_some() {
             return false;
         }
-        match self.expires_at() {
-            Some(at) => now > at + Duration::seconds(review_window_secs as i64),
-            None => false,
+        match (
+            self.expires_at(),
+            Self::checked_duration(review_window_secs),
+        ) {
+            (Some(at), Some(window)) => now > at + window,
+            _ => false,
         }
     }
 
@@ -215,6 +261,10 @@ pub(crate) enum BreakGlassError {
     /// The approver is the requester. Never permitted, whatever the roster
     /// says.
     SelfApproval,
+    /// The reviewer is the requester. Never permitted, for the same reason:
+    /// the post-access review is what makes the grant reviewable by
+    /// somebody other than the person who used it.
+    SelfReview,
     /// The approver is not on `key_management.break_glass.approvers`.
     NotAnApprover(String),
     /// This operator already approved.
@@ -259,6 +309,11 @@ impl std::fmt::Display for BreakGlassError {
                 f,
                 "a break-glass grant cannot be approved by the operator who requested it"
             ),
+            Self::SelfReview => write!(
+                f,
+                "a break-glass grant cannot be reviewed by the operator who requested it; the \
+                 post-access review exists to be somebody else's signature"
+            ),
             Self::NotAnApprover(who) => write!(
                 f,
                 "'{who}' is not on key_management.break_glass.approvers"
@@ -284,6 +339,9 @@ impl std::fmt::Display for BreakGlassError {
 /// ceiling that keeps that from being a memory-growth knob an
 /// authenticated admin can turn.
 const MAX_TRACKED_GRANTS: usize = 1024;
+
+/// How many scope entries one grant records, and how long each may be.
+const MAX_SCOPE_ENTRIES: usize = 64;
 
 /// Process-wide break-glass state.
 #[derive(Default)]
@@ -359,7 +417,18 @@ pub(crate) fn request(
         id: format!("bg_{}", sbproxy_keystore::crypto::random_id()),
         requested_by: requested_by.to_string(),
         justification: sbproxy_util::truncate_utf8(justification, 1024).to_owned(),
-        scope: scope.into_iter().filter(|s| !s.trim().is_empty()).collect(),
+        // Bounded in count and element length. An authenticated admin can
+        // hold up to MAX_TRACKED_GRANTS grants, so an unbounded scope list
+        // is retained memory they control. Truncating silently rather than
+        // refusing: a scope is a record of intent for the reviewer, not an
+        // enforced filter, so friction here buys nothing on the exception
+        // path.
+        scope: scope
+            .into_iter()
+            .filter(|s| !s.trim().is_empty())
+            .take(MAX_SCOPE_ENTRIES)
+            .map(|s| sbproxy_util::truncate_utf8(&s, 256).to_owned())
+            .collect(),
         requested_at: Utc::now(),
         ttl_secs,
         approvals: BTreeSet::new(),
@@ -367,6 +436,7 @@ pub(crate) fn request(
         actions_taken: 0,
         reviewed_by: None,
         reviewed_at: None,
+        terminal_counted: false,
     };
     {
         let mut grants = registry().grants.lock();
@@ -470,6 +540,19 @@ pub(crate) fn review(id: &str, reviewer: &str, note: &str) -> Result<Grant, Brea
         .iter_mut()
         .find(|g| g.id == id)
         .ok_or(BreakGlassError::NotFound)?;
+    // The same two checks `approve` makes, and for the same reason. The
+    // post-access review is the accountability half of this design: a
+    // requester who can close their own grant clears it off the review
+    // queue and off `sbproxy_break_glass_open{state="awaiting_review"}`,
+    // which is the one alert the whole feature is built around. Leaving
+    // these off `review` while `approve` has them made the quorum
+    // theatre for anyone willing to wait for their own grant to expire.
+    if grant.requested_by == reviewer {
+        return Err(BreakGlassError::SelfReview);
+    }
+    if !is_approver(&cfg, reviewer) {
+        return Err(BreakGlassError::NotAnApprover(reviewer.to_string()));
+    }
     let state = grant.state(now, cfg.quorum);
     if state != GrantState::AwaitingReview {
         return Err(BreakGlassError::WrongState(state));
@@ -512,6 +595,11 @@ pub(crate) fn list(now: DateTime<Utc>) -> serde_json::Value {
     let Some(cfg) = config() else {
         return json!({ "enabled": false, "grants": [] });
     };
+    // The review queue is time-driven and every other transition is not, so
+    // this read is the only thing that ever observes a grant lapsing. It has
+    // to publish, or the gauge the overdue alert reads stays on whatever the
+    // last approval left behind.
+    refresh_gauges();
     let grants = registry().grants.lock();
     let mut views: Vec<serde_json::Value> = grants.iter().map(|g| g.view(now, &cfg)).collect();
     views.reverse();
@@ -543,7 +631,24 @@ fn refresh_gauges() {
         return;
     };
     let now = Utc::now();
-    let grants = registry().grants.lock();
+    let mut grants = registry().grants.lock();
+    // Emit the time-driven transitions this read just observed, once each.
+    // Without this the `expired` and `denied` events are declared and never
+    // written, and a grant that quietly ran out with nobody approving or
+    // reviewing anything never reaches `awaiting_review` on the gauge,
+    // which is precisely the abandonment case the dashboard alerts on.
+    for grant in grants.iter_mut() {
+        if grant.terminal_counted {
+            continue;
+        }
+        let event = match grant.state(now, cfg.quorum) {
+            GrantState::AwaitingReview => "expired",
+            GrantState::Denied => "denied",
+            _ => continue,
+        };
+        grant.terminal_counted = true;
+        sbproxy_observe::metrics::record_break_glass(event);
+    }
     for label in ["pending_approval", "active", "awaiting_review"] {
         let count = grants
             .iter()
@@ -613,6 +718,7 @@ mod tests {
             actions_taken: 0,
             reviewed_by: None,
             reviewed_at: None,
+            terminal_counted: false,
         }
     }
 

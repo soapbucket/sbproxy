@@ -26,7 +26,11 @@
 #   curl -s -u admin:admin http://127.0.0.1:9090/admin/crypto/root-of-trust
 #   # { "mode": "customer_managed", "kek": "transit/sbproxy-root",
 #   #   "revocation_window_secs": 30,
-#   #   "liveness": { "probe": "ok", "cached_data_keys": 0, ... } }
+#   #   "liveness": { "probe": "ok", "last_success_unix": ..., "cached_data_keys": 0 } }
+#   #
+#   # cached_data_keys rises as credentials are resolved. It is how much
+#   # decrypt capability a revocation still has to age out, so watching it
+#   # fall to zero is watching the revocation take effect.
 #
 # 2. Store a credential. Its data key is wrapped by Vault, not by this process:
 #   curl -s -u admin:admin -X POST http://127.0.0.1:9090/admin/credentials \
@@ -36,16 +40,20 @@
 #   # { "credential": { "storage": "encrypted", "root_of_trust": "transit/sbproxy-root" } }
 #
 # 3. Revoke the grant the way a customer would, then watch decryption stop:
-#   vault policy write sbproxy-none - <<'POLICY'
-#   path "transit/*" { capabilities = ["deny"] }
-#   POLICY
-#   # (or simply: vault lease revoke -prefix auth/token, or delete the key)
-#   sleep 35
+#   vault delete transit/keys/sbproxy-root   # or revoke the token's policy
+#
+#    The background probe runs every liveness_interval_secs (15 below). Its
+#    first failure purges every cached data key, so the wait is bounded by
+#    the probe interval rather than by the cache TTL:
+#   sleep 20
 #   curl -s -u admin:admin http://127.0.0.1:9090/admin/crypto/root-of-trust
 #   # { "liveness": { "probe": "failed_or_never_run", "cached_data_keys": 0 } }
 #
 #    A request bound to cred-openai now fails to resolve rather than being
-#    served from a copy sbproxy kept.
+#    served from a copy sbproxy kept. Worst case without the probe is
+#    unwrap_cache_ttl_secs (30 below), and that is the whole exposure: a
+#    decrypted credential inherits the time left on the data key that opened
+#    it rather than starting a second window of its own.
 #
 # What this covers: the upstream-credential envelope, for credentials sealed
 # after the root of trust was configured. It does not cover the pepper (inbound

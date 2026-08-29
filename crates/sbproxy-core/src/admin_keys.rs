@@ -610,6 +610,17 @@ fn list_keys() -> Resp {
     let store = plane.cache().store().clone();
     match block_on_keystore(async move { store.list_keys().await }) {
         Ok(keys) => {
+            // WOR-2567: the `kind="key"` half of
+            // `sbproxy_key_rotation_age_days`, which
+            // `docs/configuration.md` names as the alert target for
+            // `inbound_key_days`. Published from the same read that
+            // already retires lapsed overrides below, so a deployment
+            // that never lists never pays and the number is refreshed by
+            // the thing that was going to look at it anyway.
+            let rotation_now = Utc::now();
+            if let Some(oldest) = keys.iter().map(|k| k.rotation_age_days(rotation_now)).max() {
+                sbproxy_observe::metrics::record_rotation_age_days("key", oldest as f64);
+            }
             // WOR-2561: listing is a read the operator trusts, so lapsed
             // budget overrides are retired (and their expiry audited) here.
             //
@@ -1566,6 +1577,10 @@ fn rotate_key(id: &str, body: Option<&str>) -> Resp {
     // The current secret becomes the graced prior secret.
     rec.prev_secret_hash = Some(rec.secret_hash.clone());
     rec.prev_hash_expires_at = Some(now + chrono::Duration::seconds(grace_secs));
+    // WOR-2567: what `sbproxy_key_rotation_age_days{kind="key"}` measures
+    // from. `updated_at` moves on any policy patch, so it cannot answer
+    // "when was this secret last replaced".
+    rec.rotated_at = Some(now);
     rec.secret_hash = minted.secret_hash;
     rec.updated_at = now;
     let rec = match store_key_if_revision(&plane, rec, expected_revision) {
@@ -1940,7 +1955,10 @@ impl std::fmt::Debug for CredentialCreate {
             .field("tenant", &self.tenant)
             .field("header", &self.header)
             .field("scheme", &self.scheme)
-            .finish()
+            // Non-exhaustive: `lease` was added without an arm here, and
+            // the next credential-shaped field would be too. `finish()`
+            // renders an untrue exhaustive struct and invites exactly that.
+            .finish_non_exhaustive()
     }
 }
 
@@ -2048,7 +2066,40 @@ fn list_credentials() -> Resp {
     };
     let store = plane.cache().store().clone();
     match block_on_keystore(async move { store.list_credentials().await }) {
-        Ok(creds) => {
+        Ok(mut creds) => {
+            // WOR-2567: retire material whose overlap window has closed, on
+            // the same read that publishes the rotation gauge and for the
+            // same reason `list_keys` retires lapsed budget overrides here.
+            // The field doc promises the store does not keep a retired
+            // secret indefinitely, and nothing else makes that true: the
+            // resolution path only declines to serve it.
+            //
+            // Bounded, because each retirement is a blocking store write on
+            // the request thread. Past the cap the rest are retired by the
+            // next listing; what is deferred is the write, never the
+            // refusal to serve, which `usable_prev_material` already
+            // enforces from the record itself.
+            let retire_now = Utc::now();
+            let mut retired = 0usize;
+            for record in creds.iter_mut() {
+                if retired >= MAX_RETIREMENTS_PER_LIST {
+                    break;
+                }
+                if record.retire_expired_prev_material(retire_now) {
+                    retired += 1;
+                    if let Err(e) = store_credential(&plane, record.clone()) {
+                        tracing::warn!(
+                            credential_id = %record.id,
+                            error = %e,
+                            "could not retire a credential's expired rotation overlap; the \
+                             material stays on disk until the next listing"
+                        );
+                    } else {
+                        invalidate(&plane, &record.id);
+                    }
+                }
+            }
+            let creds = creds;
             // WOR-2567: publish the oldest un-rotated credential's age
             // here rather than from a timer. This route is what the admin
             // console and the operator's own scripts already poll, so the
@@ -2318,7 +2369,17 @@ fn rotate_credential(id: &str, body: Option<&str>) -> Resp {
     let request: RotateCredentialBody = match body {
         Some(raw) if !raw.trim().is_empty() => match serde_json::from_str(raw) {
             Ok(v) => v,
-            Err(e) => return bad_request(&format!("invalid JSON body: {e}")),
+            // Not the raw serde message. This is the one admin body that
+            // carries a plaintext upstream credential, and serde's
+            // `invalid type` text embeds the offending scalar, so a
+            // mistyped field would answer
+            // `invalid type: string "sk-live-...", expected u64`.
+            Err(e) => {
+                return bad_request(&format!(
+                    "invalid JSON body: {}",
+                    sbproxy_config::origin_profile::redact_serde_message(&e.to_string())
+                ))
+            }
         },
         _ => return bad_request("rotate requires a new secret or vault_ref"),
     };
@@ -2352,14 +2413,36 @@ fn rotate_credential(id: &str, body: Option<&str>) -> Resp {
     let grace_secs = request
         .grace_secs
         .unwrap_or_else(|| plane.credential_rotation_grace_secs());
+    // `chrono::Duration::seconds` is `expect(try_seconds(..))` and panics
+    // past `i64::MAX / 1_000`, and a bare `as i64` on a large `u64` wraps
+    // negative, which would silently produce an already-expired overlap
+    // while the 200 response reported the window as open. This value comes
+    // straight off an admin JSON body, so both are reachable by anyone who
+    // can call the route. `lifecycle.rs`'s `registry_duration` is the same
+    // refusal for the same trap on config values; the unwrap ratchet cannot
+    // see either, because the `expect` lives in chrono.
+    let Some(overlap) = i64::try_from(grace_secs)
+        .ok()
+        .and_then(chrono::Duration::try_seconds)
+    else {
+        return bad_request(&format!(
+            "grace_secs is {grace_secs}, which is not a duration sbproxy can represent; use a \
+             value below {}",
+            i64::MAX / 1_000
+        ));
+    };
     let now = Utc::now();
+    // A rotation whose previous overlap has already lapsed must not carry
+    // that older material forward; retire it before the new one takes its
+    // place.
+    rec.retire_expired_prev_material(now);
     let previous = std::mem::replace(&mut rec.material, material);
     if grace_secs == 0 {
         rec.prev_material = None;
         rec.prev_material_expires_at = None;
     } else {
         rec.prev_material = Some(previous);
-        rec.prev_material_expires_at = Some(now + chrono::Duration::seconds(grace_secs as i64));
+        rec.prev_material_expires_at = Some(now + overlap);
     }
     rec.rotated_at = Some(now);
     rec.updated_at = now;
@@ -2492,7 +2575,7 @@ fn break_glass_error(error: &crate::break_glass::BreakGlassError) -> Resp {
         E::NoActor => 401,
         E::TtlOutOfRange(_) | E::UnscopedRequest | E::NoJustification => 400,
         E::NotFound => 404,
-        E::SelfApproval | E::NotAnApprover(_) => 403,
+        E::SelfApproval | E::SelfReview | E::NotAnApprover(_) => 403,
         E::AlreadyApproved | E::WrongState(_) | E::RegistryFull(_) => 409,
     };
     (
@@ -2540,10 +2623,12 @@ fn get_root_of_trust() -> Resp {
         "kek": root.kek_name(),
         "revocation_window_secs": window,
         "detail": format!(
-            "the envelope data key is wrapped by the external key service and is never held here. \
-             After the customer revokes sbproxy's grant, decryption of customer-managed \
+            "the envelope data key is wrapped by the external key service and is never held \
+             here. After the customer revokes sbproxy's grant, decryption of customer-managed \
              credentials stops within {window} seconds, or at the next failed liveness probe, \
-             whichever comes first."
+             whichever comes first. The {window} seconds is the whole exposure, not the first \
+             of two: a decrypted credential inherits the time left on the data key that opened \
+             it rather than starting a fresh window."
         ),
         "liveness": status,
         "rotation": {
