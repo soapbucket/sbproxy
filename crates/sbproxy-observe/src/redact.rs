@@ -14,10 +14,10 @@
 //!   because the value has no recognizable shape of its own:
 //!   `secret...`, `api_key`, `password`, and the schema's own key /
 //!   secret / token names (`RE_CREDENTIAL_KEY`, `RE_BARE_TOKEN`).
-//! * One *positional* pattern, [`RE_URL_USERINFO`]. A credential
-//!   embedded in a URL's userinfo has neither a recognizable shape nor
-//!   a key name in front of it; what identifies it is where it sits,
-//!   between `://` and `@`.
+//! * One *positional* rule, `mask_url_userinfo`. A credential embedded
+//!   in a URL's userinfo has neither a recognizable shape nor a key
+//!   name in front of it; what identifies it is where it sits, between
+//!   `://` and `@`.
 //!
 //! A credential that is neither a known shape nor under a known name
 //! is returned as written. In particular there is no JWT pattern: a
@@ -46,33 +46,103 @@ use std::sync::LazyLock;
 
 // --- Pattern definitions ---
 
-/// A credential in a URL's userinfo: `https://user:hvs.MUSTNOTAPPEAR...@host`.
+/// Mask the userinfo of every URL in `input`: `https://user:tok@host`
+/// becomes `https://[REDACTED]@host`.
 ///
-/// Runs first, before every shape and keyed pattern, because it is the
-/// one pattern identified by position rather than by bytes or by name.
-/// A config value like `key_management.crypto.root_of_trust.address` is
-/// an ordinary unparsed URL under an ordinary key name, so nothing else
-/// here looks at it, and `GET /admin/config` and
-/// `/admin/config/effective` handed it back verbatim while the `token`
-/// beside it was masked by [`RE_BARE_TOKEN`]. The branch that added
-/// that field already treats the address as secret-bearing on those
-/// exact grounds, redacting it in `TransitConfig`'s and
-/// `RootOfTrustConfig`'s `Debug` and keeping it out of Transit errors;
-/// this closes the fourth surface.
+/// Runs before every shape and keyed pattern, because it is the one rule
+/// here that identifies a credential by position rather than by its bytes
+/// or by the name in front of it. A config value like
+/// `key_management.crypto.root_of_trust.address` is an ordinary unparsed
+/// URL under an ordinary key name, so nothing else in this module looks at
+/// it, and `GET /admin/config` and `/admin/config/effective` handed it
+/// back verbatim while the `token` beside it was masked by
+/// [`RE_BARE_TOKEN`]. The branch that added that field already treats the
+/// address as secret-bearing on those exact grounds, redacting it in
+/// `TransitConfig`'s and `RootOfTrustConfig`'s `Debug` and keeping it out
+/// of Transit errors; this closes the fourth surface.
 ///
-/// Two groups, and only the second is masked, so the scheme and
-/// everything from the `@` on survive: an operator still reads which
-/// host is configured, which is the whole reason the field is on the
-/// route. The whole userinfo goes, user and password together, because
-/// a bare `user@host` in a config a customer sends to support is a name
-/// worth not shipping either, and telling the two apart costs a branch
-/// that buys nothing.
+/// The scheme and everything from the `@` on survive, so an operator still
+/// reads which host is configured, which is the whole reason the field is
+/// on the route. The whole userinfo goes, user and password together,
+/// because a bare `user@host` in a config a customer sends to support is a
+/// name worth not shipping either, and telling the two apart costs a
+/// branch that buys nothing.
 ///
-/// The userinfo run stops at whitespace, `/` and `@`, so a `@` later in
-/// a path or query (`.../data?to=a@b`) cannot pull the match across the
-/// authority: the first `/` ends the run before the `@` is reached.
-static RE_URL_USERINFO: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)([a-z][a-z0-9+.\-]*://)([^\s/@]+)@").expect("valid regex"));
+/// Hand-written rather than a regex. A `LazyLock<Regex>` here would be one
+/// more `.expect("valid regex")` on a ratchet that only falls, and the
+/// workspace's alternative shape, `LazyLock<Option<_>>`, fails *open*
+/// here: a redactor that quietly stops redacting is worse than one nobody
+/// added. The scan is also the cheaper of the two on a path that runs over
+/// every access-log line.
+///
+/// The authority run stops at whitespace, `/`, and `@`, which is what
+/// keeps a `@` in a path or a query (`.../data?to=a@b`) from pulling the
+/// match across it: the first `/` ends the run before the `@` is reached.
+/// The arithmetic is byte-wise and stays on character boundaries, because
+/// every byte it compares or splits at is ASCII and no UTF-8 continuation
+/// byte matches one.
+fn mask_url_userinfo(input: &str) -> std::borrow::Cow<'_, str> {
+    let bytes = input.as_bytes();
+    let mut out: Option<String> = None;
+    let mut copied = 0usize;
+    let mut search = 0usize;
+
+    while let Some(offset) = input[search..].find("://") {
+        let colon = search + offset;
+        let authority = colon + 3;
+        // Advance past this separator whatever happens below, so a URL
+        // carrying no userinfo cannot spin here.
+        search = authority;
+
+        // A scheme is one or more of `[A-Za-z0-9+.-]` ending at the colon
+        // and opening with a letter. Without one, `://` is three
+        // characters in some prose.
+        let mut scheme = colon;
+        while scheme > 0 {
+            let c = bytes[scheme - 1];
+            if c.is_ascii_alphanumeric() || c == b'+' || c == b'.' || c == b'-' {
+                scheme -= 1;
+            } else {
+                break;
+            }
+        }
+        if scheme == colon || !bytes[scheme].is_ascii_alphabetic() {
+            continue;
+        }
+
+        let mut at = None;
+        let mut i = authority;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if c == b'@' {
+                at = Some(i);
+                break;
+            }
+            if c == b'/' || c.is_ascii_whitespace() {
+                break;
+            }
+            i += 1;
+        }
+        // `scheme://@host` carries no userinfo to mask.
+        let Some(at) = at.filter(|at| *at > authority) else {
+            continue;
+        };
+
+        let buffer = out.get_or_insert_with(String::new);
+        buffer.push_str(&input[copied..authority]);
+        buffer.push_str("[REDACTED]");
+        copied = at;
+        search = at + 1;
+    }
+
+    match out {
+        Some(mut buffer) => {
+            buffer.push_str(&input[copied..]);
+            std::borrow::Cow::Owned(buffer)
+        }
+        None => std::borrow::Cow::Borrowed(input),
+    }
+}
 
 /// Anthropic keys must be matched before the generic OpenAI `sk-` pattern.
 /// Anthropic key format: `sk-ant-<segment>-<segment>` where segments are
@@ -348,7 +418,8 @@ fn keyed_credential_replacement(caps: &regex::Captures<'_>) -> String {
 
 /// Redact secrets from a string. Returns a new string with secrets replaced.
 ///
-/// Applies all thirteen patterns in priority order. The result is
+/// Applies the userinfo rule and then all twelve patterns, in priority
+/// order. The result is
 /// suitable for safe emission in log lines or error messages.
 ///
 /// Two properties callers depend on, both pinned by tests:
@@ -370,7 +441,7 @@ pub fn redact_secrets(input: &str) -> String {
     // masking it whole avoids a shape pattern hitting the embedded
     // credential first and leaving `https://user:sk-ant-[REDACTED]@host`,
     // which still names the user.
-    let s = RE_URL_USERINFO.replace_all(input, "${1}[REDACTED]@");
+    let s = mask_url_userinfo(input);
     let s = RE_ANTHROPIC.replace_all(&s, "sk-ant-[REDACTED]");
     let s = RE_STRIPE.replace_all(&s, "stripe_[REDACTED]");
     let s = RE_OPENAI.replace_all(&s, "sk-[REDACTED]");
@@ -392,7 +463,7 @@ pub fn redact_secrets(input: &str) -> String {
 /// Cheaper than a full `redact_secrets` call when you only need a boolean
 /// answer (e.g. for metrics or alerting).
 pub fn contains_secret(input: &str) -> bool {
-    RE_URL_USERINFO.is_match(input)
+    matches!(mask_url_userinfo(input), std::borrow::Cow::Owned(_))
         || RE_ANTHROPIC.is_match(input)
         || RE_STRIPE.is_match(input)
         || RE_OPENAI.is_match(input)
@@ -1069,7 +1140,7 @@ mod tests {
     /// anyone who could read the route, which is a Vault token in a
     /// document operators paste into support tickets.
     ///
-    /// Deleting `RE_URL_USERINFO` from `redact_secrets` reddens this on
+    /// Deleting `mask_url_userinfo` from `redact_secrets` reddens this on
     /// the first assertion. The last two are the boundary: the mask must
     /// not eat the host (an operator still has to see which Vault is
     /// configured) and must not fire on a `@` that lives in a path or a
