@@ -1233,8 +1233,10 @@ from tests; this branch adds nothing to either bucket beyond the two already
 recorded above. The gap to main's own 1523 is this branch's own items, counted
 here and not there, for the reasons written against them.
 
-2026-08-28 (WOR-2668 / WOR-2670 / WOR-2671): 324 -> 323. Wiring the new
-module types through sbproxy-core gave a production caller to an item
-the scanner had only seen used from tests. Nothing was renamed and
-nothing was narrowed; the count is locked so the ground is not handed
-back on the next branch.
+2026-08-28 (WOR-2668 / WOR-2670 / WOR-2671): test-only 324 -> 323,
+unreferenced 1525 -> 1524. Wiring the new module types through
+sbproxy-core gave production callers to items the scanner had only seen
+used from tests, and reading AbTestSelection::sticky_cookie from
+response_filter gave a cross-file caller to a field that had none.
+Nothing was renamed and nothing was narrowed; both counts are locked so
+the ground is not handed back on the next branch.

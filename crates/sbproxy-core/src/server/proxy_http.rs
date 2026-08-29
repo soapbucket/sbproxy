@@ -5677,6 +5677,17 @@ impl ProxyHttp for SbProxy {
             let _ = upstream_response.append_header("set-cookie", cookie);
         }
 
+        // 6b. WOR-2671: the `abtest` action's sticky pin, minted in
+        //     `handle_action` on a request that carried none. Appended
+        //     here so the assignment survives to the client's next
+        //     request; without it `sticky_cookie` would be a config key
+        //     the action reads and nothing ever writes.
+        if let Some(selection) = ctx.ab_test_selection.as_ref() {
+            if let Some(cookie) = selection.sticky_cookie.as_deref() {
+                let _ = upstream_response.append_header("set-cookie", cookie);
+            }
+        }
+
         // 7. Assertions: evaluate CEL against the response and log
         //    pass/fail. Assertions are observational only and never
         //    block or modify the response. Body size is not yet known

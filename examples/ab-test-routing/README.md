@@ -46,7 +46,9 @@ on, and every later request carrying it pins deterministically.
 ## What this exercises
 
 - `action.type: abtest` with weighted `variants`
-- Sticky-cookie variant pinning via `sticky_cookie`
+- Sticky-cookie variant pinning via `sticky_cookie`: the first request is
+  handed a `Set-Cookie`, and every request after it that sends the cookie
+  back reaches the same variant
 - `sbproxy_action_abtest_variant_selected_total{origin, variant}` incrementing
   once per request, whether the pick came from the cookie or a fresh roll
 

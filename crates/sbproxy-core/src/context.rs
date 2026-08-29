@@ -362,6 +362,16 @@ pub struct AbTestSelection {
     pub port: u16,
     /// Whether the upstream connection uses TLS.
     pub tls: bool,
+    /// The `Set-Cookie` value that pins this client to `variant_name`
+    /// on its next request, or `None` when the request already carried
+    /// a usable sticky cookie and nothing needs re-stamping.
+    ///
+    /// Built in `handle_action` rather than in `response_filter`
+    /// because the cookie's name comes from the action's config, which
+    /// the response phase no longer has in hand. The same shape
+    /// `ctx.csrf_cookie` uses: the request phase decides, the response
+    /// phase only appends.
+    pub sticky_cookie: Option<String>,
 }
 
 /// Per-request state threaded through all Pingora phases as CTX.

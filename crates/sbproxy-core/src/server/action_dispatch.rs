@@ -1244,6 +1244,10 @@ pub(super) async fn handle_action(
                 .headers
                 .get("cookie")
                 .and_then(|v| v.to_str().ok());
+            // Whether this client already carries a pin. Read before
+            // `resolve_variant` consumes the header, because it is the
+            // difference between honoring an assignment and minting one.
+            let already_pinned = ab.sticky_variant(cookie_header).is_some();
             let Some(variant) = ab.resolve_variant(cookie_header) else {
                 warn!(
                     hostname = %ctx.hostname,
@@ -1264,12 +1268,26 @@ pub(super) async fn handle_action(
                         &ctx.hostname,
                         &variant.name,
                     );
+                    // Mint the pin on a first visit. Without this the
+                    // `sticky_cookie` config key would be read and never
+                    // written, so every request would take a fresh
+                    // weighted roll and an A/B run would measure a
+                    // per-request coin flip rather than a per-client
+                    // assignment. The value is the operator-declared
+                    // variant name, never anything the caller sent.
+                    let sticky_cookie = (!already_pinned).then(|| {
+                        format!(
+                            "{}={}; Path=/; Max-Age=2592000; SameSite=Lax; HttpOnly",
+                            ab.sticky_cookie, variant.name
+                        )
+                    });
                     ctx.ab_test_selection = Some(crate::context::AbTestSelection {
                         variant_name: variant.name.clone(),
                         url: variant.url.clone(),
                         host,
                         port,
                         tls,
+                        sticky_cookie,
                     });
                     Ok(false)
                 }
@@ -2312,6 +2330,84 @@ mod plugin_action_tests {
             }))
             .expect("valid HTTPS relay fixture"),
         )
+    }
+
+    fn abtest_action(sticky_cookie: &str) -> Action {
+        Action::AbTest(
+            sbproxy_modules::action::AbTestAction::from_config(serde_json::json!({
+                "type": "abtest",
+                "sticky_cookie": sticky_cookie,
+                "variants": [
+                    { "name": "control", "url": "https://a.example.test", "weight": 1 },
+                ],
+            }))
+            .expect("valid abtest fixture"),
+        )
+    }
+
+    /// The pin has to be minted, not just read.
+    ///
+    /// `AbTestAction` reads `sticky_cookie` off the request and never
+    /// writes it, so until `handle_action` mints one a returning client
+    /// arrives with no cookie every time and takes a fresh weighted
+    /// roll. An A/B run would then measure a per-request coin flip
+    /// rather than a per-client assignment, which is the one thing the
+    /// feature claims to provide.
+    #[tokio::test]
+    async fn abtest_mints_a_sticky_pin_for_a_client_that_arrives_without_one() {
+        let pipeline = CompiledPipeline::empty_for_test();
+        let action = abtest_action("sb_ab_variant");
+
+        let (result, _wire, ctx) =
+            exchange_with_ctx(&action, &pipeline, None, DEFAULT_TEST_REQUEST, |_| {}).await;
+
+        assert!(
+            !result.expect("an abtest pick continues to upstream_peer"),
+            "the action selects and falls through rather than settling"
+        );
+        let selection = ctx
+            .ab_test_selection
+            .as_ref()
+            .expect("a variant was selected");
+        assert_eq!(selection.variant_name, "control");
+        let cookie = selection
+            .sticky_cookie
+            .as_deref()
+            .expect("a first visit must be handed a pin");
+        assert!(
+            cookie.starts_with("sb_ab_variant=control;"),
+            "the pin names the configured cookie and the selected variant: {cookie}"
+        );
+        // The pin is a routing hint, not a credential, but it is still
+        // set on the client, so it carries the same three flags every
+        // other cookie this proxy mints does.
+        for flag in ["Path=/", "SameSite=Lax", "HttpOnly"] {
+            assert!(cookie.contains(flag), "pin is missing {flag}: {cookie}");
+        }
+    }
+
+    /// And it must not be re-minted for a client that already carries
+    /// one, or every response would restamp a cookie the client already
+    /// has and the `Max-Age` window would never expire.
+    #[tokio::test]
+    async fn abtest_does_not_restamp_a_pin_the_client_already_carries() {
+        let pipeline = CompiledPipeline::empty_for_test();
+        let action = abtest_action("sb_ab_variant");
+
+        let raw = b"GET /ab HTTP/1.1\r\nHost: ab.test\r\ncookie: sb_ab_variant=control\r\n\r\n";
+        let (result, _wire, ctx) = exchange_with_ctx(&action, &pipeline, None, raw, |_| {}).await;
+
+        assert!(!result.expect("a pinned request still routes"));
+        let selection = ctx.ab_test_selection.as_ref().expect("a variant resolved");
+        assert_eq!(
+            selection.variant_name, "control",
+            "the pin decides, not a fresh roll"
+        );
+        assert!(
+            selection.sticky_cookie.is_none(),
+            "a client that already carries the pin must not be restamped: {:?}",
+            selection.sticky_cookie
+        );
     }
 
     #[tokio::test]

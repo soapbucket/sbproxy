@@ -3125,6 +3125,19 @@ origins:
 | `variants` | list | required, non-empty | Backend variants. Each entry is `name`, `url`, `weight`. |
 | `sticky_cookie` | string | `sb_ab_variant` | Cookie name used to pin a client to its assigned variant across requests. |
 
+A request that arrives without the cookie takes a weighted roll, and the
+response carries `Set-Cookie: <sticky_cookie>=<variant>; Path=/;
+Max-Age=2592000; SameSite=Lax; HttpOnly` so the next request from that
+client reaches the same variant. A request that already carries the
+cookie is routed by it and is not restamped, so the thirty-day window
+counts from the first visit rather than sliding forward on every
+request. The value is the variant name from your own config; nothing the
+caller sent is written into it.
+
+A cookie naming a variant that has since been removed from `variants`
+falls through to a fresh roll, so shrinking an experiment does not strand
+the clients pinned to the variant you dropped.
+
 A request carrying the sticky cookie with a value matching a configured
 variant's `name` always routes to that variant. Everything else gets a
 fresh weighted-random pick: a variant's share of traffic is its `weight`
