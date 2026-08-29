@@ -1291,18 +1291,22 @@ tree and locked here rather than carried at whichever number was true
 before the merge.
 
 2026-08-29 (WOR-2432/2455 closeout, merged with main at f8b547ff): recounted
-against the merged tree. Tests-only 324, which is a **rise of one against
-main** (main carries 323) and the number that needs justifying: it is the
-single item recorded above, `ConfigAuthority::rollback_to`. Unreferenced
-settled at 1523, level with main, after the confirmation round gave
-`FailedCandidate` a constructor and routed its five struct literals through
-it; that removed the last cross-file namer of its `reason` field, so the
-bucket lost one and the baseline is lowered to hold the ground rather than
-left at a number the tree no longer needs.
-Both numbers conflicted on this merge and neither side described the tree they
-make together: this branch carried 325/1525, main carried 323/1523, and the
-merged tree is one above main on each because this branch's own addition
-(`ConfigAuthority::rollback_to`, recorded above) is still in both buckets and
-main's own narrowings are not this branch's to claim. Nothing was narrowed to
-reach these figures; they are `scan-pub-item-usage.py --count` run against the
-merged tree, which is the only thing that describes it.
+against the merged tree with `scan-pub-item-usage.py --count`, which is the
+only thing that describes a tree neither parent describes. This branch carried
+325/1525 before the merge and main carries 323/1523.
+
+Tests-only 324. That is a **rise of one against main**, and it is the number
+that needs justifying: the one item is `ConfigAuthority::rollback_to`, for the
+reasons recorded above.
+
+Unreferenced 1523, **level with main**. An earlier version of this entry said
+the drop came from giving `FailedCandidate` a constructor. That was wrong, and
+the way it was wrong is worth keeping: the item left the bucket only because a
+comment added in `server/lifecycle.rs` happened to spell its name, and the
+scan is textual by design. Rewording that one comment put the count back to
+1524. A baseline resting on a sentence is not a baseline, so the three items
+involved (`FailedCandidate`, `BootWalkFailure`, `walk_for_bootable`) are now
+`pub(crate)`: `server::lifecycle` is their only consumer and always was, so
+they leave the scanner's universe for a reason the compiler enforces. The
+count is 1523 whether or not any comment names them, which was checked by
+rewording that comment again and re-running the scan.

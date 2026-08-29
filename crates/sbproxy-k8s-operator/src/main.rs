@@ -719,7 +719,7 @@ async fn reconcile_one_inner(
     // `reconcile_deployment_workload(&ctx,` and would stop seeing a
     // wrapped call.
     let pinned = suspension.as_ref();
-    let action = if clustered {
+    let pass = if clustered {
         reconcile_clustered_workload(&ctx, &sbproxy, &ns, &name, &hash, &pp, pinned).await?
     } else {
         reconcile_deployment_workload(&ctx, &sbproxy, &ns, &name, &hash, &pp, pinned).await?
@@ -731,9 +731,18 @@ async fn reconcile_one_inner(
     // `?`s above, so any failed apply leaves the previous values in place and
     // `observedConfigHash` ahead of `configHash` shows the rollout is stuck.
     patch_status(&ctx, &ns, &name, reconcile::rolled_out_status_patch(&hash)).await;
-    sbproxy_observe::metrics::record_operator_config_delivery("delivered");
+    // One count per pass, here and nowhere else. This line has counted
+    // every delivery since the metric was added, including the ones the
+    // hot-reload arms return early from, because those returns unwind
+    // into the `?` above rather than out of this function. Recording a
+    // second time down there made a clean hot reload count twice.
+    sbproxy_observe::metrics::record_operator_config_delivery(if pass.unowned_skipped == 0 {
+        "delivered"
+    } else {
+        "delivered_unowned_skipped"
+    });
 
-    Ok(action)
+    Ok(pass.action)
 }
 
 /// Non-clustered workload path: the original Deployment flow, plus
@@ -749,7 +758,7 @@ async fn reconcile_deployment_workload(
     hash: &str,
     pp: &PatchParams,
     suspension: Option<&reconcile::PodFallback>,
-) -> Result<Action, ReconcileError> {
+) -> Result<WorkloadPass, ReconcileError> {
     // The deletes below are the most destructive writes in the operator, so
     // the fence is re-checked here rather than trusted from the caller.
     require_write_gate(ctx, ns, name)?;
@@ -851,13 +860,7 @@ async fn reconcile_deployment_workload(
                     unowned_skipped = outcome.unowned_skipped,
                     "hot-reloaded every proxy pod this workload created via /admin/reload"
                 );
-                sbproxy_observe::metrics::record_operator_config_delivery(
-                    if outcome.unowned_skipped == 0 {
-                        "delivered"
-                    } else {
-                        "delivered_unowned_skipped"
-                    },
-                );
+
                 // Skip the Deployment patch entirely: the pod template's
                 // config-hash annotation is the rolling-restart trigger, so
                 // advancing it here would restart the pods a reload just
@@ -866,7 +869,10 @@ async fn reconcile_deployment_workload(
                 // what gate 4 above reads on the next pass. The ConfigMap is
                 // already up to date for any pod that restarts for unrelated
                 // reasons.
-                return Ok(Action::requeue(Duration::from_secs(300)));
+                return Ok(WorkloadPass {
+                    action: Action::requeue(Duration::from_secs(300)),
+                    unowned_skipped: outcome.unowned_skipped,
+                });
             }
             // `hot_reload_error`, not `e`: `HotReloadError::Request`
             // wraps a `reqwest::Error`, whose Display ends with the pod
@@ -890,7 +896,10 @@ async fn reconcile_deployment_workload(
         .map_err(ReconcileError::Apply)?;
 
     // Requeue periodically as a belt-and-braces against missed watch events.
-    Ok(Action::requeue(Duration::from_secs(300)))
+    Ok(WorkloadPass {
+        action: Action::requeue(Duration::from_secs(300)),
+        unowned_skipped: 0,
+    })
 }
 
 /// Clustered workload path: shared-key Secret, headless Service, and
@@ -908,7 +917,7 @@ async fn reconcile_clustered_workload(
     hash: &str,
     pp: &PatchParams,
     suspension: Option<&reconcile::PodFallback>,
-) -> Result<Action, ReconcileError> {
+) -> Result<WorkloadPass, ReconcileError> {
     require_write_gate(ctx, ns, name)?;
     require_config_push_allowed(suspension, ns, name)?;
 
@@ -1024,14 +1033,11 @@ async fn reconcile_clustered_workload(
                     "hot-reloaded every clustered proxy pod this workload created via \
                      /admin/reload"
                 );
-                sbproxy_observe::metrics::record_operator_config_delivery(
-                    if outcome.unowned_skipped == 0 {
-                        "delivered"
-                    } else {
-                        "delivered_unowned_skipped"
-                    },
-                );
-                return Ok(Action::requeue(Duration::from_secs(300)));
+
+                return Ok(WorkloadPass {
+                    action: Action::requeue(Duration::from_secs(300)),
+                    unowned_skipped: outcome.unowned_skipped,
+                });
             }
             // `hot_reload_error`, not `e`: `HotReloadError::Request`
             // wraps a `reqwest::Error`, whose Display ends with the pod
@@ -1053,7 +1059,10 @@ async fn reconcile_clustered_workload(
         .await
         .map_err(ReconcileError::Apply)?;
 
-    Ok(Action::requeue(Duration::from_secs(300)))
+    Ok(WorkloadPass {
+        action: Action::requeue(Duration::from_secs(300)),
+        unowned_skipped: 0,
+    })
 }
 
 /// The current time as an RFC 3339 timestamp, for a status condition.
@@ -1171,11 +1180,24 @@ async fn try_hot_reload(
     // it, and a fix on one of two paths is not the fix the release note
     // describes.
     //
-    // Over-filtering is safe here in a way it would not be elsewhere: a
-    // hot reload that reaches no pod returns `NoPodsFound`, and every
+    // What over-filtering costs depends on how much of the list it
+    // takes, and the two cases are not the same.
+    //
+    // Filter everything and this returns `NoPodsFound`; every
     // `HotReloadError` falls back to a rollout restart, which reloads
-    // the configuration by replacing the pods. The cost of being wrong
-    // is a restart, not a fleet left on a stale document.
+    // by replacing the pods, so the cost is a restart.
+    //
+    // Filter some and this returns `Ok`, the caller skips the workload
+    // patch on purpose, and the pods that were filtered keep the old
+    // configuration. That is deliberate rather than overlooked: a pod
+    // that fails this check was not created by the workload whose pod
+    // template a rollout would patch, so restarting cannot reach it,
+    // and erroring would restart every healthy owned pod on every
+    // config change while leaving that one exactly as stale. The count
+    // travels back on `HotReloadOutcome` so the pass is recorded as
+    // `delivered_unowned_skipped` rather than passing silently. The
+    // caller's comment at the `Ok` arm carries the same reasoning; if
+    // you change one, change both.
     let pods_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
     let sbp_name = sbproxy
         .metadata
@@ -1260,6 +1282,23 @@ async fn try_hot_reload(
 struct HotReloadOutcome {
     /// Pods carrying the instance label that this operator's workload
     /// did not create. Never reloaded and never sent the credential.
+    unowned_skipped: usize,
+}
+
+/// What one workload pass did, for the caller that records it.
+///
+/// `reconcile_one` counts the delivery exactly once, after the workload
+/// function returns, and it has counted it there since the metric was
+/// added. The label is the only thing the workload path knows and the
+/// caller does not, so it travels up rather than being recorded a second
+/// time down here: two call sites meant a clean hot reload counted
+/// `delivered` twice and a partial one counted both labels, so the
+/// series stopped counting passes.
+struct WorkloadPass {
+    /// What to tell the controller to do next.
+    action: Action,
+    /// Pods this pass could not reload because this operator's workload
+    /// did not create them. Zero on every path but a partial hot reload.
     unowned_skipped: usize,
 }
 
@@ -2178,6 +2217,51 @@ mod tests {
         );
     }
 
+    /// One delivery count per pass, pinned where it can be checked
+    /// without a metrics registry.
+    ///
+    /// `reconcile_one` has counted every pass at its single site since
+    /// the metric was added, including the hot-reload arms, whose early
+    /// `return` unwinds into the `?` there rather than out of the
+    /// function. A round that believed otherwise added a second call in
+    /// each workload function: a clean hot reload then counted
+    /// `delivered` twice and a partial one counted both labels, so the
+    /// series stopped counting passes. Nothing failed, because nothing
+    /// asserted a count.
+    ///
+    /// What this cannot see: whether the one call site is reachable, and
+    /// a call added to a helper the workload functions call. The driven
+    /// reconcile tests cover reachability; the helper case would need a
+    /// registry read, which this crate has no dependency for.
+    #[test]
+    fn the_delivery_metric_is_recorded_once_per_pass() {
+        let src = production_source();
+        assert_eq!(
+            src.matches("record_operator_config_delivery(").count(),
+            6,
+            "five refusal or suspension states plus the one success at the end of \
+             reconcile_one; a sixth call site needs a line here saying which pass it counts",
+        );
+        for name in [
+            "async fn reconcile_deployment_workload",
+            "async fn reconcile_clustered_workload",
+        ] {
+            let start = src
+                .find(name)
+                .expect("the workload function is in this file");
+            let rest = &src[start + name.len()..];
+            let end = rest.find("\nasync fn ").map_or(rest.len(), |at| at);
+            assert_eq!(
+                rest[..end]
+                    .matches("record_operator_config_delivery(")
+                    .count(),
+                0,
+                "{name} must not record a delivery: its caller already counts the pass, and \
+                 a call here is a second increment rather than a first",
+            );
+        }
+    }
+
     /// Drive `try_hot_reload` itself against a pod the operator did
     /// not create, and assert the credential never leaves.
     ///
@@ -2245,6 +2329,92 @@ mod tests {
             stub.requests(),
             0,
             "the admin credential must not be sent to a pod this operator did not create",
+        );
+    }
+
+    /// The mixed case, which the all-unowned test cannot reach: `owned`
+    /// is non-empty, so the loop actually runs and the filter has to
+    /// hold inside it.
+    ///
+    /// This is what catches iterating `pods.items` again after computing
+    /// `owned`, which the all-unowned fixture cannot see because it
+    /// returns `NoPodsFound` before the client is built. It is also the
+    /// only test of `unowned_skipped`, which is what picks the delivery
+    /// label.
+    #[tokio::test]
+    async fn a_partial_owner_filter_reloads_only_the_owned_pod_and_reports_the_rest() {
+        use tower::ServiceExt as _;
+
+        let stub = FallbackStub::start(r#"{"reloaded":true}"#);
+        let (sbp, _cfg) =
+            suspension_fixtures(i32::from(stub.port), "proxy:\n  http_bind_port: 8080\n");
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let path = request.uri().path().to_string();
+            async move {
+                let answer = if path.ends_with("/secrets/admin-auth") {
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Secret",
+                        "metadata": { "name": "admin-auth", "namespace": "sbproxy" },
+                        "data": { "authorization": "QmFzaWMgWVdSdGFXNDZjSGM9" },
+                    })
+                } else if path.ends_with("/pods") {
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "PodList",
+                        "metadata": {},
+                        "items": [
+                            {
+                                "apiVersion": "v1",
+                                "kind": "Pod",
+                                "metadata": {
+                                    "name": "edge-proxy-abc123-0",
+                                    "namespace": "sbproxy",
+                                    "ownerReferences": [{
+                                        "apiVersion": "apps/v1",
+                                        "kind": "ReplicaSet",
+                                        "name": "edge-proxy-abc123",
+                                        "uid": "rs-uid",
+                                        "controller": true,
+                                    }],
+                                },
+                                "status": { "podIP": "127.0.0.1" },
+                            },
+                            {
+                                "apiVersion": "v1",
+                                "kind": "Pod",
+                                "metadata": {
+                                    "name": "impostor-0",
+                                    "namespace": "sbproxy",
+                                    "ownerReferences": [],
+                                },
+                                "status": { "podIP": "127.0.0.1" },
+                            },
+                        ],
+                    })
+                } else {
+                    serde_json::json!({
+                        "metadata": { "name": "applied", "namespace": "sbproxy" },
+                    })
+                };
+                Ok::<_, std::convert::Infallible>(json_response(&answer))
+            }
+        });
+        let client = Client::new(service.boxed_clone(), "sbproxy");
+
+        let outcome = try_hot_reload(&client, &sbp, "sbproxy")
+            .await
+            .expect("the owned pod reloads, so this is a success");
+
+        assert_eq!(
+            outcome.unowned_skipped, 1,
+            "the impostor is reported so the caller can pick the delivery label",
+        );
+        assert_eq!(
+            stub.requests(),
+            1,
+            "exactly the owned pod was reloaded: iterating the unfiltered list would make \
+             this two, and that is the mutation the source counter cannot see",
         );
     }
 

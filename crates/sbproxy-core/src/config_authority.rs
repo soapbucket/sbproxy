@@ -1587,9 +1587,14 @@ fn dispatch_publish(method: &str, query: Option<&str>, body: Option<&str>) -> Ad
                     "code": error.code(),
                     // Whether the number is spent, computed from the
                     // variant rather than assumed. Every validation
-                    // failure costs nothing; a signing, store, or
-                    // internal failure happens after the reservation and
-                    // the number is never reissued.
+                    // failure costs nothing. `Signing` and `Internal`
+                    // are always past the reservation. The store is on
+                    // both sides of it: `Reserve` is the reservation's
+                    // own failure and costs nothing, `Store` is the
+                    // commit's and does not, and both answer
+                    // `store_failed` on the wire. That is the whole
+                    // reason this is computed rather than keyed on the
+                    // code.
                     "revision_consumed": error.consumed_revision(),
                 }),
             )

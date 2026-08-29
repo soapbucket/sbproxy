@@ -3120,12 +3120,18 @@ fn boot_document(
         Err(failure @ crate::config_boot::BootWalkFailure::RingEmpty)
         | Err(failure @ crate::config_boot::BootWalkFailure::StoreUnavailable(_)) => {
             Err(anyhow::anyhow!(
-                "{}: {failure}",
+                "{}: {}",
                 crate::config_boot::scrub_boot_failure(&format!("{primary:#}")),
+                // The failure half too, not only the primary. Both end
+                // up in the same `eprintln!("Fatal: ...")`, and
+                // `StoreUnavailable` carries an unbounded store-open
+                // string that the first argument's scrub does not reach.
+                crate::config_boot::scrub_boot_failure(&format!("{failure}")),
             ))
         }
-        // Already sanitized: every `FailedCandidate::reason` this
-        // renders went through the same function when it was built.
+        // Every `FailedCandidate::reason` this renders was sanitized
+        // when it was built, so this is bounded per candidate; the
+        // wrapper text around them is this crate's own.
         Err(failure) => Err(anyhow::anyhow!("{failure}")),
     }
 }
@@ -3231,7 +3237,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
 ///
 /// As [`run`]. Additionally, when the fallback walked the whole ring and
 /// nothing booted, the returned error is the one
-/// [`crate::config_boot::BootWalkFailure`] renders, naming every
+/// the crate-private `config_boot::BootWalkFailure` renders, naming every
 /// revision tried and why; the binary turns that into
 /// [`crate::config_boot::EXIT_CONFIG_RING_EXHAUSTED`] rather than the
 /// plain `1` every other fatal boot failure uses.

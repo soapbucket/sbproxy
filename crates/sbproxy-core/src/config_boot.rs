@@ -69,7 +69,7 @@ use sbproxy_config::{BootFallbackMode, ConfigHistoryConfig, RevisionStore};
 /// died, without parsing a log line.
 pub const EXIT_CONFIG_RING_EXHAUSTED: i32 = 78;
 
-/// The phrase [`BootWalkFailure::Exhausted`] renders, and the one
+/// The phrase the crate-private `BootWalkFailure::Exhausted` renders, and the one
 /// `crates/sbproxy/src/main.rs` matches on to choose
 /// [`EXIT_CONFIG_RING_EXHAUSTED`] over the plain `1`.
 ///
@@ -91,13 +91,24 @@ fn pinned() -> &'static Mutex<Option<PinnedRevision>> {
     PINNED.get_or_init(|| Mutex::new(None))
 }
 
-/// Longest stored fallback reason, in characters.
+/// Longest rendered boot failure, in characters.
 ///
-/// The reason is the compile failure the configured document produced,
-/// which the boot path already logs in full. Bounding the copy that
-/// reaches the admin surface keeps a pathological error (a parser that
-/// echoes a large document back) from turning a status route into a way
-/// to read the node's configuration a kilobyte at a time.
+/// The reason is the compile failure the configured document produced.
+/// Bounding it keeps a pathological error (a parser that echoes a large
+/// document back) from turning a status route into a way to read the
+/// node's configuration a kilobyte at a time.
+///
+/// This used to bound only the copy the admin surface serves, on the
+/// stated grounds that the boot path logged the failure in full
+/// somewhere. It no longer does: the bound moved into
+/// [`scrub_boot_failure`], which every rendering of a boot failure now
+/// goes through, so **no surface carries the untruncated text**. That is
+/// the deliberate trade and it is stated rather than left to be
+/// discovered: a failure longer than this is unrecoverable from the
+/// node's own output, and the remedy is `sbproxy validate` against the
+/// document, which prints the whole thing and is the tool for reading
+/// it. The alternative, one unbounded copy in the log, is the surface
+/// the bound exists to close.
 ///
 /// Characters rather than bytes, deliberately, because the cut has to
 /// land on a character boundary and a byte budget would have to walk
@@ -263,8 +274,15 @@ fn redact_secret_echo(reason: &str) -> String {
 }
 
 /// One candidate the walk tried and why it did not boot.
+///
+/// Crate-private, with [`BootWalkFailure`] and [`walk_for_bootable`],
+/// because `server::lifecycle` is the only consumer and always has
+/// been. They were `pub` by habit, which put them in the pub-item
+/// ratchet's unreferenced bucket, where the count came to rest on
+/// whether a comment in another file happened to spell the name. A
+/// visibility the compiler enforces is a better floor than a sentence.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FailedCandidate {
+pub(crate) struct FailedCandidate {
     /// Ring revision tried.
     pub revision: u64,
     /// Its content digest.
@@ -293,7 +311,7 @@ impl FailedCandidate {
 
 /// Why a fallback boot could not produce a document.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BootWalkFailure {
+pub(crate) enum BootWalkFailure {
     /// The ring held no candidate at all. A first boot: the node exits
     /// exactly the way `fallback: off` does, and says the ring was empty
     /// rather than pretending a fallback was attempted.
@@ -448,7 +466,7 @@ pub fn history_config_from_broken_document(yaml: &str) -> ConfigHistoryConfig {
 ///
 /// Returns [`BootWalkFailure`] when the ring cannot be opened, holds no
 /// candidate, or holds only candidates that do not boot.
-pub fn walk_for_bootable(
+pub(crate) fn walk_for_bootable(
     history: &ConfigHistoryConfig,
     max_attempts: u32,
     mut compiles: impl FnMut(&str) -> Result<(), String>,
@@ -1133,7 +1151,7 @@ mod tests {
         );
     }
 
-    /// G8: the same string, on the path that renders every candidate.
+    /// The same string, on the path that renders every candidate.
     ///
     /// `BootWalkFailure::Exhausted`'s `Display` writes each candidate's
     /// reason into the error that reaches `eprintln!("Fatal: ...")`, so
