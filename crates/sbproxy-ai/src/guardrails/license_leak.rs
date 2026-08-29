@@ -616,9 +616,14 @@ pub struct LicenseLeakGuardrailConfig {
     /// past the cap is not examined, so an oversize response can only
     /// be under-detected, never falsely blocked. Clamped to at least
     /// one substring shingle so a cap of `0` cannot silently disable
-    /// the guardrail. Defaults to 256 KiB; see
-    /// [`DEFAULT_MAX_SCAN_BYTES`] for why a byte cap and not only a
-    /// time budget.
+    /// the guardrail. Defaults to 256 KiB.
+    ///
+    /// Why a byte cap and not only a time budget: the detectors
+    /// allocate per character position and the scan is not preemptible,
+    /// so `max_eval_ms` is read only after the work is done and picks a
+    /// disposition rather than bounding anything. `DEFAULT_MAX_SCAN_BYTES`
+    /// in this module carries the full reasoning. (Named, not linked:
+    /// it is private, and a public item may not intra-doc link to one.)
     #[serde(default = "default_max_scan_bytes")]
     pub max_scan_bytes: usize,
     /// Licensed documents this guardrail instance protects. Empty by
