@@ -2030,6 +2030,64 @@ pub fn context_poisoning_blocked_value() -> f64 {
     AI_CONTEXT_POISONING_BLOCKED.get()
 }
 
+// --- License-leak guardrail metrics ---
+
+/// Per-mode, per-method counter of license-leak guardrail confident
+/// matches. Fires for every confident match regardless of `mode`
+/// (including `warn` and `log`, which never reach
+/// `sbproxy_ai_guardrail_blocks_total`), so a dashboard can see
+/// calibration volume before an operator flips a route from `warn` to
+/// `block`. `mode` and `method` are both closed, small enums
+/// (`LicenseLeakMode`, the detector's `DetectionMethod`), so
+/// cardinality is bounded regardless of caller input.
+/// Held as an `Option` rather than unwrapped: production code in this
+/// workspace may not add an unwrap or expect site, and
+/// `scripts/check-unwrap-ratchet.sh` counts them with a baseline that
+/// only falls. A guardrail that cannot register its counter still has
+/// a response to decide on.
+static AI_LICENSE_LEAK_FINDINGS: LazyLock<Option<CounterVec>> = LazyLock::new(|| {
+    match register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_license_leak_findings_total",
+            "License-leak guardrail confident matches by disposition and detector",
+        ),
+        &["mode", "method"]
+    ) {
+        Ok(metric) => Some(metric),
+        Err(error) => {
+            debug_assert!(
+                false,
+                "sbproxy_ai_license_leak_findings_total must register exactly once: {error}"
+            );
+            tracing::warn!(
+                metric = "sbproxy_ai_license_leak_findings_total",
+                %error,
+                "metric family did not register; its panel stays flat for this process"
+            );
+            None
+        }
+    }
+});
+
+/// Record one license-leak guardrail confident match. Blocking
+/// dispositions (`block`, `redact`) additionally call
+/// `record_guardrail_block("license_leak")` so they also appear on the
+/// existing "Guardrail Triggers by Type" panel.
+pub fn record_license_leak_finding(mode: &str, method: &str) {
+    if let Some(counter) = AI_LICENSE_LEAK_FINDINGS.as_ref() {
+        counter.with_label_values(&[mode, method]).inc();
+    }
+}
+
+/// Read the cumulative per-mode/method finding counter. Used in tests.
+#[cfg(test)]
+pub(crate) fn license_leak_finding_value(mode: &str, method: &str) -> f64 {
+    AI_LICENSE_LEAK_FINDINGS
+        .as_ref()
+        .map(|counter| counter.with_label_values(&[mode, method]).get())
+        .unwrap_or(0.0)
+}
+
 /// Record a cache result.
 pub fn record_cache_result(provider: &str, cache_type: &str, hit: bool) {
     let result = if hit { "hit" } else { "miss" };

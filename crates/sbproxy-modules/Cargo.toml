@@ -73,6 +73,12 @@ a2a = ["a2a-anthropic", "a2a-google"]
 payments = []
 payment-mpp = ["payments", "sbproxy-billing/mpp"]
 
+# Enables the `pdf_markdown` transform (PDF response bodies projected
+# to Markdown). Off by default: `pdf-extract` + `lopdf` together pull
+# roughly 70 transitive crates that most deployments never need. See
+# `transform/pdf_markdown.rs` module docs.
+transform-pdf = ["dep:pdf-extract", "dep:lopdf"]
+
 [dependencies]
 sbproxy-plugin.workspace = true
 # Unconditional: see the `payments` note above. With no payment feature
@@ -122,6 +128,8 @@ base64.workspace = true
 ring.workspace = true
 ipnetwork.workspace = true
 percent-encoding.workspace = true
+# WOR-2668: MMDB reader for the `geoip` policy.
+maxminddb.workspace = true
 regex.workspace = true
 minijinja.workspace = true
 pulldown-cmark.workspace = true
@@ -202,6 +210,27 @@ ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-
 tar = "0.4"
 flate2 = "1"
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
+
+# `transform-pdf` feature: PDF-to-Markdown transform. Both pure-Rust,
+# MIT-licensed. `pdf-extract` walks the content stream and decodes
+# glyphs (calling into `lopdf` internally for document-object
+# parsing); `lopdf` is also pulled directly so the transform can read
+# the `/Info /Title` trailer entry, which `pdf-extract` does not
+# expose. Optional: see the `transform-pdf` feature above for why.
+#
+# Both are floored at the first release that carries the fix for
+# RUSTSEC-2026-0187, not at the 0.38 line this was first written
+# against. That advisory is a stack overflow in `lopdf`'s object
+# parser: nested arrays and dictionaries recurse without bound, so a
+# ~21 KB PDF with a Catalog roughly 10,000 arrays deep exhausts the
+# call stack and aborts the process with SIGABRT. It is an abort
+# rather than a panic, so `catch_unwind` cannot contain it, and this
+# transform runs against upstream response bodies. lopdf 0.42 bounds
+# the nesting depth; pdf-extract 0.12 is the first release that
+# requires `lopdf ^0.42` rather than pinning a vulnerable line under
+# us.
+pdf-extract = { version = "0.12", optional = true }
+lopdf = { version = "0.42", default-features = false, optional = true }
 
 [dev-dependencies]
 # WOR-2298: reset_process_resolver_for_test, so aiproxy's fixture-resolver

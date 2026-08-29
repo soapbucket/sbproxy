@@ -4,7 +4,7 @@
 
 A transform edits a response body before it reaches the client. Reach for one when the shape an upstream returns is not the shape a caller needs: trimming fields from a JSON payload, converting HTML to Markdown for an LLM, capping a body size, or running a sandboxed script or WASM module over the bytes. Transforms never touch the request; for that, see the request modifier and forward-rule sections of [configuration.md](configuration.md).
 
-SBproxy ships 26 transform types plus `noop`. This page is the map: what a transform is, where it runs, the fields every transform shares, and a minimal working config for each kind. Full field references for the JSON/HTML/text transforms live inline below; the scripting, WASM, and agent-content transforms link out to their dedicated guides rather than duplicating them here.
+SBproxy ships 28 transform types plus `noop`. This page is the map: what a transform is, where it runs, the fields every transform shares, and a minimal working config for each kind. Full field references for the JSON/HTML/text transforms live inline below; the scripting, WASM, and agent-content transforms link out to their dedicated guides rather than duplicating them here.
 
 ## Where a transform runs
 
@@ -108,6 +108,28 @@ transforms:
 ```
 
 Verified against [`examples/transform-json-schema/sb.yml`](../examples/transform-json-schema/). A validation failure only produces a rejected response when `failure_posture` is `closed` (or the legacy `fail_on_error: true`); under the `open` default, a `static` action origin logs a warning and still serves the configured body unchanged.
+
+### `ai_schema` - AI structured-output enforcement
+
+A second schema-shaped transform, aimed specifically at AI provider responses rather than any JSON body. Where `json_schema` validates with the standard `jsonschema` crate under the pipeline's shared `failure_posture` axis, `ai_schema` carries its own small type/`required`/`properties`/`items` validator and its own `on_failure` mode with three values (`block`, `warn`, `passthrough`), so an operator can calibrate a new schema against live traffic in `warn` before promoting it to `block`.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `schema` | object | required | The schema document (a hand-rolled subset: `type`, `required`, `properties`, `items`, not full JSON Schema). |
+| `on_failure` | string | `block` | One of `block`, `warn`, `passthrough`. `block` refuses the response (an `Err`, subject to `failure_posture` like any other transform error); `warn` logs every violated path and forwards the response; `passthrough` forwards the response and says nothing. The set is closed: any other value is refused at config load, so a typo cannot quietly downgrade a blocking check to a no-op. |
+
+```yaml
+transforms:
+  - type: ai_schema
+    on_failure: warn
+    schema:
+      type: object
+      required: [choices]
+      properties:
+        choices: { type: array }
+```
+
+Verified against [`examples/ai-schema-enforcement/sb.yml`](../examples/ai-schema-enforcement/).
 
 ## Text, encoding, and format
 
@@ -291,6 +313,27 @@ transforms:
 ```
 
 Verified against [`examples/transform-html-to-markdown/sb.yml`](../examples/transform-html-to-markdown/). This is also the second step of the content-shaping chain covered in [content-for-agents.md](content-for-agents.md); the two uses are the same transform.
+
+### `pdf_markdown` - PDF to Markdown projection
+
+Replaces an `application/pdf` response body with a Markdown projection (the same [`MarkdownProjection`](#html_to_markdown---html-to-markdown-projection) shape `html_to_markdown` produces: `body`, `title`, `token_estimate`), so a downstream JSON envelope or `x-markdown-tokens` header sees the same shape regardless of which source format the origin served. A non-PDF response passes through untouched.
+
+Requires the `transform-pdf` cargo feature (off by default): `pdf-extract` and `lopdf`, the two pure-Rust decoders this transform uses, together pull roughly 70 transitive crates that most deployments never need. Build with `--features sbproxy-modules/transform-pdf` (or the equivalent feature on the `sbproxy` binary crate) to enable it; a route configured with `type: pdf_markdown` against a binary built without the feature fails config load with a message naming it.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_pages` | int | `50` | Hard cap on pages walked. Pages past this index are dropped; a `(... PDF truncated at N pages ...)` note is appended. |
+| `extract_text` | bool | `true` | Walk the content stream and emit page text. `false` produces an empty body with the title still resolved. |
+| `extract_tables` | bool | `false` | Reserved; table-layout reconstruction is not implemented. Setting `true` logs a warning and is otherwise a no-op. |
+| `token_bytes_ratio` | float | `0.25` | Bytes-per-token ratio for the `token_estimate` field, same default as `html_to_markdown`. |
+
+```yaml
+transforms:
+  - type: pdf_markdown
+    max_pages: 50
+```
+
+Title resolution order: the PDF's `/Info /Title` trailer entry, then the first heading-like line of the decoded body, then the literal `"Untitled PDF"`. A decode failure (a corrupted document, an unsupported font encoding, or a zero-byte body) is an `Err`, so it follows the same `failure_posture` handling as every other transform's error and never forwards the untransformed PDF bytes. Verified against [`examples/transform-pdf-markdown/sb.yml`](../examples/transform-pdf-markdown/).
 
 ### `markdown` - Markdown to HTML
 

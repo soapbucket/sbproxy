@@ -21,7 +21,7 @@ The rest of this page is the action, policy, and scripting catalogs inbound link
 
 ## 6. Reference: every action type
 
-An origin's `action:` decides what serves the request, and forward rules can pick a different action per matched rule. These fifteen types are the complete set the config compiler accepts, mirrored from its dispatch table; any other `type:` string is a linked plugin, an extension-bundle hook, or a config error. [architecture.md](architecture.md#3-request-pipeline) shows where dispatch happens in the pipeline; [request-flow.md](request-flow.md) walks everything around it.
+An origin's `action:` decides what serves the request, and forward rules can pick a different action per matched rule. These seventeen types are the complete set the config compiler accepts, mirrored from its dispatch table; any other `type:` string is a linked plugin, an extension-bundle hook, or a config error. [architecture.md](architecture.md#3-request-pipeline) shows where dispatch happens in the pipeline; [request-flow.md](request-flow.md) walks everything around it.
 
 * **`proxy`** reverse-proxies to a single upstream URL. It carries the classic knobs: base-path stripping, query preservation, `Host` and SNI overrides, forwarding-header controls, retries with backoff, DNS-based service discovery for upstreams whose IPs churn, and IP pinning for reaching a backend without traversing its public CDN entry. Docs: [routing.md](routing.md), [configuration.md](configuration.md).
 * **`load_balancer`** spreads traffic across a target pool: eight algorithms (round-robin, weighted random, least connections, IP/URI/header/cookie hash, and ketama-style `ring_hash`), five named custom strategies (`first-healthy`, `gpu-aware`, `lora`, `lora-aware`, `bandit`), three health layers (active probes, passive outlier ejection, per-target circuit breakers), and blue-green and canary deployment modes with backup targets and priority tiers. Docs: [routing.md](routing.md), [routing-strategies.md](routing-strategies.md).
@@ -38,15 +38,18 @@ An origin's `action:` decides what serves the request, and forward rules can pic
 * **`ai_proxy`** is the AI gateway in one action: the OpenAI-compatible surface, the provider catalog, model aliases, LLM-aware routing, guardrails, budgets, semantic caching, and local model hosting. [ai-gateway.md](ai-gateway.md) is the reference; [providers.md](providers.md) is the catalog.
 * **`mcp`** is the MCP gateway: federates real MCP servers, OpenAPI-derived tools, and config-defined local tools behind one endpoint, with RBAC, tool versioning, quotas, and content filters. [mcp.md](mcp.md) and [mcp-compose.md](mcp-compose.md) are the references. Cedar on `tools/call`: [cedar-policy.md](cedar-policy.md).
 * **`a2a`** proxies agent-to-agent JSON-RPC with envelope trust rules, delegation-depth caps, cycle detection, and caller and callee lists. Docs: [a2a-gateway.md](a2a-gateway.md).
+* **`abtest`** splits traffic across weighted backend variants for an A/B test. A first request takes a weighted roll and gets a sticky cookie back; every request after it that returns the cookie reaches the same variant. Docs: [configuration.md](configuration.md#abtest), example: [A/B Test Routing](../examples/ab-test-routing/).
+* **`https_proxy`** is a guarded TLS reverse-proxy relay to the request's resolved host rather than a URL fixed in config, allow-listed by `allowed_hosts`. It is not an HTTP CONNECT tunnel. The narrow case: a wildcard origin that wants to relay only a named subset of the hosts it would otherwise match. Docs: [configuration.md](configuration.md#https_proxy), example: [HTTPS Relay](../examples/https-forward-proxy/).
 
 ## 7. Reference: every policy type
 
-[policy.md](policy.md) is the catalog, with a one-line job description for each of the twenty-eight `policies:` types and a link to its full documentation. The names, grouped by the job you are hiring for:
+[policy.md](policy.md) is the catalog, with a one-line job description for each of the thirty `policies:` types and a link to its full documentation. The names, grouped by the job you are hiring for:
 
 * **Rate, volume, and budget:** `rate_limiting`, `rate_limit_budget`, `concurrent_limit`, `request_limit`, `ddos`, `ip_filter`, `agent_budget`.
 * **Identity and access:** `object_authz` (BOLA and BFLA enforcement, plus enumeration detection), `agent_class`, `a2a`, `csrf`, `security_headers`.
 * **Content, validation, and DLP:** `request_validator`, `openapi_validation`, `body_threat_protection`, `waf`, `http_framing`, `sri`, `content_digest`, `page_shield`, `dlp`, `exposed_credentials`.
 * **AI-specific:** `ai_crawl_control`, `prompt_injection_v2`, `semantic_constraint`.
+* **Enrichment:** `geoip`, `user_agent_parser`. Neither denies traffic; both annotate the request for downstream identity/anomaly hooks and, optionally, the upstream request. Docs: [request-enrichment.md](request-enrichment.md).
 * **Scripting-driven:** `expression` (CEL), `rego`, `assertion`.
 * **Packs:** `owasp_api_top10` is not a twenty-ninth type. The compiler expands it into entries from the groups above, backs off per item when you author the type yourself, and reports each of the ten items in a five-state manifest, including the ones it does not cover. Docs: [owasp-api-top10.md](owasp-api-top10.md).
 

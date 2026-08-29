@@ -258,6 +258,17 @@ fn every_oss_example_constructs_its_pipeline() {
             .and_then(Path::file_name)
             .is_some_and(|name| name == "ai-rag-local");
         let expect_missing_rag_feature = is_rag_example && !cfg!(feature = "rag");
+        // examples/transform-pdf-markdown's `pdf_markdown` transform lives
+        // behind `sbproxy-modules/transform-pdf` (forwarded here as this
+        // crate's own `transform-pdf` feature), off by default for the
+        // same "keep the heavy PDF-parsing dependency stack out of the
+        // default build" reason as RAG. Same shape as the RAG case above.
+        let is_pdf_markdown_example = file
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "transform-pdf-markdown");
+        let expect_missing_pdf_feature =
+            is_pdf_markdown_example && !cfg!(feature = "transform-pdf");
         match sbproxy_core::pipeline::CompiledPipeline::from_config_for_validation_at(
             compiled,
             file.parent()
@@ -270,6 +281,12 @@ fn every_oss_example_constructs_its_pipeline() {
                          \"rebuild with feature 'rag'\" rejection",
                         file.display()
                     ));
+                } else if expect_missing_pdf_feature {
+                    failures.push(format!(
+                        "{}: constructed without the `transform-pdf` feature; expected the \
+                         \"requires the `transform-pdf` cargo feature\" rejection",
+                        file.display()
+                    ));
                 }
             }
             Err(e) => {
@@ -277,6 +294,9 @@ fn every_oss_example_constructs_its_pipeline() {
                 if expect_missing_rag_feature && rendered.contains("rebuild with feature 'rag'") {
                     // Expected: the config is valid, this build just
                     // ships no RAG runtime.
+                } else if expect_missing_pdf_feature && rendered.contains("transform-pdf") {
+                    // Expected: the config is valid, this build just
+                    // ships no PDF decoder.
                 } else {
                     failures.push(format!(
                         "{}: pipeline construction: {}",

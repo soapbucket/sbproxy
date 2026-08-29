@@ -1232,6 +1232,126 @@ pub(super) async fn handle_action(
             Ok(true)
         }
 
+        // WOR-2671: traffic-split A/B testing. The variant is resolved
+        // once here (sticky cookie, else a fresh weighted roll) and
+        // carried on `ctx` for `upstream_peer` and
+        // `upstream_request_filter` to read, the same way a
+        // `load_balancer` action's target selection travels on
+        // `ctx.lb_attempt`.
+        Action::AbTest(ab) => {
+            let cookie_header = session
+                .req_header()
+                .headers
+                .get("cookie")
+                .and_then(|v| v.to_str().ok());
+            // Whether this client already carries a pin. Read before
+            // `resolve_variant` consumes the header, because it is the
+            // difference between honoring an assignment and minting one.
+            let already_pinned = ab.sticky_variant(cookie_header).is_some();
+            // `None` here is unreachable: `AbTestAction::from_config`
+            // refuses an empty `variants`, and `select_variant` returns
+            // `Some` for any non-empty list, including the
+            // all-zero-weight case, which falls back to the first entry.
+            //
+            // What used to sit here was a 502 and a `warn!` for that
+            // impossible case, which is an operator-facing error path a
+            // reader has to evaluate and rule out before concluding it
+            // can never fire. A `debug_assert` says the same thing to
+            // the person reading the code and to every test run, and
+            // release builds fall through to the ordinary proxy flow
+            // rather than inventing a status for a state that cannot
+            // occur.
+            let Some(variant) = ab.resolve_variant(cookie_header) else {
+                debug_assert!(
+                    false,
+                    "abtest variants are non-empty by construction; \
+                     AbTestAction::from_config refuses an empty list"
+                );
+                return Ok(false);
+            };
+            match ab.parse_variant_upstream(variant) {
+                Ok((host, port, tls)) => {
+                    debug!(
+                        hostname = %ctx.hostname,
+                        variant = %variant.name,
+                        upstream = %variant.url,
+                        "abtest: routing to variant"
+                    );
+                    sbproxy_observe::metrics::record_abtest_variant_selected(
+                        &ctx.hostname,
+                        &variant.name,
+                    );
+                    // Mint the pin on a first visit. Without this the
+                    // `sticky_cookie` config key would be read and never
+                    // written, so every request would take a fresh
+                    // weighted roll and an A/B run would measure a
+                    // per-request coin flip rather than a per-client
+                    // assignment. The value is the operator-declared
+                    // variant name, never anything the caller sent.
+                    let sticky_cookie = (!already_pinned).then(|| {
+                        format!(
+                            "{}={}; Path=/; Max-Age=2592000; SameSite=Lax; HttpOnly",
+                            ab.sticky_cookie, variant.name
+                        )
+                    });
+                    ctx.ab_test_selection = Some(crate::context::AbTestSelection {
+                        variant_name: variant.name.clone(),
+                        url: variant.url.clone(),
+                        host,
+                        port,
+                        tls,
+                        sticky_cookie,
+                    });
+                    Ok(false)
+                }
+                Err(e) => {
+                    warn!(
+                        hostname = %ctx.hostname,
+                        variant = %variant.name,
+                        error = %e,
+                        "abtest: variant upstream URL failed to parse"
+                    );
+                    send_error(session, 502, "abtest variant has an invalid upstream URL").await?;
+                    Ok(true)
+                }
+            }
+        }
+
+        // WOR-2671: allow-listed HTTPS reverse-proxy relay. See
+        // `sbproxy_modules::HttpsProxyAction`'s module doc for how this
+        // adapts the source's CONNECT-tunnel semantics to OSS's
+        // Host-header-driven reverse-proxy model: the destination is
+        // the request's own resolved hostname, not a configured URL, so
+        // an allowed request falls through to Pingora's normal proxy
+        // flow (`Ok(false)`) with no rewrite, and `upstream_peer` builds
+        // the peer straight from `ctx.hostname`.
+        Action::HttpsProxy(hp) => {
+            if hp.require_auth
+                && !matches!(
+                    ctx.auth_result,
+                    Some(sbproxy_plugin::AuthDecision::Allow { .. })
+                )
+            {
+                warn!(
+                    hostname = %ctx.hostname,
+                    "https_proxy: require_auth is set but no auth decision allowed this request"
+                );
+                sbproxy_observe::metrics::record_https_proxy_decision(&ctx.hostname, "deny");
+                send_error(session, 401, "https_proxy requires authentication").await?;
+                return Ok(true);
+            }
+            if hp.is_host_allowed(&ctx.hostname) {
+                debug!(hostname = %ctx.hostname, "https_proxy: host allowed, relaying");
+                sbproxy_observe::metrics::record_https_proxy_decision(&ctx.hostname, "allow");
+                Ok(false)
+            } else {
+                warn!(hostname = %ctx.hostname, "https_proxy: host not in allow-list");
+                sbproxy_observe::metrics::record_https_proxy_decision(&ctx.hostname, "deny");
+                send_error(session, 403, "host not permitted by https_proxy allow-list").await?;
+                Ok(true)
+            }
+        }
+
         Action::Plugin(handler) => {
             let request_header = session.req_header();
             let method = request_header.method.clone();
@@ -2207,6 +2327,171 @@ mod plugin_action_tests {
             before + 1,
             "the refused plugin outcome has to reach sbproxy_errors_total under its closed reason"
         );
+    }
+
+    fn https_proxy_action(
+        allowed_hosts: &[&str],
+        require_auth: bool,
+        connect_timeout_ms: u64,
+    ) -> Action {
+        Action::HttpsProxy(
+            sbproxy_modules::action::HttpsProxyAction::from_config(serde_json::json!({
+                "type": "https_proxy",
+                "allowed_hosts": allowed_hosts,
+                "require_auth": require_auth,
+                "connect_timeout_ms": connect_timeout_ms,
+            }))
+            .expect("valid HTTPS relay fixture"),
+        )
+    }
+
+    fn abtest_action(sticky_cookie: &str) -> Action {
+        Action::AbTest(
+            sbproxy_modules::action::AbTestAction::from_config(serde_json::json!({
+                "type": "abtest",
+                "sticky_cookie": sticky_cookie,
+                "variants": [
+                    { "name": "control", "url": "https://a.example.test", "weight": 1 },
+                ],
+            }))
+            .expect("valid abtest fixture"),
+        )
+    }
+
+    /// The pin has to be minted, not just read.
+    ///
+    /// `AbTestAction` reads `sticky_cookie` off the request and never
+    /// writes it, so until `handle_action` mints one a returning client
+    /// arrives with no cookie every time and takes a fresh weighted
+    /// roll. An A/B run would then measure a per-request coin flip
+    /// rather than a per-client assignment, which is the one thing the
+    /// feature claims to provide.
+    #[tokio::test]
+    async fn abtest_mints_a_sticky_pin_for_a_client_that_arrives_without_one() {
+        let pipeline = CompiledPipeline::empty_for_test();
+        let action = abtest_action("sb_ab_variant");
+
+        let (result, _wire, ctx) =
+            exchange_with_ctx(&action, &pipeline, None, DEFAULT_TEST_REQUEST, |_| {}).await;
+
+        assert!(
+            !result.expect("an abtest pick continues to upstream_peer"),
+            "the action selects and falls through rather than settling"
+        );
+        let selection = ctx
+            .ab_test_selection
+            .as_ref()
+            .expect("a variant was selected");
+        assert_eq!(selection.variant_name, "control");
+        let cookie = selection
+            .sticky_cookie
+            .as_deref()
+            .expect("a first visit must be handed a pin");
+        assert!(
+            cookie.starts_with("sb_ab_variant=control;"),
+            "the pin names the configured cookie and the selected variant: {cookie}"
+        );
+        // The pin is a routing hint, not a credential, but it is still
+        // set on the client, so it carries the same three flags every
+        // other cookie this proxy mints does.
+        for flag in ["Path=/", "SameSite=Lax", "HttpOnly"] {
+            assert!(cookie.contains(flag), "pin is missing {flag}: {cookie}");
+        }
+    }
+
+    /// And it must not be re-minted for a client that already carries
+    /// one, or every response would restamp a cookie the client already
+    /// has and the `Max-Age` window would never expire.
+    #[tokio::test]
+    async fn abtest_does_not_restamp_a_pin_the_client_already_carries() {
+        let pipeline = CompiledPipeline::empty_for_test();
+        let action = abtest_action("sb_ab_variant");
+
+        let raw = b"GET /ab HTTP/1.1\r\nHost: ab.test\r\ncookie: sb_ab_variant=control\r\n\r\n";
+        let (result, _wire, ctx) = exchange_with_ctx(&action, &pipeline, None, raw, |_| {}).await;
+
+        assert!(!result.expect("a pinned request still routes"));
+        let selection = ctx.ab_test_selection.as_ref().expect("a variant resolved");
+        assert_eq!(
+            selection.variant_name, "control",
+            "the pin decides, not a fresh roll"
+        );
+        assert!(
+            selection.sticky_cookie.is_none(),
+            "a client that already carries the pin must not be restamped: {:?}",
+            selection.sticky_cookie
+        );
+    }
+
+    #[tokio::test]
+    async fn https_proxy_runtime_allows_exact_and_wildcard_hosts() {
+        let pipeline = CompiledPipeline::empty_for_test();
+        let action = https_proxy_action(&["api.example.test", "*.svc.example.test"], false, 321);
+
+        for hostname in ["api.example.test", "worker.svc.example.test"] {
+            let (result, wire) =
+                exchange_with(&action, &pipeline, None, DEFAULT_TEST_REQUEST, |ctx| {
+                    ctx.hostname = hostname.into();
+                })
+                .await;
+            assert!(
+                !result.expect("allowed HTTPS relay must continue to upstream_peer"),
+                "{hostname} must pass the runtime allow-list"
+            );
+            assert!(
+                wire.is_empty(),
+                "allowed relay must not short-circuit: {wire:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn https_proxy_runtime_denies_unlisted_host() {
+        let pipeline = CompiledPipeline::empty_for_test();
+        let action = https_proxy_action(&["api.example.test"], false, 321);
+
+        let (result, wire) = exchange_with(&action, &pipeline, None, DEFAULT_TEST_REQUEST, |ctx| {
+            ctx.hostname = "blocked.example.test".into();
+        })
+        .await;
+
+        assert!(result.expect("deny response must dispatch"));
+        let response = String::from_utf8(wire).expect("HTTP response");
+        assert!(response.starts_with("HTTP/1.1 403"), "response: {response}");
+        assert!(response.contains("allow-list"), "response: {response}");
+    }
+
+    #[tokio::test]
+    async fn https_proxy_runtime_requires_a_prior_allow_decision() {
+        let pipeline = CompiledPipeline::empty_for_test();
+        let action = https_proxy_action(&["api.example.test"], true, 321);
+
+        let (denied, wire) = exchange_with(&action, &pipeline, None, DEFAULT_TEST_REQUEST, |ctx| {
+            ctx.hostname = "api.example.test".into();
+        })
+        .await;
+        assert!(denied.expect("auth refusal must dispatch"));
+        assert!(
+            String::from_utf8(wire)
+                .expect("HTTP response")
+                .starts_with("HTTP/1.1 401"),
+            "HTTPS relay must reject before allow-list continuation without auth"
+        );
+
+        let (allowed, wire) =
+            exchange_with(&action, &pipeline, None, DEFAULT_TEST_REQUEST, |ctx| {
+                ctx.hostname = "api.example.test".into();
+                ctx.auth_result = Some(sbproxy_plugin::AuthDecision::Allow {
+                    sub: Some("fixture-user".to_string()),
+                    source: None,
+                });
+            })
+            .await;
+        assert!(
+            !allowed.expect("authenticated HTTPS relay must continue"),
+            "prior auth allow must open the relay path"
+        );
+        assert!(wire.is_empty());
     }
 
     #[tokio::test]

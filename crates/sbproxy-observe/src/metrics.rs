@@ -5743,6 +5743,147 @@ pub fn record_script_reload(engine: &'static str, result: &'static str) {
     counter.with_label_values(&[engine, result]).inc();
 }
 
+// --- abtest / https_proxy action metrics (WOR-2671) -----------------------
+//
+// Both actions make a per-request decision an operator would want to
+// audit: which A/B variant a request landed on, and whether the
+// https_proxy relay let a host through. `origin` is the config-declared
+// hostname the action is attached to (bounded by the origin count), and
+// `variant` is a config-declared variant name (bounded by the abtest
+// action's `variants` list), so both are sanitised the same way
+// `record_rate_limit_decision`'s `policy` label is rather than budget
+// limited.
+
+/// Record an `abtest` action's variant pick on
+/// `sbproxy_action_abtest_variant_selected_total{origin, variant}`.
+/// Fires once per request that reaches the action, whether the variant
+/// came from the sticky cookie or a fresh weighted roll, so the ratio
+/// between variants over time reflects the configured weights (absent a
+/// skew in sticky-cookie return traffic).
+pub fn record_abtest_variant_selected(origin: &str, variant: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::LazyLock;
+    // `Option` rather than `expect`: production code in this workspace
+    // may not add an unwrap or expect site, and an A/B split that
+    // cannot register its counter still has a request to route.
+    static C: LazyLock<Option<IntCounterVec>> = LazyLock::new(|| {
+        match register_int_counter_vec!(
+            "sbproxy_action_abtest_variant_selected_total",
+            "abtest action variant selections, by origin and variant",
+            &["origin", "variant"],
+        ) {
+            Ok(metric) => Some(metric),
+            Err(error) => {
+                debug_assert!(
+                    false,
+                    "sbproxy_action_abtest_variant_selected_total must register once: {error}"
+                );
+                tracing::warn!(
+                    metric = "sbproxy_action_abtest_variant_selected_total",
+                    %error,
+                    "metric family did not register; its panel stays flat for this process"
+                );
+                None
+            }
+        }
+    });
+    let Some(counter) = C.as_ref() else {
+        return;
+    };
+    let origin = sanitize_label("origin", origin);
+    let variant = sanitize_label("variant", variant);
+    counter
+        .with_label_values(&[origin.as_str(), variant.as_str()])
+        .inc();
+}
+
+/// Record an `https_proxy` action's allow/deny decision on
+/// `sbproxy_action_https_proxy_decisions_total{origin, decision}`.
+/// `decision` is one of the closed strings `allow` or `deny`.
+pub fn record_https_proxy_decision(origin: &str, decision: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::LazyLock;
+    // Same reasoning as `record_abtest_variant_selected` above: the
+    // relay's allow/deny decision is made whether or not it is counted.
+    static C: LazyLock<Option<IntCounterVec>> = LazyLock::new(|| {
+        match register_int_counter_vec!(
+            "sbproxy_action_https_proxy_decisions_total",
+            "https_proxy action allow/deny decisions, by origin and decision",
+            &["origin", "decision"],
+        ) {
+            Ok(metric) => Some(metric),
+            Err(error) => {
+                debug_assert!(
+                    false,
+                    "sbproxy_action_https_proxy_decisions_total must register once: {error}"
+                );
+                tracing::warn!(
+                    metric = "sbproxy_action_https_proxy_decisions_total",
+                    %error,
+                    "metric family did not register; its panel stays flat for this process"
+                );
+                None
+            }
+        }
+    });
+    let Some(counter) = C.as_ref() else {
+        return;
+    };
+    let origin = sanitize_label("origin", origin);
+    counter
+        .with_label_values(&[origin.as_str(), decision])
+        .inc();
+}
+
+#[cfg(test)]
+mod abtest_https_proxy_metric_tests {
+    use super::*;
+
+    #[test]
+    fn abtest_variant_selected_increments_by_origin_and_variant() {
+        record_abtest_variant_selected("api.example.com", "control");
+        record_abtest_variant_selected("api.example.com", "control");
+        record_abtest_variant_selected("api.example.com", "experiment");
+
+        let families = prometheus::gather();
+        let family = families
+            .iter()
+            .find(|f| f.name() == "sbproxy_action_abtest_variant_selected_total")
+            .expect("family registered");
+        let control = family
+            .get_metric()
+            .iter()
+            .find(|m| {
+                m.get_label()
+                    .iter()
+                    .any(|l| l.name() == "variant" && l.value() == "control")
+            })
+            .expect("control variant series present");
+        assert!(control.get_counter().value() >= 2.0);
+    }
+
+    #[test]
+    fn https_proxy_decision_records_allow_and_deny() {
+        record_https_proxy_decision("relay.example.com", "allow");
+        record_https_proxy_decision("relay.example.com", "deny");
+
+        let families = prometheus::gather();
+        let family = families
+            .iter()
+            .find(|f| f.name() == "sbproxy_action_https_proxy_decisions_total")
+            .expect("family registered");
+        let decisions: Vec<&str> = family
+            .get_metric()
+            .iter()
+            .flat_map(|m| m.get_label())
+            .filter(|l| l.name() == "decision")
+            .map(|l| l.value())
+            .collect();
+        assert!(decisions.contains(&"allow"));
+        assert!(decisions.contains(&"deny"));
+    }
+}
+
 // --- rate-limit + idempotency metrics ------------------------------------
 //
 // The two request-shaping middlewares (rate_limit, idempotency) expose

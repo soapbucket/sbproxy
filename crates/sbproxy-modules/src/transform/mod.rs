@@ -8,6 +8,7 @@
 //! matching and error behavior.
 
 mod a2a_agent_card_rewrite;
+mod ai_schema;
 mod boilerplate;
 mod cel_script;
 mod citation_block;
@@ -16,11 +17,14 @@ mod json;
 mod json_envelope;
 pub mod llms_txt;
 mod markup;
+#[cfg(feature = "transform-pdf")]
+mod pdf_markdown;
 mod text;
 
 pub use a2a_agent_card_rewrite::{
     rewrite_card_urls, A2aAgentCardRewriteConfig, A2aAgentCardRewriter, DEFAULT_AGENT_CARD_PATHS,
 };
+pub use ai_schema::{AiSchemaConfig, AiSchemaTransform};
 pub use boilerplate::{BoilerplateConfig, BoilerplateTransform};
 pub use cel_script::{
     AgentClassView, CelHeaderMutation, CelHeaderOp, CelHeaderPhase, CelHeaderRule,
@@ -38,6 +42,8 @@ pub use markup::{
     CssTransform, HtmlToMarkdownTransform, HtmlTransform, MarkdownProjection, MarkdownTransform,
     OptimizeHtmlTransform, DEFAULT_TOKEN_BYTES_RATIO,
 };
+#[cfg(feature = "transform-pdf")]
+pub use pdf_markdown::{DecodeErrorKind, PdfConfig, PdfDecodeError, PdfToMarkdownTransform};
 pub use text::{
     EncodingTransform, FormatConvertTransform, NormalizeTransform, ReplaceStringsTransform,
     TemplateTransform,
@@ -100,6 +106,10 @@ pub enum Transform {
     JsonProjection(JsonProjectionTransform),
     /// Validate JSON against a schema.
     JsonSchema(JsonSchemaTransform),
+    /// Validate an AI provider's response body against an
+    /// operator-supplied JSON Schema, with a `block`/`warn`/passthrough
+    /// `on_failure` mode for calibrating a schema before enforcing it.
+    AiSchema(AiSchemaTransform),
     /// Render a template using response body as input data.
     Template(TemplateTransform),
     /// Find-and-replace strings (literal or regex) in the body.
@@ -124,6 +134,12 @@ pub enum Transform {
     HtmlToMarkdown(HtmlToMarkdownTransform),
     /// Convert Markdown to HTML.
     Markdown(MarkdownTransform),
+    /// Replace a `application/pdf` response body with a Markdown
+    /// projection. Requires the `transform-pdf` cargo feature; the
+    /// heavy PDF-parsing dependency stack stays out of the default
+    /// build.
+    #[cfg(feature = "transform-pdf")]
+    PdfMarkdown(PdfToMarkdownTransform),
     /// Manipulate CSS (inject rules, remove selectors, minify).
     Css(CssTransform),
     /// Lua-based raw-body transform. Calls a user-defined Lua function
@@ -193,6 +209,7 @@ impl Transform {
             Self::Json(_) => "json",
             Self::JsonProjection(_) => "json_projection",
             Self::JsonSchema(_) => "json_schema",
+            Self::AiSchema(_) => "ai_schema",
             Self::Template(_) => "template",
             Self::ReplaceStrings(_) => "replace_strings",
             Self::Normalize(_) => "normalize",
@@ -205,6 +222,8 @@ impl Transform {
             Self::OptimizeHtml(_) => "optimize_html",
             Self::HtmlToMarkdown(_) => "html_to_markdown",
             Self::Markdown(_) => "markdown",
+            #[cfg(feature = "transform-pdf")]
+            Self::PdfMarkdown(_) => "pdf_markdown",
             Self::Css(_) => "css",
             Self::Lua(_) => "lua",
             Self::LuaJson(_) => "lua_json",
@@ -264,6 +283,7 @@ impl Transform {
             Self::Json(_)
             | Self::JsonProjection(_)
             | Self::JsonSchema(_)
+            | Self::AiSchema(_)
             | Self::Template(_)
             | Self::ReplaceStrings(_)
             | Self::Normalize(_)
@@ -278,6 +298,8 @@ impl Transform {
             | Self::Css(_)
             | Self::Boilerplate(_)
             | Self::Noop => false,
+            #[cfg(feature = "transform-pdf")]
+            Self::PdfMarkdown(_) => false,
         }
     }
 
@@ -287,6 +309,7 @@ impl Transform {
             Self::Json(t) => t.apply(body),
             Self::JsonProjection(t) => t.apply(body),
             Self::JsonSchema(t) => t.apply(body),
+            Self::AiSchema(t) => t.apply(body),
             Self::Template(t) => t.apply(body),
             Self::ReplaceStrings(t) => t.apply(body),
             Self::Normalize(t) => t.apply(body),
@@ -299,6 +322,8 @@ impl Transform {
             Self::OptimizeHtml(t) => t.apply(body),
             Self::HtmlToMarkdown(t) => t.apply(body),
             Self::Markdown(t) => t.apply(body),
+            #[cfg(feature = "transform-pdf")]
+            Self::PdfMarkdown(t) => t.apply(body, content_type),
             Self::Css(t) => t.apply(body),
             Self::Lua(t) => t.apply(body),
             Self::LuaJson(t) => t.apply(body),
@@ -441,6 +466,7 @@ impl std::fmt::Debug for Transform {
             Self::Json(t) => f.debug_tuple("Json").field(t).finish(),
             Self::JsonProjection(t) => f.debug_tuple("JsonProjection").field(t).finish(),
             Self::JsonSchema(t) => f.debug_tuple("JsonSchema").field(t).finish(),
+            Self::AiSchema(t) => f.debug_tuple("AiSchema").field(t).finish(),
             Self::Template(t) => f.debug_tuple("Template").field(t).finish(),
             Self::ReplaceStrings(t) => f.debug_tuple("ReplaceStrings").field(t).finish(),
             Self::Normalize(t) => f.debug_tuple("Normalize").field(t).finish(),
@@ -453,6 +479,8 @@ impl std::fmt::Debug for Transform {
             Self::OptimizeHtml(t) => f.debug_tuple("OptimizeHtml").field(t).finish(),
             Self::HtmlToMarkdown(t) => f.debug_tuple("HtmlToMarkdown").field(t).finish(),
             Self::Markdown(t) => f.debug_tuple("Markdown").field(t).finish(),
+            #[cfg(feature = "transform-pdf")]
+            Self::PdfMarkdown(t) => f.debug_tuple("PdfMarkdown").field(t).finish(),
             Self::Css(t) => f.debug_tuple("Css").field(t).finish(),
             Self::Lua(t) => f.debug_tuple("Lua").field(t).finish(),
             Self::LuaJson(t) => f.debug_tuple("LuaJson").field(t).finish(),

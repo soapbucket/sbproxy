@@ -1259,6 +1259,14 @@ the second narrowed to a private const with its bound restated in prose, and
 the third is named by the suspension warn log in the operator's `main.rs`,
 which is the line an operator greps before reading the condition.
 
+2026-08-28 (WOR-2668 / WOR-2670 / WOR-2671): test-only 324 -> 323,
+unreferenced 1525 -> 1524. Wiring the new module types through
+sbproxy-core gave production callers to items the scanner had only seen
+used from tests, and reading AbTestSelection::sticky_cookie from
+response_filter gave a cross-file caller to a field that had none.
+Nothing was renamed and nothing was narrowed; both counts are locked so
+the ground is not handed back on the next branch.
+
 2026-08-29 (WOR-2421): unreferenced 1525 -> 1524. Parallel-input chain
 predicates and the session wait helper are cfg(test) rather than pub, so
 they leave this bucket and rustc polices them.
@@ -1273,3 +1281,22 @@ The re-review round added no `pub` item to either bucket: `consumed_revision`
 on both error types is private, because its only production caller is in the
 same file, and its per-variant test moved into that module rather than
 staying an integration test that would have forced it public.
+
+2026-08-29 (merge of main #1247 into WOR-2668 / WOR-2670 / WOR-2671):
+unreferenced 1524 -> 1523. Both sides of this merge emptied items out of
+this bucket independently, and each recorded 1525 -> 1524 against its own
+base, so the merged tree is one lower than either. Neither branch
+narrowed anything to get there; the count is re-derived from the merged
+tree and locked here rather than carried at whichever number was true
+before the merge.
+
+2026-08-29 (WOR-2432/2455 closeout, merged with main at f8b547ff): recounted
+against the merged tree, tests-only 325 -> 324 and unreferenced 1525 -> 1524.
+Both numbers conflicted on this merge and neither side described the tree they
+make together: this branch carried 325/1525, main carried 323/1523, and the
+merged tree is one above main on each because this branch's own addition
+(`ConfigAuthority::rollback_to`, recorded above) is still in both buckets and
+main's own narrowings are not this branch's to claim. Nothing was narrowed to
+reach these figures; they are `scan-pub-item-usage.py --count` run against the
+merged tree, which is the only thing that describes it.
+

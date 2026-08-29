@@ -22,11 +22,11 @@ use super::AgentClassEnforcer;
 use super::{
     A2AEnforcer, AgentBudgetEnforcer, AiCrawlEnforcer, AssertionEnforcer,
     BodyThreatProtectionEnforcer, ConcurrentLimitEnforcer, ContentDigestEnforcer, CsrfEnforcer,
-    DdosEnforcer, DlpEnforcer, ExposedCredsEnforcer, ExpressionEnforcer, HttpFramingEnforcer,
-    IpFilterEnforcer, ObjectAuthzEnforcer, OpenApiValidationEnforcer, PageShieldEnforcer,
-    PromptInjectionV2Enforcer, RateLimitBudgetEnforcer, RateLimitEnforcer, RequestLimitEnforcer,
-    RequestValidatorEnforcer, SecHeadersEnforcer, SemanticConstraintEnforcer, SriEnforcer,
-    WafEnforcer,
+    DdosEnforcer, DlpEnforcer, ExposedCredsEnforcer, ExpressionEnforcer, GeoIpEnforcer,
+    HttpFramingEnforcer, IpFilterEnforcer, ObjectAuthzEnforcer, OpenApiValidationEnforcer,
+    PageShieldEnforcer, PromptInjectionV2Enforcer, RateLimitBudgetEnforcer, RateLimitEnforcer,
+    RequestLimitEnforcer, RequestValidatorEnforcer, SecHeadersEnforcer, SemanticConstraintEnforcer,
+    SriEnforcer, UserAgentEnforcer, WafEnforcer,
 };
 
 /// One compiled policy ready for request-phase dispatch.
@@ -191,6 +191,8 @@ fn compile_one(policy: Policy, metric_policy: &str) -> anyhow::Result<CompiledEn
                 shared_admission,
             }
         }
+        Policy::GeoIp(p) => builtin(GeoIpEnforcer(Arc::new(p))),
+        Policy::UserAgent(p) => builtin(UserAgentEnforcer(Arc::new(p))),
         Policy::Plugin(plugin) => {
             let (enforcer, dynamic_hook) = plugin.into_parts();
             // A linked Rust plugin and a config-loaded bundle both land

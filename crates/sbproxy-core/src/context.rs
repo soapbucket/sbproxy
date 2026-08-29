@@ -341,6 +341,39 @@ pub struct DeferredAuthPending {
     pub allow_reason: &'static str,
 }
 
+/// The `abtest` action's per-request variant pick (WOR-2671), resolved
+/// once in `handle_action` (from the sticky cookie or a fresh weighted
+/// roll) and read again in `upstream_peer` and
+/// `upstream_request_filter`, mirroring how `lb_attempt` carries a
+/// `load_balancer` action's target selection across the same phases.
+#[derive(Debug, Clone)]
+pub struct AbTestSelection {
+    /// The selected variant's `name`, for logging and the
+    /// `variant` metric label.
+    pub variant_name: String,
+    /// The selected variant's configured backend URL, unparsed (used
+    /// for the default upstream `Host` header, the same way
+    /// `ProxyAction::url` is).
+    pub url: String,
+    /// Parsed upstream host, from
+    /// [`sbproxy_modules::action::AbTestAction::parse_variant_upstream`].
+    pub host: String,
+    /// Parsed upstream port.
+    pub port: u16,
+    /// Whether the upstream connection uses TLS.
+    pub tls: bool,
+    /// The `Set-Cookie` value that pins this client to `variant_name`
+    /// on its next request, or `None` when the request already carried
+    /// a usable sticky cookie and nothing needs re-stamping.
+    ///
+    /// Built in `handle_action` rather than in `response_filter`
+    /// because the cookie's name comes from the action's config, which
+    /// the response phase no longer has in hand. The same shape
+    /// `ctx.csrf_cookie` uses: the request phase decides, the response
+    /// phase only appends.
+    pub sticky_cookie: Option<String>,
+}
+
 /// Per-request state threaded through all Pingora phases as CTX.
 pub struct RequestContext {
     // --- Identity ---
@@ -872,6 +905,10 @@ pub struct RequestContext {
     // --- Forward rule state ---
     /// If a forward rule matched, this holds the index into the origin's forward_rules vec.
     pub forward_rule_idx: Option<usize>,
+    /// The `abtest` action's resolved variant for this request, set by
+    /// `handle_action` and read by `upstream_peer` and
+    /// `upstream_request_filter`. `None` for every other action type.
+    pub ab_test_selection: Option<AbTestSelection>,
     /// Path parameters captured by the matched forward rule's `template` or
     /// `regex` matcher. `None` when no forward rule matched, or the rule
     /// matched via `prefix`/`exact` (which capture nothing). Available to
@@ -1698,6 +1735,22 @@ pub struct RequestContext {
     /// confidence in `[0.0, 1.0]`.
     pub headless_signal: Option<HeadlessSignal>,
 
+    // --- WOR-2668 GeoIP + User-Agent enrichment ---
+    //
+    // Populated by the `geoip` / `user_agent_parser` builtin
+    // enforcers (`builtin_enforcers::geoip`,
+    // `builtin_enforcers::user_agent`) when an origin configures
+    // them. `None` when the policy is not configured for this
+    // origin. Read back into `sbproxy_plugin::RequestContextView`
+    // for `AnomalyDetectorHook` / `IdentityResolverHook` consumers in
+    // `server::proxy_http`.
+    /// GeoIP lookup result for the resolved client IP, if the
+    /// `geoip` policy ran for this origin.
+    pub geo_lookup: Option<sbproxy_modules::GeoLookup>,
+    /// Parsed `User-Agent` header, if the `user_agent_parser` policy
+    /// ran for this origin.
+    pub parsed_user_agent: Option<sbproxy_modules::ParsedUserAgent>,
+
     // --- Wave 7 / A7.2 A2A protocol envelope ---
     //
     // Populated once in `request_filter` by [`sbproxy_modules::detect_a2a`]
@@ -2048,6 +2101,7 @@ impl RequestContext {
             rsl_inject_link_buf: None,
             rsl_inject_link_emitted: false,
             forward_rule_idx: None,
+            ab_test_selection: None,
             path_params: None,
             ai_upstream_cancelled_on_client_disconnect: false,
             fallback_triggered: false,
@@ -2185,6 +2239,8 @@ impl RequestContext {
             tls_fingerprint: None,
             agent_detection: None,
             headless_signal: None,
+            geo_lookup: None,
+            parsed_user_agent: None,
             a2a: None,
             a2a_denial_body: None,
             deny_payload: None,

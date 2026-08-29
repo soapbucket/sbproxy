@@ -55,7 +55,7 @@ Everything in this repository ships under Apache-2.0:
 * The AI gateway: 70 native providers, routing strategies, guardrails, budgets, streaming, semantic cache, virtual keys.
 * Every auth provider (API key, Basic, Bearer, JWT, Digest, forward-auth, Web Bot Auth, CAP, OIDC).
 * Every policy (rate limit, WAF, IP filter, CORS, HSTS, CSRF, agent budget, content digest, BOLA / `object_authz`, ...).
-* Every transform (26 types, including `json`, `template`, `wasm`).
+* Every transform (28 types, including `json`, `template`, `wasm`).
 * Scripting via CEL, Lua, JavaScript, and WebAssembly.
 * The embedded admin server, the access log, the metrics and tracing wiring, the audit log.
 * All examples and dashboards.

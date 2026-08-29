@@ -319,6 +319,8 @@ Every family below is emitted by running code. That is worth stating because it 
 | `sbproxy_requests_total` | 50 000 | Labels: `hostname`, `method`, `status`, `agent_id`, `agent_class`, `agent_vendor`, `payment_rail`, `content_shape`. `agent_id` is the sanitized registry id, never a raw UA-derived value. There is deliberately no `tenant_id` here. This is the substrate traffic counter, it already carries eight dimensions, and a ninth multiplies its series count by the number of tenants a config declares. Per-tenant request attribution is on `sbproxy_inbound_key_requests_total` instead, which carries `tenant_id` and is written from the same point in the response path, so the two counters are directly comparable. |
 | `sbproxy_request_duration_seconds_bucket` | 100 000 | Labeled by `hostname`, plus buckets. |
 | `sbproxy_policy_triggers_total` | 20 000 | Labels: `origin`, `policy_type`, `action`, `agent_id`, `agent_class`. |
+| `sbproxy_action_abtest_variant_selected_total` | 500 | Labels: `origin`, `variant` (both sanitized). Bounded by origin count times variants configured per `abtest` action. |
+| `sbproxy_action_https_proxy_decisions_total` | 400 | Labels: `origin` (sanitized), `decision` (`allow`\|`deny`). Bounded by origin count times two. |
 | `sbproxy_ledger_redeem_duration_seconds_bucket` | 10 000 | Labels: `host`, `outcome`, plus buckets. There is no separate `_total` counter; derive counts from the histogram's `_count` series. |
 | `sbproxy_outbound_request_duration_seconds_bucket` | 30 000 | Labels: `host`, `method`, `status`, plus buckets. There is no separate `_total` counter. |
 | `sbproxy_audit_emit_duration_seconds_bucket` | 5 000 | Labels: `channel`, `outcome`, plus buckets. There is no separate `_total` counter. |
