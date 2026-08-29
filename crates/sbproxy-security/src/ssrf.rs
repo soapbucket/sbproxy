@@ -31,7 +31,7 @@
 //!
 //! This list exists so a reviewer auditing the contract above can walk
 //! every path that needs dial-time re-validation without grepping.
-//! Twelve call sites across the workspace, split by whether the caller
+//! Thirteen call sites across the workspace, split by whether the caller
 //! actually pins what it validated.
 //!
 //! Pinned: the caller takes the [`SocketAddr`]s back and dials those.
@@ -61,6 +61,10 @@
 //!   endpoints. Operator-configured except for the `jwks_uri` taken
 //!   from a fetched authorization-server metadata document, which is
 //!   remote-controlled. Pins the same way.
+//! - `sbproxy-modules::action::mcp`, `approval.webhook`: compile-time
+//!   `validate_url_resolved`, then the dispatcher pins the POST with
+//!   `resolve_to_addrs` so a later DNS rebind cannot retarget the hold
+//!   body.
 //!
 //! Not pinned. Each is defensible for its own reason, and each is a
 //! place the rebinding window is still open:
