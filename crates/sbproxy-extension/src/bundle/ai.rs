@@ -552,7 +552,9 @@ impl AiExtensionSession {
 
     /// Take the in-flight parallel input task so the provider path can race it.
     ///
-    /// The caller owns cancellation: dropping the handle aborts the hook.
+    /// Tokio's [`tokio::task::JoinHandle`] does not abort on drop. The caller must
+    /// abort the task (or wrap the handle so drop does) or the inspect
+    /// work keeps the prompt-bearing event until sandbox budget.
     #[must_use]
     pub fn take_parallel_task(
         &mut self,

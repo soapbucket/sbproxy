@@ -15549,6 +15549,24 @@ async fn refuse_if_parallel_input_blocks(
     }
 }
 
+#[cfg(test)]
+mod parallel_input_join_sites {
+    #[test]
+    fn refuse_if_parallel_input_blocks_is_called_from_every_non_race_short_circuit() {
+        let src = include_str!("ai_dispatch.rs");
+        let replay = src
+            .find("AiIdempotencyEngagement::Replayed { response } => {\n            if refuse_if_parallel_input_blocks")
+            .expect("idempotency replay in handle_ai_proxy must join parallel input");
+        let hit = src
+            .find("SemanticLookupOutcome::Hit(hit)) => {\n                            if refuse_if_parallel_input_blocks(")
+            .expect("semantic-cache hit in handle_ai_proxy must join parallel input");
+        let race = src
+            .find("if race_mode\n        && refuse_if_parallel_input_blocks")
+            .expect("raced fan-out in handle_ai_proxy must join parallel input");
+        assert!(replay < hit && hit < race);
+    }
+}
+
 async fn send_ai_extension_block_response(
     session: &mut Session,
     ctx: &mut RequestContext,
@@ -27680,6 +27698,128 @@ origins:
             upstream_hits.load(Ordering::SeqCst),
             1,
             "parallel input must start the upstream call before refusing"
+        );
+    }
+
+    #[tokio::test]
+    async fn bundled_parallel_input_blocks_an_idempotency_replay() {
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"choices":[]}"#).await;
+        let config = openai_proxy_config(&upstream_url);
+        let request = serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        });
+        let native_request = serde_json::to_vec(&request).expect("request JSON");
+        let request_hash = sbproxy_middleware::idempotency::hash_body(&native_request);
+        let (mut session, client) = downstream_session(request).await;
+        let mut context = crate::context::RequestContext::new();
+        let (_directory, extension_pipeline) = pipeline_with_ai_javascript(
+            "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: parallel-idempotency\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nhooks:\n  - kind: ai_guardrail_input\n    type: inspect_input\n    export: inspect\n    execution:\n      mode: parallel\n",
+            r#"export function inspect() { return {version:"sbproxy-envelope/v1",decision:"block",status:451,code:"fixture_parallel",message:"parallel refused"}; }"#,
+        );
+        let (mut pipeline, _, idempotency) = pipeline_with_recording_caches().await;
+        pipeline.ai_extension_chain = extension_pipeline.ai_extension_chain;
+        *idempotency.hit.lock().expect("idempotency hit lock") =
+            Some(sbproxy_middleware::idempotency::CachedResponse {
+                status: 200,
+                headers: vec![("content-type".to_string(), "application/json".to_string())],
+                body: canonical_chat_response("idempotency replay"),
+                request_body_hash: request_hash,
+                expires_at_unix: u64::MAX,
+            });
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("parallel refusal of an idempotency replay is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response UTF-8");
+        assert!(response.starts_with("HTTP/1.1 451"), "{response}");
+        assert!(response.contains("fixture_parallel"), "{response}");
+        assert!(!response.contains("idempotency replay"), "{response}");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn bundled_parallel_input_blocks_raced_fan_out_before_any_leg_starts() {
+        let (upstream_a, hits_a) = slow_upstream_fixture(
+            canonical_chat_response("should-not-reach-the-client"),
+            Duration::from_millis(800),
+        )
+        .await;
+        let (upstream_b, hits_b) = slow_upstream_fixture(
+            canonical_chat_response("should-not-reach-the-client"),
+            Duration::from_millis(800),
+        )
+        .await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {
+                    "name": "openai-a",
+                    "provider_type": "openai",
+                    "base_url": upstream_a,
+                    "allow_private_base_url": true,
+                    "api_key": "fixture-key"
+                },
+                {
+                    "name": "openai-b",
+                    "provider_type": "openai",
+                    "base_url": upstream_b,
+                    "allow_private_base_url": true,
+                    "api_key": "fixture-key"
+                }
+            ],
+            "routing": {"strategy": "race"}
+        }))
+        .expect("raced OpenAI proxy config");
+        let (_directory, pipeline) = pipeline_with_ai_javascript(
+            "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: parallel-race\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nhooks:\n  - kind: ai_guardrail_input\n    type: inspect_input\n    export: inspect\n    execution:\n      mode: parallel\n",
+            r#"export function inspect() { return {version:"sbproxy-envelope/v1",decision:"block",status:451,code:"fixture_parallel",message:"parallel refused"}; }"#,
+        );
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("parallel refusal of raced fan-out is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response UTF-8");
+        assert!(response.starts_with("HTTP/1.1 451"), "{response}");
+        assert!(response.contains("fixture_parallel"), "{response}");
+        assert!(
+            !response.contains("should-not-reach-the-client"),
+            "{response}"
+        );
+        assert_eq!(
+            hits_a.load(Ordering::SeqCst),
+            0,
+            "raced fan-out must wait for parallel input before dialing"
+        );
+        assert_eq!(
+            hits_b.load(Ordering::SeqCst),
+            0,
+            "raced fan-out must wait for parallel input before dialing"
         );
     }
 

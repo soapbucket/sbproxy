@@ -1,6 +1,8 @@
 //! Request-local adaptation between the AI hub and extension events.
 
 use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use sbproxy_ai::format::{ContentPartDelta, FinishReason, HubChunk};
 use sbproxy_ai::guardrails::stream::CompletedToolCall;
@@ -245,6 +247,7 @@ impl AiRequestExtensions {
         let Some(task) = self.session.take_parallel_task() else {
             return ParallelModerationRace::Attempt(attempt.await);
         };
+        let task = AbortOnDropJoinHandle::new(task);
         tokio::pin!(attempt);
         tokio::pin!(task);
         tokio::select! {
@@ -274,7 +277,7 @@ impl AiRequestExtensions {
         let Some(task) = self.session.take_parallel_task() else {
             return Ok(());
         };
-        join_parallel_task(task).await
+        join_parallel_task(AbortOnDropJoinHandle::new(task)).await
     }
 
     /// Returns the canonical output text a hook rewrote, or `None`
@@ -661,9 +664,55 @@ fn join_parallel_result(
 }
 
 async fn join_parallel_task(
-    task: tokio::task::JoinHandle<sbproxy_plugin::PluginResult<AiChainVerdict>>,
+    task: impl Future<
+        Output = Result<sbproxy_plugin::PluginResult<AiChainVerdict>, tokio::task::JoinError>,
+    >,
 ) -> Result<(), AiExtensionBlock> {
     join_parallel_result(task.await)
+}
+
+/// Join handle that aborts the spawned task when dropped.
+///
+/// Tokio's [`tokio::task::JoinHandle`] does not abort on drop. Parallel
+/// inspect tasks hold the prompt-bearing event; dropping the provider
+/// race (client disconnect, early return) must cancel that work rather
+/// than leave it running until sandbox budget.
+struct AbortOnDropJoinHandle<T> {
+    inner: Option<tokio::task::JoinHandle<T>>,
+}
+
+impl<T> AbortOnDropJoinHandle<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self {
+            inner: Some(handle),
+        }
+    }
+}
+
+impl<T> Drop for AbortOnDropJoinHandle<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.inner.take() {
+            handle.abort();
+        }
+    }
+}
+
+impl<T> Future for AbortOnDropJoinHandle<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let inner = match self.inner.as_mut() {
+            Some(inner) => inner,
+            None => return Poll::Pending,
+        };
+        match Pin::new(inner).poll(cx) {
+            Poll::Ready(result) => {
+                self.inner.take();
+                Poll::Ready(result)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 pub(crate) async fn race_provider_attempt_optional<T>(
@@ -1064,6 +1113,20 @@ mod tests {
                 panic!("parallel block must refuse the attempt")
             }
         }
+    }
+
+    #[tokio::test]
+    async fn dropping_an_abort_on_drop_join_handle_cancels_the_spawned_task() {
+        let (hold, held) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            let _hold = hold;
+            std::future::pending::<()>().await
+        });
+        drop(super::AbortOnDropJoinHandle::new(handle));
+        assert!(
+            held.await.is_err(),
+            "abort-on-drop must cancel the spawned task so its captured state is released"
+        );
     }
 
     #[tokio::test]
