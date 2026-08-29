@@ -511,6 +511,20 @@ batch_log_url_ratchet() {
   bash "$ROOT/scripts/check-log-url-ratchet.sh"
 }
 
+# CI: ci.yml test lane, "the AI dispatch path's stack budget only
+# falls" (WOR-2699). The fourth ratchet of the same family and the same
+# shape: one integer in one file, compared against the merge base.
+#
+# The budget is the worker stack that
+# `the_ai_dispatch_path_stays_inside_its_stack_budget` runs a real
+# dispatch on. The test enforces the number; this enforces the
+# direction, which a test compiled against a raised baseline cannot. A
+# stack overflow does not unwind, carries no backtrace and names no
+# frame, so the only defence is a budget that keeps falling.
+batch_stack_budget_ratchet() {
+  bash "$ROOT/scripts/check-stack-budget-ratchet.sh"
+}
+
 # CI: ci.yml guards lane and docs-ci.yml, "spec citation hygiene".
 batch_spec_citations() {
   bash "$ROOT/scripts/check-spec-citations.sh"
@@ -608,6 +622,7 @@ run_batch "read-only source and doc scans" \
   batch_pub_item_ratchet "pub items whose only consumer is a test (ratchet)" \
   batch_unwrap_ratchet "unwrap/expect/panic in production code (ratchet)" \
   batch_log_url_ratchet "operator URLs at log lines (ratchet)" \
+  batch_stack_budget_ratchet "AI dispatch path stack budget (ratchet)" \
   batch_spec_citations "spec citation hygiene" \
   batch_env_mutation "no process-global env mutation outside test helpers" \
   batch_durable_file_modes "durable sinks create files owner-only" \
