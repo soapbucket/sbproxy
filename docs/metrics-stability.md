@@ -86,6 +86,8 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_agent_registry_operations_total` | Counter | `stable` | `beta` | `op`, `outcome` | Agent registry and registration-queue operations by operation and outcome, including every refusal the queue's state machine and the feed verifier produce. |
 | `sbproxy_acme_renewal_duration_seconds` | Histogram | `stable` | `beta` | `result` | ACME renewal full-flow duration, by outcome. |
 | `sbproxy_acme_renewals_total` | Counter | `stable` | `beta` | `result` | ACME certificate renewal attempts, by outcome. |
+| `sbproxy_action_abtest_variant_selected_total` | Counter | `stable` | `alpha` | `origin`, `variant` | abtest action variant selections, by origin and configured variant name. |
+| `sbproxy_action_https_proxy_decisions_total` | Counter | `stable` | `alpha` | `origin`, `decision` | https_proxy action allow/deny decisions, by origin and decision. |
 | `sbproxy_active_connections` | Gauge | `stable` | `stable` | none | Current active connections. |
 | `sbproxy_admin_request_export_rows_total` | Counter | `stable` | `beta` | `format` | Rows written by admin request-log exports, by format. |
 | `sbproxy_admin_request_exports_total` | Counter | `stable` | `beta` | `format` | Admin request-log exports served, by format. |
@@ -152,6 +154,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_classifier_tenants` | Gauge | `stable` | `beta` | none | Tenants currently registered with the rich classifier sidecar. |
 | `sbproxy_ai_key_fallbacks_total` | Counter | `stable` | `beta` | `provider`, `outcome` | AI provider-key fallback decisions, by the provider entry whose own key was refused and the outcome (`engaged` when the operator's `fallback_credential_id` resolved and the retry was queued, `unavailable` when it did not and the provider's rejection stands). `unavailable` is the alertable one: it means the house credential is broken and the only other evidence is a `401` that reads like the tenant's fault. |
 | `sbproxy_ai_lb_decisions_total` | Counter | `stable` | `beta` | `strategy`, `provider` | AI router provider selections by strategy. |
+| `sbproxy_ai_license_leak_findings_total` | Counter | `stable` | `beta` | `mode`, `method` | License-leak guardrail confident matches, by disposition and detector. |
 | `sbproxy_ai_model_group_selections_total` | Counter | `stable` | `alpha` | `group`, `provider` | Named model group member selections: which group a request addressed and which provider's deployment served it. Both labels are operator-declared config names. |
 | `sbproxy_ai_prefix_affinity_decisions_total` | Counter | `stable` | `beta` | `outcome` | Prefix-affinity selections by cache-location outcome. |
 | `sbproxy_ai_prefix_affinity_evictions_total` | Counter | `stable` | `beta` | `reason` | Entries evicted from the bounded prefix-affinity table. |
@@ -438,6 +441,8 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_target_health_state` | Gauge | `stable` | `beta` | `origin`, `target` | Per-target tri-state health on LiteLLM's 0/1/2 scale: 0 healthy, 1 degraded (circuit breaker half-open), 2 excluded from selection (probe-unhealthy, outlier-ejected, or breaker open). Sampled at scrape time from the same pipeline walk that renders GET /api/health/targets. `origin` is the configured origin id, not the request Host. `target` is the configured target URL, or the load balancer's own url#index identifier when one origin configures that URL more than once. |
 | `sbproxy_telemetry_dropped_total` | Counter | `stable` | `beta` | `kind`, `reason` | Telemetry records dropped or sinks that failed to set up, by kind and reason. |
 | `sbproxy_tokens_attributed_total` | Counter | `stable` | `beta` | `project`, `user`, `tag`, `direction` | AI token usage attributed to a credential's project / user / tag. |
+| `sbproxy_transform_pdf_decode_errors_total` | Counter | `stable` | `alpha` | `origin`, `error_kind` | pdf_markdown transform decode failures, by origin and error kind. Requires the transform-pdf cargo feature. |
+| `sbproxy_transform_pdf_pages_decoded_total` | Counter | `stable` | `alpha` | `origin` | Pages successfully decoded by the pdf_markdown transform. Requires the transform-pdf cargo feature. |
 | `sbproxy_transport_duration_seconds` | Histogram | `config_only` (nothing emits this yet) | `alpha` | `protocol`, `result` | Transport-layer request duration, by protocol and outcome. |
 | `sbproxy_transport_requests_total` | Counter | `config_only` (nothing emits this yet) | `alpha` | `protocol`, `result` | Transport-layer requests, by protocol and outcome. |
 | `sbproxy_trust_tier_requests_total` | Counter | `stable` | `beta` | `tier` | Requests partitioned by the conservative trust-tier decision. |

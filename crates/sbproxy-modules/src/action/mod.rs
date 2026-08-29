@@ -2,11 +2,13 @@
 
 pub mod a2a;
 pub mod a2a_card;
+mod abtest;
 mod aiproxy;
 pub mod content_negotiate;
 pub mod graphql;
 pub mod grpc;
 pub mod grpc_web;
+mod https_proxy;
 mod loadbalancer;
 pub mod mcp;
 mod mcp_interpolate;
@@ -16,11 +18,13 @@ pub mod versioning;
 pub mod websocket;
 pub use a2a::*;
 pub use a2a_card::{AgentCapabilities, AgentCard, NegotiationOutcome};
+pub use abtest::{AbTestAction, AbTestVariant};
 pub use aiproxy::*;
 pub use content_negotiate::{resolve_shapes, ContentNegotiateConfig, NegotiatedShapes};
 pub use graphql::*;
 pub use grpc::*;
 pub use grpc_web::GrpcWebTranscoder;
+pub use https_proxy::HttpsProxyAction;
 pub use loadbalancer::*;
 pub use mcp::{
     McpAction, McpActionConfig, McpFederatedServerConfig, McpGuardrailEntry, McpInjectSource,
@@ -109,6 +113,14 @@ pub enum Action {
     /// federation handle holds an `Arc` plus per-server metadata and
     /// keeps the enum's stack footprint small.
     Mcp(Box<McpAction>),
+    /// Traffic-split A/B testing across weighted backend variants, with an
+    /// existing sticky cookie pinning a returning client to its matching
+    /// variant (WOR-2671).
+    AbTest(AbTestAction),
+    /// Allow-listed HTTPS reverse-proxy relay to the requested host
+    /// (WOR-2671). See [`HttpsProxyAction`] for how this adapts the
+    /// source's CONNECT-tunnel semantics to OSS's reverse-proxy model.
+    HttpsProxy(HttpsProxyAction),
     /// Placeholder for future variants - keeps the enum populated.
     Noop,
     /// Third-party plugin (only case using dynamic dispatch).
@@ -953,6 +965,8 @@ impl Action {
             Self::Storage(_) => "storage",
             Self::A2a(_) => "a2a",
             Self::Mcp(_) => "mcp",
+            Self::AbTest(_) => "abtest",
+            Self::HttpsProxy(_) => "https_proxy",
             Self::Noop => "noop",
             Self::Plugin(p) => p.handler().handler_type(),
         }
@@ -1002,9 +1016,21 @@ impl Action {
             // `response_filter`, which owns the real status and the
             // real upstream headers and runs before the first body byte
             // arrives.
-            Self::Proxy(_) | Self::LoadBalancer(_) | Self::A2a(_) => {
-                ResponseTransformPhase::Streaming
-            }
+            //
+            // `abtest` and `https_proxy` belong here for the same
+            // reason (WOR-2671): both make their decision in the
+            // request phase and then return `Ok(false)`, so Pingora's
+            // ordinary proxy flow builds the peer and streams the
+            // upstream response through `response_filter` exactly as it
+            // does for `proxy`. Answering `None` for either would make
+            // the config compiler refuse a `headers:` rule on an origin
+            // whose response transforms do in fact have a phase to run
+            // in.
+            Self::Proxy(_)
+            | Self::LoadBalancer(_)
+            | Self::A2a(_)
+            | Self::AbTest(_)
+            | Self::HttpsProxy(_) => ResponseTransformPhase::Streaming,
             // Settles locally without ever running the origin transform
             // chain. A `headers:` rule configured against one of these
             // has no phase to run in at all.
@@ -1057,6 +1083,8 @@ impl std::fmt::Debug for Action {
             Self::Storage(st) => f.debug_tuple("Storage").field(st).finish(),
             Self::A2a(a) => f.debug_tuple("A2a").field(a).finish(),
             Self::Mcp(m) => f.debug_tuple("Mcp").field(m).finish(),
+            Self::AbTest(a) => f.debug_tuple("AbTest").field(a).finish(),
+            Self::HttpsProxy(h) => f.debug_tuple("HttpsProxy").field(h).finish(),
             Self::Noop => write!(f, "Noop"),
             Self::Plugin(_) => write!(f, "Plugin(...)"),
         }

@@ -18,7 +18,7 @@
 //! these types and fails there at the assertion rather than at the
 //! `use` line.
 
-use sbproxy_modules::{compile_policy, compile_transform};
+use sbproxy_modules::{compile_action, compile_policy, compile_transform};
 
 // --- WOR-2668: enrichment producers ---------------------------------------
 
@@ -81,4 +81,60 @@ fn pdf_markdown_transform_type_string_compiles_to_the_pdf_variant() {
     let transform = compile_transform(&serde_json::json!({ "type": "pdf_markdown" }))
         .expect("`type: pdf_markdown` is a known transform type under transform-pdf");
     assert_eq!(transform.transform_type(), "pdf_markdown");
+}
+
+// --- WOR-2671: action types -----------------------------------------------
+
+#[test]
+fn abtest_action_type_string_compiles_to_the_abtest_variant() {
+    let action = compile_action(&serde_json::json!({
+        "type": "abtest",
+        "variants": [
+            { "name": "control", "url": "https://a.example.com", "weight": 50 },
+            { "name": "experiment", "url": "https://b.example.com", "weight": 50 },
+        ],
+    }))
+    .expect("`type: abtest` is a known action type");
+    assert_eq!(action.action_type(), "abtest");
+}
+
+#[test]
+fn https_proxy_action_type_string_compiles_to_the_https_proxy_variant() {
+    let action = compile_action(&serde_json::json!({
+        "type": "https_proxy",
+        "allowed_hosts": ["api.example.com", "*.internal.io"],
+    }))
+    .expect("`type: https_proxy` is a known action type");
+    assert_eq!(action.action_type(), "https_proxy");
+}
+
+// --- The types this port deliberately did not add -------------------------
+
+/// WOR-2670 and WOR-2671 each asked for a decision on two types rather
+/// than a port. All four were dropped, and this pins that: a config
+/// naming one of them is refused at load rather than silently accepted.
+///
+/// The reasoning is in the PR body. In short: `ai_cache` and
+/// `token_count` duplicate shipped work (`sbproxy-ai`'s semantic cache
+/// and its usage/cost accounting) and both carry defects;
+/// `loadbalancer_adv` and `orchestration` are declarations whose
+/// implementations degrade to a constant, a round-robin, or nothing at
+/// all. If a later ticket ports any of them, this test is the one that
+/// goes red and asks whether the decision was revisited on purpose.
+#[test]
+fn the_four_declined_module_types_are_not_config_surface() {
+    for declined in ["ai_cache", "token_count"] {
+        let result = compile_transform(&serde_json::json!({ "type": declined }));
+        assert!(
+            result.is_err(),
+            "`{declined}` was declined in WOR-2670 but compiles as a transform"
+        );
+    }
+    for declined in ["loadbalancer_adv", "advanced_lb", "orchestration"] {
+        let result = compile_action(&serde_json::json!({ "type": declined }));
+        assert!(
+            result.is_err(),
+            "`{declined}` was declined in WOR-2671 but compiles as an action"
+        );
+    }
 }

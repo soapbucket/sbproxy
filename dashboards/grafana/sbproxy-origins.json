@@ -640,6 +640,74 @@
         }
       ],
       "description": "The config-authority revision the aggregator last published. Zero means this aggregator has published nothing yet. A revision that stops advancing while entries keep resolving is the expected steady state, because an unchanged composition publishes nothing; read this panel together with Aggregation Entries by Outcome rather than alone. A revision that advances on every round is the thing to investigate, since each published revision is a full pipeline rebuild on every subscriber. Runbook: docs/operator-runbook.md#origins."
+    },
+    {
+      "id": 10,
+      "title": "abtest / https_proxy Action Decisions",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 88
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (origin, variant) (rate(sbproxy_action_abtest_variant_selected_total[5m]))",
+          "legendFormat": "abtest {{origin}} / {{variant}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (origin, decision) (rate(sbproxy_action_https_proxy_decisions_total[5m]))",
+          "legendFormat": "https_proxy {{origin}} / {{decision}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "abtest action variant picks by origin and variant, alongside https_proxy allow/deny decisions by origin. A variant's share drifting from its configured weight, or a sustained run of https_proxy deny, both surface here before they are mistaken for the action being broken."
     }
   ],
   "templating": {

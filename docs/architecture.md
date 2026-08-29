@@ -203,7 +203,7 @@ implemented as a sequence of `ProxyHttp` callbacks; the per-request work happens
 those callbacks rather than in a separate dispatcher.
 
 The full path, from listener to access log. Every box is a stage this section names; the
-action-dispatch branches are the fifteen action types cataloged in
+action-dispatch branches are the seventeen action types cataloged in
 [features.md](features.md#6-reference-every-action-type):
 
 ```mermaid

@@ -13,9 +13,9 @@ use sbproxy_extension::bundle::{
 };
 
 use crate::action::{
-    A2aAction, Action, AiProxyAction, BeaconAction, EchoAction, GraphQLAction, GrpcAction,
-    LoadBalancerAction, McpAction, MockAction, ProxyAction, RedirectAction, StaticAction,
-    StorageAction, WebSocketAction,
+    A2aAction, AbTestAction, Action, AiProxyAction, BeaconAction, EchoAction, GraphQLAction,
+    GrpcAction, HttpsProxyAction, LoadBalancerAction, McpAction, MockAction, ProxyAction,
+    RedirectAction, StaticAction, StorageAction, WebSocketAction,
 };
 use crate::auth::{
     ApiKeyAuth, Auth, BasicAuthProvider, BearerAuth, BotAuthProvider, DigestAuth,
@@ -128,6 +128,12 @@ fn compile_action_for_origin_with_runtime(
         "mcp" => Ok(Action::Mcp(Box::new(McpAction::from_config(
             config.clone(),
         )?))),
+        // WOR-2671: traffic-split A/B testing and the allow-listed HTTPS
+        // forward-proxy relay, ported from sbproxy-enterprise.
+        "abtest" => Ok(Action::AbTest(AbTestAction::from_config(config.clone())?)),
+        "https_proxy" => Ok(Action::HttpsProxy(HttpsProxyAction::from_config(
+            config.clone(),
+        )?)),
         "noop" => Ok(Action::Noop),
         other => match sbproxy_plugin::build_action_plugin(other, config.clone()) {
             Some(Ok(handler)) => Ok(Action::Plugin(crate::PluginAction::linked(handler))),
@@ -1459,6 +1465,51 @@ hooks:
             "type": "mcp",
             "federated_servers": []
         });
+        assert!(compile_action(&json).is_err());
+    }
+
+    #[test]
+    fn compile_action_abtest() {
+        let json = serde_json::json!({
+            "type": "abtest",
+            "variants": [
+                {"name": "control", "url": "https://a.example.com", "weight": 50},
+                {"name": "experiment", "url": "https://b.example.com", "weight": 50}
+            ]
+        });
+        let action = compile_action(&json).unwrap();
+        assert_eq!(action.action_type(), "abtest");
+        if let Action::AbTest(a) = action {
+            assert_eq!(a.variants.len(), 2);
+        } else {
+            panic!("expected Action::AbTest");
+        }
+    }
+
+    #[test]
+    fn compile_action_abtest_requires_variants() {
+        let json = serde_json::json!({"type": "abtest", "variants": []});
+        assert!(compile_action(&json).is_err());
+    }
+
+    #[test]
+    fn compile_action_https_proxy() {
+        let json = serde_json::json!({
+            "type": "https_proxy",
+            "allowed_hosts": ["api.example.com", "*.internal.io"]
+        });
+        let action = compile_action(&json).unwrap();
+        assert_eq!(action.action_type(), "https_proxy");
+        if let Action::HttpsProxy(h) = action {
+            assert!(h.is_host_allowed("api.example.com"));
+        } else {
+            panic!("expected Action::HttpsProxy");
+        }
+    }
+
+    #[test]
+    fn compile_action_https_proxy_requires_allowed_hosts() {
+        let json = serde_json::json!({"type": "https_proxy", "allowed_hosts": []});
         assert!(compile_action(&json).is_err());
     }
 

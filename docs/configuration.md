@@ -3096,6 +3096,94 @@ versioning, and cost attribution, and [mcp-compose.md](mcp-compose.md) for
 `type: local` servers: config-declared tools, HTTP and step-DAG handlers,
 and response shaping.
 
+### abtest
+
+([config](../examples/ab-test-routing/))
+
+Split traffic across weighted backend variants for an A/B test. A returning
+client carrying a matching sticky cookie stays pinned to that variant so a
+multi-request user journey never sees a different variant mid-flight. The
+action does not issue the cookie.
+
+```yaml
+origins:
+  "app.example.com":
+    action:
+      type: abtest
+      sticky_cookie: sb_ab_variant
+      variants:
+        - name: control
+          url: https://control.internal:8080
+          weight: 50
+        - name: experiment
+          url: https://experiment.internal:8080
+          weight: 50
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `variants` | list | required, non-empty | Backend variants. Each entry is `name`, `url`, `weight`. |
+| `sticky_cookie` | string | `sb_ab_variant` | Cookie name used to pin a client to its assigned variant across requests. |
+
+A request carrying the sticky cookie with a value matching a configured
+variant's `name` always routes to that variant. Everything else gets a
+fresh weighted-random pick: a variant's share of traffic is its `weight`
+divided by the sum of all weights, and a total weight of `0` (every
+variant weighted `0`) falls back to the first configured variant rather
+than dividing by zero. The action does not set the sticky cookie itself;
+pair it with a `static`/`json_body` response or an upstream that reads
+`x-sbproxy-variant`-style signals if you need the client to see which
+variant it landed on. Each variant's `url` accepts the same host as a
+`proxy` action; `host_override`, `retry`, and `service_discovery` are not
+supported on a per-variant basis.
+
+Every request that reaches this action records
+`sbproxy_action_abtest_variant_selected_total{origin, variant}`, whether
+the pick came from the sticky cookie or a fresh roll, so the observed
+ratio between variants reflects the configured weights over time (absent
+a skew in how often sticky-cookie holders return).
+
+### https_proxy
+
+([config](../examples/https-forward-proxy/))
+
+Relay a request to the host it already resolved to (the inbound `Host`
+header), but only when that host is on an explicit allow-list. Where every
+other action in this section proxies to a URL fixed in config, this one
+has no `url` field at all: think of it as a narrower version of `proxy`
+for an origin whose hostname key is a wildcard (`"*.internal.io"`) and
+that wants to relay only a named subset of the hosts the wildcard would
+otherwise match, refusing the rest with `403` instead of quietly
+forwarding them.
+
+```yaml
+origins:
+  "*.internal.io":
+    action:
+      type: https_proxy
+      allowed_hosts:
+        - api.internal.io
+        - "*.svc.internal.io"
+      require_auth: true
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `allowed_hosts` | list | required, non-empty | Hosts permitted through the relay. Exact match or a `*.suffix` wildcard. |
+| `connect_timeout_ms` | int | `5000` | Upstream connect timeout applied to the relayed connection. |
+| `require_auth` | bool | `false` | When true, the origin must also configure an `authentication:` provider; a request with no successful `Allow` decision is refused with `401` regardless of `allowed_hosts`. |
+
+This is a guarded TLS reverse-proxy action, not an HTTP `CONNECT` tunnel: it
+forwards the HTTP request to the resolved host over TLS on port `443` and
+cannot create a raw byte tunnel. The relay is always HTTPS to port `443` on the resolved host, with the
+inbound request forwarded otherwise unchanged (no `Host` rewrite, matching
+the source concept this ports: the destination is whatever host the
+client asked for, not a URL the operator configured). A denied host gets
+`403`; every decision, allowed or denied, records
+`sbproxy_action_https_proxy_decisions_total{origin, decision}` so a
+sustained run of `deny` is visible before it is mistaken for the relay
+being broken.
+
 ### noop
 
 Return `200 OK` with an empty body. The action accepts no fields beyond

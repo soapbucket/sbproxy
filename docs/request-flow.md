@@ -143,7 +143,7 @@ Action dispatch is where the traffic-type branch happens; see
 what differs by branch. Built-in action types are enum variants matched
 here: `proxy`, `load_balancer`, `ai_proxy`, `static`, `mock`, `redirect`,
 `echo`, `beacon`, `noop`, `websocket`, `grpc`, `graphql`, `storage`,
-`a2a`, and `mcp`; the complete catalog with a paragraph on each is
+`a2a`, `mcp`, `abtest`, and `https_proxy`; the complete catalog with a paragraph on each is
 [features.md's action reference](features.md#6-reference-every-action-type). A third-party
 action plugin (`Plugin(Box<dyn ActionHandler>)`) pays one indirect call
 here instead of hitting the branch-predicted match; see

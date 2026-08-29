@@ -341,6 +341,29 @@ pub struct DeferredAuthPending {
     pub allow_reason: &'static str,
 }
 
+/// The `abtest` action's per-request variant pick (WOR-2671), resolved
+/// once in `handle_action` (from the sticky cookie or a fresh weighted
+/// roll) and read again in `upstream_peer` and
+/// `upstream_request_filter`, mirroring how `lb_attempt` carries a
+/// `load_balancer` action's target selection across the same phases.
+#[derive(Debug, Clone)]
+pub struct AbTestSelection {
+    /// The selected variant's `name`, for logging and the
+    /// `variant` metric label.
+    pub variant_name: String,
+    /// The selected variant's configured backend URL, unparsed (used
+    /// for the default upstream `Host` header, the same way
+    /// `ProxyAction::url` is).
+    pub url: String,
+    /// Parsed upstream host, from
+    /// [`sbproxy_modules::action::AbTestAction::parse_variant_upstream`].
+    pub host: String,
+    /// Parsed upstream port.
+    pub port: u16,
+    /// Whether the upstream connection uses TLS.
+    pub tls: bool,
+}
+
 /// Per-request state threaded through all Pingora phases as CTX.
 pub struct RequestContext {
     // --- Identity ---
@@ -872,6 +895,10 @@ pub struct RequestContext {
     // --- Forward rule state ---
     /// If a forward rule matched, this holds the index into the origin's forward_rules vec.
     pub forward_rule_idx: Option<usize>,
+    /// The `abtest` action's resolved variant for this request, set by
+    /// `handle_action` and read by `upstream_peer` and
+    /// `upstream_request_filter`. `None` for every other action type.
+    pub ab_test_selection: Option<AbTestSelection>,
     /// Path parameters captured by the matched forward rule's `template` or
     /// `regex` matcher. `None` when no forward rule matched, or the rule
     /// matched via `prefix`/`exact` (which capture nothing). Available to
@@ -2064,6 +2091,7 @@ impl RequestContext {
             rsl_inject_link_buf: None,
             rsl_inject_link_emitted: false,
             forward_rule_idx: None,
+            ab_test_selection: None,
             path_params: None,
             ai_upstream_cancelled_on_client_disconnect: false,
             fallback_triggered: false,

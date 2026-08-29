@@ -8962,6 +8962,19 @@ fn anomaly_view<'a>(
         ja4_trustworthy,
         headless_library,
         client_ip: ctx.client_ip,
+        // WOR-2668. This function's contract is that the request-phase
+        // gate and the response-phase dispatch judge the same request
+        // the same way, so the geoip / user_agent_parser output has to
+        // appear on both. All three are `None` unless the origin
+        // configured the producing policy, and a policy that runs
+        // later in the chain than this gate leaves them `None` here
+        // and populated in `response_filter`.
+        geo_country: ctx.geo_lookup.as_ref().and_then(|g| g.country.as_deref()),
+        geo_asn: ctx.geo_lookup.as_ref().and_then(|g| g.asn),
+        ua_headless_library: ctx
+            .parsed_user_agent
+            .as_ref()
+            .and_then(|p| p.headless_library.as_deref()),
     }
 }
 
@@ -9304,6 +9317,10 @@ origins:
             ja4_trustworthy: true,
             headless_library: None,
             client_ip: None,
+            // WOR-2668: no enrichment policy runs in this fixture.
+            geo_country: None,
+            geo_asn: None,
+            ua_headless_library: None,
         }
     }
 

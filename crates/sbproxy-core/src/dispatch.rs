@@ -601,6 +601,14 @@ async fn dispatch_action(
             warn!("H3: mcp action not yet supported in H3 dispatch");
             Ok(text_response(501, &h3_unsupported_message("mcp")))
         }
+        Action::AbTest(_) => {
+            warn!("H3: abtest action not yet supported in H3 dispatch");
+            Ok(text_response(501, &h3_unsupported_message("abtest")))
+        }
+        Action::HttpsProxy(_) => {
+            warn!("H3: https_proxy action not yet supported in H3 dispatch");
+            Ok(text_response(501, &h3_unsupported_message("https_proxy")))
+        }
         Action::Plugin(handler) => {
             let mut request = http::Request::builder()
                 .method(method.clone())
@@ -1110,6 +1118,42 @@ mod tests {
             Some(Bytes::from_static(b"payload")),
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn h3_refuses_abtest_and_https_proxy_actions_with_documented_501() {
+        let abtest = Action::AbTest(
+            sbproxy_modules::action::AbTestAction::from_config(serde_json::json!({
+                "type": "abtest",
+                "variants": [{"name": "only", "url": "https://only.example.test", "weight": 1}],
+            }))
+            .expect("valid A/B fixture"),
+        );
+        let https_proxy = Action::HttpsProxy(
+            sbproxy_modules::action::HttpsProxyAction::from_config(serde_json::json!({
+                "type": "https_proxy",
+                "allowed_hosts": ["api.example.test"],
+            }))
+            .expect("valid HTTPS relay fixture"),
+        );
+
+        for action in [&abtest, &https_proxy] {
+            let response = dispatch_action(
+                action,
+                &http::Method::GET,
+                &"/".parse().expect("fixture URI"),
+                &http::HeaderMap::new(),
+                None,
+            )
+            .await
+            .expect("H3 refusal response");
+            assert_eq!(response.status, 501);
+            assert!(
+                String::from_utf8_lossy(response.body.as_deref().unwrap_or_default())
+                    .contains("not supported over HTTP/3"),
+                "H3 refusal must explain the action is unavailable"
+            );
+        }
     }
 
     #[tokio::test]

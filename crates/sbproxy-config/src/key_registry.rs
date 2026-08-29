@@ -1266,10 +1266,17 @@ const MODULE_COVERAGE: &[ModuleCoverage] = &[
     // Only the `resilience` subtree of the AI action has a root today.
     deferred("action", "ai_proxy"),
     deferred("action", "a2a"),
+    // WOR-2671: both fields are read directly (`resolve_variant`,
+    // `parse_variant_upstream`); no secret material in its config.
+    deferred("action", "abtest"),
     deferred("action", "beacon"),
     deferred("action", "echo"),
     deferred("action", "graphql"),
     deferred("action", "grpc"),
+    // WOR-2671: all three fields (`allowed_hosts`, `connect_timeout_ms`,
+    // `require_auth`) are read directly in `handle_action`/`upstream_peer`;
+    // no secret material in its config.
+    deferred("action", "https_proxy"),
     deferred("action", "mcp"),
     deferred("action", "mock"),
     deferred("action", "noop"),
@@ -1339,6 +1346,9 @@ const MODULE_COVERAGE: &[ModuleCoverage] = &[
     deferred("policy", "user_agent_parser"),
     deferred("policy", "waf"),
     deferred("transform", "a2a_agent_card_rewrite"),
+    // WOR-2670: `schema` and `on_failure` are both read directly in
+    // `AiSchemaTransform::apply`; no secret material in its config.
+    deferred("transform", "ai_schema"),
     deferred("transform", "boilerplate"),
     deferred("transform", "cel"),
     deferred("transform", "citation_block"),
@@ -1360,6 +1370,10 @@ const MODULE_COVERAGE: &[ModuleCoverage] = &[
     deferred("transform", "noop"),
     deferred("transform", "normalize"),
     deferred("transform", "optimize_html"),
+    // WOR-2670: gated behind the opt-in `transform-pdf` cargo feature; all
+    // fields (`max_pages`, `extract_text`, `extract_tables`,
+    // `token_bytes_ratio`) are read directly in `PdfToMarkdownTransform`.
+    deferred("transform", "pdf_markdown"),
     deferred("transform", "payload_limit"),
     deferred("transform", "replace_strings"),
     deferred("transform", "sse_chunking"),

@@ -118,6 +118,8 @@ pub const KNOWN_ACTION_TYPES: &[&str] = &[
     "storage",
     "a2a",
     "mcp",
+    "abtest",
+    "https_proxy",
     "noop",
 ];
 
