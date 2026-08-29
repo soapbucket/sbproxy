@@ -595,7 +595,10 @@ static AI_GUARDRAIL_BLOCKS: LazyLock<CounterVec> = LazyLock::new(|| {
     .unwrap()
 });
 
-static AI_PARALLEL_MODERATION: LazyLock<CounterVec> = LazyLock::new(|| {
+/// Registered without `.unwrap()` for the same reason as
+/// `AI_ADMISSION_DECISIONS`: the production unwrap/expect ratchet is at
+/// its baseline and one metric family is not worth a panic path.
+static AI_PARALLEL_MODERATION: LazyLock<Option<CounterVec>> = LazyLock::new(|| {
     register_counter_vec!(
         Opts::new(
             "sbproxy_ai_parallel_moderation_total",
@@ -603,7 +606,7 @@ static AI_PARALLEL_MODERATION: LazyLock<CounterVec> = LazyLock::new(|| {
         ),
         &["outcome"]
     )
-    .unwrap()
+    .ok()
 });
 
 static AI_SAFETY_GUARDRAIL_VERDICTS: LazyLock<CounterVec> = LazyLock::new(|| {
@@ -1875,11 +1878,14 @@ pub fn record_guardrail_block(category: &str) {
 /// hook blocked first and the in-flight call was dropped). A cancelled
 /// call may still be billed by the provider.
 pub fn record_ai_parallel_moderation(outcome: &str) {
+    let Some(counter) = &*AI_PARALLEL_MODERATION else {
+        return;
+    };
     let outcome = match outcome {
         "allow" | "block" | "cancelled_upstream" => outcome,
         _ => "unknown",
     };
-    AI_PARALLEL_MODERATION.with_label_values(&[outcome]).inc();
+    counter.with_label_values(&[outcome]).inc();
 }
 
 /// Record one built-in safety guardrail evaluation.

@@ -154,24 +154,27 @@ impl AiExtensionChain {
     ///
     /// Parallel inspect-only input hooks are excluded: they run alongside
     /// the upstream call, not on the session [`Self::start_session`] builds.
+    #[cfg(test)]
     #[must_use]
-    pub fn has_sequential_kind(&self, kind: ExtensionHookKind) -> bool {
+    fn has_sequential_kind(&self, kind: ExtensionHookKind) -> bool {
         self.hooks
             .iter()
             .any(|hook| hook.kind == kind && !hook.parallel)
     }
 
     /// True when a sequential enforcing hook receives this event kind.
+    #[cfg(test)]
     #[must_use]
-    pub fn has_sequential_enforcing(&self, kind: ExtensionHookKind) -> bool {
+    fn has_sequential_enforcing(&self, kind: ExtensionHookKind) -> bool {
         self.hooks.iter().any(|hook| {
             hook.kind == kind && !hook.parallel && hook.enforcement == AiExtensionEnforcement::Block
         })
     }
 
     /// True when at least one inspect-only input hook runs alongside dispatch.
+    #[cfg(test)]
     #[must_use]
-    pub fn has_parallel_input(&self) -> bool {
+    fn has_parallel_input(&self) -> bool {
         self.hooks.iter().any(|hook| hook.parallel)
     }
 
@@ -563,7 +566,8 @@ impl AiExtensionSession {
     ///
     /// Returns a plugin error when the task was cancelled or a closed-posture
     /// hook failed.
-    pub async fn wait_parallel(&mut self) -> PluginResult<AiChainVerdict> {
+    #[cfg(test)]
+    async fn wait_parallel(&mut self) -> PluginResult<AiChainVerdict> {
         let Some(task) = self.take_parallel_task() else {
             return Ok(AiChainVerdict::Release);
         };
