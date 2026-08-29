@@ -1258,6 +1258,7 @@ named by the `archive_keep` validation error in `sbproxy-config/src/types.rs`,
 the second narrowed to a private const with its bound restated in prose, and
 the third is named by the suspension warn log in the operator's `main.rs`,
 which is the line an operator greps before reading the condition.
+
 2026-08-29 (WOR-2421): unreferenced 1525 -> 1524. Parallel-input chain
 predicates and the session wait helper are cfg(test) rather than pub, so
 they leave this bucket and rustc polices them.
