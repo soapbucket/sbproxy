@@ -324,12 +324,14 @@ pub trait SettlementStore: Send + Sync {
     /// same row. Resuming requires the same draft bytes.
     ///
     /// `payer_hash` is the opaque scope key
-    /// [`SettlementStore::unresolved_intent_for_route`] matches on, and this
-    /// is the only call that ever writes it. `None` means the request path
-    /// could not identify a payer, which is the legacy shape every row
-    /// written before WOR-2238 has. It is written on insert only: resuming
-    /// an existing intent leaves the first writer's value in place, because
-    /// the row's scope belongs to whoever the payment was minted for.
+    /// [`SettlementStore::unresolved_intent_for_route`] matches on.
+    /// `None` means the request path could not identify a payer, which is
+    /// the legacy shape every row written before WOR-2238 has. It is
+    /// written on insert, and
+    /// [`SettlementStore::attribute_payer_hash`] may fill a NULL later
+    /// from a facilitator `/verify` (WOR-2302). Resuming an existing intent
+    /// leaves the first writer's value in place, because the row's scope
+    /// belongs to whoever the payment was minted for.
     ///
     /// Implementations must treat the value as opaque. It is derived, never
     /// raw payer material, and it belongs in this table and nowhere else: it
@@ -346,6 +348,26 @@ pub trait SettlementStore: Send + Sync {
         request_idempotency_key: &str,
         payer_hash: Option<&str>,
     ) -> Result<CreateIntent, BillingError>;
+
+    /// Fills a NULL `payer_hash` after a facilitator `/verify` names one.
+    ///
+    /// WOR-2302: the request path has no x402 payer identity at challenge
+    /// time. The address arrives on `VerifyResponse.payer` at redemption.
+    /// This writes the already-derived scope key, never the raw address,
+    /// and only when the column is still NULL. A later caller cannot
+    /// restamp it, for the same reason resume cannot: the row's scope
+    /// belongs to the payer it was attributed to. An already-attributed
+    /// row is a success, not a conflict.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BillingError::IntentNotFound`] when the intent is gone,
+    /// and [`BillingError::InvalidRequirement`] when `payer_hash` is empty.
+    async fn attribute_payer_hash(
+        &self,
+        intent_id: &str,
+        payer_hash: &str,
+    ) -> Result<(), BillingError>;
 
     /// Commits the final requirement, its digest, and the signed quote.
     ///
@@ -543,24 +565,25 @@ pub trait SettlementStore: Send + Sync {
     ///
     /// The request path reads this before pricing a new challenge. The key is
     /// the content plus the payer scope key the intent was minted under
-    /// (WOR-2238). A row matches when any of three things is true:
+    /// (WOR-2238) or attributed under after an x402 `/verify` (WOR-2302).
+    /// A row matches when:
     ///
     /// - its stored `payer_hash` equals `payer_hash`, which is the payer
     ///   whose own payment is stuck;
     /// - its stored `payer_hash` is `NULL`, which is every row written
-    ///   before WOR-2238 and every row minted for a caller the request path
-    ///   could not identify. Those rows keep the original route-wide
+    ///   before WOR-2238, every row minted for a caller the request path
+    ///   could not identify, and every x402 intent that has not yet
+    ///   survived `/verify`. Those rows keep the original route-wide
     ///   behavior, so an in-flight upgrade cannot regress into a double
-    ///   charge;
-    /// - the caller passed `None`, which says this request carries no payer
-    ///   identity. It could be the stranded payer arriving unidentified, and
-    ///   an unproven guess in that direction is the double charge WOR-2230
-    ///   closed, so it waits on every unresolved intent for the route.
+    ///   charge, and a first-ever stall from a never-verified payer is
+    ///   still route-wide.
     ///
-    /// The narrowing is therefore strictly conservative: every pair that
-    /// blocked before this landed still blocks, and the only pairs that
-    /// stopped blocking are the ones where two different identified payers
-    /// are provably involved.
+    /// A request that itself carries `None` matches only NULL rows. An
+    /// attributed intent no longer withholds from unidentified callers:
+    /// after `/verify` the facilitator named a payer, so the row is not
+    /// "could be anyone". The residual WOR-2302 accepts is that the same
+    /// anonymous wallet's *next* challenge is still unidentified at mint
+    /// time and is not keyed off the previous hash.
     ///
     /// [`IntentStatus::Stranded`] is deliberately not matched here. That is
     /// the state an unattributable intent reaches once

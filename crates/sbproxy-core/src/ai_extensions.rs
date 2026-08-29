@@ -1,5 +1,9 @@
 //! Request-local adaptation between the AI hub and extension events.
 
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use sbproxy_ai::format::{ContentPartDelta, FinishReason, HubChunk};
 use sbproxy_ai::guardrails::stream::CompletedToolCall;
 use sbproxy_extension::bundle::{AiChainVerdict, AiExtensionChain, AiExtensionSession};
@@ -67,6 +71,25 @@ impl AiExtensionBlock {
             message: "An AI extension rewrote content this response shape cannot carry".to_owned(),
         }
     }
+}
+
+/// How a parallel inspect-only input hook settled against one provider attempt.
+pub(crate) enum ParallelModerationRace<T> {
+    /// The hook allowed, or none was armed. Carry the attempt result forward.
+    Attempt(T),
+    /// The upstream finished, then the hook blocked. Keep the attempt for
+    /// billing and still refuse the client.
+    BlockedAfterAnswer {
+        /// The hook's client-safe refusal.
+        block: AiExtensionBlock,
+        /// The attempt result, including a transport error.
+        result: T,
+    },
+    /// The hook blocked first. The attempt future was dropped.
+    Cancelled {
+        /// The hook's client-safe refusal.
+        block: AiExtensionBlock,
+    },
 }
 
 /// AI hook state pinned to one request and one pipeline generation.
@@ -209,6 +232,52 @@ impl AiRequestExtensions {
             Some(_) => Err(AiExtensionBlock::runtime_failure()),
             None => Ok(None),
         }
+    }
+
+    /// Race one provider attempt against an armed parallel input hook.
+    ///
+    /// A block that lands first drops `attempt`, which is the cancellation
+    /// of the in-flight `reqwest` call. A block that lands after the
+    /// attempt still returns that result so billing can record an
+    /// answered call.
+    pub(crate) async fn race_provider_attempt<T>(
+        &mut self,
+        attempt: impl Future<Output = T>,
+    ) -> ParallelModerationRace<T> {
+        let Some(task) = self.session.take_parallel_task() else {
+            return ParallelModerationRace::Attempt(attempt.await);
+        };
+        let task = AbortOnDropJoinHandle::new(task);
+        tokio::pin!(attempt);
+        tokio::pin!(task);
+        tokio::select! {
+            biased;
+            result = &mut attempt => match join_parallel_result(task.await) {
+                Ok(()) => ParallelModerationRace::Attempt(result),
+                Err(block) => ParallelModerationRace::BlockedAfterAnswer { block, result },
+            },
+            verdict = &mut task => match join_parallel_result(verdict) {
+                Ok(()) => ParallelModerationRace::Attempt(attempt.await),
+                Err(block) => {
+                    // Returning drops the pinned attempt future, which is
+                    // the cancellation of the in-flight reqwest call.
+                    // `drop(attempt)` here would only drop a `Pin<&mut _>`.
+                    ParallelModerationRace::Cancelled { block }
+                }
+            },
+        }
+    }
+
+    /// Await an armed parallel input hook before a raced fan-out.
+    ///
+    /// Raced dispatch fans out to every eligible provider at once, so a
+    /// block here refuses before those extra calls start rather than
+    /// cancelling N in-flight generations.
+    pub(crate) async fn wait_parallel(&mut self) -> Result<(), AiExtensionBlock> {
+        let Some(task) = self.session.take_parallel_task() else {
+            return Ok(());
+        };
+        join_parallel_task(AbortOnDropJoinHandle::new(task)).await
     }
 
     /// Returns the canonical output text a hook rewrote, or `None`
@@ -573,6 +642,89 @@ impl AiRequestExtensions {
     }
 }
 
+fn join_parallel_result(
+    verdict: Result<sbproxy_plugin::PluginResult<AiChainVerdict>, tokio::task::JoinError>,
+) -> Result<(), AiExtensionBlock> {
+    match verdict {
+        Ok(Ok(AiChainVerdict::Release | AiChainVerdict::Mutated)) => {
+            sbproxy_ai::ai_metrics::record_ai_parallel_moderation("allow");
+            Ok(())
+        }
+        Ok(Ok(AiChainVerdict::Block {
+            status,
+            code,
+            message,
+        })) => Err(AiExtensionBlock {
+            status,
+            code,
+            message,
+        }),
+        Ok(Err(_)) | Err(_) => Err(AiExtensionBlock::runtime_failure()),
+    }
+}
+
+async fn join_parallel_task(
+    task: impl Future<
+        Output = Result<sbproxy_plugin::PluginResult<AiChainVerdict>, tokio::task::JoinError>,
+    >,
+) -> Result<(), AiExtensionBlock> {
+    join_parallel_result(task.await)
+}
+
+/// Join handle that aborts the spawned task when dropped.
+///
+/// Tokio's [`tokio::task::JoinHandle`] does not abort on drop. Parallel
+/// inspect tasks hold the prompt-bearing event; dropping the provider
+/// race (client disconnect, early return) must cancel that work rather
+/// than leave it running until sandbox budget.
+struct AbortOnDropJoinHandle<T> {
+    inner: Option<tokio::task::JoinHandle<T>>,
+}
+
+impl<T> AbortOnDropJoinHandle<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self {
+            inner: Some(handle),
+        }
+    }
+}
+
+impl<T> Drop for AbortOnDropJoinHandle<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.inner.take() {
+            handle.abort();
+        }
+    }
+}
+
+impl<T> Future for AbortOnDropJoinHandle<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let inner = match self.inner.as_mut() {
+            Some(inner) => inner,
+            None => return Poll::Pending,
+        };
+        match Pin::new(inner).poll(cx) {
+            Poll::Ready(result) => {
+                self.inner.take();
+                Poll::Ready(result)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+pub(crate) async fn race_provider_attempt_optional<T>(
+    extensions: Option<&mut AiRequestExtensions>,
+    attempt: impl Future<Output = T>,
+) -> ParallelModerationRace<T> {
+    match extensions {
+        Some(ext) => ext.race_provider_attempt(attempt).await,
+        None => ParallelModerationRace::Attempt(attempt.await),
+    }
+}
+
 fn bounded_id(value: &str) -> String {
     if value.len() <= MAX_EVENT_ID_BYTES {
         return value.to_owned();
@@ -931,6 +1083,50 @@ mod tests {
             .unwrap_err();
         assert_eq!(block.status, 422);
         assert_eq!(block.code, "fixture_input");
+    }
+
+    #[tokio::test]
+    async fn parallel_input_bundle_does_not_block_serial_guard_input() {
+        let (_directory, chain) = chain(
+            "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: parallel-input\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nhooks:\n  - kind: ai_guardrail_input\n    type: inspect_input\n    export: inspect\n    execution:\n      mode: parallel\n",
+            r#"export function inspect(input) { if (input.event.messages[0].content !== "blocked") throw new Error("wrong input"); return {version:"sbproxy-envelope/v1",decision:"block",status:422,code:"fixture_parallel",message:"fixture blocked"}; }"#,
+        );
+        let mut request = AiRequestExtensions::start(&chain, "request-1", "model-1").unwrap();
+
+        let mutated = request
+            .guard_input(
+                "original",
+                &json!({"messages": [{"role": "user", "content": "blocked"}]}),
+            )
+            .await
+            .expect("serial lane must release a parallel-only hook");
+        assert!(mutated.is_none());
+
+        let raced = request.race_provider_attempt(async { "attempted" }).await;
+        match raced {
+            super::ParallelModerationRace::Cancelled { block }
+            | super::ParallelModerationRace::BlockedAfterAnswer { block, .. } => {
+                assert_eq!(block.status, 422);
+                assert_eq!(block.code, "fixture_parallel");
+            }
+            super::ParallelModerationRace::Attempt(_) => {
+                panic!("parallel block must refuse the attempt")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_an_abort_on_drop_join_handle_cancels_the_spawned_task() {
+        let (hold, held) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            let _hold = hold;
+            std::future::pending::<()>().await
+        });
+        drop(super::AbortOnDropJoinHandle::new(handle));
+        assert!(
+            held.await.is_err(),
+            "abort-on-drop must cancel the spawned task so its captured state is released"
+        );
     }
 
     #[tokio::test]

@@ -275,6 +275,34 @@ impl DispatchContext {
         &self.store
     }
 
+    /// Persists a hashed facilitator payer on the intent (WOR-2302).
+    ///
+    /// `payer` is the raw address from `VerifyResponse`. It is hashed
+    /// immediately and never stored, logged, or returned. An empty value
+    /// is a no-op so a facilitator that omits the field leaves the first-ever
+    /// stall route-wide, which is the residual this ticket accepts.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store's error. Callers must fail closed before stamping
+    /// a settle: a payment we cannot attribute should not become a
+    /// route-wide hold we then cannot explain.
+    pub async fn attribute_x402_payer(
+        &self,
+        intent_id: &str,
+        payer: &str,
+    ) -> Result<(), BillingError> {
+        let payer = payer.trim();
+        if payer.is_empty() {
+            return Ok(());
+        }
+        let Some(attempt) = self.attempt() else {
+            return Err(BillingError::InvalidRequirement("intent_id"));
+        };
+        let hash = crate::types::x402_facilitator_payer_hash(&attempt.tenant_id, payer);
+        self.store.attribute_payer_hash(intent_id, &hash).await
+    }
+
     /// Returns the current time in milliseconds since the Unix epoch.
     pub fn now_ms(&self) -> i64 {
         self.clock.now_ms()

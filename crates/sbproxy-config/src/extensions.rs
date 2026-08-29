@@ -349,6 +349,27 @@ pub struct BundleExecution {
     /// hooks may declare it; validation refuses it elsewhere.
     #[serde(default)]
     pub mutates: bool,
+    /// When this inspect-only hook runs relative to the upstream call.
+    ///
+    /// `serial` (the default) waits for the hook before the provider is
+    /// dialed. `parallel` starts the hook alongside the upstream call and
+    /// cancels that call if the hook blocks. Only `ai_guardrail_input`
+    /// hooks may declare it, and it cannot combine with `mutates: true`.
+    #[serde(default)]
+    pub mode: BundleExecutionMode,
+}
+
+/// When an inspect-only hook evaluates relative to the upstream call.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum BundleExecutionMode {
+    /// Wait for the hook before dialing the provider.
+    #[default]
+    Serial,
+    /// Run alongside the upstream call; a block cancels it (WOR-2421).
+    Parallel,
 }
 
 /// One hook declared by a bundle manifest.
@@ -810,6 +831,25 @@ impl BundleManifest {
                     "mutates requires enforcement_mode block; an observe hook's \
                      decisions are discarded, so its mutation could never apply",
                 );
+            }
+            if hook.execution.mode == BundleExecutionMode::Parallel {
+                if hook.kind != BundleHookKind::AiGuardrailInput {
+                    return invalid(
+                        "execution.mode parallel is only supported for ai_guardrail_input hooks",
+                    );
+                }
+                if hook.execution.mutates {
+                    return invalid(
+                        "execution.mode parallel cannot combine with mutates: true; \
+                         a rewrite must land before dispatch",
+                    );
+                }
+                if hook.enforcement_mode == EnforcementMode::Observe {
+                    return invalid(
+                        "execution.mode parallel requires enforcement_mode block; \
+                         observe hooks already run off the request path",
+                    );
+                }
             }
             if let Some(schema) = &hook.config_schema {
                 validate_schema(schema)?;
@@ -1377,6 +1417,27 @@ sandbox:
 permissions: []
 "#;
 
+    const AI_INPUT_JS_MANIFEST: &str = r#"
+apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: input-moderation
+version: 1.0.0
+runtime: javascript
+entry: entry.js
+hooks:
+  - kind: ai_guardrail_input
+    type: inspect_input
+    export: inspect
+    execution:
+      body_mode: none
+failure_posture: closed
+sandbox:
+  budget_ms: 50
+  memory_mb: 16
+  stack_kb: 512
+permissions: []
+"#;
+
     fn parse_manifest(yaml: &str) -> BundleManifest {
         BundleManifest::parse_yaml(yaml.as_bytes()).expect("manifest parses")
     }
@@ -1679,6 +1740,69 @@ permissions: []
         let error = manifest_error(&yaml);
         assert!(
             error.contains("declares query, which only applies to runtime rego"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn parallel_mode_is_accepted_on_an_inspect_only_input_hook() {
+        let yaml = replace_once(
+            AI_INPUT_JS_MANIFEST,
+            "      body_mode: none",
+            "      body_mode: none\n      mode: parallel",
+        );
+        let manifest = parse_manifest(&yaml);
+        assert_eq!(
+            manifest.hooks[0].execution.mode,
+            BundleExecutionMode::Parallel
+        );
+        assert!(!manifest.hooks[0].execution.mutates);
+    }
+
+    #[test]
+    fn parallel_mode_cannot_combine_with_mutates() {
+        let yaml = replace_once(
+            AI_INPUT_JS_MANIFEST,
+            "      body_mode: none",
+            "      body_mode: none\n      mutates: true\n      mode: parallel",
+        );
+        let error = manifest_error(&yaml);
+        assert!(
+            error.contains("parallel") && error.contains("mutates"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn parallel_mode_is_refused_on_output_hooks() {
+        let yaml = AI_INPUT_JS_MANIFEST
+            .replace("kind: ai_guardrail_input", "kind: ai_guardrail_output")
+            .replace(
+                "      body_mode: none",
+                "      body_mode: none\n      mode: parallel",
+            );
+        let error = manifest_error(&yaml);
+        assert!(
+            error.contains("parallel") && error.contains("ai_guardrail_input"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn parallel_mode_cannot_combine_with_observe() {
+        let yaml = replace_once(
+            AI_INPUT_JS_MANIFEST,
+            "    export: inspect\n    execution:",
+            "    export: inspect\n    enforcement_mode: observe\n    execution:",
+        );
+        let yaml = replace_once(
+            &yaml,
+            "      body_mode: none",
+            "      body_mode: none\n      mode: parallel",
+        );
+        let error = manifest_error(&yaml);
+        assert!(
+            error.contains("parallel") && error.contains("observe"),
             "{error}"
         );
     }

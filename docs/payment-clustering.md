@@ -1,6 +1,6 @@
 # Payment clustering
 
-*Last modified: 2026-08-09*
+*Last modified: 2026-08-28*
 
 A node that configures both `proxy.payments` and `proxy.cluster` refuses to
 start. That refusal is the largest limitation on settlement: payments run on
@@ -60,7 +60,11 @@ that withholds a fresh challenge matches on a derived payer key, so a stuck
 payment normally withholds the route from the payer it stranded rather than
 from everyone. An intent minted with no payer scope has no such key, and it
 withholds the route from every caller on that route on the mere possibility
-that one of them is the stranded payer. Those rows, and only those, now age
+that one of them is the stranded payer. On x402, a successful `/verify`
+fills that NULL with a hashed facilitator payer, after which unidentified
+callers of the same route are billable again; the same anonymous wallet's
+next challenge is still unidentified at mint time. Those remaining
+unattributable rows, and only those, now age
 out. Past a grace window beyond the challenge expiry they move to
 `IntentStatus::Stranded`, which releases the route gate and nothing else: the
 attempt stays on the reconciliation queue, the failure category stays

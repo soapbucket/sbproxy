@@ -1232,3 +1232,7 @@ callers and removed the fixed-port test helpers that had been reachable only
 from tests; this branch adds nothing to either bucket beyond the two already
 recorded above. The gap to main's own 1523 is this branch's own items, counted
 here and not there, for the reasons written against them.
+
+2026-08-29 (WOR-2421): unreferenced 1525 -> 1524. Parallel-input chain
+predicates and the session wait helper are cfg(test) rather than pub, so
+they leave this bucket and rustc polices them.
