@@ -266,7 +266,10 @@ impl TtlCache {
             // heap, and an attacker who can read it can already read whatever
             // key would have sealed it, so sealing it would buy nothing. See
             // the guardrail about not encrypting memory-only caches.
-            if rec.material.is_plaintext() {
+            // The record, not the field. `prev_material` is a second slot
+            // that can hold plaintext after a rotation, and this guard
+            // predates it (WOR-2567).
+            if rec.carries_plaintext() {
                 tracing::debug!(
                     credential_id = %rec.id,
                     "not publishing a plaintext credential to the second cache tier; \

@@ -34,11 +34,20 @@
 //! ciphertext names the version that made it and Vault decrypts against
 //! that version until the operator explicitly trims it.
 //!
-//! # Blocking
+//! # Blocking, and the trace context
 //!
 //! `ureq`, like every other backend here. Callers that need this from an
 //! async context wrap it in `spawn_blocking`, the same way
 //! [`crate::resolver`] already does for the read path.
+//!
+//! Unlike the read backends, these calls sit on the credential-resolution
+//! path, so there is a customer request behind them and a trace for them to
+//! join. `spawn_blocking` loses the ambient span context across the thread
+//! boundary, so the caller captures
+//! [`sbproxy_observe::telemetry::outbound_trace_headers`] on the async side
+//! and hands the pairs in. That is why every method here takes a `trace`
+//! slice rather than reading the context itself: reading it in here would
+//! read it on the wrong thread and silently produce nothing.
 
 use std::time::Duration;
 
@@ -120,28 +129,37 @@ impl TransitClient {
         )
     }
 
-    fn stamp(&self, req: ureq::Request) -> ureq::Request {
+    fn stamp(&self, req: ureq::Request, trace: &[(&'static str, String)]) -> ureq::Request {
         let mut req = req.set("X-Vault-Token", &self.config.token);
         if let Some(ns) = &self.config.namespace {
             req = req.set("X-Vault-Namespace", ns);
+        }
+        for (name, value) in trace {
+            req = req.set(name, value);
         }
         req.timeout(TRANSIT_TIMEOUT)
     }
 
     /// Encrypt a data key, returning Vault's opaque ciphertext string.
     ///
+    /// `trace` is the W3C propagation pairs the caller captured on the
+    /// async side; empty for a call with no request behind it.
+    ///
     /// # Errors
     ///
     /// Any transport failure, any non-2xx status (403 is the revoked-grant
     /// case and is reported as such), or a response missing
     /// `.data.ciphertext`. The error text never carries the plaintext.
-    pub fn wrap(&self, plaintext: &[u8]) -> Result<String> {
+    pub fn wrap(&self, plaintext: &[u8], trace: &[(&'static str, String)]) -> Result<String> {
         let url = self.url("encrypt");
         let body = serde_json::json!({
             "plaintext": base64::engine::general_purpose::STANDARD.encode(plaintext),
         });
         let response = self
-            .stamp(ureq::post(&url).set("Content-Type", "application/json"))
+            .stamp(
+                ureq::post(&url).set("Content-Type", "application/json"),
+                trace,
+            )
             .send_json(body)
             .map_err(|e| transit_error("encrypt", &url, e))?;
         let json: serde_json::Value = response
@@ -156,15 +174,20 @@ impl TransitClient {
 
     /// Decrypt a ciphertext previously produced by [`Self::wrap`].
     ///
+    /// `trace` as [`Self::wrap`].
+    ///
     /// # Errors
     ///
     /// As [`Self::wrap`], plus a `.data.plaintext` that is not valid
     /// base64.
-    pub fn unwrap(&self, ciphertext: &str) -> Result<Vec<u8>> {
+    pub fn unwrap(&self, ciphertext: &str, trace: &[(&'static str, String)]) -> Result<Vec<u8>> {
         let url = self.url("decrypt");
         let body = serde_json::json!({ "ciphertext": ciphertext });
         let response = self
-            .stamp(ureq::post(&url).set("Content-Type", "application/json"))
+            .stamp(
+                ureq::post(&url).set("Content-Type", "application/json"),
+                trace,
+            )
             .send_json(body)
             .map_err(|e| transit_error("decrypt", &url, e))?;
         let json: serde_json::Value = response
@@ -182,15 +205,19 @@ impl TransitClient {
 
     /// Confirm the key exists and this token is still authorized for it.
     ///
+    /// `trace` as [`Self::wrap`]. The background probe passes an empty
+    /// slice: it runs on a timer with no request behind it, so there is no
+    /// trace for it to join.
+    ///
     /// # Errors
     ///
     /// Any transport failure or non-2xx status. A 403 here is the signal an
     /// operator wants: the customer revoked the grant and the deployment's
     /// remaining decrypt capability is bounded by whatever unwrap cache is
     /// still warm.
-    pub fn liveness(&self) -> Result<()> {
+    pub fn liveness(&self, trace: &[(&'static str, String)]) -> Result<()> {
         let url = self.url("keys");
-        self.stamp(ureq::get(&url))
+        self.stamp(ureq::get(&url), trace)
             .call()
             .map_err(|e| transit_error("keys", &url, e))?;
         Ok(())

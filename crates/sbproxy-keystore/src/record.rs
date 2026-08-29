@@ -525,11 +525,16 @@ impl std::fmt::Debug for CredentialMaterial {
 impl CredentialMaterial {
     /// Whether this material carries a raw, unsealed secret.
     ///
-    /// Callers use this to keep plaintext material out of shared or persistent
-    /// surfaces. [`Self::VaultRef`] holds only a reference and
-    /// [`Self::Envelope`] is already sealed, so both are safe to hand onward;
-    /// [`Self::Plaintext`] is the secret itself.
-    pub fn is_plaintext(&self) -> bool {
+    /// [`Self::VaultRef`] holds only a reference and [`Self::Envelope`] is
+    /// already sealed, so both are safe to hand onward; [`Self::Plaintext`]
+    /// is the secret itself.
+    ///
+    /// Crate-private on purpose. Callers outside this crate want
+    /// [`CredentialRecord::carries_plaintext`], which asks the *record*
+    /// rather than one of its material slots: a record has carried two
+    /// since WOR-2567, and a guard that reads one slot is a guard a
+    /// rotation walks past.
+    pub(crate) fn is_plaintext(&self) -> bool {
         matches!(self, Self::Plaintext { .. })
     }
 }
@@ -640,6 +645,30 @@ impl CredentialRecord {
         (expires > now)
             .then_some(self.prev_material.as_ref())
             .flatten()
+    }
+
+    /// Whether this record carries a raw, unsealed secret in *any* of its
+    /// material slots.
+    ///
+    /// [`CredentialMaterial::is_plaintext`] answers the question for one
+    /// slot. This answers it for the record, and the difference is load
+    /// bearing: WOR-2567 gave a record a second slot, `prev_material`, and
+    /// the two guards that keep plaintext off shared surfaces (the mesh
+    /// keystore's `put_credential` and the TTL cache's second-tier
+    /// publish) were both written when there was only one. A rotation of a
+    /// plaintext-seeded credential would have moved that plaintext into
+    /// `prev_material`, where both guards would have looked straight past
+    /// it and replicated the raw secret onto every replica shard's disk.
+    ///
+    /// So the guards ask the record, not the field. A third slot added
+    /// later is covered here, in one place, rather than by remembering to
+    /// widen two call sites in another crate.
+    pub fn carries_plaintext(&self) -> bool {
+        self.material.is_plaintext()
+            || self
+                .prev_material
+                .as_ref()
+                .is_some_and(CredentialMaterial::is_plaintext)
     }
 
     /// Days since this credential's material was last rotated, or since it
@@ -1006,5 +1035,68 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// WOR-2567: the rotation overlap gave a record a second material
+    /// slot, and the two guards that keep plaintext off shared surfaces
+    /// were both written when there was only one.
+    ///
+    /// The failure this pins is a rotation of a plaintext-seeded
+    /// credential: the plaintext moves from `material` into
+    /// `prev_material`, where a guard reading only `material` sees an
+    /// envelope and replicates the raw secret onto every replica shard's
+    /// disk and into the shared cache tier. The record answers, not the
+    /// field, so a third slot is covered here rather than by remembering
+    /// to widen two call sites in another crate.
+    #[test]
+    fn a_rotation_cannot_hide_plaintext_in_the_previous_material_slot() {
+        let now = now();
+        let mut record = CredentialRecord {
+            id: "cred-rot".to_string(),
+            name: "cred-rot".to_string(),
+            provider: None,
+            kind: default_cred_kind(),
+            header: default_cred_header(),
+            scheme: default_cred_scheme(),
+            material: CredentialMaterial::Plaintext {
+                value: "sk-seeded-in-the-clear".to_string(),
+            },
+            status: RecordStatus::Active,
+            tenant_id: None,
+            metadata: BTreeMap::new(),
+            created_at: now,
+            updated_at: now,
+            source: RecordSource::Config,
+            rotated_at: None,
+            prev_material: None,
+            prev_material_expires_at: None,
+        };
+        assert!(record.carries_plaintext(), "the pre-rotation state");
+
+        // Rotate: the plaintext moves one slot to the left, and the
+        // current slot becomes a vault reference that looks perfectly
+        // safe on its own.
+        record.prev_material = Some(std::mem::replace(
+            &mut record.material,
+            CredentialMaterial::VaultRef {
+                reference: "vault://secret/cred-rot".to_string(),
+            },
+        ));
+        record.prev_material_expires_at = Some(now + Duration::seconds(300));
+        record.rotated_at = Some(now);
+
+        assert!(
+            !record.material.is_plaintext(),
+            "the field-level check is exactly what stops seeing it, which is the point"
+        );
+        assert!(
+            record.carries_plaintext(),
+            "a rotation must not launder plaintext into a slot the guards do not read"
+        );
+
+        // Once the overlap is dropped, nothing is in the clear again.
+        record.prev_material = None;
+        record.prev_material_expires_at = None;
+        assert!(!record.carries_plaintext());
     }
 }

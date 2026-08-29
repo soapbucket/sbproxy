@@ -582,13 +582,18 @@ impl KeyStore for MeshKeyStore {
     }
 
     async fn put_credential(&self, record: CredentialRecord) -> Result<()> {
-        if record.material.is_plaintext() {
+        // The record, not the field: a rotation leaves the pre-rotation
+        // material in `prev_material`, and a guard that only reads
+        // `material` would replicate a plaintext secret that moved one
+        // slot to the left (WOR-2567).
+        if record.carries_plaintext() {
             anyhow::bail!(
                 "mesh keystore refuses credential '{}': plaintext material would replicate \
                  the raw secret onto every replica shard's disk. Store it as an AEAD envelope \
                  (hand the admin API or the config seed a 'secret', which is sealed under the \
                  master key) or as a vault reference ('vault_ref'), neither of which \
-                 replicates plaintext",
+                 replicates plaintext. This covers the material a rotation retired as well as \
+                 the current one",
                 record.id
             );
         }

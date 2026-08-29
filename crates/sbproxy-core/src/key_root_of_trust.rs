@@ -129,7 +129,10 @@ impl CustomerManagedRoot {
     /// Whatever the key service reported. A 403 is the revoked-grant case.
     pub async fn probe_liveness(&self) -> Result<()> {
         let client = self.client.clone();
-        let result = tokio::task::spawn_blocking(move || client.liveness())
+        // Empty: the probe runs on a timer with no request behind it, so
+        // there is no trace for it to join. The wrap and unwrap paths below
+        // do have one and carry it.
+        let result = tokio::task::spawn_blocking(move || client.liveness(&[]))
             .await
             .context("root-of-trust liveness probe task panicked")?;
         let ok = result.is_ok();
@@ -190,7 +193,12 @@ impl RootOfTrust for CustomerManagedRoot {
     async fn wrap_dek(&self, dek: &[u8]) -> Result<String> {
         let client = self.client.clone();
         let dek = dek.to_vec();
-        let wrapped = tokio::task::spawn_blocking(move || client.wrap(&dek))
+        // Captured here, on the async side, inside the request's span.
+        // `spawn_blocking` loses the ambient context across the thread
+        // boundary, so reading it inside the closure would read it on the
+        // wrong thread and produce nothing.
+        let trace = sbproxy_observe::telemetry::outbound_trace_headers(None);
+        let wrapped = tokio::task::spawn_blocking(move || client.wrap(&dek, &trace))
             .await
             .context("root-of-trust wrap task panicked")?;
         sbproxy_observe::metrics::record_root_of_trust_operation("wrap", wrapped.is_ok());
@@ -204,7 +212,8 @@ impl RootOfTrust for CustomerManagedRoot {
         }
         let client = self.client.clone();
         let ciphertext = wrapped.to_string();
-        let result = tokio::task::spawn_blocking(move || client.unwrap(&ciphertext))
+        let trace = sbproxy_observe::telemetry::outbound_trace_headers(None);
+        let result = tokio::task::spawn_blocking(move || client.unwrap(&ciphertext, &trace))
             .await
             .context("root-of-trust unwrap task panicked")?;
         sbproxy_observe::metrics::record_root_of_trust_operation("unwrap", result.is_ok());
