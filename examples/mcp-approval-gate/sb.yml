@@ -1,0 +1,32 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Gateway-originated MCP approval hold (WOR-2454).
+#
+# tools/call for reports.hello is parked until an operator approves the
+# content snapshot. The caller's HTTP connection is not held open:
+# look for JSON-RPC -32097 and POST /api/mcp/approvals/{id}/approve.
+#
+# Run (from the repository root):
+#   sbproxy serve -f examples/mcp-approval-gate/sb.yml
+
+proxy:
+  http_bind_port: 8080
+  admin:
+    enabled: true
+    port: 9900
+
+origins:
+  "mcp.example.com":
+    action:
+      type: mcp
+      mode: gateway
+      server_info:
+        name: approval-demo
+        version: "1.0.0"
+      approval:
+        store: /tmp/sbproxy-mcp-approval-holds.json
+        hold_ttl: 15m
+        tools:
+          - name: reports.hello
+      federated_servers:
+        - origin: https://test.sbproxy.dev/mcp
+          prefix: reports

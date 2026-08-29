@@ -120,7 +120,7 @@ use sbproxy_extension::mcp::rollout::{
 use sbproxy_extension::mcp::sessions::SessionStore;
 use sbproxy_extension::mcp::{
     EgressPolicy, FederationIoSettings, McpFederation, McpServerConfig, NamespaceMode,
-    ToolAccessPolicy, ToolQuotaStore, ToolVersioningGate, VersioningMode,
+    ToolAccessDecision, ToolAccessPolicy, ToolQuotaStore, ToolVersioningGate, VersioningMode,
 };
 use sbproxy_extension::rego::CompiledRego;
 use sbproxy_security::span::{cap_spans, DetectionSpan};
@@ -146,6 +146,14 @@ pub struct McpActionConfig {
     /// reference a label in this table. WOR-186.
     #[serde(default)]
     pub rbac_policies: HashMap<String, ToolAccessPolicy>,
+    /// Durable grant ledger for time-boxed `tool_access[].ttl` rows
+    /// (WOR-2386). Required when any rule sets `ttl`.
+    #[serde(default)]
+    pub(crate) grant_ledger: Option<McpGrantLedgerConfig>,
+    /// Gateway-originated approval gate for high-risk tool calls
+    /// (WOR-2454). Absent keeps Cedar `@confirm` as a refusal.
+    #[serde(default)]
+    pub(crate) approval: Option<McpApprovalConfig>,
     /// Optional Cedar ABAC policy for MCP tool calls (WOR-2587). Runs
     /// ALONGSIDE `rbac_policies` above, not instead of it. See the
     /// module docs' `cedar_policies:` section and
@@ -367,6 +375,57 @@ pub struct McpAuditConfig {
     /// the full tradeoff.
     #[serde(default)]
     pub capture_arguments: bool,
+}
+
+/// Durable path for the time-boxed grant ledger (WOR-2386).
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct McpGrantLedgerConfig {
+    /// Owner-only JSON file the ledger is loaded from and rewritten to.
+    pub path: String,
+}
+
+/// Gateway-originated approval gate (WOR-2454).
+///
+/// Approvals are surfaced on the admin API (`GET`/`POST /api/mcp/approvals`)
+/// and, optionally, a webhook. A console page is deferred: the JSON
+/// routes are the operator surface. The caller's HTTP connection is
+/// never held open; an unanswered hold expires rather than stalling
+/// the route.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct McpApprovalConfig {
+    /// Owner-only JSON file that survives a restart.
+    pub store: String,
+    /// How long a pending hold waits for an operator. Same duration
+    /// strings as `tool_quotas[].rate.per`. Defaults to `15m`.
+    #[serde(default)]
+    pub hold_ttl: Option<String>,
+    /// Optional notification URL, SSRF-checked at compile time. The
+    /// body carries hold id, origin, tool name, snapshot, and reason;
+    /// never arguments or secrets.
+    #[serde(default)]
+    pub webhook: Option<String>,
+    /// Tools that always require a gateway-originated hold. Prefer
+    /// `digest` (rename-proof). `name` is a trailing-`*` glob and is
+    /// the weaker form a rename escapes.
+    #[serde(default)]
+    pub tools: Vec<sbproxy_extension::mcp::ApprovalSelector>,
+}
+
+/// Compiled approval gate held on [`McpAction`].
+pub struct CompiledMcpApproval {
+    /// Durable hold table.
+    pub store: Arc<sbproxy_extension::mcp::PendingConfirmStore>,
+    /// Pending-hold lifetime.
+    pub hold_ttl: Duration,
+    /// Optional notification URL, already SSRF-validated.
+    pub webhook: Option<url::Url>,
+    /// Host of [`Self::webhook`], for a pinned dial.
+    pub webhook_host: Option<String>,
+    /// Addresses [`Self::webhook`] resolved to at compile. The POST
+    /// pins to these so a later DNS rebind cannot retarget the body.
+    pub webhook_addrs: Vec<std::net::SocketAddr>,
+    /// Tools that always park.
+    pub tools: Vec<sbproxy_extension::mcp::ApprovalSelector>,
 }
 
 /// `content_filters:` block (WOR-2384, MCP01/MCP10): secret- and
@@ -1620,12 +1679,21 @@ pub const MCP_POLICY_HOOK_REASON: &str = "policy_hook";
 pub const MCP_POLICY_HOOK_DENY_RULE_ID: &str = "policy_hook_deny";
 
 /// `sbproxy.decision.rule_id` for an `McpPolicyHook` `Confirm` verdict
-/// (WOR-2587 review). PR beta's dispatcher currently denies a Confirm
-/// rather than parking it for approval (no `PendingConfirmStore` in
-/// OSS yet); this rule id lets a SIEM rule distinguish "denied
-/// outright" from "would have been held for human approval" even
-/// while both answer the caller the same way.
+/// (WOR-2587 / WOR-2454). When `approval:` is configured the call is
+/// parked; without it the dispatcher still refuses. This rule id lets
+/// a SIEM distinguish Confirm from an outright deny either way.
 pub const MCP_POLICY_HOOK_CONFIRM_RULE_ID: &str = "policy_hook_confirm";
+
+/// `sbproxy.decision.reason` for a time-boxed RBAC grant that has
+/// elapsed (WOR-2386, MCP02).
+pub const MCP_GRANT_EXPIRED_REASON: &str = "grant_expired";
+
+/// `sbproxy.decision.reason` for a gateway-originated approval hold
+/// (WOR-2454).
+pub const MCP_APPROVAL_HOLD_REASON: &str = "approval_hold";
+
+/// `sbproxy.decision.rule_id` for a parked high-risk tool call.
+pub const MCP_APPROVAL_HOLD_RULE_ID: &str = "approval_hold";
 
 /// One entry in the gateway-level guardrails list.
 #[derive(Debug, Clone, Deserialize)]
@@ -1893,6 +1961,12 @@ pub struct McpAction {
     /// Named RBAC policies declared at the top level. Looked up by
     /// the per-server `rbac` label at `tools/call` time. WOR-186.
     pub rbac_policies: HashMap<String, ToolAccessPolicy>,
+    /// Time-boxed grant clock (WOR-2386). In-memory when no path was
+    /// configured and no rule has a `ttl`.
+    pub grant_ledger: Arc<sbproxy_extension::mcp::GrantLedger>,
+    /// Gateway-originated approval gate (WOR-2454). `None` when the
+    /// `approval:` block is absent; Cedar `@confirm` then stays a refusal.
+    pub approval: Option<CompiledMcpApproval>,
     /// Underlying federation handle from `sbproxy-extension`.
     pub federation: Arc<McpFederation>,
     /// Compiled tool-rollout plan (`tool_versioning.rollout`):
@@ -4656,7 +4730,85 @@ impl McpAction {
             policy.validate_quota_windows().map_err(|error| {
                 anyhow::anyhow!("mcp action: rbac_policies['{label}']: {error}")
             })?;
+            policy.validate_grant_ttls().map_err(|error| {
+                anyhow::anyhow!("mcp action: rbac_policies['{label}']: {error}")
+            })?;
         }
+
+        let needs_durable_grants = cfg
+            .rbac_policies
+            .values()
+            .any(ToolAccessPolicy::has_time_boxed_grants);
+        if needs_durable_grants && cfg.grant_ledger.is_none() {
+            anyhow::bail!(
+                "mcp action: tool_access[].ttl is set but grant_ledger.path is missing; \
+                 a restart would silently extend every grant"
+            );
+        }
+        let grant_ledger = match &cfg.grant_ledger {
+            Some(ledger) => Arc::new(
+                sbproxy_extension::mcp::GrantLedger::load(std::path::Path::new(&ledger.path))
+                    .map_err(|error| {
+                        anyhow::anyhow!("mcp action: grant_ledger.path '{}': {error}", ledger.path)
+                    })?,
+            ),
+            None => Arc::new(sbproxy_extension::mcp::GrantLedger::in_memory()),
+        };
+
+        let approval = match &cfg.approval {
+            Some(approval) => {
+                let hold_ttl = match approval.hold_ttl.as_deref() {
+                    Some(ttl) => sbproxy_extension::mcp::parse_grant_ttl(ttl).map_err(|error| {
+                        anyhow::anyhow!("mcp action: approval.hold_ttl '{ttl}': {error}")
+                    })?,
+                    None => Duration::from_secs(15 * 60),
+                };
+                let mut webhook_host = None;
+                let mut webhook_addrs = Vec::new();
+                let webhook = match approval.webhook.as_deref() {
+                    Some(raw) => {
+                        let parsed = url::Url::parse(raw).map_err(|error| {
+                            anyhow::anyhow!("mcp action: approval.webhook: {error}")
+                        })?;
+                        let resolved =
+                            sbproxy_security::ssrf::validate_url_resolved(parsed.as_str(), &[])
+                                .map_err(|reason| {
+                                    anyhow::anyhow!(
+                                "mcp action: approval.webhook blocked by SSRF guard ({reason})"
+                            )
+                                })?;
+                        webhook_host = Some(resolved.host);
+                        webhook_addrs = resolved.addrs;
+                        Some(parsed)
+                    }
+                    None => None,
+                };
+                if approval
+                    .tools
+                    .iter()
+                    .any(|t| t.digest.is_none() && t.name.is_none())
+                {
+                    anyhow::bail!("mcp action: approval.tools[] entry needs digest or name");
+                }
+                let store = Arc::new(
+                    sbproxy_extension::mcp::PendingConfirmStore::load(std::path::Path::new(
+                        &approval.store,
+                    ))
+                    .map_err(|error| {
+                        anyhow::anyhow!("mcp action: approval.store '{}': {error}", approval.store)
+                    })?,
+                );
+                Some(CompiledMcpApproval {
+                    store,
+                    hold_ttl,
+                    webhook,
+                    webhook_host,
+                    webhook_addrs,
+                    tools: approval.tools.clone(),
+                })
+            }
+            None => None,
+        };
 
         // WOR-2384 fix round 1, item 1 (critical): federation's
         // OUTBOUND leg speaks only `LEGACY_PROTOCOL_VERSION` today.
@@ -5207,6 +5359,8 @@ impl McpAction {
             server_version,
             prefixes,
             rbac_policies: cfg.rbac_policies,
+            grant_ledger,
+            approval,
             federation,
             rollout_plan,
             tool_allowlist,
@@ -5754,6 +5908,45 @@ impl McpAction {
         self.rbac_policies.get(label)
     }
 
+    /// RBAC plus time-boxed grant check (WOR-2386).
+    pub fn authorize_tool(
+        &self,
+        principal: &sbproxy_plugin::Principal,
+        server_name: &str,
+        tool: &str,
+    ) -> ToolAccessDecision {
+        match self.policy_for_server(server_name) {
+            Some(policy) => {
+                let label = self
+                    .prefix_for(server_name)
+                    .and_then(|p| p.rbac.as_deref())
+                    .unwrap_or("");
+                policy.check_with_ledger(
+                    principal,
+                    tool,
+                    label,
+                    self.server_name.as_str(),
+                    &self.grant_ledger,
+                    std::time::SystemTime::now(),
+                )
+            }
+            None => ToolAccessDecision::Allow,
+        }
+    }
+
+    /// True when the principal may invoke the tool right now.
+    pub fn tool_is_granted(
+        &self,
+        principal: &sbproxy_plugin::Principal,
+        server_name: &str,
+        tool: &str,
+    ) -> bool {
+        matches!(
+            self.authorize_tool(principal, server_name, tool),
+            ToolAccessDecision::Allow
+        )
+    }
+
     /// Registry approval status for a federated server (WOR-2384,
     /// MCP09). An unknown server name returns the default
     /// (`approved`), matching the "unknown server means don't
@@ -5858,8 +6051,18 @@ impl McpAction {
             federation: Arc::clone(&self.federation),
             prefixes: self.prefixes.clone(),
             rbac_policies: self.rbac_policies.clone(),
+            grant_ledger: Arc::clone(&self.grant_ledger),
+            grant_origin: self.server_name.clone(),
             tool_allowlist: self.tool_allowlist.clone(),
         })
+    }
+
+    /// Contract digest used to bind an approval to tool content, not
+    /// the advertised name (WOR-2454 / WOR-2444).
+    pub fn federated_tool_digest(tool: &sbproxy_extension::mcp::FederatedTool) -> String {
+        sbproxy_extension::mcp::compat::digest::contract_digest_v2(
+            &sbproxy_extension::mcp::compat::digest::contract_of(tool),
+        )
     }
 
     /// Look up the per-server prefix entry by name.
@@ -6124,6 +6327,8 @@ pub struct McpInjectSource {
     federation: Arc<McpFederation>,
     prefixes: HashMap<String, McpServerPrefix>,
     rbac_policies: HashMap<String, ToolAccessPolicy>,
+    grant_ledger: Arc<sbproxy_extension::mcp::GrantLedger>,
+    grant_origin: String,
     tool_allowlist: Option<HashSet<String>>,
 }
 
@@ -6163,8 +6368,20 @@ impl McpInjectSource {
             }
             // RBAC: skip a tool the owning upstream's policy denies.
             if let Some(policy) = self.policy_for_server(&entry.server_name) {
+                let label = self
+                    .prefixes
+                    .get(&entry.server_name)
+                    .and_then(|p| p.rbac.as_deref())
+                    .unwrap_or("");
                 if !matches!(
-                    policy.check(principal, &entry.name),
+                    policy.check_with_ledger(
+                        principal,
+                        &entry.name,
+                        label,
+                        &self.grant_origin,
+                        &self.grant_ledger,
+                        std::time::SystemTime::now(),
+                    ),
                     sbproxy_extension::mcp::ToolAccessDecision::Allow,
                 ) {
                     continue;
@@ -6309,6 +6526,65 @@ mod tests {
             "federated_servers": [{ "origin": "upstream.example.com" }]
         }))
         .expect("modern HTTP fixture must compile")
+    }
+
+    #[test]
+    fn ttl_without_grant_ledger_path_is_refused() {
+        let error = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "rbac_policies": {
+                "analyst": {
+                    "default_allow": false,
+                    "tool_access": [{
+                        "principals": [],
+                        "allowed": ["reports.hello"],
+                        "ttl": "1h"
+                    }]
+                }
+            },
+            "federated_servers": [{
+                "origin": "http://127.0.0.1:1/mcp",
+                "prefix": "reports",
+                "rbac": "analyst"
+            }]
+        }))
+        .expect_err("ttl without grant_ledger.path must fail compile");
+        let message = error.to_string();
+        assert!(
+            message.contains("grant_ledger.path"),
+            "compile error must name grant_ledger.path, got: {message}"
+        );
+    }
+
+    #[test]
+    fn unparseable_grant_ttl_is_refused() {
+        let error = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "grant_ledger": { "path": "/tmp/sbproxy-mcp-grants-compile-test.json" },
+            "rbac_policies": {
+                "analyst": {
+                    "default_allow": false,
+                    "tool_access": [{
+                        "principals": [],
+                        "allowed": ["reports.hello"],
+                        "ttl": "not-a-duration"
+                    }]
+                }
+            },
+            "federated_servers": [{
+                "origin": "http://127.0.0.1:1/mcp",
+                "prefix": "reports",
+                "rbac": "analyst"
+            }]
+        }))
+        .expect_err("unparseable ttl must fail compile");
+        let message = error.to_string();
+        assert!(
+            message.contains("ttl") || message.contains("duration"),
+            "compile error must name the ttl, got: {message}"
+        );
     }
 
     #[test]

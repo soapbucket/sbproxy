@@ -28,6 +28,11 @@ pub mod admin_federation;
 /// admin server (`/admin/keys`, `/admin/credentials`).
 pub mod admin_keys;
 pub mod admin_licensing;
+/// Time-boxed MCP grants and gateway-originated approval holds
+/// (`/api/mcp/grants`, `/api/mcp/approvals`). A console page is deferred.
+/// Time-boxed MCP grant ledger and gateway-originated approval holds
+/// (`GET`/`POST /api/mcp/grants`, `GET`/`POST /api/mcp/approvals`).
+pub mod admin_mcp_grants;
 pub mod admin_mcp_oauth;
 /// Attested-metering operator surface (`/api/meter/*`), WOR-2131: units
 /// with their provenance, the mesh coverage a total was assembled from,
