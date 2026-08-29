@@ -1291,7 +1291,14 @@ tree and locked here rather than carried at whichever number was true
 before the merge.
 
 2026-08-29 (WOR-2432/2455 closeout, merged with main at f8b547ff): recounted
-against the merged tree, tests-only 325 -> 324 and unreferenced 1525 -> 1524.
+against the merged tree. Tests-only 324, which is a **rise of one against
+main** (main carries 323) and the number that needs justifying: it is the
+single item recorded above, `ConfigAuthority::rollback_to`. Unreferenced
+settled at 1523, level with main, after the confirmation round gave
+`FailedCandidate` a constructor and routed its five struct literals through
+it; that removed the last cross-file namer of its `reason` field, so the
+bucket lost one and the baseline is lowered to hold the ground rather than
+left at a number the tree no longer needs.
 Both numbers conflicted on this merge and neither side described the tree they
 make together: this branch carried 325/1525, main carried 323/1523, and the
 merged tree is one above main on each because this branch's own addition
@@ -1299,4 +1306,3 @@ merged tree is one above main on each because this branch's own addition
 main's own narrowings are not this branch's to claim. Nothing was narrowed to
 reach these figures; they are `scan-pub-item-usage.py --count` run against the
 merged tree, which is the only thing that describes it.
-

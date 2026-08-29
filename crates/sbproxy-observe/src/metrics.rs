@@ -4152,8 +4152,12 @@ pub fn record_config_authority_announce(result: &'static str) {
 /// finish", and every refusal below finishes cleanly, so it reads `ok`.
 /// This answers the different question an operator actually has:
 /// **is configuration still reaching this SBProxy's pods, and if not,
-/// why.** Every state but `delivered` means a pass completed without
-/// the ConfigMap or the workload being applied.
+/// why.** Every state but `delivered` and `delivered_unowned_skipped`
+/// means a pass completed without the ConfigMap or the workload being
+/// applied. A hot reload records one of the two delivered states and
+/// deliberately skips the workload patch, because advancing the pod
+/// template's config-hash annotation would restart pods the reload just
+/// spared.
 ///
 /// `state` is a closed string:
 ///
@@ -4164,6 +4168,7 @@ pub fn record_config_authority_announce(result: &'static str) {
 /// | `refused_auto_revert` | The referenced config arms `proxy.config_history.soak.auto_revert`, which this operator refuses. Permanent until the config changes. |
 /// | `refused_acme` | A multi-replica SBProxy drives ACME from a pod-local certificate store. |
 /// | `refused_invalid_config` | The referenced `SBProxyConfig` did not validate, or the clustered render failed. |
+/// | `delivered_unowned_skipped` | Delivered by hot reload to every pod this operator's workload created, while one or more pods carrying the same instance label were skipped because it did not create them. They were never sent the admin credential and are not reloaded or restarted by this operator. |
 pub fn record_operator_config_delivery(state: &'static str) {
     use prometheus::{register_int_counter_vec, IntCounterVec};
     use std::sync::OnceLock;
@@ -4243,7 +4248,7 @@ pub fn record_operator_fallback_probe(outcome: &'static str) {
 /// | Result | Meaning |
 /// |---|---|
 /// | `published` | The payload revalidated and went out under a new revision. |
-/// | `refused` | Nothing was published: no target, a revision the ring does not hold, or a payload that no longer validates. The served bundle is untouched. Whether a revision number was spent depends on how far it got: every validation refusal costs nothing, a signing or store failure has already reserved. The admin response's `revision_consumed` says which. |
+/// | `refused` | Nothing was published: no target, a revision the ring does not hold, or a payload that no longer validates. The served bundle is untouched. Whether a revision number was spent depends on how far it got, and the code does not answer it: every validation refusal costs nothing, `signing_failed` and `internal` are always past the reservation, and `store_failed` falls on either side of it because the store both reserves the number and persists the bundle. The admin response's `revision_consumed` is the only field that says which. |
 pub fn record_config_authority_rollback(target: &'static str, result: &'static str) {
     use prometheus::{register_int_counter_vec, IntCounterVec};
     use std::sync::OnceLock;

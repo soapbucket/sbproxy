@@ -3111,10 +3111,21 @@ fn boot_document(
         // An empty ring is a first boot: exit exactly the way `off`
         // does, saying the ring was empty rather than pretending a
         // fallback was attempted.
+        // Scrubbed on the way out, like the pin and the log line above.
+        // This error is printed by `eprintln!("Fatal: ...")`, which in
+        // Kubernetes is pod logs: a wider audience than the operator's
+        // own terminal, and wider than the config file they already
+        // hold. `--config-fallback=off` still returns the raw error and
+        // that path is not this change's to widen.
         Err(failure @ crate::config_boot::BootWalkFailure::RingEmpty)
         | Err(failure @ crate::config_boot::BootWalkFailure::StoreUnavailable(_)) => {
-            Err(primary.context(format!("{failure}")))
+            Err(anyhow::anyhow!(
+                "{}: {failure}",
+                crate::config_boot::scrub_boot_failure(&format!("{primary:#}")),
+            ))
         }
+        // Already sanitized: every `FailedCandidate::reason` this
+        // renders went through the same function when it was built.
         Err(failure) => Err(anyhow::anyhow!("{failure}")),
     }
 }

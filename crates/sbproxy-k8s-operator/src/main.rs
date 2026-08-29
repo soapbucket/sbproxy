@@ -827,17 +827,36 @@ async fn reconcile_deployment_workload(
     require_config_push_allowed(suspension, ns, name)?;
 
     if hot_reload_eligible {
-        // Best-effort hot-reload across every running proxy pod.
-        // If any pod fails, we fall through to the rollout-restart
-        // path so the cluster is never left in a half-reloaded
-        // state.
+        // Best-effort hot-reload across every proxy pod this operator's
+        // workload created. If any of them fails, we fall through to the
+        // rollout-restart path so the workload is never left in a
+        // half-reloaded state.
+        //
+        // A pod carrying the instance label that this workload did not
+        // create is skipped rather than failed, and that is deliberate.
+        // Erroring would fall through to the rollout restart, which
+        // patches the workload's own pod template and therefore cannot
+        // reach the very pod that was skipped; it would restart every
+        // healthy owned pod on every config change, forever, and leave
+        // the unowned one exactly as stale as before. So the owned fleet
+        // is what `Ok` claims, the skipped pods are counted rather than
+        // silently absorbed, and an operator who orphaned pods on
+        // purpose owns them from that point on.
         match try_hot_reload(&ctx.client, sbproxy, ns).await {
-            Ok(()) => {
+            Ok(outcome) => {
                 tracing::info!(
                     name = %name,
                     namespace = %ns,
                     config_revision = %hash,
-                    "hot-reloaded all proxy pods via /admin/reload"
+                    unowned_skipped = outcome.unowned_skipped,
+                    "hot-reloaded every proxy pod this workload created via /admin/reload"
+                );
+                sbproxy_observe::metrics::record_operator_config_delivery(
+                    if outcome.unowned_skipped == 0 {
+                        "delivered"
+                    } else {
+                        "delivered_unowned_skipped"
+                    },
                 );
                 // Skip the Deployment patch entirely: the pod template's
                 // config-hash annotation is the rolling-restart trigger, so
@@ -996,12 +1015,21 @@ async fn reconcile_clustered_workload(
 
     if hot_reload_eligible {
         match try_hot_reload(&ctx.client, sbproxy, ns).await {
-            Ok(()) => {
+            Ok(outcome) => {
                 tracing::info!(
                     name = %name,
                     namespace = %ns,
                     config_revision = %hash,
-                    "hot-reloaded all clustered proxy pods via /admin/reload"
+                    unowned_skipped = outcome.unowned_skipped,
+                    "hot-reloaded every clustered proxy pod this workload created via \
+                     /admin/reload"
+                );
+                sbproxy_observe::metrics::record_operator_config_delivery(
+                    if outcome.unowned_skipped == 0 {
+                        "delivered"
+                    } else {
+                        "delivered_unowned_skipped"
+                    },
                 );
                 return Ok(Action::requeue(Duration::from_secs(300)));
             }
@@ -1112,14 +1140,19 @@ async fn patch_status(ctx: &Ctx, ns: &str, name: &str, body: serde_json::Value) 
 /// Best-effort `POST /admin/reload` against every running proxy
 /// pod for the given `SBProxy`.
 ///
-/// Returns `Ok(())` only when every pod returned 200. Any pod that
-/// returns a non-200 (or fails to dial) propagates as `Err`, which
-/// triggers the rollout-restart fallback in `reconcile_one`.
+/// Returns `Ok` only when every pod this operator's workload created
+/// returned 200. Any pod that returns a non-200 (or fails to dial)
+/// propagates as `Err`, which triggers the rollout-restart fallback in
+/// `reconcile_one`.
+///
+/// The `Ok` value counts the pods that carried this SBProxy's instance
+/// label and were skipped because its workload did not create them, so
+/// the caller can say which kind of success this was.
 async fn try_hot_reload(
     client: &Client,
     sbproxy: &SBProxy,
     namespace: &str,
-) -> Result<(), HotReloadError> {
+) -> Result<HotReloadOutcome, HotReloadError> {
     let secret_ref = sbproxy
         .spec
         .admin_auth_secret_ref
@@ -1174,6 +1207,7 @@ async fn try_hot_reload(
     if owned.is_empty() {
         return Err(HotReloadError::NoPodsFound);
     }
+    let unowned_skipped = pods.items.len() - owned.len();
 
     let admin_port = sbproxy.spec.admin_port;
     let http = reqwest::Client::builder()
@@ -1212,7 +1246,21 @@ async fn try_hot_reload(
         }
     }
 
-    Ok(())
+    Ok(HotReloadOutcome { unowned_skipped })
+}
+
+/// What a successful hot reload actually covered.
+///
+/// A bare `Ok(())` could not distinguish "every labeled pod reloaded"
+/// from "every pod I own reloaded, and some sharing the label did not",
+/// and the caller skips the workload patch on both. That is the right
+/// call and it should not be silent, so the count travels with the
+/// success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HotReloadOutcome {
+    /// Pods carrying the instance label that this operator's workload
+    /// did not create. Never reloaded and never sent the credential.
+    unowned_skipped: usize,
 }
 
 /// Most pods one pass probes before it gives up and applies.
@@ -2130,6 +2178,76 @@ mod tests {
         );
     }
 
+    /// Drive `try_hot_reload` itself against a pod the operator did
+    /// not create, and assert the credential never leaves.
+    ///
+    /// The source counter proves the ownership call exists in the file.
+    /// It cannot prove the call *gates* the send: inverting the filter,
+    /// or iterating `pods.items` again after computing `owned`, leaves
+    /// both counts at two. This is the backstop the counter's own
+    /// disclosure names, for the path that did not have one.
+    #[tokio::test]
+    async fn the_reload_credential_never_reaches_a_pod_the_operator_did_not_create() {
+        use tower::ServiceExt as _;
+
+        // A stub on a real port, so a request that escapes the filter is
+        // counted rather than merely rejected somewhere downstream.
+        let stub = FallbackStub::start(r#"{"reloaded":true}"#);
+        let (sbp, _cfg) =
+            suspension_fixtures(i32::from(stub.port), "proxy:\n  http_bind_port: 8080\n");
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let path = request.uri().path().to_string();
+            async move {
+                let answer = if path.ends_with("/secrets/admin-auth") {
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Secret",
+                        "metadata": { "name": "admin-auth", "namespace": "sbproxy" },
+                        "data": { "authorization": "QmFzaWMgWVdSdGFXNDZjSGM9" },
+                    })
+                } else if path.ends_with("/pods") {
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "PodList",
+                        "metadata": {},
+                        // Carries the instance label the selector asks
+                        // for, and no controller owner reference: a bare
+                        // `kubectl run` by anyone with pods/create.
+                        "items": [{
+                            "apiVersion": "v1",
+                            "kind": "Pod",
+                            "metadata": {
+                                "name": "impostor-0",
+                                "namespace": "sbproxy",
+                                "ownerReferences": [],
+                            },
+                            "status": { "podIP": "127.0.0.1" },
+                        }],
+                    })
+                } else {
+                    serde_json::json!({
+                        "metadata": { "name": "applied", "namespace": "sbproxy" },
+                    })
+                };
+                Ok::<_, std::convert::Infallible>(json_response(&answer))
+            }
+        });
+        let client = Client::new(service.boxed_clone(), "sbproxy");
+
+        let outcome = try_hot_reload(&client, &sbp, "sbproxy").await;
+
+        assert!(
+            matches!(outcome, Err(HotReloadError::NoPodsFound)),
+            "every labeled pod was unowned, so there is nothing this operator may reload, and \
+             the caller must fall through to the rollout restart: {outcome:?}",
+        );
+        assert_eq!(
+            stub.requests(),
+            0,
+            "the admin credential must not be sent to a pod this operator did not create",
+        );
+    }
+
     /// A Blocker from the WOR-2467 review. A pod is selected for the
     /// probe by label, and a label is a value anyone with pod-create in
     /// the namespace can type. Before the owner gate, any pod answering
@@ -2261,9 +2379,18 @@ mod tests {
     /// an ownership filter, and adding a third sender without one moves
     /// these two numbers apart.
     ///
-    /// What it cannot see: a credential sent from another crate, or one
-    /// built with a differently spelled header call. Both are caught by
-    /// the driven-reconcile tests rather than here.
+    /// What it cannot see, stated rather than implied. It matches the
+    /// literal `header("authorization"`, so `.basic_auth(...)`,
+    /// `.bearer_auth(...)` and `.header(AUTHORIZATION, ...)` are all
+    /// invisible to it; none exists in this crate today, and this
+    /// assertion is what makes adding one a deliberate edit here. It
+    /// also cannot see whether a counted check actually *gates* its
+    /// send, because it counts occurrences and not control flow. That
+    /// half is covered by
+    /// `the_reload_credential_never_reaches_a_pod_the_operator_did_not_create`
+    /// and `a_labeled_pod_the_operator_did_not_create_is_neither_probed_nor_obeyed`,
+    /// one per credential path, which drive the real code against a
+    /// stub that counts what it was asked.
     #[test]
     fn every_credentialed_pod_request_is_filtered_by_ownership() {
         let src = production_source();

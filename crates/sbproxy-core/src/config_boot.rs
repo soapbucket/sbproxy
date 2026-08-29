@@ -178,22 +178,7 @@ impl PinnedRevision {
     /// anyone with read access to the namespace.
     #[must_use]
     pub fn with_reason(revision: u64, digest: String, reason: &str) -> Self {
-        let scrubbed = scrub_boot_failure(reason);
-        let flattened: String = scrubbed
-            .chars()
-            .map(|character| {
-                if character.is_control() {
-                    ' '
-                } else {
-                    character
-                }
-            })
-            .collect();
-        let trimmed = flattened.trim();
-        let bounded = match trimmed.char_indices().nth(MAX_FALLBACK_REASON_CHARS) {
-            Some((cut, _)) => format!("{}...", &trimmed[..cut]),
-            None => trimmed.to_string(),
-        };
+        let bounded = scrub_boot_failure(reason);
         Self {
             revision,
             digest,
@@ -202,16 +187,50 @@ impl PinnedRevision {
     }
 }
 
-/// Both scrubs a boot failure needs, in one place.
+/// Everything a boot failure needs before anything renders it, in one
+/// place: credential scrub, control-character flattening, trim, and the
+/// [`MAX_FALLBACK_REASON_CHARS`] bound.
 ///
-/// The pin serves this string on `GET /admin/config/fallback` and the
-/// boot walk logs it at `error!`, and the two have to remove the same
-/// things. They did not: the pin was scrubbed when it became a product
-/// surface and the log line beside it was left echoing an inlined
-/// credential verbatim. One function rather than two call sites is what
-/// keeps the next one from drifting the same way.
+/// # Every consumer, because a partial list is what went wrong here
+///
+/// This string is quoted from an operator-authored document, so it can
+/// carry an inlined credential the secret resolver echoes, an ANSI
+/// escape, or a whole document. It reaches four places:
+///
+/// * [`PinnedRevision::reason`], served by `GET /admin/config/fallback`
+///   and copied into a Kubernetes condition.
+/// * the boot walk's `error!` log line.
+/// * [`FailedCandidate::reason`], which
+///   [`BootWalkFailure::Exhausted`]'s `Display` renders into the error
+///   that reaches `eprintln!("Fatal: ...")`, and from there pod logs.
+/// * the primary document's own failure on the ring-empty and
+///   store-unavailable paths, same destination.
+///
+/// The first two were sanitized and the last two were not, while this
+/// function's own documentation claimed there were only two consumers.
+/// Naming all four is the point: the next one added has somewhere to
+/// look.
+///
+/// Not covered, deliberately: `--config-fallback=off` returns the raw
+/// error, exactly as it did before any of this existed. Widening that
+/// is a separate change to a path this one does not own.
 pub(crate) fn scrub_boot_failure(reason: &str) -> String {
-    redact_secret_echo(&sbproxy_config::scrub_credentials(reason))
+    let scrubbed = redact_secret_echo(&sbproxy_config::scrub_credentials(reason));
+    let flattened: String = scrubbed
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let trimmed = flattened.trim();
+    match trimmed.char_indices().nth(MAX_FALLBACK_REASON_CHARS) {
+        Some((cut, _)) => format!("{}...", &trimmed[..cut]),
+        None => trimmed.to_string(),
+    }
 }
 
 /// Replace the value the secret resolver echoes between single quotes.
@@ -251,7 +270,25 @@ pub struct FailedCandidate {
     /// Its content digest.
     pub digest: String,
     /// Why it did not boot, or why it was skipped.
+    ///
+    /// Built through the crate-private `FailedCandidate::new`, which
+    /// applies the same `scrub_boot_failure` the pin gets. Every one of
+    /// these is rendered into the fatal error by
+    /// [`BootWalkFailure::Exhausted`]'s `Display`, so an unsanitized
+    /// one reaches pod logs multiplied by the number of candidates
+    /// tried.
     pub reason: String,
+}
+
+impl FailedCandidate {
+    /// A candidate failure with its reason sanitized and bounded.
+    fn new(revision: u64, digest: String, reason: &str) -> Self {
+        Self {
+            revision,
+            digest,
+            reason: scrub_boot_failure(reason),
+        }
+    }
 }
 
 /// Why a fallback boot could not produce a document.
@@ -439,15 +476,15 @@ pub fn walk_for_bootable(
             // Already spent its budget on an earlier boot that died
             // before it could clear the counter.
             retire(&mut store, candidate.revision);
-            tried.push(FailedCandidate {
-                revision: candidate.revision,
-                digest: candidate.digest.clone(),
-                reason: format!(
+            tried.push(FailedCandidate::new(
+                candidate.revision,
+                candidate.digest.clone(),
+                &format!(
                     "already failed {} boot attempt(s), at or past the max_attempts of \
                      {max_attempts}; retired",
                     candidate.boot_attempts
                 ),
-            });
+            ));
             continue;
         }
         let attempts = match store.begin_boot_attempt(candidate.revision) {
@@ -456,11 +493,11 @@ pub fn walk_for_bootable(
                 // A counter that cannot be persisted would let this walk
                 // retry the same dead entry forever, so the candidate is
                 // skipped rather than tried.
-                tried.push(FailedCandidate {
-                    revision: candidate.revision,
-                    digest: candidate.digest.clone(),
-                    reason: format!("its boot attempt counter could not be persisted: {error}"),
-                });
+                tried.push(FailedCandidate::new(
+                    candidate.revision,
+                    candidate.digest.clone(),
+                    &format!("its boot attempt counter could not be persisted: {error}"),
+                ));
                 continue;
             }
         };
@@ -468,20 +505,20 @@ pub fn walk_for_bootable(
             Ok(bytes) => match String::from_utf8(bytes) {
                 Ok(yaml) => yaml,
                 Err(error) => {
-                    tried.push(FailedCandidate {
-                        revision: candidate.revision,
-                        digest: candidate.digest.clone(),
-                        reason: format!("its stored document is not UTF-8: {error}"),
-                    });
+                    tried.push(FailedCandidate::new(
+                        candidate.revision,
+                        candidate.digest.clone(),
+                        &format!("its stored document is not UTF-8: {error}"),
+                    ));
                     continue;
                 }
             },
             Err(error) => {
-                tried.push(FailedCandidate {
-                    revision: candidate.revision,
-                    digest: candidate.digest.clone(),
-                    reason: format!("its stored document could not be read: {error}"),
-                });
+                tried.push(FailedCandidate::new(
+                    candidate.revision,
+                    candidate.digest.clone(),
+                    &format!("its stored document could not be read: {error}"),
+                ));
                 continue;
             }
         };
@@ -504,11 +541,11 @@ pub fn walk_for_bootable(
                 if attempts >= max_attempts {
                     retire(&mut store, candidate.revision);
                 }
-                tried.push(FailedCandidate {
-                    revision: candidate.revision,
-                    digest: candidate.digest.clone(),
-                    reason: format!("attempt {attempts} of {max_attempts}: {reason}"),
-                });
+                tried.push(FailedCandidate::new(
+                    candidate.revision,
+                    candidate.digest.clone(),
+                    &format!("attempt {attempts} of {max_attempts}: {reason}"),
+                ));
             }
         }
     }
@@ -1094,6 +1131,43 @@ mod tests {
             None,
             "an empty reason is absent rather than an empty string",
         );
+    }
+
+    /// G8: the same string, on the path that renders every candidate.
+    ///
+    /// `BootWalkFailure::Exhausted`'s `Display` writes each candidate's
+    /// reason into the error that reaches `eprintln!("Fatal: ...")`, so
+    /// an unsanitized one is multiplied by the number of candidates
+    /// tried. The pin was sanitized and this was not.
+    #[test]
+    fn a_failed_candidate_reason_is_sanitized_like_the_pin() {
+        let hostile = format!(
+            "source.credential references the secret 'ghp_realtoken' at \u{1b}[2J{}",
+            "x".repeat(MAX_FALLBACK_REASON_CHARS * 2),
+        );
+        let candidate = FailedCandidate::new(4, "digest".to_string(), &hostile);
+
+        assert!(
+            !candidate.reason.contains("ghp_realtoken"),
+            "the resolver's echo must not reach a fatal log: {}",
+            candidate.reason,
+        );
+        assert!(
+            !candidate.reason.chars().any(char::is_control),
+            "no control character survives: {:?}",
+            candidate.reason,
+        );
+        assert_eq!(
+            candidate.reason.chars().count(),
+            MAX_FALLBACK_REASON_CHARS + 3,
+            "bounded like the pin, with an ellipsis saying it was cut",
+        );
+
+        // And the whole rendered failure carries the bounded form, so a
+        // ring of candidates cannot multiply an unbounded string.
+        let rendered = BootWalkFailure::Exhausted(vec![candidate]).to_string();
+        assert!(!rendered.contains("ghp_realtoken"), "{rendered}");
+        assert!(rendered.contains("revision 4"), "{rendered}");
     }
 
     #[test]

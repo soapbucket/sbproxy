@@ -1672,8 +1672,10 @@ fn dispatch_rollback(method: &str, query: Option<&str>, body: Option<&str>) -> A
                     "code": error.code(),
                     // A rollback republishes, so it inherits the
                     // publish path's spend: a target the ring does not
-                    // hold costs nothing, and a signing or store
-                    // failure on the way out has already reserved.
+                    // hold costs nothing, and a failure past the
+                    // reservation has spent a number. `store_failed`
+                    // is on both sides of that line, which is why this
+                    // is computed rather than keyed on the code.
                     "revision_consumed": error.consumed_revision(),
                     // Machine-readable alongside the sentence, so a
                     // console can offer the choices rather than asking

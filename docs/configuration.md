@@ -8231,7 +8231,7 @@ Registration returns the clear credential exactly once. The authority stores onl
 
 A subscriber may hold several credentials at once, which is how one is rotated without a window where the node cannot fetch: register the new one, deploy it, then revoke the old.
 
-A rejected publish says which step caught it and whether it spent a revision number. `revision_consumed` is the field to read: every validation refusal costs nothing, and `signing_failed`, `store_failed` and `internal` are reached after the number is reserved and report `true`, because the counter never reissues one.
+A rejected publish says which step caught it and whether it spent a revision number. The code and the spend are separate answers, so read `revision_consumed` rather than inferring it from the code: every validation refusal costs nothing and reports `false`; `signing_failed` and `internal` are always after the reservation and report `true`; and `store_failed` covers both sides of it, because the store is what reserves the number as well as what persists the bundle. A store failure while reserving leaves the counter where it was and reports `false`, one while committing reports `true`, and the counter never reissues a number it did report.
 
 ```json
 {

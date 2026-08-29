@@ -743,6 +743,77 @@ fn a_store_failure_after_the_reservation_reports_the_number_as_spent() {
     );
 }
 
+/// The rollback route's own `revision_consumed`, which the publish test
+/// above does not witness.
+///
+/// The criterion was both wire sites. Reverting only the rollback site to
+/// a hardcoded `false` left the whole suite green, because every existing
+/// rollback refusal here is a request fault that answers `false` anyway.
+/// A rollback republishes, so it reserves a number and can fail after it
+/// the same way a publish can, and that is the case nothing covered.
+#[test]
+fn a_rollback_that_fails_after_its_reservation_reports_the_number_as_spent() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let authority = std::sync::Arc::new(published_series(temp.path(), 2));
+
+    let archive_dir = temp
+        .path()
+        .join("authority-store")
+        .join("revisions")
+        .join("archive");
+    let original = std::fs::metadata(&archive_dir)
+        .expect("archive dir")
+        .permissions();
+    std::fs::set_permissions(&archive_dir, std::fs::Permissions::from_mode(0o500))
+        .expect("make the archive unwritable");
+
+    // Root and mode-ignoring filesystems: skip honestly rather than
+    // assert a refusal that never happened.
+    let probe = archive_dir.join(".writability-probe");
+    if std::fs::write(&probe, b"x").is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        std::fs::set_permissions(&archive_dir, original).expect("restore permissions");
+        return;
+    }
+
+    sbproxy_core::config_authority::install_process_authority(std::sync::Arc::clone(&authority));
+    let (status, refused) = {
+        let (status, _content_type, body) = sbproxy_core::config_authority::dispatch(
+            "POST",
+            "/admin/config-authority/rollback",
+            None,
+        )
+        .expect("the route must be owned by this dispatcher");
+        (
+            status,
+            serde_json::from_str::<serde_json::Value>(&body).expect("a JSON body"),
+        )
+    };
+    sbproxy_core::config_authority::clear_process_authority();
+    std::fs::set_permissions(&archive_dir, original).expect("restore permissions");
+
+    assert_eq!(
+        status, 500,
+        "the store failed, which is the authority's fault, not the request's: {refused}",
+    );
+    assert_eq!(refused["code"], "store_failed", "{refused}");
+    assert_eq!(
+        refused["revision_consumed"], true,
+        "the republication reserved a number before the store failed: {refused}",
+    );
+
+    // The number really is gone, independently of what the wire said.
+    let next = authority
+        .publish(&payload("api.test", "body-after"), BundleMode::Overlay)
+        .expect("the store is writable again");
+    assert_eq!(
+        next.revision, 4,
+        "the rollback reserved 3 and the counter never reissues it",
+    );
+}
+
 #[test]
 fn a_rollback_to_a_revision_the_archive_does_not_hold_is_refused_by_name() {
     let temp = tempfile::tempdir().expect("temp dir");

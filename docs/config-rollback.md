@@ -31,9 +31,11 @@ flowchart TD
     C -- "failed" --> E{"auto_revert armed?"}
     C -- "inconclusive" --> B2["stays applied<br/>lkg does not move"]
     E -- "no (the default)" --> F["alert; you decide"]
-    E -- "yes" --> G["ring entry: reverted<br/>node returns to lkg"]
+    E -- "yes" --> G["auto_revert rolls back<br/>node returns to lkg"]
     F --> H["POST /admin/config/rollback"]
-    H --> B
+    G --> M
+    H --> M["the revision rolled away from:<br/>ring entry becomes reverted"]
+    M --> B
     I["process will not start"] --> J["--config-fallback=last-known-good"]
     J --> K["boots on lkg, pinned<br/>watcher suspended"]
     K --> L["DELETE /admin/config/fallback"]
