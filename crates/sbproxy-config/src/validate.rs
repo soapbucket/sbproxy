@@ -118,6 +118,8 @@ pub const KNOWN_ACTION_TYPES: &[&str] = &[
     "storage",
     "a2a",
     "mcp",
+    "abtest",
+    "https_proxy",
     "noop",
 ];
 
@@ -194,6 +196,10 @@ pub const KNOWN_POLICY_TYPES: &[&str] = &[
     "http_framing",
     "agent_class",
     "a2a",
+    // WOR-2668: GeoIP lookup and User-Agent parsing enrichment
+    // producers. See `crates/sbproxy-modules/src/enricher/`.
+    "geoip",
+    "user_agent_parser",
     // WOR-203 PR 3b: NL-as-a-policy via the LLM-as-judge backend.
     // See `crates/sbproxy-modules/src/policy/semantic_constraint.rs`.
     "semantic_constraint",

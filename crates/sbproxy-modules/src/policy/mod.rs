@@ -243,6 +243,20 @@ pub enum Policy {
     /// IP, so a tight LLM-driven loop hits a single bucket regardless
     /// of how many TCP connections it opens.
     AgentBudget(std::sync::Arc<AgentBudgetPolicy>),
+    /// GeoIP lookup: resolves the client IP to country / continent /
+    /// city / ASN via a MaxMind-compatible MMDB. Never denies; stamps
+    /// the result onto `RequestContext::geo_lookup` for
+    /// `sbproxy_plugin::RequestContextView` consumers and, when
+    /// configured, onto `X-Geo-*` upstream headers. See
+    /// `crate::enricher::geoip` (WOR-2668).
+    GeoIp(crate::enricher::geoip::GeoIpPolicy),
+    /// User-Agent parsing: browser / OS / device-type plus a
+    /// headless-automation-library signal. Never denies; stamps the
+    /// result onto `RequestContext::parsed_user_agent` for
+    /// `sbproxy_plugin::RequestContextView` consumers and, when
+    /// configured, onto an upstream JSON header. See
+    /// `crate::enricher::uaparser` (WOR-2668).
+    UserAgent(crate::enricher::uaparser::UserAgentPolicy),
     /// Third-party plugin (only case using dynamic dispatch).
     Plugin(PluginPolicy),
 }
@@ -280,6 +294,8 @@ impl Policy {
             Self::A2A(_) => "a2a",
             Self::SemanticConstraint(_) => "semantic_constraint",
             Self::AgentBudget(_) => "agent_budget",
+            Self::GeoIp(_) => "geoip",
+            Self::UserAgent(_) => "user_agent_parser",
             Self::Plugin(p) => p.enforcer().policy_type(),
         }
     }
@@ -319,6 +335,8 @@ impl std::fmt::Debug for Policy {
             Self::A2A(r) => f.debug_tuple("A2A").field(r).finish(),
             Self::SemanticConstraint(r) => f.debug_tuple("SemanticConstraint").field(r).finish(),
             Self::AgentBudget(r) => f.debug_tuple("AgentBudget").field(r).finish(),
+            Self::GeoIp(r) => f.debug_tuple("GeoIp").field(r).finish(),
+            Self::UserAgent(r) => f.debug_tuple("UserAgent").field(r).finish(),
             Self::Plugin(_) => write!(f, "Plugin(...)"),
         }
     }
@@ -349,6 +367,13 @@ mod tests {
             Policy::BodyThreatProtection(
                 BodyThreatProtectionPolicy::from_config(serde_json::json!({})).unwrap(),
             ),
+            Policy::GeoIp(
+                crate::enricher::geoip::GeoIpPolicy::from_config(serde_json::json!({})).unwrap(),
+            ),
+            Policy::UserAgent(
+                crate::enricher::uaparser::UserAgentPolicy::from_config(serde_json::json!({}))
+                    .unwrap(),
+            ),
         ];
 
         let expected_names = [
@@ -361,6 +386,8 @@ mod tests {
             "Expression",
             "Assertion",
             "BodyThreatProtection",
+            "GeoIp",
+            "UserAgent",
         ];
 
         for (policy, name) in variants.iter().zip(expected_names.iter()) {

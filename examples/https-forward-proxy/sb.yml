@@ -1,0 +1,36 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Allow-listed HTTPS relay: proxy each request to the host it already
+# resolved to (the inbound Host header), but only for allow-listed
+# hosts. There is no `url:` field; the destination is the request's own
+# Host, not a URL fixed in config.
+#
+# Two origins share the same allow-list, which permits only httpbin.org:
+#
+#   Host: httpbin.org  -> allowed, relayed over TLS to the real httpbin.org
+#   Host: example.com  -> denied, 403 (not in allowed_hosts)
+#
+# Run:
+#   make run CONFIG=examples/https-forward-proxy/sb.yml
+#
+# Test:
+#   curl -s -H 'Host: httpbin.org' http://127.0.0.1:8080/get
+#   # -> 200, the real httpbin.org response body
+#
+#   curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: example.com' \
+#     http://127.0.0.1:8080/get
+#   # -> 403
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "httpbin.org":
+    action:
+      type: https_proxy
+      allowed_hosts:
+        - httpbin.org
+  "example.com":
+    action:
+      type: https_proxy
+      allowed_hosts:
+        - httpbin.org

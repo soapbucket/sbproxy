@@ -115,7 +115,11 @@ fn cost_rank(g: &Guardrail) -> u8 {
         | Guardrail::Injection(_)
         | Guardrail::AgentAlignment(_)
         | Guardrail::Classifier(_)
-        | Guardrail::SafetyClassifier(_) => 1,
+        | Guardrail::SafetyClassifier(_)
+        // Token-shingle Jaccard overlap scored against every document
+        // in the corpus, not a single-pass scan; ranked with the
+        // heavier detectors rather than the O(1)-per-pattern group.
+        | Guardrail::LicenseLeak(_) => 1,
     }
 }
 

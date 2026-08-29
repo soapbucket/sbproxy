@@ -13,9 +13,9 @@ use sbproxy_extension::bundle::{
 };
 
 use crate::action::{
-    A2aAction, Action, AiProxyAction, BeaconAction, EchoAction, GraphQLAction, GrpcAction,
-    LoadBalancerAction, McpAction, MockAction, ProxyAction, RedirectAction, StaticAction,
-    StorageAction, WebSocketAction,
+    A2aAction, AbTestAction, Action, AiProxyAction, BeaconAction, EchoAction, GraphQLAction,
+    GrpcAction, HttpsProxyAction, LoadBalancerAction, McpAction, MockAction, ProxyAction,
+    RedirectAction, StaticAction, StorageAction, WebSocketAction,
 };
 use crate::auth::{
     ApiKeyAuth, Auth, BasicAuthProvider, BearerAuth, BotAuthProvider, DigestAuth,
@@ -26,14 +26,16 @@ use crate::policy::{
     RateLimitPolicy, RequestLimitPolicy, SecHeadersPolicy, SemanticConstraintPolicy, SriPolicy,
     WafPolicy,
 };
+#[cfg(feature = "transform-pdf")]
+use crate::transform::PdfToMarkdownTransform;
 use crate::transform::{
-    A2aAgentCardRewriter, BoilerplateTransform, CelScriptTransform, CitationBlockTransform,
-    CssTransform, DiscardTransform, EncodingTransform, FormatConvertTransform,
-    HtmlToMarkdownTransform, HtmlTransform, JavaScriptTransform, JsJsonTransform,
-    JsonEnvelopeTransform, JsonProjectionTransform, JsonSchemaTransform, JsonTransform,
-    LuaJsonTransform, LuaTransform, MarkdownTransform, NormalizeTransform, OptimizeHtmlTransform,
-    PayloadLimitTransform, ReplaceStringsTransform, SseChunkingTransform, TemplateTransform,
-    Transform, WasmTransform,
+    A2aAgentCardRewriter, AiSchemaTransform, BoilerplateTransform, CelScriptTransform,
+    CitationBlockTransform, CssTransform, DiscardTransform, EncodingTransform,
+    FormatConvertTransform, HtmlToMarkdownTransform, HtmlTransform, JavaScriptTransform,
+    JsJsonTransform, JsonEnvelopeTransform, JsonProjectionTransform, JsonSchemaTransform,
+    JsonTransform, LuaJsonTransform, LuaTransform, MarkdownTransform, NormalizeTransform,
+    OptimizeHtmlTransform, PayloadLimitTransform, ReplaceStringsTransform, SseChunkingTransform,
+    TemplateTransform, Transform, WasmTransform,
 };
 
 /// Compile a JSON action config into an Action enum variant.
@@ -126,6 +128,12 @@ fn compile_action_for_origin_with_runtime(
         "mcp" => Ok(Action::Mcp(Box::new(McpAction::from_config(
             config.clone(),
         )?))),
+        // WOR-2671: traffic-split A/B testing and the allow-listed HTTPS
+        // forward-proxy relay, ported from sbproxy-enterprise.
+        "abtest" => Ok(Action::AbTest(AbTestAction::from_config(config.clone())?)),
+        "https_proxy" => Ok(Action::HttpsProxy(HttpsProxyAction::from_config(
+            config.clone(),
+        )?)),
         "noop" => Ok(Action::Noop),
         other => match sbproxy_plugin::build_action_plugin(other, config.clone()) {
             Some(Ok(handler)) => Ok(Action::Plugin(crate::PluginAction::linked(handler))),
@@ -472,6 +480,14 @@ fn compile_policy_with_optional_registry(
         "agent_budget" => Ok(Policy::AgentBudget(std::sync::Arc::new(
             crate::policy::AgentBudgetPolicy::from_config(config.clone())?,
         ))),
+        // WOR-2668: GeoIP lookup and User-Agent parsing. Both are
+        // typed producers, never denials; see `crate::enricher`.
+        "geoip" => Ok(Policy::GeoIp(
+            crate::enricher::geoip::GeoIpPolicy::from_config(config.clone())?,
+        )),
+        "user_agent_parser" => Ok(Policy::UserAgent(
+            crate::enricher::uaparser::UserAgentPolicy::from_config(config.clone())?,
+        )),
         other => match sbproxy_plugin::build_policy_plugin(other, config.clone()) {
             Some(Ok(enforcer)) => Ok(Policy::Plugin(crate::PluginPolicy::linked(enforcer))),
             Some(Err(error)) => {
@@ -516,6 +532,9 @@ fn compile_transform_with_optional_registry(
         "json_schema" => Ok(Transform::JsonSchema(JsonSchemaTransform::from_config(
             config.clone(),
         )?)),
+        "ai_schema" => Ok(Transform::AiSchema(AiSchemaTransform::from_config(
+            config.clone(),
+        )?)),
         "template" => Ok(Transform::Template(TemplateTransform::from_config(
             config.clone(),
         )?)),
@@ -550,6 +569,20 @@ fn compile_transform_with_optional_registry(
         "markdown" => Ok(Transform::Markdown(MarkdownTransform::from_config(
             config.clone(),
         )?)),
+        #[cfg(feature = "transform-pdf")]
+        "pdf_markdown" => Ok(Transform::PdfMarkdown(PdfToMarkdownTransform::from_config(
+            config.clone(),
+        )?)),
+        // Named explicitly (rather than falling through to the
+        // `unknown transform type` catch-all below) so an operator who
+        // authors `type: pdf_markdown` against a binary built without
+        // `transform-pdf` gets told why, not just that the type is
+        // unrecognized.
+        #[cfg(not(feature = "transform-pdf"))]
+        "pdf_markdown" => anyhow::bail!(
+            "transform type \"pdf_markdown\" requires the `transform-pdf` cargo feature, \
+             which this build was compiled without"
+        ),
         "css" => Ok(Transform::Css(CssTransform::from_config(config.clone())?)),
         "lua" => Ok(Transform::Lua(LuaTransform::from_config(config.clone())?)),
         "lua_json" => Ok(Transform::LuaJson(LuaJsonTransform::from_config(
@@ -1436,6 +1469,51 @@ hooks:
     }
 
     #[test]
+    fn compile_action_abtest() {
+        let json = serde_json::json!({
+            "type": "abtest",
+            "variants": [
+                {"name": "control", "url": "https://a.example.com", "weight": 50},
+                {"name": "experiment", "url": "https://b.example.com", "weight": 50}
+            ]
+        });
+        let action = compile_action(&json).unwrap();
+        assert_eq!(action.action_type(), "abtest");
+        if let Action::AbTest(a) = action {
+            assert_eq!(a.variants.len(), 2);
+        } else {
+            panic!("expected Action::AbTest");
+        }
+    }
+
+    #[test]
+    fn compile_action_abtest_requires_variants() {
+        let json = serde_json::json!({"type": "abtest", "variants": []});
+        assert!(compile_action(&json).is_err());
+    }
+
+    #[test]
+    fn compile_action_https_proxy() {
+        let json = serde_json::json!({
+            "type": "https_proxy",
+            "allowed_hosts": ["api.example.com", "*.internal.io"]
+        });
+        let action = compile_action(&json).unwrap();
+        assert_eq!(action.action_type(), "https_proxy");
+        if let Action::HttpsProxy(h) = action {
+            assert!(h.is_host_allowed("api.example.com"));
+        } else {
+            panic!("expected Action::HttpsProxy");
+        }
+    }
+
+    #[test]
+    fn compile_action_https_proxy_requires_allowed_hosts() {
+        let json = serde_json::json!({"type": "https_proxy", "allowed_hosts": []});
+        assert!(compile_action(&json).is_err());
+    }
+
+    #[test]
     fn compile_action_missing_type() {
         let json = serde_json::json!({"url": "http://example.com"});
         assert!(compile_action(&json).is_err());
@@ -1949,6 +2027,42 @@ hooks:
         });
         let policy = compile_policy(&json).unwrap();
         assert_eq!(policy.policy_type(), "agent_budget");
+    }
+
+    #[test]
+    fn compile_policy_geoip() {
+        let json = serde_json::json!({
+            "type": "geoip",
+            "inject_headers": false
+        });
+        let policy = compile_policy(&json).unwrap();
+        assert_eq!(policy.policy_type(), "geoip");
+        assert!(matches!(policy, Policy::GeoIp(_)));
+    }
+
+    #[test]
+    fn compile_policy_geoip_defaults() {
+        let json = serde_json::json!({"type": "geoip"});
+        let policy = compile_policy(&json).unwrap();
+        assert_eq!(policy.policy_type(), "geoip");
+    }
+
+    #[test]
+    fn compile_policy_user_agent_parser() {
+        let json = serde_json::json!({
+            "type": "user_agent_parser",
+            "inject_header": "x-ua-info"
+        });
+        let policy = compile_policy(&json).unwrap();
+        assert_eq!(policy.policy_type(), "user_agent_parser");
+        assert!(matches!(policy, Policy::UserAgent(_)));
+    }
+
+    #[test]
+    fn compile_policy_user_agent_parser_defaults() {
+        let json = serde_json::json!({"type": "user_agent_parser"});
+        let policy = compile_policy(&json).unwrap();
+        assert_eq!(policy.policy_type(), "user_agent_parser");
     }
 
     // --- compile_transform tests ---

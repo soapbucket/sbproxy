@@ -1,0 +1,48 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# A/B test traffic split with sticky-cookie pinning.
+#
+# Two variants split traffic 50/50. To make the split visible without
+# local infrastructure, the two variants point at distinct keyless
+# public APIs that produce different response shapes for the same
+# /products/1 path (the same pair examples/load-balancer-deployment uses):
+#
+#   control    -> fakestoreapi.com
+#   experiment -> dummyjson.com
+#
+# A request with no sticky cookie takes a weighted pick and the response
+# carries `Set-Cookie: sb_ab_variant=<variant>`; a request that sends
+# that cookie back stays on the same variant and is not restamped.
+#
+# Run:
+#   make run CONFIG=examples/ab-test-routing/sb.yml
+#
+# Test:
+#   # No cookie: each request is an independent weighted roll, so the
+#   # ten hits below land on a mix of both variants.
+#   for i in $(seq 1 10); do
+#     curl -s -H 'Host: app.local' http://127.0.0.1:8080/products/1 | head -c 60
+#     echo
+#   done
+#
+#   # With the sticky cookie set, every request pins to that variant.
+#   for i in $(seq 1 5); do
+#     curl -s -H 'Host: app.local' -H 'Cookie: sb_ab_variant=experiment' \
+#       http://127.0.0.1:8080/products/1 | head -c 60
+#     echo
+#   done
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "app.local":
+    action:
+      type: abtest
+      sticky_cookie: sb_ab_variant
+      variants:
+        - name: control
+          url: https://fakestoreapi.com
+          weight: 50
+        - name: experiment
+          url: https://dummyjson.com
+          weight: 50

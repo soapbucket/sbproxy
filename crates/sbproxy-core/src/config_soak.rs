@@ -360,6 +360,14 @@ pub(crate) fn bears_an_upstream(action: &sbproxy_modules::Action) -> bool {
         | Action::Storage(_)
         | Action::A2a(_)
         | Action::Mcp(_)
+        // WOR-2671. `abtest` resolves a variant to a real (host, port,
+        // tls) upstream and then falls through to the ordinary proxy
+        // flow; `https_proxy` relays an allow-listed request to the
+        // host it already resolved to. Both dial something, so a soak
+        // signal that cannot reach it must abstain rather than call the
+        // origin healthy.
+        | Action::AbTest(_)
+        | Action::HttpsProxy(_)
         // A plugin is dynamic dispatch into third-party code: this
         // cannot see what it dials, and "I cannot see" is exactly the
         // unobserved answer.

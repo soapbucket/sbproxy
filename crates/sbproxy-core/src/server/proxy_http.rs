@@ -12,6 +12,12 @@ use anyhow::Context as _;
 use sbproxy_config::types::FailureMode;
 use sbproxy_modules::action::websocket::FrameViolation;
 
+/// Apply the action-specific connect deadline after the origin's normal
+/// transport tuning has constructed the TLS peer.
+fn set_https_proxy_connection_timeout(peer: &mut HttpPeer, connect_timeout_ms: u64) {
+    peer.options.connection_timeout = Some(std::time::Duration::from_millis(connect_timeout_ms));
+}
+
 fn active_action<'a>(pipeline: &'a CompiledPipeline, ctx: &RequestContext) -> Option<&'a Action> {
     let origin_idx = ctx.origin_idx?;
     if let Some(fwd_idx) = ctx.forward_rule_idx {
@@ -3414,6 +3420,58 @@ impl ProxyHttp for SbProxy {
                 let peer = tune_peer(HttpPeer::new(&*addr, tls, host));
                 Ok(Box::new(peer))
             }
+            Action::AbTest(_) => {
+                // WOR-2671: the variant was already resolved and parsed
+                // in `handle_action`; this only builds the peer from
+                // that selection. A missing selection here means
+                // `handle_action` never ran for this request (a forward
+                // rule / origin mismatch), which is a bug rather than a
+                // config error, so it is logged distinctly from the
+                // ordinary "bad upstream URL" case above.
+                let Some(selection) = ctx.ab_test_selection.as_ref() else {
+                    warn!(
+                        hostname = %ctx.hostname,
+                        "upstream_peer called for abtest action with no resolved variant"
+                    );
+                    return Err(Error::new(ErrorType::HTTPStatus(500)));
+                };
+                guard_upstream(
+                    &selection.host,
+                    selection.port,
+                    selection.tls,
+                    allow_private,
+                )
+                .await?;
+                debug!(
+                    hostname = %ctx.hostname,
+                    variant = %selection.variant_name,
+                    upstream_host = %selection.host,
+                    upstream_port = %selection.port,
+                    tls = %selection.tls,
+                    "routing abtest request to selected variant"
+                );
+                let addr = format!("{}:{}", selection.host, selection.port);
+                let peer = tune_peer(HttpPeer::new(&*addr, selection.tls, selection.host.clone()));
+                Ok(Box::new(peer))
+            }
+            Action::HttpsProxy(hp) => {
+                // WOR-2671: no configured upstream URL exists for this
+                // action; the destination is the request's own resolved
+                // hostname (see the module doc on
+                // `sbproxy_modules::HttpsProxyAction`). Always TLS,
+                // always port 443: this action is specifically an
+                // HTTPS relay.
+                guard_upstream(&ctx.hostname, 443, true, allow_private).await?;
+                debug!(
+                    hostname = %ctx.hostname,
+                    connect_timeout_ms = hp.connect_timeout_ms,
+                    "routing https_proxy request to the requested host"
+                );
+                let addr = format!("{}:443", ctx.hostname);
+                let mut peer = tune_peer(HttpPeer::new(&*addr, true, ctx.hostname.to_string()));
+                set_https_proxy_connection_timeout(&mut peer, hp.connect_timeout_ms);
+                Ok(Box::new(peer))
+            }
             _ => {
                 // Should never reach here - non-proxy actions are handled in request_filter.
                 warn!(
@@ -3637,6 +3695,7 @@ impl ProxyHttp for SbProxy {
                     Action::Grpc(action) => Some(action.url.as_str()),
                     Action::A2a(action) => Some(action.url.as_str()),
                     Action::GraphQL(action) => Some(action.url.as_str()),
+                    Action::AbTest(_) => ctx.ab_test_selection.as_ref().map(|s| s.url.as_str()),
                     _ => None,
                 };
                 upstream_scheme =
@@ -3681,17 +3740,38 @@ impl ProxyHttp for SbProxy {
                             .clone()
                             .or_else(|| parsed_upstream_url(&gq.url).host.clone())
                     }
+                    Action::AbTest(_) => ctx
+                        .ab_test_selection
+                        .as_ref()
+                        .and_then(|s| parsed_upstream_url(&s.url).host.clone()),
                     _ => None,
                 };
                 forwarding = fc;
                 disable_forwarded_host = forwarding.disable_forwarded_host_header;
 
-                if let Action::Proxy(proxy) = effective_action {
+                // The upstream URL whose path, if it has one, prefixes
+                // the request path. WOR-2671: `abtest` belongs here as
+                // well as `proxy`. Its variants take the same `url:`
+                // an operator writes for a `proxy` action, so
+                // `url: https://b.example.com/v2` has to reach the same
+                // backend path it would there. Gating this on
+                // `Action::Proxy` alone meant a variant path was parsed
+                // and then dropped, and the experiment quietly measured
+                // the wrong path on the right host.
+                let path_bearing_url = match effective_action {
+                    Action::Proxy(proxy) => Some(proxy.url.as_str()),
+                    Action::AbTest(_) => ctx
+                        .ab_test_selection
+                        .as_ref()
+                        .map(|selection| selection.url.as_str()),
+                    _ => None,
+                };
+                if let Some(url) = path_bearing_url {
                     // WOR-1698: read the memoized path instead of
                     // re-parsing the fixed upstream URL. A URL that does
                     // not parse yields an empty path, so the guard below
                     // skips it, matching the old `if let Ok(..)` behavior.
-                    let p = &parsed_upstream_url(&proxy.url).path;
+                    let p = &parsed_upstream_url(url).path;
                     if p != "/" && !p.is_empty() {
                         upstream_url_path = Some(p.clone());
                     }
@@ -5112,6 +5192,18 @@ impl ProxyHttp for SbProxy {
                     bool,
                     Option<&str>,
                 ) = (None, false, None);
+                // WOR-2668: GeoIP country/ASN and UA-parsed
+                // headless-library signal, populated by the
+                // `geoip` / `user_agent_parser` builtin enforcers
+                // earlier in the request-phase policy chain. Both
+                // are `None` unless the origin configured the
+                // corresponding policy.
+                let geo_country = ctx.geo_lookup.as_ref().and_then(|g| g.country.as_deref());
+                let geo_asn = ctx.geo_lookup.as_ref().and_then(|g| g.asn);
+                let ua_headless_library = ctx
+                    .parsed_user_agent
+                    .as_ref()
+                    .and_then(|p| p.headless_library.as_deref());
                 let view = sbproxy_plugin::RequestContextView {
                     tenant_id: ctx.tenant_id.as_str(),
                     hostname: ctx.hostname.as_str(),
@@ -5124,6 +5216,9 @@ impl ProxyHttp for SbProxy {
                     ja4_trustworthy: ja4_trust,
                     headless_library: headless_lib,
                     client_ip: ctx.client_ip,
+                    geo_country,
+                    geo_asn,
+                    ua_headless_library,
                 };
                 for hook in hooks.iter() {
                     // WOR-2666: every verdict is counted on
@@ -5597,6 +5692,17 @@ impl ProxyHttp for SbProxy {
         // 6. CSRF cookie (set on safe method responses).
         if let Some(ref cookie) = ctx.csrf_cookie {
             let _ = upstream_response.append_header("set-cookie", cookie);
+        }
+
+        // 6b. WOR-2671: the `abtest` action's sticky pin, minted in
+        //     `handle_action` on a request that carried none. Appended
+        //     here so the assignment survives to the client's next
+        //     request; without it `sticky_cookie` would be a config key
+        //     the action reads and nothing ever writes.
+        if let Some(selection) = ctx.ab_test_selection.as_ref() {
+            if let Some(cookie) = selection.sticky_cookie.as_deref() {
+                let _ = upstream_response.append_header("set-cookie", cookie);
+            }
         }
 
         // 7. Assertions: evaluate CEL against the response and log
@@ -9793,6 +9899,63 @@ mod tests {
     use pingora_core::protocols::l4::stream::Stream;
     use pingora_error::ErrorSource;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn idle_h1_session() -> Session {
+        use pingora_core::protocols::l4::stream::Stream;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind downstream fixture");
+        let address = listener.local_addr().expect("downstream fixture address");
+        let client = tokio::spawn(async move {
+            tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect downstream fixture")
+        });
+        let (stream, _) = listener.accept().await.expect("accept downstream fixture");
+        let _client = client.await.expect("join downstream client");
+
+        Session::new_h1(Box::new(Stream::from(stream)))
+    }
+
+    #[tokio::test]
+    async fn https_proxy_upstream_peer_applies_action_timeout_after_transport_tuning() {
+        let config = sbproxy_config::compile_config(
+            r#"
+proxy:
+  extensions:
+    upstream:
+      allow_private_cidrs: ["127.0.0.0/8"]
+origins:
+  "127.0.0.1":
+    action:
+      type: https_proxy
+      allowed_hosts: ["127.0.0.1"]
+      connect_timeout_ms: 321
+    timeouts:
+      connect_ms: 999
+"#,
+        )
+        .expect("valid HTTPS relay fixture");
+        let pipeline = std::sync::Arc::new(
+            CompiledPipeline::from_config(config).expect("compile HTTPS relay fixture"),
+        );
+        let mut ctx = RequestContext::new();
+        ctx.origin_idx = pipeline.resolve_origin("127.0.0.1");
+        ctx.hostname = "127.0.0.1".into();
+        ctx.pipeline = pipeline;
+        let mut session = idle_h1_session().await;
+
+        let peer = SbProxy
+            .upstream_peer(&mut session, &mut ctx)
+            .await
+            .expect("HTTPS relay peer");
+
+        assert_eq!(
+            peer.options.connection_timeout,
+            Some(std::time::Duration::from_millis(321))
+        );
+    }
 
     /// A downstream `GET` asking for a WebSocket upgrade.
     fn upgrade_request() -> pingora_http::RequestHeader {

@@ -781,8 +781,6 @@ async fn drain_body_for_signature_verification(
     }
 }
 
-/// Handle an incoming request before proxying. See the trait method
-/// `<SbProxy as ProxyHttp>::request_filter` for the phase contract.
 /// Run the origin's `cache.key` event, if it has one.
 ///
 /// Returns the plan, plus whether the cache must be bypassed entirely.
@@ -1237,6 +1235,8 @@ async fn serve_comp_well_known(
     Ok(false)
 }
 
+/// Handle an incoming request before proxying. See the trait method
+/// `<SbProxy as ProxyHttp>::request_filter` for the phase contract.
 pub(super) async fn request_filter(
     session: &mut Session,
     ctx: &mut RequestContext,
@@ -8962,6 +8962,19 @@ fn anomaly_view<'a>(
         ja4_trustworthy,
         headless_library,
         client_ip: ctx.client_ip,
+        // WOR-2668. This function's contract is that the request-phase
+        // gate and the response-phase dispatch judge the same request
+        // the same way, so the geoip / user_agent_parser output has to
+        // appear on both. All three are `None` unless the origin
+        // configured the producing policy, and a policy that runs
+        // later in the chain than this gate leaves them `None` here
+        // and populated in `response_filter`.
+        geo_country: ctx.geo_lookup.as_ref().and_then(|g| g.country.as_deref()),
+        geo_asn: ctx.geo_lookup.as_ref().and_then(|g| g.asn),
+        ua_headless_library: ctx
+            .parsed_user_agent
+            .as_ref()
+            .and_then(|p| p.headless_library.as_deref()),
     }
 }
 
@@ -9304,6 +9317,10 @@ origins:
             ja4_trustworthy: true,
             headless_library: None,
             client_ip: None,
+            // WOR-2668: no enrichment policy runs in this fixture.
+            geo_country: None,
+            geo_asn: None,
+            ua_headless_library: None,
         }
     }
 

@@ -11,6 +11,7 @@
 pub mod action;
 pub mod auth;
 pub mod compile;
+pub mod enricher;
 mod extension_hook;
 pub mod olp;
 pub mod policy;
@@ -32,6 +33,8 @@ pub use auth::a2a::{
 };
 pub use auth::{ApiKeyAuth, Auth};
 pub use compile::*;
+pub use enricher::geoip::{GeoIpPolicy, GeoLookup};
+pub use enricher::uaparser::{ParsedUserAgent, UserAgentPolicy};
 pub use extension_hook::{DynamicHookMetadata, PluginAction, PluginPolicy, PluginTransform};
 pub use policy::{
     body_threat_family, classification_cache_stats, evaluate_body, evaluate_body_with_audit,

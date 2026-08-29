@@ -715,6 +715,36 @@ fn apply_transform_with_ctx(
             let host = t.proxy_host.as_deref().unwrap_or(ctx.hostname.as_str());
             t.apply_with_path(body, content_type, ctx.request_path.as_str(), host)
         }
+        // WOR-2670: same shape as `HtmlToMarkdown` above. The PDF
+        // transform builds a full `MarkdownProjection`, so its `title`
+        // and `token_estimate` are put on the context rather than
+        // computed and dropped. That is what makes the module's claim
+        // true, that a downstream `json_envelope` or
+        // `x-markdown-tokens` header sees the same shape whichever
+        // source format the origin served: `json_envelope` reads
+        // `ctx.markdown_projection.title`, and before this it only ever
+        // saw one populated by HTML.
+        #[cfg(feature = "transform-pdf")]
+        Transform::PdfMarkdown(t) => {
+            let is_pdf = content_type
+                .map(|c| {
+                    c.split(';')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .eq_ignore_ascii_case("application/pdf")
+                })
+                .unwrap_or(false);
+            if !is_pdf {
+                return Ok(());
+            }
+            let projection = t.decode(body.as_ref())?;
+            body.clear();
+            body.extend_from_slice(projection.body.as_bytes());
+            ctx.markdown_token_estimate = Some(projection.token_estimate);
+            ctx.markdown_projection = Some(projection);
+            Ok(())
+        }
         // All other transform variants: standard pipeline.
         _ => compiled.transform.apply(body, content_type),
     }
@@ -2254,14 +2284,6 @@ async fn send_idempotency_cache_hit(
     Ok(status)
 }
 
-/// Build a `{"error": "<message>"}` JSON body with the message
-/// correctly escaped (WOR-1738).
-///
-/// The error message can carry client-controlled text (for example an
-/// AI request's `model` field echoed back in a 403), so it must be
-/// escaped rather than interpolated into a hand-built JSON string. A
-/// quote or backslash in the message would otherwise break the envelope
-/// or inject sibling fields.
 /// Classify a resolved `security_headers` entry as a CSP emission, and in
 /// which mode.
 ///
@@ -2321,6 +2343,14 @@ pub(crate) fn record_stranded_cel_header_mutation(hostname: &str, reason: &'stat
 /// chain that produced them faulted terminally.
 pub(crate) const CEL_MUTATIONS_DROPPED_REASON: &str = "cel_mutations_dropped_on_transform_failure";
 
+/// Build a `{"error": "<message>"}` JSON body with the message
+/// correctly escaped (WOR-1738).
+///
+/// The error message can carry client-controlled text (for example an
+/// AI request's `model` field echoed back in a 403), so it must be
+/// escaped rather than interpolated into a hand-built JSON string. A
+/// quote or backslash in the message would otherwise break the envelope
+/// or inject sibling fields.
 pub(super) fn error_json_body(message: &str) -> String {
     serde_json::json!({ "error": message }).to_string()
 }
@@ -7334,14 +7364,13 @@ mod wor_2477_panic_containment_tests {
     }
 }
 
-/// A generated (`static` / `mock`) response body goes through the same
-/// origin transform chain a proxied body does, so a transform that
-/// faults there has to reach the same `failure_posture`.
+/// The CEL header phases: which request and response phases a
+/// `headers:` transform is allowed to run in, and what happens at the
+/// ones it is not.
 ///
-/// Retrospective review of PR #1153 found it did not: every fault was a
-/// `warn!` and the loop continued with the untransformed buffer, so a
-/// redaction transform declared `closed` shipped the exact bytes it
-/// existed to strip.
+/// Left undocumented for a while because the block above it belonged to
+/// `generated_body_failure_posture_tests` and was read as this module's
+/// own.
 #[cfg(test)]
 mod cel_header_phase_gate_tests {
     use super::*;
@@ -7482,6 +7511,14 @@ mod cel_header_phase_gate_tests {
     }
 }
 
+/// A generated (`static` / `mock`) response body goes through the same
+/// origin transform chain a proxied body does, so a transform that
+/// faults there has to reach the same `failure_posture`.
+///
+/// Retrospective review of PR #1153 found it did not: every fault was a
+/// `warn!` and the loop continued with the untransformed buffer, so a
+/// redaction transform declared `closed` shipped the exact bytes it
+/// existed to strip.
 #[cfg(test)]
 mod generated_body_failure_posture_tests {
     use super::*;

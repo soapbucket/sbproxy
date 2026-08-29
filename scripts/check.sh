@@ -454,6 +454,9 @@ fi
 #     rewrite Cargo.lock rather than regenerating it.
 #   * secret-resolver drift: python source scan.
 #   * doc drift: grep/sed plus a python read of the generated schema.
+#   * attribute placement: python source scan.
+#   * attribute theft: `git diff` and `git show` against the merge base,
+#     both read-only plumbing; the script writes nothing.
 #
 # The rest of this phase stays serial: the llms-full guard regenerates
 # the corpus into a temp file when the branch carries it, the helper
@@ -523,6 +526,29 @@ batch_log_url_ratchet() {
 # frame, so the only defence is a budget that keeps falling.
 batch_stack_budget_ratchet() {
   bash "$ROOT/scripts/check-stack-budget-ratchet.sh"
+}
+
+# CI: ci.yml guards lane, "no insertion landed inside an attribute
+# block". Diff-scoped: an item inserted between an attribute
+# block and the item it was attached to takes the block with it, and the
+# stolen lines stay context in the diff, so the review sees a new item
+# with a doc comment above it. Three of these reached main in one day.
+#
+# Fails closed when no base resolves, for the reason
+# check-stack-budget-ratchet.sh has written down next door.
+batch_attribute_theft() {
+  python3 "$ROOT/scripts/check-attribute-theft.py" --check
+}
+
+# CI: ci.yml guards lane, "attributes sit on items they can apply
+# to". Tree-scoped, and the half rustc cannot cover: it refuses
+# `#[test]` on a static, a const, a use, or a function taking arguments
+# in every cfg rather than only in the ones a lane compiles with
+# --test, and it refuses `#[ignore]` and `#[should_panic]` on a
+# function carrying no test attribute, which nothing else reports at
+# all. Fifteen to twenty-five seconds of python over 1,400 files.
+batch_attribute_placement() {
+  python3 "$ROOT/scripts/check-attribute-placement.py" --check
 }
 
 # CI: ci.yml guards lane and docs-ci.yml, "spec citation hygiene".
@@ -633,6 +659,8 @@ run_batch "read-only source and doc scans" \
   batch_unwrap_ratchet "unwrap/expect/panic in production code (ratchet)" \
   batch_log_url_ratchet "operator URLs at log lines (ratchet)" \
   batch_stack_budget_ratchet "AI dispatch path stack budget (ratchet)" \
+  batch_attribute_placement "attributes sit on items they can apply to" \
+  batch_attribute_theft "no insertion landed inside an attribute block" \
   batch_spec_citations "spec citation hygiene" \
   batch_env_mutation "no process-global env mutation outside test helpers" \
   batch_onnx_model_loaders "every ONNX load refuses external tensor data" \
@@ -695,6 +723,14 @@ python3 "$ROOT/scripts/tests/test_notice_coverage.py"
 # a rule narrowed in gate-scope.py fails here rather than silently
 # turning a phase off on somebody else's branch.
 python3 "$ROOT/scripts/gate-scope.py" --self-test
+# The two attribute guards and the test-count helper. All three are
+# detectors, and a detector that has quietly stopped detecting reads
+# exactly like a clean tree, which is the one failure a gate cannot
+# self-report. The theft fixtures are the two real hunks from cf77910e9
+# and eb42165a5.
+python3 "$ROOT/scripts/check-attribute-theft.py" --self-test
+python3 "$ROOT/scripts/check-attribute-placement.py" --self-test
+bash "$ROOT/scripts/lib/expect-tests.sh" --self-test
 
 # Serial: the test_doc_generators module binds listeners and has
 # leaked one on port 18091 before; nothing that opens a port runs

@@ -4592,6 +4592,9 @@ async fn anomaly_hook_registry_iterates_registered_hooks() {
         ja4_trustworthy: false,
         headless_library: None,
         client_ip: None,
+        geo_country: None,
+        geo_asn: None,
+        ua_headless_library: None,
     };
     for hook in sbproxy_plugin::anomaly_hooks().iter() {
         let _ = hook.analyze(&view).await;
