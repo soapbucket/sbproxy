@@ -57,15 +57,19 @@ pub struct Hold {
     pub tool_digest: String,
     /// Advertised tool name, display only. Never used as the gate.
     pub tool_name: String,
-    /// Origin hostname.
+    /// MCP action origin (`server_info.name`), not the request Host.
     pub origin: String,
     /// Caller principal id.
     pub principal_id: String,
+    /// Tenant the principal belongs to. Same isolation as the quota store.
+    #[serde(default)]
+    pub tenant_id: String,
     /// Why the gateway held the call. No arguments, no secrets.
     pub reason: String,
     /// Unix seconds the hold was created.
     pub created_at_unix: u64,
-    /// Unix seconds after which a pending hold is treated as expired.
+    /// Unix seconds after which the hold is dropped, pending, denied,
+    /// or an unused approval alike.
     pub expires_at_unix: u64,
     /// Current decision.
     pub state: HoldState,
@@ -188,6 +192,7 @@ impl PendingConfirmStore {
         tool_name: &str,
         origin: &str,
         principal_id: &str,
+        tenant_id: &str,
         reason: &str,
         arguments: &Value,
         hold_ttl: Duration,
@@ -197,18 +202,23 @@ impl PendingConfirmStore {
         let now_unix = unix_secs(now);
         let mut holds = self.holds.lock().unwrap_or_else(|e| e.into_inner());
         self.expire_pending(&mut holds, now_unix);
-        if let Some(hold) = holds
-            .values()
-            .find(|h| h.snapshot == snapshot && matches!(h.state, HoldState::Approved { .. }))
-        {
+        if let Some(hold) = holds.values().find(|h| {
+            same_caller(h, &snapshot, origin, principal_id, tenant_id)
+                && matches!(h.state, HoldState::Approved { .. })
+        }) {
             let id = hold.id.clone();
+            let snapshot_hold = hold.clone();
             holds.remove(&id);
             drop(holds);
-            let _ = self.persist();
+            if self.persist().is_err() {
+                let mut holds = self.holds.lock().unwrap_or_else(|e| e.into_inner());
+                holds.insert(id, snapshot_hold);
+                return ParkOutcome::Saturated;
+            }
             return ParkOutcome::Resume;
         }
         if let Some(hold) = holds.values().find(|h| {
-            h.snapshot == snapshot
+            same_caller(h, &snapshot, origin, principal_id, tenant_id)
                 && matches!(h.state, HoldState::Pending)
                 && h.expires_at_unix > now_unix
         }) {
@@ -218,6 +228,10 @@ impl PendingConfirmStore {
                 snapshot,
             };
         }
+        holds.retain(|_, hold| {
+            !(same_caller(hold, &snapshot, origin, principal_id, tenant_id)
+                && matches!(hold.state, HoldState::Denied { .. }))
+        });
         if holds.len() >= MAX_HOLD_ROWS {
             return ParkOutcome::Saturated;
         }
@@ -226,12 +240,7 @@ impl PendingConfirmStore {
         let n = *seq;
         *seq = seq.saturating_add(1);
         drop(seq);
-        let digest_tail: String = snapshot
-            .trim_start_matches("sha256:")
-            .chars()
-            .take(8)
-            .collect();
-        let id = format!("hold_{n}_{digest_tail}");
+        let id = mint_hold_id(self.persist_path.as_deref(), origin, n, &snapshot);
         let hold = Hold {
             id: id.clone(),
             snapshot: snapshot.clone(),
@@ -239,6 +248,7 @@ impl PendingConfirmStore {
             tool_name: tool_name.to_string(),
             origin: origin.to_string(),
             principal_id: principal_id.to_string(),
+            tenant_id: tenant_id.to_string(),
             reason: reason.to_string(),
             created_at_unix: now_unix,
             expires_at_unix: now_unix.saturating_add(ttl_secs),
@@ -246,7 +256,11 @@ impl PendingConfirmStore {
         };
         holds.insert(id.clone(), hold);
         drop(holds);
-        let _ = self.persist();
+        if self.persist().is_err() {
+            let mut holds = self.holds.lock().unwrap_or_else(|e| e.into_inner());
+            holds.remove(&id);
+            return ParkOutcome::Saturated;
+        }
         ParkOutcome::Held {
             hold_id: id,
             expires_at_unix: now_unix.saturating_add(ttl_secs),
@@ -308,15 +322,23 @@ impl PendingConfirmStore {
         Ok(snapshot)
     }
 
-    /// True when this snapshot already has a pending (unexpired) or
-    /// approved hold. Used to consume an approval before policy hooks
-    /// run, so a Cedar `@confirm` retry does not park a second time.
-    pub fn has_live_hold(&self, snapshot: &str, now: SystemTime) -> bool {
+    /// True when this caller already has a pending (unexpired) or
+    /// approved hold for the snapshot. Used to consume an approval
+    /// before policy hooks run, so a Cedar `@confirm` retry does not
+    /// park a second time.
+    pub fn has_live_hold(
+        &self,
+        snapshot: &str,
+        origin: &str,
+        principal_id: &str,
+        tenant_id: &str,
+        now: SystemTime,
+    ) -> bool {
         let now_unix = unix_secs(now);
         let mut holds = self.holds.lock().unwrap_or_else(|e| e.into_inner());
         self.expire_pending(&mut holds, now_unix);
         holds.values().any(|hold| {
-            hold.snapshot == snapshot
+            same_caller(hold, snapshot, origin, principal_id, tenant_id)
                 && (matches!(hold.state, HoldState::Approved { .. })
                     || (matches!(hold.state, HoldState::Pending)
                         && hold.expires_at_unix > now_unix))
@@ -334,9 +356,7 @@ impl PendingConfirmStore {
     }
 
     fn expire_pending(&self, holds: &mut HashMap<String, Hold>, now_unix: u64) {
-        holds.retain(|_, hold| {
-            !(matches!(hold.state, HoldState::Pending) && hold.expires_at_unix <= now_unix)
-        });
+        holds.retain(|_, hold| hold.expires_at_unix > now_unix);
     }
 
     fn persist(&self) -> io::Result<()> {
@@ -347,6 +367,38 @@ impl PendingConfirmStore {
         let rows: Vec<&Hold> = holds.values().collect();
         persist_json(path, &rows)
     }
+}
+
+/// Hold ids must be unique across MCP actions on one proxy. A
+/// per-store sequence plus a snapshot tail collides when two
+/// `approval.store` files both park seq 1 of the same snapshot, and
+/// admin dispatch matches on id alone.
+fn mint_hold_id(path: Option<&Path>, origin: &str, seq: u64, snapshot: &str) -> String {
+    let mut hasher = Sha256::new();
+    match path {
+        Some(path) => hasher.update(path.to_string_lossy().as_bytes()),
+        None => hasher.update(b"memory"),
+    }
+    hasher.update([0]);
+    hasher.update(origin.as_bytes());
+    hasher.update([0]);
+    hasher.update(seq.to_le_bytes());
+    hasher.update([0]);
+    hasher.update(snapshot.as_bytes());
+    format!("hold_{}", hex::encode(&hasher.finalize()[..8]))
+}
+
+fn same_caller(
+    hold: &Hold,
+    snapshot: &str,
+    origin: &str,
+    principal_id: &str,
+    tenant_id: &str,
+) -> bool {
+    hold.snapshot == snapshot
+        && hold.origin == origin
+        && hold.principal_id == principal_id
+        && hold.tenant_id == tenant_id
 }
 
 fn redact_operator(by: &str) -> String {
@@ -400,6 +452,7 @@ mod tests {
             "crm.delete",
             "mcp.example.com",
             "vk_analyst",
+            "acme",
             "high-risk tool",
             &args,
             ttl,
@@ -417,6 +470,7 @@ mod tests {
                 "crm.delete",
                 "mcp.example.com",
                 "vk_analyst",
+                "acme",
                 "high-risk tool",
                 &args,
                 ttl,
@@ -429,6 +483,7 @@ mod tests {
             "crm.delete",
             "mcp.example.com",
             "vk_analyst",
+            "acme",
             "high-risk tool",
             &args,
             ttl,
@@ -450,6 +505,7 @@ mod tests {
             "crm.delete",
             "mcp.example.com",
             "vk_analyst",
+            "acme",
             "high-risk tool",
             &args,
             ttl,
@@ -466,6 +522,7 @@ mod tests {
             "crm.purge",
             "mcp.example.com",
             "vk_analyst",
+            "acme",
             "high-risk tool",
             &args,
             ttl,
@@ -488,6 +545,7 @@ mod tests {
             "crm.delete",
             "mcp.example.com",
             "vk_analyst",
+            "acme",
             "high-risk tool",
             &json!({}),
             ttl,
@@ -500,6 +558,158 @@ mod tests {
         reloaded
             .approve(&hold_id, "secops@example.com", t0())
             .expect("approve after restart");
+    }
+
+    #[test]
+    fn another_principal_cannot_consume_an_approval() {
+        let store = PendingConfirmStore::in_memory();
+        let args = json!({"n": 1});
+        let ttl = Duration::from_secs(600);
+        let first = store.park(
+            "digest-a",
+            "crm.delete",
+            "mcp.example.com",
+            "vk_alice",
+            "acme",
+            "high-risk tool",
+            &args,
+            ttl,
+            t0(),
+        );
+        let ParkOutcome::Held { hold_id, .. } = first else {
+            panic!("expected Held");
+        };
+        store
+            .approve(&hold_id, "secops@example.com", t0())
+            .expect("approve");
+        let bob = store.park(
+            "digest-a",
+            "crm.delete",
+            "mcp.example.com",
+            "vk_bob",
+            "acme",
+            "high-risk tool",
+            &args,
+            ttl,
+            t0(),
+        );
+        assert!(
+            matches!(bob, ParkOutcome::Held { .. }),
+            "Bob must not consume Alice's approval, got {bob:?}"
+        );
+        let alice = store.park(
+            "digest-a",
+            "crm.delete",
+            "mcp.example.com",
+            "vk_alice",
+            "acme",
+            "high-risk tool",
+            &args,
+            ttl,
+            t0(),
+        );
+        assert_eq!(alice, ParkOutcome::Resume);
+    }
+
+    #[test]
+    fn two_store_paths_do_not_mint_the_same_hold_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staging = PendingConfirmStore::load(&dir.path().join("staging.json")).expect("staging");
+        let prod = PendingConfirmStore::load(&dir.path().join("prod.json")).expect("prod");
+        let args = json!({"n": 1});
+        let ttl = Duration::from_secs(600);
+        let ParkOutcome::Held {
+            hold_id: staging_id,
+            ..
+        } = staging.park(
+            "digest-a",
+            "crm.delete",
+            "staging.mcp.example.com",
+            "vk_analyst",
+            "acme",
+            "high-risk tool",
+            &args,
+            ttl,
+            t0(),
+        )
+        else {
+            panic!("expected Held");
+        };
+        let ParkOutcome::Held {
+            hold_id: prod_id, ..
+        } = prod.park(
+            "digest-a",
+            "crm.delete",
+            "prod.mcp.example.com",
+            "vk_analyst",
+            "acme",
+            "high-risk tool",
+            &args,
+            ttl,
+            t0(),
+        )
+        else {
+            panic!("expected Held");
+        };
+        assert_ne!(
+            staging_id, prod_id,
+            "admin dispatch matches on id alone, so two MCP actions must not mint the same id"
+        );
+        prod.approve(&prod_id, "secops@example.com", t0())
+            .expect("approve prod");
+        assert!(
+            staging
+                .approve(&prod_id, "secops@example.com", t0())
+                .is_err(),
+            "approving prod must not decide the staging hold"
+        );
+    }
+
+    #[test]
+    fn a_denied_hold_is_replaced_on_retry_rather_than_accumulating() {
+        let store = PendingConfirmStore::in_memory();
+        let args = json!({"n": 1});
+        let ttl = Duration::from_secs(600);
+        let ParkOutcome::Held { hold_id, .. } = store.park(
+            "digest-a",
+            "crm.delete",
+            "mcp.example.com",
+            "vk_analyst",
+            "acme",
+            "high-risk tool",
+            &args,
+            ttl,
+            t0(),
+        ) else {
+            panic!("expected Held");
+        };
+        store
+            .deny(&hold_id, "secops@example.com", t0())
+            .expect("deny");
+        let ParkOutcome::Held {
+            hold_id: retry_id, ..
+        } = store.park(
+            "digest-a",
+            "crm.delete",
+            "mcp.example.com",
+            "vk_analyst",
+            "acme",
+            "high-risk tool",
+            &args,
+            ttl,
+            t0(),
+        )
+        else {
+            panic!("expected a fresh hold after deny");
+        };
+        assert_ne!(hold_id, retry_id);
+        let stale = store
+            .approve(&hold_id, "secops@example.com", t0())
+            .expect_err("denied row must be gone so it does not occupy the cap");
+        assert_eq!(stale.kind(), std::io::ErrorKind::NotFound);
+        store
+            .approve(&retry_id, "secops@example.com", t0())
+            .expect("retry is the live pending hold");
     }
 
     #[test]

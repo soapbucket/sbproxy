@@ -6563,7 +6563,8 @@ pub fn record_mcp_grant_expired(tenant: &str, policy: &str) {
 /// Record one gateway-originated MCP approval hold
 /// (`sbproxy_mcp_approval_hold_total{tenant, outcome}`, WOR-2454).
 /// `outcome` is a closed set: `held` when a call is parked for an
-/// operator. Registration failure yields no counter rather than a
+/// operator, `saturated` when the hold table refused a new row.
+/// Registration failure yields no counter rather than a
 /// panic, matching [`record_fallback_served`].
 pub fn record_mcp_approval_hold(tenant: &str, outcome: &str) {
     use prometheus::{register_int_counter_vec, IntCounterVec};

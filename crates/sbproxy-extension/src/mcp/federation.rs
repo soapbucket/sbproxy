@@ -2900,12 +2900,11 @@ impl McpFederation {
     /// - [`PolicyDecision::Deny`]: short-circuit with
     ///   [`McpCallOutcome::DeniedByPolicy`] carrying the deny message.
     ///   The upstream is never contacted.
-    /// - [`PolicyDecision::Confirm`]: temporarily treated as `Deny`
-    ///   pending the `PendingConfirmStore` work in PR ζ. The verdict is
-    ///   still labelled `confirm` on the
-    ///   `sbproxy_mcp_policy_hook_invocations_total` metric so the
-    ///   future migration is observable. Future cleanup: replace this
-    ///   branch with a call into `PendingConfirmStore::park`.
+    /// - [`PolicyDecision::Confirm`]: when `approval:` is configured
+    ///   on the MCP action, `action_dispatch` parks the call in
+    ///   [`super::PendingConfirmStore`]. Without that block this verdict
+    ///   stays a refusal. Do not park from inside federation: that
+    ///   would mint a second hold beside the dispatcher.
     ///
     /// PR β walks registered hooks in registration order and takes the
     /// first non-Allow verdict; an all-Allow chain forwards as if no
@@ -3105,12 +3104,11 @@ impl McpFederation {
         // registered at all, the federation falls through to the
         // [`default_no_op_hook`] and Allow is returned.
         //
-        // WOR-2454: after an operator approval is consumed, the caller
-        // skips this walk so a Cedar `@confirm` cannot park the same
-        // snapshot again.
-        let verdict = if skip_policy_hooks {
-            PolicyDecision::Allow
-        } else {
+        // WOR-2454: after an operator approval is consumed, Confirm
+        // becomes Allow so a Cedar `@confirm` cannot park the same
+        // snapshot again. The walk still runs: a Cedar `forbid`
+        // (Deny) must refuse even after approval.
+        let verdict = {
             let hooks = registered_hooks_or_default();
             let mut chosen = PolicyDecision::Allow;
             for hook in &hooks {
@@ -3129,7 +3127,14 @@ impl McpFederation {
                     break;
                 }
             }
-            chosen
+            // After an operator approval is consumed, Confirm becomes
+            // Allow so the same snapshot is not parked again. A Cedar
+            // `forbid` (Deny) still refuses: approval is not a
+            // privilege bypass (WOR-2454 review).
+            match chosen {
+                PolicyDecision::Confirm { .. } if skip_policy_hooks => PolicyDecision::Allow,
+                other => other,
+            }
         };
 
         match verdict {

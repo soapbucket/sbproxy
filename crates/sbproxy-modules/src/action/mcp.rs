@@ -419,6 +419,11 @@ pub struct CompiledMcpApproval {
     pub hold_ttl: Duration,
     /// Optional notification URL, already SSRF-validated.
     pub webhook: Option<url::Url>,
+    /// Host of [`Self::webhook`], for a pinned dial.
+    pub webhook_host: Option<String>,
+    /// Addresses [`Self::webhook`] resolved to at compile. The POST
+    /// pins to these so a later DNS rebind cannot retarget the body.
+    pub webhook_addrs: Vec<std::net::SocketAddr>,
     /// Tools that always park.
     pub tools: Vec<sbproxy_extension::mcp::ApprovalSelector>,
 }
@@ -4758,18 +4763,22 @@ impl McpAction {
                     })?,
                     None => Duration::from_secs(15 * 60),
                 };
+                let mut webhook_host = None;
+                let mut webhook_addrs = Vec::new();
                 let webhook = match approval.webhook.as_deref() {
                     Some(raw) => {
                         let parsed = url::Url::parse(raw).map_err(|error| {
                             anyhow::anyhow!("mcp action: approval.webhook: {error}")
                         })?;
-                        sbproxy_security::ssrf::validate_url(parsed.as_str()).map_err(
-                            |reason| {
-                                anyhow::anyhow!(
-                                    "mcp action: approval.webhook blocked by SSRF guard ({reason})"
-                                )
-                            },
-                        )?;
+                        let resolved =
+                            sbproxy_security::ssrf::validate_url_resolved(parsed.as_str(), &[])
+                                .map_err(|reason| {
+                                    anyhow::anyhow!(
+                                "mcp action: approval.webhook blocked by SSRF guard ({reason})"
+                            )
+                                })?;
+                        webhook_host = Some(resolved.host);
+                        webhook_addrs = resolved.addrs;
                         Some(parsed)
                     }
                     None => None,
@@ -4793,6 +4802,8 @@ impl McpAction {
                     store,
                     hold_ttl,
                     webhook,
+                    webhook_host,
+                    webhook_addrs,
                     tools: approval.tools.clone(),
                 })
             }

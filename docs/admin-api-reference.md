@@ -3676,7 +3676,7 @@ model-host artifact cache above:
 | GET | `/admin/mcp-oauth` | Every colocated MCP OAuth broker this proxy runs, and what each has wired in. |
 | GET | `/admin/mcp-runtime` | Federated MCP server runtime state and in-flight tool-call auth challenges. |
 | GET | `/api/mcp/grants` | Time-boxed MCP RBAC grants. A console page is deferred. |
-| POST | `/api/mcp/grants/renew` | Reset `renewed_at` for a grant. Body: `{origin, policy, tool, principal?}`. |
+| POST | `/api/mcp/grants/renew` | Reset `renewed_at` for a grant. Body: `{origin, policy, tool, principal?, tenant?}`. |
 | GET | `/api/mcp/approvals` | Pending and decided MCP approval holds. A console page is deferred. |
 | POST | `/api/mcp/approvals/{id}/approve` | Approve a hold. Body: `{approved_by}`. The next matching retry consumes it once. |
 | POST | `/api/mcp/approvals/{id}/deny` | Deny a hold. Body: `{approved_by}`. |
@@ -3990,6 +3990,7 @@ page is deferred; this JSON is the operator surface. Both `admin` and
       "policy": "analyst",
       "tool": "reports.hello",
       "principal_id": "analyst-1",
+      "tenant_id": "acme",
       "renewed_at": 1756400000,
       "ttl_secs": 28800,
       "expires_at": 1756428800
@@ -4004,11 +4005,12 @@ page is deferred; this JSON is the operator surface. Both `admin` and
 Reset `renewed_at` for a grant. `admin` only. Body:
 
 ```json
-{ "origin": "mcp.example.com", "policy": "analyst", "tool": "reports.hello" }
+{ "origin": "mcp.example.com", "policy": "analyst", "tool": "reports.hello", "principal": "vk_analyst", "tenant": "acme" }
 ```
 
-`principal` is optional. When omitted, every matching row renews. A
-tool with no `ttl` on that policy is a 400.
+`principal` and `tenant` are optional. When omitted, every matching row
+renews. A tool with no `ttl` on that policy is a 400. Exact tool-name
+rules beat a `*` catch-all.
 
 ### `GET /api/mcp/approvals`
 

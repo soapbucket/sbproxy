@@ -251,6 +251,7 @@ impl ToolAccessPolicy {
                     policy: policy_label.to_string(),
                     tool: tool.to_string(),
                     principal_id: principal_id_for(principal),
+                    tenant_id: principal.tenant_id.as_str().to_string(),
                 };
                 return match ledger.observe(&key, ttl, now) {
                     GrantStatus::Active { .. } => ToolAccessDecision::Allow,
@@ -273,14 +274,15 @@ impl ToolAccessPolicy {
         self.tool_access.iter().any(|rule| rule.ttl.is_some())
     }
 
-    /// Configured grant lifetime for `tool` under the first matching
-    /// allow rule. Used by admin renewal so a YAML ttl change applies
-    /// to the next window.
+    /// Configured grant lifetime for `tool`. Exact tool-name matches
+    /// beat a `*` rule. Rules with no `ttl` are skipped so a catch-all
+    /// without a window cannot hide a later time-boxed grant.
     pub fn matching_grant_ttl(
         &self,
         principal: Option<&Principal>,
         tool: &str,
     ) -> Option<std::time::Duration> {
+        let mut star = None;
         for rule in &self.tool_access {
             let matches_principal = match principal {
                 None => true,
@@ -295,12 +297,21 @@ impl ToolAccessPolicy {
             if !rule.allowed.iter().any(|t| t == "*" || t == tool) {
                 continue;
             }
-            return rule
+            let Some(ttl) = rule
                 .ttl
                 .as_deref()
-                .and_then(|ttl| parse_quota_window(ttl).ok());
+                .and_then(|ttl| parse_quota_window(ttl).ok())
+            else {
+                continue;
+            };
+            if rule.allowed.iter().any(|t| t == tool) {
+                return Some(ttl);
+            }
+            if star.is_none() && rule.allowed.iter().any(|t| t == "*") {
+                star = Some(ttl);
+            }
         }
-        None
+        star
     }
 
     /// Filter the given list of tool names down to the ones the
@@ -1066,6 +1077,7 @@ mod tests {
                     policy: "analyst".to_string(),
                     tool: "reports.hello".to_string(),
                     principal_id: "vk_analyst".to_string(),
+                    tenant_id: "acme".to_string(),
                 },
                 Duration::from_secs(60),
                 later,
@@ -1081,6 +1093,75 @@ mod tests {
                 later
             ),
             ToolAccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn matching_grant_ttl_skips_rules_without_ttl_and_prefers_exact_name() {
+        let policy = ToolAccessPolicy {
+            default_allow: false,
+            tool_access: vec![
+                ToolAccessRule {
+                    principals: vec![],
+                    allowed: vec!["*".to_string()],
+                    ttl: None,
+                },
+                ToolAccessRule {
+                    principals: vec![],
+                    allowed: vec!["*".to_string()],
+                    ttl: Some("30s".to_string()),
+                },
+                ToolAccessRule {
+                    principals: vec![],
+                    allowed: vec!["reports.hello".to_string()],
+                    ttl: Some("90s".to_string()),
+                },
+            ],
+            tool_quotas: vec![],
+        };
+        assert_eq!(
+            policy.matching_grant_ttl(None, "reports.hello"),
+            Some(std::time::Duration::from_secs(90))
+        );
+        assert_eq!(
+            policy.matching_grant_ttl(None, "other.tool"),
+            Some(std::time::Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn matching_grant_ttl_uses_the_named_principal() {
+        let policy = ToolAccessPolicy {
+            default_allow: false,
+            tool_access: vec![
+                ToolAccessRule {
+                    principals: vec![McpPrincipalSelector {
+                        virtual_key: Some("vk_analyst".to_string()),
+                        ..Default::default()
+                    }],
+                    allowed: vec!["reports.hello".to_string()],
+                    ttl: Some("8h".to_string()),
+                },
+                ToolAccessRule {
+                    principals: vec![McpPrincipalSelector {
+                        virtual_key: Some("vk_admin".to_string()),
+                        ..Default::default()
+                    }],
+                    allowed: vec!["reports.hello".to_string()],
+                    ttl: Some("30d".to_string()),
+                },
+            ],
+            tool_quotas: vec![],
+        };
+        let analyst = principal("acme", "u", None, None, Some("vk_analyst"));
+        let admin = principal("acme", "u", None, None, Some("vk_admin"));
+        assert_eq!(
+            policy.matching_grant_ttl(Some(&analyst), "reports.hello"),
+            Some(std::time::Duration::from_secs(8 * 3600))
+        );
+        assert_eq!(
+            policy.matching_grant_ttl(Some(&admin), "reports.hello"),
+            Some(std::time::Duration::from_secs(30 * 24 * 3600))
         );
     }
 

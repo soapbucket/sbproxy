@@ -73,6 +73,7 @@ fn list_grants() -> Resp {
                 "policy": record.policy,
                 "tool": record.tool,
                 "principal_id": record.principal_id,
+                "tenant_id": record.tenant_id,
                 "renewed_at": record.renewed_at_unix,
                 "ttl_secs": record.ttl_secs,
                 "expires_at": record.renewed_at_unix.saturating_add(record.ttl_secs),
@@ -98,6 +99,8 @@ struct RenewBody {
     tool: String,
     #[serde(default)]
     principal: Option<String>,
+    #[serde(default)]
+    tenant: Option<String>,
 }
 
 fn renew_grant(body: Option<&str>) -> Resp {
@@ -129,20 +132,38 @@ fn renew_grant(body: Option<&str>) -> Resp {
         let Some(policy) = mcp.rbac_policies.get(&parsed.policy) else {
             continue;
         };
-        let Some(ttl) = policy.matching_grant_ttl(None, &parsed.tool) else {
-            return (
-                400,
-                "application/json",
-                json!({ "error": "tool has no ttl on this policy" }).to_string(),
-            );
-        };
+        if parsed.principal.is_none() {
+            if policy.matching_grant_ttl(None, &parsed.tool).is_none() {
+                return (
+                    400,
+                    "application/json",
+                    json!({ "error": "tool has no ttl on this policy" }).to_string(),
+                );
+            }
+        } else if let Some(principal_id) = parsed.principal.as_deref() {
+            let principal = grant_principal(principal_id, parsed.tenant.as_deref().unwrap_or(""));
+            if policy
+                .matching_grant_ttl(Some(&principal), &parsed.tool)
+                .is_none()
+            {
+                return (
+                    400,
+                    "application/json",
+                    json!({ "error": "tool has no ttl on this policy" }).to_string(),
+                );
+            }
+        }
         let ledger_origin = mcp.server_name.as_str();
         match mcp.grant_ledger.renew_matching(
             ledger_origin,
             &parsed.policy,
             &parsed.tool,
             parsed.principal.as_deref(),
-            ttl,
+            parsed.tenant.as_deref(),
+            |key| {
+                let principal = grant_principal(&key.principal_id, &key.tenant_id);
+                policy.matching_grant_ttl(Some(&principal), &key.tool)
+            },
             std::time::SystemTime::now(),
         ) {
             Ok(rows) => {
@@ -157,6 +178,13 @@ fn renew_grant(body: Option<&str>) -> Resp {
                     404,
                     "application/json",
                     json!({ "error": "no matching mcp grant" }).to_string(),
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+                return (
+                    400,
+                    "application/json",
+                    json!({ "error": "tool has no ttl on this policy" }).to_string(),
                 );
             }
             Err(error) => {
@@ -195,6 +223,7 @@ fn list_holds() -> Resp {
                 "tool_name": hold.tool_name,
                 "origin": hold.origin,
                 "principal_id": hold.principal_id,
+                "tenant_id": hold.tenant_id,
                 "reason": hold.reason,
                 "created_at": hold.created_at_unix,
                 "expires_at": hold.expires_at_unix,
@@ -290,4 +319,17 @@ fn decide_hold(id: &str, body: Option<&str>, approve: bool) -> Resp {
         "application/json",
         json!({ "error": "unknown mcp approval hold" }).to_string(),
     )
+}
+
+fn grant_principal(principal_id: &str, tenant_id: &str) -> sbproxy_plugin::Principal {
+    sbproxy_plugin::Principal {
+        tenant_id: sbproxy_plugin::TenantId::from(tenant_id),
+        sub: principal_id.to_string(),
+        source: sbproxy_plugin::PrincipalSource::VirtualKey,
+        virtual_key: Some(sbproxy_plugin::VirtualKeyRef {
+            name: principal_id.to_string(),
+            allowed_providers: Vec::new(),
+        }),
+        attrs: sbproxy_plugin::PrincipalAttrs::default(),
+    }
 }

@@ -2,7 +2,7 @@
 //!
 //! A `tool_access[]` rule with `ttl` is a grant that expires unless an
 //! operator renews it. The ledger records `renewed_at` per
-//! `(origin, policy, tool, principal)` so a restart cannot silently
+//! `(origin, policy, tool, principal, tenant)` so a restart cannot silently
 //! extend the window, and so renewal is an admin API rather than a
 //! YAML edit.
 //!
@@ -35,10 +35,12 @@ pub struct GrantKey {
     pub tool: String,
     /// Virtual-key name or `sub`, matching the quota store's id.
     pub principal_id: String,
+    /// Tenant the principal belongs to. Same isolation as the quota store.
+    pub tenant_id: String,
 }
 
 impl GrantKey {
-    /// Stable ledger row id. Hex SHA-256 of the four identity fields
+    /// Stable ledger row id. Hex SHA-256 of the five identity fields
     /// joined with NULs so a field containing a separator cannot alias.
     pub(crate) fn row_id(&self) -> String {
         let mut hasher = Sha256::new();
@@ -49,6 +51,8 @@ impl GrantKey {
         hasher.update(self.tool.as_bytes());
         hasher.update([0]);
         hasher.update(self.principal_id.as_bytes());
+        hasher.update([0]);
+        hasher.update(self.tenant_id.as_bytes());
         hex::encode(hasher.finalize())
     }
 }
@@ -64,6 +68,10 @@ pub struct GrantRecord {
     pub tool: String,
     /// Principal id the grant is bound to.
     pub principal_id: String,
+    /// Tenant the principal belongs to. Absent on ledgers written
+    /// before WOR-2386's tenant isolation; treated as empty.
+    #[serde(default)]
+    pub tenant_id: String,
     /// Unix seconds of the last renewal (or first observation).
     pub renewed_at_unix: u64,
     /// Configured lifetime in seconds, copied from the rule so a
@@ -124,6 +132,7 @@ impl GrantLedger {
                             policy: record.policy.clone(),
                             tool: record.tool.clone(),
                             principal_id: record.principal_id.clone(),
+                            tenant_id: record.tenant_id.clone(),
                         };
                         (key.row_id(), record)
                     })
@@ -162,12 +171,17 @@ impl GrantLedger {
             policy: key.policy.clone(),
             tool: key.tool.clone(),
             principal_id: key.principal_id.clone(),
+            tenant_id: key.tenant_id.clone(),
             renewed_at_unix: now_unix,
             ttl_secs,
         };
-        entries.insert(id, record);
+        entries.insert(id.clone(), record);
         drop(entries);
-        let _ = self.persist();
+        if self.persist().is_err() {
+            let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+            entries.remove(&id);
+            return GrantStatus::Saturated;
+        }
         GrantStatus::Active {
             expires_at_unix: now_unix.saturating_add(ttl_secs),
         }
@@ -204,6 +218,7 @@ impl GrantLedger {
             policy: key.policy.clone(),
             tool: key.tool.clone(),
             principal_id: key.principal_id.clone(),
+            tenant_id: key.tenant_id.clone(),
             renewed_at_unix: now_unix,
             ttl_secs,
         };
@@ -214,19 +229,25 @@ impl GrantLedger {
     }
 
     /// Reset every row matching `origin`/`policy`/`tool`, optionally
-    /// narrowed to one principal. Used by `POST /api/mcp/grants/renew`.
+    /// narrowed to one principal and tenant. Used by
+    /// `POST /api/mcp/grants/renew`. `ttl_for` is consulted per row so
+    /// two principals with different windows on the same tool keep
+    /// those windows.
     ///
     /// # Errors
     ///
-    /// Returns when no row matches, the ledger is saturated inserting a
-    /// new row, or the durable write fails.
+    /// Returns when no row matches, a matching row has no ttl, the
+    /// ledger is saturated inserting a new row, or the durable write
+    /// fails.
+    #[allow(clippy::too_many_arguments)] // admin renew identity
     pub fn renew_matching(
         &self,
         origin: &str,
         policy: &str,
         tool: &str,
         principal_id: Option<&str>,
-        ttl: Duration,
+        tenant_id: Option<&str>,
+        ttl_for: impl Fn(&GrantKey) -> Option<Duration>,
         now: SystemTime,
     ) -> io::Result<Vec<GrantRecord>> {
         let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
@@ -239,12 +260,14 @@ impl GrantLedger {
                     && principal_id
                         .map(|id| record.principal_id == id)
                         .unwrap_or(true)
+                    && tenant_id.map(|id| record.tenant_id == id).unwrap_or(true)
             })
             .map(|record| GrantKey {
                 origin: record.origin.clone(),
                 policy: record.policy.clone(),
                 tool: record.tool.clone(),
                 principal_id: record.principal_id.clone(),
+                tenant_id: record.tenant_id.clone(),
             })
             .collect();
         drop(entries);
@@ -255,6 +278,13 @@ impl GrantLedger {
                     policy: policy.to_string(),
                     tool: tool.to_string(),
                     principal_id: principal_id.to_string(),
+                    tenant_id: tenant_id.unwrap_or("").to_string(),
+                };
+                let Some(ttl) = ttl_for(&key) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "tool has no ttl on this policy for this principal",
+                    ));
                 };
                 return Ok(vec![self.renew(&key, ttl, now)?]);
             }
@@ -265,6 +295,12 @@ impl GrantLedger {
         }
         let mut renewed = Vec::with_capacity(keys.len());
         for key in keys {
+            let Some(ttl) = ttl_for(&key) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "tool has no ttl on this policy for this principal",
+                ));
+            };
             renewed.push(self.renew(&key, ttl, now)?);
         }
         Ok(renewed)
@@ -352,6 +388,7 @@ mod tests {
             policy: "analyst".to_string(),
             tool: tool.to_string(),
             principal_id: "vk_analyst".to_string(),
+            tenant_id: "acme".to_string(),
         }
     }
 
@@ -423,5 +460,29 @@ mod tests {
             ledger.observe(&other, ttl, later),
             GrantStatus::Active { .. }
         ));
+    }
+
+    #[test]
+    fn distinct_tenants_do_not_share_a_window() {
+        let ledger = GrantLedger::in_memory();
+        let ttl = Duration::from_secs(60);
+        ledger.observe(&key("reports.hello"), ttl, t0());
+        let mut other = key("reports.hello");
+        other.tenant_id = "other-tenant".to_string();
+        let later = t0() + Duration::from_secs(61);
+        assert!(
+            matches!(
+                ledger.observe(&other, ttl, later),
+                GrantStatus::Active { .. }
+            ),
+            "a second tenant with the same principal id must seed its own window"
+        );
+        assert!(
+            matches!(
+                ledger.observe(&key("reports.hello"), ttl, later),
+                GrantStatus::Expired { .. }
+            ),
+            "the first tenant's elapsed grant must not be reset by the other tenant"
+        );
     }
 }
