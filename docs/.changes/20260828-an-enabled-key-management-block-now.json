@@ -1,0 +1,4 @@
+{
+  "type": "changed",
+  "message": "An enabled `key_management` block now refuses to boot when `crypto.pepper` or `crypto.master_key` is unset, naming the missing key, instead of minting an ephemeral one and warning. Set `key_management.crypto.allow_ephemeral_secrets: true` for a local development run that wants the old behavior."
+}

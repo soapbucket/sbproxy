@@ -1,0 +1,4 @@
+{
+  "type": "added",
+  "message": "Break-glass emergency access to the key and credential admin API under `/admin/break-glass`: scoped, time-boxed, N-of-M quorum approved with no self-approval, every action tagged with the grant id in the audit chain, and an expired grant held on a review queue until a human signs off."
+}

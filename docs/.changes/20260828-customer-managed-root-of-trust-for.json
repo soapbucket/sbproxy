@@ -1,0 +1,4 @@
+{
+  "type": "added",
+  "message": "Customer-managed root of trust for the upstream-credential envelope: `key_management.crypto.root_of_trust` wraps and unwraps each envelope data key through HashiCorp Vault Transit, so sbproxy never holds the key and revoking the grant stops decryption within the stated `unwrap_cache_ttl_secs`. `GET /admin/crypto/root-of-trust` reports the mode, the liveness of the external key service, and the revocation-latency bound."
+}

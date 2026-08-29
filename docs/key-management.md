@@ -1,6 +1,6 @@
 # SBproxy dynamic key management
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-28*
 
 A virtual key is a live, governed resource, not a line of YAML. With the
 `key_management:` block enabled, you mint, revoke, and rotate inbound keys at
@@ -1601,6 +1601,487 @@ The secret-free `EffectiveKeyPolicy` schema is version 2. Version 2 carries
 and effective-policy preview. Readers still accept a version 1 policy that
 lacks the field and treat it as unset, so rolling upgrades do not invent a
 selector for an older record.
+
+## Crypto material is pinned, not minted
+
+An enabled key plane needs two secrets: `pepper`, which hashes inbound virtual
+keys at rest, and `master_key`, which wraps the data key on every stored
+upstream-credential envelope. Neither has a default, and a process that pins
+neither refuses to boot.
+
+That refusal is deliberate and it is a change. Earlier builds minted a random
+pepper and logged a warning. The warning was read once, by whoever happened to
+be watching the boot; the consequence arrived at the next restart, when every
+stored key hash stopped verifying and every stored envelope stopped opening.
+The first symptom was a flood of 401s, which is a long way from the cause.
+
+```yaml
+proxy:
+  key_management:
+    enabled: true
+    crypto:
+      pepper: env:SBPROXY_KEY_PEPPER
+      master_key: vault://secret/sbproxy/master
+```
+
+Both fields take a secret reference (`env:`, `file:`, `vault://`, `awssm://`,
+`gcpsm://`, `azurekv://`, `k8ssecret://`) or an inline literal. A provider URI
+needs a matching backend under `proxy.secrets.backends`; without one the field
+is refused rather than becoming key material, because the reference text itself
+is source-visible and identical on every deployment that copied the same
+config.
+
+Two further guards sit on these fields:
+
+* A resolution that hands back the literal text of the reference that named it
+  is refused. That is the shape of a real incident: a `pepper:
+  awssm://prod/pepper` that nothing dereferenced became the 19-character ASCII
+  string `awssm://prod/pepper`, offline-crackable by anyone who had read the
+  documentation. The refusal covers the class, not the one instance: any
+  scheme, any backend.
+* An inline literal is exempt from that check and has to be, because
+  `pepper: a-literal-value` is the documented way to pin one on a single node.
+
+For a local development run where a key plane that does not outlive the process
+is exactly what you want:
+
+```yaml
+proxy:
+  key_management:
+    enabled: true
+    crypto:
+      allow_ephemeral_secrets: true    # local development only
+```
+
+The process then mints both, warns on every boot, and the store is effectively
+scratch.
+
+## Rotation cadence
+
+`key_management.crypto.rotation` names a crypto period per class of key
+material. NIST SP 800-57 Part 1 Rev 5 frames a key's life as generation,
+activation, active use, rotation, and destruction, and expects a deployment to
+*state* its crypto period rather than leave "rotate periodically" as the whole
+policy. These defaults are that statement.
+
+| Field | Default | What it covers | Why that number |
+|---|---|---|---|
+| `inbound_key_days` | 90 | Minted virtual keys | A bearer token with no proof of possession, held by a caller sbproxy does not control |
+| `credential_days` | 90 | Upstream provider credentials | Also a bearer credential, and one whose blast radius is the provider bill |
+| `master_key_days` | 365 | The envelope master key | The symmetric data-encryption-key end of NIST's range. Under a customer-managed root this is the customer's Transit key cadence, not sbproxy's |
+| `credential_grace_secs` | 300 | The rotation overlap window, below | Long enough for a provider-side activation to land, short enough that a retired secret is not left usable overnight |
+
+Nothing enforces a cadence. What sbproxy provides is the number to alert on:
+`GET /admin/credentials` publishes `sbproxy_key_rotation_age_days{kind="credential"}`
+for the oldest record it listed, and each credential's detail view carries its
+own `rotation_age_days`. Page when the gauge exceeds the period you named.
+
+```promql
+sbproxy_key_rotation_age_days{kind="credential"}
+  > on() group_left() 90    # your credential_days
+```
+
+## Rotating an upstream credential
+
+`POST /admin/keys/{id}/rotate` has minted a fresh inbound secret with a
+dual-validity window since the beginning. Rotating an *upstream* credential
+used to be a `PATCH` overwrite: the instant it landed, every request presented
+the new value, and a value the provider had not activated yet took the
+deployment down with it.
+
+```bash
+curl -sS -u admin:admin -X POST \
+  http://127.0.0.1:9901/admin/credentials/cred-openai/rotate \
+  -H 'content-type: application/json' \
+  -d '{"secret":"sk-the-new-one","grace_secs":300}'
+```
+
+```json
+{
+  "credential": {
+    "id": "cred-openai",
+    "storage": "encrypted",
+    "rotated_at": "2026-08-28T09:14:02Z",
+    "rotation_age_days": 0,
+    "rotation_overlap_expires_at": "2026-08-28T09:19:02Z"
+  },
+  "overlap": {
+    "grace_secs": 300,
+    "previous_material_expires_at": "2026-08-28T09:19:02Z",
+    "effect": "the previous material is used only if the new material will not resolve, and only until it expires"
+  }
+}
+```
+
+Read the overlap precisely, because it is narrower than the inbound-key one and
+the two are easy to conflate. sbproxy *presents* an upstream credential rather
+than validating one, so there is no old-value acceptance to do. The new
+material is what every request uses. The previous material is reached only when
+the new one will not resolve, and only while the window is open. A rotation that
+works never presents the retired secret at all, and a warn line plus a
+`credential_resolved` event with `outcome: rotation_overlap` fires when the
+fallback is used, so a rotation that silently stayed in overlap is visible.
+
+Pass `grace_secs: 0` when the secret you are replacing is compromised. The old
+material is retired at once and there is no window.
+
+Rotation is refused on a revoked credential. Revocation is terminal, and a
+rotate that reactivated a revoked record would make revocation reversible by
+anyone who can rotate.
+
+## Customer-managed root of trust
+
+By default the envelope's data key is wrapped by a key derived from
+`master_key`, which this process holds for its whole life. A `vault://`
+reference on that field does not change the shape: the read happens once, at
+boot, and the copy is sbproxy's. Revoking the operator's Vault policy afterwards
+changes nothing about what the process can still decrypt.
+
+`key_management.crypto.root_of_trust` changes the shape. The data key is
+wrapped and unwrapped by an external key service, and sbproxy never receives the
+key that did it.
+
+```yaml
+proxy:
+  key_management:
+    enabled: true
+    crypto:
+      pepper: env:SBPROXY_KEY_PEPPER
+      master_key: env:SBPROXY_KEY_MASTER
+      root_of_trust:
+        provider: vault_transit
+        address: https://vault.internal:8200
+        mount: transit
+        key_name: sbproxy-root
+        token: env:SBPROXY_TRANSIT_TOKEN
+        unwrap_cache_ttl_secs: 60
+        liveness_interval_secs: 30
+```
+
+The provider is HashiCorp Vault's Transit secrets engine, chosen because its
+contract is the one the claim needs: the caller hands over plaintext and gets
+back ciphertext, or the reverse, and never receives the key. That is the same
+shape AWS KMS `Encrypt`/`Decrypt` take, and it is what makes revoking the
+customer's grant actually stop decryption rather than merely inconvenience it.
+The `vault:v1:` prefix on Vault's ciphertext carries the key version, so the
+customer can rotate their Transit key without re-wrapping a single stored
+envelope: old ciphertext names the version that made it.
+
+### The revocation-latency bound
+
+`unwrap_cache_ttl_secs` is the number, and it is the product claim. An unwrap
+per request would put a network round trip on the credential path, so an
+unwrapped data key is reused for up to that long. **After the customer revokes
+sbproxy's grant, decryption of customer-managed credentials stops within
+`unwrap_cache_ttl_secs` seconds, or at the next failed liveness probe,
+whichever comes first.** With the defaults above, that is 60 seconds worst case
+and typically 30.
+
+Two caches that would otherwise extend that number are clamped so they cannot:
+
+* the resolved-credential cache is held to the revocation window for any
+  credential whose envelope names a customer-managed root, so raising
+  `proxy.secrets.rotation.re_resolve_interval_secs` does not lengthen it;
+* the stale-serve grace window in `proxy.secrets.rotation` is clamped the same
+  way, so a grace period bought for a briefly unreachable secret store does not
+  become a grace period for a revoked root of trust.
+
+A failed liveness probe purges every cached data key immediately, which is what
+turns the TTL into an upper bound rather than a per-entry lottery.
+
+### The dependency you are buying
+
+A customer-managed root makes credential decryption strictly dependent on the
+customer's key service. That is the feature, and it is also the cost, and the
+two are the same sentence read from either side. HashiCorp documents the
+identical trade for its own auto-unseal: a Vault whose KMS key is unavailable
+stays sealed and cannot serve, and recovery keys do not substitute for the
+seal mechanism.
+
+Here the blast radius is narrower than Vault's, because only the
+upstream-credential envelope depends on it: inbound key authentication, policy,
+budgets, and every `vault_ref` credential keep working while the Transit mount
+is unreachable. What stops is presenting a credential whose envelope the
+customer's key wrapped. Requests bound to one fail to resolve rather than
+falling back, which is the whole point and is not a bug to route around.
+
+Two things follow. Size `unwrap_cache_ttl_secs` against your key service's
+availability, not only against your revocation appetite: it is also how long a
+blip is invisible. And keep at least one non-customer-managed path to the
+providers you cannot afford to lose, if the customer's key service and your
+proxy do not share a failure domain.
+
+### What it covers, and what it does not
+
+Read this before quoting the claim to anyone.
+
+* It covers the **upstream-credential envelope**. A credential stored as an
+  envelope after the root of trust was configured is unreadable without the
+  external key service.
+* It does **not** cover `pepper`, which hashes inbound virtual keys and is
+  still held locally, nor the key-audit chain's fingerprint key, which is
+  derived from `master_key`. Both are still required, and `master_key` also
+  still opens envelopes sealed *before* the root of trust was turned on.
+* Turning the feature on does **not** re-wrap existing envelopes. They keep
+  opening under the local master, which is why nothing breaks at the switch and
+  also why the claim is not retroactive. `POST /admin/credentials/{id}/rotate`
+  re-seals under the current root and is the migration path; the credential's
+  detail view carries `root_of_trust`, so an operator can see which records have
+  moved.
+* Credentials stored as `vault_ref` are not envelopes at all and are not
+  covered. Their secret lives in the vault backend and the root of trust never
+  touches them.
+* A `plaintext` credential is not covered either, and never was.
+
+### The admin surface
+
+```bash
+curl -sS -u admin:admin http://127.0.0.1:9901/admin/crypto/root-of-trust
+```
+
+```json
+{
+  "mode": "customer_managed",
+  "kek": "transit/sbproxy-root",
+  "revocation_window_secs": 60,
+  "detail": "the envelope data key is wrapped by the external key service and is never held here. After the customer revokes sbproxy's grant, decryption of customer-managed credentials stops within 60 seconds, or at the next failed liveness probe, whichever comes first.",
+  "liveness": {
+    "probe": "ok",
+    "last_success_unix": 1787999640,
+    "cached_data_keys": 3,
+    "detail": "cached data keys are what a revoked grant still has to age out; a failed probe purges them immediately"
+  },
+  "rotation": { "master_key_days": 365, "credential_days": 90, "inbound_key_days": 90 }
+}
+```
+
+`mode` is `local` when no root of trust is configured, and the body says so in
+those words rather than leaving the reader to infer it from a missing field.
+
+## Leased credentials, and the scope limit
+
+Read the scope before the mechanism, because the scope is the honest part.
+
+Every credential shape above is static until somebody rotates it. Vault's
+actual differentiator is the opposite: mint on demand, hand back something with
+a lease, let it expire. That works where the platform underneath can mint
+short-lived credentials, and **most AI provider API keys cannot**. OpenAI,
+Anthropic, and the OpenAI-passthrough catalog have no STS equivalent and no
+short-TTL issuance, so there is nothing to lease against and no amount of
+gateway plumbing creates one.
+
+So leasing here covers exactly what it can: an enterprise buyer's own cloud IAM
+(AWS for Bedrock, GCP for Vertex, Azure for Azure OpenAI) and Vault-fronted
+database credentials, reached through a dynamic-secrets mount sbproxy reads.
+
+```bash
+curl -sS -u admin:admin -X POST http://127.0.0.1:9901/admin/credentials \
+  -H 'content-type: application/json' \
+  -d '{"id":"cred-bedrock","name":"bedrock-prod","provider":"bedrock",
+       "lease":{"reference":"vault://aws/creds/sbproxy-bedrock",
+                "platform":"aws","lease_duration_secs":900}}'
+```
+
+```json
+{
+  "credential": {
+    "id": "cred-bedrock",
+    "storage": "leased",
+    "vault_ref": "vault://aws/creds/sbproxy-bedrock",
+    "lease": {
+      "platform": "aws",
+      "lease_duration_secs": 900,
+      "detail": "material is minted on demand and never cached past the lease; sbproxy re-leases at use time rather than renewing ahead of expiry"
+    }
+  }
+}
+```
+
+The record stores the mount, not a credential. A resolution that cannot be
+served from cache reads the mount, which mints; the resolved material is then
+cached for at most `lease_duration_secs`, never longer, whatever
+`proxy.secrets.rotation.re_resolve_interval_secs` says. That ceiling is the
+whole difference between a leased credential and a `vault_ref` one.
+
+`lease` for a provider whose platform cannot mint short-lived credentials is
+refused at creation, with the limitation named:
+
+```
+provider 'openai' cannot be leased against platform 'aws'. Leasing needs a
+platform that mints short-lived credentials (AWS, GCP, or Azure IAM, or a
+Vault-fronted database mount); an AI provider API key has no short-TTL issuance
+to lease against, so a leased record would be exactly as static as a stored one
+```
+
+Accepting that and reading the reference once would produce a record that says
+"leased" on the admin view, never expires, and is exactly as static as the
+stored secret it replaced. An operator would believe they had short-lived
+upstream credentials and would not.
+
+Three things this does not do, stated rather than implied:
+
+* **No background renewal loop.** sbproxy re-leases lazily, at the next
+  resolution after the cache lapses, rather than renewing ahead of expiry.
+  For a non-renewable mount that is the correct behavior and the only
+  available one. For a renewable mount it means a fresh lease rather than an
+  extended one.
+* **No lease revocation.** sbproxy does not call `sys/leases/revoke` on a lease
+  it stops using; it relies on the mount's own TTL to reap it. Set
+  `lease_duration_secs` to match the mount's configured TTL so the two agree.
+* **The vault backend's own read cache still applies.** A dynamic mount read
+  goes through the same `sbproxy-vault` backend as any other reference, and
+  that backend caches. Keep its cache TTL below `lease_duration_secs`, or the
+  effective re-mint interval is the backend's rather than the lease's.
+
+## Read and access audit
+
+`audit.key_path` records who *changed* a key or credential. It does not record
+who *read* one, and "who touched this secret" is the question a breach
+investigation actually asks.
+
+```yaml
+proxy:
+  key_management:
+    read_audit:
+      enabled: true
+      detail_window_secs: 300
+      hash_identifiers: true
+```
+
+State the claim precisely, because the honest one is narrower than "we audit
+every read":
+
+* **Volume is recorded unconditionally.** `sbproxy_credential_read_total{outcome}`
+  moves on every credential resolution, including the ones that ride the
+  per-request cache. This is on whether or not `read_audit.enabled` is set.
+* **Detail is recorded on a bounded cadence.** A chained record fires at most
+  once per credential per `detail_window_secs`. The reads that do not get one
+  are counted as `sbproxy_credential_read_audit_records_total{outcome="suppressed"}`,
+  so the divergence is visible rather than silent.
+
+A detail record per request at gateway volume would be a real hot-path tax and a
+chain nobody could read. Cost here scales with credential count, not request
+rate, which is the same shape HashiCorp Vault's audit devices take when they
+separate what is counted from what is kept.
+
+Field posture follows Vault's selective hash. With `hash_identifiers: true`
+(the default) the credential id in the detail record is replaced by
+`hmac-sha256:<hex>` under the key-audit fingerprint key, and the timestamp,
+outcome, tenant, and cache layer pass through readable. An investigator who
+suspects a specific credential confirms it by hashing that id the same way,
+rather than by reading a chain that enumerates every credential the deployment
+holds. Two fingerprints are comparable only when they carry the same
+`key_epoch`; a rotated `master_key` re-bases every fingerprint after it.
+
+The records land on the existing `key_audit` channel with `op: resolve`, which
+means they reach the chain when `audit.key_path` is set and reach the tracing
+target and the admin ring either way. That was a choice between extending a
+proven channel and adding a fifth one: the read records share the payload
+shape, the fingerprint key, and the verification command with the mutation
+records, and a reviewer pulling one credential's history wants both in one file
+rather than in two joined on a timestamp. The per-channel opt-in cost stays
+separated by the second key: reads need both `audit.key_path` and
+`read_audit.enabled`.
+
+## Break-glass emergency access
+
+Before this, the narrowest thing available for "I need access to this one
+credential, right now, and I want it to be impossible to use quietly" was the
+standing admin credential.
+
+```yaml
+proxy:
+  key_management:
+    break_glass:
+      enabled: true
+      approvers: [alice, bob, carol]
+      quorum: 2
+      max_ttl_secs: 3600
+      review_window_secs: 86400
+```
+
+A grant is not a new authorization model. It is a time-boxed, scoped, audited
+marker on an admin session: authorization is still the admin RBAC roles. What
+the grant adds is that the access was asked for, agreed to by other people,
+bounded, and attributable afterwards to one id. The shape follows what every
+vault and PAM product surveyed converges on: pre-staged, time-boxed at 15 to 60
+minutes, scope-limited, two-person or quorum approved, and reviewed inside a
+fixed window.
+
+```bash
+# 1. Request. Scope and justification are both required.
+curl -sS -u alice:… -X POST http://127.0.0.1:9901/admin/break-glass \
+  -H 'content-type: application/json' \
+  -d '{"justification":"incident 4412, provider key rotated out from under us",
+       "scope":["cred-openai"],"ttl_secs":900}'
+# 201 { "grant": { "id": "bg_…", "state": "pending_approval", "approvals_needed": 2 } }
+
+# 2. Approve, twice, by two other operators on the roster.
+curl -sS -u bob:…   -X POST http://127.0.0.1:9901/admin/break-glass/bg_…/approve
+curl -sS -u carol:… -X POST http://127.0.0.1:9901/admin/break-glass/bg_…/approve
+# 200 { "grant": { "state": "active", "expires_at": "…" } }
+
+# 3. Anything alice does now is tagged with the grant id in the key audit chain.
+
+# 4. After it expires, somebody signs off.
+curl -sS -u dave:… -X POST http://127.0.0.1:9901/admin/break-glass/bg_…/review \
+  -H 'content-type: application/json' -d '{"note":"rotation confirmed, no other access"}'
+
+# The queue a reviewer opens.
+curl -sS -u admin:admin http://127.0.0.1:9901/admin/break-glass
+```
+
+Rules the endpoints enforce rather than document:
+
+* **No self-approval**, and it is refused before the roster is consulted, so
+  adding yourself to `approvers` does not close the gap. A two-person rule one
+  person can satisfy is not a two-person rule.
+* **A TTL above `max_ttl_secs` is refused, not clamped**, so the requester finds
+  out now rather than when the grant expires early.
+* **An unscoped request is refused.** An unscoped break-glass grant is a
+  standing admin credential with extra paperwork.
+* **Expiry is computed on read.** There is no sweeper to fail to run.
+* **An expired grant with no sign-off does not close.** It moves to
+  `awaiting_review` and stays on the queue and on
+  `sbproxy_break_glass_open{state="awaiting_review"}` until a human signs off,
+  and is marked overdue past `review_window_secs`.
+
+Two limitations to know before relying on it. Grants live in process memory, so
+a restart voids every active grant (which fails safe) and a fleet does not share
+them: a grant approved on one node is not visible on another, and each node
+counts its own quorum. Closing that means a store-backed grant record. And the
+console flow (request, pending approvals, active grants with a countdown, review
+queue) is deferred to the admin-console work; the JSON routes above are complete
+on their own and are what that page will read.
+
+## Key-lifecycle events in CEF
+
+`key_minted`, `key_revoked`, `key_rotated`, and `key_blocked` reach the
+`events:` egress as JSON. A SIEM that cannot take JSON gets the same records
+flattened into ArcSight CEF on the `key_audit_cef` tracing target, the format
+Vault's own audit device emits:
+
+```
+CEF:0|Soap Bucket|sbproxy|1.13.0|sbproxy.key.revoke|key revoke|7|rt=1787999640 outcome=applied duid=sbp_a1b2c3d4e5f60789 cs1Label=resource cs1=key suser=operator-jo cs2Label=tenant cs2=acme cn1Label=evidenceSeq cn1=42 cs3Label=evidenceInstance cs3=…
+```
+
+Route that target wherever the SIEM reads. A deployment that does not subscribe
+to it pays one disabled-callsite check per mutation and nothing else. LEEF is
+not emitted, and that is a decision rather than an omission. CEF is the open
+standard every major SIEM has an ingest path for, and it is what Vault's own
+audit device emits. LEEF is IBM's own format: QRadar parses it more tightly
+than it parses CEF, but QRadar does read CEF through its Universal DSM, so the
+choice costs a QRadar-only shop some parsing polish and buys everyone else one
+mapping instead of two. A second mapping is a second place a later field can
+silently stop crossing, and only one of them would be exercised daily.
+
+Every record on this feed now carries `sbproxy.evidence.seq` and
+`sbproxy.evidence.instance`. Within one instance, one tenant's sequence is
+gapless and strictly increasing, so a receiver that sees `1, 2, 4` knows exactly
+one record was lost. The feed is still a lossy real-time copy and the local hash
+chain is still the durable record; what the sequence adds is that a loss is
+*visible to the receiver* without trusting the process that wrote it, which
+matters because the chain's Ed25519 signing key lives in that same process.
 
 ## Examples in Practice
 
