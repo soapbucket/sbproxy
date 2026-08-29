@@ -1,0 +1,111 @@
+# The lane that runs a real sbproxy binary down the AI request path.
+#
+# It lives in its own workflow, with no `paths:` filter, because of how
+# it failed. It used to be a job inside context-compression-eval.yml
+# behind a twelve-path trigger, and the two commits that broke `main`
+# touched none of those twelve paths. The lane did not go red; it did
+# not run at all, and `main` sat overflowing its stack with nothing to
+# say so.
+#
+# A stack budget cannot be gated on a path list. The stack is consumed
+# by the whole call chain, so a frame added anywhere in the workspace,
+# in a crate this file has never heard of, spends the same budget as one
+# added in `ai_dispatch.rs`. Any filter narrower than "every pull
+# request" is narrower than the thing being guarded, and a guard
+# narrower than its claim is worse than none.
+#
+# This lane builds a DEBUG binary on purpose. Debug frames are far
+# larger than release ones, so it reaches depths production never does,
+# which is exactly what makes it the place a stack budget is worth
+# checking.
+
+name: request-path-smoke
+
+on:
+  # No `paths:` filter, deliberately: see the header. Branches are named
+  # so a fork's pull request against a release branch does not silently
+  # skip the one lane that catches a stack overflow.
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  request-path-smoke:
+    name: production request-path smoke
+    runs-on: ubuntu-latest
+    # Was 35 with a warm cache. The cache below is restore-only now, and a
+    # cold run compiles the sbproxy binary and the e2e test union from
+    # scratch; 60 covers that honestly.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      # Restore-only: this key held ~2.0 GB of the 10 GB budget that
+      # ci.yml's header arithmetic gives back to the per-PR keys. The
+      # key name is unchanged from when this job lived in
+      # context-compression-eval.yml, so the warm cache carries over.
+      - uses: ./.github/actions/rust-setup
+        with:
+          cache-key: context-compression-request-path
+          cache-save: 'false'
+
+      # First, and on its own: this is the check that says how close the
+      # request path is to the stack it runs on, and it is cheap next to
+      # the three e2e runs below. `--nocapture` because the number is
+      # the point; a reviewer comparing two branches reads it out of the
+      # log rather than editing the test. Linux frames are the ones that
+      # matter here: macOS numbers rank candidates and nothing else.
+      # `cargo test` exits 0 when a filter matches nothing, so a
+      # renamed test turns this step into a no-op that reports success.
+      # That already happened once on this branch, with `--exact` and a
+      # bare test name selecting none of 2857 tests and passing. Count
+      # the tests that ran and fail if it is not the two expected.
+      - name: request-path stack budget
+        run: |
+          set -euo pipefail
+          cargo test -p sbproxy-core --locked --lib \
+            dispatch_path_stays_inside_its_stack_budget -- --nocapture 2>&1 \
+            | tee /tmp/stack-budget.log
+          ran="$(sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' /tmp/stack-budget.log \
+            | head -1)"
+          if [ "${ran:-0}" -ne 2 ]; then
+            echo "::error::expected 2 stack budget tests, ran ${ran:-0}. A renamed or removed"
+            echo "::error::test makes this step pass while checking nothing."
+            exit 1
+          fi
+          grep -E 'STACK_HIGH_WATER_BYTES' /tmp/stack-budget.log
+
+      - name: build sbproxy binary
+        run: cargo build -p sbproxy --locked
+
+      - name: Phase 1 request path
+        run: >-
+          cargo test -p sbproxy-e2e --locked --test context_compression_phase1
+          -- --test-threads=1
+
+      - name: governed selector precedence
+        run: >-
+          cargo test -p sbproxy-e2e --locked --test governed_key_policy
+          dynamic_compression_profile_changes_context_and_header_overrides_it
+          -- --exact --test-threads=1
+
+      - name: Anthropic native compression
+        run: >-
+          cargo test -p sbproxy-e2e --locked --test ai_native_inbound
+          anthropic_native_upstream_receives_the_compressed_message_list
+          -- --exact --test-threads=1

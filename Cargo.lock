@@ -7041,7 +7041,7 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 [[package]]
 name = "pingora-cache"
 version = "0.8.0"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#4153f0d22ef5ccc591a3ae5e75637effe83f9be8"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#2d9dc2b908dd1dee69ade3378054c0d8b472bac5"
 dependencies = [
  "ahash",
  "arrayvec 0.7.6",
@@ -7076,7 +7076,7 @@ dependencies = [
 [[package]]
 name = "pingora-core"
 version = "0.8.0"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#4153f0d22ef5ccc591a3ae5e75637effe83f9be8"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#2d9dc2b908dd1dee69ade3378054c0d8b472bac5"
 dependencies = [
  "ahash",
  "async-trait",
@@ -7129,12 +7129,12 @@ dependencies = [
 [[package]]
 name = "pingora-error"
 version = "0.8.0"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#4153f0d22ef5ccc591a3ae5e75637effe83f9be8"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#2d9dc2b908dd1dee69ade3378054c0d8b472bac5"
 
 [[package]]
 name = "pingora-header-serde"
 version = "0.8.0"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#4153f0d22ef5ccc591a3ae5e75637effe83f9be8"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#2d9dc2b908dd1dee69ade3378054c0d8b472bac5"
 dependencies = [
  "bytes",
  "http 1.4.0",
@@ -7149,7 +7149,7 @@ dependencies = [
 [[package]]
 name = "pingora-http"
 version = "0.8.0"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#4153f0d22ef5ccc591a3ae5e75637effe83f9be8"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#2d9dc2b908dd1dee69ade3378054c0d8b472bac5"
 dependencies = [
  "bytes",
  "http 1.4.0",
@@ -7159,7 +7159,7 @@ dependencies = [
 [[package]]
 name = "pingora-lru"
 version = "0.8.0"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#4153f0d22ef5ccc591a3ae5e75637effe83f9be8"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#2d9dc2b908dd1dee69ade3378054c0d8b472bac5"
 dependencies = [
  "ahash",
  "arrayvec 0.7.6",
@@ -7175,7 +7175,7 @@ dependencies = [
 [[package]]
 name = "pingora-pool"
 version = "0.8.0"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#4153f0d22ef5ccc591a3ae5e75637effe83f9be8"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#2d9dc2b908dd1dee69ade3378054c0d8b472bac5"
 dependencies = [
  "crossbeam-queue",
  "dashmap 5.5.3",
@@ -7190,7 +7190,7 @@ dependencies = [
 [[package]]
 name = "pingora-proxy"
 version = "0.8.0"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#4153f0d22ef5ccc591a3ae5e75637effe83f9be8"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#2d9dc2b908dd1dee69ade3378054c0d8b472bac5"
 dependencies = [
  "async-trait",
  "bytes",
@@ -7212,7 +7212,7 @@ dependencies = [
 [[package]]
 name = "pingora-runtime"
 version = "0.8.0"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#4153f0d22ef5ccc591a3ae5e75637effe83f9be8"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#2d9dc2b908dd1dee69ade3378054c0d8b472bac5"
 dependencies = [
  "log",
  "once_cell",
@@ -7225,7 +7225,7 @@ dependencies = [
 [[package]]
 name = "pingora-rustls"
 version = "0.8.0"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#4153f0d22ef5ccc591a3ae5e75637effe83f9be8"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#2d9dc2b908dd1dee69ade3378054c0d8b472bac5"
 dependencies = [
  "log",
  "no_debug",
@@ -7241,7 +7241,7 @@ dependencies = [
 [[package]]
 name = "pingora-timeout"
 version = "0.8.0"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#4153f0d22ef5ccc591a3ae5e75637effe83f9be8"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#2d9dc2b908dd1dee69ade3378054c0d8b472bac5"
 dependencies = [
  "once_cell",
  "parking_lot",
@@ -9078,6 +9078,7 @@ dependencies = [
  "pingora-error",
  "pingora-http",
  "pingora-proxy",
+ "pingora-runtime",
  "prometheus",
  "rand 0.8.6",
  "rcgen",
