@@ -134,7 +134,7 @@ pub fn replay(
         let baseline_label = baseline.map(|ev| verdict_label(&ev.evaluate(&request)));
         let expected = sample.expected.as_deref().map(normalize_label);
         let expected_mismatch = expected.as_deref().is_some_and(|want| want != verdict);
-        let row_changed = baseline_label.as_deref().is_some_and(|was| was != verdict);
+        let row_changed = baseline_label.is_some_and(|was| was != verdict);
         if expected_mismatch {
             expected_mismatches += 1;
         }
