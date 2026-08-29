@@ -1033,7 +1033,8 @@ async fn refuse_olp_token_over_budget(
 /// rather than an inline block in `request_filter` (WOR-2673). Inline,
 /// every local this body holds and every future it awaits, including
 /// `serve_redeem`'s, became part of `request_filter`'s own state
-/// machine, which Pingora polls on a 2 MiB worker stack and which CI's
+/// machine, which Pingora polls on an 8 MiB worker stack (WOR-2699
+/// raised it from tokio's 2 MiB default) and which CI's
 /// request-path smoke lane overflowed three times on this branch while
 /// `origin/main` stayed green. Boxed, the whole thing is one pointer in
 /// the parent and is allocated only on the three paths that reach it.
@@ -9787,86 +9788,22 @@ mod olp_token_rate_limiter_tests {
     }
 }
 
-/// WOR-2673: the request path's own stack budget.
-///
-/// The AI dispatch guards next door measure `handle_ai_proxy`. Nothing
-/// measured `request_filter`, which is the function every request enters
-/// and the one this ticket grew: the CoMP well-known block and the OLP
-/// token budget both live in it. A DEBUG build gives a Rust async fn
-/// far larger frames than a release one, and Pingora runs its workers on
-/// a 2 MiB stack, so a request path that fits in release can overflow in
-/// the debug binary CI's request-path smoke lane builds.
-#[cfg(test)]
-mod request_filter_stack_tests {
-    /// Pingora's per-worker stack.
-    const PINGORA_WORKER_STACK: usize = 2 * 1024 * 1024;
-
-    /// Measured sizes, for the next person comparing branches.
-    ///
-    /// | tree | bytes |
-    /// |---|---|
-    /// | `origin/main` at `1cd47627` | 36,464 |
-    /// | WOR-2673 with the CoMP block and OLP budget inline | 36,656 |
-    /// | WOR-2673 after boxing both | 36,480 |
-    ///
-    /// Read those as a trend, not as proof. This is `size_of` on
-    /// aarch64 macOS; CI's request-path smoke lane compiles a Linux
-    /// debug binary whose frame layout is not this one, and that lane
-    /// overflowed three times on this branch while `origin/main` stayed
-    /// green even though the first two numbers above differ by 192
-    /// bytes. Equality of future size is not equality of stack depth.
-    /// What boxing actually bought is not visible here at all: the
-    /// bodies of `serve_comp_well_known` and
-    /// `refuse_olp_token_over_budget`, and every future they await,
-    /// now live on the heap instead of in this frame.
-    ///
-    /// Share of that stack one `request_filter` future may occupy.
-    ///
-    /// The future is state, not frames: it is held live for the whole
-    /// request while everything it calls runs *above* it. So the budget
-    /// has to leave room for the deepest thing it dispatches into, which
-    /// is the AI path. An eighth of the stack is the line drawn here,
-    /// deliberately far below what would actually overflow, because the
-    /// number that matters is the trend and a guard that only fires at
-    /// the cliff fires too late to say what pushed it over.
-    const BUDGET: usize = PINGORA_WORKER_STACK / 8;
-
-    /// The size of the future `request_filter` returns.
-    ///
-    /// Read off the type, never from a value: `size_of` needs only the
-    /// layout, and the closure below is passed by value and dropped
-    /// without being called, so no `Session` is ever built and nothing
-    /// is polled. That is what makes this cheap enough to run in every
-    /// suite and safe enough to need no `unsafe`.
-    fn future_size<F: core::future::Future>(_never_called: impl FnOnce() -> F) -> usize {
-        core::mem::size_of::<F>()
-    }
-
-    /// The measured size of `request_filter`'s state machine.
-    fn request_filter_future_size() -> usize {
-        // Unreachable by construction: `future_size` takes the closure
-        // and drops it unpolled, so `never` is called only in the type
-        // system. One expression, so every statement stays reachable.
-        fn never<T>() -> T {
-            unreachable!("the size probe never runs its closure")
-        }
-        future_size(|| super::request_filter(never(), never()))
-    }
-
-    #[test]
-    fn request_filter_fits_its_share_of_a_pingora_worker_stack() {
-        let size = request_filter_future_size();
-        // Printed on every run, not only on failure: the number is the
-        // point, and a reviewer comparing two branches wants to read it
-        // without editing the test.
-        println!("request_filter future: {size} bytes (budget {BUDGET})");
-        assert!(
-            size <= BUDGET,
-            "the `request_filter` future is {size} bytes, past the {BUDGET}-byte budget \
-             ({PINGORA_WORKER_STACK}-byte Pingora worker stack / 8). Every request holds this \
-             live while the phases it dispatches into run above it, so growth here comes \
-             straight off what the AI path has left. Box the new state or move it into its own \
-             `async fn` rather than raising this number."
-        );
-    }
-}
+// WOR-2699: `request_filter_fits_its_share_of_a_pingora_worker_stack`
+// stood here. It asserted `size_of` on the `request_filter` future
+// against an eighth of a 2 MiB worker stack, and reported 36,480 bytes
+// of a 262,144 budget: 14% used, on a tree whose CI smoke lane was
+// aborting with a stack overflow on this very path. It passed green
+// through three of them.
+//
+// The number was not wrong; it was measuring the wrong thing. A
+// future's size is the state it holds between polls. The stack is the
+// chain of frames live during one, and this future sits at the top of
+// that chain rather than containing it, so 96% of what fills the stack
+// was outside what it could see. A budget that cannot be reached is not
+// a budget, and a guard that cannot go red is worse than none, because
+// it answers the question nobody then asks again.
+//
+// `the_ai_dispatch_path_stays_inside_its_stack_budget` in
+// `ai_dispatch.rs` replaces it: it runs the real dispatch on a real
+// Pingora worker whose stack is set to the budget, and measures the
+// bytes actually used from the worker's own stack base.

@@ -19,6 +19,7 @@ ten-minute build.
 | pub-item ratchet | `bash scripts/check-pub-item-ratchet.sh` |
 | unwrap/expect/panic ratchet | `bash scripts/check-unwrap-ratchet.sh` |
 | Operator URLs at log lines | `bash scripts/check-log-url-ratchet.sh` |
+| AI dispatch stack budget | `bash scripts/check-stack-budget-ratchet.sh` |
 | Spec citations | `bash scripts/check-spec-citations.sh` |
 | Env mutation | `bash scripts/check-env-mutation.sh` |
 | Durable file modes | `bash scripts/check-durable-file-modes.sh` |
@@ -689,14 +690,34 @@ ships without any upstream fixes landed since the last cut.
 Re-sync it as the first step of every release:
 
 1. In the `pingora` checkout, fetch upstream (`origin`,
-   `github.com/cloudflare/pingora`) and rebase `sbproxy-0.8.0` onto the
-   target upstream tag, keeping our patch commits on top. Resolve any
-   conflicts against the new upstream.
-2. Push the rebased branch to the `sb` remote
+   `github.com/cloudflare/pingora`) and rebase `sbproxy-0.8.0` onto a
+   newer upstream **`main`**, keeping our patch commits on top. Resolve
+   any conflicts against the new upstream.
+
+   Never onto a release tag, even though the branch is named for one.
+   Cloudflare cuts releases on a release branch, so a tag is not an
+   ancestor of `main`: as of 2026-08-28, `0.8.1` holds 8 commits `main`
+   does not have while `main` holds 190 that `0.8.1` does not. Rebasing
+   onto a tag moves the fork to a different line rather than to an older
+   point on the same one, and strands the fixes we have upstreamed,
+   which land on `main`.
+
+   The crates declare `0.8.0` and the branch is named `sbproxy-0.8.0`,
+   but neither is a release we track. Read the version as an API
+   generation.
+2. Run `scripts/divergence.sh` in the fork before and after. It prints
+   the merge base, how far ahead and behind the fork is, and which files
+   we carry, which is the only honest before-and-after for a rebase that
+   touches upstream history. The fork's CI prints the same report on
+   every PR. Copy the after numbers into the comment above
+   `[patch.crates-io]` in `Cargo.toml`.
+3. Push the rebased branch to the `sb` remote
    (`git@github.com:soapbucket/pingora.git`).
-3. Back in this workspace, refresh `Cargo.lock` so the build resolves to
-   the new fork commit, then run the full gate. Only cut the tag once it
-   is green against the updated fork.
+4. Back in this workspace, refresh `Cargo.lock` so the build resolves to
+   the new fork commit, then run the full gate. Diff the lockfile and
+   revert anything that is not the `pingora-*` rev bumps: a `cargo update
+   -p` on this workspace has silently downgraded unrelated dependencies
+   before. Only cut the tag once it is green against the updated fork.
 
 ## License + attribution
 

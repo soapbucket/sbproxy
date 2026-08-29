@@ -198,6 +198,12 @@ enum Cmd {
     /// Diff a proposed config against a baseline. Exit 0 no-op, 2
     /// changes present, 3 semantic-validation errors.
     Plan(PlanArgs),
+    /// Fetch every project repository `origin_sources:` names, compose
+    /// the `origins:` map, and either publish it through the config
+    /// authority or write it to a file. Exit 0 published or unchanged,
+    /// 1 CLI error, 2 `--dry-run` found changes, 3 the composition or
+    /// the authority refused it.
+    Aggregate(AggregateArgs),
     /// Validate and reload an sbproxy config in place. Same primitive
     /// the SIGHUP handler and file watcher use.
     Apply(ApplyArgs),
@@ -310,6 +316,85 @@ struct PlanArgs {
     /// with `apply -p <plan-file>`. Atomic via temp-file + rename(2).
     #[arg(long = "out")]
     out: Option<PathBuf>,
+    /// Print the composition provenance for one composed host instead
+    /// of a diff: which layer set each leaf of that origin, and which
+    /// repository and commit it came from. Fetches every project
+    /// repository `origin_sources:` names, so it is refused under
+    /// `--no-fetch`.
+    #[arg(long = "explain-origin", conflicts_with = "against")]
+    explain_origin: Option<String>,
+}
+
+/// `sbproxy aggregate`: compose project-owned origin profiles into the
+/// `origins:` map and publish or write the result.
+#[derive(clap::Args)]
+struct AggregateArgs {
+    /// Positional runtime config path. Equivalent to `-f <path>`. This
+    /// is the document carrying `origin_sources:` and `origin_defaults:`,
+    /// not a project profile.
+    config_path: Option<PathBuf>,
+    /// Compose to this file instead of publishing. The offline path for
+    /// a single node, a self-host, or a CI job that wants to review the
+    /// composed output before it ships.
+    #[arg(long = "out")]
+    out: Option<PathBuf>,
+    /// Print what `--out` would change against the file already there
+    /// and write nothing. Exit 2 when there are changes.
+    #[arg(long = "dry-run", action = ArgAction::SetTrue, requires = "out")]
+    dry_run: bool,
+    /// Print the composition provenance for one host and exit: which
+    /// layer set each leaf, and which repository and commit it came
+    /// from.
+    #[arg(long = "explain")]
+    explain: Option<String>,
+    /// Keep running: poll each entry on the configured interval,
+    /// coalesce a burst of movement into one composition, and publish
+    /// when the composed document actually changed.
+    ///
+    /// Refuses to combine with the one-shot flags rather than ignoring
+    /// them. `--watch --out f.yml` used to drop `--out` without a word
+    /// and loop publishing to the admin API instead, which on a node
+    /// with an admin listener is a fleet publish nobody asked for.
+    #[arg(
+        long = "watch",
+        action = ArgAction::SetTrue,
+        conflicts_with_all = ["dry_run", "out", "explain"]
+    )]
+    watch: bool,
+    /// Stop after this many poll cycles in `--watch`. Zero means run
+    /// until interrupted, which is the operational default; a positive
+    /// value is what a cron-shaped invocation uses. Poll cycles rather
+    /// than compositions, because a fleet where nothing moves composes
+    /// nothing and a bound counting compositions would never be reached.
+    #[arg(long = "polls", default_value_t = 0)]
+    polls: u32,
+    /// How subscribers apply the composed document. Must match the mode
+    /// each subscriber is configured for, or they refuse the bundle.
+    #[arg(long = "mode", value_enum, default_value_t = BundleModeArg::Overlay)]
+    mode: BundleModeArg,
+    /// Admin endpoint and Basic Auth credentials of the config
+    /// authority this publishes through.
+    #[command(flatten)]
+    admin: ModelsAdminArgs,
+    /// Output format. `text` (default) prints a human summary; `json`
+    /// is the stable envelope for tooling.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+impl std::fmt::Debug for AggregateArgs {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AggregateArgs")
+            .field("config_path", &self.config_path)
+            .field("out", &self.out)
+            .field("dry_run", &self.dry_run)
+            .field("explain", &self.explain)
+            .field("watch", &self.watch)
+            .field("polls", &self.polls)
+            .field("admin", &self.admin)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(clap::Args)]
@@ -383,6 +468,14 @@ enum ConfigSub {
     /// Print one recorded revision's stored document, selected by the
     /// revision number `config history` lists.
     Show(ConfigShowArgs),
+    /// Roll the running proxy back to a config revision it already
+    /// stored. Names the blast radius before it acts, refuses a stale
+    /// `--expected-current`, and the restored document soaks like any
+    /// other candidate.
+    Rollback(ConfigRollbackArgs),
+    /// Diff two stored config revisions, or one stored revision against
+    /// what the proxy is running. Applies nothing.
+    Diff(ConfigDiffArgs),
 }
 
 impl ConfigCmd {
@@ -394,7 +487,15 @@ impl ConfigCmd {
     /// indistinguishable from a broken invocation, so their CLI-error code
     /// is 1 like `plan`'s.
     fn uses_plan_exit_codes(&self) -> bool {
-        matches!(self.sub, ConfigSub::Authority(_) | ConfigSub::Pull(_))
+        // `config diff` joins the two that already report this way: it
+        // prints a plan, and a plan whose exit code doubled as a CLI
+        // error code would make "these two revisions differ"
+        // indistinguishable from "you typed the command wrong"
+        // (WOR-2460).
+        matches!(
+            self.sub,
+            ConfigSub::Authority(_) | ConfigSub::Pull(_) | ConfigSub::Diff(_)
+        )
     }
 }
 
@@ -580,6 +681,70 @@ struct ConfigHistoryArgs {
     admin: ModelsAdminArgs,
     /// Output format. `text` (default) prints a table; `json` prints
     /// the admin API's response verbatim.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+/// `sbproxy config rollback`: re-apply a stored config revision.
+#[derive(clap::Args, Debug)]
+struct ConfigRollbackArgs {
+    /// Which revision to restore: a revision number from
+    /// `sbproxy config history`, a content digest, or the default
+    /// `last-known-good`.
+    #[arg(long = "to", default_value = "last-known-good")]
+    to: String,
+    /// Refuse unless this is the revision the node is running right
+    /// now. Two operators reaching for rollback during one incident is
+    /// not hypothetical, and without this the second silently undoes
+    /// the first. Read it from `sbproxy config history`.
+    #[arg(long = "expected-current")]
+    expected_current: Option<u64>,
+    /// Confirm a restart-class or breaking rollback by naming the
+    /// target revision again. Required for those two classes and
+    /// ignored for the other two, the way a destructive action should
+    /// be.
+    #[arg(long = "confirm")]
+    confirm: Option<u64>,
+    /// Refuse unless the node's ring carries this lineage. A `source:`
+    /// repoint preserves lineage; a node-identity change re-mints it,
+    /// and a revision number from before that names a different
+    /// history.
+    #[arg(long = "lineage")]
+    lineage: Option<String>,
+    /// Roll back across a lineage break anyway.
+    #[arg(long = "force", action = ArgAction::SetTrue)]
+    force: bool,
+    /// Admin endpoint and Basic Auth credentials of the running proxy.
+    #[command(flatten)]
+    admin: ModelsAdminArgs,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+/// `sbproxy config diff`: plan between two stored revisions.
+#[derive(clap::Args, Debug)]
+struct ConfigDiffArgs {
+    /// The revision to diff **to**: a revision number or
+    /// `last-known-good`. Positional, so `sbproxy config diff 7` is the
+    /// short form.
+    to: Option<String>,
+    /// Baseline revision. Defaults to what the proxy is running, which
+    /// makes the one-argument form the question people actually ask
+    /// mid-incident. Junos spells the two forms
+    /// `show | compare rollback n` and
+    /// `show system rollback 3 compare 1`; this is both.
+    #[arg(long = "from")]
+    from: Option<String>,
+    /// Target revision, as a flag rather than the positional. Naming
+    /// both is a usage error rather than a precedence rule.
+    #[arg(long = "to")]
+    to_flag: Option<String>,
+    /// Admin endpoint and Basic Auth credentials of the running proxy.
+    #[command(flatten)]
+    admin: ModelsAdminArgs,
+    /// Output format. `text` prints the plan; `json` prints the admin
+    /// API's response verbatim.
     #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
 }
@@ -1941,6 +2106,16 @@ fn main() {
         }
         Some(Cmd::Plan(args)) => {
             run_subcommand("plan", 1, handle_plan_subcommand(&args));
+        }
+        Some(Cmd::Aggregate(args)) => {
+            // `-f/--config` is a global, so it lands in `cli.globals`
+            // rather than in this subcommand's positional, the same way
+            // `validate` has to fall back. The positional still wins.
+            let args = AggregateArgs {
+                config_path: args.config_path.or(global_config_path.clone()),
+                ..args
+            };
+            run_subcommand("aggregate", 1, handle_aggregate_subcommand(&args));
         }
         Some(Cmd::Apply(args)) => {
             run_subcommand("apply", 1, handle_apply_subcommand(&args));
@@ -8831,6 +9006,8 @@ fn handle_config_subcommand(
         ConfigSub::Pull(args) => handle_config_pull(args, global_config),
         ConfigSub::History(args) => handle_config_history(args),
         ConfigSub::Show(args) => handle_config_show(args),
+        ConfigSub::Rollback(args) => handle_config_rollback(args),
+        ConfigSub::Diff(args) => handle_config_diff(args),
     }
 }
 
@@ -9377,8 +9554,13 @@ fn report_admin_refusal(
         .get("code")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown");
-    eprintln!("{command}: the authority refused (HTTP {status}, {code}): {error}");
-    eprintln!("{command}: nothing changed on the authority.");
+    // "the admin API" rather than "the authority": most callers here
+    // (`config history`, `config show`, `config rollback`, `config diff`)
+    // talk to a proxy node's own admin API, and telling an operator
+    // mid-incident that "the authority refused" sends them to look at
+    // the wrong machine.
+    eprintln!("{command}: the admin API refused (HTTP {status}, {code}): {error}");
+    eprintln!("{command}: nothing changed.");
     4
 }
 
@@ -9677,6 +9859,335 @@ fn handle_authority_init(args: &AuthorityInitArgs) -> anyhow::Result<i32> {
 /// Exit codes: 0 published (or validated under `--validate-only`), 1 CLI or
 /// IO error, 3 the payload was refused locally and nothing was sent, 4 the
 /// authority refused it, 7 the authority was unreachable.
+/// Publish a composed document through the config authority's admin
+/// route.
+///
+/// The same route `sbproxy config authority publish` posts to, so the
+/// composed document goes through `compile_config`, the pipeline
+/// construction, the model-runtime check and the denied-path screen on
+/// the authority side rather than being trusted because the aggregator
+/// produced it.
+struct AdminApiPublisher<'a> {
+    admin: &'a ModelsAdminArgs,
+    mode: BundleModeArg,
+}
+
+impl sbproxy_core::config_aggregator::CompositionPublisher for AdminApiPublisher<'_> {
+    fn publish(&self, config_yaml: &str) -> Result<u64, String> {
+        let route = format!(
+            "{}?mode={}",
+            sbproxy_core::config_authority::PUBLISH_PATH,
+            self.mode.as_str()
+        );
+        let outcome = admin_request_parts(
+            self.admin,
+            reqwest::Method::POST,
+            &route,
+            Some(AdminRequestBody::Yaml(config_yaml.to_string())),
+        )
+        .map_err(|error| format!("{error:#}"))?;
+        match outcome {
+            AdminOutcome::Unreachable(reason) => Err(format!(
+                "could not reach the admin API at {}: {reason}",
+                self.admin.admin_url.as_deref().unwrap_or(DEFAULT_ADMIN_URL)
+            )),
+            AdminOutcome::Answered { status, body } if !status.is_success() => {
+                let error = body
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("the admin API gave no reason");
+                let code = body
+                    .get("code")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                Err(format!("HTTP {status} ({code}): {error}"))
+            }
+            AdminOutcome::Answered { body, .. } => Ok(json_u64(&body, "revision")),
+        }
+    }
+}
+
+/// `sbproxy aggregate`: fetch, compose, and publish or write.
+///
+/// Exit codes: 0 published, written, or unchanged; 1 a CLI or
+/// composition error (through `run_subcommand`); 2 `--dry-run` found
+/// changes; 3 the composition or the authority refused it.
+fn handle_aggregate_subcommand(args: &AggregateArgs) -> anyhow::Result<i32> {
+    let path = args
+        .config_path
+        .clone()
+        .or_else(|| std::env::var("SB_CONFIG_FILE").ok().map(PathBuf::from))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "missing config path: aggregate takes the runtime document that carries \
+                 `origin_sources:`, as a positional argument or through -f / --config"
+            )
+        })?;
+    // `from_path` rather than a read plus `from_document`, so a
+    // `--watch` run re-reads the document each cycle instead of
+    // composing from the one it saw at start-up.
+    let mut aggregator = sbproxy_core::config_aggregator::Aggregator::from_path(
+        &path,
+        sbproxy_config::source::FetchContext::with_git_binary(),
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    aggregator
+        .resolve_credentials()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+    if args.watch {
+        let publisher = AdminApiPublisher {
+            admin: &args.admin,
+            mode: args.mode,
+        };
+        let polls = (args.polls > 0).then_some(args.polls);
+        {
+            let entries = aggregator.entries().len();
+            let timings = aggregator.timings();
+            println!(
+                "aggregate: watching {entries} entr{}; poll {}s, debounce {}s, ceiling {}s",
+                if entries == 1 { "y" } else { "ies" },
+                timings.poll_interval_secs,
+                timings.debounce_secs,
+                timings.max_deferral_secs
+            );
+        }
+        sbproxy_core::config_aggregator::aggregation_loop(&mut aggregator, &publisher, polls);
+        return Ok(0);
+    }
+
+    let composed = match aggregator.compose() {
+        Ok(composed) => composed,
+        Err(error) => {
+            use sbproxy_core::config_aggregator::AggregateError;
+            eprintln!("aggregate: {error}");
+            // Both classes exit 3 because neither published anything.
+            // The second line differs because the next action does: a
+            // deadline or an unreachable repository leaves the fleet on
+            // its last good revision and is worth waiting out, while a
+            // document that will not compose needs somebody to edit it.
+            match error {
+                AggregateError::Deadline { .. } | AggregateError::Unresolvable { .. } => {
+                    eprintln!(
+                        "aggregate: nothing was published; every subscriber is still serving \
+                         the last revision this authority published."
+                    );
+                }
+                _ => eprintln!("aggregate: nothing was published and nothing was written."),
+            }
+            return Ok(3);
+        }
+    };
+    for failure in &composed.failed {
+        eprintln!(
+            "aggregate: warning: entry `{}` ({}) did not resolve: {}{}",
+            failure.entry,
+            failure.repo,
+            failure.reason,
+            failure
+                .reused_commit
+                .as_deref()
+                .map_or_else(String::new, |commit| format!(
+                    "; reusing its last resolved document at {commit}"
+                ))
+        );
+    }
+
+    if let Some(host) = args.explain.as_deref() {
+        let Some(provenance) = composed.provenance.get(host) else {
+            let known: Vec<&str> = composed.provenance.keys().map(String::as_str).collect();
+            eprintln!(
+                "aggregate: nothing composed for '{host}'. This composition produced: {}",
+                if known.is_empty() {
+                    "(no hosts)".to_string()
+                } else {
+                    known.join(", ")
+                }
+            );
+            return Ok(3);
+        };
+        match args.format {
+            OutputFormat::Json => println!(
+                "{}",
+                serde_json::to_string_pretty(&cli_command_envelope(
+                    "aggregate.explain",
+                    serde_json::json!({ "host": host, "provenance": provenance }),
+                ))?
+            ),
+            OutputFormat::Text => print!("{}", provenance.render(host)),
+        }
+        return Ok(0);
+    }
+
+    if let Some(out) = args.out.as_deref() {
+        if args.dry_run {
+            let diff = sbproxy_core::config_aggregator::Aggregator::diff_against(&composed, out)
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            return Ok(report_aggregate_dry_run(
+                args,
+                &composed,
+                out,
+                diff.as_deref(),
+            ));
+        }
+        sbproxy_core::config_aggregator::Aggregator::write_composed(&composed, out)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        // The header goes to stderr as well as into the file, so an
+        // operator watching a CI job sees which revisions produced the
+        // artifact without opening it.
+        eprint!("{}", composed.header());
+        match args.format {
+            OutputFormat::Json => println!(
+                "{}",
+                serde_json::to_string_pretty(&cli_command_envelope(
+                    "aggregate.out",
+                    aggregate_summary_json(&composed, Some(&out.display().to_string()), None),
+                ))?
+            ),
+            OutputFormat::Text => println!(
+                "aggregate: wrote {} origins from {} entries to {} ({} bytes, digest {})",
+                composed.origins,
+                composed.resolved.len(),
+                out.display(),
+                composed.yaml.len(),
+                composed.content_digest
+            ),
+        }
+        return Ok(0);
+    }
+
+    let publisher = AdminApiPublisher {
+        admin: &args.admin,
+        mode: args.mode,
+    };
+    match aggregator.publish_composed(composed, &publisher) {
+        Ok(sbproxy_core::config_aggregator::RoundOutcome::Published { revision, outcome }) => {
+            match args.format {
+                OutputFormat::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&cli_command_envelope(
+                        "aggregate.publish",
+                        aggregate_summary_json(&outcome, None, Some(revision)),
+                    ))?
+                ),
+                OutputFormat::Text => println!(
+                    "aggregate: published revision {revision} ({} origins from {} entries, \
+                     digest {})",
+                    outcome.origins,
+                    outcome.resolved.len(),
+                    outcome.content_digest
+                ),
+            }
+            Ok(0)
+        }
+        Ok(sbproxy_core::config_aggregator::RoundOutcome::Unchanged { outcome }) => {
+            match args.format {
+                OutputFormat::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&cli_command_envelope(
+                        "aggregate.publish",
+                        aggregate_summary_json(&outcome, None, None),
+                    ))?
+                ),
+                OutputFormat::Text => println!(
+                    "aggregate: the composed document is unchanged (digest {}), so nothing was \
+                     published and no subscriber reloaded",
+                    outcome.content_digest
+                ),
+            }
+            Ok(0)
+        }
+        // `RoundOutcome` is `#[non_exhaustive]`, so a decision added
+        // later reaches this arm rather than failing to compile in a
+        // downstream crate. Reporting the digest and exiting 0 is the
+        // conservative reading: nothing about the authority changed that
+        // this binary understands.
+        Ok(other) => {
+            eprintln!("aggregate: the round finished with an outcome this build does not render");
+            let _ = other;
+            Ok(0)
+        }
+        Err(error) => {
+            eprintln!("aggregate: {error}");
+            eprintln!("aggregate: nothing changed on the authority.");
+            Ok(3)
+        }
+    }
+}
+
+/// Print what `--out --dry-run` would change, and pick the exit code.
+fn report_aggregate_dry_run(
+    args: &AggregateArgs,
+    composed: &sbproxy_core::config_aggregator::CompositionOutcome,
+    out: &std::path::Path,
+    diff: Option<&[String]>,
+) -> i32 {
+    let (changed, lines) = match diff {
+        // The file is not there, so writing it is entirely a change.
+        None => (true, Vec::new()),
+        Some(lines) => (!lines.is_empty(), lines.to_vec()),
+    };
+    if matches!(args.format, OutputFormat::Json) {
+        let body = cli_command_envelope(
+            "aggregate.dry-run",
+            serde_json::json!({
+                "out": out.display().to_string(),
+                "exists": diff.is_some(),
+                "changed": changed,
+                "diff": lines,
+                "origins": composed.origins,
+                "content_digest": composed.content_digest,
+            }),
+        );
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string())
+        );
+        return i32::from(changed) * 2;
+    }
+    if diff.is_none() {
+        println!(
+            "aggregate: {} does not exist; composing would create it with {} origins",
+            out.display(),
+            composed.origins
+        );
+        return 2;
+    }
+    if !changed {
+        println!(
+            "aggregate: {} already holds this composition (digest {})",
+            out.display(),
+            composed.content_digest
+        );
+        return 0;
+    }
+    println!("aggregate: {} would change:", out.display());
+    for line in &lines {
+        println!("  {line}");
+    }
+    2
+}
+
+/// The shared JSON summary for the three `aggregate` output shapes.
+fn aggregate_summary_json(
+    composed: &sbproxy_core::config_aggregator::CompositionOutcome,
+    out: Option<&str>,
+    revision: Option<u64>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "out": out,
+        "revision": revision,
+        "origins": composed.origins,
+        "content_digest": composed.content_digest,
+        "bytes": composed.yaml.len(),
+        "duration_ms": composed.duration.as_millis(),
+        "resolved": composed.resolved,
+        "failed": composed.failed,
+        "drops": composed.drops,
+        "provenance_hosts": composed.provenance.keys().collect::<Vec<_>>(),
+    })
+}
+
 fn handle_authority_publish(args: &AuthorityPublishArgs) -> anyhow::Result<i32> {
     let path = args.config.as_deref().ok_or_else(|| {
         anyhow::anyhow!(
@@ -10481,6 +10992,266 @@ fn print_config_history_table(body: &serde_json::Value) {
             "{revision}\t{state}\t{blast_radius}\t{provenance}\t{applied_at}\t{actor}\t{digest}"
         );
     }
+}
+
+/// `sbproxy config rollback --to <rev|digest|last-known-good>`: ask the
+/// running proxy to re-apply a config revision it already stored
+/// (WOR-2460).
+///
+/// Speaks to the admin API the way `config history` and `apply` do.
+/// Exit codes follow the `config` family's convention: `0` on a
+/// rollback that applied, `4` when the node refused it (an unknown
+/// revision, a stale `--expected-current`, an unconfirmed restart-class
+/// change), and `2` on a CLI-level error, which `run_subcommand` maps.
+///
+/// The `--confirm` flag is the typed confirmation a restart-class or
+/// breaking rollback needs. The node computes the blast radius from the
+/// two stored documents, so the CLI does not have to guess: run without
+/// `--confirm` first, read the refusal, and re-run naming the revision
+/// back if the radius is one you accept.
+fn handle_config_rollback(args: &ConfigRollbackArgs) -> anyhow::Result<i32> {
+    let mut body = serde_json::Map::new();
+    // A digest is 64 lowercase hex characters; a revision is a number.
+    // Deciding here rather than making the operator pick a flag is the
+    // one place this CLI guesses, and it guesses from a shape that
+    // cannot be both.
+    if args.to == "last-known-good" {
+        body.insert(
+            "target".to_string(),
+            serde_json::Value::String("last-known-good".to_string()),
+        );
+    } else if let Ok(revision) = args.to.parse::<u64>() {
+        body.insert("revision".to_string(), serde_json::json!(revision));
+    } else {
+        body.insert(
+            "digest".to_string(),
+            serde_json::Value::String(args.to.clone()),
+        );
+    }
+    if let Some(expected) = args.expected_current {
+        body.insert("expected_current".to_string(), serde_json::json!(expected));
+    }
+    if let Some(confirm) = args.confirm {
+        body.insert("confirm_revision".to_string(), serde_json::json!(confirm));
+    }
+    if let Some(lineage) = args.lineage.as_deref() {
+        body.insert(
+            "lineage".to_string(),
+            serde_json::Value::String(lineage.to_string()),
+        );
+    }
+    if args.force {
+        body.insert("force".to_string(), serde_json::json!(true));
+    }
+    let payload = AdminRequestBody::Json(serde_json::Value::Object(body));
+
+    let answer = match admin_request_parts(
+        &args.admin,
+        reqwest::Method::POST,
+        "/admin/config/rollback",
+        Some(payload),
+    )? {
+        AdminOutcome::Unreachable(reason) => {
+            return Ok(report_admin_unreachable(
+                "config rollback",
+                &args.admin,
+                &reason,
+            ));
+        }
+        AdminOutcome::Answered { status, body } if !status.is_success() => {
+            // Printed rather than swallowed: the refusal body is where
+            // the available revisions and both sides of a stale
+            // `expected_current` live, and it is the whole reason this
+            // route names them.
+            report_admin_refusal("config rollback", status, &body);
+            if matches!(args.format, OutputFormat::Json) {
+                println!("{}", serde_json::to_string_pretty(&body)?);
+            }
+            return Ok(4);
+        }
+        AdminOutcome::Answered { body, .. } => body,
+    };
+
+    match args.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&answer)?),
+        OutputFormat::Text => print_config_rollback_text(&answer),
+    }
+    Ok(0)
+}
+
+/// Render a successful rollback for `--format text`.
+///
+/// Every warning the node returned is printed, and the config-file line
+/// is printed whether or not the node listed it, because that is the
+/// half of the recovery the rollback did not do.
+fn print_config_rollback_text(body: &serde_json::Value) {
+    let restored = json_u64(body, "restored_revision");
+    let digest = body
+        .get("restored_digest")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("-");
+    let radius = body
+        .get("blast_radius")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    println!("config rollback: restored revision {restored} ({digest}), blast radius {radius}");
+    // Both of these are conditional on `appended_revision`, and on the
+    // same one: a rollback onto the document already running is
+    // deduplicated by the ring, so it appends nothing and marks nothing
+    // reverted. Keying the "marked reverted" line on `previous_revision`
+    // printed a false claim on exactly the no-op rollback the server
+    // side exists to handle, which is also the one an operator is most
+    // likely to reach for mid-incident.
+    match (
+        body.get("appended_revision")
+            .and_then(serde_json::Value::as_u64),
+        body.get("previous_revision")
+            .and_then(serde_json::Value::as_u64),
+    ) {
+        (Some(appended), previous) => {
+            if let Some(previous) = previous {
+                println!("config rollback: revision {previous} is marked reverted");
+            }
+            println!(
+                "config rollback: appended as revision {appended}; history is append-only, so \
+                 this rollback is itself in the history"
+            );
+        }
+        (None, _) => println!(
+            "config rollback: that revision was already what this node was running, so nothing \
+             was appended and no revision was marked reverted"
+        ),
+    }
+    if body
+        .get("soaking")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        println!(
+            "config rollback: the restored revision is soaking like any other candidate. \
+             POST /admin/config/confirm promotes it early; a failed soak leaves the \
+             last-known-good pointer where it is"
+        );
+    }
+    for warning in body
+        .get("warnings")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or(&Vec::new())
+    {
+        if let Some(warning) = warning.as_str() {
+            println!("config rollback: warning: {warning}");
+        }
+    }
+}
+
+/// `sbproxy config diff [<rev>] [--from <a> --to <b>]`: a plan between
+/// two stored config revisions, or between what is running and one
+/// stored revision (WOR-2460).
+///
+/// Junos has both forms and the second is the one people want
+/// mid-incident: `show | compare rollback n` diffs against one stored
+/// revision, and `show system rollback 3 compare 1` diffs two stored
+/// revisions that need not be adjacent. Cisco's
+/// `show archive config differences` is the same idea.
+///
+/// Reads only. Nothing is applied, no pointer moves, and the running
+/// config is untouched whichever form is used. Exit codes follow
+/// `plan`'s convention through [`ConfigCmd::uses_plan_exit_codes`]: `0`
+/// when the two revisions are identical, `2` when they differ.
+fn handle_config_diff(args: &ConfigDiffArgs) -> anyhow::Result<i32> {
+    let to = match (args.to.as_deref(), args.to_flag.as_deref()) {
+        (Some(_), Some(_)) => {
+            eprintln!(
+                "config diff: name the target revision once, either as the positional argument \
+                 or as --to, not both"
+            );
+            return Ok(1);
+        }
+        (Some(positional), None) => positional,
+        (None, Some(flag)) => flag,
+        (None, None) => {
+            eprintln!(
+                "config diff: name a target revision, for example `sbproxy config diff 7` or \
+                 `sbproxy config diff --from 5 --to 7`. `sbproxy config history` lists what is \
+                 in the ring"
+            );
+            return Ok(1);
+        }
+    };
+    let mut path = format!("/admin/config/diff?to={}", urlencoding_lite(to));
+    if let Some(from) = args.from.as_deref() {
+        path.push_str(&format!("&from={}", urlencoding_lite(from)));
+    }
+    let body = match admin_request_parts(&args.admin, reqwest::Method::GET, &path, None)? {
+        AdminOutcome::Unreachable(reason) => {
+            return Ok(report_admin_unreachable(
+                "config diff",
+                &args.admin,
+                &reason,
+            ));
+        }
+        AdminOutcome::Answered { status, body } if !status.is_success() => {
+            return Ok(report_admin_refusal("config diff", status, &body));
+        }
+        AdminOutcome::Answered { body, .. } => body,
+    };
+    match args.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&body)?),
+        OutputFormat::Text => {
+            let from = describe_diff_side(body.get("from"), "the running configuration");
+            let to = describe_diff_side(body.get("to"), "unknown");
+            let radius = body
+                .get("max_blast_radius")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            println!("config diff: {from} -> {to}, largest blast radius {radius}");
+            print!(
+                "{}",
+                body.get("plan_text")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+            );
+        }
+    }
+    // `plan`'s convention: 2 means "changes present" and is not an
+    // error, so a script can branch on "is this rollback a no-op".
+    let changes = json_u64(&body, "changes");
+    Ok(if changes == 0 { 0 } else { 2 })
+}
+
+/// Name one side of a diff for the text header.
+fn describe_diff_side(side: Option<&serde_json::Value>, when_absent: &str) -> String {
+    side.and_then(|side| side.get("revision"))
+        .and_then(serde_json::Value::as_u64)
+        .map_or_else(
+            || when_absent.to_string(),
+            |revision| format!("revision {revision}"),
+        )
+}
+
+/// Percent-encode the handful of characters a revision selector could
+/// carry that would otherwise break the query string.
+///
+/// Deliberately tiny rather than a dependency: the accepted values are a
+/// decimal number and the literal `last-known-good`, and anything else
+/// is refused by the route with a message naming both forms. This exists
+/// so a typo cannot smuggle an `&` into the next parameter.
+fn urlencoding_lite(value: &str) -> String {
+    // Over bytes, not chars: `character as u32 & 0xFF` truncated a
+    // non-ASCII scalar to its low byte, so `U+0100` encoded as `%00`
+    // and the server was handed a different string than the operator
+    // typed. Percent-encoding is defined on octets, and `as_bytes` on a
+    // `&str` is already UTF-8.
+    value
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                (byte as char).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect()
 }
 
 /// `sbproxy config show <rev>`: resolve a revision number to its
@@ -11756,6 +12527,9 @@ fn plan_exit_code(report: &sbproxy_config::PlanReport) -> i32 {
 }
 
 fn handle_plan_subcommand(args: &PlanArgs) -> anyhow::Result<i32> {
+    if let Some(host) = args.explain_origin.as_deref() {
+        return handle_plan_explain_origin(args, host);
+    }
     let (baseline, proposed, construction_error) = load_plan_inputs(args)?;
     let config_path = args
         .config
@@ -11767,6 +12541,68 @@ fn handle_plan_subcommand(args: &PlanArgs) -> anyhow::Result<i32> {
     }
     render_and_write_plan(&report, args, &baseline)?;
     Ok(plan_exit_code(&report))
+}
+
+/// `sbproxy plan --explain-origin <host>`: why is this policy here.
+///
+/// The question a security engineer has when an origin is the product of
+/// four layers and two repositories, answered on the same verb they
+/// already reach for to ask what a config change would do. It composes
+/// exactly as the aggregator does, through the same
+/// [`sbproxy_core::config_aggregator::Aggregator`], so what this prints
+/// and what a publish records cannot disagree.
+///
+/// Exit 0 when the host composed, 3 when it did not, and the refusal
+/// names every host this composition did produce.
+fn handle_plan_explain_origin(args: &PlanArgs, host: &str) -> anyhow::Result<i32> {
+    if args.no_fetch {
+        anyhow::bail!(
+            "--explain-origin composes the project repositories `origin_sources:` names, which \
+             --no-fetch forbids. Drop --no-fetch, or compose on a host that can reach them with \
+             `sbproxy aggregate --out`"
+        );
+    }
+    let path = args
+        .config
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("missing -f / --config"))?;
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| anyhow::anyhow!("read '{}': {error}", path.display()))?;
+    let mut aggregator = sbproxy_core::config_aggregator::Aggregator::from_document(&text)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    aggregator
+        .resolve_credentials()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let composed = match aggregator.compose() {
+        Ok(composed) => composed,
+        Err(error) => {
+            eprintln!("plan: {error}");
+            return Ok(3);
+        }
+    };
+    let Some(provenance) = composed.provenance.get(host) else {
+        let known: Vec<&str> = composed.provenance.keys().map(String::as_str).collect();
+        eprintln!(
+            "plan: nothing composed for '{host}'. This composition produced: {}",
+            if known.is_empty() {
+                "(no hosts)".to_string()
+            } else {
+                known.join(", ")
+            }
+        );
+        return Ok(3);
+    };
+    match args.format {
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&cli_command_envelope(
+                "plan.explain-origin",
+                serde_json::json!({ "host": host, "provenance": provenance }),
+            ))?
+        ),
+        OutputFormat::Text => print!("{}", provenance.render(host)),
+    }
+    Ok(0)
 }
 
 /// Take an exclusive `flock(2)` on the apply lock for `yaml_path`.
@@ -14683,6 +15519,12 @@ hooks:
         let plan_style = [
             vec!["sbproxy", "config", "pull", "sb.yml", "--dry-run"],
             vec!["sbproxy", "config", "authority", "status"],
+            // WOR-2460. `config diff` prints a plan, so it reports the
+            // same way. Listed here rather than trusted: this test is
+            // named for the property, and a member of the set it does
+            // not name is a member nothing checks.
+            vec!["sbproxy", "config", "diff", "7"],
+            vec!["sbproxy", "config", "diff", "--from", "5", "--to", "7"],
         ];
         for argv in plan_style {
             let cli = Cli::try_parse_from(&argv).expect("parses");
@@ -14992,6 +15834,143 @@ hooks:
         assert!(
             msg.contains("required") || msg.contains("REVISION"),
             "expected a missing-argument message, got: {msg}"
+        );
+    }
+
+    /// WOR-2460. The escape hatch's own surface: the target defaults to
+    /// the last known good, and every guard the route offers is
+    /// reachable from the command line, because an operator who has to
+    /// open a browser mid-incident does not have the escape hatch.
+    #[test]
+    fn parses_config_rollback_subcommand_with_every_guard() {
+        let cli = parse(&["sbproxy", "config", "rollback"]);
+        let Some(Cmd::Config(cmd)) = cli.cmd else {
+            panic!("expected Config");
+        };
+        assert!(
+            !cmd.uses_plan_exit_codes(),
+            "a rollback applies; it does not print a plan",
+        );
+        let ConfigSub::Rollback(args) = cmd.sub else {
+            panic!("expected Rollback");
+        };
+        assert_eq!(
+            args.to, "last-known-good",
+            "the bare form is the one an operator types under pressure",
+        );
+        assert_eq!(args.expected_current, None);
+        assert_eq!(args.confirm, None);
+        assert!(!args.force);
+
+        let cli = parse(&[
+            "sbproxy",
+            "config",
+            "rollback",
+            "--to",
+            "41",
+            "--expected-current",
+            "43",
+            "--confirm",
+            "41",
+            "--lineage",
+            "0f9c2c1e-0000-4000-8000-000000000000",
+            "--force",
+            "--format",
+            "json",
+        ]);
+        let Some(Cmd::Config(cmd)) = cli.cmd else {
+            panic!("expected Config");
+        };
+        let ConfigSub::Rollback(args) = cmd.sub else {
+            panic!("expected Rollback");
+        };
+        assert_eq!(args.to, "41");
+        assert_eq!(args.expected_current, Some(43));
+        assert_eq!(args.confirm, Some(41));
+        assert_eq!(
+            args.lineage.as_deref(),
+            Some("0f9c2c1e-0000-4000-8000-000000000000")
+        );
+        assert!(args.force);
+        assert!(matches!(args.format, OutputFormat::Json));
+    }
+
+    /// WOR-2460. `config diff` takes its target as a positional or as
+    /// `--to`, and naming it twice or not at all is a usage error rather
+    /// than a precedence rule. Both refusals are reached before any
+    /// admin request, so this drives the real handler.
+    #[test]
+    fn config_diff_wants_its_target_named_exactly_once() {
+        let both = parse(&["sbproxy", "config", "diff", "7", "--to", "9"]);
+        let Some(Cmd::Config(cmd)) = both.cmd else {
+            panic!("expected Config");
+        };
+        let ConfigSub::Diff(args) = cmd.sub else {
+            panic!("expected Diff");
+        };
+        assert_eq!(
+            handle_config_diff(&args).expect("a usage error is not an anyhow failure"),
+            1,
+            "naming the target twice is refused rather than resolved by precedence",
+        );
+
+        let neither = parse(&["sbproxy", "config", "diff"]);
+        let Some(Cmd::Config(cmd)) = neither.cmd else {
+            panic!("expected Config");
+        };
+        let ConfigSub::Diff(args) = cmd.sub else {
+            panic!("expected Diff");
+        };
+        assert_eq!(handle_config_diff(&args).expect("a usage error"), 1);
+
+        // And the two accepted forms carry what they were given.
+        let positional = parse(&["sbproxy", "config", "diff", "7"]);
+        let Some(Cmd::Config(cmd)) = positional.cmd else {
+            panic!("expected Config");
+        };
+        let ConfigSub::Diff(args) = cmd.sub else {
+            panic!("expected Diff");
+        };
+        assert_eq!(args.to.as_deref(), Some("7"));
+        assert_eq!(args.from, None);
+
+        let pair = parse(&[
+            "sbproxy", "config", "diff", "--from", "5", "--to", "7", "--format", "json",
+        ]);
+        let Some(Cmd::Config(cmd)) = pair.cmd else {
+            panic!("expected Config");
+        };
+        let ConfigSub::Diff(args) = cmd.sub else {
+            panic!("expected Diff");
+        };
+        assert_eq!(args.from.as_deref(), Some("5"));
+        assert_eq!(args.to_flag.as_deref(), Some("7"));
+        assert_eq!(args.to, None);
+    }
+
+    /// WOR-2460. The query-string encoder exists so a typed revision
+    /// selector cannot smuggle a second parameter into the diff request,
+    /// which is the only claim it makes and therefore the one to pin.
+    #[test]
+    fn a_revision_selector_cannot_smuggle_a_query_parameter() {
+        assert_eq!(urlencoding_lite("7"), "7");
+        assert_eq!(urlencoding_lite("last-known-good"), "last-known-good");
+        assert_eq!(
+            urlencoding_lite("7&from=1"),
+            "7%26from%3D1",
+            "an ampersand and an equals sign are both encoded, so neither opens a parameter",
+        );
+        assert_eq!(urlencoding_lite("a b"), "a%20b");
+        assert_eq!(urlencoding_lite("../etc"), "..%2Fetc");
+        // Percent-encoding is defined on octets. A non-ASCII scalar
+        // encodes as its UTF-8 bytes, not as a truncated low byte,
+        // which `U+0100` would otherwise render as the NUL escape.
+        assert_eq!(urlencoding_lite("\u{0100}"), "%C4%80");
+        assert_eq!(urlencoding_lite("revisión"), "revisi%C3%B3n");
+        assert_eq!(
+            urlencoding_lite("7#frag"),
+            "7%23frag",
+            "a fragment marker would otherwise truncate the path at the server",
         );
     }
 
@@ -16595,6 +17574,7 @@ origins:
             against: None,
             format: OutputFormat::Text,
             out: None,
+            explain_origin: None,
         };
         assert_eq!(handle_plan_subcommand(&args).unwrap(), 2);
         // Plan against itself: no changes -> exit 0.
@@ -16604,9 +17584,56 @@ origins:
             against: Some(path.clone()),
             format: OutputFormat::Text,
             out: None,
+            explain_origin: None,
         };
         assert_eq!(handle_plan_subcommand(&args).unwrap(), 0);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// `--watch` refuses the one-shot flags rather than dropping them.
+    ///
+    /// It used to return before `--out` and `--explain` were read, so
+    /// `aggregate --out f.yml --watch` looped POSTing composed documents
+    /// to the admin API while the file was never written. On a node with
+    /// an admin listener that is a fleet publish nobody asked for
+    /// (WOR-2432 review, Major 5).
+    #[test]
+    fn aggregate_watch_refuses_the_one_shot_flags() {
+        use clap::Parser as _;
+
+        for conflicting in [
+            vec!["--out", "composed.yml"],
+            vec!["--explain", "api.example.com"],
+            vec!["--out", "composed.yml", "--dry-run"],
+        ] {
+            let mut argv = vec!["sbproxy", "aggregate", "-f", "sb.yml", "--watch"];
+            argv.extend(conflicting.iter().copied());
+            let parsed = Cli::try_parse_from(&argv);
+            assert!(
+                parsed.is_err(),
+                "`{}` must be refused rather than silently dropping a flag",
+                argv.join(" ")
+            );
+        }
+
+        // And each of them still parses on its own, so the conflict is
+        // the pairing rather than the flag.
+        for alone in [
+            vec!["--out", "composed.yml"],
+            vec!["--explain", "api.example.com"],
+        ] {
+            let mut argv = vec!["sbproxy", "aggregate", "-f", "sb.yml"];
+            argv.extend(alone.iter().copied());
+            assert!(
+                Cli::try_parse_from(&argv).is_ok(),
+                "`{}` is a valid one-shot invocation",
+                argv.join(" ")
+            );
+        }
+        assert!(
+            Cli::try_parse_from(["sbproxy", "aggregate", "-f", "sb.yml", "--watch"]).is_ok(),
+            "and --watch on its own is valid"
+        );
     }
 
     #[test]
@@ -16617,6 +17644,7 @@ origins:
             against: None,
             format: OutputFormat::Text,
             out: None,
+            explain_origin: None,
         };
         assert!(handle_plan_subcommand(&args).is_err());
     }

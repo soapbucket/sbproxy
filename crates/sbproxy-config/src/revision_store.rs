@@ -915,13 +915,20 @@ impl RejectionReason {
 pub struct RejectionMetadata {
     /// Which refusal in the failure table this was.
     pub reason: RejectionReason,
-    /// Which stage refused it. Two values are written today:
+    /// Which stage refused it. Three values are written today:
     ///
     /// * `"config_authority"`, for a bundle the subscriber refused;
     /// * `"file_watcher"`, for a local document that did not apply. The
     ///   SIGHUP path shares this label because both triggers converge on
     ///   one reload function and one audit label, which WOR-2486 already
     ///   settled.
+    /// * `"rollback"`, for a stored revision this node tried to restore
+    ///   and could not: a document that published cleanly months ago and
+    ///   no longer constructs on this binary. Both rollback triggers
+    ///   share it, the admin route and the soak's auto-revert, because
+    ///   both converge on one reload function; the `actor` on the ring
+    ///   entry a *successful* rollback appends is what tells them apart
+    ///   (WOR-2460, WOR-2461).
     ///
     /// Two refusal paths are **not** covered yet and so never appear
     /// here: the `source:` refresh poller's own `CompileFailed` branch,
@@ -1043,6 +1050,48 @@ impl RevisionStore {
         Ok(())
     }
 
+    /// Mark the entry holding `revision` as [`RevisionState::Reverted`]:
+    /// this node rolled away from it (WOR-2460, WOR-2461).
+    ///
+    /// The `lkg` pointer is deliberately **not** touched. A rollback
+    /// away from a revision says nothing about which revision is good;
+    /// what is good is whatever a soak promoted, and the rollback's own
+    /// candidate soaks like any other before it can become that. A
+    /// version of this that repointed `lkg` at the rollback target would
+    /// promote it on apply, which is the epic's root defect wearing a
+    /// different hat.
+    ///
+    /// History stays append-only: the successful rollback appends a
+    /// **new** entry carrying the restored document, and this only
+    /// annotates the entry that was rolled away from, so reading the
+    /// ring top to bottom still tells the whole story in order.
+    ///
+    /// Distinct from [`RevisionState::Failed`], which is a soak verdict:
+    /// an operator can roll away from a revision that soaked perfectly,
+    /// a change that worked but was not wanted.
+    ///
+    /// An automatic revert reaches a revision that is already `Failed`,
+    /// and `state` is one field, so this **overwrites** that mark rather
+    /// than adding to it. The soak's own answer is not lost: it lives on
+    /// `soak_verdict`, which nothing here touches, and that is the field
+    /// [`Self::boot_candidates`] reads when it decides what may boot.
+    /// Anything else that needs to know whether a soak condemned a
+    /// revision must read `soak_verdict` too, for the same reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RevisionStoreError::Invalid`] when no live entry holds
+    /// `revision`, and [`RevisionStoreError::Io`] or
+    /// [`RevisionStoreError::Json`] when the index cannot be persisted.
+    pub fn mark_reverted(&mut self, revision: u64) -> Result<(), RevisionStoreError> {
+        let mut next = self.index.clone();
+        let entry = find_entry_mut(&mut next, revision)?;
+        entry.state = RevisionState::Reverted;
+        self.save_index(&next)?;
+        self.index = next;
+        Ok(())
+    }
+
     /// Increment and persist `boot_attempts` on `revision`, returning
     /// the new count.
     ///
@@ -1119,10 +1168,20 @@ impl RevisionStore {
     ///
     /// 1. the entry the `lkg` pointer names, because it is the only one
     ///    a soak window ever judged against real traffic;
-    /// 2. every other entry that is not [`RevisionState::Failed`],
-    ///    newest first, because a more recent applied revision is closer
-    ///    to what the operator meant than an older one;
+    /// 2. every other entry no soak measured as bad, newest first,
+    ///    because a more recent applied revision is closer to what the
+    ///    operator meant than an older one;
     /// 3. the entries a soak measured as bad, newest first, last.
+    ///
+    /// The demotion keys on `soak_verdict`, **not** on
+    /// [`RevisionState::Failed`], and that distinction is load bearing.
+    /// There is one `state` field and two writers:
+    /// [`Self::record_soak_verdict`] writes `Failed` and
+    /// [`Self::mark_reverted`] writes `Reverted` over it. An automatic
+    /// revert is exactly the sequence that does both to one revision,
+    /// so reading `state` here let the revision a soak had just
+    /// measured as breaking traffic climb back out of this group.
+    /// `soak_verdict` survives both writes.
     ///
     /// Step 3 is the part worth reading twice. A `Failed` entry is one a
     /// soak window watched under real traffic and judged bad; the epic's
@@ -1158,7 +1217,7 @@ impl RevisionStore {
             {
                 continue;
             }
-            if entry.state == RevisionState::Failed {
+            if entry.soak_verdict == Some(SoakVerdict::Failed) {
                 measured_bad.push(entry.clone());
             } else {
                 candidates.push(entry.clone());
@@ -1410,6 +1469,54 @@ mod tests {
             applied_at,
             degraded: Vec::new(),
         }
+    }
+
+    /// WOR-2460, WOR-2461. Marking a revision reverted annotates that
+    /// entry and touches nothing else. The last-known-good pointer in
+    /// particular does not move: a rollback away from a revision says
+    /// nothing about which revision is good, and a version of this that
+    /// repointed `lkg` at the rollback target would promote it on apply,
+    /// which is the defect the soak exists to fix.
+    #[test]
+    fn marking_a_revision_reverted_annotates_it_without_moving_the_pointer() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let mut store = RevisionStore::open(temp.path(), 10, None).expect("open");
+        let first = store
+            .append(b"proxy: {}\n# one\n", metadata(1))
+            .expect("append");
+        let second = store
+            .append(b"proxy: {}\n# two\n", metadata(2))
+            .expect("append");
+        store.mark_good(first.revision).expect("promote");
+
+        store.mark_reverted(second.revision).expect("annotate");
+        assert_eq!(store.entries()[1].state, RevisionState::Reverted);
+        assert_eq!(
+            store.entries()[0].state,
+            RevisionState::Good,
+            "the entry that was rolled back to keeps its own verdict",
+        );
+        assert_eq!(
+            store.lkg().map(|entry| entry.revision),
+            Some(first.revision),
+            "and the pointer does not move: only a soak moves it",
+        );
+        assert_eq!(
+            store.entries().len(),
+            2,
+            "annotating is not removing; the ring is append-only",
+        );
+
+        let error = store
+            .mark_reverted(999)
+            .expect_err("a revision that is not in the ring cannot be annotated");
+        assert!(error.to_string().contains("999"), "{error}");
+
+        // Durable: an operator reading history after a restart has to
+        // see that this node rolled away from something.
+        drop(store);
+        let reopened = RevisionStore::open(temp.path(), 10, None).expect("reopen");
+        assert_eq!(reopened.entries()[1].state, RevisionState::Reverted);
     }
 
     fn fingerprint(cluster_id: &str) -> ClusterRestartFingerprint {
@@ -2164,6 +2271,61 @@ mod tests {
                 .iter()
                 .any(|entry| entry.revision == newer_broken.revision),
             "a failed revision is demoted, not deleted",
+        );
+    }
+
+    /// Review Major 3. The demotion above read `entry.state`, and
+    /// `mark_reverted` writes the same single field, so an automatic
+    /// revert overwrote `Failed` with `Reverted` and the revision a soak
+    /// measured as breaking traffic climbed back out of the last-resort
+    /// group. That is the epic's success criterion inverted by the
+    /// feature meant to uphold it: `auto_revert` is the only thing that
+    /// writes both marks to one revision.
+    ///
+    /// `soak_verdict` survives both writes, which is what the demotion
+    /// keys on now.
+    #[test]
+    fn a_soak_failed_revision_stays_last_resort_after_an_auto_revert_annotates_it() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let mut store = RevisionStore::open(temp.path(), 8, None).expect("open");
+        let old_healthy = store.append(b"a: 1\n", metadata(1)).expect("append");
+        let newer_broken = store.append(b"a: 2\n", metadata(2)).expect("append");
+        store
+            .record_soak_verdict(newer_broken.revision, SoakVerdict::Failed)
+            .expect("verdict");
+        // What an automatic revert does next, and the whole of the bug:
+        // one `state` field, two writers, second write wins.
+        store
+            .mark_reverted(newer_broken.revision)
+            .expect("annotate the revision reverted away from");
+
+        let entry = store
+            .entries()
+            .iter()
+            .find(|entry| entry.revision == newer_broken.revision)
+            .cloned()
+            .expect("the entry is still there");
+        assert_eq!(
+            entry.state,
+            RevisionState::Reverted,
+            "the annotation is the newer fact and still lands",
+        );
+        assert_eq!(
+            entry.soak_verdict,
+            Some(SoakVerdict::Failed),
+            "and the verdict survives it, which is what the boot walk has to read",
+        );
+
+        let order: Vec<u64> = store
+            .boot_candidates()
+            .iter()
+            .map(|entry| entry.revision)
+            .collect();
+        assert_eq!(
+            order,
+            vec![old_healthy.revision, newer_broken.revision],
+            "a revision a soak measured as bad stays the last resort after it is reverted \
+             away from, or an auto-revert turns the boot walk into a way back onto it",
         );
     }
 

@@ -96,6 +96,10 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_agent_detect_total` | Counter | `stable` | `stable` | `agent_id`, `provenance` | Agent-detect scorer verdicts by agent id and provenance. |
 | `sbproxy_agent_reputation_score` | Gauge | `stable` | `beta` | `tenant_id`, `agent_class` | Agent-class reputation in [0.0, 1.0] over the anomaly detector's rolling window; 1.0 is a class that has produced nothing. |
 | `sbproxy_agent_skill_digest_mismatch_total` | Counter | `stable` | `beta` | `skill` | Agent Skills artifact digest mismatches detected at serve time. |
+| `sbproxy_aggregate_compose_duration_seconds` | Histogram | `stable` | `beta` | none | Wall-clock time for one aggregation round, fetches included. |
+| `sbproxy_aggregate_entries` | Gauge | `stable` | `beta` | `outcome` | origin_sources entries by the outcome of the last aggregation round. |
+| `sbproxy_aggregate_published_revision` | Gauge | `stable` | `beta` | none | Config-authority revision the aggregator last published. |
+| `sbproxy_aggregate_rounds_total` | Counter | `stable` | `beta` | `outcome` | Aggregation rounds by what the round decided to do. |
 | `sbproxy_ai_admission_decisions_total` | Counter | `stable` | `beta` | `surface`, `reason`, `outcome` | Pre-provider AI gateway admission decisions: a request refused at the inbound native-format shim before any provider saw it, by inbound surface and bounded reason code. |
 | `sbproxy_ai_audio_seconds_attributed_total` | Counter | `stable` | `beta` | `provider`, `model`, `surface`, `project`, `feature`, `team`, `agent_type`, `environment`, `tenant_id`, `api_key_id` | AI audio seconds consumed (realtime + audio surfaces), partitioned by attribution tag. |
 | `sbproxy_ai_budget_utilization_ratio` | Gauge | `stable` | `stable` | `scope` | Budget utilization as a fraction of the limit; above 1 is over budget. |
@@ -247,6 +251,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_config_history_entries` | Gauge | `stable` | `beta` | none | Entries currently held in the config revision ring. |
 | `sbproxy_config_lkg_revision` | Gauge | `stable` | `beta` | none | Config ring revision the last-known-good pointer names, or -1 when it names none. |
 | `sbproxy_config_soak_verdict_total` | Counter | `stable` | `beta` | `verdict`, `signal` | Config soak outcomes, by verdict and reporting signal. |
+| `sbproxy_config_apply_total` | Counter | `stable` | `beta` | `outcome` | Config rollback attempts, by outcome: applied for an operator rollback, reverted for an automatic one after a failed soak, declined for an armed node that decided not to revert, rejected for a refusal. |
 | `sbproxy_config_rejected_total` | Counter | `stable` | `beta` | `reason` | Config candidates refused before applying, by reason. |
 | `sbproxy_config_fallback_active` | Gauge | `stable` | `beta` | none | 1 while this node serves a config its boot fallback restored from the revision ring. |
 | `sbproxy_config_reload_total` | Counter | `stable` | `beta` | `result` | Config reload attempts, by result. |

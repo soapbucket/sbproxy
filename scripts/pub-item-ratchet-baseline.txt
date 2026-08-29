@@ -1076,6 +1076,77 @@ below this branch's 1523: this branch adds `ConfigBootConfig`,
 while main's `effective_document` and `origin_source_entry_counts` work
 removed two the branch had counted.
 
+2026-08-28 (WOR-2432 aggregation, the aggregator): tests-only 323 -> 324,
+unreferenced 1518 -> 1521. Five items landed that nothing outside their
+defining file names, and each was looked at before the number moved rather
+than after.
+
+Three cannot be narrowed at all. `ResolvedEntry` and `EntryFailure` are
+public fields of `CompositionOutcome` and `AggregationStatus`, and
+`AggregationStatus` is the return type of `config_aggregator::last_round`,
+which `admin.rs` calls. Narrowing any of the three is a private type in a
+public interface, which does not compile.
+
+Two are integration-test seams whose production callers are in the same
+file, which this scan cannot see. `Aggregator::with_fetch_context` is how
+`tests/config_aggregator.rs` installs a fixture cloner in place of `git`;
+its production caller is `Aggregator::from_document` and `spawn`, both in
+`config_aggregator.rs`. `AuthorityPublisher` is how the same file publishes
+through a real `ConfigAuthority` rather than through a fake, which is the
+claim those tests exist to make; its production caller is `spawn`, in the
+same file. An integration test links against the library's public API, so
+`pub` is the only visibility that compiles for either.
+
+Six other items in the same change were narrowed rather than counted:
+`Coalescer` and `CoalesceDecision` are `pub(crate)` with their two
+acceptance tests moved into the module, `CompositionOutcome::document_with_header`,
+`Aggregator::would_change`, `Aggregator::mark_published` and
+`config_aggregator::record_status` are private, and
+`CompositionLayer::is_project_authored` is `pub(crate)`. Two more,
+`Coalescer::pending` and `Aggregator::last_published_digest`, were deleted
+once narrowing showed nothing called them.
+
+2026-08-28 (WOR-2432 the aggregator, merged with main at 1cd47627):
+recounted against the merged tree rather than carried from either parent.
+Tests-only 324, unreferenced 1524.
+
+Neither parent's figure describes this tree. Main recorded 323 and 1521
+after its own merge; this branch recorded 324 and 1521 against 454e0abf.
+The tests-only figure is this branch's 324, because main's rollback work
+added nothing to that bucket. The unreferenced figure is three above both,
+which is exactly this branch's three unnarrowable additions landing on top
+of main's `ConfigBootConfig`, `FailedCandidate` and `FallbackDocument`.
+
+2026-08-28 (WOR-2432 the aggregator, review round): tests-only 324 -> 326,
+unreferenced 1524 -> 1526. Recounted against the tree after the merge with
+main at 1cd47627, which is where both numbers are locked.
+
+The same two items move both figures, and both are integration-test seams
+whose production caller lives in the same file, which is the blind spot this
+scan is documented as having.
+
+`Aggregator::seed_published_digest` is new. The change detector lived only in
+memory, so a restart composed the same payload, saw no previous digest, and
+published a byte-identical revision, which rebuilds every subscriber's
+pipeline for nothing (review Minor 10). `spawn` now seeds it from what the
+authority already serves; `spawn` is in `config_aggregator.rs`, so the scan
+sees only `tests/config_aggregator.rs` naming it. The test that proves a
+restart stays quiet has to construct a second `Aggregator` and hand it the
+digest a first one published, and an integration test links against the
+library's public API, so `pub` is the only visibility that compiles.
+
+`Aggregator::run_round` did have a production caller outside the file until
+this round: `main.rs` used it for the one-shot publish. That was the defect in
+review Minor 11, because `run_round` composes, so the one-shot path composed
+twice and the second pass reported every entry as `unchanged`, leaving
+`sbproxy_aggregate_entries{outcome="resolved"}` at 0 after a publish that
+resolved N entries. `main.rs` now calls `publish_composed` with the
+composition it already has, and `run_round`'s only remaining callers are
+`aggregation_loop` in the same file and ten tests. It stays `pub` because it
+is the single-round form of the loop and the seam an embedder without a watch
+thread would use, and because pushing those ten tests through
+`aggregation_loop` would make each one wait on a real clock to assert
+something that has nothing to do with timing.
 2026-08-28 (WOR-2673, cache-reserve consolidation): tests-only 324 -> 323.
 `S3ReserveConfig` and the `S3Reserve` surface around it went with the
 AWS-SDK cache-reserve backend, which the object-storage backend replaces.
@@ -1128,3 +1199,36 @@ baselines (unwrap 794, panic 0, metric-visibility 242, log-url 41,
 request-error 0) were zeroed and recounted the same way; all five came
 back at the value both parents already held.
 
+
+2026-08-28 (WOR-2432 the aggregator, merged with main at 49145cbd): recounted
+against the merged tree, not carried from either parent, and neither parent's
+figure describes it. Tests-only 324, unreferenced 1529. This branch alone read
+326 / 1526 and main alone 321 / 1524.
+
+Tests-only comes out two below this branch, which is main's ground being kept
+rather than this branch's being handed back. Main deleted the AWS-SDK
+cache-reserve backend, taking `S3ReserveConfig` and its tests with it, and
+wired `sbproxy-licensing` into the proxy, which gave the CoMP marketplace
+surface its first production consumers. Both were counted here and neither is
+any more. This branch's own two, `Aggregator::seed_published_digest` and
+`Aggregator::run_round`, are still in the bucket for the reasons written above.
+
+Unreferenced comes out three above both parents, which is the union and not a
+regression: each parent's figure counted its own additions and none of the
+other's. Main's `origins.<host>.comp` nested config structs are field types of
+a `pub` schema struct in `sbproxy-config`, where `schemars` derives a node per
+type and narrowing does not compile; this branch's three are private types in
+a public interface for the same kind of reason. Nothing narrowed in the merge
+that had not narrowed in a parent.
+
+2026-08-28 (WOR-2432 the aggregator, merged with main at 16b94ea2): recounted
+against the merged tree. Tests-only 324, unchanged. Unreferenced 1529 -> 1528,
+which is the only figure the merge conflicted on: this branch carried 1529 and
+main 1523, and neither describes the tree they make together.
+
+It falls by one rather than rising, which is the direction that needs no
+argument. Main's gate work (#1237) gave `scripts/`-facing items their first
+callers and removed the fixed-port test helpers that had been reachable only
+from tests; this branch adds nothing to either bucket beyond the two already
+recorded above. The gap to main's own 1523 is this branch's own items, counted
+here and not there, for the reasons written against them.

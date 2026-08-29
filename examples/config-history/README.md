@@ -1,6 +1,6 @@
 # Config history: a durable local ring of every applied config
 
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-28*
 
 Every config this proxy applies, whether at boot or through a later reload, gets kept as a content-addressed entry on local disk: the digest, when it applied, who or what applied it, the blast radius against the previous entry, and the pre-resolution document bytes exactly as they were read, before `${VAR}` and `vault://`/`secret://` references resolved. `GET /admin/config/history` reads the ring back; `GET /admin/config/history/{digest}` reads one entry in full, including a diff against the config running now.
 
@@ -276,13 +276,105 @@ curl -s -u admin:demo-change-me -X DELETE http://127.0.0.1:9090/admin/config/fal
 
 Set `boot.fallback: off` (the shipping default) and the same restart exits 1 with the compile error, exactly as it always has.
 
+## Roll back
+
+Look before you leap. `config diff` renders a plan between what is running
+and a stored revision, or between two stored revisions, and touches
+neither:
+
+```bash
+sbproxy config diff 1 --password demo-change-me
+```
+
+```
+config diff: the running configuration -> revision 1, largest blast radius hitless
+~ origins.api.local.request_modifiers
+```
+
+Then do it. `--expected-current` is optional and worth typing: it refuses
+if somebody else moved this node between your `config history` and your
+rollback, rather than silently undoing their change.
+
+```bash
+sbproxy config rollback --to 1 --expected-current 2 --password demo-change-me
+```
+
+```
+config rollback: restored revision 1 (c43d2794...), blast radius hitless
+config rollback: revision 2 is marked reverted
+config rollback: appended as revision 3; history is append-only, so this rollback is itself in the history
+config rollback: the restored revision is soaking like any other candidate. POST /admin/config/confirm promotes it early; a failed soak leaves the last-known-good pointer where it is
+config rollback: warning: this node's config file is unchanged: the next file-watcher event, SIGHUP, source: poll, or authority bundle re-applies whatever the source of truth still says. fix it before then
+```
+
+Three things that walkthrough shows and are easy to miss:
+
+* The ring now holds **three** entries, not two. History is append-only, so
+  the rollback is itself in the history and a second rollback can undo it.
+  Read it back with `sbproxy config history` and revision 2's state is
+  `reverted`.
+* The restored revision **soaks**. It is an ordinary candidate: it
+  resolved, it compiled, it published through the same transaction, and
+  its own window is open. `POST /admin/config/confirm` closes that early.
+* The config **file** is untouched. This example's file still holds the
+  edit you made, so the next save in that directory re-applies it. On a
+  real node, fix the source of truth as the second half of the recovery.
+
+Ask for something that is not there and the refusal names what is:
+
+```bash
+curl -s -u admin:demo-change-me -X POST \
+  http://127.0.0.1:9090/admin/config/rollback \
+  -H 'content-type: application/json' -d '{"revision": 99}' | jq .
+```
+
+```json
+{
+  "error": "revision 99 is not in this node's config revision ring. available: 1, 2, 3",
+  "code": "unknown_revision",
+  "rolled_back": false,
+  "available_revisions": [1, 2, 3]
+}
+```
+
+## Let it revert on its own (or do not)
+
+`soak.auto_revert` in this example is `false`, which is the shipping
+default and the setting most deployments should run. With it off the soak
+still runs, still promotes, and still alerts; what changes is only whether
+the node is allowed to undo an operator's change without being asked.
+
+Flip it to `true` in `sb.yml` and restart, and a failed soak on a `hitless`
+or `reload` class change re-applies the last known good through the same
+path the manual rollback above uses. Watch
+`sbproxy_config_apply_total{outcome="reverted"}`, which is disjoint from
+the `applied` a manual rollback counts.
+
+What it will **not** do, and the log says so at WARN with the radius
+named: revert a `restart` or `breaking` change. Change
+`proxy.http_bind_port` in this example, let the soak fail, and the node
+leaves it running rather than half-undoing it, because swapping the
+pipeline pointer back does not unbind a socket. Boot fallback (already on
+above) and `POST /admin/config/rollback` are the answer for that class.
+
+It also will not loop. If the revision an automatic revert restored then
+fails its own soak, the node escalates at ERROR instead of reverting to
+itself, because both the new config and the last known good are failing
+the same signals and a second swap does not fix that.
+
 ## What this ring does not do yet
 
-Nothing reverts automatically. A failed soak records its verdict and leaves the running config alone; deciding to roll back and doing it are separate, and the second half is follow-on work. Reapplying a prior entry by hand works today: `config show` prints the stored document, and `sbproxy apply -f -` puts it back.
+The console's Config page already draws the ring: every revision with its state badge and blast radius, the lineage, which revision the last-known-good pointer names, and the stored document and plan for any row you click. What it has no control for is acting on one. Rolling back is the admin API and the CLI only, and the Roll back button is tracked separately.
+
+The gating rule that button will use (a `restart` or `breaking` rollback, or one whose radius could not be measured, needs the revision typed back) ships ahead of it as a tested function in `ui/src/lib/config-history.ts`, so the panel inherits the rule rather than reinventing it.
+
+The two are not computing the same radius, though, and whoever wires the button has to close that. The client can only see the radius `GET /admin/config/history` stored on the entry, which was measured against the revision before it at the time it applied. The server measures the running document against the target at the moment you ask. Those are different pairs of documents, so the two can disagree in either direction: the button may wave through a rollback the route then refuses with a `409`, or demand a confirmation the route would not have. The route is always the one that decides.
 
 ## Reference
 
 - [docs/configuration.md](../../docs/configuration.md#config_history) - the `proxy.config_history` block, its fields, and the restart requirement
 - [docs/admin-api-reference.md](../../docs/admin-api-reference.md#get-adminconfighistory) - the full `GET /admin/config/history` and `GET /admin/config/history/{digest}` wire contract
 - [docs/admin-api-reference.md](../../docs/admin-api-reference.md#get-adminconfigrejected) - `GET /admin/config/rejected`, `POST /admin/config/confirm`, and the fallback routes
+- [docs/admin-api-reference.md](../../docs/admin-api-reference.md#post-adminconfigrollback) - `POST /admin/config/rollback` and `GET /admin/config/diff`, with every refusal code
+- [docs/configuration.md](../../docs/configuration.md#auto_revert) - `soak.auto_revert`, why it ships off, and the blast-radius arming rule
 - [docs/operator-runbook.md](../../docs/operator-runbook.md#config-history-ring) - the ring in the context of an actual rollback procedure, including the soak window and the fallback boot

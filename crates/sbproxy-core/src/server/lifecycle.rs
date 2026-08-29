@@ -476,6 +476,96 @@ fn reload_from_config_text(config_path: &str, yaml: &str) -> anyhow::Result<Relo
     result
 }
 
+/// Apply a document read back out of the config revision ring, through
+/// the ordinary reload transaction (WOR-2460).
+///
+/// A rollback is an ordinary candidate. It resolves, it compiles, it
+/// publishes through the same prepare-and-publish body every other
+/// reload goes through, and the soak the transaction arms judges it like
+/// any other revision. Treating a rollback as a privileged path that
+/// skips validation is how rolling back becomes the incident: the stored
+/// document published cleanly once, but "once" was possibly before an
+/// upgrade tightened a validation rule, and the document that will not
+/// construct on this binary has to be refused with the pipeline pointer
+/// untouched rather than half-applied. `AuthorityStore::rollback` takes
+/// the same position for the same reason on the publisher side.
+///
+/// Not [`reload_from_config_yaml`], for three reasons, each of which is
+/// a behavior difference rather than a naming one:
+///
+/// * The **suspension guard** there refuses a pinned node's local
+///   reloads. A rollback is an explicit act (an operator asking, or the
+///   soak's own auto-revert acting on evidence), the same class as
+///   `POST /admin/reload`, which
+///   [`crate::config_boot::reload_suspended`] already keeps live. A
+///   pinned node is exactly where a rollback is most likely to be needed.
+/// * The **audit source** is `rollback`, not `file_watcher`. Blaming the
+///   watcher for the single most consequential operator action in this
+///   feature is the defect that verification residual R3 fixed next
+///   door.
+/// * The **ring actor** is the caller's, so `sbproxy config history`
+///   shows who rolled the node back rather than a generic label.
+///
+/// `ring_actor` is `rollback:<operator>` for the admin route and
+/// `auto_revert` for the soak's own revert. It reaches the ring entry
+/// this apply appends; the stable `rollback` label the audit record
+/// carries is separate, so the audit vocabulary stays closed while the
+/// history column stays specific.
+///
+/// # Errors
+///
+/// Returns `Err` under exactly the conditions
+/// [`reload_from_config_yaml`] does: an unresolvable `source:` pointer
+/// (which a stored blob never carries, since the ring stores
+/// post-resolution text), a document that does not compile on this
+/// binary, or a pipeline that does not construct. The running pipeline
+/// keeps serving in every one of those cases.
+pub(crate) fn reload_from_stored_revision(
+    config_path: &str,
+    yaml: &str,
+    ring_actor: &str,
+) -> anyhow::Result<ReloadOutcome> {
+    let result = {
+        let _reload_guard = CONFIG_RELOAD_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reload_from_config_yaml_locked(config_path, yaml, ring_actor, None)
+    };
+    match &result {
+        Ok(_) => sbproxy_observe::metrics::record_config_reload("success"),
+        Err(_) => sbproxy_observe::metrics::record_config_reload("failure"),
+    }
+    audit_reload_outcome("rollback", config_path, &result);
+    if let Err(error) = &result {
+        // The refused candidate is kept like any other (WOR-2462), and
+        // this is the one an operator most needs to find later: a
+        // rollback target that no longer constructs is a revision the
+        // ring will keep offering and the node will keep refusing, and
+        // the stored refusal is what says why without reproducing it.
+        //
+        // `CompileFailed` covers all three ways this can fail by its own
+        // definition ("did not compile, could not be constructed, or
+        // still carried an unresolved `${VAR}` reference"), and the
+        // three are not separable here anyway: the reload transaction
+        // returns one `anyhow::Error`. Which of them it was is in the
+        // stored `detail`, and `stage: "rollback"` already separates
+        // these from a subscriber cycle's refusals.
+        crate::config_subscriber::record_refusal(
+            yaml,
+            &crate::config_subscriber::CycleRefusal::new(
+                crate::config_subscriber::CycleResult::CompileFailed,
+                crate::path_redact::sanitise_path_in_error(
+                    &format!("{error:#}"),
+                    std::path::Path::new(config_path),
+                ),
+            ),
+            "rollback",
+            sbproxy_config::BaseOrigin::Local,
+        );
+    }
+    result
+}
+
 /// Emit a `config_audit` record for a reload outcome on a non-admin path
 /// (WOR-2486): the file watcher, SIGHUP, the remote config-source
 /// refresh poller, the config-authority bundle apply, and the
@@ -3522,6 +3612,22 @@ pub fn run_with_fallback(
             .and_then(|authority| authority.publish.as_ref()),
     )?;
 
+    // Start the aggregation loop, when this node is the one that should
+    // run it (WOR-2437). A no-op unless the document declares
+    // `origin_sources` entries *and* this process installed a config
+    // authority above, because a node with entries and nowhere to
+    // publish has no runtime composition to do: its answer is the
+    // offline `sbproxy aggregate --out`, which is an operator's decision
+    // rather than something to start behind one.
+    //
+    // `Overlay` because what travels is an origins overlay: `origins:`
+    // plus `origin_defaults`, and nothing else. A subscriber that took
+    // that as `Replace` would replace its whole document with those two
+    // keys, losing its listeners, its TLS, its admin surface and its
+    // secrets in one publish. The one-shot `sbproxy aggregate` takes
+    // `--mode` for the deployment that wants the other one.
+    crate::config_aggregator::spawn(config_path, sbproxy_config::BundleMode::Overlay)?;
+
     // --- Wave 5 day-6 Item 4: SIGHUP re-bootstrap handler ---
     //
     // Pingora's `Server::run_forever` owns its own tokio runtime, but
@@ -3624,18 +3730,36 @@ pub fn run_with_fallback(
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(auto_threads);
+    // WOR-2699: worker stack size. Unset means the fork's
+    // `DEFAULT_THREAD_STACK_SIZE`, which is 8 MiB. A worker polls the
+    // whole request path on this stack, and the debug binary CI's smoke
+    // lane builds needs several times what the release binary does, so
+    // the ceiling has to be sized for the deeper of the two.
+    //
+    // Environment-only, like `SB_WORKER_THREADS` beside it: rarely
+    // changed, and the right value is deployment-shaped. Raising it
+    // costs reserved address space per worker thread and no resident
+    // memory, because a thread stack is committed page by page as it is
+    // touched. `docs/manual.md` carries the arithmetic.
+    //
+    let worker_stack_bytes =
+        resolve_worker_stack_bytes(std::env::var("SB_WORKER_STACK_BYTES").ok().as_deref());
     let conf = PingoraServerConf {
         threads,
         upstream_keepalive_pool_size: 256,
         upstream_connect_offload_threadpools: Some(2),
         grace_period_seconds: Some(grace_seconds),
         graceful_shutdown_timeout_seconds: Some(grace_seconds),
+        runtime_thread_stack_size: worker_stack_bytes,
         ..PingoraServerConf::default()
     };
     tracing::info!(
         threads = %conf.threads,
         upstream_pool = %conf.upstream_keepalive_pool_size,
         connect_offload = ?conf.upstream_connect_offload_threadpools,
+        worker_stack_bytes = conf
+            .runtime_thread_stack_size
+            .unwrap_or(pingora_runtime::DEFAULT_THREAD_STACK_SIZE),
         "pingora server config"
     );
     let mut server = Server::new_with_opt_and_conf(None, conf);
@@ -4223,6 +4347,12 @@ pub fn run_with_fallback(
             )));
 
         let admin_state = std::sync::Arc::new(admin_state_inner);
+        // Owned before the `move` closure below takes everything else:
+        // the soak supervisor drives a rollback when `auto_revert` is
+        // armed and a window fails, and the reload transaction needs the
+        // config path to resolve relative paths inside the restored
+        // document (WOR-2461).
+        let soak_config_path = config_path.to_string();
         // WOR-1718: install the global handle so the pipeline's logging
         // hook can feed the request-log ring buffer + SSE tail.
         crate::admin::install_admin_log_sink(admin_state.clone());
@@ -4252,7 +4382,7 @@ pub fn run_with_fallback(
                 // window in flight, running the operator probe on its
                 // cadence, and closing the window when it is due. A
                 // no-op on every node that never arms one.
-                crate::config_soak::spawn();
+                crate::config_soak::spawn(soak_config_path);
                 // WOR-2664 review: without this the configured feed was read
                 // only when a human POSTed /admin/agent-registry/refresh, so
                 // every restart served whatever the store had cached and a
@@ -4607,6 +4737,58 @@ pub(crate) static OP_REDACT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::
 ///
 /// Called once at boot (from `run`) and on every config reload (from
 /// `reload_from_config_path`) so SIGHUP picks up new tenant caps.
+/// Smallest worker stack sbproxy accepts from `SB_WORKER_STACK_BYTES`.
+///
+/// One 4 KiB page, matching pingora's own floor. It rules out one thing:
+/// a value written in the wrong unit, `SB_WORKER_STACK_BYTES=8` meaning
+/// megabytes. It is not a safe lower bound, because the real floor is
+/// whatever the deepest request path needs, which is what
+/// `server::stack_probe` exists to report.
+const MIN_WORKER_STACK_BYTES: usize = 4 * 1024;
+
+/// Resolve `SB_WORKER_STACK_BYTES` into pingora's
+/// `runtime_thread_stack_size`.
+///
+/// `None` means "use pingora's default", which is 8 MiB.
+///
+/// A free function, not inline at the call site, for two reasons. It is
+/// the only way to test the parsing without standing up a server, and
+/// the config-reader guard cannot see a key read from inside a larger
+/// function.
+///
+/// # Why a bad value is ignored rather than fatal
+///
+/// `SB_WORKER_THREADS` beside it ignores what it cannot parse, and an
+/// environment typo should not stop a proxy from starting. But the
+/// previous version ignored only unparseable values and zero, and
+/// passed everything else through to a `ServerConf` struct literal.
+/// `ServerConf::validate()` runs from `from_yaml` and nothing else, so
+/// the below-a-page refusal that `docs/manual.md` documented never ran:
+/// `SB_WORKER_STACK_BYTES=8` started a server whose workers had a stack
+/// the platform rounded up to something arbitrary, and aborted on the
+/// first request with no diagnosis. Refusing here is what makes the
+/// documented behavior real.
+pub(crate) fn resolve_worker_stack_bytes(raw: Option<&str>) -> Option<usize> {
+    let raw = raw?;
+    let Ok(bytes) = raw.trim().parse::<usize>() else {
+        tracing::warn!(
+            value = %raw,
+            "SB_WORKER_STACK_BYTES is not a positive integer; using the default worker stack"
+        );
+        return None;
+    };
+    if bytes < MIN_WORKER_STACK_BYTES {
+        tracing::warn!(
+            value = bytes,
+            minimum = MIN_WORKER_STACK_BYTES,
+            "SB_WORKER_STACK_BYTES is below one page, which is a value written in the wrong \
+             unit rather than a stack any thread can run on; using the default worker stack"
+        );
+        return None;
+    }
+    Some(bytes)
+}
+
 fn install_tenant_cardinality_state(server: &sbproxy_config::ProxyServerConfig) {
     use sbproxy_config::TENANT_CARDINALITY_DEFAULT_MAX_SERIES;
     let limiter = sbproxy_observe::metrics::global_limiter();
@@ -9799,4 +9981,63 @@ fn build_notifier(
         "outbound notifier opened"
     );
     Ok(std::sync::Arc::new(notifier))
+}
+
+/// `SB_WORKER_STACK_BYTES` (WOR-2699).
+///
+/// The knob had no test at all: the stack budget test builds its own
+/// runtime, so the whole hunk that reads this key could be reverted and
+/// every test still passed.
+#[cfg(test)]
+mod worker_stack_env_tests {
+    use super::{resolve_worker_stack_bytes, MIN_WORKER_STACK_BYTES};
+
+    #[test]
+    fn an_unset_key_leaves_pingora_its_default() {
+        assert_eq!(resolve_worker_stack_bytes(None), None);
+    }
+
+    #[test]
+    fn a_real_size_is_passed_through() {
+        assert_eq!(
+            resolve_worker_stack_bytes(Some("16777216")),
+            Some(16 * 1024 * 1024)
+        );
+        // Whitespace from a shell export or a compose file.
+        assert_eq!(
+            resolve_worker_stack_bytes(Some(" 16777216 ")),
+            Some(16 * 1024 * 1024)
+        );
+    }
+
+    /// The typo the floor exists for.
+    ///
+    /// `SB_WORKER_STACK_BYTES=8` reads as bytes and means megabytes.
+    /// Before this, it reached a `ServerConf` struct literal, which
+    /// `validate()` never sees, so the server started and aborted on its
+    /// first request with nothing to say why.
+    #[test]
+    fn a_size_written_in_the_wrong_unit_is_refused() {
+        assert_eq!(resolve_worker_stack_bytes(Some("8")), None);
+        assert_eq!(
+            resolve_worker_stack_bytes(Some(&(MIN_WORKER_STACK_BYTES - 1).to_string())),
+            None
+        );
+        assert_eq!(
+            resolve_worker_stack_bytes(Some(&MIN_WORKER_STACK_BYTES.to_string())),
+            Some(MIN_WORKER_STACK_BYTES),
+            "the floor itself is allowed; it is a floor and not an exclusion"
+        );
+    }
+
+    #[test]
+    fn junk_and_zero_fall_back_rather_than_stopping_the_proxy() {
+        for raw in ["", "0", "-1", "8mb", "eight", "1e6"] {
+            assert_eq!(
+                resolve_worker_stack_bytes(Some(raw)),
+                None,
+                "{raw:?} has to fall back to the default, not stop startup"
+            );
+        }
+    }
 }

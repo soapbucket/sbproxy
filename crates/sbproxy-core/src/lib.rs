@@ -117,6 +117,11 @@ pub mod compression_runtime;
 pub mod compression_store;
 /// Success-path bridge for prompt-free, per-lever AI compression value.
 pub mod compression_value;
+/// The aggregator: fetch every project repository an `origin_sources`
+/// block names, compose the `origins:` map from the platform floor and
+/// the project profiles, and publish the result through the config
+/// authority that already ships.
+pub mod config_aggregator;
 /// Config-authority publisher: validate a configuration the way boot
 /// does, sign it, store it under a monotonic revision, and serve it to
 /// subscribers on a listener of its own.
@@ -139,6 +144,15 @@ pub mod config_gossip;
 /// every config this process applies, recorded once by the shared
 /// reload transaction, and read back by the admin history surface.
 pub mod config_history;
+/// Re-applying a stored config revision: the manual rollback the admin
+/// route and the CLI drive, and the automatic revert a failed soak arms
+/// when `soak.auto_revert` is on (WOR-2460, WOR-2461).
+///
+/// Crate-visible rather than public for the same reason
+/// [`mod@config_soak`] is: the admin surface and the soak supervisor are
+/// the only two callers, both inside this crate, and nothing outside it
+/// has a reason to move this node's running configuration.
+pub(crate) mod config_rollback;
 /// The soak window that decides whether an applied config revision
 /// becomes this node's last known good (WOR-2458).
 ///

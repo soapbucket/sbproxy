@@ -1253,6 +1253,7 @@ proxy:
       max_error_rate_delta: 0.05
       require_no_degraded_subsystems: true
       require_upstream_health: true
+      auto_revert: false
       probe:
         url: http://127.0.0.1:8080/healthz
         expect_status: 200
@@ -1289,6 +1290,7 @@ moves the last-known-good pointer.
 | `max_error_rate_delta` | float | `0.05` | How far the error rate may rise, against the rate measured when the window armed, before the request-outcome signal fails. Between 0 and 1. |
 | `require_no_degraded_subsystems` | bool | `true` | Whether a reload that published while a subsystem stayed on prior state fails its soak. |
 | `require_upstream_health` | bool | `true` | Whether an open upstream circuit breaker fails the soak. |
+| `auto_revert` | bool | `false` | Whether a failed soak re-applies the last known good on its own. The one key in this block that defaults off. See [auto_revert](#auto_revert). |
 | `probe.url` | string | unset | An HTTP `GET` the soak issues on its own cadence. Absent by default. |
 | `probe.expect_status` | int | `200` | Status that response must carry. |
 | `probe.interval_secs` | int | `10` | Seconds between probe ticks. Must be at least 1. |
@@ -1362,6 +1364,186 @@ proves the chain executes and proves nothing about whether any upstream is
 reachable. That is why it sits alongside the upstream-health signal rather
 than replacing it, and why an operator who wants a real upstream exercised
 still declares `probe.url`.
+
+#### auto_revert
+
+`soak.auto_revert` is the only key in the `soak` block that ships off, and
+it is off because it is the only slice of this feature that acts on
+production without an operator.
+
+With it off the soak still runs and still promotes. You get a correct
+last-known-good pointer, `sbproxy_config_soak_verdict_total`, a
+`config_soak_verdict` event, and an alert, and none of the risk. That is
+the setting most deployments should run, and running it for a while first
+is what lets you calibrate `min_requests` and `max_error_rate_delta`
+against your real traffic before handing a node permission to undo a
+change nobody asked it to undo. The failure mode is asymmetric: a flapping
+upstream during a deploy window reverts a good config, the operator
+re-applies it, it reverts again, and now the safety feature is the
+incident.
+
+Junos `commit confirmed` is the closest prior art and it is deliberately
+not what this is. There the operator opts in per commit, and the rollback
+timer is armed for that one change; if the commit is not confirmed within
+the window (ten minutes by default) the device rolls back to the previous
+configuration on its own. Here the opt-in is per node and standing, which
+is a larger promise, so it is off until somebody makes it. The per-change
+half of the Junos ergonomic is `POST /admin/config/confirm`, which is
+already on.
+
+A failed soak arrives one of two ways and both of them revert. A window
+that ran its time and failed reverts when the supervisor closes it. A
+reload that published with a subsystem left on prior state fails
+immediately, without waiting the window out, and reverts on the
+supervisor's next tick about a second later. The second is the common
+one: the evidence is already in hand and no traffic is needed to confirm
+it.
+
+**Arming is gated by blast radius.** An in-process revert is an arc-swap.
+A `Restart` or `Breaking` change (listener ports, the `proxy.admin` block,
+cluster identity, an origin's action or auth type) is not something
+swapping the pipeline pointer back can undo, and half-reverting one would
+leave the process in a state neither configuration describes: the listener
+still bound to the port the failing config asked for, the admin server
+still holding credentials from the config you rolled away from. So a
+failure of that class does not arm. The node logs the radius at WARN and
+leaves boot fallback and `POST /admin/config/rollback` as the answer, and
+`GET /admin/config/history` shows the radius per revision, so "why did it
+not revert" is answerable without reading logs.
+
+Some of that class never reaches a soak at all. `proxy.cluster` and its
+subtree are refused outright by the reload transaction's own restart
+fingerprint, which names the changed fields and declines to publish, so
+those documents never apply and never arm a window. Measured against the
+blast-radius matrix: 24 of its 67 rules classify `Restart` or `Breaking`,
+the restart fingerprint covers 2 of those 24, and the remaining 22 do
+apply and are exactly what the arming gate is for.
+
+Three further refusals, all of which log and none of which retry:
+
+* A revision an earlier automatic revert restored, now failing its own
+  soak, escalates instead of reverting to itself. The node has
+  demonstrated that both its new configuration and its last known good
+  fail the same signals, which is an operator's problem and not something
+  a second swap fixes.
+* A revert whose document no longer compiles leaves the running pipeline
+  serving. Nothing is retried on a timer: a revert that cannot apply once
+  will not apply on the next tick, and looping on it would turn one bad
+  config into a reload storm.
+* An `inconclusive` verdict never reverts. A window where every signal
+  abstained measured nothing, and reverting on no information is the false
+  positive that gets this switched off.
+
+A revert counts on `sbproxy_config_apply_total{outcome="reverted"}`, which
+is disjoint from the `applied` a manual rollback counts, so "did anything
+roll this fleet back without an operator" is one query.
+
+Every one of the refusals above counts too, on
+`{outcome="declined"}`, and publishes a `config_rollback` event with the
+reason. That matters more than it sounds: a change that fails its soak on
+every node and is declined on every node leaves the `reverted` counter
+flat, which reads exactly like no soak having failed. Alert on
+`declined` alongside `reverted`, and read the reason off the event. A
+node running the default `auto_revert: false` does not count `declined`,
+because it is the default and would drown the signal;
+`sbproxy_config_soak_verdict_total{verdict="failed"}` is where an unarmed
+node's failed soak shows up.
+
+#### rollback
+
+`POST /admin/config/rollback` re-applies a revision the ring already
+holds. It is the escape hatch, and it is needed whatever else is armed.
+
+```bash
+# Back to whatever the soak last promoted.
+sbproxy config rollback --to last-known-good
+
+# To a specific revision, refusing if somebody else moved this node first.
+sbproxy config rollback --to 41 --expected-current 43
+
+# A restart-class rollback needs the revision typed back.
+sbproxy config rollback --to 41 --confirm 41
+```
+
+A rollback is an **ordinary candidate**. It resolves, it compiles, it
+publishes through the same reload transaction every other apply goes
+through, and it soaks. Rolling back into a second bad config is a real
+thing that happens under pressure, and a privileged path that skipped
+validation is how rolling back becomes the incident. Argo Rollouts takes
+the other position for container images, letting a promotion back to a
+recently running ReplicaSet skip the analysis steps, on the reasoning
+that the thing being rolled back to was running minutes ago. That
+reasoning does not carry here: this ring keeps revisions for weeks, and a
+rollback target from October is not evidence about now.
+
+| Body field | Meaning |
+|---|---|
+| `revision` | Roll back to this ring revision number. |
+| `digest` | Roll back to this content digest. |
+| `target` | `"last-known-good"`, the default. An empty body `{}` means this. |
+| `expected_current` | Refuse unless this is the revision running now. |
+| `lineage` | Refuse unless this is the ring's lineage, absent `force`. |
+| `confirm_revision` | Name the target revision back to accept a `restart` or `breaking` rollback. |
+| `force` | Proceed across a lineage break. |
+
+`revision`, `digest`, and `target` are mutually exclusive; naming two is a
+`400` rather than a silent precedence rule.
+
+`expected_current` is the HAProxy Data Plane API's discipline: it stamps a
+version onto the configuration and requires every mutating call to carry
+the version it expects, erroring on a mismatch rather than taking
+last-writer-wins. Two operators reaching for rollback during the same
+incident is not hypothetical, and without it the second silently undoes
+the first. Omitting it proceeds, so a caller written before it existed
+keeps working.
+
+History stays append-only. A successful rollback **appends** a new entry
+carrying the restored document rather than rewinding the ring, so the
+rollback is itself visible in history and a second rollback can undo it.
+The revision you rolled away from is marked `reverted`, unless there was
+nothing to roll away from: rolling back onto the document already running
+is deduplicated by the ring, so it appends no entry and marks none
+`reverted`. The response says which happened through `appended_revision`.
+The last-known-good pointer does not move on a rollback either way: what
+is good is whatever a soak promoted, and the rollback's own candidate
+soaks like any other before it can become that.
+
+**The node's config file is not rewritten.** The ring holds what this node
+applied, and on an authority-owned or git-sourced node the local file is a
+pointer rather than the document, so rewriting it would break the
+relationship you configured. Every response says so
+(`config_file_unchanged`) and names it in `warnings`, because it is the
+half of the recovery this route cannot do: the next filesystem event,
+SIGHUP, `source:` poll, or authority bundle re-applies whatever the source
+of truth still says. Fix the source of truth before then.
+
+Two more things the response carries. A rollback whose stored
+`secrets_fingerprint` differs from the one running warns, because the
+secret backends moved since that document applied and a `vault://`
+reference inside it may resolve to something else now. And a rollback
+whose document no longer constructs on this build is refused with the
+compile error and the running configuration keeps serving; the refused
+candidate is kept under `rejected/` with `rollback` as its stage.
+
+`GET /admin/config/diff?from=<a>&to=<b>` renders a plan between two stored
+revisions, or between what is running and one stored revision when `from`
+is omitted. Junos has both forms and the second is the one people want
+mid-incident (`show | compare rollback n` against one stored revision,
+`show system rollback 3 compare 1` between two that need not be adjacent);
+Cisco's `show archive config differences` is the same idea. Both sides
+accept a revision number or `last-known-good`. It reads: no reload, no
+ring write, no pointer move.
+
+```bash
+sbproxy config diff 41                 # 41 against what is running
+sbproxy config diff --from 38 --to 41  # two stored revisions
+```
+
+Rollback is authenticated exactly like `POST /admin/reload` and goes
+through the same RBAC gate, so a read-only operator cannot roll a node
+back. Every attempt, accepted or refused, publishes a `config_rollback`
+event carrying the trigger, the actor, and both revisions, because who
+rolled the gateway back and to what is an audit question.
 
 #### boot
 
@@ -1449,6 +1631,10 @@ flowchart TD
     T -->|"passed"| U["state: good,\nlkg pointer advances"]
     T -->|"failed"| V["state: failed,\nlkg pointer does not move"]
     T -->|"inconclusive\n(every signal abstained)"| W["state stays applied,\nlkg pointer does not move"]
+    V --> X{"soak.auto_revert armed,\nand the diff hitless or reload class?"}
+    X -->|"no (the default,\nor a restart/breaking diff)"| Y["nothing serving changes;\nWARN names the radius"]
+    X -->|"yes"| Z["re-apply the lkg blob\nthrough the same transaction"]
+    Z --> D
 ```
 
 A candidate that never applies is kept too, under `rejected/<digest>.json`,
@@ -8238,6 +8424,110 @@ curl -su admin:"$ADMIN_PASSWORD" http://127.0.0.1:9090/admin/origin-composition
 A repository URL is credential-stripped, an entry credential is reported as present or absent and never by value, and an input is reported by name only.
 
 `sbproxy_origin_source_entries{tier,pinned}` carries the same two facts for alerting. The total dropping to zero means a fleet that should be composing project profiles has quietly stopped. A non-zero `pinned="false"` series under `tier="production"` means a node is running a document that predates the pinning rule, since config load refuses that combination outright.
+
+### `sbproxy aggregate`: running the composition
+
+```bash
+# Compose the origins overlay and publish it through the config
+# authority this document configures. The node's own `proxy:` block
+# stays here; only `origins:` and `origin_defaults` travel.
+sbproxy aggregate -f /etc/sbproxy/sb.yml
+
+# Compose to a file instead, for a single node or a CI review step.
+sbproxy aggregate -f /etc/sbproxy/sb.yml --out composed.yml
+
+# Show what that file would change, and write nothing. Exit 2 on changes.
+sbproxy aggregate -f /etc/sbproxy/sb.yml --out composed.yml --dry-run
+
+# Why is this policy here.
+sbproxy aggregate -f /etc/sbproxy/sb.yml --explain checkout.example.com
+sbproxy plan -f /etc/sbproxy/sb.yml --explain-origin checkout.example.com
+
+# Keep running: poll, coalesce a burst into one publish, publish on change.
+sbproxy aggregate -f /etc/sbproxy/sb.yml --watch
+```
+
+One round fetches every entry, composes, and publishes only when the composed document differs from the last one published. A proxy that both declares `origin_sources` entries and publishes a config authority runs the same loop in process at boot, which is where the metrics below come from; a node with entries and no authority logs that it is not composing rather than doing it silently, because its answer is `--out` and that is an operator's decision.
+
+Two documents come out of one composition, and they are not the same document.
+
+**What `--out` writes** is the whole runtime document with its composition blocks replaced by the origins they produced. A single node boots that file unmodified, so it has to keep `proxy:`. It carries neither composition block: `origin_sources` because a composed output is not a source of further composition and re-composing one would loop, and `origin_defaults` because the floor is already folded into every composed origin.
+
+**What gets published** is narrower: the `origins:` map (composed plus hand-written) and `origin_defaults`, and nothing else. It is built up rather than cut down, and that is the point. The node running the aggregator necessarily declares `proxy.config_authority`, and any entry with a `credential:` needs a `proxy.secrets` backend in the same file to resolve it against. Both are on the [subscriber-owned path list](#what-the-subscriber-owns-outright), so a payload assembled by removing keys from the runtime document is refused by the publish screen on every real configuration, and it would be the wrong thing to send even if it were not: a subscriber's listeners, TLS, admin surface and secrets are not the fleet's to set. `origin_defaults` rides along because it is deliberately not on that list; a subscriber's `GET /admin/origin-composition` then reports the floor its composed origins were built from. Nothing on a node re-applies it, because nothing on a node composes.
+
+Anything else a platform team wants to distribute goes through `sbproxy config authority publish` with a payload it writes. This verb composes origins.
+
+**A hand-written origin travels, so it has to be portable.** The `origins:` map the aggregator node writes by hand is published alongside the composed ones, and so is every entry's `overrides:` block. Both are checked at composition time with the same screen the config authority applies to any document that reaches a fleet: no key that names a file on this host (`spec_file`, `spec_path`, `module_path`, `rego_module_path`, `sha1_file`, and the rest of the [confined fragments](#confined-fragments) table), and no `env:`, `file:` or `vault://env/` value anywhere. Those are all legal on a node that owns its own filesystem and meaningless on the fifty that do not. A `${VAR}` reference is still fine and is the documented way to name a per-node value, because it resolves on the subscriber. Composition is refused with the offending key named, so `sbproxy aggregate`, `--out` and `--dry-run` all report it before a publish does. Carry the OpenAPI document inline under `spec`, the Rego module inline under `rego_module`, and the secret through a `secret://` or `vault://<backend>/` reference each subscriber resolves for itself.
+
+A revision beginning with `refs/` takes a targeted `git init` plus shallow fetch rather than a clone, because `git clone --branch` takes a short name and refuses a full ref. That matters here more than anywhere else: `refs/tags/<name>` is the spelling a `production` tier requires. An annotated tag resolves to the commit a checkout reports, not to the tag object.
+
+A composed origin is materialized **once per host**, so a profile bound to ten hosts is ten origins, and the size a signed bundle may carry (`MAX_CONFIG_YAML_BYTES`, 4 MiB) is a ceiling on hosts rather than on projects. The limit is checked against the published payload, since that is what gets signed. Measured against a realistic floor (a proxy action, three floor policies, one project policy, one response modifier) a composed origin is 435 bytes, so the ceiling is reached at roughly 9,600 hosts. Past it the composition is refused with a message naming the limit, how many origins materialized, and the mean bytes each; nothing is published.
+
+Two failure classes are kept apart, deliberately. A single entry that will not fetch falls back to its last successfully resolved profile, is named in the output and counted on `sbproxy_aggregate_entries{outcome="failed"}`, and the other entries are unaffected: one unreachable repository must not discard forty-nine other projects' last-known-good. An entry that fails its **first** fetch has nothing to fall back on, and there the whole round is refused, because composing without it would publish an `origins:` map silently missing that project's hosts. A composed document that does not compile, does not construct, or names a denied path is refused at the authority and never published at all.
+
+#### `origin_sources.aggregator`
+
+```yaml
+origin_sources:
+  tier: production
+  aggregator:
+    poll_interval_secs: 120
+    debounce_secs: 15
+    max_deferral_secs: 120
+    concurrency: 8
+    deadline_secs: 300
+  entries:
+    - name: checkout
+      # ...
+```
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `poll_interval_secs` | int | `120` | How often each unpinned entry is asked whether its revision moved. One `git ls-remote` per unpinned entry per interval, so `3600 / poll_interval_secs` requests per hour per repository: **30 per hour per repository** at the default. An entry pinned to a full commit sha is polled zero times. |
+| `debounce_secs` | int | `15` | How long a moved entry waits for others before the aggregator composes. Zero composes immediately. |
+| `max_deferral_secs` | int | `120` | Ceiling on that wait, measured from the first movement in the window. Without it a continuously-changing entry would reset the debounce forever and never publish. |
+| `concurrency` | int | `8` | How many repositories are fetched at once. |
+| `deadline_secs` | int | `300` | Hard deadline for all of one round's fetches. Distinct from a per-entry `timeout_secs`, which bounds one repository. |
+
+The defaults come from the state of the art rather than from taste. `poll_interval_secs: 120` is Argo CD's `--app-resync` default, which is the same job: the floor on how often a change is looked for. The debounce and its ceiling are the pair Argo CD reaches with its self-heal timeout, the floor on how often a change is acted on.
+
+Polling is cheap because it does not clone. `git ls-remote <repo> <ref>` returns the sha for a reference in one network round trip with no working tree, and a clone only happens when that sha moved. Argo CD's repo-server resolves an ambiguous revision the same way and keys its manifest cache on the resolved commit, so an unchanged sha never reaches a checkout. Three reductions fall out: an entry pinned to a full commit sha is never polled, because a sha cannot move; two entries naming the same repository at the same revision are one fetch, which is what a monorepo deploying several services wants; and a round where nothing moved composes nothing, publishes nothing, and leaves every subscriber on its `304`.
+
+Aggregation writes four metric families:
+
+| Metric | Labels | What it says |
+|---|---|---|
+| `sbproxy_aggregate_entries` | `outcome` | Entries by how the last round ended: `resolved`, `unchanged`, `failed`. Every outcome is written on every round including the zeroes. |
+| `sbproxy_aggregate_compose_duration_seconds` | none | Wall clock of one round, fetches included. |
+| `sbproxy_aggregate_published_revision` | none | The config-authority revision last published. Zero means nothing has been. |
+| `sbproxy_aggregate_rounds_total` | `outcome` | Rounds by decision: `published`, `unchanged`, `refused`. |
+
+The entry name is deliberately not a label. Fifty entries would be fifty series that churn as the block is edited, and the entry that failed is named in the structured log, in the CLI output, and on `GET /admin/origin-composition`.
+
+### Composition provenance
+
+Once an origin is the product of four layers and two repositories, "why is this WAF rule here" has four possible answers and they lead to different people. `sbproxy aggregate --explain <host>` and `sbproxy plan --explain-origin <host>` name the layer for every leaf:
+
+```
+checkout.example.com
+  action.url                         spec.base  entry checkout  https://git.example.com/acme/checkout@a1b2c3d4e5f6
+  policies[platform_waf].action_on_match  origin_defaults
+  policies[rate_limit].requests_per_minute  spec.environments[prod]  entry checkout  https://git.example.com/acme/checkout@a1b2c3d4e5f6
+  policies[rate_limit].burst         origin_sources.entries[].overrides  entry checkout
+  dropped policies[legacy_cap]  spec.base dropped a default introduced by origin_defaults  entry checkout
+```
+
+Four things about that output are deliberate.
+
+The merged lists are keyed by `name:` rather than by index, because an index moves whenever an earlier entry is dropped or a project appends one, and an audit trail that renumbered itself between two composes would be worse than none.
+
+A field-level override reports per field. The floor set `requests_per_minute` and `burst`; the project rewrote one and the runtime rewrote the other, and the field nobody touched still names the floor. Reporting per policy would credit one layer with all three and lose exactly the fact somebody needs.
+
+A drop is recorded with both layers. `disabled: true` removing a default is precisely the thing somebody asks about later, and an absence explains nothing on its own, so the record names the layer that dropped it and the layer that had introduced it.
+
+Nothing carries a value. Provenance says which layer set a leaf and which repository that layer came from; the leaf's value is in the composed document, which is the thing under access control. A composed leaf can be a `secret://backend/name` reference an entry bound, so carrying values here would put a reference into every surface that renders provenance, including a `plan` output somebody pastes into a ticket.
+
+Kustomize is the closest published analogue and it stops one level short: `buildMetadata: [originAnnotations, transformerAnnotations]` writes `config.kubernetes.io/origin` (with `path`, `repo`, `ref`) and an `alpha.config.kubernetes.io/transformations` chain onto each resource, so it answers which file and which transformers produced a resource. It does not answer which layer set a field. A composed origin is one resource made of four layers, so per-resource attribution would collapse to a single answer, which is why the grain here is the leaf.
 
 ---
 

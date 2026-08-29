@@ -16438,6 +16438,12 @@ pub(super) async fn relay_ai_response_with_cache(
         extras.push(("retry-after".to_string(), retry_after));
     }
 
+    // WOR-2699: the deepest frame the buffered path holds, for the same
+    // reason as the probe in the streaming relay's loop. A function's
+    // frame is one size throughout, so anywhere in this body measures
+    // the same depth; here is where the whole dispatch chain above is
+    // unambiguously still live.
+    crate::server::stack_probe::record_depth();
     let sent =
         send_response_with_extras(session, status, &content_type, &client_body, &extras).await;
     if sent
@@ -18179,6 +18185,112 @@ impl RelayBodyHoldback {
     }
 }
 
+/// The stack the AI dispatch path must fit in, in bytes.
+///
+/// Read from `scripts/stack-budget-baseline.count` so the number
+/// lives where the ratchet can see it, in a one-line file that
+/// two branches cannot both edit without git stopping to ask.
+/// `scripts/check-stack-budget-ratchet.sh` refuses to let it
+/// rise.
+///
+/// Set from a measurement, not from a fraction of the stack. An
+/// earlier version used half of
+/// `pingora_runtime::DEFAULT_THREAD_STACK_SIZE`, which sounds
+/// principled and is not a ratchet: at 4,194,304 against a measured
+/// 1,600,952 it had 2.6x of slack, and the commit that broke `main`
+/// moved the depth 31,152 bytes, 0.7% of it. Fifty such commits
+/// would not have tripped it. That is the same false comfort this
+/// branch exists to remove, in a new place.
+///
+/// The number is the measured high water rounded up to the next
+/// 256 KiB, plus 512 KiB of growth margin. The margin for frames
+/// this fixture does not wire, TLS and guardrails and translators,
+/// lives in the worker stack and not here: the stack is 8 MiB and
+/// this is a fraction of it.
+///
+/// | measured, Linux, `x86_64-unknown-linux-gnu`, dev profile | bytes |
+/// |---|---|
+/// | streaming, through `request_filter` | 1,604,072 |
+/// | buffered, through `request_filter` | 1,471,496 |
+///
+/// `ceil(1_604_072 / 256 KiB) * 256 KiB + 512 KiB = 2_359_296`.
+///
+/// Worth knowing before assuming the platform explains a gap: the
+/// same fixture measures 1,600,952 on aarch64 macOS, 3,120 bytes
+/// less. Linux debug frames are not meaningfully larger here. The
+/// distance between this number and the 2 MiB stack that actually
+/// overflowed is the configuration, compression and a CEL policy
+/// plane and guardrails, not the target.
+///
+/// Re-derive it by reading `STACK_HIGH_WATER_BYTES` out of the
+/// `production request-path smoke` lane, which prints it on Linux
+/// on every pull request, and lowering this to match. It only
+/// falls.
+#[cfg(test)]
+const STACK_BUDGET: usize = parse_budget(include_str!(
+    "../../../../scripts/stack-budget-baseline.count"
+));
+
+/// Parse the one-line baseline file at compile time.
+///
+/// Deliberately strict: anything other than digits and a single
+/// trailing newline stops the build. A baseline file that a
+/// merge left holding two numbers must not parse as one of them.
+#[cfg(test)]
+const fn parse_budget(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let mut value: usize = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\n' && i + 1 == bytes.len() {
+            break;
+        }
+        assert!(
+            b >= b'0' && b <= b'9',
+            "scripts/stack-budget-baseline.count holds the integer and nothing else"
+        );
+        value = value * 10 + (b - b'0') as usize;
+        i += 1;
+    }
+    assert!(value > 0, "the stack budget cannot be zero");
+    value
+}
+
+/// A request context carrying a real compiled pipeline that
+/// routes `ai.test` at the fixture provider.
+///
+/// `request_filter` reads its pipeline from the context rather
+/// than taking one as an argument, so this is what makes driving
+/// the real entry point possible.
+#[cfg(test)]
+fn ai_request_context(upstream_url: &str) -> crate::context::RequestContext {
+    let yaml = format!(
+        r#"
+proxy:
+  http_bind_port: 0
+
+origins:
+  "ai.test":
+    action:
+      type: ai_proxy
+      usage_parser: openai
+      providers:
+        - name: openai
+          api_key: "fixture-key"
+          base_url: "{upstream_url}"
+          allow_private_base_url: true
+"#
+    );
+    let config = sbproxy_config::compile_config(&yaml).expect("fixture config compiles");
+    let pipeline = crate::pipeline::CompiledPipeline::from_config_for_validation(config)
+        .expect("fixture pipeline compiles");
+    let mut context = crate::context::RequestContext::new();
+    context.pipeline = std::sync::Arc::new(pipeline);
+    context.hostname = compact_str::CompactString::new("ai.test");
+    context
+}
+
 #[cfg(test)]
 mod stream_classifier_holdback_tests {
     use super::RelayBodyHoldback;
@@ -19092,7 +19204,20 @@ async fn relay_ai_stream_frames(
     let mut assembled_output = String::new();
     let mut mutated_stream_body: Option<Bytes> = None;
     let mut pending_builtin_block: Option<sbproxy_ai::guardrails::GuardrailBlock> = None;
+    // WOR-2699: the deepest frame the streaming path holds. Everything
+    // from `request_filter` down through `handle_ai_proxy`,
+    // `relay_ai_stream` and into this loop is live on the worker's stack
+    // here, so this is where the stack budget is spent.
+    //
+    // Once, not once per chunk: a loop body's frame is the same size on
+    // every iteration, so a second measurement learns nothing and the
+    // probe is only free if it stays out of the inner loop.
+    let mut stack_depth_probed = false;
     'relay: loop {
+        if !stack_depth_probed {
+            stack_depth_probed = true;
+            crate::server::stack_probe::record_depth();
+        }
         match stream.next().await {
             Some(Ok(chunk)) => {
                 let chunk_bytes = Bytes::copy_from_slice(&chunk);
@@ -22728,6 +22853,35 @@ mod external_guardrail_context_tests {
             )
         }
 
+        /// Starts of SSE data frames carrying a JSON payload in a
+        /// relayed response.
+        ///
+        /// Starts, not completed frames: this matches the `data:`
+        /// prefix and the byte that opens its JSON payload, and never
+        /// looks for the terminating blank line, so a caller waiting on
+        /// `n` has `n - 1` frames delivered whole and one begun.
+        /// Callers want a lower bound on delivered content and get one;
+        /// the caller below needs 9 completion tokens and waits for
+        /// about 70.
+        ///
+        /// `data: [DONE]` and the response headers are deliberately not
+        /// counted: a caller waiting on this wants frames the usage
+        /// estimator can draw completion text out of.
+        fn delivered_sse_frames(buffer: &[u8]) -> usize {
+            // Spelled as a code point rather than written out.
+            // `scripts/scan-pub-item-usage.py` brace-counts `#[cfg(test)]`
+            // regions, so an unbalanced brace inside a literal here
+            // extends the region it computes past the end of this module
+            // and mis-files the production references below it as test
+            // consumers. `sbproxy_ai::model_group::routing_name` was the
+            // one that moved.
+            const JSON_OPEN: u8 = 0x7b;
+            buffer
+                .windows(7)
+                .filter(|window| window.starts_with(b"data: ") && window[6] == JSON_OPEN)
+                .count()
+        }
+
         /// A downstream client that reads the streamed response and
         /// breaks its connection when the test says so.
         ///
@@ -22739,6 +22893,40 @@ mod external_guardrail_context_tests {
         async fn streaming_downstream_session(
             body: serde_json::Value,
         ) -> (Session, tokio::sync::oneshot::Sender<()>, DownstreamClient) {
+            let (session, close, client, _delivered) =
+                streaming_downstream_session_watching_frames(body, None).await;
+            (session, close, client)
+        }
+
+        /// The same client, plus a signal that fires once it has read
+        /// `announce_frames` data frames off the relayed response.
+        ///
+        /// This is the happens-before edge a test needs before it can
+        /// drop a dispatch mid-stream. The bytes the client counts are
+        /// the relay's own downstream writes, and the relay only makes
+        /// them from inside `relay_ai_stream`, which is downstream of
+        /// the point where the settle guard is armed. Reading them is
+        /// therefore proof that the guard exists.
+        ///
+        /// A wall-clock deadline is not that proof and cannot be made
+        /// into one by raising it. The request side of a dispatch builds
+        /// the model's BPE table on the first call in a process, which
+        /// is a synchronous block no timer can preempt: on a loaded
+        /// machine the whole deadline can pass before the relay exists
+        /// at all, and the test then reads the unarmed `None` and
+        /// reports a settlement failure that never happened.
+        ///
+        /// `None` counts nothing and never fires, which is what every
+        /// caller that does not need the edge wants.
+        async fn streaming_downstream_session_watching_frames(
+            body: serde_json::Value,
+            announce_frames: Option<usize>,
+        ) -> (
+            Session,
+            tokio::sync::oneshot::Sender<()>,
+            DownstreamClient,
+            tokio::sync::oneshot::Receiver<()>,
+        ) {
             let body = serde_json::to_vec(&body).expect("request JSON");
             let mut wire = format!(
                 "POST /v1/chat/completions HTTP/1.1\r\nHost: ai.test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
@@ -22752,7 +22940,9 @@ mod external_guardrail_context_tests {
                 .expect("bind downstream fixture");
             let address = listener.local_addr().expect("downstream address");
             let (close, mut closed) = tokio::sync::oneshot::channel::<()>();
+            let (announce, delivered) = tokio::sync::oneshot::channel::<()>();
             let mut client = DownstreamClient::new(tokio::spawn(async move {
+                let mut announce = announce_frames.map(|wanted| (wanted, announce));
                 let mut stream = tokio::net::TcpStream::connect(address)
                     .await
                     .expect("connect downstream fixture");
@@ -22769,7 +22959,17 @@ mod external_guardrail_context_tests {
                         }
                         read = stream.read(&mut chunk) => match read {
                             Ok(0) | Err(_) => return response,
-                            Ok(read) => response.extend_from_slice(&chunk[..read]),
+                            Ok(read) => {
+                                response.extend_from_slice(&chunk[..read]);
+                                let reached = announce.as_ref().is_some_and(|(wanted, _)| {
+                                    delivered_sse_frames(&response) >= *wanted
+                                });
+                                if reached {
+                                    if let Some((_, tx)) = announce.take() {
+                                        let _ = tx.send(());
+                                    }
+                                }
+                            }
                         },
                     }
                 }
@@ -22803,7 +23003,7 @@ mod external_guardrail_context_tests {
                     panic!("parse downstream request timed out: {error:?}");
                 }
             }
-            (session, close, client)
+            (session, close, client, delivered)
         }
 
         fn stream_probe_config(upstream_url: &str) -> sbproxy_ai::AiHandlerConfig {
@@ -23282,78 +23482,169 @@ mod external_guardrail_context_tests {
             }
         }
 
-        /// The streaming twin of
-        /// `a_non_streaming_dispatch_fits_a_pingora_worker_stack`.
+        /// What the AI dispatch path actually costs in stack, held to a
+        /// budget that can only fall.
         ///
-        /// The relay gained a frame: `relay_ai_stream` now calls
-        /// `relay_ai_stream_frames` and settles after it returns, so the
-        /// chunk loop and everything it awaits sit one call deeper than
-        /// they did. Pingora workers are std threads with the default
-        /// 2 MiB stack and `#[tokio::test]` is not, which is how
-        /// WOR-2165's overflow on the sibling path shipped green. This
-        /// runs a whole streamed dispatch, header write, chunk loop,
-        /// close-out and settlement, on a worker-sized thread.
+        /// # Why the old guards could not do this
         ///
-        /// A stack overflow aborts rather than unwinding, so the failure
-        /// here is the test binary dying with a signal, which is louder
-        /// than an assertion. The dev profile spills more locals than
-        /// release, so a pass is the stricter answer.
+        /// Every stack guard in this tree measured `size_of` on one
+        /// future. A future's size is the state it holds *between*
+        /// polls. The stack is the whole chain of frames live *during* a
+        /// poll, and one says almost nothing about the other. The
+        /// numbers those guards reported, on a tree whose CI lane was
+        /// aborting with a stack overflow, were `request_filter` at
+        /// 36,480 bytes of a 262,144 budget and `handle_ai_proxy` at
+        /// 24,464 of 32,656. Around 96% of what fills the stack was
+        /// invisible to them, which is why both stayed green through
+        /// three overflows.
         ///
-        /// What it still cannot see: the fixture provider is local
-        /// plaintext, so no TLS frames sit on this stack, and no
-        /// guardrail, translator or holdback session is wired, each of
-        /// which adds its own locals to the loop.
+        /// # What this measures instead
+        ///
+        /// The request runs on a real Pingora runtime worker whose stack
+        /// is [`pingora_runtime::DEFAULT_THREAD_STACK_SIZE`], the size
+        /// production gives a worker. Pingora's runtime records where
+        /// each worker's stack starts, the request path takes the
+        /// address of a local at its deepest point, and the difference
+        /// is bytes actually in use. Three things are checked, and the
+        /// two numbers involved are different tiers:
+        ///
+        /// 1. The measured depth is inside [`STACK_BUDGET`], which is a
+        ///    fraction of that stack and the thing that only falls.
+        ///    This is an assertion and not an overflow on purpose: an
+        ///    overflow aborts, and an abort has no number and no
+        ///    message, which is the wrong failure for the check that
+        ///    exists to explain this class of bug. Sizing the worker to
+        ///    the budget instead would make this assertion unreachable,
+        ///    and would also abort on a path production serves fine.
+        /// 2. The request completes at all. A path that outgrows the
+        ///    production stack overflows and aborts, which under
+        ///    nextest is this test and nothing else, and that covers the
+        ///    entire call chain including every frame below the probes:
+        ///    reqwest, hyper, the TLS stack, serde.
+        /// 3. The probe reported a non-zero depth. Without this the
+        ///    measurement could quietly stop working, the budget check
+        ///    would pass vacuously, and we would be back to a guard that
+        ///    cannot fail.
+        ///
+        /// # What it still cannot see
+        ///
+        /// The reported number is the depth at the probes, not the
+        /// deepest point reached, so read it as a floor and a trend. The
+        /// budget in (1) is the part that covers everything.
+        ///
+        /// The fixture provider is local plaintext, so no TLS frames sit
+        /// on this stack, and no guardrail, translator or holdback
+        /// session is wired. Production is deeper than this. The budget
+        /// leaves room for that; it is not the whole margin.
+        ///
+        /// # When this fails
+        ///
+        /// Do not raise the budget first. Frames added anywhere in the
+        /// workspace spend it, so the growth is usually not in the file
+        /// that broke this. Boxing is not the answer either: two
+        /// extractions on this path moved 528 bytes, 0.025% of a 2 MiB
+        /// stack, and cost an afternoon. Raising the worker stack with
+        /// `runtime_thread_stack_size` and then raising this budget is a
+        /// deliberate decision with an operator-visible cost, and it
+        /// belongs in a commit that says so.
         #[test]
-        fn a_streaming_dispatch_fits_a_pingora_worker_stack() {
-            const PINGORA_WORKER_STACK: usize = 2 * 1024 * 1024;
+        fn the_ai_dispatch_path_stays_inside_its_stack_budget() {
+            // The worker gets the *production* stack, not the budget.
+            //
+            // Sizing it to the budget makes the assertion below dead
+            // code: the thread's stack would be the budget, so `used`
+            // could not exceed it without the process having already
+            // aborted. The first version of this did exactly that while
+            // its doc claimed the opposite, which is the third guard
+            // over this property in two days that could not fail.
+            //
+            // Two distinct numbers, and they are not the same tier:
+            //
+            //   the stack   what production gives a worker, 8 MiB. An
+            //               overflow here is a real overflow and aborts,
+            //               which is the honest answer to a path that
+            //               outgrows what production serves it on.
+            //   the budget  what the request path is allowed to use of
+            //               that, and the thing that only falls. Passing
+            //               it is an assertion failure with the
+            //               measurement in hand, long before the cliff.
+            let runtime = pingora_runtime::RuntimeBuilder::new(1, "stack-budget")
+                .thread_stack_size(pingora_runtime::DEFAULT_THREAD_STACK_SIZE)
+                .build();
+            // Await the task from here rather than blocking on a
+            // channel, so a panic inside it surfaces as a panic instead
+            // of as a timeout.
+            let task = runtime
+                .get_handle()
+                .spawn(async { a_streamed_dispatch().await });
+            let waiter = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread runtime to await the worker");
+            let used = waiter
+                .block_on(task)
+                .expect("the request completes on a production-sized worker stack");
 
-            let worker = std::thread::Builder::new()
-                .stack_size(PINGORA_WORKER_STACK)
-                .spawn(|| {
-                    // `new_current_thread` drives the future on *this*
-                    // thread, so the sized stack is the one the relay is
-                    // polled on.
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .expect("current-thread runtime");
-                    runtime.block_on(async {
-                        let frames =
-                            vec![content_frame("hello"), usage_frame(11, 7), sse("[DONE]")];
-                        let (upstream_url, upstream) =
-                            streaming_upstream_fixture(frames, 3, 0).await;
-                        let config = stream_probe_config(&upstream_url);
-                        let pipeline = crate::pipeline::CompiledPipeline::default();
-                        let (mut session, close, client) =
-                            streaming_downstream_session(stream_probe_request()).await;
-                        let mut context = crate::context::RequestContext::new();
+            // Printed on every run, not only on failure, and in one
+            // grep-able line: the number is the point. CI reads it out
+            // of a log and a reviewer comparing two branches wants it
+            // without editing the test.
+            let budget = super::super::STACK_BUDGET;
+            let stack = pingora_runtime::DEFAULT_THREAD_STACK_SIZE;
+            println!(
+                "STACK_HIGH_WATER_BYTES={used} BUDGET_BYTES={budget} WORKER_STACK_BYTES={stack}"
+            );
+            assert!(
+                used > 0,
+                "the stack probe reported nothing. Either the worker stopped recording its \
+                 stack base or the probes stopped being reached, and either way this check \
+                 has been passing vacuously."
+            );
+            assert!(
+                used <= budget,
+                "the AI request path measured {used} bytes against a {budget}-byte budget"
+            );
+        }
 
-                        super::super::handle_ai_proxy(
-                            &mut session,
-                            &config,
-                            &pipeline,
-                            "ai.test",
-                            &mut context,
-                            None,
-                        )
-                        .await
-                        .expect("the streamed dispatch completes on a worker-sized stack");
-                        assert_eq!(
-                            context.ai_tokens_out,
-                            Some(7),
-                            "the settlement has to run on that stack too, not just the loop"
-                        );
-                        let _ = close.send(());
-                        let _ = upstream.outcome.await;
-                        drop(session);
-                        drop(client);
-                    });
-                })
-                .expect("spawn a worker-sized thread");
+        /// A whole streamed dispatch: header write, chunk loop,
+        /// close-out and settlement. Returns the deepest stack usage the
+        /// probes saw on this thread.
+        ///
+        /// Entered through `request_phase::request_filter`, not through
+        /// `handle_ai_proxy` directly, and that is the whole point.
+        /// `request_filter` is the function every request enters and it
+        /// stays live on the stack while everything it dispatches into
+        /// runs above it, so a frame added there costs the AI path
+        /// exactly as much as one added in the relay. The commit that
+        /// broke `main` (`edf8b937`, PR #1235) grew `request_filter`,
+        /// `proxy_http`, `context`, `trust_tier` and `hmac_auth` and
+        /// touched no AI file at all. A measurement that started at
+        /// `handle_ai_proxy` would not have seen a byte of it.
+        async fn a_streamed_dispatch() -> usize {
+            let frames = vec![content_frame("hello"), usage_frame(11, 7), sse("[DONE]")];
+            let (upstream_url, upstream) = streaming_upstream_fixture(frames, 3, 0).await;
+            let (mut session, close, client) =
+                streaming_downstream_session(stream_probe_request()).await;
+            let mut context = super::super::ai_request_context(&upstream_url);
 
-            worker
-                .join()
-                .expect("a streamed AI request must fit a 2 MiB Pingora worker stack");
+            let served = crate::server::request_phase::request_filter(&mut session, &mut context)
+                .await
+                .expect("the streamed request completes on a budget-sized worker stack");
+            assert!(
+                served,
+                "request_filter has to serve the AI request itself, not hand it to an upstream \
+                 peer: a request that leaves early never reaches the frames this measures"
+            );
+            assert_eq!(
+                context.ai_tokens_out,
+                Some(7),
+                "the settlement has to run on that stack too, not just the loop"
+            );
+            let _ = close.send(());
+            let _ = upstream.outcome.await;
+            drop(session);
+            drop(client);
+            crate::server::stack_probe::thread_high_water_bytes()
         }
 
         /// Seam: the buffered relay's terminal write.
@@ -23567,8 +23858,8 @@ mod external_guardrail_context_tests {
         }
 
         /// The whole `handle_ai_proxy` state machine sits on a pingora
-        /// worker's 2 MiB stack while it is polled, and it is not alone
-        /// there: the compression pipeline, the CEL policy plane and the
+        /// worker's stack while it is polled, 8 MiB since WOR-2699, and
+        /// it is not alone there: the compression pipeline, the CEL policy plane and the
         /// provider client each add their own frames on top of it.
         ///
         /// WOR-2622: this path had roughly a kilobyte of headroom and
@@ -23580,17 +23871,23 @@ mod external_guardrail_context_tests {
         /// `ai_policy` expression together
         /// (`e2e/tests/governed_key_policy.rs`'s
         /// `compression-cel.localhost`). Boxing the two relay futures
-        /// took it to 24,464. The sibling guards
-        /// (`a_streaming_dispatch_fits_a_pingora_worker_stack`,
-        /// `a_non_streaming_dispatch_fits_a_pingora_worker_stack`) ran a
-        /// real dispatch on a worker-sized thread and still passed,
-        /// because their fixtures wire no compression, no policy plane
-        /// and no TLS: they measure a floor, not this ceiling.
+        /// took it to 24,464.
         ///
-        /// So this measures the number itself. The budget is deliberately
-        /// below where the failure was observed rather than at it, and a
-        /// change that needs more than this needs to box something, not
-        /// to raise the line.
+        /// This is a size, not a depth, and the difference is the whole
+        /// lesson of WOR-2699.
+        /// `the_ai_dispatch_path_stays_inside_its_stack_budget` measures
+        /// the stack the dispatch actually uses, which is the number a
+        /// worker's budget is spent on and the one that overflows. This
+        /// measures the state the future holds between polls: a much
+        /// smaller number, worth its own line because it is also the
+        /// per-in-flight-request memory cost, and because it fails on
+        /// growth rather than at a cliff. Neither substitutes for the
+        /// other, and this one alone says nothing about an overflow: on
+        /// a tree whose smoke lane was aborting, guards of this shape
+        /// reported 14% and 75% of their budgets and stayed green.
+        ///
+        /// The budget is deliberately below where the failure was
+        /// observed rather than at it.
         #[tokio::test]
         async fn the_dispatch_future_stays_inside_its_stack_budget() {
             const BUDGET_BYTES: usize = 25 * 1024;
@@ -23622,7 +23919,7 @@ mod external_guardrail_context_tests {
             assert!(
                 size <= BUDGET_BYTES,
                 "the AI dispatch future is {size} bytes, over its {BUDGET_BYTES}-byte budget. \
-                 It is polled on a 2 MiB pingora worker stack under the compression pipeline \
+                 It is polled on an 8 MiB pingora worker stack under the compression pipeline \
                  and the policy plane; box the deepest new future rather than raising this."
             );
         }
@@ -23639,9 +23936,25 @@ mod external_guardrail_context_tests {
         /// reason, and this is the exit that proves it, since a panic
         /// unwinds through the same guard by the language's own
         /// guarantee.
+        ///
+        /// The drop is taken on the frames the client has read, not on a
+        /// clock. "Mid-stream" is a position in the dispatch, and a
+        /// deadline cannot name it: the request side builds the model's
+        /// BPE table on the first call in a process, a synchronous block
+        /// no timer preempts, and under the test lane's parallelism that
+        /// block outran a two-second deadline often enough to red the
+        /// gate. The dispatch was then dropped before `relay_ai_stream`
+        /// had armed any guard, and a test about what the settlement
+        /// does reported that there had been no settlement. Counting
+        /// relayed frames is the edge that does name the position: the
+        /// relay writes them, and only from inside the guard's scope.
         #[tokio::test]
         async fn a_dropped_dispatch_still_settles_what_the_stream_delivered() {
             const CAP: u64 = 20;
+            // Comfortably more completion text than `CAP`, and far
+            // fewer frames than the fixture will supply, so the drop
+            // lands mid-flight with the cap already exceeded.
+            const FRAMES_BEFORE_DROP: usize = 32;
             let hostname = "dropped-stream-cap.test";
             let pipeline = crate::pipeline::CompiledPipeline::default();
 
@@ -23654,29 +23967,62 @@ mod external_guardrail_context_tests {
             )
             .await;
             let config = stream_capped_config(&first_url, CAP);
-            let (mut session, close, client) =
-                streaming_downstream_session(stream_probe_request()).await;
+            let (mut session, close, client, delivered) =
+                streaming_downstream_session_watching_frames(
+                    stream_probe_request(),
+                    Some(FRAMES_BEFORE_DROP),
+                )
+                .await;
             let mut context = crate::context::RequestContext::new();
-            let dropped = tokio::time::timeout(
-                Duration::from_millis(2000),
-                super::super::handle_ai_proxy(
-                    &mut session,
-                    &config,
-                    &pipeline,
-                    hostname,
-                    &mut context,
-                    None,
-                ),
-            )
-            .await;
+            // Boxed so the drop below is the future's own drop. A
+            // `Pin<&mut _>` from `tokio::pin!` would only end the borrow
+            // at the end of the scope, which is after the assertions
+            // that need the settlement to have happened.
+            let mut dispatch = Box::pin(super::super::handle_ai_proxy(
+                &mut session,
+                &config,
+                &pipeline,
+                hostname,
+                &mut context,
+                None,
+            ));
+            // The watchdog is not the synchronization; it is the bound
+            // on a relay that never delivers, which is a real failure
+            // and says so.
+            let mut delivered =
+                std::pin::pin!(tokio::time::timeout(Duration::from_secs(30), delivered));
+            let finished = tokio::select! {
+                result = dispatch.as_mut() => Some(result),
+                reached = delivered.as_mut() => {
+                    reached
+                        .expect(
+                            "the relay never delivered its first frames downstream, so the \
+                             dispatch was never mid-stream and this test could not run",
+                        )
+                        .expect(
+                            "the downstream client task ended before it counted the frames, \
+                             so the relay closed the socket or the fixture itself failed",
+                        );
+                    None
+                }
+            };
             assert!(
-                dropped.is_err(),
-                "the fixture has to still be streaming when the future is dropped"
+                finished.is_none(),
+                "the fixture has to still be streaming when the future is dropped, but the \
+                 dispatch returned first: {finished:?}"
             );
+            // The drop, and with it the guard's `Drop`.
+            drop(dispatch);
             assert_eq!(
                 context.ai_usage_source,
                 Some("estimated"),
                 "the dropped dispatch has to settle from what it received"
+            );
+            let settled = context.ai_tokens_in.unwrap_or(0) + context.ai_tokens_out.unwrap_or(0);
+            assert!(
+                settled > CAP,
+                "the abandoned stream settled {settled} tokens, which does not spend the \
+                 {CAP}-token cap the refusal below depends on"
             );
             let _ = close.send(());
             first_upstream.outcome.abort();
@@ -23934,6 +24280,87 @@ mod external_guardrail_context_tests {
                 "cancel_on_half_close": cancel_on_half_close
             }))
             .expect("single-provider disconnect fixture config")
+        }
+
+        /// The buffered twin of
+        /// `the_ai_dispatch_path_stays_inside_its_stack_budget`.
+        ///
+        /// Deleting `a_non_streaming_dispatch_fits_a_pingora_worker_stack`
+        /// left the non-streaming relay with no stack coverage at all,
+        /// and left the probe in `relay_ai_response_with_cache`
+        /// unreached by any test, which means it could stop working and
+        /// nothing would notice. The two relays are different functions
+        /// with different frames; measuring one says nothing about the
+        /// other.
+        ///
+        /// Same shape as the streaming budget test: entered through
+        /// `request_phase::request_filter`, run on a worker with a
+        /// production-sized stack, measured against the same budget.
+        ///
+        /// A connected client, deliberately not `downstream_session`,
+        /// which half-closes the instant the request is written. That
+        /// FIN would settle the disconnect watch on its first poll and
+        /// let the `select!` resolve immediately, so every later poll of
+        /// the provider future, including the one that decodes the
+        /// response header, would run at the bare `.await` outside the
+        /// `select!`. The deeper frame is the one this measures, so the
+        /// sender is held and never fired.
+        #[test]
+        fn the_buffered_ai_dispatch_path_stays_inside_its_stack_budget() {
+            let runtime = pingora_runtime::RuntimeBuilder::new(1, "stack-budget-buffered")
+                .thread_stack_size(pingora_runtime::DEFAULT_THREAD_STACK_SIZE)
+                .build();
+            let task = runtime.get_handle().spawn(async {
+                let (upstream_url, upstream) =
+                    slow_upstream_fixture(Duration::from_millis(50)).await;
+                let (mut session, _close, client) = downstream_session_closing_on_demand(
+                    disconnect_probe_request(),
+                    DownstreamClose::Reset,
+                )
+                .await;
+                let mut context = super::super::ai_request_context(&upstream_url);
+
+                let served =
+                    crate::server::request_phase::request_filter(&mut session, &mut context)
+                        .await
+                        .expect("the request completes on a production-sized worker stack");
+                assert!(served, "request_filter has to serve the AI request itself");
+                assert!(
+                    !context.ai_upstream_cancelled_on_client_disconnect,
+                    "the budget must measure a served dispatch, not a cancelled one"
+                );
+                drop(session);
+                let response = live_downstream_body(client).await;
+                assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+                let _ = upstream.outcome.await;
+                crate::server::stack_probe::thread_high_water_bytes()
+            });
+            let waiter = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread runtime to await the worker");
+            let used = waiter
+                .block_on(task)
+                .expect("the request completes on a production-sized worker stack");
+
+            let budget = super::super::STACK_BUDGET;
+            let stack = pingora_runtime::DEFAULT_THREAD_STACK_SIZE;
+            println!(
+                "BUFFERED_STACK_HIGH_WATER_BYTES={used} BUDGET_BYTES={budget} \
+                 WORKER_STACK_BYTES={stack}"
+            );
+            assert!(
+                used > 0,
+                "the stack probe reported nothing on the buffered path. Either the worker \
+                 stopped recording its stack base or the probe in \
+                 `relay_ai_response_with_cache` stopped being reached, and either way this \
+                 check has been passing vacuously."
+            );
+            assert!(
+                used <= budget,
+                "the buffered AI request path used {used} bytes of worker stack, past its \
+                 {budget}-byte budget"
+            );
         }
 
         fn disconnect_probe_request() -> serde_json::Value {
@@ -24334,147 +24761,6 @@ mod external_guardrail_context_tests {
                 with.cancel_on_half_close,
                 "an operator who writes the key gets it"
             );
-        }
-
-        /// The one risk this change's own commit message calls out, made
-        /// executable.
-        ///
-        /// Pingora workers are std threads with the default 2 MiB stack.
-        /// `#[tokio::test]` is not: it runs on a runtime whose stacks are
-        /// far larger, which is exactly why WOR-2165's overflow on this
-        /// path shipped with roughly 13,000 green tests (see
-        /// `sbproxy-ai/src/client.rs`'s `send_provider_request`, boxed
-        /// for that reason). Running one whole non-streaming dispatch on
-        /// a worker-sized thread turns "the frame still fits" from an
-        /// argument into a check.
-        ///
-        /// A stack overflow aborts the process rather than unwinding, so
-        /// the failure mode here is the test binary dying with a signal.
-        /// That is louder than a failed assertion, not quieter. The dev
-        /// profile this runs under spills more locals than release, so a
-        /// pass here is the stricter of the two answers.
-        ///
-        /// What it still cannot see: the fixture provider is local
-        /// plaintext, so no TLS frames sit on this stack, and the release
-        /// binary's own path is not exercised here.
-        /// The dispatch future's own size, pinned so a regression
-        /// fails here rather than in CI's request-path smoke lane.
-        ///
-        /// The two guards beside this one run the real future on a
-        /// 2 MiB stack, which catches an overflow but only after the
-        /// state machine has already grown enough to cause one, and
-        /// only on the platform running them. This reads the type's
-        /// layout instead: no runtime, no I/O, and it fails on the
-        /// growth rather than on the cliff.
-        ///
-        /// The number is the one `d3c28199` (WOR-2606) left behind
-        /// after boxing the two relay futures, measured again here on
-        /// `1cd47627` and unchanged. `BUDGET` leaves 8 KiB of room, so
-        /// ordinary churn does not trip it and a new inline `Vec` of
-        /// state does.
-        ///
-        /// When this fails: box the new state or move it into its own
-        /// `async fn`, the way `d3c28199` did. Raising the number is
-        /// the last resort, not the first, and CI's smoke lane builds a
-        /// debug binary whose frames are larger than these, so the
-        /// headroom here is not the headroom there.
-        #[test]
-        fn the_dispatch_future_has_not_grown() {
-            /// Measured on `1cd47627` and on WOR-2673's merge of it.
-            const MEASURED: usize = 24_464;
-            /// Room for churn before the guard fires.
-            const BUDGET: usize = MEASURED + 8 * 1024;
-
-            fn future_size<F: core::future::Future>(_never_called: impl FnOnce() -> F) -> usize {
-                core::mem::size_of::<F>()
-            }
-
-            // The closure is taken by value and dropped, never called,
-            // so nothing is constructed and nothing is polled.
-            // `never` is called only in the type system: `future_size`
-            // takes the closure by value and drops it unpolled, so no
-            // argument is ever produced. Writing it as one expression
-            // keeps every statement reachable.
-            fn never<T>() -> T {
-                unreachable!("the size probe never runs its closure")
-            }
-            let size = future_size(|| {
-                super::super::handle_ai_proxy(never(), never(), never(), "ai.test", never(), None)
-            });
-            println!("handle_ai_proxy future: {size} bytes (budget {BUDGET})");
-            assert!(
-                size <= BUDGET,
-                "the `handle_ai_proxy` future is {size} bytes, past the {BUDGET}-byte budget \
-                 ({MEASURED} measured on main plus 8 KiB). This future is polled on a 2 MiB \
-                 Pingora worker stack, and CI's request-path smoke lane runs a debug binary \
-                 whose frames are larger than these. Box the new state rather than raising the \
-                 number."
-            );
-        }
-
-        #[test]
-        fn a_non_streaming_dispatch_fits_a_pingora_worker_stack() {
-            const PINGORA_WORKER_STACK: usize = 2 * 1024 * 1024;
-
-            let worker = std::thread::Builder::new()
-                .stack_size(PINGORA_WORKER_STACK)
-                .spawn(|| {
-                    // `new_current_thread` drives the future on *this*
-                    // thread, so the sized stack is the one the dispatch
-                    // state machine is polled on.
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .expect("current-thread runtime");
-                    runtime.block_on(async {
-                        let (upstream_url, upstream) =
-                            slow_upstream_fixture(Duration::from_millis(50)).await;
-                        let config = disconnect_probe_config(&upstream_url);
-                        let pipeline = crate::pipeline::CompiledPipeline::default();
-                        // A connected client, deliberately not
-                        // `downstream_session`, which half-closes the
-                        // instant the request is written. That FIN would
-                        // settle the watch on its first poll and let the
-                        // `select!` resolve immediately, so every later
-                        // poll of the provider future, including the one
-                        // that decodes the response header, would run at
-                        // the bare `.await` outside the `select!`. The
-                        // deeper frame is the one this guard exists to
-                        // measure, so the sender is held and never fired
-                        // and the watch stays pending for the whole
-                        // dispatch.
-                        let (mut session, _close, client) = downstream_session_closing_on_demand(
-                            disconnect_probe_request(),
-                            DownstreamClose::Reset,
-                        )
-                        .await;
-                        let mut context = crate::context::RequestContext::new();
-
-                        super::super::handle_ai_proxy(
-                            &mut session,
-                            &config,
-                            &pipeline,
-                            "ai.test",
-                            &mut context,
-                            None,
-                        )
-                        .await
-                        .expect("the dispatch completes on a worker-sized stack");
-                        assert!(
-                            !context.ai_upstream_cancelled_on_client_disconnect,
-                            "the guard must measure a served dispatch, not a cancelled one"
-                        );
-                        drop(session);
-                        let response = live_downstream_body(client).await;
-                        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
-                        let _ = upstream.outcome.await;
-                    });
-                })
-                .expect("spawn a worker-sized thread");
-
-            worker
-                .join()
-                .expect("a non-streaming AI request must fit a 2 MiB Pingora worker stack");
         }
     }
     struct QualityVerdictHook {

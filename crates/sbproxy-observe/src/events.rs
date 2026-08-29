@@ -606,6 +606,16 @@ pub enum EventType {
     /// signal with its outcome and explanation; never a config value and
     /// never a secret.
     ConfigSoakVerdict,
+    /// Event name `config_rollback`. This node re-applied a stored config
+    /// revision: an operator through `POST /admin/config/rollback`, or
+    /// the node itself through `soak.auto_revert` after a failed soak
+    /// (WOR-2460, WOR-2461). Its payload is the trigger, the actor when
+    /// an operator asked, the revision rolled away from, the revision
+    /// restored, its digest, the blast radius, and the outcome; never a
+    /// config value and never a secret. "Who rolled the gateway back and
+    /// to what" is an audit question, which is why this has an event and
+    /// not only a counter.
+    ConfigRollback,
 }
 
 impl ProxyEvent {
@@ -648,7 +658,7 @@ impl ProxyEvent {
 /// mode this prevents is a twenty-third event type that no `events:` sink
 /// can ever be told to deliver, which looks exactly like a working sink
 /// to everyone except the operator waiting for the event.
-pub const ALL_EVENT_TYPES: [EventType; 24] = [
+pub const ALL_EVENT_TYPES: [EventType; 25] = [
     EventType::RequestStarted,
     EventType::RequestCompleted,
     EventType::RequestError,
@@ -673,6 +683,7 @@ pub const ALL_EVENT_TYPES: [EventType; 24] = [
     EventType::AiPromptRolloutSelected,
     EventType::AgentRegistrationDecided,
     EventType::ConfigSoakVerdict,
+    EventType::ConfigRollback,
 ];
 
 impl EventType {
@@ -709,6 +720,7 @@ impl EventType {
             Self::AiPromptRolloutSelected => "ai_prompt_rollout_selected",
             Self::AgentRegistrationDecided => "agent_registration_decided",
             Self::ConfigSoakVerdict => "config_soak_verdict",
+            Self::ConfigRollback => "config_rollback",
         }
     }
 
@@ -749,6 +761,7 @@ impl EventType {
             Self::AiPromptRolloutSelected => 21,
             Self::AgentRegistrationDecided => 22,
             Self::ConfigSoakVerdict => 23,
+            Self::ConfigRollback => 24,
         }
     }
 
@@ -806,6 +819,10 @@ impl EventType {
                 // The config soak window publishes one per closed
                 // window, from `sbproxy_core::config_soak` (WOR-2458).
                 | Self::ConfigSoakVerdict
+                // Both rollback paths publish one, from
+                // `sbproxy_core::config_rollback`: the admin route and
+                // the auto-revert the soak arms (WOR-2460, WOR-2461).
+                | Self::ConfigRollback
         )
         // `CacheHit` and `CacheMiss` are deliberately absent: wiring
         // them per-request would put an NDJSON line on every configured

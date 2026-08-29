@@ -334,7 +334,7 @@ pub struct FetchRequest<'a> {
     pub timeout: Duration,
     /// Whether the resolved tag or commit must carry a valid signature.
     pub verify_signature: bool,
-    /// Empty directory the working tree is materialised into.
+    /// Empty directory the working tree is materialized into.
     pub dest: &'a Path,
     /// Writable directory outside `dest` for captured child output.
     ///
@@ -362,7 +362,7 @@ impl std::fmt::Debug for FetchRequest<'_> {
 /// install a fake that copies a fixture directory into the destination;
 /// the loader logic stays identical.
 pub trait Cloner: Send + Sync {
-    /// Materialise `request.repo` at `request.revision` into
+    /// Materialize `request.repo` at `request.revision` into
     /// `request.dest` and report the commit it resolved to.
     ///
     /// The directory at `dest` exists and is empty when the cloner is
@@ -377,6 +377,71 @@ pub trait Cloner: Send + Sync {
     /// than with a clone error.
     fn preflight(&self) -> Result<(), ConfigSourceError> {
         Ok(())
+    }
+
+    /// Ask the remote which commit a reference points at, without
+    /// materializing a working tree.
+    ///
+    /// One network round trip and no working tree, which is what makes
+    /// a poll affordable at fifty repositories: `git ls-remote` answers
+    /// the only question a change detector has. Argo CD's repo-server
+    /// resolves an ambiguous revision the same way and keys its
+    /// manifest cache on the resolved commit sha, so an unchanged sha
+    /// never reaches a clone (WOR-2438).
+    ///
+    /// `Ok(None)` means "this cloner cannot answer cheaply", not "the
+    /// reference does not exist". The default is `Ok(None)` so a cloner
+    /// that only knows how to materialize a tree keeps working and its
+    /// caller falls back to a fetch; a missing reference is an
+    /// [`ConfigSourceError`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigSourceError::Clone`] when the remote refused the
+    /// request or named no such reference, and
+    /// [`ConfigSourceError::Timeout`] when the round trip outran
+    /// `request.timeout`.
+    fn ls_remote(
+        &self,
+        request: &LsRemoteRequest<'_>,
+    ) -> Result<Option<String>, ConfigSourceError> {
+        let _ = request;
+        Ok(None)
+    }
+}
+
+/// One cheap remote-reference lookup, the polling half of
+/// [`FetchRequest`].
+///
+/// No `dest`, because nothing is materialized. `Debug` is implemented by
+/// hand for the same reason [`FetchRequest`]'s is: the separate
+/// credential must never enter a log line.
+pub struct LsRemoteRequest<'a> {
+    /// Repository URL with any configured userinfo removed.
+    pub repo: &'a str,
+    /// Resolved credential carried separately from `repo`.
+    pub credential: Option<&'a str>,
+    /// Username selected from configured URL userinfo, when present.
+    pub credential_username: Option<&'a str>,
+    /// Branch, tag, or full commit sha, or `None` for the default
+    /// branch's `HEAD`.
+    pub revision: Option<&'a str>,
+    /// Hard timeout for the round trip.
+    pub timeout: Duration,
+    /// Writable directory for captured child output. `git ls-remote`
+    /// writes its answer to stdout, and this is where that is captured.
+    pub scratch: &'a Path,
+}
+
+impl std::fmt::Debug for LsRemoteRequest<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LsRemoteRequest")
+            .field("repo", &redact_repo(self.repo))
+            .field("revision", &self.revision)
+            .field("has_credential", &self.credential.is_some())
+            .field("timeout", &self.timeout)
+            .finish_non_exhaustive()
     }
 }
 
@@ -508,7 +573,7 @@ impl GitBinaryCloner {
         })
     }
 
-    /// Resolve `HEAD` in an already-materialised working tree.
+    /// Resolve `HEAD` in an already-materialized working tree.
     fn head_commit(
         &self,
         dest: &Path,
@@ -688,15 +753,27 @@ impl Cloner for GitBinaryCloner {
         let dest = request.dest;
         let dest_str = dest.to_string_lossy().to_string();
         let pinned = request.revision.is_some_and(is_full_commit_sha);
+        // `git clone --branch` takes a short name and refuses a
+        // fully-qualified ref: `--branch refs/tags/v1.4.2` fails with
+        // "Remote branch refs/tags/v1.4.2 not found in upstream origin".
+        // A production-tier `origin_sources` entry has to spell a tag
+        // that way (WOR-2436), because git does not tell a tag from a
+        // branch by spelling, so the clone path cannot serve it and the
+        // targeted fetch below has to. `git fetch origin <full ref>`
+        // takes it exactly as written, which is the whole reason that
+        // spelling was chosen.
+        let qualified = request
+            .revision
+            .is_some_and(|revision| revision.starts_with("refs/"));
         let http_auth = GitHttpAuth::new(
             request.credential_username,
             request.credential,
             request.repo,
         );
 
-        if pinned {
-            let sha = request.revision.unwrap_or_default();
-            self.fetch_pinned_sha(request, &dest_str, sha, http_auth.as_ref())?;
+        if pinned || qualified {
+            let revision = request.revision.unwrap_or_default();
+            self.fetch_targeted(request, &dest_str, revision, http_auth.as_ref())?;
         } else {
             let mut args: Vec<&str> = vec!["clone", "--quiet", "--depth", "1"];
             if let Some(reference) = request.revision {
@@ -742,17 +819,119 @@ impl Cloner for GitBinaryCloner {
             commit,
         })
     }
+
+    fn ls_remote(
+        &self,
+        request: &LsRemoteRequest<'_>,
+    ) -> Result<Option<String>, ConfigSourceError> {
+        // A full sha is its own answer. Asking the remote about it costs
+        // a round trip to learn what the config already states, and the
+        // server may not advertise the commit at all when it is not the
+        // tip of a ref.
+        if let Some(revision) = request.revision {
+            if is_full_commit_sha(revision) {
+                return Ok(Some(revision.to_ascii_lowercase()));
+            }
+        }
+        let http_auth = GitHttpAuth::new(
+            request.credential_username,
+            request.credential,
+            request.repo,
+        );
+        // `--exit-code` turns "the reference does not exist" into a
+        // non-zero exit rather than a silent empty answer, which would
+        // otherwise read as "unchanged" forever.
+        //
+        // Two patterns, not one. `git ls-remote <repo> refs/tags/v1`
+        // prints only the tag object; the peeled `refs/tags/v1^{}` line
+        // that carries the commit does not match that pattern and is
+        // filtered out, so asking for the peeled form explicitly is the
+        // only way to see it. Verified against git 2.50: the pair
+        // returns both lines for an annotated tag, and for a branch or
+        // `HEAD` the second pattern simply matches nothing and the exit
+        // code still reflects the first.
+        let peeled = request.revision.map_or_else(
+            || "HEAD^{}".to_string(),
+            |revision| format!("{revision}^{{}}"),
+        );
+        let mut args: Vec<&str> = vec!["ls-remote", "--exit-code", "--", request.repo];
+        args.push(request.revision.unwrap_or("HEAD"));
+        args.push(&peeled);
+        let output = self.run(
+            &args,
+            None,
+            request.scratch,
+            request.timeout,
+            http_auth.as_ref(),
+        )?;
+        if !output.success {
+            return Err(ConfigSourceError::Clone(format!(
+                "git ls-remote of {} failed: {}",
+                redact_repo(request.repo),
+                scrub_credentials(output.stderr.trim())
+            )));
+        }
+        Ok(resolved_ls_remote_sha(&output.stdout))
+    }
+}
+
+/// The commit `git ls-remote` resolved a reference to.
+///
+/// Each line is `<sha>\t<ref>`. An **annotated** tag has two: the tag
+/// object, and the commit it points at under a `^{}` suffix. The peeled
+/// line is the one this returns when it is present, because the tag
+/// object's sha is not what any checkout of that tag reports, and a
+/// change detector that compared a tag object against a checked-out
+/// commit would find them different forever and clone on every single
+/// round. A production tier pins with `refs/tags/<name>`, so that is
+/// not an edge case; it is the main case.
+///
+/// The peeled line only arrives because the caller asks for it by name.
+/// `git ls-remote <repo> refs/tags/v1` filters to refs matching that
+/// pattern, and `refs/tags/v1^{}` does not match it, so a single-pattern
+/// query returns the tag object alone. See the caller.
+///
+/// # What this cannot see
+///
+/// Whether the reference is ambiguous. `git ls-remote <repo> <ref>`
+/// matches by suffix, so a bare name can match more than one namespace,
+/// and this takes the peeled line of whichever came back. That is why
+/// the production tier requires the unambiguous `refs/tags/<name>`
+/// spelling and why the commit recorded on a composition still comes
+/// from the fetch rather than from here.
+fn resolved_ls_remote_sha(stdout: &str) -> Option<String> {
+    let mut fallback = None;
+    for line in stdout.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(sha), reference) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        if sha.is_empty() {
+            continue;
+        }
+        if reference.is_some_and(|reference| reference.ends_with("^{}")) {
+            return Some(sha.to_ascii_lowercase());
+        }
+        if fallback.is_none() {
+            fallback = Some(sha.to_ascii_lowercase());
+        }
+    }
+    fallback
 }
 
 impl GitBinaryCloner {
-    /// Materialise one exact commit sha.
+    /// Materialize one exact revision: a full commit sha, or a
+    /// fully-qualified ref such as `refs/tags/v1.4.2`.
     ///
+    /// Two things `git clone` cannot do, and one path that does both.
     /// `git clone --depth 1` cannot ask for an arbitrary commit: the
     /// server has to allow it, which most do not by default (it is
-    /// `uploadpack.allowReachableSHA1InWant`). So the pinned path is
-    /// `git init` plus a targeted shallow fetch, and falls back to a
-    /// full fetch of every ref when the server refuses the shallow one.
-    fn fetch_pinned_sha(
+    /// `uploadpack.allowReachableSHA1InWant`). And `git clone --branch`
+    /// takes a short name, so it refuses a fully-qualified ref outright.
+    /// `git init` plus a targeted shallow fetch takes either, and falls
+    /// back to a full fetch of every ref when the server refuses the
+    /// shallow one.
+    fn fetch_targeted(
         &self,
         request: &FetchRequest<'_>,
         dest_str: &str,
@@ -814,8 +993,8 @@ impl GitBinaryCloner {
             )?;
             if !full.success {
                 return Err(ConfigSourceError::Clone(format!(
-                    "git fetch of {} at {sha} failed, both as a shallow single-commit fetch \
-                     (the server may not allow it) and as a full fetch: {}",
+                    "git fetch of {} at {sha} failed, both as a shallow targeted fetch \
+                     (the server may not allow one for a bare commit) and as a full fetch: {}",
                     redact_repo(request.repo),
                     scrub_credentials(full.stderr.trim())
                 )));
@@ -829,8 +1008,8 @@ impl GitBinaryCloner {
             )?;
             if !checkout.success {
                 return Err(ConfigSourceError::RevisionMismatch(format!(
-                    "commit {sha} is not present in {} after a full fetch; the pin names a \
-                     commit this repository does not contain: {}",
+                    "{sha} is not present in {} after a full fetch; the pin names a revision \
+                     this repository does not contain: {}",
                     redact_repo(request.repo),
                     scrub_credentials(checkout.stderr.trim())
                 )));
@@ -919,6 +1098,20 @@ impl Cloner for GitOrGixCloner {
             return self.git.fetch(request);
         }
         fetch_with_gix(request)
+    }
+
+    fn ls_remote(
+        &self,
+        request: &LsRemoteRequest<'_>,
+    ) -> Result<Option<String>, ConfigSourceError> {
+        if self.git.preflight().is_ok() {
+            return self.git.ls_remote(request);
+        }
+        // The in-process fallback has no cheap remote query, so the
+        // caller falls back to a fetch rather than believing nothing
+        // moved. Answering `Ok(None)` here rather than erroring is the
+        // difference between a slower poll and a poll that stops.
+        Ok(None)
     }
 }
 
@@ -1417,6 +1610,208 @@ where
         root: &dest,
         revision: &revision,
     })
+}
+
+/// Cap on one file read out of a materialized checkout.
+///
+/// A config document and an origin profile are both hand-written YAML:
+/// the largest in this repository is a few tens of kilobytes and the
+/// bundle a composed document goes into is capped at 4 MiB, so 4 MiB is
+/// generous for either and still bounded.
+///
+/// The cap exists because the file is authored by whoever owns the
+/// repository, which for an `origin_sources` entry is deliberately not
+/// whoever runs the proxy. Checking a size *after* `read_to_string` has
+/// already allocated is not a cap at all: one project repository
+/// committing a two-gigabyte file would take the process that composes
+/// the whole fleet's configuration down, and it would do it again on
+/// the next round.
+pub const MAX_CHECKOUT_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Read one file out of a materialized checkout, refusing anything that
+/// is not a plain file genuinely inside it.
+///
+/// Three refusals, and the middle one is the reason this is a shared
+/// function rather than a `join` at each call site.
+///
+/// * A relative path with no `..` component and no absolute prefix.
+///   This constrains the **runtime** document, which is the trusted
+///   half: `source.path` and `origin_sources.entries[].path` are both
+///   written by whoever runs the proxy.
+/// * A path whose resolved target is still inside the checkout, and
+///   which is a regular file rather than a symlink. This constrains the
+///   **checkout**, which is the untrusted half. `git clone`
+///   materializes symlinks, so a project repository can commit
+///   `sbproxy/origin.yaml` as a link at the aggregator's own
+///   `/etc/sbproxy/sb.yml` and be read with the aggregator's filesystem
+///   rights. A traversal check on the configured path cannot see that,
+///   and a guard narrower than its claim is worse than none.
+/// * A file past `max_bytes`, checked with `metadata` **before** the
+///   read rather than after it.
+///
+/// # What this cannot see
+///
+/// A file that grows between the `metadata` call and the read. The
+/// window is microseconds and the checkout is a temporary directory this
+/// process just created, so the only writer is a `git` that has already
+/// exited. The read is capped by `take` anyway, so the worst case is a
+/// truncated document that fails to parse rather than an unbounded
+/// allocation.
+///
+/// # Errors
+///
+/// Returns [`ConfigSourceError::Invalid`] for a path shape that is
+/// refused before anything is opened, and [`ConfigSourceError::Read`]
+/// for a missing file, an unreadable one, a symlink, an escape, or one
+/// past `max_bytes`. The three cases are distinguished in the message,
+/// because "not in the repository" and "there but unreadable" send an
+/// operator to different places.
+pub fn read_file_within(
+    root: &Path,
+    relative: &str,
+    max_bytes: u64,
+    label: &str,
+) -> Result<String, ConfigSourceError> {
+    use std::io::Read as _;
+
+    let candidate = Path::new(relative);
+    if candidate.is_absolute()
+        || relative
+            .split('/')
+            .any(|part| part == ".." || part == "." || part.is_empty())
+    {
+        return Err(ConfigSourceError::Invalid(format!(
+            "{label} '{relative}' must be a relative path inside the repository, with no `..` \
+             or `.` components"
+        )));
+    }
+    let full = root.join(candidate);
+    // `symlink_metadata` does not follow, so a link is visible as one.
+    let metadata = std::fs::symlink_metadata(&full).map_err(|error| {
+        ConfigSourceError::Read(format!(
+            "{label} '{relative}' is not in the repository at the resolved revision: {error}"
+        ))
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(ConfigSourceError::Read(format!(
+            "{label} '{relative}' is a symbolic link. A repository this proxy does not own can \
+             point a link anywhere the reading process can reach, so a link is refused rather \
+             than followed; commit the file itself"
+        )));
+    }
+    if !metadata.is_file() {
+        return Err(ConfigSourceError::Read(format!(
+            "{label} '{relative}' is not a regular file"
+        )));
+    }
+    if metadata.len() > max_bytes {
+        return Err(ConfigSourceError::Read(format!(
+            "{label} '{relative}' is {} bytes, past the {max_bytes}-byte limit for a file read \
+             out of a repository this proxy does not own",
+            metadata.len()
+        )));
+    }
+    // Belt and braces after the symlink refusal: a hard link, or a
+    // component of the path that is itself a link, still has to resolve
+    // inside the checkout.
+    let resolved_root = std::fs::canonicalize(root)
+        .map_err(|error| ConfigSourceError::Read(format!("resolve the checkout root: {error}")))?;
+    let resolved = std::fs::canonicalize(&full).map_err(|error| {
+        ConfigSourceError::Read(format!("resolve {label} '{relative}': {error}"))
+    })?;
+    if !resolved.starts_with(&resolved_root) {
+        return Err(ConfigSourceError::Read(format!(
+            "{label} '{relative}' resolves outside the checkout"
+        )));
+    }
+    let file = std::fs::File::open(&resolved).map_err(|error| {
+        ConfigSourceError::Read(format!("{label} '{relative}' could not be opened: {error}"))
+    })?;
+    let mut text = String::new();
+    file.take(max_bytes)
+        .read_to_string(&mut text)
+        .map_err(|error| {
+            ConfigSourceError::Read(format!(
+                "{label} '{relative}' is there but could not be read (it may not be UTF-8): \
+                 {error}"
+            ))
+        })?;
+    Ok(text)
+}
+
+/// Ask a repository which commit an entry's revision points at, with no
+/// working tree materialized.
+///
+/// The polling half of [`materialize_git_tree`], and it takes the same
+/// [`GitTreeRequest`] so a caller cannot poll one repository and fetch
+/// another. Credential resolution, redaction, and the missing-credential
+/// refusal are the same code path, deliberately: a poll that
+/// authenticated differently from the fetch beside it would report a
+/// change the fetch could not then read.
+///
+/// `Ok(None)` means the cloner cannot answer cheaply and the caller
+/// should fetch. `Ok(Some(sha))` is a change detector, not a promise
+/// about what a checkout will report: an annotated tag resolves to its
+/// peeled commit here, and an ambiguous reference resolves to whichever
+/// namespace the remote matched.
+///
+/// # Errors
+///
+/// Returns [`ConfigSourceError::Invalid`] for an empty repository, an
+/// out-of-range timeout, or a declared credential with no resolved
+/// value; [`ConfigSourceError::Clone`] when the remote refused;
+/// [`ConfigSourceError::Timeout`] when the round trip outran the
+/// request's timeout.
+pub fn poll_git_revision(
+    request: &GitTreeRequest<'_>,
+) -> Result<Option<String>, ConfigSourceError> {
+    if request.repo.trim().is_empty() {
+        return Err(ConfigSourceError::Invalid(
+            "Git tree repository must not be empty".to_owned(),
+        ));
+    }
+    if request.timeout.is_zero() || request.timeout > MAX_FETCH_TIMEOUT {
+        return Err(ConfigSourceError::Invalid(format!(
+            "Git tree timeout must be between 1 and {} seconds",
+            MAX_FETCH_TIMEOUT.as_secs()
+        )));
+    }
+    let resolved_credential = request
+        .credential
+        .and_then(|_| request.fetch_context.credentials.get(request.repo))
+        .map(String::as_str);
+    if request.credential.is_some() && resolved_credential.is_none() {
+        return Err(ConfigSourceError::Invalid(format!(
+            "a credential is declared for {} but no resolved credential was supplied",
+            redact_repo(request.repo)
+        )));
+    }
+    let tempdir = request.fetch_context.new_tempdir()?;
+    let scratch = tempdir.path().join("scratch");
+    std::fs::create_dir_all(&scratch)
+        .map_err(|error| ConfigSourceError::Clone(format!("mkdir scratch: {error}")))?;
+    let clean_repo = redact_repo(request.repo);
+    let credential_username = repo_username(request.repo);
+    let http_auth = GitHttpAuth::new(
+        credential_username.as_deref(),
+        resolved_credential,
+        &clean_repo,
+    );
+    let poll = LsRemoteRequest {
+        repo: &clean_repo,
+        credential: resolved_credential,
+        credential_username: credential_username.as_deref(),
+        revision: request.revision,
+        timeout: request.timeout,
+        scratch: &scratch,
+    };
+    request
+        .fetch_context
+        .cloner
+        .ls_remote(&poll)
+        .map_err(|error| {
+            sanitize_materialization_error(error, resolved_credential, http_auth.as_ref())
+        })
 }
 
 fn sanitize_materialization_error(
@@ -1956,7 +2351,16 @@ fn load_git(
             fetch_context: fetch_ctx,
         },
         |tree| {
-            let text = std::fs::read_to_string(tree.root().join(relative)).map_err(|error| {
+            // The same guard the aggregator uses, for the same reason:
+            // a `confine: true` source is a repository this proxy does
+            // not own, and `git clone` materializes symlinks.
+            let text = read_file_within(
+                tree.root(),
+                &relative.to_string_lossy(),
+                MAX_CHECKOUT_FILE_BYTES,
+                "source.path",
+            )
+            .map_err(|error| {
                 ConfigSourceError::Read(format!(
                     "'{}' at {} in {}: {error}",
                     spec.path,
@@ -2005,6 +2409,85 @@ fn merge_yaml_value(base: &mut YamlValue, overlay: YamlValue) {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    /// A `{:?}` of a poll request must not print the credential.
+    ///
+    /// Pins the registry line in `scripts/secret-debug-registry.txt`.
+    /// The struct carries a resolved credential, so a derived `Debug`
+    /// would put a token into any log line, panic message or test
+    /// failure that formatted the request.
+    #[test]
+    fn debug_never_renders_the_ls_remote_credential() {
+        let request = LsRemoteRequest {
+            repo: "https://git.test/acme/checkout",
+            credential: Some("sk-live-LSREMOTE-SENTINEL"),
+            credential_username: Some("git"),
+            revision: Some("refs/tags/v1.4.2"),
+            timeout: Duration::from_secs(5),
+            scratch: Path::new("/tmp"),
+        };
+        let rendered = format!("{request:?}");
+        assert!(
+            !rendered.contains("LSREMOTE-SENTINEL"),
+            "the credential reached a Debug rendering: {rendered}"
+        );
+        assert!(
+            rendered.contains("has_credential: true"),
+            "presence is still reported, so a Debug is worth having: {rendered}"
+        );
+    }
+
+    /// An annotated tag's peeled commit wins over the tag object.
+    #[test]
+    fn ls_remote_output_resolves_to_the_peeled_commit() {
+        let tag_object = "1".repeat(40);
+        let commit = "2".repeat(40);
+        let annotated =
+            format!("{tag_object}\trefs/tags/v1.4.2\n{commit}\trefs/tags/v1.4.2^{{}}\n");
+        assert_eq!(
+            resolved_ls_remote_sha(&annotated),
+            Some(commit.clone()),
+            "the tag object's sha is not what a checkout of that tag reports, so comparing it \
+             against one would clone on every round forever"
+        );
+        // A lightweight tag and a branch print one line and have no
+        // peeled form, so the only line is the answer.
+        let lightweight = format!("{commit}\trefs/tags/v1.4.2\n");
+        assert_eq!(resolved_ls_remote_sha(&lightweight), Some(commit));
+        assert_eq!(resolved_ls_remote_sha(""), None);
+        assert_eq!(resolved_ls_remote_sha("\n\n"), None);
+    }
+
+    /// A cloner that only knows how to materialize a tree answers the
+    /// cheap question with "I cannot", so its caller fetches rather than
+    /// believing nothing moved.
+    #[test]
+    fn the_default_ls_remote_says_it_cannot_answer_rather_than_saying_unchanged() {
+        struct TreeOnly;
+        impl Cloner for TreeOnly {
+            fn fetch(
+                &self,
+                _request: &FetchRequest<'_>,
+            ) -> Result<ResolvedRevision, ConfigSourceError> {
+                Err(ConfigSourceError::Clone("not used".to_string()))
+            }
+        }
+        let request = LsRemoteRequest {
+            repo: "https://git.test/acme/checkout",
+            credential: None,
+            credential_username: None,
+            revision: None,
+            timeout: Duration::from_secs(5),
+            scratch: Path::new("/tmp"),
+        };
+        assert_eq!(
+            TreeOnly
+                .ls_remote(&request)
+                .expect("the default never errors"),
+            None,
+            "`Ok(None)` is \"cannot answer cheaply\" and not \"the reference does not exist\""
+        );
+    }
 
     /// Fixture-copying stub that swaps in for `git clone` in tests.
     /// Each `repo` key maps to a directory layout that is copied into

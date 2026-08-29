@@ -147,6 +147,7 @@ fn fetch<'a>(credential: &'a str, if_none_match: Option<&'a str>) -> BundleFetch
         subscriber_id: None,
         if_none_match,
         peer: "127.0.0.1",
+        apply_report: None,
     }
 }
 
@@ -345,6 +346,7 @@ fn an_unauthenticated_fetch_is_rejected() {
         subscriber_id: None,
         if_none_match: None,
         peer: "127.0.0.1",
+        apply_report: None,
     });
     assert_eq!(anonymous.status, 401);
     assert_eq!(anonymous.reason, "missing_credential");
@@ -1371,4 +1373,231 @@ async fn the_admin_routes_publish_register_revoke_and_report() {
         assert_eq!(status, 404, "{path}: {body}");
         assert_eq!(body["code"], "publish_not_configured", "{path}");
     }
+}
+
+// --- WOR-2464: subscribers report what they applied -------------------
+
+/// The apply-report headers a subscriber sends, as wire strings.
+///
+/// Driven over the real listener rather than through `serve_bundle`
+/// directly, deliberately: the header names are a contract between two
+/// files in two crates, and a test that hands the parsed struct straight
+/// to the decision function would keep passing if the listener stopped
+/// reading one of them off the wire.
+fn apply_headers<'a>(
+    status: &'a str,
+    revision: &'a str,
+    hash: &'a str,
+    error: Option<&'a str>,
+) -> Vec<(&'a str, &'a str)> {
+    let mut headers = vec![
+        ("x-sbproxy-config-status", status),
+        ("x-sbproxy-applied-revision", revision),
+        ("x-sbproxy-applied-hash", hash),
+        ("x-sbproxy-fallback-active", "false"),
+    ];
+    if let Some(error) = error {
+        headers.push(("x-sbproxy-config-error", error));
+    }
+    headers
+}
+
+/// One subscriber row out of the status page.
+fn subscriber_row(status: &serde_json::Value, id: &str) -> serde_json::Value {
+    status["subscribers"]
+        .as_array()
+        .expect("subscribers")
+        .iter()
+        .find(|record| record["subscriber_id"] == id)
+        .cloned()
+        .unwrap_or_else(|| panic!("subscriber {id} is listed"))
+}
+
+/// WOR-2464. The authority status endpoint tracked per-subscriber
+/// last-**seen** revision, and seen is not applied: a fleet where three
+/// nodes fetched r42, refused it, and kept serving r41 looked identical
+/// from here to a fleet that applied it cleanly. All four report states
+/// in one test, over the real listener, because the page's value is in
+/// telling them apart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_status_page_tells_applied_from_fetched_for_every_report_state() {
+    let temp = tempfile::tempdir().expect("temp");
+    let publish = publish_config(temp.path(), free_port());
+    let authority = Arc::new(ConfigAuthority::from_config(&publish).expect("authority"));
+    authority
+        .publish(&payload("api.test", "authority"), BundleMode::Overlay)
+        .expect("publish");
+    let addr = serve(Arc::clone(&authority), &publish).await;
+
+    let token = |id: &str| {
+        authority
+            .register_subscriber(id)
+            .expect("register")
+            .into_token()
+    };
+    let clean = token("edge-clean");
+    let degraded = token("edge-degraded");
+    let refused = token("edge-refused");
+    let silent = token("edge-old-build");
+
+    for (credential, headers) in [
+        (&clean, apply_headers("applied", "1", "sha-clean", None)),
+        (
+            &degraded,
+            apply_headers("applied_degraded", "1", "sha-clean", None),
+        ),
+        (
+            &refused,
+            apply_headers("failed", "0", "", Some("unknown policy type `waf_v3`")),
+        ),
+    ] {
+        let mut sent = vec![("authorization", format!("Bearer {credential}"))];
+        sent.extend(
+            headers
+                .into_iter()
+                .map(|(name, value)| (name, value.to_string())),
+        );
+        let borrowed: Vec<(&str, &str)> = sent
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect();
+        let reply = raw_get(addr, BUNDLE_ENDPOINT_PATH, &borrowed).await;
+        assert_eq!(reply.status, 200, "the bundle is still served");
+    }
+    // The old build fetches without any of the new headers. It must be
+    // served, and it must not be rendered as having applied anything.
+    let reply = raw_get(
+        addr,
+        BUNDLE_ENDPOINT_PATH,
+        &[("authorization", &format!("Bearer {silent}"))],
+    )
+    .await;
+    assert_eq!(reply.status, 200);
+
+    let status = authority.status();
+
+    let clean = subscriber_row(&status, "edge-clean");
+    assert_eq!(clean["apply_status"], "applied");
+    assert_eq!(clean["applied_revision"], 1);
+    assert_eq!(clean["applied_config_hash"], "sha-clean");
+    assert_eq!(clean["applied_up_to_date"], true);
+    assert_eq!(clean["poll_state"], "recent");
+
+    assert_eq!(
+        subscriber_row(&status, "edge-degraded")["apply_status"],
+        "applied_degraded",
+        "a degraded apply must stay distinguishable from a clean one on the trip upstream",
+    );
+
+    let refused = subscriber_row(&status, "edge-refused");
+    assert_eq!(refused["apply_status"], "failed");
+    assert_eq!(
+        refused["applied_revision"], 0,
+        "a refusing node keeps naming the revision it is serving, not the one it refused",
+    );
+    assert_eq!(refused["apply_error"], "unknown policy type `waf_v3`");
+    assert_eq!(refused["applied_up_to_date"], false);
+    // It was still served, so its *seen* revision moved. That is exactly
+    // the pair of facts the ticket exists to separate.
+    assert_eq!(refused["last_seen_revision"], 1);
+
+    let silent = subscriber_row(&status, "edge-old-build");
+    assert_eq!(
+        silent["apply_status"], "unknown",
+        "an old subscriber is handled without error and rendered as unknown, never as applied",
+    );
+    assert!(silent["applied_revision"].is_null());
+    assert_eq!(silent["last_seen_revision"], 1, "it was still served");
+
+    // The three numbers that turn a fleet rollback into a decision.
+    assert_eq!(status["applied_current_count"], 2);
+    assert_eq!(status["apply_failed_count"], 1);
+    assert_eq!(status["apply_unknown_count"], 1);
+}
+
+/// WOR-2464. A subscriber cannot report a revision higher than the
+/// authority has published. That would let one compromised node make the
+/// fleet view say a rollout is complete, which is the one answer an
+/// operator acts on without checking.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_subscriber_cannot_claim_a_revision_the_authority_never_published() {
+    let temp = tempfile::tempdir().expect("temp");
+    let publish = publish_config(temp.path(), free_port());
+    let authority = Arc::new(ConfigAuthority::from_config(&publish).expect("authority"));
+    authority
+        .publish(&payload("api.test", "authority"), BundleMode::Overlay)
+        .expect("publish");
+    let addr = serve(Arc::clone(&authority), &publish).await;
+    let credential = authority
+        .register_subscriber("edge-liar")
+        .expect("register")
+        .into_token();
+
+    let bearer = format!("Bearer {credential}");
+    let mut headers = vec![("authorization", bearer.as_str())];
+    headers.extend(apply_headers("applied", "9999", "sha-forged", None));
+    let reply = raw_get(addr, BUNDLE_ENDPOINT_PATH, &headers).await;
+    assert_eq!(
+        reply.status, 200,
+        "the node is still served: the report is discarded, not the bundle",
+    );
+
+    let status = authority.status();
+    assert_eq!(
+        subscriber_row(&status, "edge-liar")["apply_status"],
+        "unknown",
+        "an over-claim leaves the record as it was rather than poisoning the fleet view",
+    );
+    assert_eq!(status["applied_current_count"], 0);
+    assert_eq!(status["apply_unknown_count"], 1);
+}
+
+/// WOR-2464. The report rides the existing bundle fetch, so it carries
+/// the existing subscriber credential and adds no new auth surface. An
+/// unauthenticated or forged request cannot plant one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_apply_report_needs_the_subscriber_credential_like_the_fetch_it_rides_on() {
+    let temp = tempfile::tempdir().expect("temp");
+    let publish = publish_config(temp.path(), free_port());
+    let authority = Arc::new(ConfigAuthority::from_config(&publish).expect("authority"));
+    authority
+        .publish(&payload("api.test", "authority"), BundleMode::Overlay)
+        .expect("publish");
+    let addr = serve(Arc::clone(&authority), &publish).await;
+    let credential = authority
+        .register_subscriber("edge-01")
+        .expect("register")
+        .into_token();
+
+    let anonymous = raw_get(
+        addr,
+        BUNDLE_ENDPOINT_PATH,
+        &apply_headers("applied", "1", "sha-forged", None),
+    )
+    .await;
+    assert_eq!(
+        anonymous.status, 401,
+        "no credential, no fetch and no report",
+    );
+
+    let mut forged = vec![("authorization", "Bearer sbca1.not.a.real.token")];
+    forged.extend(apply_headers("applied", "1", "sha-forged", None));
+    assert_eq!(
+        raw_get(addr, BUNDLE_ENDPOINT_PATH, &forged).await.status,
+        401
+    );
+
+    assert_eq!(
+        subscriber_row(&authority.status(), "edge-01")["apply_status"],
+        "unknown",
+        "neither refused request may have planted a report against the registered subscriber",
+    );
+
+    // And the credential that is real still works, which proves the two
+    // refusals above were about the credential rather than the headers.
+    let bearer = format!("Bearer {credential}");
+    let mut real = vec![("authorization", bearer.as_str())];
+    real.extend(apply_headers("applied", "1", "sha-real", None));
+    assert_eq!(raw_get(addr, BUNDLE_ENDPOINT_PATH, &real).await.status, 200);
+    assert_eq!(authority.status()["applied_current_count"], 1);
 }

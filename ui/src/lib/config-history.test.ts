@@ -7,6 +7,7 @@ import {
   degradedSummary,
   historyStateTone,
   isConfigHistoryDisabled,
+  rollbackGate,
 } from "./config-history";
 
 describe("config history presentation", () => {
@@ -78,3 +79,41 @@ function _typeCheck(entry: ConfigHistoryEntry): void {
   void degradedSummary(entry.degraded);
 }
 void _typeCheck;
+
+describe("rollbackGate", () => {
+  it("lets a hitless or reload rollback submit without ceremony", () => {
+    for (const radius of ["hitless", "reload"] as const) {
+      const gate = rollbackGate(radius, 7, "");
+      expect(gate.requiresTypedConfirmation).toBe(false);
+      expect(gate.canSubmit).toBe(true);
+      expect(gate.reason).toBeNull();
+    }
+  });
+
+  it("refuses to submit a restart or breaking rollback without the typed revision", () => {
+    for (const radius of ["restart", "breaking"] as const) {
+      const blank = rollbackGate(radius, 7, "");
+      expect(blank.requiresTypedConfirmation).toBe(true);
+      expect(blank.canSubmit).toBe(false);
+      expect(blank.reason).toContain("revision 7");
+      expect(blank.reason).toContain(radius);
+
+      const wrong = rollbackGate(radius, 7, "8");
+      expect(wrong.canSubmit).toBe(false);
+
+      const right = rollbackGate(radius, 7, " 7 ");
+      expect(right.canSubmit).toBe(true);
+      expect(right.reason).toBeNull();
+    }
+  });
+
+  it("treats an unknown radius as one that needs confirming", () => {
+    // The lineage's first entry has nothing to compare against, so the
+    // node reports null. An unknown radius is not a safe radius.
+    const gate = rollbackGate(null, 1, "");
+    expect(gate.requiresTypedConfirmation).toBe(true);
+    expect(gate.canSubmit).toBe(false);
+    expect(gate.reason).toContain("unknown-radius");
+    expect(rollbackGate(null, 1, "1").canSubmit).toBe(true);
+  });
+});

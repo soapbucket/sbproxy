@@ -1081,9 +1081,108 @@ pub struct OriginSourcesConfig {
     /// [`EnvironmentTier`].
     #[serde(default)]
     pub tier: EnvironmentTier,
+    /// How often the aggregator polls, how long it waits before
+    /// composing, and how many repositories it reads at once.
+    #[serde(default)]
+    pub aggregator: OriginAggregatorConfig,
     /// The project repositories composed into `origins:`.
     #[serde(default)]
     pub entries: Vec<OriginSourceEntry>,
+}
+
+/// Timings and bounds for `sbproxy aggregate` (WOR-2437, WOR-2438).
+///
+/// Inside `origin_sources` rather than under `proxy:` for the same
+/// reason [`EnvironmentTier`] is: this block is on
+/// [`crate::AUTHORITY_DENIED_PATHS`], so an authority cannot reach in
+/// and set a poll interval on a fleet that did not ask for one.
+///
+/// Every default here is stated in `docs/configuration.md` alongside
+/// what it costs in requests per hour per repository, because that
+/// number is the one a platform team gets asked about by whoever runs
+/// the git server.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OriginAggregatorConfig {
+    /// How often each unpinned entry is asked whether its revision
+    /// moved, in seconds.
+    ///
+    /// One `git ls-remote` per unpinned entry per interval, so the cost
+    /// is `3600 / poll_interval_secs` requests per hour per repository.
+    /// The default of 120 is Argo CD's `--app-resync` default and gives
+    /// 30 requests per hour per repository. An entry pinned to a full
+    /// commit sha is polled zero times, because a sha cannot move.
+    #[serde(default = "default_aggregator_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+    /// How long a moved entry waits for others to move before the
+    /// aggregator composes, in seconds.
+    ///
+    /// Project repositories merge on their own cadences and nothing
+    /// coordinates them, so three teams merging inside one minute would
+    /// otherwise be three published revisions and three fleet-wide
+    /// pipeline rebuilds. Zero composes immediately.
+    #[serde(default = "default_aggregator_debounce_secs")]
+    pub debounce_secs: u64,
+    /// The ceiling on that wait, in seconds.
+    ///
+    /// A continuously-changing entry would otherwise reset the debounce
+    /// window forever and never publish at all. Measured from the first
+    /// movement in the current window, not from the last.
+    #[serde(default = "default_aggregator_max_deferral_secs")]
+    pub max_deferral_secs: u64,
+    /// How many repositories are fetched at once.
+    ///
+    /// Serial resolution with per-entry timeouts means fifty entries can
+    /// hold one compose open for fifty times one timeout, so the pool is
+    /// bounded rather than absent and rather than unbounded.
+    #[serde(default = "default_aggregator_concurrency")]
+    pub concurrency: usize,
+    /// Hard deadline for all of one compose's fetches, in seconds.
+    ///
+    /// Distinct from the per-entry `timeout_secs`: that one bounds a
+    /// single repository, this one bounds the whole round, so a pool of
+    /// slow-but-not-timing-out repositories cannot hold a compose open
+    /// past it.
+    #[serde(default = "default_aggregator_deadline_secs")]
+    pub deadline_secs: u64,
+}
+
+impl Default for OriginAggregatorConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval_secs: default_aggregator_poll_interval_secs(),
+            debounce_secs: default_aggregator_debounce_secs(),
+            max_deferral_secs: default_aggregator_max_deferral_secs(),
+            concurrency: default_aggregator_concurrency(),
+            deadline_secs: default_aggregator_deadline_secs(),
+        }
+    }
+}
+
+/// Default aggregator poll cadence, in seconds. Argo CD's
+/// `--app-resync` default, and 30 requests per hour per repository.
+fn default_aggregator_poll_interval_secs() -> u64 {
+    120
+}
+
+/// Default coalescing window, in seconds.
+fn default_aggregator_debounce_secs() -> u64 {
+    15
+}
+
+/// Default ceiling on the coalescing window, in seconds.
+fn default_aggregator_max_deferral_secs() -> u64 {
+    120
+}
+
+/// Default bound on concurrent repository fetches.
+fn default_aggregator_concurrency() -> usize {
+    8
+}
+
+/// Default hard deadline for one compose's fetches, in seconds.
+fn default_aggregator_deadline_secs() -> u64 {
+    300
 }
 
 /// The tier of the runtime config document, which is what the
@@ -1474,6 +1573,38 @@ pub struct ConfigSoakConfig {
     /// whatever the operator knows and the proxy does not.
     #[serde(default)]
     pub probe: Option<ConfigSoakProbeConfig>,
+    /// Whether a failed soak re-applies the last known good revision on
+    /// its own. **Off by default**, and the only key in this block that
+    /// is (WOR-2461).
+    ///
+    /// # Why this one defaults off
+    ///
+    /// A node that undoes an operator's change without being asked is
+    /// surprising in a way that costs trust, and the failure mode is
+    /// asymmetric: a flapping upstream during a deploy window reverts a
+    /// good config, the operator re-applies it, it reverts again, and
+    /// the safety feature is now the incident. With it off the soak
+    /// still runs and still promotes, so the operator gets a correct
+    /// last-known-good pointer, a metric, an event, and an alert, with
+    /// none of that risk. Calibrate the thresholds against real traffic
+    /// with this off before arming it.
+    ///
+    /// Junos `commit confirmed` is the closest prior art and it is
+    /// deliberately not what this is: there the operator opts in per
+    /// commit and the rollback timer is armed for that one change.
+    /// Here the opt-in is per node and standing, which is a bigger
+    /// promise, so it is off until someone makes it.
+    ///
+    /// # It arms only for a diff an arc-swap can undo
+    ///
+    /// A `Restart` or `Breaking` diff (listener ports, admin block,
+    /// cluster identity, an origin's action or auth type) cannot be
+    /// undone by swapping the pipeline pointer back, and half-reverting
+    /// would leave the process in a state neither config describes.
+    /// Those get boot fallback and `POST /admin/config/rollback`
+    /// instead. The stored `blast_radius` on the ring entry decides it.
+    #[serde(default)]
+    pub auto_revert: bool,
 }
 
 impl Default for ConfigSoakConfig {
@@ -1486,6 +1617,7 @@ impl Default for ConfigSoakConfig {
             require_no_degraded_subsystems: true,
             require_upstream_health: true,
             probe: None,
+            auto_revert: false,
         }
     }
 }
@@ -1891,7 +2023,38 @@ boot:
         assert_eq!(cfg.boot.fallback, BootFallbackMode::LastKnownGood);
         assert_eq!(cfg.boot.max_attempts, 2);
         assert_eq!(cfg.boot.success_secs, 15);
+        assert!(
+            !cfg.soak.auto_revert,
+            "auto_revert is the one key in this block that defaults off, and a block that \
+             names every other soak key without naming it must still come back off",
+        );
         cfg.validate().expect("valid");
+    }
+
+    /// WOR-2461. `auto_revert` ships off, and it is the only key in the
+    /// soak block that does. Pinned as its own test rather than as an
+    /// assertion inside another, because a default flipping on is the
+    /// one change here that would take production action without an
+    /// operator asking.
+    #[test]
+    fn auto_revert_is_off_by_default_and_opting_in_is_explicit() {
+        assert!(
+            !ConfigSoakConfig::default().auto_revert,
+            "a node that undoes an operator's change without being asked is surprising in a \
+             way that costs trust",
+        );
+        assert!(
+            !ConfigHistoryConfig::default().soak.auto_revert,
+            "and it stays off through the block that turns the soak itself on",
+        );
+        let armed: ConfigHistoryConfig =
+            serde_yaml::from_str("enabled: true\nsoak:\n  auto_revert: true\n").expect("parses");
+        assert!(armed.soak.auto_revert, "opting in is one key");
+        assert!(
+            armed.soak.enabled,
+            "and arming the revert does not require restating that the soak is on",
+        );
+        armed.validate().expect("valid");
     }
 
     /// A zero window would promote on apply, which is the defect the

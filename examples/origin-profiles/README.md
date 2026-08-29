@@ -179,6 +179,43 @@ The metric `sbproxy_origin_source_entries{tier,pinned}` carries the same two fac
 
 `origin_sources` is not. It is on the subscriber's denied-path list alongside `source`, and for the same reason one level up: `source` names one repository, while this block names N of them, and the documents it pulls carry Lua, WASM and JavaScript bodies the config interpolator deliberately never reads. An authority able to write it would be arbitrary code fetch on every node that trusts it.
 
+## Running the composition
+
+```bash
+# Publish through the config authority this document configures.
+sbproxy aggregate -f examples/origin-profiles/sb.yml
+
+# Compose to a file instead: the single-node path, and the CI review step.
+sbproxy aggregate -f examples/origin-profiles/sb.yml --out composed.yml
+
+# What would that file change? Writes nothing; exit 2 on changes.
+sbproxy aggregate -f examples/origin-profiles/sb.yml --out composed.yml --dry-run
+
+# Keep running: poll, coalesce a burst into one publish, publish on change.
+sbproxy aggregate -f examples/origin-profiles/sb.yml --watch
+```
+
+A proxy that both declares these entries and publishes a config authority runs the same loop in process at boot. A node with entries and no authority logs that it is not composing rather than doing it quietly, because its answer is `--out` and that is an operator's decision.
+
+The `aggregator:` block above writes out every shipped default, so the cost is visible rather than implied. `poll_interval_secs: 120` is one `git ls-remote` per unpinned entry every two minutes, which is 30 requests per hour per repository; the entry here is pinned to a tag, so each round compares a sha and clones only when it moved. The debounce and its ceiling are the pair that turns three teams merging inside one minute into one composed document and one fleet reload, without letting a continuously-changing entry defer a publish forever.
+
+## Why is this policy here
+
+```bash
+sbproxy aggregate -f examples/origin-profiles/sb.yml --explain checkout.example.com
+sbproxy plan -f examples/origin-profiles/sb.yml --explain-origin checkout.example.com
+```
+
+```
+checkout.example.com
+  action.url                                spec.base  entry checkout  https://git.example.com/acme/checkout@a1b2c3d4e5f6
+  policies[platform_waf].action_on_match    origin_defaults
+  policies[rate_limit].requests_per_minute  origin_sources.entries[].overrides  entry checkout
+  dropped policies[legacy_cap]              spec.base dropped a default introduced by origin_defaults  entry checkout
+```
+
+One line per leaf, naming the layer that set it and, for the two layers the project authored, the repository and the resolved commit. The merged lists are keyed by `name:` rather than by index, because an index moves whenever an earlier entry is dropped. A field-level override reports per field, so the fields the project did not touch still name the floor. And nothing carries a value: a composed leaf can be a `secret://` reference an entry bound, so provenance says which layer and which repository, never what.
+
 ## Try it
 
 ```bash

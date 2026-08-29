@@ -1,6 +1,6 @@
 # SBproxy Runtime Manual
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-28*
 
 Vendor: Soap Bucket LLC - [www.soapbucket.com](https://www.soapbucket.com)
 
@@ -156,12 +156,22 @@ sbproxy validate <path> [--format text|json] [--no-fetch]
 sbproxy --config <path> --check
 sbproxy --config <path> --locked
 sbproxy plan -f <yaml> [--against <yaml>] [--format json|text] [--out <plan-file>] [--no-fetch]
+sbproxy plan -f <yaml> --explain-origin <host> [--format json|text]
+sbproxy aggregate [<path>] [--out <file>] [--dry-run] [--explain <host>]
+                        [--watch] [--polls <n>] [--mode overlay|replace]
+                        [--admin-url <url>] [--username <u>] [--password <p>]
+                        [--format text|json]
 sbproxy apply -f <yaml> [--admin-url <url>] [--username <u>] [--password <p>]
                         [--validate-only]
 sbproxy apply -p <plan-file> [--admin-url <url>] [--validate-only]
 sbproxy config {migrate|import-litellm|print}
 sbproxy config history [--admin-url <url>] [--format text|json]
 sbproxy config show <revision> [--admin-url <url>] [--format text|json]
+sbproxy config rollback [--to <rev|digest|last-known-good>] [--expected-current <rev>]
+                        [--confirm <rev>] [--lineage <uuid>] [--force]
+                        [--admin-url <url>] [--format text|json]
+sbproxy config diff [<rev>] [--from <rev>] [--to <rev>] [--admin-url <url>]
+                        [--format text|json]
 sbproxy config authority init --dir <path> [--key-id <id>] [--authority-id <id>]
                               [--force] [--format text|json]
 sbproxy config authority publish -f <payload.yml> [--mode overlay|replace]
@@ -348,6 +358,58 @@ Exit codes:
 When `--against` is omitted, the baseline is empty, so every origin in
 the proposed config surfaces as `added`. The `--running` baseline
 (pulled from a live admin socket) is deferred.
+
+### `aggregate` - compose project-owned origin profiles
+
+Fetches every project repository the runtime document's `origin_sources:`
+block names, composes the `origins:` map from the platform floor and the
+project profiles, and either publishes the result through the config
+authority or writes it to a file. See
+[configuration.md](configuration.md#project-owned-origin-profiles).
+
+```bash
+sbproxy aggregate -f /etc/sbproxy/sb.yml                       # publish
+sbproxy aggregate -f /etc/sbproxy/sb.yml --out composed.yml    # write a file
+sbproxy aggregate -f /etc/sbproxy/sb.yml --out composed.yml --dry-run
+sbproxy aggregate -f /etc/sbproxy/sb.yml --explain checkout.example.com
+sbproxy aggregate -f /etc/sbproxy/sb.yml --watch
+```
+
+`--out` is the offline path: the written document is ordinary config
+that boots and reloads normally, and it carries neither composition
+block, because a composed output is not a source of further composition.
+What gets **published** is narrower than what `--out` writes: the
+`origins:` map plus `origin_defaults`, built up rather than cut down, so
+a node's own `proxy:` block never travels to the fleet.
+The same inputs at the same revisions produce a byte-identical file, so
+a CI diff means something. `--dry-run` prints what would change against
+a file already there and writes nothing.
+
+`--explain <host>` prints which composition layer set each leaf of one
+composed origin, and for the two layers a project authored, the
+repository and the resolved commit. `sbproxy plan --explain-origin
+<host>` prints the same thing from the verb an operator already reaches
+for; it fetches, so it is refused under `--no-fetch`.
+
+`--watch` polls each entry on the configured interval, coalesces a burst
+of movement into one composition, and publishes only when the composed
+document changed. It re-reads the runtime document every cycle, so an
+edit plus a reload reaches the aggregator without a restart. `--polls
+<n>` stops after that many poll cycles, for a cron-shaped invocation.
+`--watch` refuses to combine with `--out`, `--dry-run` or `--explain`
+rather than ignoring them. A proxy that both declares `origin_sources`
+entries and publishes a config authority runs the same loop in process at
+boot, so `--watch` is for a deployment that runs the aggregator
+separately.
+
+Exit codes:
+
+| Code | Meaning |
+|------|---------|
+| 0 | Published, written, or the composition was unchanged and nothing needed publishing. |
+| 1 | CLI / IO error, or a credential that would not resolve. |
+| 2 | `--dry-run` found changes (informational, not an error). |
+| 3 | The composition was refused, or the authority refused the composed document. Nothing was published and nothing was written. |
 
 ### `apply` - validate, then apply to a running proxy
 
@@ -591,6 +653,50 @@ stored document, selected from the same ring by the revision number
 `proxy.config_history.keep` is no longer available. `--format json` on
 `show` prints the admin API's full detail envelope (`entry`, `document`,
 `plan_text`) rather than just the document.
+
+### `config rollback` / `config diff` - move a running proxy back to a stored revision
+
+Same admin-API plumbing as `config history`, and the same requirement:
+`proxy.config_history.enabled` on the node being talked to.
+
+```bash
+# What would change, before anything does. Reads only.
+sbproxy config diff 41
+sbproxy config diff --from 38 --to 41
+
+# Back to whatever the soak last promoted.
+sbproxy config rollback --to last-known-good
+
+# To a named revision, refusing if somebody else moved this node first.
+sbproxy config rollback --to 41 --expected-current 43
+
+# A restart-class or breaking rollback needs the revision typed back.
+sbproxy config rollback --to 41 --confirm 41
+```
+
+`--to` accepts a revision number, a content digest, or the literal
+`last-known-good`, which is the default. The restored document is applied
+through the ordinary reload transaction and soaks like any other candidate,
+history stays append-only (the rollback appends a new entry and marks the
+revision it left as `reverted`), and the node's own config **file** is not
+rewritten, which the text output says in a warning line. Fix the source of
+truth before the next reload trigger re-applies it.
+
+`--expected-current` is optimistic concurrency: the call is refused when
+that is not the revision running, so two operators reaching for rollback
+during one incident do not silently undo each other. Omitting it proceeds.
+
+`config diff` takes the target as a positional or as `--to`, and defaults
+`--from` to what the proxy is running. Two stored revisions need not be
+adjacent. It exits `0` when the two documents are identical and `2` when
+they differ, following `plan`'s convention, so a script can branch on
+whether a rollback is a no-op.
+
+| Exit code | `config rollback` |
+|---|---|
+| 0 | Applied. |
+| 4 | Refused: an unknown revision, a stale `--expected-current`, a lineage break, an unconfirmed restart-class change, or a document that no longer compiles. The refusal body names what is available or both sides of the mismatch. |
+| 7 | The admin API could not be reached. Nothing was applied. |
 
 ### `projections render` - serve-time documents on demand
 
@@ -1238,6 +1344,25 @@ Values that are not positive integers are ignored and the auto-detected value is
 
 In environments without cgroup CPU quotas (bare metal, macOS), the proxy falls back to the number of logical CPUs as reported by the OS.
 
+### Worker stack size
+
+Each Pingora worker polls the whole request path on one stack: the request filter, the module chain, the AI dispatch, the streaming relay, and every future they await are all live frames while a request is in flight. SBproxy gives each worker 8 MiB, which is the same size Linux gives a process's main thread by default. Override it with `SB_WORKER_STACK_BYTES`:
+
+```bash
+SB_WORKER_STACK_BYTES=16777216 sbproxy --config sb.yml
+```
+
+Values that are not positive integers are ignored and the default is used, the same way `SB_WORKER_THREADS` behaves. So is anything below one 4 KiB page: that is a size written in the wrong unit rather than a stack any thread can run on, and it is refused with a warning naming the value rather than by refusing to start, because an environment typo should not stop a proxy.
+
+Raising this costs reserved address space, not memory. A thread stack is an anonymous mapping the kernel commits page by page as it is touched, so resident memory tracks how deep a request actually goes and not how much was reserved. Sixteen workers at 8 MiB reserve 128 MiB of a 64-bit process's 128 TiB address space and resident nothing extra.
+
+Two reasons to raise it:
+
+- The proxy logs `the request path is using most of a worker's stack`. That line is emitted once per process, when a request first passes three quarters of the worker stack, and it carries the bytes used and the stack size. It is a warning rather than an error: nothing has failed yet, but a stack overflow aborts the process without unwinding and leaves no diagnosis, so this is the last chance to act on it.
+- A debug build. Debug frames are several times larger than release frames, so a proxy built with `cargo build` (no `--release`) reaches depths the shipped binary never does.
+
+There is no equivalent config key or CLI flag; this is an environment-only knob for the same reason `SB_WORKER_THREADS` is.
+
 ### Startup sequence
 
 SBproxy initializes subsystems in a fixed order. A config or pipeline
@@ -1269,7 +1394,8 @@ plane, pipeline lifecycle hooks) log and degrade instead of blocking.
 9. **TLS**: initializes TLS state when `https_bind_port`,
    `tls_cert_file`, or an enabled `proxy.acme` block is present.
 10. **Listeners**: creates the Pingora server (worker count from
-    `SB_WORKER_THREADS` or auto-detection), binds the plain HTTP
+    `SB_WORKER_THREADS` or auto-detection, worker stack size from
+    `SB_WORKER_STACK_BYTES` or the 8 MiB default), binds the plain HTTP
     listener on `http_bind_port`, and adds the HTTPS listener (manual
     certs or the ACME dynamic-certificate resolver, with optional
     mTLS). No QUIC port is bound. Config compilation rejects
@@ -2332,7 +2458,7 @@ spec:
 
 ## 13. Environment variables reference
 
-The binary reads fourteen environment variables, most of them fallbacks
+The binary reads fifteen environment variables, most of them fallbacks
 for CLI flags. Variables are applied at process start; changes require a
 restart.
 
@@ -2345,6 +2471,7 @@ restart.
 | `SBPROXY_SHUTDOWN_GRACE_MS` | `--shutdown-grace-ms` | `30000` | SIGINT/SIGTERM drain budget in milliseconds. Wins over `SB_GRACE_TIME`. |
 | `SB_GRACE_TIME` | `--grace-time` | (unset) | Legacy Pingora grace period and shutdown timeout in seconds. Superseded by `SBPROXY_SHUTDOWN_GRACE_MS`. |
 | `SB_WORKER_THREADS` | (none) | (auto) | Override the auto-detected Pingora worker thread count. Positive integers only. |
+| `SB_WORKER_STACK_BYTES` | (none) | `8388608` | Stack in bytes for every Pingora worker, blocking-pool and offload thread. A value below one 4 KiB page, which is a size written in the wrong unit, is ignored with a warning and the default is used. See [worker stack size](#worker-stack-size). |
 | `SB_DISABLE_SB_FLAGS` | `--disable-sb-flags` | `false` | Lock off the per-request `x-sb-flags` surface. Accepts `1`, `true`, `yes`, `on`. |
 | `SB_ADMIN_URL` | `--admin-url` | `http://127.0.0.1:9090` | Admin API base URL for the commands that talk to a running proxy: `apply`, `models ps` / `stop` / `remove`, `cluster status`, and every `config authority` subcommand. |
 | `SB_ADMIN_USERNAME` | `--username` | `admin` | Admin Basic Auth username for the same commands. |
