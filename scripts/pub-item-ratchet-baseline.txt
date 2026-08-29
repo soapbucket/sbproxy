@@ -1232,3 +1232,29 @@ callers and removed the fixed-port test helpers that had been reachable only
 from tests; this branch adds nothing to either bucket beyond the two already
 recorded above. The gap to main's own 1523 is this branch's own items, counted
 here and not there, for the reasons written against them.
+
+2026-08-28 (WOR-2463, the config-authority archive ring): raised to 325 for
+one item, `ConfigAuthority::rollback_to`. It has a production consumer,
+`dispatch_rollback` in `crates/sbproxy-core/src/config_authority.rs`, which
+is the admin route `POST /admin/config-authority/rollback` and the only way
+an operator reaches it; that call is in the item's own defining file, which
+is the case this count is defined not to see.
+
+Narrowing it to `pub(crate)` would compile, and it is still wrong. The item
+is the sibling of `ConfigAuthority::rollback`, which is `pub` and is reached
+the same way, and the two differ only in whether the caller names a revision.
+An API where "undo the last publish" is public and "go back to Tuesday" is
+crate-private would be a shape nobody chose. The alternative, routing the
+four integration tests that exercise it through `dispatch` instead, would
+push them all onto the process-global authority slot and serialise a file
+that runs in parallel today, which trades a real property for a number.
+
+Unreferenced rises to 1526 in the same change and for the same one item:
+`rollback_to` is named outside its own file only by the integration tests, so
+it lands in both buckets. The three other constants this branch introduced
+(`MAX_ARCHIVE_BYTES`, `MAX_FALLBACK_REASON_CHARS`,
+`FALLBACK_CONDITION_TYPE`) were resolved rather than counted: the first is now
+named by the `archive_keep` validation error in `sbproxy-config/src/types.rs`,
+the second narrowed to a private const with its bound restated in prose, and
+the third is named by the suspension warn log in the operator's `main.rs`,
+which is the line an operator greps before reading the condition.

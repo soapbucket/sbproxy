@@ -1228,6 +1228,7 @@ fn require_config_push_allowed(
         namespace = %ns,
         pod = %pinned.pod,
         revision = pinned.report.revision,
+        condition = reconcile::FALLBACK_CONDITION_TYPE,
         "a pod is serving a configuration its boot fallback restored; not pushing config to \
          this SBProxy until the pin is cleared",
     );

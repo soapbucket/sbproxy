@@ -144,8 +144,10 @@ const MAX_STORED_BUNDLE_BYTES: u64 =
 /// Worst-case bytes the archive ring can occupy at [`MAX_ARCHIVE_KEEP`].
 ///
 /// Written down rather than left to be discovered on a full disk. One
-/// archived file is bounded by [`MAX_STORED_BUNDLE_BYTES`], which is
-/// twice `MAX_CONFIG_YAML_BYTES` (4 MiB) plus 64 KiB of envelope, so
+/// archived file is bounded by the same envelope limit a subscriber
+/// applies on the wire, which is twice
+/// [`MAX_CONFIG_YAML_BYTES`](crate::config_bundle::MAX_CONFIG_YAML_BYTES)
+/// (4 MiB) plus 64 KiB of envelope, so
 /// 8.06 MiB. At the 200-entry ceiling that is 1.57 GiB, and at the
 /// [`DEFAULT_ARCHIVE_KEEP`] of 20 it is 161 MiB. Those are ceilings for
 /// a configuration document at the 4 MiB wire limit; a real `sb.yml`

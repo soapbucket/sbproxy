@@ -98,7 +98,7 @@ fn pinned() -> &'static Mutex<Option<PinnedRevision>> {
 /// reaches the admin surface keeps a pathological error (a parser that
 /// echoes a large document back) from turning a status route into a way
 /// to read the node's configuration a kilobyte at a time.
-pub const MAX_FALLBACK_REASON_CHARS: usize = 512;
+const MAX_FALLBACK_REASON_CHARS: usize = 512;
 
 /// The ring entry a fallback boot is serving.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,8 +107,8 @@ pub struct PinnedRevision {
     pub revision: u64,
     /// Its content digest.
     pub digest: String,
-    /// Why the configured document did not boot, bounded to
-    /// [`MAX_FALLBACK_REASON_CHARS`].
+    /// Why the configured document did not boot, bounded to 512
+    /// characters.
     ///
     /// `None` on a pin an operator or a test set directly rather than
     /// one a boot walk produced. A controller that owns this node's
@@ -120,7 +120,7 @@ pub struct PinnedRevision {
 
 impl PinnedRevision {
     /// A pin carrying the failure that caused the fallback, truncated to
-    /// [`MAX_FALLBACK_REASON_CHARS`] characters on a character boundary.
+    /// 512 characters on a character boundary.
     #[must_use]
     pub fn with_reason(revision: u64, digest: String, reason: &str) -> Self {
         let trimmed = reason.trim();

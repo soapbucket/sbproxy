@@ -4430,7 +4430,7 @@ pub enum ConfigAuthorityConfigError {
         found: u64,
     },
     /// `archive_keep` was above the accepted maximum.
-    #[error("proxy.config_authority.publish.archive_keep is {found}; it must be at most {max} (the archive is bounded because every entry is a whole signed configuration on the authority's disk, and at the maximum a document at the wire limit already reaches 1.57 GiB)", max = crate::config_authority::MAX_ARCHIVE_KEEP)]
+    #[error("proxy.config_authority.publish.archive_keep is {found}; it must be at most {max} (the archive is bounded because every entry is a whole signed configuration on the authority's disk, and at {max} a document at the wire limit already reaches {ceiling} bytes)", max = crate::config_authority::MAX_ARCHIVE_KEEP, ceiling = crate::config_authority::MAX_ARCHIVE_BYTES)]
     PublishArchiveKeep {
         /// Configured value.
         found: usize,

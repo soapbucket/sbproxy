@@ -15419,6 +15419,7 @@ hooks:
                 "{:?}",
                 AuthorityRollbackArgs {
                     admin: admin.clone(),
+                    to_revision: Some(41),
                     format: OutputFormat::Text,
                 }
             ),
