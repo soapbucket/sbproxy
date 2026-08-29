@@ -300,6 +300,14 @@ rederive_ratchet "stable metrics with no panel" scripts/metric-visibility-baseli
 rederive_ratchet "raw-url log sites" scripts/log-url-ratchet-baseline.count logurl
 rederive_ratchet "raw request-error log sites" scripts/request-error-ratchet-baseline.count reqerr
 
+# The stack budget has no scanner to re-derive it from: it is a decision
+# about how much worker stack the request path may use, not a count of
+# source sites. On a merge the correct number is the LOWER of the two
+# sides. Never their maximum, and never a fresh guess: a budget that
+# rises to accommodate whichever branch spent more is not a budget.
+printf '  %-46s %s\n' "AI dispatch stack budget (not re-derivable)" \
+  "$(cat scripts/stack-budget-baseline.count 2>/dev/null || echo missing) bytes; keep the lower side"
+
 # --- Report ------------------------------------------------------------
 printf '\n------------------------------------------------------------------------\n'
 if [ "${#MOVED[@]}" -eq 0 ] && [ "${#FAILED[@]}" -eq 0 ] && [ "${#NEEDS_BUILD[@]}" -eq 0 ]; then
