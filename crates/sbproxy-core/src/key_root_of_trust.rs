@@ -26,8 +26,8 @@
 //! path, so unwrapped data keys are cached for
 //! `root_of_trust.unwrap_cache_ttl_secs`. That value is the deployment's
 //! revocation-latency bound: however long the cache holds, that is how long
-//! a revoked grant keeps working. [`CustomerManagedRoot::revocation_window`]
-//! reports it, `GET /admin/crypto/root-of-trust` prints it, and
+//! a revoked grant keeps working. `RootOfTrust::revocation_window` reports
+//! it, `GET /admin/crypto/root-of-trust` prints it, and
 //! `docs/key-management.md` states it. Nothing here rounds it down or
 //! describes it as "immediate".
 //!
