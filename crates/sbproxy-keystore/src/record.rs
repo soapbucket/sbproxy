@@ -613,8 +613,17 @@ pub struct CredentialRecord {
     /// will not resolve or is refused falls back to this one instead of
     /// failing the request.
     ///
-    /// Cleared when [`Self::prev_material_expires_at`] passes, so the old
-    /// secret does not sit in the store indefinitely.
+    /// Cleared by [`Self::retire_expired_prev_material`] once
+    /// [`Self::prev_material_expires_at`] passes, so the old secret does
+    /// not sit in the store indefinitely.
+    ///
+    /// Retirement is read-driven, not swept: `GET /admin/credentials`
+    /// retires up to a bounded number of lapsed overlaps per listing, and
+    /// a rotation retires this record's own before installing a new one.
+    /// A deployment that never lists never retires. What is *not*
+    /// read-driven is the refusal to serve it, which
+    /// [`Self::usable_prev_material`] enforces from the record itself on
+    /// every resolution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prev_material: Option<CredentialMaterial>,
     /// When [`Self::prev_material`] stops being usable.
@@ -652,13 +661,6 @@ impl CredentialRecord {
         self.status == RecordStatus::Active
     }
 
-    /// The previous material, if a rotation left one and its window is
-    /// still open at `now` (WOR-2567).
-    ///
-    /// A method rather than two field reads at the call site because the
-    /// window has to be checked everywhere the material is: a caller that
-    /// reads `prev_material` and forgets `prev_material_expires_at` is a
-    /// caller that presents a retired provider key forever.
     /// Drop the retired material once its overlap window has closed,
     /// reporting whether anything was dropped (WOR-2567).
     ///

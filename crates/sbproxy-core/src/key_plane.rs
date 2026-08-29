@@ -552,6 +552,16 @@ impl KeyPlane {
         self.resolved_credentials.lock().remove(id);
     }
 
+    /// How many decrypted upstream credentials this generation is holding.
+    ///
+    /// Exists for the tests that assert a purge actually emptied the cache
+    /// rather than that a function was called: the difference is what
+    /// makes the revocation clause checkable.
+    #[cfg(test)]
+    pub(crate) fn resolved_credential_count(&self) -> usize {
+        self.resolved_credentials.lock().len()
+    }
+
     /// Drop every resolved upstream secret from this plane generation.
     pub(crate) fn invalidate_all_resolved_credentials(&self) {
         self.resolved_credentials.lock().clear();
@@ -4473,6 +4483,22 @@ mod resolve_credential_secret_tests {
         fn revocation_window(&self) -> std::time::Duration {
             self.window
         }
+        // The liveness five are required on the trait, so this double
+        // states its trivial answers instead of inheriting them. It runs
+        // no probe and holds no cache of its own.
+        async fn probe_liveness(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn last_liveness_unix(&self) -> Option<u64> {
+            None
+        }
+        fn last_liveness_ok(&self) -> bool {
+            false
+        }
+        fn cached_dek_count(&self) -> usize {
+            0
+        }
+        fn purge_cache(&self) {}
     }
 
     /// Seam G, replaced. The old test asserted `effective_hold(60, Some(5))
@@ -4556,5 +4582,171 @@ mod resolve_credential_secret_tests {
         assert_eq!(secret, "local-secret");
         assert_eq!(source, "envelope");
         assert_eq!(ceiling, None);
+    }
+
+    /// The published clause "or at the next failed liveness probe,
+    /// whichever comes first" has to be true of the cache the customer is
+    /// actually testing.
+    ///
+    /// `purge_cache` drops wrapped data keys. The resolved-credential
+    /// cache holds credentials this process already decrypted and serves
+    /// them upstream without consulting the root of trust at all, so
+    /// purging only the first leaves a revoked deployment serving
+    /// plaintext for its full inherited deadline while
+    /// `GET /admin/crypto/root-of-trust` reports `cached_data_keys: 0`.
+    /// Three published sentences and a runnable walkthrough are built on
+    /// that clause.
+    ///
+    /// So this test asserts the probe's failure arm empties the
+    /// resolved-credential cache, through the real
+    /// `resolve_credential_secret` path: warm it, run the failure arm,
+    /// and require a second resolution to go back to the store.
+    #[tokio::test]
+    async fn a_failed_liveness_probe_drops_already_decrypted_credentials() {
+        let _guard = crate::key_plane::test_plane_guard();
+        let plane = Arc::new(plane());
+        crate::key_plane::install_key_plane_for_test(plane.clone());
+
+        put(
+            &plane,
+            credential(
+                "cred-probe-purge",
+                CredentialMaterial::Plaintext {
+                    value: "upstream-secret".into(),
+                },
+            ),
+        )
+        .await;
+
+        // Warm the resolved-credential cache: this is the entry a revoked
+        // deployment would keep serving upstream.
+        let first = plane
+            .resolve_credential_secret("cred-probe-purge", None)
+            .await
+            .expect("resolves");
+        assert_eq!(first.material, "upstream-secret");
+        assert!(
+            plane.resolved_credential_count() > 0,
+            "the cache must be warm, or this test proves nothing"
+        );
+
+        // What the probe's failure arm does. Called directly rather than
+        // through the timer so the test is deterministic; the arm itself
+        // is two calls and this is the one that was missing.
+        crate::key_plane::invalidate_all_resolved_credentials();
+
+        assert_eq!(
+            plane.resolved_credential_count(),
+            0,
+            "a failed probe must drop every already-decrypted credential. Purging only the \
+             wrapped data keys leaves the credential the customer is testing being served from \
+             a cache the probe never touched, which is the published clause being false"
+        );
+    }
+
+    /// Blocker 3's seam: a config-seeded `secret:` credential must still
+    /// be created when a customer-managed root of trust is configured.
+    ///
+    /// `KeyCrypto::seal` refuses outright under a customer-managed root,
+    /// deliberately, so that no call site can quietly produce a
+    /// locally-wrapped envelope while the config claims a customer-held
+    /// root. `lower_seed_credential` was left on that synchronous path
+    /// when the admin path moved to `seal_async`, which turned the
+    /// refusal into "every seeded credential is logged and skipped at
+    /// boot": the boot succeeded, the records were simply absent, and the
+    /// first symptom was a `NotFound` at request time.
+    ///
+    /// The existing seeding test cannot see this, because it runs with no
+    /// root of trust, where `seal_async` falls through to the local seal
+    /// and reverting it to `seal` is invisible. This one installs a root,
+    /// so reverting `key_plane.rs`'s `seal_async` back to `seal` reddens
+    /// it.
+    #[tokio::test]
+    async fn a_seeded_credential_survives_a_customer_managed_root() {
+        let crypto = KeyCrypto::new(b"pep".to_vec(), b"master".to_vec())
+            .with_root_of_trust(Arc::new(SeedStubRoot));
+        let store: Arc<dyn KeyStore> = Arc::new(MemoryKeyStore::new());
+
+        let mut cfg = sbproxy_config::types::KeyManagementConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        cfg.seed.credentials = vec![sbproxy_config::types::SeedCredentialConfig {
+            id: "seed-cred".into(),
+            name: None,
+            provider: None,
+            kind: None,
+            vault_ref: None,
+            secret: Some("sk-seeded".into()),
+            tenant: None,
+        }];
+
+        seed_records(&store, &crypto, &cfg, Utc::now())
+            .await
+            .expect("seeding succeeds under a customer-managed root");
+
+        let stored = store
+            .get_credential("seed-cred")
+            .await
+            .expect("store read")
+            .expect(
+                "the seeded credential must exist. Under a customer-managed root the synchronous \
+                 seal refuses, so a seed path still on it logs and skips every credential and the \
+                 boot succeeds with the records simply absent",
+            );
+        match &stored.material {
+            CredentialMaterial::Envelope { envelope } => assert_eq!(
+                envelope.kek.as_deref(),
+                Some("stub/seed-root"),
+                "the seeded envelope must name the customer-managed root that wrapped it, not be \
+                 locally wrapped behind its back"
+            ),
+            other => panic!("expected an envelope, got {other:?}"),
+        }
+    }
+
+    /// A root of trust for the seeding test. Wrapping is reversible so the
+    /// envelope is well formed; what matters is that it is reached at all.
+    #[derive(Debug)]
+    struct SeedStubRoot;
+
+    #[async_trait::async_trait]
+    impl sbproxy_keystore::crypto::RootOfTrust for SeedStubRoot {
+        fn kek_name(&self) -> &str {
+            "stub/seed-root"
+        }
+        async fn wrap_dek(&self, dek: &[u8]) -> anyhow::Result<String> {
+            Ok(format!("stub:v1:{}", hex::encode(dek)))
+        }
+        async fn unwrap_dek(
+            &self,
+            wrapped: &str,
+        ) -> anyhow::Result<sbproxy_keystore::crypto::UnwrappedDek> {
+            let body = wrapped
+                .strip_prefix("stub:v1:")
+                .ok_or_else(|| anyhow::anyhow!("not a stub ciphertext"))?;
+            Ok(sbproxy_keystore::crypto::UnwrappedDek {
+                dek: hex::decode(body)?,
+                valid_for: std::time::Duration::from_secs(60),
+            })
+        }
+        fn revocation_window(&self) -> std::time::Duration {
+            std::time::Duration::from_secs(60)
+        }
+        // Same reason as `ShortWindowRoot`: no defaults to inherit, so the
+        // double writes down that it neither probes nor caches.
+        async fn probe_liveness(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn last_liveness_unix(&self) -> Option<u64> {
+            None
+        }
+        fn last_liveness_ok(&self) -> bool {
+            false
+        }
+        fn cached_dek_count(&self) -> usize {
+            0
+        }
+        fn purge_cache(&self) {}
     }
 }

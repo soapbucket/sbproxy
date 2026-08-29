@@ -361,7 +361,7 @@ fn derive_wrap_key(master: &[u8]) -> [u8; AES256_KEY_LEN] {
 /// own entry to `hold_for`, measured from now, so the deployment's stated
 /// revocation window is the whole of the exposure rather than the first of
 /// two consecutive ones.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OpenedEnvelope {
     /// The decrypted credential material.
     pub plaintext: Vec<u8>,
@@ -383,12 +383,45 @@ pub struct OpenedEnvelope {
 /// to W is what makes the composition invisible. Carrying the remaining time
 /// instead makes the published revocation bound true by construction, with no
 /// second call site to keep in step.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UnwrappedDek {
     /// The plaintext data key.
     pub dek: Vec<u8>,
     /// How much of the revocation window is left for this data key.
     pub valid_for: std::time::Duration,
+}
+
+/// Redacting `Debug`. Unlike the config types in this workspace that carry
+/// a secret among several readable fields, these two hold *only* a secret:
+/// there is no useful redacted rendering of the payload, so the length is
+/// all that crosses. The `RootOfTrust` trait carries a `std::fmt::Debug`
+/// bound, which makes deriving `Debug` on things in this neighborhood the
+/// habit, and a single `tracing::debug!(?opened)` on the credential path
+/// would turn that habit into a decrypted upstream credential in a log
+/// line. `CredentialMaterial` in this crate already hand-writes the same
+/// treatment for the same reason.
+impl std::fmt::Debug for OpenedEnvelope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenedEnvelope")
+            .field(
+                "plaintext",
+                &format_args!("[REDACTED] ({} bytes)", self.plaintext.len()),
+            )
+            .field("hold_for", &self.hold_for)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for UnwrappedDek {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnwrappedDek")
+            .field(
+                "dek",
+                &format_args!("[REDACTED] ({} bytes)", self.dek.len()),
+            )
+            .field("valid_for", &self.valid_for)
+            .finish()
+    }
 }
 
 /// The external key service that wraps and unwraps envelope data keys when
@@ -450,38 +483,40 @@ pub trait RootOfTrust: Send + Sync + std::fmt::Debug {
     /// On the trait rather than on one implementation because the admin
     /// surface and the background probe both hold a `dyn RootOfTrust` and
     /// neither has any business knowing which concrete root is installed.
-    /// The default answers "no liveness story", which is the honest
-    /// answer for a test double.
+    ///
+    /// Required, with no default, and that is deliberate. This and the four
+    /// methods below shipped once as defaults answering `Ok(())`, `None`,
+    /// `false`, `0`, and a no-op. Every runtime caller holds a
+    /// `dyn RootOfTrust`, so a root that forgot to forward them inherited
+    /// those answers silently: the background probe reported a healthy
+    /// service it had never dialed, and `GET /admin/crypto/root-of-trust`
+    /// reported a warm cache as empty while an operator waited on a
+    /// revocation. A default that reads as an honest "no liveness story"
+    /// on paper reads as a healthy root on the admin surface. A test
+    /// double is entitled to trivial answers here, but it has to write
+    /// them down, so the compiler asks rather than the reviewer.
     ///
     /// # Errors
     ///
     /// Whatever the external service reported. A permission error is the
     /// revoked-grant case.
-    async fn probe_liveness(&self) -> Result<()> {
-        Ok(())
-    }
+    async fn probe_liveness(&self) -> Result<()>;
 
     /// Unix seconds of the last *successful* liveness confirmation, or
     /// `None` when none has succeeded in this process.
-    fn last_liveness_unix(&self) -> Option<u64> {
-        None
-    }
+    fn last_liveness_unix(&self) -> Option<u64>;
 
     /// Whether the most recent liveness check succeeded.
-    fn last_liveness_ok(&self) -> bool {
-        false
-    }
+    fn last_liveness_ok(&self) -> bool;
 
     /// How many unwrapped data keys are currently cached and still inside
     /// [`Self::revocation_window`]. This is how much decrypt capability a
     /// revocation still has to age out.
-    fn cached_dek_count(&self) -> usize {
-        0
-    }
+    fn cached_dek_count(&self) -> usize;
 
     /// Drop every cached data key, so a revocation takes effect now rather
     /// than at the end of each entry's own window.
-    fn purge_cache(&self) {}
+    fn purge_cache(&self);
 }
 
 /// A consolidated crypto handle holding the two server secrets the key plane
@@ -984,6 +1019,26 @@ mod tests {
         fn revocation_window(&self) -> std::time::Duration {
             std::time::Duration::from_secs(42)
         }
+        // Written out rather than inherited: the trait has no defaults for
+        // the liveness five, precisely so a root cannot answer "healthy,
+        // nothing cached" by accident. This double keeps no cache, and its
+        // liveness is its grant, so it says both.
+        async fn probe_liveness(&self) -> Result<()> {
+            if self.is_revoked() {
+                return Err(anyhow!("grant revoked"));
+            }
+            Ok(())
+        }
+        fn last_liveness_unix(&self) -> Option<u64> {
+            None
+        }
+        fn last_liveness_ok(&self) -> bool {
+            !self.is_revoked()
+        }
+        fn cached_dek_count(&self) -> usize {
+            0
+        }
+        fn purge_cache(&self) {}
     }
 
     /// The seam: with a customer-managed root configured, the key that
@@ -1096,5 +1151,56 @@ mod tests {
                 .expect_err("a mismatched root must be refused")
         );
         assert!(err.contains("stub/root-c"), "{err}");
+    }
+
+    /// Registry sentinel for `OpenedEnvelope` and `UnwrappedDek`
+    /// (`scripts/secret-debug-registry.txt`).
+    ///
+    /// These two hold nothing but key material: the decrypted upstream
+    /// credential and the plaintext AES-256 data key. There is no useful
+    /// redacted rendering of the payload, so the length is all that may
+    /// cross, and the length is what tells an operator the difference
+    /// between an empty read and a real one.
+    #[test]
+    fn debug_never_renders_opened_or_unwrapped_key_material() {
+        let opened = OpenedEnvelope {
+            plaintext: b"sk-live-must-not-appear".to_vec(),
+            hold_for: Some(std::time::Duration::from_secs(7)),
+        };
+        let rendered = format!("{opened:?}");
+        assert!(
+            !rendered.contains("sk-live-must-not-appear"),
+            "the decrypted credential reached Debug: {rendered}"
+        );
+        assert!(
+            !rendered.contains("115"),
+            "the payload must not render as a byte array either: {rendered}"
+        );
+        assert!(
+            rendered.contains("[REDACTED]") && rendered.contains("23 bytes"),
+            "the redaction must still say how much was there: {rendered}"
+        );
+        assert!(
+            rendered.contains("OpenedEnvelope") && rendered.contains("hold_for"),
+            "the identifier and the non-secret field survive: {rendered}"
+        );
+
+        let unwrapped = UnwrappedDek {
+            dek: b"0123456789abcdef0123456789abcdef".to_vec(),
+            valid_for: std::time::Duration::from_secs(11),
+        };
+        let rendered = format!("{unwrapped:?}");
+        assert!(
+            !rendered.contains("0123456789abcdef"),
+            "the plaintext data key reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("[REDACTED]") && rendered.contains("32 bytes"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("UnwrappedDek") && rendered.contains("valid_for"),
+            "{rendered}"
+        );
     }
 }

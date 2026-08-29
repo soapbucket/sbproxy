@@ -220,6 +220,8 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_boilerplate_stripped_bytes_total` | Counter | `stable` | `beta` | `hostname` | Bytes removed by the boilerplate transform, by hostname. |
 | `sbproxy_bot_auth_directory_fetch_failures_total` | Counter | `stable` | `beta` | `url` | Bot-auth hosted key-directory fetches that failed (the verifier serves stale or fails per nonce_policy). |
 | `sbproxy_bot_auth_nonce_replay_total` | Counter | `stable` | `beta` | `policy` | Web Bot Auth signatures rejected (or logged) because the nonce was already observed. |
+| `sbproxy_break_glass_grants_total` | Counter | `stable` | `alpha` | `event` | Break-glass grant transitions, by event (requested, approved, activated, denied, used, expired, reviewed). |
+| `sbproxy_break_glass_open` | Gauge | `stable` | `alpha` | `state` | Break-glass grants currently open, by state (pending_approval, active, awaiting_review). |
 | `sbproxy_budget_share_fail_open_total` | Counter | `stable` | `beta` | `op` | Shared budget store operations that failed and fell open to per-instance enforcement, by operation: `read`, `write`, or `mirror_dropped` (a streamed settlement handed its mirror write to a detached task that never ran, which a shutting-down runtime does). |
 | `sbproxy_budget_share_unavailable` | Gauge | `stable` | `beta` | none | 1 while shared budget enforcement is degraded to per-instance tracking, 0 when the shared store answered. |
 | `sbproxy_bytes_total` | Counter | `stable` | `stable` | `origin`, `direction` | Bytes transferred. |
@@ -259,8 +261,6 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_config_revision_info` | Gauge | `stable` | `beta` | `revision`, `digest`, `provenance` | Current entry in the config revision ring; always 1, the revision/digest/provenance are the labels. |
 | `sbproxy_config_source_fetch_total` | Counter | `stable` | `beta` | `kind`, `result` | Config source resolutions, by source kind and result. |
 | `sbproxy_config_source_revision_info` | Gauge | `stable` | `beta` | `sha` | Commit the config source resolved to; always 1, the commit is the label. |
-| `sbproxy_break_glass_grants_total` | Counter | `stable` | `alpha` | `event` | Break-glass grant transitions, by event (requested, approved, activated, denied, used, expired, reviewed). |
-| `sbproxy_break_glass_open` | Gauge | `stable` | `alpha` | `state` | Break-glass grants currently open, by state (pending_approval, active, awaiting_review). |
 | `sbproxy_cors_refusals_total` | Counter | `stable` | `beta` | `reason` | Responses the CORS middleware refused to add headers to, by reason. |
 | `sbproxy_credential_read_audit_records_total` | Counter | `stable` | `alpha` | `outcome` | Read-audit detail records for credential resolution, by outcome (emitted, suppressed, failed). |
 | `sbproxy_credential_read_total` | Counter | `stable` | `alpha` | `outcome` | Credential resolutions counted for the read audit, by outcome (ok, refused, error). Unconditional; the chained detail record is rate limited. |
@@ -425,8 +425,8 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_request_duration_seconds` | Histogram | `stable` | `stable` | `hostname` | Request latency. |
 | `sbproxy_requests_total` | Counter | `stable` | `stable` | `hostname`, `method`, `status`, `agent_id`, `agent_class`, `agent_vendor`, `payment_rail`, `content_shape` | Total HTTP requests. |
 | `sbproxy_response_body_bytes` | Histogram | `stable` | `beta` | `direction` | Response body size, by compression direction. |
-| `sbproxy_root_of_trust_operations_total` | Counter | `stable` | `alpha` | `operation`, `outcome` | Customer-managed root-of-trust operations, by operation (wrap, unwrap, unwrap_cached) and outcome. |
 | `sbproxy_root_of_trust_liveness` | Gauge | `stable` | `alpha` | none | 1 when the last customer-managed root-of-trust probe reached and was authorized by the external key service, 0 otherwise. |
+| `sbproxy_root_of_trust_operations_total` | Counter | `stable` | `alpha` | `operation`, `outcome` | Customer-managed root-of-trust operations, by operation (wrap, unwrap, unwrap_cached) and outcome. |
 | `sbproxy_script_compile_total` | Counter | `stable` | `beta` | `engine`, `result` | Script-engine compile attempts, by engine and outcome. |
 | `sbproxy_script_duration_seconds` | Histogram | `stable` | `beta` | `engine` | Script-engine invocation duration, by engine. |
 | `sbproxy_script_invocations_total` | Counter | `stable` | `beta` | `engine`, `result` | Script-engine invocations, by engine and outcome. |

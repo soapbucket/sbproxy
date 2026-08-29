@@ -136,6 +136,18 @@ pub(crate) struct Grant {
     pub reviewed_by: Option<String>,
     /// When the post-access review was recorded.
     pub reviewed_at: Option<DateTime<Utc>>,
+    /// The reviewer's sign-off note.
+    ///
+    /// A field rather than only a line in the audit context string,
+    /// because that string is capped at 256 bytes and shares its budget
+    /// with `scope`, which is bounded two orders of magnitude higher. A
+    /// grant with a large scope silently truncated `approvals=`,
+    /// `ttl_secs=` and the note out of the record, which is to say it
+    /// dropped the sign-off on exactly the grants most likely to want
+    /// one. The note now rides the structured diff, where the
+    /// justification already lives, and the context string carries only
+    /// bounded counters.
+    pub reviewed_note: Option<String>,
     /// Whether this grant's time-driven terminal transition has already
     /// been counted on `sbproxy_break_glass_grants_total`.
     ///
@@ -238,6 +250,7 @@ impl Grant {
             "actions_taken": self.actions_taken,
             "reviewed_by": self.reviewed_by,
             "reviewed_at": self.reviewed_at,
+            "reviewed_note": self.reviewed_note,
             "review_overdue": self.review_overdue(now, cfg.review_window_secs),
         })
     }
@@ -340,7 +353,8 @@ impl std::fmt::Display for BreakGlassError {
 /// authenticated admin can turn.
 const MAX_TRACKED_GRANTS: usize = 1024;
 
-/// How many scope entries one grant records, and how long each may be.
+/// How many scope entries one grant records. Each is separately capped at
+/// 256 bytes where it is truncated.
 const MAX_SCOPE_ENTRIES: usize = 64;
 
 /// Process-wide break-glass state.
@@ -436,6 +450,7 @@ pub(crate) fn request(
         actions_taken: 0,
         reviewed_by: None,
         reviewed_at: None,
+        reviewed_note: None,
         terminal_counted: false,
     };
     {
@@ -531,6 +546,15 @@ pub(crate) fn approve(id: &str, approver: &str) -> Result<Grant, BreakGlassError
 /// An unknown id, or a grant that never reached the review queue.
 pub(crate) fn review(id: &str, reviewer: &str, note: &str) -> Result<Grant, BreakGlassError> {
     let cfg = config().ok_or(BreakGlassError::Disabled)?;
+    // The same kill-switch guard `request`, `approve`, and `tag_action`
+    // carry. Symmetry rather than behavior: an operator reading whether
+    // the switch is complete should not have to notice that one of four
+    // routes stays live. Grants do not survive a reload that disables the
+    // block anyway, because the registry is process-local and `config()`
+    // reads the installed plane.
+    if !cfg.enabled {
+        return Err(BreakGlassError::Disabled);
+    }
     if reviewer.trim().is_empty() {
         return Err(BreakGlassError::NoActor);
     }
@@ -559,6 +583,8 @@ pub(crate) fn review(id: &str, reviewer: &str, note: &str) -> Result<Grant, Brea
     }
     grant.reviewed_by = Some(reviewer.to_string());
     grant.reviewed_at = Some(now);
+    grant.reviewed_note =
+        (!note.trim().is_empty()).then(|| sbproxy_util::truncate_utf8(note, 1024).to_owned());
     let snapshot = grant.clone();
     drop(grants);
     sbproxy_observe::metrics::record_break_glass("reviewed");
@@ -669,28 +695,38 @@ fn audit(grant: &Grant, op: &str, outcome: &str) {
 }
 
 fn audit_with_note(grant: &Grant, op: &str, outcome: &str, note: &str) {
+    // Bounded counters only. `with_context` truncates the whole string to
+    // 256 bytes, and `scope` is bounded two orders of magnitude higher, so
+    // anything variable-length in here evicts whatever follows it. The
+    // scope, the justification, and the reviewer's note all ride the
+    // structured diff below, which is not competing for that budget.
     let mut entry = sbproxy_observe::KeyAuditEntry::new(op, "break_glass", grant.id.clone())
         .with_actor(grant.requested_by.clone())
         .with_outcome(outcome)
         .with_context(format!(
-            "scope={} approvals={} ttl_secs={}{}",
-            grant.scope.join(","),
+            "scope_entries={} approvals={} ttl_secs={} actions={}",
+            grant.scope.len(),
             grant.approvals.len(),
             grant.ttl_secs,
-            if note.is_empty() {
-                String::new()
-            } else {
-                format!(" note={note}")
-            }
+            grant.actions_taken,
         ));
-    entry = entry.with_diff(
-        None,
-        Some(json!({
-            "justification": grant.justification,
-            "approvals": grant.approvals,
-            "actions_taken": grant.actions_taken,
-        })),
-    );
+    let mut after = json!({
+        "justification": grant.justification,
+        "scope": grant.scope,
+        "approvals": grant.approvals,
+        "actions_taken": grant.actions_taken,
+    });
+    // The sign-off is the artifact the review exists to produce, so it
+    // goes where nothing can crowd it out.
+    if let Some(recorded) = grant.reviewed_note.as_ref().filter(|n| !n.is_empty()) {
+        after["review_note"] = json!(recorded);
+    } else if !note.trim().is_empty() {
+        after["review_note"] = json!(sbproxy_util::truncate_utf8(note, 1024));
+    }
+    if let Some(reviewer) = &grant.reviewed_by {
+        after["reviewed_by"] = json!(reviewer);
+    }
+    entry = entry.with_diff(None, Some(after));
     entry.emit();
 }
 
@@ -718,6 +754,7 @@ mod tests {
             actions_taken: 0,
             reviewed_by: None,
             reviewed_at: None,
+            reviewed_note: None,
             terminal_counted: false,
         }
     }

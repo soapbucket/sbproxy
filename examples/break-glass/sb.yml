@@ -85,8 +85,10 @@ proxy:
       # How long after expiry an unreviewed grant is merely open rather
       # than overdue.
       review_window_secs: 86400
-    # Every action under a grant is tagged in this chain with the grant id,
-    # so a reviewer pulls the whole session by one key.
+    # Credential-read auditing. Independent of break-glass grant tagging,
+    # which happens unconditionally in the admin audit seam and needs no
+    # opt-in; what this block turns on is the chained detail record for
+    # credential *resolutions*.
     read_audit:
       enabled: true
       detail_window_secs: 300
@@ -101,6 +103,10 @@ proxy:
     key_id: break-glass-demo-2026
     ed25519_seed_hex: "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
 
+# Every key or credential mutation made while a grant is active carries
+# break_glass_grant=<id> in its context field. That tagging is
+# unconditional; this block is what makes it durable, so a reviewer can pull
+# the whole session by one key after the fact.
 audit:
   sink: chain
   path: /tmp/sbproxy-break-glass-security.chain

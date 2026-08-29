@@ -286,10 +286,13 @@ impl TransitFailure {
     fn detail(self) -> &'static str {
         match self {
             Self::Unauthorized => {
-                "the token is no longer authorized for this key. If the customer revoked                  sbproxy's grant, this is the expected outcome and credential decryption stops                  once the unwrap cache lapses"
+                "the token is no longer authorized for this key. If the customer revoked \
+                 sbproxy's grant, this is the expected outcome and credential decryption stops \
+                 once the unwrap cache lapses"
             }
             Self::NotFound => {
-                "the mount or key does not exist; check key_management.crypto.root_of_trust.mount                  and .key_name"
+                "the mount or key does not exist; check \
+                 key_management.crypto.root_of_trust.mount and .key_name"
             }
             Self::Status => "the key service refused the call",
             Self::Unreachable => "the key service could not be reached",
@@ -371,6 +374,125 @@ mod tests {
         assert_eq!(
             client.url("encrypt"),
             "https://vault.example:8200/v1/transit/encrypt/sbproxy-root"
+        );
+    }
+
+    /// Registry sentinel for `TransitConfig` and `TransitClient`
+    /// (`scripts/secret-debug-registry.txt`).
+    ///
+    /// The token is a live credential. The address is operator-set and
+    /// never parsed, so it may carry userinfo, which is the same reason
+    /// it is kept out of `transit_error`.
+    #[test]
+    fn debug_never_renders_the_transit_token_or_address() {
+        let config = TransitConfig {
+            address: "https://sbproxy:hvs.MUSTNOTAPPEAR@vault.internal:8200".to_string(),
+            mount: "transit".to_string(),
+            key_name: "sbproxy-root".to_string(),
+            token: "hvs.TOKENMUSTNOTAPPEAR".to_string(),
+            namespace: None,
+        };
+        for rendered in [
+            format!("{config:?}"),
+            format!("{:?}", TransitClient::new(config.clone()).expect("valid")),
+        ] {
+            assert!(
+                !rendered.contains("hvs.TOKENMUSTNOTAPPEAR"),
+                "the token reached Debug: {rendered}"
+            );
+            assert!(
+                !rendered.contains("hvs.MUSTNOTAPPEAR") && !rendered.contains("vault.internal"),
+                "the address, which may carry userinfo, reached Debug: {rendered}"
+            );
+            assert!(
+                rendered.contains("transit") && rendered.contains("sbproxy-root"),
+                "the mount and key name are operator-chosen non-secrets and must survive, or a \
+                 misconfiguration is undiagnosable: {rendered}"
+            );
+        }
+    }
+
+    /// The address never reaches an error, whatever `ureq` says.
+    ///
+    /// Shaped after `config_soak.rs`'s
+    /// `the_probe_failure_detail_is_built_from_a_redacted_url_and_a_bounded_kind`,
+    /// which is the precedent this fix copied the enum from and did not
+    /// copy the proof from. Without this, restoring `{url}` or the
+    /// `ureq::Error` into `transit_error` is a one-line change that
+    /// compiles, lints, and passes the whole gate:
+    /// `scripts/check-log-url-ratchet.sh`'s raw-request-error counter is
+    /// `reqwest`-only by construction, so its `0 (baseline 0)` says
+    /// nothing about the four `ureq` clients in this crate.
+    ///
+    /// The three surfaces this protects are a per-request warn on the
+    /// proxy path, the background liveness warn, and the
+    /// `POST /admin/credentials` 400 body.
+    #[test]
+    fn a_transit_error_never_carries_the_address_or_ureq_text() {
+        let address = "https://sbproxy:hvs.MUSTNOTAPPEAR@vault.internal:8200";
+        // Every arm of the classifier, including the transport arm whose
+        // `ureq::Error` Display writes the URL, and the status arm whose
+        // Display writes it too.
+        let errors = [
+            transit_error(
+                "decrypt",
+                "transit",
+                "sbproxy-root",
+                ureq::Error::Status(
+                    403,
+                    ureq::Response::new(403, "Forbidden", "denied").unwrap(),
+                ),
+            ),
+            transit_error(
+                "encrypt",
+                "transit",
+                "sbproxy-root",
+                ureq::Error::Status(404, ureq::Response::new(404, "Not Found", "nope").unwrap()),
+            ),
+            transit_error(
+                "keys",
+                "transit",
+                "sbproxy-root",
+                ureq::Error::Status(500, ureq::Response::new(500, "Boom", "boom").unwrap()),
+            ),
+        ];
+        for error in errors {
+            // `{:#}` walks the whole context chain, which is what the
+            // proxy warn and the admin body actually render.
+            let rendered = format!("{error:#}");
+            for forbidden in [
+                address,
+                "hvs.MUSTNOTAPPEAR",
+                "vault.internal",
+                "sbproxy:hvs",
+                "8200",
+            ] {
+                assert!(
+                    !rendered.contains(forbidden),
+                    "a Transit error leaked '{forbidden}': {rendered}"
+                );
+            }
+            assert!(
+                rendered.contains("transit") && rendered.contains("sbproxy-root"),
+                "the mount and key name are operator-chosen non-secrets and have to survive, or \
+                 the operator cannot tell which key failed: {rendered}"
+            );
+        }
+
+        // And the classification itself: a revoked grant is the case an
+        // operator most needs named, and it must not read as an outage.
+        let revoked = format!(
+            "{:#}",
+            transit_error(
+                "decrypt",
+                "transit",
+                "sbproxy-root",
+                ureq::Error::Status(403, ureq::Response::new(403, "Forbidden", "x").unwrap()),
+            )
+        );
+        assert!(
+            revoked.contains("no longer authorized"),
+            "a 403 is the revoked-grant case and must say so: {revoked}"
         );
     }
 }

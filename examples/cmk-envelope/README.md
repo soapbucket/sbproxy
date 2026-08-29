@@ -14,7 +14,10 @@ policy stops decryption within `unwrap_cache_ttl_secs`, or at the next failed
 liveness probe, whichever comes first.
 
 `sb.yml` walks the full cycle against a dev Vault: configure, store a
-credential, revoke the grant, watch the decrypt stop.
+credential, **send a real request so the decrypted credential is cached**,
+revoke the grant, and watch the decrypt stop. That third step is the one worth
+doing, because a revocation has to reach the cache a live deployment actually
+serves from, not only the wrapped data keys.
 
 Read the scope in `docs/key-management.md` before quoting the claim. It covers
 the upstream-credential envelope for records sealed after the switch. It does

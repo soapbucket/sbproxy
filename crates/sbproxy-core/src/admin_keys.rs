@@ -2369,11 +2369,13 @@ fn rotate_credential(id: &str, body: Option<&str>) -> Resp {
     let request: RotateCredentialBody = match body {
         Some(raw) if !raw.trim().is_empty() => match serde_json::from_str(raw) {
             Ok(v) => v,
-            // Not the raw serde message. This is the one admin body that
-            // carries a plaintext upstream credential, and serde's
-            // `invalid type` text embeds the offending scalar, so a
-            // mistyped field would answer
-            // `invalid type: string "sk-live-...", expected u64`.
+            // Not the raw serde message. This body carries a plaintext
+            // upstream credential and serde's `invalid type` text embeds
+            // the offending scalar, so a mistyped field would answer
+            // `invalid type: string "sk-live-...", expected u64`. The
+            // create and update bodies carry one too and get the same
+            // scrub inside `parse_body`; this route parses on its own
+            // path, hence the second call.
             Err(e) => {
                 return bad_request(&format!(
                     "invalid JSON body: {}",
@@ -2778,7 +2780,10 @@ struct CredentialView {
     tenant_id: Option<String>,
     /// How the secret is held, without revealing it.
     storage: &'static str,
-    /// The vault reference (only for vault-ref credentials; never a secret).
+    /// The reference naming where the material comes from: a secret
+    /// reference for a `vault_ref` credential, or the dynamic-secrets
+    /// mount for a `leased` one. Non-secret either way, and absent for an
+    /// envelope or plaintext credential.
     vault_ref: Option<String>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -2820,7 +2825,8 @@ impl From<&CredentialRecord> for CredentialView {
             } => Some(json!({
                 "platform": platform.label(),
                 "lease_duration_secs": lease_duration_secs,
-                "detail": "material is minted on demand and never cached past the lease; sbproxy                            re-leases at use time rather than renewing ahead of expiry",
+                "detail": "material is minted on demand and never cached past the lease; \
+                           sbproxy re-leases at use time rather than renewing ahead of expiry",
             })),
             _ => None,
         };
@@ -3037,12 +3043,27 @@ fn status_label(status: RecordStatus) -> &'static str {
     }
 }
 
+/// Parse an admin JSON body, scrubbing serde's message before it reaches
+/// the 400.
+///
+/// serde's `invalid type` rendering embeds the offending scalar, so a body
+/// that lands a value on a field of the wrong type answers with that value
+/// quoted back. Three bodies through this function carry a plaintext
+/// upstream credential (`CredentialCreate`, `CredentialUpdate`, and the
+/// rotate body on its own path), so the scrub is applied here rather than
+/// at one call site: a route added later gets it without anyone
+/// remembering. `redact_serde_message` is the same one-rule scrub
+/// `origin_profile` uses, and quoting is what it keys on, so a quoted
+/// secret is exactly the shape it removes.
 fn parse_body<T: for<'de> Deserialize<'de> + Default>(body: Option<&str>) -> Result<T, Resp> {
     match body {
         None | Some("") => Ok(T::default()),
-        Some(b) => {
-            serde_json::from_str(b).map_err(|e| bad_request(&format!("invalid JSON body: {e}")))
-        }
+        Some(b) => serde_json::from_str(b).map_err(|e| {
+            bad_request(&format!(
+                "invalid JSON body: {}",
+                sbproxy_config::origin_profile::redact_serde_message(&e.to_string())
+            ))
+        }),
     }
 }
 
@@ -5780,5 +5801,196 @@ mod tests {
         assert_eq!(mixed.0, 400, "{}", mixed.2);
         assert!(mixed.2.contains("mutually exclusive"), "{}", mixed.2);
         assert!(!mixed.2.contains("sk-static"), "{}", mixed.2);
+    }
+
+    /// The post-access review cannot be closed by the operator who used
+    /// the grant, and cannot be closed by somebody off the roster.
+    ///
+    /// `approve` had both checks and `review` had neither, so the
+    /// requester could wait for their own grant to expire and then clear
+    /// it off the review queue and off
+    /// `sbproxy_break_glass_open{state="awaiting_review"}`, which is the
+    /// one alert the feature is built around. Untested until now, so
+    /// reverting either check left the whole gate green.
+    #[test]
+    fn a_break_glass_review_refuses_the_requester_and_anyone_off_the_roster() {
+        let _g = crate::key_plane::test_plane_guard();
+        crate::break_glass::reset_for_test();
+        install_break_glass_plane(1, &["bob", "dave"]);
+
+        let _alice = crate::admin::set_current_admin_actor(Some((
+            "alice".to_string(),
+            sbproxy_config::types::AdminRole::Admin,
+        )));
+        let requested = dispatch(
+            "POST",
+            "/admin/break-glass",
+            Some(r#"{"justification":"incident 71","scope":["cred-x"],"ttl_secs":1}"#),
+        )
+        .unwrap();
+        assert_eq!(requested.0, 201, "{}", requested.2);
+        let grant_id = parse(&requested)["grant"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let _bob = crate::admin::set_current_admin_actor(Some((
+            "bob".to_string(),
+            sbproxy_config::types::AdminRole::Admin,
+        )));
+        let approved = dispatch(
+            "POST",
+            &format!("/admin/break-glass/{grant_id}/approve"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(parse(&approved)["grant"]["state"], "active");
+
+        // Let the one-second TTL lapse so the grant is awaiting review.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        // Alice used the grant. She cannot sign off on it.
+        let _alice = crate::admin::set_current_admin_actor(Some((
+            "alice".to_string(),
+            sbproxy_config::types::AdminRole::Admin,
+        )));
+        let self_review = dispatch(
+            "POST",
+            &format!("/admin/break-glass/{grant_id}/review"),
+            Some(r#"{"note":"looks fine to me"}"#),
+        )
+        .unwrap();
+        assert_eq!(self_review.0, 403, "{}", self_review.2);
+        assert!(
+            self_review
+                .2
+                .contains("cannot be reviewed by the operator who requested it"),
+            "{}",
+            self_review.2
+        );
+
+        // Neither can somebody who is not an approver.
+        let _mallory = crate::admin::set_current_admin_actor(Some((
+            "mallory".to_string(),
+            sbproxy_config::types::AdminRole::Admin,
+        )));
+        let outsider = dispatch(
+            "POST",
+            &format!("/admin/break-glass/{grant_id}/review"),
+            Some(r#"{"note":"nothing to see"}"#),
+        )
+        .unwrap();
+        assert_eq!(outsider.0, 403, "{}", outsider.2);
+
+        // The grant is still on the review queue after both attempts.
+        let listed = dispatch("GET", "/admin/break-glass", None).unwrap();
+        let body = parse(&listed);
+        let grant = body["grants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["id"] == grant_id.as_str())
+            .expect("listed");
+        assert_eq!(
+            grant["state"], "awaiting_review",
+            "a refused review must leave the grant on the queue: {}",
+            listed.2
+        );
+
+        // A roster approver who is not the requester closes it.
+        let _dave = crate::admin::set_current_admin_actor(Some((
+            "dave".to_string(),
+            sbproxy_config::types::AdminRole::Admin,
+        )));
+        let reviewed = dispatch(
+            "POST",
+            &format!("/admin/break-glass/{grant_id}/review"),
+            Some(r#"{"note":"rotation confirmed"}"#),
+        )
+        .unwrap();
+        assert_eq!(reviewed.0, 200, "{}", reviewed.2);
+        assert_eq!(parse(&reviewed)["grant"]["state"], "reviewed");
+    }
+
+    /// The reviewer's note reaches the audit record whole, whatever the
+    /// scope carried.
+    ///
+    /// The note and the scope shared one 256-byte context string, and
+    /// scope was bounded at 64 entries of 256 bytes, which is sixty-four
+    /// times the context cap. A grant with a large scope silently dropped
+    /// `approvals=`, `ttl_secs=` and the note, so the sign-off the whole
+    /// feature exists to produce vanished on exactly the grants most
+    /// likely to want it.
+    #[test]
+    fn a_reviewers_note_survives_a_large_scope() {
+        let _g = crate::key_plane::test_plane_guard();
+        crate::break_glass::reset_for_test();
+        install_break_glass_plane(1, &["bob"]);
+
+        let _alice = crate::admin::set_current_admin_actor(Some((
+            "alice".to_string(),
+            sbproxy_config::types::AdminRole::Admin,
+        )));
+        let scope: Vec<String> = (0..40)
+            .map(|i| format!("cred-with-a-long-name-{i:03}"))
+            .collect();
+        let request = serde_json::json!({
+            "justification": "incident 72",
+            "scope": scope,
+            "ttl_secs": 1,
+        });
+        let requested = dispatch("POST", "/admin/break-glass", Some(&request.to_string())).unwrap();
+        assert_eq!(requested.0, 201, "{}", requested.2);
+        let grant_id = parse(&requested)["grant"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let _bob = crate::admin::set_current_admin_actor(Some((
+            "bob".to_string(),
+            sbproxy_config::types::AdminRole::Admin,
+        )));
+        dispatch(
+            "POST",
+            &format!("/admin/break-glass/{grant_id}/approve"),
+            None,
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        let reviewed = dispatch(
+            "POST",
+            &format!("/admin/break-glass/{grant_id}/review"),
+            Some(r#"{"note":"SENTINEL-NOTE-4f2a reviewed, no other credential touched"}"#),
+        )
+        .unwrap();
+        assert_eq!(reviewed.0, 200, "{}", reviewed.2);
+
+        assert_eq!(
+            parse(&reviewed)["grant"]["reviewed_note"],
+            "SENTINEL-NOTE-4f2a reviewed, no other credential touched",
+            "the reviewer's note must survive whole, whatever the scope carried. It used to \
+             share a 256-byte context string with a scope bounded two orders of magnitude \
+             higher, so a large scope silently evicted the sign-off: {}",
+            reviewed.2
+        );
+
+        // And it is still there on the listing a reviewer reads later.
+        let listed = dispatch("GET", "/admin/break-glass", None).unwrap();
+        let body = parse(&listed);
+        let grant = body["grants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["id"] == grant_id.as_str())
+            .expect("listed");
+        assert!(
+            grant["reviewed_note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("SENTINEL-NOTE-4f2a"),
+            "{}",
+            listed.2
+        );
     }
 }

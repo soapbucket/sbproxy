@@ -425,6 +425,14 @@ written under a recognized name: `api_key`, `password`, `master_key`,
 `signing_key`, `shared_key`, `virtual_key`, `challenge_binding_key`,
 `signing_secret`, `client_secret`, `session_token`, or a bare `token`.
 
+It also masks a credential carried in a URL's userinfo, which is the one
+thing it recognizes by position rather than by shape or by name:
+`https://sbproxy:hvs.MUSTNOTAPPEAR...@vault.internal:8200` comes out as
+`https://[REDACTED]@vault.internal:8200`. The scheme and everything from
+the `@` on survive, so the host stays readable. The user is masked along
+with the password, and an `@` that appears after the authority, in a path
+or a query, is not touched.
+
 The **field pass** then parses the line as JSON and masks whole values
 by field name. That is the layer covering `prompt`, `messages`,
 `cookie`, `authorization`, a captured `x-api-key` header, and

@@ -39,18 +39,29 @@
 #   curl -s -u admin:admin http://127.0.0.1:9090/admin/credentials/cred-openai
 #   # { "credential": { "storage": "encrypted", "root_of_trust": "transit/sbproxy-root" } }
 #
-# 3. Revoke the grant the way a customer would, then watch decryption stop:
+# 3. Prove the credential works first. This is the step that matters, and
+#    the one an operator does naturally: a request here warms the
+#    resolved-credential cache, which is what a revocation has to reach.
+#   curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Host: openai.local' \
+#     -H 'Content-Type: application/json' \
+#     -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+#
+# 4. Revoke the grant the way a customer would, then watch decryption stop:
 #   vault delete transit/keys/sbproxy-root   # or revoke the token's policy
 #
 #    The background probe runs every liveness_interval_secs (15 below). Its
-#    first failure purges every cached data key, so the wait is bounded by
-#    the probe interval rather than by the cache TTL:
+#    first failure drops every cached data key and every already-decrypted
+#    credential, so the wait is bounded by the probe interval rather than by
+#    the cache TTL:
 #   sleep 20
 #   curl -s -u admin:admin http://127.0.0.1:9090/admin/crypto/root-of-trust
 #   # { "liveness": { "probe": "failed_or_never_run", "cached_data_keys": 0 } }
 #
-#    A request bound to cred-openai now fails to resolve rather than being
-#    served from a copy sbproxy kept. Worst case without the probe is
+#    Repeat the request from step 3. It now fails to resolve rather than
+#    being served from a copy sbproxy kept: the failed probe drops the
+#    wrapped data keys *and* every already-decrypted credential, which is
+#    what makes the "or at the next failed liveness probe" clause true of
+#    the cache you actually warmed. Worst case without the probe is
 #    unwrap_cache_ttl_secs (30 below), and that is the whole exposure: a
 #    decrypted credential inherits the time left on the data key that opened
 #    it rather than starting a second window of its own.

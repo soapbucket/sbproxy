@@ -1043,7 +1043,7 @@ proxy:
 | `token` | string | required | Secret reference for the token sbproxy authenticates with. Resolved once at boot. Losing it is a second, independent way for the customer to cut sbproxy off. |
 | `namespace` | string | unset | Optional Vault Enterprise namespace header. |
 | `unwrap_cache_ttl_secs` | int | `60` | How long an unwrapped data key may be reused before the key service is consulted again. **This number is the deployment's revocation-latency bound in full, not the first of two windows** and is reported verbatim on `GET /admin/crypto/root-of-trust`. A decrypted credential inherits the time left on the data key that opened it rather than starting a fresh window, so the two caches in series do not compose: clamping each to the same value would have given up to twice it. |
-| `liveness_interval_secs` | int | `30` | How often to probe the key service for reachability and continued authorization. A failed probe purges every cached data key, which is what turns the TTL above into an upper bound. Zero disables the probe; the on-demand path still fails closed. |
+| `liveness_interval_secs` | int | `30` | How often to probe the key service for reachability and continued authorization. A failed probe drops every cached data key *and* every already-decrypted credential, which is what turns the TTL above into an upper bound rather than a bound on only the first of the two caches. Zero disables the probe; the on-demand path still fails closed. |
 
 `key_management.crypto.rotation`:
 
@@ -1745,9 +1745,12 @@ either ever leaves the process, the same redaction pass
 [`GET /admin/config`](admin-api-reference.md#get-put-adminconfig) applies.
 Masking is by recognized credential shape and key name (vendor key
 prefixes, `Authorization` values, and the schema's own key / secret /
-token / password fields); a secret under a name or shape the redactor
-does not recognize is returned as written, which is one more reason the
-permission boundary above is the real control. And it is display
+token / password fields), plus a URL's userinfo, which is masked by
+position: `https://user:token@vault.internal:8200` comes back as
+`https://[REDACTED]@vault.internal:8200`, host intact. A secret under a
+name or shape the redactor does not recognize is returned as written,
+which is one more reason the permission boundary above is the real
+control. And it is display
 redaction either way: the ring file underneath still holds the
 original bytes, because a rollback needs them.
 

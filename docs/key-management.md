@@ -1781,8 +1781,8 @@ unwrapped data key is reused for up to that long. **After the customer revokes
 sbproxy's grant, decryption of customer-managed credentials stops within
 `unwrap_cache_ttl_secs` seconds, or at the next failed liveness probe,
 whichever comes first.** With the defaults above, that is 60 seconds worst
-case, and typically sooner: the liveness probe runs every 30 seconds and purges
-the cache on its first failure.
+case, and typically sooner: the liveness probe runs every 30 seconds and drops
+both caches on its first failure.
 
 That is the whole exposure, not the first of two, and the distinction is worth
 spelling out because getting it wrong is easy. There are two caches in series:
@@ -1798,9 +1798,13 @@ full window. The stale-serve grace window in `proxy.secrets.rotation` is
 clamped the same way, so a grace period bought for a briefly unreachable secret
 store does not become a grace period for a revoked root of trust.
 
-A failed liveness probe purges every cached data key immediately, which is what
-turns the TTL into an upper bound rather than a per-entry lottery. The probe
-runs every `liveness_interval_secs` and reports on the admin surface below.
+A failed liveness probe drops every cached data key immediately, and with it
+every already-decrypted credential, which is what turns the TTL into an upper
+bound rather than a per-entry lottery. Both matter: purging only the data keys
+would leave a credential this process had already decrypted going upstream for
+its full inherited deadline while the admin surface reported
+`cached_data_keys: 0`. The probe runs every `liveness_interval_secs` and
+reports on the admin surface below.
 
 ### The dependency you are buying
 
@@ -1857,12 +1861,12 @@ curl -sS -u admin:admin http://127.0.0.1:9901/admin/crypto/root-of-trust
   "mode": "customer_managed",
   "kek": "transit/sbproxy-root",
   "revocation_window_secs": 60,
-  "detail": "the envelope data key is wrapped by the external key service and is never held here. After the customer revokes sbproxy's grant, decryption of customer-managed credentials stops within 60 seconds, or at the next failed liveness probe, whichever comes first.",
+  "detail": "the envelope data key is wrapped by the external key service and is never held here. After the customer revokes sbproxy's grant, decryption of customer-managed credentials stops within 60 seconds, or at the next failed liveness probe, whichever comes first. The 60 seconds is the whole exposure, not the first of two: a decrypted credential inherits the time left on the data key that opened it rather than starting a fresh window.",
   "liveness": {
     "probe": "ok",
     "last_success_unix": 1787999640,
     "cached_data_keys": 3,
-    "detail": "cached data keys are what a revoked grant still has to age out; a failed probe purges them immediately"
+    "detail": "cached data keys are what a revoked grant still has to age out; a failed probe drops them and every already-decrypted credential immediately"
   },
   "rotation": { "master_key_days": 365, "credential_days": 90, "inbound_key_days": 90 }
 }
@@ -2013,7 +2017,7 @@ proxy:
   key_management:
     break_glass:
       enabled: true
-      approvers: [alice, bob, carol]
+      approvers: [alice, bob, carol, dave]
       quorum: 2
       max_ttl_secs: 3600
       review_window_secs: 86400
@@ -2052,6 +2056,26 @@ curl -sS -u dave:… -X POST http://127.0.0.1:9901/admin/break-glass/bg_…/revi
 # The queue a reviewer opens.
 curl -sS -u admin:admin http://127.0.0.1:9901/admin/break-glass
 ```
+
+The sign-off note comes back on the grant as `reviewed_note`, beside
+`reviewed_by` and `reviewed_at`, on both the `review` response and every grant
+in the queue:
+
+```json
+{ "grant": { "id": "bg_...", "state": "reviewed",
+             "reviewed_by": "dave", "reviewed_at": "2026-08-28T14:02:11Z",
+             "reviewed_note": "rotation confirmed, no other access" } }
+```
+
+It is a field rather than only a line in the audit record's context string
+because that string is capped at 256 bytes and shares its budget with `scope`,
+which is bounded two orders of magnitude higher. A grant with a large scope
+truncated `approvals=`, `ttl_secs=`, and the note out of the record, which is
+to say it dropped the sign-off on exactly the grants most likely to want one.
+The context string now carries bounded counters and the note rides the
+structured diff, where the justification already lives. A note over 1024 bytes
+is truncated on a character boundary; an empty note is recorded as absent
+rather than as an empty string.
 
 Rules the endpoints enforce rather than document:
 

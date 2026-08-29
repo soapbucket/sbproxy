@@ -155,6 +155,14 @@ impl CustomerManagedRoot {
     /// before each insert, so steady state is the working set rather than
     /// every ciphertext ever seen.
     fn remember(&self, wrapped: &str, dek: &[u8]) {
+        // A zero window means "every open consults the key service", which
+        // is the most conservative configuration an operator can pick.
+        // Caching an entry `cached()` can never serve would park one
+        // unusable plaintext data key in the map until the next unwrap,
+        // which is the opposite of what they asked for.
+        if self.window.is_zero() {
+            return;
+        }
         let now = Instant::now();
         let mut cache = self.cache.lock();
         cache.retain(|_, entry| now.duration_since(entry.at) < self.window);
@@ -275,15 +283,16 @@ impl RootOfTrust for CustomerManagedRoot {
 /// Describe an installed root's liveness for the admin surface.
 ///
 /// Reads the trait rather than a concrete type, because that is what the
-/// crypto handle carries and what the admin route holds. A root with no
-/// liveness story of its own answers through the trait's defaults.
+/// crypto handle carries and what the admin route holds. The five liveness
+/// methods are required on the trait, so every root answers for itself and
+/// none of these fields can be a default in disguise.
 pub fn describe(root: &Arc<dyn RootOfTrust>) -> serde_json::Value {
     serde_json::json!({
         "probe": if root.last_liveness_ok() { "ok" } else { "failed_or_never_run" },
         "last_success_unix": root.last_liveness_unix(),
         "cached_data_keys": root.cached_dek_count(),
         "detail": "cached data keys are what a revoked grant still has to age out; a failed \
-                   probe purges them immediately",
+                   probe drops them and every already-decrypted credential immediately",
     })
 }
 
@@ -300,10 +309,13 @@ pub fn liveness_interval(cfg: &RootOfTrustConfig) -> Duration {
 /// Run the background liveness probe for an installed customer-managed
 /// root. Driven on the key plane's own runtime by `activate_key_plane`.
 ///
-/// A failed probe purges the unwrap cache. That is what turns the stated
-/// revocation window into an upper bound rather than a per-entry lottery: a
-/// grant revoked one second after an entry was cached would otherwise keep
-/// that entry usable for the whole window, and the probe cuts it short.
+/// A failed probe drops both caches: the wrapped data keys here, and every
+/// already-decrypted credential in the key plane. That is what turns the
+/// stated revocation window into an upper bound rather than a per-entry
+/// lottery, and it is what makes "or at the next failed liveness probe"
+/// true rather than aspirational. Purging only the data keys leaves the
+/// credential a customer is actually testing being served from a cache the
+/// probe never touched.
 pub async fn run_liveness_probe(root: Arc<dyn RootOfTrust>, interval: Duration) {
     if interval.is_zero() {
         return;
@@ -318,10 +330,32 @@ pub async fn run_liveness_probe(root: Arc<dyn RootOfTrust>, interval: Duration) 
             tracing::warn!(
                 kek = %root.kek_name(),
                 error = %error,
-                "customer-managed root of trust is not answering; purging cached data keys so \
-                 credential decryption stops now rather than at the end of each cache window"
+                "customer-managed root of trust is not answering; dropping cached data keys and \
+                 every already-decrypted credential so decryption stops now rather than at the \
+                 end of each cache window"
             );
+            // Both caches, and the second one is the point.
+            //
+            // `purge_cache` drops the wrapped data keys. It does not touch
+            // the resolved-credential cache, which holds credentials this
+            // process already decrypted and serves them upstream without
+            // consulting the root of trust at all. Purging only the first
+            // makes the published clause "or at the next failed liveness
+            // probe, whichever comes first" false by up to the whole
+            // revocation window: a credential resolved before the
+            // revocation keeps going upstream for its full inherited
+            // deadline while `GET /admin/crypto/root-of-trust` reports
+            // `cached_data_keys: 0`, which reads as "nothing left to age
+            // out" and is backwards.
+            //
+            // Dropping every resolved credential rather than only the
+            // customer-managed ones is deliberate: this cache is keyed by
+            // credential id and does not record which root opened each
+            // entry, and a probe failure is rare and cheap to over-react
+            // to. The cost is one re-resolution per credential in flight;
+            // the alternative is a published sentence that is not true.
             root.purge_cache();
+            crate::key_plane::invalidate_all_resolved_credentials();
         }
     }
 }
@@ -388,7 +422,9 @@ mod tests {
     ///
     /// So this one asserts the opposite: state recorded through the trait
     /// object is state the trait object reports back. Any method that
-    /// slips off the impl block reddens it.
+    /// slips off the impl block reddens it. The five are now required on
+    /// the trait with no defaults, so that slip is a compile error first
+    /// and this test second.
     #[tokio::test]
     async fn liveness_state_recorded_through_the_dyn_is_reported_through_the_dyn() {
         let mut c = cfg();
@@ -397,21 +433,21 @@ mod tests {
             Arc::new(CustomerManagedRoot::new(&c, "s.token".to_string()).expect("builds"));
 
         // The address is unroutable, so this probe fails rather than
-        // reaching a real Vault, which is all this needs: a *default*
-        // `probe_liveness` returns `Ok(())` and records nothing, and a
-        // forwarded one returns `Err` and records the failure.
+        // reaching a real Vault, which is all this needs: the no-op shape
+        // this replaced answered `Ok(())` and recorded nothing, and a
+        // forwarded probe returns `Err` and records the failure.
         let probed = root.probe_liveness().await;
         assert!(
             probed.is_err(),
-            "the probe must actually dial the key service; a trait default returns Ok(())              without contacting anything, which is what made the liveness half a no-op"
+            "the probe must actually dial the key service; a probe that answers Ok(()) \
+             without contacting anything is what made the liveness half a no-op"
         );
         assert!(!root.last_liveness_ok());
 
         // Warm the cache through the trait, then confirm the trait reports
-        // it and can clear it. With `cached_dek_count` and `purge_cache`
-        // left off the impl these are 0 and a no-op, and an operator
-        // watching a revocation reads "no decrypt capability left to age
-        // out" on a cache that is full.
+        // it and can clear it. Answer `cached_dek_count` and `purge_cache`
+        // with 0 and a no-op and an operator watching a revocation reads
+        // "no decrypt capability left to age out" on a cache that is full.
         root.purge_cache();
         assert_eq!(root.cached_dek_count(), 0);
         let concrete = CustomerManagedRoot::new(&c, "s.token".to_string()).expect("builds");
@@ -420,14 +456,16 @@ mod tests {
         assert_eq!(
             warm.cached_dek_count(),
             1,
-            "a warm cache must be visible through the trait, because that is what the admin              surface holds"
+            "a warm cache must be visible through the trait, because that is what the admin \
+             surface holds"
         );
         assert_eq!(describe(&warm)["cached_data_keys"], 1);
         warm.purge_cache();
         assert_eq!(
             warm.cached_dek_count(),
             0,
-            "purge must reach the real cache through the trait, or a failed probe cannot cut a              revocation short"
+            "purge must reach the real cache through the trait, or a failed probe cannot cut a \
+             revocation short"
         );
     }
 

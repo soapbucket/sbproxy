@@ -14,6 +14,10 @@
 //!   because the value has no recognizable shape of its own:
 //!   `secret...`, `api_key`, `password`, and the schema's own key /
 //!   secret / token names (`RE_CREDENTIAL_KEY`, `RE_BARE_TOKEN`).
+//! * One *positional* pattern, [`RE_URL_USERINFO`]. A credential
+//!   embedded in a URL's userinfo has neither a recognizable shape nor
+//!   a key name in front of it; what identifies it is where it sits,
+//!   between `://` and `@`.
 //!
 //! A credential that is neither a known shape nor under a known name
 //! is returned as written. In particular there is no JWT pattern: a
@@ -41,6 +45,34 @@ use regex::Regex;
 use std::sync::LazyLock;
 
 // --- Pattern definitions ---
+
+/// A credential in a URL's userinfo: `https://user:hvs.MUSTNOTAPPEAR...@host`.
+///
+/// Runs first, before every shape and keyed pattern, because it is the
+/// one pattern identified by position rather than by bytes or by name.
+/// A config value like `key_management.crypto.root_of_trust.address` is
+/// an ordinary unparsed URL under an ordinary key name, so nothing else
+/// here looks at it, and `GET /admin/config` and
+/// `/admin/config/effective` handed it back verbatim while the `token`
+/// beside it was masked by [`RE_BARE_TOKEN`]. The branch that added
+/// that field already treats the address as secret-bearing on those
+/// exact grounds, redacting it in `TransitConfig`'s and
+/// `RootOfTrustConfig`'s `Debug` and keeping it out of Transit errors;
+/// this closes the fourth surface.
+///
+/// Two groups, and only the second is masked, so the scheme and
+/// everything from the `@` on survive: an operator still reads which
+/// host is configured, which is the whole reason the field is on the
+/// route. The whole userinfo goes, user and password together, because
+/// a bare `user@host` in a config a customer sends to support is a name
+/// worth not shipping either, and telling the two apart costs a branch
+/// that buys nothing.
+///
+/// The userinfo run stops at whitespace, `/` and `@`, so a `@` later in
+/// a path or query (`.../data?to=a@b`) cannot pull the match across the
+/// authority: the first `/` ends the run before the `@` is reached.
+static RE_URL_USERINFO: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)([a-z][a-z0-9+.\-]*://)([^\s/@]+)@").expect("valid regex"));
 
 /// Anthropic keys must be matched before the generic OpenAI `sk-` pattern.
 /// Anthropic key format: `sk-ant-<segment>-<segment>` where segments are
@@ -316,7 +348,7 @@ fn keyed_credential_replacement(caps: &regex::Captures<'_>) -> String {
 
 /// Redact secrets from a string. Returns a new string with secrets replaced.
 ///
-/// Applies all twelve patterns in priority order. The result is
+/// Applies all thirteen patterns in priority order. The result is
 /// suitable for safe emission in log lines or error messages.
 ///
 /// Two properties callers depend on, both pinned by tests:
@@ -334,7 +366,12 @@ pub fn redact_secrets(input: &str) -> String {
     // Work through a scratch buffer so each replacement sees the previous output.
     // Ordering matters: more-specific patterns (Anthropic) come before more-general
     // ones (OpenAI `sk-`) to avoid double-redaction artifacts.
-    let s = RE_ANTHROPIC.replace_all(input, "sk-ant-[REDACTED]");
+    // Userinfo first: it is bounded by `://` and `@` on both sides, so
+    // masking it whole avoids a shape pattern hitting the embedded
+    // credential first and leaving `https://user:sk-ant-[REDACTED]@host`,
+    // which still names the user.
+    let s = RE_URL_USERINFO.replace_all(input, "${1}[REDACTED]@");
+    let s = RE_ANTHROPIC.replace_all(&s, "sk-ant-[REDACTED]");
     let s = RE_STRIPE.replace_all(&s, "stripe_[REDACTED]");
     let s = RE_OPENAI.replace_all(&s, "sk-[REDACTED]");
     let s = RE_GITHUB.replace_all(&s, "gh_[REDACTED]");
@@ -355,7 +392,8 @@ pub fn redact_secrets(input: &str) -> String {
 /// Cheaper than a full `redact_secrets` call when you only need a boolean
 /// answer (e.g. for metrics or alerting).
 pub fn contains_secret(input: &str) -> bool {
-    RE_ANTHROPIC.is_match(input)
+    RE_URL_USERINFO.is_match(input)
+        || RE_ANTHROPIC.is_match(input)
         || RE_STRIPE.is_match(input)
         || RE_OPENAI.is_match(input)
         || RE_GITHUB.is_match(input)
@@ -1016,6 +1054,59 @@ mod tests {
                 contains_secret(input),
                 redact_secrets(input) != input,
                 "detector and enforcer disagree on: {input}"
+            );
+        }
+    }
+
+    /// The seam: a credential carried in a URL's userinfo, on the two
+    /// routes that hand a whole config document back.
+    ///
+    /// `key_management.crypto.root_of_trust.address` is an unparsed URL
+    /// under a key name no pattern here matches. Its `token` sibling is
+    /// masked by `RE_BARE_TOKEN`, so the field beside it came back in
+    /// full: `GET /admin/config` returned
+    /// `address: https://sbproxy:hvs.MUSTNOTAPPEAR...@vault.internal:8200` to
+    /// anyone who could read the route, which is a Vault token in a
+    /// document operators paste into support tickets.
+    ///
+    /// Deleting `RE_URL_USERINFO` from `redact_secrets` reddens this on
+    /// the first assertion. The last two are the boundary: the mask must
+    /// not eat the host (an operator still has to see which Vault is
+    /// configured) and must not fire on a `@` that lives in a path or a
+    /// query, where it is not userinfo at all.
+    #[test]
+    fn a_credential_in_a_urls_userinfo_is_masked_on_the_config_routes() {
+        let out = redact_secrets(
+            "  address: https://sbproxy:hvs.MUSTNOTAPPEARINACONFIGROUTE@vault.internal:8200",
+        );
+        assert_eq!(
+            out, "  address: https://[REDACTED]@vault.internal:8200",
+            "userinfo must be masked whole, and the host must survive it"
+        );
+        assert!(!out.contains("hvs.MUSTNOTAPPEARINACONFIGROUTE"));
+        assert!(contains_secret(
+            "address: https://sbproxy:hvs.MUSTNOTAPPEARINACONFIGROUTE@vault.internal:8200"
+        ));
+
+        // A bare user is masked too: telling a name from a password
+        // costs a branch that buys nothing, and a username is not worth
+        // shipping either.
+        assert_eq!(
+            redact_secrets("amqp://svc-billing@broker.internal:5672"),
+            "amqp://[REDACTED]@broker.internal:5672"
+        );
+
+        // The boundary. An `@` after the authority is not userinfo, and
+        // a URL without one is returned as written.
+        for untouched in [
+            "GET https://api.example.com/v1/data?notify=ops@example.com 200",
+            "https://vault.internal:8200/v1/transit/decrypt/sbproxy-root",
+            "vault://primary/upstream?key=openai",
+        ] {
+            assert_eq!(
+                redact_secrets(untouched),
+                untouched,
+                "no userinfo here, so nothing to mask: {untouched}"
             );
         }
     }

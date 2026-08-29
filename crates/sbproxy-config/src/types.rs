@@ -16692,4 +16692,43 @@ mod host_backed_secret_reference_tests {
             assert!(host_backed_secret_reference(value).is_none(), "`{value}`");
         }
     }
+
+    /// Registry sentinel for `RootOfTrustConfig`
+    /// (`scripts/secret-debug-registry.txt`).
+    ///
+    /// The config-side twin of `TransitConfig`. `token` is a secret
+    /// reference and `resolve_crypto_field` deliberately exempts inline
+    /// literals, so an operator may legitimately write the token itself
+    /// here; `address` is unparsed and may carry userinfo.
+    #[test]
+    fn debug_never_renders_the_root_of_trust_token_or_address() {
+        const SENTINEL: &str = "SENTINEL-ROT-9c4a";
+
+        let root = RootOfTrustConfig {
+            provider: RootOfTrustProvider::VaultTransit,
+            address: format!("https://sbproxy:{SENTINEL}@vault.internal:8200"),
+            mount: "transit".to_string(),
+            key_name: "sbproxy-root".to_string(),
+            token: format!("hvs.{SENTINEL}"),
+            namespace: None,
+            unwrap_cache_ttl_secs: 60,
+            liveness_interval_secs: 30,
+        };
+        let rendered = format!("{root:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the root-of-trust token or address reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("RootOfTrustConfig")
+                && rendered.contains("transit")
+                && rendered.contains("sbproxy-root"),
+            "the identifier, mount, and key name must survive so a misconfiguration is \
+             diagnosable: {rendered}"
+        );
+        assert!(
+            rendered.contains("[REDACTED]"),
+            "the redaction must be visible rather than the field simply vanishing: {rendered}"
+        );
+    }
 }
