@@ -256,7 +256,9 @@ impl AiRequestExtensions {
             verdict = &mut task => match join_parallel_result(verdict) {
                 Ok(()) => ParallelModerationRace::Attempt(attempt.await),
                 Err(block) => {
-                    drop(attempt);
+                    // Returning drops the pinned attempt future, which is
+                    // the cancellation of the in-flight reqwest call.
+                    // `drop(attempt)` here would only drop a `Pin<&mut _>`.
                     ParallelModerationRace::Cancelled { block }
                 }
             },

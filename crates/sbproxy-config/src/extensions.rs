@@ -1777,7 +1777,6 @@ permissions: []
     fn parallel_mode_is_refused_on_output_hooks() {
         let yaml = AI_INPUT_JS_MANIFEST
             .replace("kind: ai_guardrail_input", "kind: ai_guardrail_output")
-            .replace("export: inspect", "export: inspect")
             .replace(
                 "      body_mode: none",
                 "      body_mode: none\n      mode: parallel",
