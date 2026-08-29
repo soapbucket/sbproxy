@@ -2179,6 +2179,36 @@ export interface RoutingDecisionFilters {
   limit?: number;
 }
 
+/** One MCP approval hold from `GET /api/mcp/approvals`. */
+export interface McpHold {
+  id: string;
+  snapshot: string;
+  tool_digest: string;
+  tool_name: string;
+  origin: string;
+  principal_id: string;
+  tenant_id: string;
+  reason: string;
+  created_at: number;
+  expires_at: number;
+  state: "pending" | { approved: { by: string; at_unix: number } } | { denied: { by: string; at_unix: number } };
+}
+
+export interface McpApprovalsResponse {
+  enabled: boolean;
+  holds: McpHold[];
+  console_page?: string;
+}
+
+function holdStateLabel(state: McpHold["state"]): string {
+  if (state === "pending") return "pending";
+  if (state && typeof state === "object" && "approved" in state) return "approved";
+  if (state && typeof state === "object" && "denied" in state) return "denied";
+  return "unknown";
+}
+
+export { holdStateLabel };
+
 export type AlertRuleState = "inactive" | "ok" | "firing";
 export type AlertDeliveryStatus = "untested" | "healthy" | "failing";
 export type AlertHistoryEvent = "fired" | "resolved" | "test";
@@ -3054,6 +3084,20 @@ export const api = {
   // here"), newest first from the in-memory ring.
   routingDecisions: (filters: RoutingDecisionFilters = {}) =>
     getJson<RoutingDecision[]>(routingDecisionsPath(filters)),
+  // WOR-2588: parked MCP Confirm / approval.tools holds.
+  mcpApprovals: () => getJson<McpApprovalsResponse>("/api/mcp/approvals"),
+  approveMcpHold: (id: string, approvedBy: string) =>
+    sendJson<McpHold>(
+      "POST",
+      `/api/mcp/approvals/${encodeURIComponent(id)}/approve`,
+      { approved_by: approvedBy },
+    ),
+  denyMcpHold: (id: string, approvedBy: string) =>
+    sendJson<McpHold>(
+      "POST",
+      `/api/mcp/approvals/${encodeURIComponent(id)}/deny`,
+      { approved_by: approvedBy },
+    ),
 
   // WOR-2094: unified audit sample (security/key/config/admin/policy).
   auditEvents: (filters: AuditEventFilters = {}) => {

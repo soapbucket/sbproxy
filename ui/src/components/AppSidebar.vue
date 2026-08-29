@@ -15,6 +15,7 @@ const nav = [
   { to: "/logs", label: "logs" },
   { to: "/sessions", label: "sessions" },
   { to: "/routing-decisions", label: "routing decisions" },
+  { to: "/mcp-approvals", label: "mcp approvals" },
   { to: "/metrics", label: "metrics" },
   { to: "/spend", label: "spend" },
   { to: "/reports", label: "reports" },

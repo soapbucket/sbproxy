@@ -522,6 +522,20 @@ pub const BLAST_RADIUS_MATRIX: &[BlastRadiusRule] = &[
         radius: BlastRadius::Breaking,
         reason: "action-type swap breaks wire compatibility (e.g. proxy -> static)",
     },
+    // Cedar source is compiled at load / reload into the MCP hook.
+    // Named ahead of the generic `action.**` rule so `sbproxy plan`
+    // reports the change as a Cedar policy edit, not an opaque action
+    // body tweak (WOR-2590).
+    BlastRadiusRule {
+        pattern: "origins.*.action.cedar_policies.**",
+        radius: BlastRadius::Reload,
+        reason: "Cedar MCP policies recompile on reload",
+    },
+    BlastRadiusRule {
+        pattern: "origins.*.action.cedar_policies",
+        radius: BlastRadius::Reload,
+        reason: "Cedar MCP policies recompile on reload",
+    },
     // --- Origin reload-class: every other origin field is
     //     hot-swappable through arc-swap today. ---
     BlastRadiusRule {
@@ -1318,17 +1332,59 @@ fn origin_change_reason(host: &str, old: &serde_json::Value, new: &serde_json::V
             .copied()
             .collect();
         if !differing.is_empty() {
-            let preview = differing
-                .iter()
-                .take(3)
-                .copied()
-                .collect::<Vec<_>>()
-                .join(", ");
+            let mut labels: Vec<String> = Vec::new();
+            for key in differing.iter().take(3) {
+                if *key == "action" {
+                    if let Some(nested) =
+                        nested_object_keys(old_obj.get("action"), new_obj.get("action"))
+                    {
+                        labels.push(format!("action.{nested}"));
+                        continue;
+                    }
+                }
+                labels.push((*key).to_string());
+            }
             let suffix = if differing.len() > 3 { ", ..." } else { "" };
-            return format!("origin '{host}' changed ({preview}{suffix})");
+            return format!(
+                "origin '{host}' changed ({preview}{suffix})",
+                preview = labels.join(", ")
+            );
         }
     }
     format!("origin '{host}' changed")
+}
+
+/// First nested object key that differs between two JSON values, so a
+/// Cedar-only edit shows up as `action.cedar_policies` rather than a
+/// generic `action` change.
+fn nested_object_keys(
+    old: Option<&serde_json::Value>,
+    new: Option<&serde_json::Value>,
+) -> Option<String> {
+    let old_obj = old.and_then(serde_json::Value::as_object);
+    let new_obj = new.and_then(serde_json::Value::as_object);
+    match (old_obj, new_obj) {
+        (Some(old_obj), Some(new_obj)) => {
+            let mut keys: BTreeSet<&str> = BTreeSet::new();
+            for k in old_obj.keys() {
+                keys.insert(k.as_str());
+            }
+            for k in new_obj.keys() {
+                keys.insert(k.as_str());
+            }
+            let mut differing: Vec<&str> = keys
+                .iter()
+                .filter(|k| old_obj.get(**k) != new_obj.get(**k))
+                .copied()
+                .collect();
+            if differing.is_empty() {
+                return None;
+            }
+            differing.sort_unstable();
+            Some(differing.into_iter().take(3).collect::<Vec<_>>().join(", "))
+        }
+        _ => None,
+    }
 }
 
 /// Best-effort preview of one origin's `owasp_api_top10` pack outcome
@@ -1958,6 +2014,58 @@ origins:
     fn matrix_lookup_origin_other_action_field_is_reload() {
         let (r, _) = lookup_blast_radius("origins.*.action.url");
         assert_eq!(r, BlastRadius::Reload);
+    }
+
+    #[test]
+    fn matrix_lookup_cedar_policies_is_reload() {
+        let (r, reason) = lookup_blast_radius("origins.*.action.cedar_policies");
+        assert_eq!(r, BlastRadius::Reload);
+        assert!(
+            reason.contains("Cedar"),
+            "cedar_policies must be named, got {reason:?}"
+        );
+        let (r2, _) = lookup_blast_radius("origins.*.action.cedar_policies.policies");
+        assert_eq!(r2, BlastRadius::Reload);
+    }
+
+    #[test]
+    fn plan_cedar_policy_text_change_is_reload_and_named() {
+        let baseline = serde_yaml::from_str::<ConfigFile>(
+            r#"
+origins:
+  mcp.example.com:
+    action:
+      type: mcp
+      cedar_policies:
+        policies: |
+          permit(principal, action, resource);
+"#,
+        )
+        .expect("baseline");
+        let proposed = serde_yaml::from_str::<ConfigFile>(
+            r#"
+origins:
+  mcp.example.com:
+    action:
+      type: mcp
+      cedar_policies:
+        policies: |
+          permit(principal, action, resource);
+          forbid(principal, action, resource);
+"#,
+        )
+        .expect("proposed");
+        let report = plan(&baseline, &proposed);
+        assert_eq!(report.entries.len(), 1);
+        let entry = &report.entries[0];
+        assert_eq!(entry.kind, PlanKind::Changed);
+        assert_eq!(entry.path, "origins.mcp.example.com");
+        assert_eq!(entry.blast_radius, BlastRadius::Reload);
+        assert!(
+            entry.reason.contains("cedar_policies"),
+            "expected cedar_policies in reason, got {:?}",
+            entry.reason
+        );
     }
 
     #[test]

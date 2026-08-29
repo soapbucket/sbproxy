@@ -1,6 +1,6 @@
 # SBproxy documentation
 
-*Last modified: 2026-08-28*
+*Last modified: 2026-08-29*
 
 SBproxy is an open source Enterprise AI Gateway for API, MCP and agent, and AI model traffic. Every feature in this repository ships under Apache-2.0.
 
@@ -166,7 +166,7 @@ Point a framework you already run at the gateway: chat completions through the O
 ## Policies
 
 - [policy.md](policy.md) - the policy catalog: all 30 policy types grouped as traffic-shape/abuse, identity/access, content/input safety, AI-specific, enrichment, and scripting-driven, each linked to wherever it's documented.
-- [cedar-policy.md](cedar-policy.md) - Cedar ABAC on MCP `tools/call`: compile-at-load, empty entity store, Confirm as a labelled refusal. Runnable: [`examples/cedar-mcp-full/`](../examples/cedar-mcp-full/).
+- [cedar-policy.md](cedar-policy.md) - Cedar ABAC on MCP `tools/call`: compile-at-load, empty entity store, `sbproxy cedar replay`, Confirm park plus admin queue. Runnable: [`examples/cedar-mcp-full/`](../examples/cedar-mcp-full/), [`examples/cedar-confirm-flow/`](../examples/cedar-confirm-flow/), [`examples/cedar-replay/`](../examples/cedar-replay/).
 - [object-authz.md](object-authz.md) - `object_authz` policy: BOLA + BFLA enforcement with tenant-isolation and enumeration detection.
 - [waf-options.md](waf-options.md) - what the 16-rule WAF baseline catches and what it does not, and the three alternatives when you need more.
 - [exposed-credentials.md](exposed-credentials.md) - the `exposed_credentials` policy: detect known-leaked basic-auth passwords and tag or block.

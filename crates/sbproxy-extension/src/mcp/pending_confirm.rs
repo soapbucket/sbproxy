@@ -86,6 +86,10 @@ pub enum ParkOutcome {
         expires_at_unix: u64,
         /// Snapshot the retry must present.
         snapshot: String,
+        /// True when this call minted the row. False when it collapsed
+        /// onto an already-pending hold, so notifications must not fire
+        /// again.
+        fresh: bool,
     },
     /// A previous approval for this snapshot was consumed; dispatch.
     Resume,
@@ -226,6 +230,7 @@ impl PendingConfirmStore {
                 hold_id: hold.id.clone(),
                 expires_at_unix: hold.expires_at_unix,
                 snapshot,
+                fresh: false,
             };
         }
         holds.retain(|_, hold| {
@@ -265,6 +270,7 @@ impl PendingConfirmStore {
             hold_id: id,
             expires_at_unix: now_unix.saturating_add(ttl_secs),
             snapshot,
+            fresh: true,
         }
     }
 

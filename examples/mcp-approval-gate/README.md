@@ -1,11 +1,12 @@
 # Gateway-originated MCP approval hold
 
-*Last modified: 2026-08-28*
+*Last modified: 2026-08-29*
 
 A high-risk `tools/call` is parked until an operator approves the
 content snapshot. The caller's HTTP connection is never held open.
-TrueFoundry is the surveyed state of the art for this gate. A console
-page is deferred; the JSON admin routes are the operator surface.
+TrueFoundry is the surveyed state of the art for this gate. Approve
+from `POST /api/mcp/approvals/{id}/approve` or the admin console at
+`/admin/ui/mcp-approvals`.
 
 ## Run
 

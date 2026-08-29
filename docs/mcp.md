@@ -1,6 +1,6 @@
 # MCP gateway
 
-*Last modified: 2026-08-28*
+*Last modified: 2026-08-29*
 
 SBproxy ships an MCP (Model Context Protocol) gateway that speaks
 JSON-RPC 2.0 over HTTP POST. Configure the `mcp` action on an origin
@@ -1209,8 +1209,10 @@ cannot consume another tool's approval. The caller's HTTP connection
 is never held open: the gateway returns JSON-RPC `-32097` with
 `hold_id`, `snapshot`, and `expires_at`. Retry the same snapshot after
 `POST /api/mcp/approvals/{id}/approve`. Approval is single-use.
-Unanswered holds expire fail-closed. A console page is deferred; the
-JSON routes are the operator surface.
+Unanswered holds expire fail-closed (default `hold_ttl: 15m`). The
+admin console lists them at `/admin/ui/mcp-approvals`; the JSON
+routes remain the scripting surface. A fresh Cedar Confirm park also
+fires alert rule `mcp_confirm` on `proxy.alerting.channels`.
 
 ```yaml
       approval:

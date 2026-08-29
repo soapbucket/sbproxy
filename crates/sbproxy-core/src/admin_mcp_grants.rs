@@ -4,8 +4,9 @@
 //! Time-boxed MCP grant ledger and gateway-originated approval holds
 //! (`GET`/`POST /api/mcp/grants`, `GET`/`POST /api/mcp/approvals`).
 //!
-//! A console page is deferred: these JSON routes are the operator
-//! surface. The caller's MCP HTTP connection is never held open.
+//! The admin console page is `/admin/ui/mcp-approvals`. JSON routes
+//! remain the scripting surface. The caller's MCP HTTP connection is
+//! never held open.
 
 use sbproxy_modules::action::{Action, CompiledMcpApproval};
 use serde::Deserialize;
@@ -237,7 +238,7 @@ fn list_holds() -> Resp {
         json!({
             "enabled": configured,
             "holds": holds,
-            "console_page": "deferred",
+            "console_page": "/admin/ui/mcp-approvals",
         })
         .to_string(),
     )

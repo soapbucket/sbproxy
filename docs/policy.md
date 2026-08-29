@@ -1,5 +1,5 @@
 # Policy engine
-*Last modified: 2026-08-28*
+*Last modified: 2026-08-29*
 
 The policy engine evaluates a list of policies on every request. Each policy returns one of four verdicts: `Allow`, `Deny`, `AllowWithHeaders`, or `Confirm`. The dispatcher folds the per-policy results into a single decision and applies it before the request reaches the upstream.
 
@@ -168,7 +168,7 @@ The fail-closed contract is deliberate: a misconfigured or unreachable judge can
 
 ## NL-to-Cedar decision
 
-SBproxy does not offer natural-language-to-Cedar compilation: nothing turns a prose rule into Cedar policy text, and the inactive NL components that once attempted it had no runtime consumer and were removed. That is a different thing from the Cedar engine itself, which does ship: an `mcp` action's `cedar_policies` block hands Cedar source to `sbproxy-extension`'s compiler, which turns it into a schema-validated policy set, and its evaluator maps verdicts onto allow, deny, and confirm on the built-in MCP `tools/call` hook. Write Cedar under `cedar_policies`; the gateway compiles and enforces it at config load. The engine's embedded policy store (redb, stateless by default) is in the tree but is not yet wired to that hook; policies come from the config block, and the store's console and CLI surfaces are tracked as separate work. Dedicated page: [cedar-policy.md](cedar-policy.md). Runnable: [`examples/cedar-mcp-full/`](../examples/cedar-mcp-full/).
+SBproxy does not offer natural-language-to-Cedar compilation: nothing turns a prose rule into Cedar policy text, and the inactive NL components that once attempted it had no runtime consumer and were removed. That is a different thing from the Cedar engine itself, which does ship: an `mcp` action's `cedar_policies` block hands Cedar source to `sbproxy-extension`'s compiler, which turns it into a schema-validated policy set, and its evaluator maps verdicts onto allow, deny, and confirm on the built-in MCP `tools/call` hook. Write Cedar under `cedar_policies`; the gateway compiles and enforces it at config load. A Cedar-only edit shows in `sbproxy plan` as Reload; `sbproxy cedar replay` previews the same source against a JSONL traffic sample. Confirm without `approval:` is a labelled refusal; with `approval:` the call parks until an operator acts in `/admin/ui/mcp-approvals`. The engine's embedded policy store (redb, stateless by default) is in the tree but is not yet wired to that hook; policies come from the config block. Dedicated page: [cedar-policy.md](cedar-policy.md). Runnable: [`examples/cedar-mcp-full/`](../examples/cedar-mcp-full/), [`examples/cedar-confirm-flow/`](../examples/cedar-confirm-flow/), [`examples/cedar-replay/`](../examples/cedar-replay/).
 
 ## request_validator
 

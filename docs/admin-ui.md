@@ -1,6 +1,6 @@
 # Admin UI
 
-*Last modified: 2026-08-27*
+*Last modified: 2026-08-29*
 
 The built-in admin UI is a Vue 3 + Vite single-page app that drives the
 same [admin API](admin-api-reference.md) any curl script can call. It
@@ -534,6 +534,36 @@ The observability surfaces compose into one attribution loop. Send
 Only properties listed in the origin's `properties.rollup_keys` become
 durable spend dimensions; every captured property stays filterable in Logs
 for the life of the ring. Redacted keys show as `[redacted]` everywhere.
+
+## MCP approvals (`/mcp-approvals`)
+
+Parked MCP `tools/call` holds waiting for a human: gateway-originated
+`approval.tools[]` selectors, and Cedar `@confirm` forbids when the
+same action has `approval:` (store plus TTL). Approving a snapshot
+lets the next matching retry through once. An unanswered hold expires
+fail-closed (default 15 minutes) and never becomes an allow.
+
+Where a row comes from: the gateway returns JSON-RPC `-32097` with
+`hold_id` instead of holding the caller's HTTP connection. A fresh
+Confirm park also fires alert rule `mcp_confirm` on
+`proxy.alerting.channels`. This page polls `GET /api/mcp/approvals`
+every five seconds.
+
+- **Shows:** each hold's state (pending, approved, denied), advertised
+  tool name, origin, principal, reason, and hold id.
+- **Filters:** none. The list is the current store contents.
+- **Mutations:** Approve and Deny (`POST /api/mcp/approvals/{id}/approve`
+  and `/deny`), as the signed-in operator. `admin` role only for
+  mutations; `read_only` can list.
+- **Empty/error notes:** no `mcp` action with `approval:` renders a
+  disabled empty state that says Cedar `@confirm` stays a labelled
+  refusal until you add a store. A configured store with no holds
+  says so rather than erroring.
+- **Retention boundary:** the JSON file at `approval.store`. Holds
+  expire out of that file; this page is not a durable audit log.
+
+Cedar source, replay, and the Confirm wire shape: [cedar-policy.md](cedar-policy.md).
+Runnable: [`examples/cedar-confirm-flow/`](../examples/cedar-confirm-flow/).
 
 ## Routing decisions (`/routing-decisions`)
 

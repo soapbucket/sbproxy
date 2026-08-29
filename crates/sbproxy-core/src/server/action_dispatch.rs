@@ -6744,6 +6744,7 @@ pub(super) async fn handle_mcp_action(
                                                 hold_id,
                                                 expires_at_unix,
                                                 snapshot,
+                                                fresh,
                                             } => {
                                                 tracing::warn!(
                                                     target: "sbproxy::mcp::approval",
@@ -6756,13 +6757,26 @@ pub(super) async fn handle_mcp_action(
                                                     ctx.tenant_id.as_str(),
                                                     "held",
                                                 );
-                                                mcp_notify_approval_webhook(
-                                                    approval,
-                                                    &hold_id,
-                                                    mcp.server_name.as_str(),
-                                                    &name,
-                                                    &snapshot,
-                                                );
+                                                if fresh {
+                                                    mcp_notify_approval_webhook(
+                                                        approval,
+                                                        &hold_id,
+                                                        mcp.server_name.as_str(),
+                                                        &name,
+                                                        &snapshot,
+                                                    );
+                                                    mcp_notify_confirm_channels(
+                                                        &hold_id,
+                                                        mcp.server_name.as_str(),
+                                                        &name,
+                                                        &principal_id,
+                                                        if tools_match {
+                                                            "configured approval.tools selector"
+                                                        } else {
+                                                            "prior hold for this snapshot"
+                                                        },
+                                                    );
+                                                }
                                                 if emit_mcp_governance_evidence(
                                                     ctx,
                                                     &name,
@@ -7876,6 +7890,7 @@ pub(super) async fn handle_mcp_action(
                                                         hold_id,
                                                         expires_at_unix,
                                                         snapshot,
+                                                        fresh,
                                                     } => {
                                                         tracing::warn!(
                                                             target: "sbproxy::mcp::approval",
@@ -7888,13 +7903,24 @@ pub(super) async fn handle_mcp_action(
                                                             ctx.tenant_id.as_str(),
                                                             "held",
                                                         );
-                                                        mcp_notify_approval_webhook(
-                                                            approval,
-                                                            &hold_id,
-                                                            mcp.server_name.as_str(),
-                                                            &name,
-                                                            &snapshot,
-                                                        );
+                                                        if fresh {
+                                                            mcp_notify_approval_webhook(
+                                                                approval,
+                                                                &hold_id,
+                                                                mcp.server_name.as_str(),
+                                                                &name,
+                                                                &snapshot,
+                                                            );
+                                                            mcp_notify_confirm_channels(
+                                                                &hold_id,
+                                                                mcp.server_name.as_str(),
+                                                                &name,
+                                                                &sbproxy_extension::mcp::principal_id_for(
+                                                                    &ctx.principal,
+                                                                ),
+                                                                &denied.message,
+                                                            );
+                                                        }
                                                         if emit_mcp_governance_evidence(
                                                             ctx,
                                                             &name,
@@ -11324,6 +11350,31 @@ fn mcp_approval_pending_response(
             "expires_at": expires_at_unix,
         })),
     )
+}
+
+/// Page Slack / webhook / PagerDuty when a *new* hold is minted.
+/// Retries that collapse onto an existing pending row must not fire
+/// again. Labels never include arguments or the snapshot hash.
+fn mcp_notify_confirm_channels(
+    hold_id: &str,
+    origin: &str,
+    tool: &str,
+    principal_id: &str,
+    reason: &str,
+) {
+    let mut labels = std::collections::HashMap::new();
+    labels.insert("origin".to_string(), origin.to_string());
+    labels.insert("tool".to_string(), tool.to_string());
+    labels.insert("hold_id".to_string(), hold_id.to_string());
+    labels.insert("principal".to_string(), principal_id.to_string());
+    crate::alerting::fire_event_alert(sbproxy_observe::alerting::Alert {
+        rule: "mcp_confirm".to_string(),
+        severity: "warning".to_string(),
+        message: format!("MCP tools/call parked: {tool} on {origin} ({reason})"),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        labels,
+        resolved: false,
+    });
 }
 
 /// Fire-and-forget operator webhook after a hold is parked. The body

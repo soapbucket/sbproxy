@@ -1,6 +1,6 @@
 # MCP security
 
-*Last modified: 2026-08-28*
+*Last modified: 2026-08-29*
 
 For a row-by-row scorecard against the OWASP MCP Top 10, coverage stated
 plainly as full, partial, or out of gateway scope, see
@@ -149,7 +149,8 @@ High-risk tools can require a human at the gateway (not MCP elicitation).
 returns `-32097` immediately, and resumes once on a retry after
 `POST /api/mcp/approvals/{id}/approve`. Approvals bind to the tool contract and
 canonical arguments, so a rename does not consume another tool's decision.
-TrueFoundry is the surveyed SOTA for this gate. A console page is deferred.
+TrueFoundry is the surveyed SOTA for this gate. Approve from
+`POST /api/mcp/approvals/{id}/approve` or `/admin/ui/mcp-approvals`.
 
 A reviewed grant can also expire. Set `ttl` on a `tool_access[]` row and
 `grant_ledger.path` so the window survives a restart. After the ttl elapses
