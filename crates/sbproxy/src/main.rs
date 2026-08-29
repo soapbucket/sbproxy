@@ -15,12 +15,13 @@ use std::path::PathBuf;
 use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 
+mod cedar_cli;
+
 /// `sbproxy connect` / `sbproxy disconnect`: detect the coding agents on this
 /// machine and point them at the gateway. Its own module because it is the
 /// only verb here that writes files belonging to other programs, and the
 /// reasoning about backups, atomic replacement, and what it deliberately
 /// refuses to write belongs next to the code that does it.
-mod cedar_cli;
 mod connect;
 
 // mimalloc is Microsoft's high-performance allocator. Typically 5-10% faster

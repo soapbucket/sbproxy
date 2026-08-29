@@ -80,7 +80,7 @@ When the same `mcp` action also has `approval:` (`store` plus optional `hold_ttl
 1. The gateway returns JSON-RPC `-32097` with `hold_id`, `snapshot`, and `expires_at`. The caller's HTTP connection is never held open.
 2. A **fresh** insert fires `mcp_confirm` on `proxy.alerting.channels`. Add `type: log` for a process-local line, or webhook / Slack / PagerDuty the same way any other alert channel is configured. Per-origin `approval.webhook` is a separate, SSRF-checked POST and still works when alerting was not installed.
 3. An operator approves or denies from `GET`/`POST /api/mcp/approvals` or the admin page `/admin/ui/mcp-approvals`. Approval is single-use and bound to the content snapshot (tool-contract digest plus canonical arguments), so a rename cannot consume another tool's decision.
-4. The next matching `tools/call` consumes an approval once and proceeds. A deny leaves later retries refused until the hold expires.
+4. The next matching `tools/call` consumes an approval once and proceeds. A deny deletes the row, so a retry of the same snapshot parks again (a fresh insert, another `mcp_confirm`) rather than staying refused until `hold_ttl`. Unanswered holds are the ones that expire fail-closed.
 
 Do not list the Confirm tool on `approval.tools[]` if you want Cedar to be the layer that parks. That selector holds matching `tools/call` before the Cedar hook runs.
 

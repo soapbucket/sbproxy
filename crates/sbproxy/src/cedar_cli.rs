@@ -22,18 +22,15 @@ use sbproxy_extension::cedar::{
 
 /// One origin's Cedar block, the same unit the live hook compiles.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CedarOriginSource {
-    /// Origin hostname (`origins:` map key).
-    pub host: String,
-    /// Cedar source from `cedar_policies.policies`.
-    pub policies: String,
-    /// Optional `cedar_policies.schema_override`.
-    pub schema_override: Option<String>,
+struct CedarOriginSource {
+    host: String,
+    policies: String,
+    schema_override: Option<String>,
 }
 
 /// Arguments for `sbproxy cedar replay`.
 #[derive(Debug, Clone)]
-pub struct CedarReplayRequest {
+pub(crate) struct CedarReplayRequest {
     /// Proposed `sb.yml` (or a YAML that at least contains
     /// `origins.*.action.cedar_policies`).
     pub config: PathBuf,
@@ -51,7 +48,7 @@ pub struct CedarReplayRequest {
 /// Run replay. Exit 0 when every assertion held and no baseline
 /// verdict moved; 1 when a sample missed; 2 is reserved for the
 /// caller (`run_subcommand`) on `Err`.
-pub fn handle_cedar_replay(req: &CedarReplayRequest) -> anyhow::Result<i32> {
+pub(crate) fn handle_cedar_replay(req: &CedarReplayRequest) -> anyhow::Result<i32> {
     let proposed_yaml = std::fs::read_to_string(&req.config)
         .with_context(|| format!("read {}", req.config.display()))?;
     let proposed_src = select_one_origin(cedar_sources_from_yaml(
@@ -146,7 +143,7 @@ fn select_one_origin(mut sources: Vec<CedarOriginSource>) -> anyhow::Result<Ceda
 ///
 /// Returns when the document is not YAML, has no matching Cedar
 /// block, or `--origin` names a host that has none.
-pub fn cedar_sources_from_yaml(
+fn cedar_sources_from_yaml(
     yaml: &str,
     origin_filter: Option<&str>,
 ) -> anyhow::Result<Vec<CedarOriginSource>> {
