@@ -3067,12 +3067,21 @@ fn boot_document(
         boot_candidate_compiles,
     ) {
         Ok(document) => {
-            crate::config_boot::mark_on_fallback(document.pinned.clone());
-            crate::config_boot::spawn_boot_success_timer(
+            // The pin carries why the configured document failed, not
+            // only which revision rescued the node. A controller that
+            // suspends reconciliation on this pin has to be able to say
+            // what it is waiting for (WOR-2467).
+            let pinned = crate::config_boot::PinnedRevision::with_reason(
                 document.pinned.revision,
+                document.pinned.digest.clone(),
+                &format!("{primary:#}"),
+            );
+            crate::config_boot::mark_on_fallback(pinned.clone());
+            crate::config_boot::spawn_boot_success_timer(
+                pinned.revision,
                 boot_config.boot.success_secs,
             );
-            Ok((document.yaml, Some(document.pinned)))
+            Ok((document.yaml, Some(pinned)))
         }
         // An empty ring is a first boot: exit exactly the way `off`
         // does, saying the ring was empty rather than pretending a
@@ -8826,6 +8835,7 @@ egress:
         crate::config_boot::mark_on_fallback(crate::config_boot::PinnedRevision {
             revision: 3,
             digest: "rescued".to_string(),
+            reason: None,
         });
 
         let failures_before = reload_total("failure");
@@ -8969,6 +8979,7 @@ egress:
         crate::config_boot::mark_on_fallback(crate::config_boot::PinnedRevision {
             revision: 9,
             digest: "rescued".to_string(),
+            reason: None,
         });
 
         // Exactly what the file watcher calls once the burst it saw goes

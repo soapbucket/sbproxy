@@ -117,6 +117,44 @@ spec:
             description: 'Status reported by the operator, so `kubectl get sbproxy -o yaml` answers two different questions: what the operator has seen, and what it has finished delivering.'
             nullable: true
             properties:
+              conditions:
+                description: |-
+                  Kubernetes-style conditions.
+
+                  One type today, `ConfigFallbackActive`: `True` while a pod owned by this `SBProxy` is serving a configuration its boot fallback restored from the node's revision ring rather than the document this operator applied. While it is `True` the operator stops pushing configuration to this `SBProxy`, because a node that rescued itself has not drifted on purpose and reapplying the document it could not compile would restart it into the same crash loop.
+
+                  The condition is the operator-visible signal, so an alert can fire on "a node in this cluster is running on fallback" without scraping the proxy directly.
+                items:
+                  description: |-
+                    One Kubernetes-style status condition.
+
+                    Modeled by hand rather than reused from `k8s_openapi`, whose `metav1.Condition` requires `lastTransitionTime` as a `Time` and does not derive `JsonSchema` at the pinned feature set. The field names and semantics match the upstream convention, so `kubectl wait --for=condition=ConfigFallbackActive` works.
+                  properties:
+                    lastTransitionTime:
+                      description: RFC 3339 timestamp of the last status change.
+                      type: string
+                    message:
+                      description: Human-readable detail.
+                      type: string
+                    observedGeneration:
+                      description: '`metadata.generation` the condition was computed against.'
+                      format: int64
+                      nullable: true
+                      type: integer
+                    reason:
+                      description: Machine-readable, CamelCase reason for the current status.
+                      type: string
+                    status:
+                      description: '`True`, `False`, or `Unknown`.'
+                      type: string
+                    type:
+                      description: Condition type, for example `ConfigFallbackActive`.
+                      type: string
+                  required:
+                  - status
+                  - type
+                  type: object
+                type: array
               configHash:
                 description: Hash of the `SBProxyConfig.spec.config` the operator has finished delivering. Written only after the ConfigMap, Service, and workload have all been applied, or after every pod has accepted a hot reload. Empty until the first rollout completes. A rolling restart is still asynchronous after the apply lands, so pair this with the workload's own rollout status when you need to know the pods have caught up. When this trails `observedConfigHash`, the operator could not finish delivering; check `lastError` and the operator log.
                 type: string

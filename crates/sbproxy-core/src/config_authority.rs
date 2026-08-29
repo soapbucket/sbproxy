@@ -826,9 +826,7 @@ impl ConfigAuthority {
             let store = self.lock_store();
             let replaced_revision = store.current_revision();
             let Some(previous) = store.previous() else {
-                sbproxy_observe::metrics::record_config_authority_rollback(
-                    "previous", "refused",
-                );
+                sbproxy_observe::metrics::record_config_authority_rollback("previous", "refused");
                 return Err(RollbackError::NoPreviousRevision {
                     published: replaced_revision,
                 });

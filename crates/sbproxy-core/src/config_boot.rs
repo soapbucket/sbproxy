@@ -91,6 +91,15 @@ fn pinned() -> &'static Mutex<Option<PinnedRevision>> {
     PINNED.get_or_init(|| Mutex::new(None))
 }
 
+/// Longest stored fallback reason, in characters.
+///
+/// The reason is the compile failure the configured document produced,
+/// which the boot path already logs in full. Bounding the copy that
+/// reaches the admin surface keeps a pathological error (a parser that
+/// echoes a large document back) from turning a status route into a way
+/// to read the node's configuration a kilobyte at a time.
+pub const MAX_FALLBACK_REASON_CHARS: usize = 512;
+
 /// The ring entry a fallback boot is serving.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PinnedRevision {
@@ -98,6 +107,33 @@ pub struct PinnedRevision {
     pub revision: u64,
     /// Its content digest.
     pub digest: String,
+    /// Why the configured document did not boot, bounded to
+    /// [`MAX_FALLBACK_REASON_CHARS`].
+    ///
+    /// `None` on a pin an operator or a test set directly rather than
+    /// one a boot walk produced. A controller that owns this node's
+    /// configuration reads this to say *why* it stopped reconciling,
+    /// which is the difference between an alert somebody can act on and
+    /// one that only says something is wrong (WOR-2467).
+    pub reason: Option<String>,
+}
+
+impl PinnedRevision {
+    /// A pin carrying the failure that caused the fallback, truncated to
+    /// [`MAX_FALLBACK_REASON_CHARS`] characters on a character boundary.
+    #[must_use]
+    pub fn with_reason(revision: u64, digest: String, reason: &str) -> Self {
+        let trimmed = reason.trim();
+        let bounded = match trimmed.char_indices().nth(MAX_FALLBACK_REASON_CHARS) {
+            Some((cut, _)) => format!("{}...", &trimmed[..cut]),
+            None => trimmed.to_string(),
+        };
+        Self {
+            revision,
+            digest,
+            reason: (!bounded.is_empty()).then_some(bounded),
+        }
+    }
 }
 
 /// One candidate the walk tried and why it did not boot.
@@ -349,8 +385,13 @@ pub fn walk_for_bootable(
                     pinned: PinnedRevision {
                         revision: candidate.revision,
                         digest: candidate.digest,
+                        // The walk knows which candidate booted, not why
+                        // the configured document did not. The boot path
+                        // has that error and stamps it on with
+                        // `PinnedRevision::with_reason`.
+                        reason: None,
                     },
-                })
+                });
             }
             Err(reason) => {
                 if attempts >= max_attempts {
@@ -811,10 +852,16 @@ mod tests {
             "nothing is suspended before a fallback boot",
         );
 
-        mark_on_fallback(PinnedRevision {
-            revision: 4,
-            digest: "abc".to_string(),
-        });
+        mark_on_fallback(PinnedRevision::with_reason(
+            4,
+            "abc".to_string(),
+            "origins.\"api.test\": unknown action type `statik`",
+        ));
+        assert_eq!(
+            pinned_revision().and_then(|pin| pin.reason).as_deref(),
+            Some("origins.\"api.test\": unknown action type `statik`"),
+            "the pin carries why the configured document failed",
+        );
         assert!(on_fallback());
         assert!(reload_suspended("file_watcher"));
         assert!(reload_suspended("config_refresh_poller"));
@@ -857,5 +904,32 @@ mod tests {
         let history = history_config_from_broken_document("\t: [unbalanced\n");
         assert_eq!(history.dir, "/var/lib/sbproxy/config-history");
         assert!(history.enabled);
+    }
+
+    #[test]
+    fn a_fallback_reason_is_bounded_so_a_status_route_cannot_echo_a_document_back() {
+        let long = "x".repeat(MAX_FALLBACK_REASON_CHARS * 3);
+        let pin = PinnedRevision::with_reason(1, "digest".to_string(), &long);
+        let reason = pin.reason.expect("a reason");
+        assert_eq!(
+            reason.chars().count(),
+            MAX_FALLBACK_REASON_CHARS + 3,
+            "bounded, with an ellipsis saying it was cut",
+        );
+        assert!(reason.ends_with("..."), "{reason}");
+
+        // A multi-byte character on the boundary is cut on a character
+        // boundary rather than panicking mid-codepoint.
+        let wide = "\u{00e9}".repeat(MAX_FALLBACK_REASON_CHARS * 2);
+        let cut = PinnedRevision::with_reason(1, "digest".to_string(), &wide)
+            .reason
+            .expect("a reason");
+        assert_eq!(cut.chars().count(), MAX_FALLBACK_REASON_CHARS + 3);
+
+        assert_eq!(
+            PinnedRevision::with_reason(1, "digest".to_string(), "   ").reason,
+            None,
+            "an empty reason is absent rather than an empty string",
+        );
     }
 }

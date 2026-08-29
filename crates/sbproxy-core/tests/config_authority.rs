@@ -649,7 +649,10 @@ fn a_rollback_to_a_revision_the_archive_does_not_hold_is_refused_by_name() {
     assert_eq!(error.code(), "revision_not_archived", "{error}");
     assert!(error.is_request_fault(), "{error}");
     let message = error.to_string();
-    assert!(message.contains("revision 9 is not in the archive"), "{message}");
+    assert!(
+        message.contains("revision 9 is not in the archive"),
+        "{message}"
+    );
     assert!(
         message.contains("available revisions are 1, 2"),
         "the refusal lists what an operator may pick instead: {message}",
@@ -682,7 +685,7 @@ fn an_archived_payload_that_no_longer_validates_is_refused_with_its_validation_e
             .expect("decode");
     let signer = sbproxy_config::ConfigBundleSigner::ed25519_from_seed_file(
         KEY_ID,
-        &write_signing_key(temp.path()),
+        write_signing_key(temp.path()),
     )
     .expect("signer");
     let denied = signer
@@ -798,7 +801,10 @@ fn a_zero_archive_keep_leaves_the_one_step_rollback_and_refuses_a_named_one() {
     assert!(authority.archived_revisions().is_empty());
     // The behavior that predates the ring is untouched.
     assert_eq!(
-        authority.rollback().expect("one-step rollback").restored_from_revision,
+        authority
+            .rollback()
+            .expect("one-step rollback")
+            .restored_from_revision,
         1,
     );
     assert_eq!(

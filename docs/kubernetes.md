@@ -54,6 +54,52 @@ Config-only changes prefer the hot-reload branch; a cluster-topology change (rep
 
 A pass over an unchanged `SBProxy` writes nothing and reloads nothing. Deciding that needs the two hashes above rather than the pod template's `sbproxy.dev/config-hash` annotation: a successful hot reload deliberately leaves that annotation alone, since changing it is the rolling restart the reload exists to avoid. The operator reads `status.configHash` for "what have the pods been given" and keeps the annotation at whatever the pods were started with until something actually has to roll them.
 
+### A node that rescued itself is not drift
+
+A proxy pod that could not compile the configuration it was given can come up on its last known good one instead (`--config-fallback=last-known-good`, see [config-rollback.md](config-rollback.md)). That node is *pinned*: it serves the rescued document, and its file watcher, SIGHUP, and `source:` refresh poller stay suspended until an operator clears the pin.
+
+A controller that reads that pin as drift would reapply the document the node could not compile and restart it into the same crash loop, which is the failure the fallback exists to prevent, reintroduced one layer up. So the operator does the opposite: while any pod owned by an `SBProxy` reports a pin, the operator stops pushing configuration to that `SBProxy` and says so on the CR.
+
+```console
+$ kubectl get sbproxy edge -o jsonpath='{.status.conditions}' | jq
+[
+  {
+    "type": "ConfigFallbackActive",
+    "status": "True",
+    "reason": "NodeOnFallbackConfig",
+    "message": "pod edge-0 is serving revision 7 from its config revision ring, not the configured document; config reconciliation is suspended for this SBProxy until the pin is cleared with DELETE /admin/config/fallback. the configured document failed with: origins.\"api.test\": unknown action type `statik`",
+    "lastTransitionTime": "2026-08-28T09:14:02Z",
+    "observedGeneration": 3
+  }
+]
+```
+
+The condition is the operator-visible signal, so an alert can fire on `a node in this cluster is running on fallback` without scraping the proxy directly:
+
+```yaml
+- alert: SBPROXY-NODE-ON-FALLBACK-CONFIG
+  expr: |
+    kube_customresource_sbproxy_status_condition{type="ConfigFallbackActive",status="true"} == 1
+  for: 15m
+```
+
+The resume is on the node, not on the CR. `DELETE /admin/config/fallback` clears the pin and reapplies the file; the next reconcile sees no pin, flips the condition to `False`, and pushes config again. Nothing about the `SBProxy` has to change.
+
+Two things this deliberately does not do. It does not suspend on an unhealthy pod: a pod that is merely crash-looping has said nothing about its configuration, and freezing config delivery for it would let one sick replica block a fix from reaching the healthy ones. And it does not suspend when it cannot ask: a pod with no IP yet, an unreachable admin port, or an `SBProxy` with no `spec.adminAuthSecretRef` all contribute no report, and the operator reconciles as it always did. The suspension is keyed on a node actually saying "I am on a fallback", never on silence.
+
+### `auto_revert` is refused under operator ownership
+
+`proxy.config_history.soak.auto_revert` lets a node undo a configuration on its own after a failed soak. It ships off, and under this operator it is refused outright:
+
+```console
+$ kubectl describe sbproxy edge | grep -A2 'Last Error'
+  Last Error:  proxy.config_history.soak.auto_revert is true, but this SBProxy's
+    configuration is owned by the sbproxy Kubernetes operator, which reapplies the
+    ConfigMap on every reconcile. A node that reverts its own config loses that race...
+```
+
+A node that reverts its own config loses the race with the next reconcile, which reapplies the ConfigMap the node just reverted away from, and the two take turns. Accepting the key and then losing that race is worse than refusing it, and refusing it quietly is worse still, because nothing would tell you why the setting did nothing. Roll back through the control plane instead: `sbproxy config authority rollback --to-revision N` for a fleet, or `POST /admin/config/rollback` on a node this operator does not own.
+
 Upgrade the CRDs along with the operator image. `observedConfigHash` is new, and until the CRD carries it the apiserver prunes the field on every status write. The operator only trusts a `configHash` that has an `observedConfigHash` beside it, because an older build wrote `configHash` before applying anything and a hash that means "seen" would read as "delivered". So an operator running against the old CRD reloads the fleet once per requeue instead of skipping the pass, which is wasteful rather than wrong and stops as soon as the CRD is applied. `helm upgrade` handles this; a raw `kubectl apply` needs `deploy/crds/sbproxy.yaml` reapplied too.
 
 ## Install the chart

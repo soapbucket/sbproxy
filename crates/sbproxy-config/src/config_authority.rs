@@ -693,11 +693,7 @@ impl AuthorityState {
         // rule came from somewhere other than this store's own commit
         // path, and adopting it would let a rollback target a number the
         // counter never handed out.
-        if self
-            .archive
-            .windows(2)
-            .any(|pair| pair[0] >= pair[1])
-        {
+        if self.archive.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(AuthorityStoreError::Corrupt(
                 "the archive list is not strictly ascending".to_string(),
             ));
@@ -1048,7 +1044,10 @@ impl AuthorityStore {
     /// Returns [`AuthorityStoreError::Corrupt`] when the file is there
     /// but does not decode, and [`AuthorityStoreError::Io`] when it
     /// cannot be read.
-    pub fn archived(&self, revision: u64) -> Result<Option<SignedConfigBundle>, AuthorityStoreError> {
+    pub fn archived(
+        &self,
+        revision: u64,
+    ) -> Result<Option<SignedConfigBundle>, AuthorityStoreError> {
         if !self.state.archive.contains(&revision) {
             return Ok(None);
         }
@@ -2159,7 +2158,12 @@ mod tests {
             assert_eq!(plain, ringed, "{slot} differs once the archive is on");
         }
         assert!(
-            !without.path().join(REVISIONS_DIR).join(ARCHIVE_DIR).join("1.json").exists(),
+            !without
+                .path()
+                .join(REVISIONS_DIR)
+                .join(ARCHIVE_DIR)
+                .join("1.json")
+                .exists(),
             "archive_keep of zero writes no ring at all",
         );
     }
