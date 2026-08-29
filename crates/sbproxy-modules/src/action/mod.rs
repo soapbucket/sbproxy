@@ -182,6 +182,11 @@ pub struct ProxyAction {
     /// and rewrite the upstream `Host` header via `host_override`.
     #[serde(default)]
     pub resolve_override: Option<String>,
+    /// Maximum WebSocket message payload size in bytes when this origin
+    /// carries an upgraded tunnel. Default 10 MB, matching a `websocket`
+    /// action that configures nothing. `0` means no ceiling.
+    #[serde(default = "crate::action::websocket::default_max_message_size")]
+    pub max_message_size: usize,
 }
 
 /// DNS-based service discovery for an upstream hostname.
@@ -1155,6 +1160,7 @@ mod tests {
             service_discovery: None,
             sni_override: None,
             resolve_override: None,
+            max_message_size: 10 * 1024 * 1024,
         });
         assert_eq!(action.action_type(), "proxy");
     }
@@ -1177,6 +1183,7 @@ mod tests {
             service_discovery: None,
             sni_override: None,
             resolve_override: None,
+            max_message_size: 10 * 1024 * 1024,
         });
         let debug = format!("{:?}", action);
         assert!(debug.contains("Proxy"));
@@ -1214,6 +1221,29 @@ mod tests {
         let action = ProxyAction::from_config(json).unwrap();
         assert!(!action.strip_base_path);
         assert!(!action.preserve_query);
+        assert_eq!(action.max_message_size, 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn proxy_action_from_config_honours_max_message_size() {
+        let json = serde_json::json!({
+            "type": "proxy",
+            "url": "http://localhost:3000",
+            "max_message_size": 2048
+        });
+        let action = ProxyAction::from_config(json).unwrap();
+        assert_eq!(action.max_message_size, 2048);
+    }
+
+    #[test]
+    fn proxy_action_from_config_zero_max_message_size_is_unbounded() {
+        let json = serde_json::json!({
+            "type": "proxy",
+            "url": "http://localhost:3000",
+            "max_message_size": 0
+        });
+        let action = ProxyAction::from_config(json).unwrap();
+        assert_eq!(action.max_message_size, 0);
     }
 
     #[test]
@@ -1236,6 +1266,7 @@ mod tests {
             service_discovery: None,
             sni_override: None,
             resolve_override: None,
+            max_message_size: 10 * 1024 * 1024,
         };
         let (host, port, tls) = action.parse_upstream().unwrap();
         assert_eq!(host, "backend");
@@ -1255,6 +1286,7 @@ mod tests {
             service_discovery: None,
             sni_override: None,
             resolve_override: None,
+            max_message_size: 10 * 1024 * 1024,
         };
         let (host, port, tls) = action.parse_upstream().unwrap();
         assert_eq!(host, "api.example.com");
@@ -1274,6 +1306,7 @@ mod tests {
             service_discovery: None,
             sni_override: None,
             resolve_override: None,
+            max_message_size: 10 * 1024 * 1024,
         };
         let (host, port, tls) = action.parse_upstream().unwrap();
         assert_eq!(host, "localhost");
@@ -1293,6 +1326,7 @@ mod tests {
             service_discovery: None,
             sni_override: None,
             resolve_override: None,
+            max_message_size: 10 * 1024 * 1024,
         };
         let (host, port, tls) = action.parse_upstream().unwrap();
         assert_eq!(host, "backend");
@@ -1312,6 +1346,7 @@ mod tests {
             service_discovery: None,
             sni_override: None,
             resolve_override: None,
+            max_message_size: 10 * 1024 * 1024,
         };
         assert!(action.parse_upstream().is_err());
     }

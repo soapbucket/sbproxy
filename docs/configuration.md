@@ -843,7 +843,7 @@ proxy:
 | `state_dir` | path | required | Installed identity plus durable boot, peer-identity high-water, snapshot generation, deployment generation, and authority cursor state. |
 | `snapshot_ttl_secs` | int | `30` | Worker snapshot lifetime; at least two publish intervals. |
 | `publish_interval_secs` | int | `5` | Snapshot publication cadence. |
-| `dead_peer_gc_secs` | int | `300` | Seconds before SWIM removes a dead peer from routing membership. The admin roster retains a bounded tombstone after this GC. |
+| `dead_peer_gc_secs` | int | `300` | Seconds before SWIM removes a dead or gracefully-left peer from routing membership. The admin roster retains a bounded tombstone after this GC. A node that exits cleanly announces `Left` to a fan-out of live peers on SIGTERM, so it is evicted under `graceful_leave` rather than a suspect window later under `dead_timeout`. That announcement is a wire break: every node in the cluster must understand `Left`. |
 | `security.mode` | enum | required | `mtls` for production or `shared_key` for explicit development. |
 | `security.development` | bool | `false` | Must be true for shared-key-only mode. |
 | `security.shared_key` | secret reference | unset | UDP gossip key; required in mTLS production mode too. |
@@ -2016,6 +2016,7 @@ origins:
 | `disable_forwarded_header` | bool | false | Suppress the RFC 7239 `Forwarded` header. |
 | `disable_via_header` | bool | false | Suppress the `Via: 1.1 sbproxy` header. |
 | `retry` | object | unset | Upstream retry policy. See [Upstream retries](#upstream-retries). |
+| `max_message_size` | int | 10485760 | Maximum WebSocket message payload in bytes when this origin carries an upgraded tunnel. Same default and `0` means no ceiling as the `websocket` action. See [websocket.md](websocket.md). |
 
 The same `host_override` and `disable_*_header` flags are accepted on every URL-bearing action: `proxy`, `load_balancer` targets, `websocket`, `grpc` (via the `:authority` field), `graphql`, `a2a`, and `forward_auth`.
 
@@ -2159,6 +2160,7 @@ origins:
 | `deployment_mode` | object | `{mode: normal}` | Deployment mode. See below. |
 | `outlier_detection` | object | unset | Passive ejection policy. See [Outlier detection](#outlier-detection). |
 | `locality` | object | `{min_pool_size: 2}` | Zone-locality tuning. `min_pool_size` deactivates the same-zone preference when the deployment-filtered pool is smaller than this. The pool is counted before health filtering, as Envoy counts cluster hosts for `min_cluster_size`, so a health flap can never toggle the stage on and off. The stage itself needs no block, only `proxy.zone` (or `SB_ZONE`) plus `targets[].zone` labels. See [Zone-aware routing](routing.md#distributing-traffic-the-load-balancer-action). |
+| `max_message_size` | int | 10485760 | Maximum WebSocket message payload in bytes when a target carries an upgraded tunnel. Same default and `0` means no ceiling as the `websocket` action. See [websocket.md](websocket.md). |
 
 Algorithms:
 
@@ -2328,6 +2330,7 @@ origins:
 | `blocked_models` | list | | Block-list of model names. Takes precedence over allow-list. |
 | `data_posture` | object | unset | Data-handling posture requirement: `require_zdr` (default `false`) and `allow_data_collection` (default `true`). A hard provider-eligibility filter applied before any routing strategy runs, composed with the per-request `x-sbproxy-require-zdr` / `x-sbproxy-disallow-data-collection` headers (most restrictive wins). A request left with no eligible provider fails closed naming the constraint and the excluded providers; a block that excludes every configured provider is refused at config load. See [ai-gateway.md](ai-gateway.md#provider-data-posture). |
 | `max_body_size` | int | `67108864` (64 MiB) | Maximum request body size in bytes the gateway accepts, checked while the body arrives rather than once it is buffered. An oversize declared `Content-Length` is refused before the first read, and a chunked upload that declares nothing is refused on the chunk that crosses the cap. Either way the answer is `413` and no provider is contacted, so nothing reaches the response cache or the idempotency store. The same number bounds the buffered upstream response. Unset means 64 MiB rather than unlimited, `0` reads as unset, and values above 1 GiB are clamped to 1 GiB. |
+| `max_message_size` | int | 10485760 | Maximum WebSocket message payload in bytes on `/v1/realtime` and any other upgraded tunnel this action carries. Same default and `0` means no ceiling as the `websocket` action. See [websocket.md](websocket.md). |
 | `guardrails` | object | | Input/output guardrails pipeline. |
 | `budget` | object | | Budget enforcement configuration. |
 | `model_rate_limits` | map | | Per-model rate limit overrides keyed by model name. |

@@ -98,6 +98,9 @@ pub struct LoadBalancerAction {
     /// Minimum eligible-target count for the locality stage; see
     /// [`LocalityConfig::min_pool_size`].
     locality_min_pool_size: usize,
+    /// Maximum WebSocket message payload size in bytes when a target
+    /// carries an upgraded tunnel. Default 10 MB. `0` means no ceiling.
+    pub max_message_size: usize,
     state: LoadBalancerState,
 }
 
@@ -523,6 +526,10 @@ struct LoadBalancerConfig {
     /// Legacy selector kept for compatibility with the Go line.
     #[serde(default)]
     lb_method: Option<String>,
+    /// Maximum WebSocket message payload size in bytes when a target
+    /// carries an upgraded tunnel. Default 10 MB. `0` means no ceiling.
+    #[serde(default = "crate::action::websocket::default_max_message_size")]
+    max_message_size: usize,
 }
 
 fn default_algo() -> Algorithm {
@@ -729,6 +736,7 @@ impl LoadBalancerAction {
             local_zone: std::sync::OnceLock::new(),
             zoned_targets,
             locality_min_pool_size,
+            max_message_size: config.max_message_size,
             state: LoadBalancerState {
                 round_robin_counter: AtomicU64::new(0),
                 connections: (0..num_targets).map(|_| AtomicU32::new(0)).collect(),
@@ -1930,6 +1938,19 @@ mod tests {
         }));
         assert_eq!(lb.algorithm, Algorithm::RoundRobin);
         assert_eq!(lb.targets.len(), 2);
+        assert_eq!(
+            lb.max_message_size,
+            crate::action::websocket::DEFAULT_MAX_MESSAGE_SIZE
+        );
+    }
+
+    #[test]
+    fn from_config_honours_max_message_size() {
+        let lb = make_lb(serde_json::json!({
+            "targets": [{"url": "http://a:8080"}],
+            "max_message_size": 4096
+        }));
+        assert_eq!(lb.max_message_size, 4096);
     }
 
     #[test]

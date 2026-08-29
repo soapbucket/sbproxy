@@ -150,6 +150,8 @@ pub enum ClusterMemberState {
     Suspect,
     /// SWIM declared the member dead.
     Dead,
+    /// The member announced it is leaving.
+    Left,
     /// The member is live but has no usable typed-state transport address.
     Unreachable,
 }
@@ -1263,6 +1265,7 @@ fn member_from_peer(peer: &PeerEntry, reachable: bool) -> ClusterMember {
         PeerState::Alive => ClusterMemberState::Unreachable,
         PeerState::Suspect { .. } => ClusterMemberState::Suspect,
         PeerState::Dead => ClusterMemberState::Dead,
+        PeerState::Left => ClusterMemberState::Left,
     };
     ClusterMember {
         node_id: peer.node_id.clone(),
@@ -1363,6 +1366,11 @@ mod tests {
         assert_eq!(
             member_from_peer(&peer, true).state,
             ClusterMemberState::Dead
+        );
+        peer.state = PeerState::Left;
+        assert_eq!(
+            member_from_peer(&peer, true).state,
+            ClusterMemberState::Left
         );
     }
 

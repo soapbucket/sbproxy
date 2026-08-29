@@ -269,11 +269,10 @@ pub struct AiDecisionView {
     /// gathered (the default).
     pub providers: Vec<ProviderStateView>,
     /// The origin's base-data document (per-model prices and context
-    /// windows), prebuilt in the shared form by
-    /// [`crate::routing_base_data::build_catalog_cel`] so this clone is a
-    /// reference-count bump. Bound as the `ai.catalog` map; `None` (the
-    /// default) binds an empty map, so `ai.model in ai.catalog` is the
-    /// guard either way and never an evaluation error.
+    /// windows), prebuilt in shared form so this clone is a reference-count
+    /// bump. Bound as the `ai.catalog` map; `None` (the default) binds an
+    /// empty map, so `ai.model in ai.catalog` is the guard either way and
+    /// never an evaluation error.
     pub catalog: Option<CelValue>,
 }
 

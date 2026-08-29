@@ -392,6 +392,14 @@ impl MeshNode {
             guard.values().cloned().collect()
         }
     }
+
+    /// Announce this node's departure to live peers and stop the gossip
+    /// loop. Safe to call more than once; [`Drop`] takes the same path.
+    pub fn leave(&self) {
+        if let Some(loop_handle) = self.gossip_loop.as_ref() {
+            loop_handle.request_shutdown();
+        }
+    }
 }
 
 impl Drop for MeshNode {

@@ -181,6 +181,13 @@ pub(super) fn transition_to_alive(
         Err(p) => p.into_inner(),
     };
     if let Some(entry) = super::find_mut(&mut table, target_id, target_addr) {
+        // A graceful leave is terminal at this incarnation. An in-flight
+        // probe ACK from a process that is already shutting down must
+        // not resurrect the peer as Alive; dissemination only accepts
+        // Left -> Alive at a strictly higher incarnation.
+        if matches!(entry.state, PeerState::Left) {
+            return;
+        }
         let prev = entry.state;
         let now = Instant::now();
         entry.state = PeerState::Alive;
@@ -215,11 +222,10 @@ pub(super) fn transition_to_alive(
                 }
             }
             PeerState::Dead => {
-                // Extremely rare: a Dead peer should not produce an
-                // ACK because we stopped probing it. If this happens
-                // (e.g. a witness still knows the peer), accept the
-                // refutation so the cluster converges without manual
-                // intervention.
+                // Extremely rare: a Dead peer should not produce an ACK
+                // because we stopped probing it. If this happens (e.g. a
+                // witness still knows the peer), accept the refutation
+                // so the cluster converges without manual intervention.
                 MESH_SUSPECT_TRANSITIONS
                     .with_label_values(&[PEER_STATE_DEAD, PEER_STATE_ALIVE])
                     .inc();
@@ -234,6 +240,9 @@ pub(super) fn transition_to_alive(
                         incarnation,
                     });
                 }
+            }
+            PeerState::Left => {
+                // Unreachable: the Left check above returns first.
             }
         }
     }
@@ -335,7 +344,7 @@ pub(super) fn sweep_dead_for_gc(
     };
     // Wave 2D: PeerTable handles HashMap + Vec removal in one pass.
     let removed_entries = table.retain_remove(|entry| {
-        matches!(entry.state, PeerState::Dead)
+        matches!(entry.state, PeerState::Dead | PeerState::Left)
             && now.duration_since(entry.last_transition) >= dead_peer_gc
     });
     removed_entries

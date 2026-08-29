@@ -161,7 +161,7 @@ fn live_membership_snapshot(
     let mut live = BTreeMap::new();
     for member in members {
         match member.state {
-            ClusterMemberState::Dead => continue,
+            ClusterMemberState::Dead | ClusterMemberState::Left => continue,
             ClusterMemberState::Alive => {
                 live.insert(member.node_id.clone(), member.incarnation);
             }

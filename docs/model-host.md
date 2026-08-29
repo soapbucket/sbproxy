@@ -1,6 +1,6 @@
 # Model host
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-28*
 
 SBproxy can own model processes on one worker or place them across a managed
 cluster. Model-host control lives under `proxy.model_host`. Depending on its
@@ -1271,10 +1271,13 @@ artifact counts, replica truth, model eligibility, and exclusion reason. The
 top-level `unhealthy_nodes` array repeats only actionable nodes so an admin UI
 can render a prominent alert without hiding them from the main table.
 
-Routing membership may remove a dead peer after `dead_peer_gc_secs`. The model
-directory separately retains a bounded long-lived tombstone with the last safe
-snapshot and current exclusion reason, so the admin roster and unhealthy alert
-do not silently lose failed nodes after routing GC.
+Routing membership may remove a dead or gracefully-left peer after
+`dead_peer_gc_secs`. A node that exits cleanly announces `Left` so it
+is evicted under `graceful_leave` rather than a suspect window later.
+The model directory separately retains a bounded long-lived tombstone
+with the last safe snapshot and current exclusion reason, so the admin
+roster and unhealthy alert do not silently lose failed nodes after
+routing GC.
 
 The response also includes healthy/degraded/unhealthy counts, eligible workers
 and replicas, deployment digest consistency, exact target assignments,

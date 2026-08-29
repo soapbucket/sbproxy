@@ -54,12 +54,15 @@ pub async fn send_via_sse(
 
     let status = resp.status();
     if !status.is_success() {
-        let www_authenticate_present = resp
+        let www_authenticate = resp
             .headers()
-            .contains_key(reqwest::header::WWW_AUTHENTICATE);
+            .get(reqwest::header::WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
         return Err(McpUpstreamHttpStatus {
             status: status.as_u16(),
-            www_authenticate_present,
+            www_authenticate_present: www_authenticate.is_some(),
+            www_authenticate,
         }
         .into());
     }

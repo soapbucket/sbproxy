@@ -378,6 +378,7 @@ mod ai_owned_replay_path_tests {
                 "providers": []
             }))
             .expect("AI config"),
+            max_message_size: sbproxy_modules::action::websocket::DEFAULT_MAX_MESSAGE_SIZE,
         };
         let action = Action::AiProxy(Box::new(ai));
 
@@ -3617,7 +3618,17 @@ pub(super) async fn request_filter(
         };
         if let Some(as_yaml) = yaml {
             let host = pipeline.config.origins[origin_idx].hostname.as_str();
-            let spec = sbproxy_openapi::build(&pipeline.config, Some(host));
+            let version =
+                match sbproxy_openapi::OpenApiVersion::from_query(session.req_header().uri.query())
+                {
+                    Ok(version) => version,
+                    Err(error) => {
+                        let body = serde_json::json!({"error": error.to_string()}).to_string();
+                        send_response(session, 400, "application/json", body.as_bytes()).await?;
+                        return Ok(true);
+                    }
+                };
+            let spec = sbproxy_openapi::build_for_version(&pipeline.config, Some(host), version);
             let (ct, body) = if as_yaml {
                 (
                     "application/yaml",

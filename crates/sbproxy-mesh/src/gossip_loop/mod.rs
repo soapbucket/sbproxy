@@ -22,7 +22,12 @@
 //!    `target` Suspect.
 //! 8. A peer that stays Suspect for `swim_suspect_timeout_secs` without
 //!    a refuting ACK is marked Dead and reported to `PeerEvictor`
-//!    (hash-ring removal). Dead is terminal.
+//!    (hash-ring removal). Dead is terminal unless a later Alive
+//!    rumor with a higher incarnation revives it. A node that is
+//!    shutting down instead announces [`PeerState::Left`] (WOR-2232),
+//!    which is terminal the same way and evicts under `graceful_leave`
+//!    rather than `dead_timeout`. `Left` is a wire break: every node
+//!    in the cluster must understand it.
 //!
 //! # Dissemination (L1)
 //!
@@ -103,7 +108,7 @@ use crate::metrics::{
     ADDR_MAP_KIND_LEARNED, ADDR_MAP_KIND_REWRITTEN, CRYPTO_KIND_GOSSIP, DISSEM_KIND_ACK,
     MESH_ADDR_MAP_UPDATES, MESH_CRYPTO_DECRYPT_FAILED, MESH_DEAD_PEERS_GC,
     MESH_DISSEMINATION_UPDATES_SENT, MESH_PEER_COUNT, MESH_SUSPECT_TRANSITIONS, PEER_STATE_ALIVE,
-    PEER_STATE_DEAD, PEER_STATE_SUSPECT,
+    PEER_STATE_DEAD, PEER_STATE_LEFT, PEER_STATE_SUSPECT,
 };
 use crate::peer_eviction::PeerEvictor;
 
@@ -134,6 +139,11 @@ const MAX_PEER_ENTRIES: usize = 1024;
 /// receivers apply them to their own peer table using incarnation-based
 /// conflict resolution (see `apply_update`). This is a wire break from
 /// K4: all nodes in a cluster must upgrade together.
+///
+/// `PeerStateWire::Left` (graceful leave) is a further wire break on
+/// top of L1: a node that sends `Left` is dropped by peers that
+/// understand it, and a pre-leave node that receives `Left` fails to
+/// decode the whole datagram. Upgrade the cluster together.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum GossipMsg {
     /// Back-compat / legacy. Not emitted by K4; accepted on the receive
@@ -318,6 +328,9 @@ pub enum PeerStateWire {
     Suspect,
     /// Peer is confirmed dead.
     Dead,
+    /// Peer announced its own departure and should be evicted now,
+    /// labelled `graceful_leave` rather than `dead_timeout`.
+    Left,
 }
 
 impl PeerStateWire {
@@ -329,6 +342,7 @@ impl PeerStateWire {
             PeerStateWire::Alive => PEER_STATE_ALIVE,
             PeerStateWire::Suspect => PEER_STATE_SUSPECT,
             PeerStateWire::Dead => PEER_STATE_DEAD,
+            PeerStateWire::Left => PEER_STATE_LEFT,
         }
     }
 }
@@ -366,6 +380,9 @@ pub enum PeerState {
     /// Terminal. The peer has been evicted from the hash ring and will
     /// not be probed again until an operator restarts the node.
     Dead,
+    /// The peer declared it is leaving. Terminal like [`PeerState::Dead`],
+    /// but eviction is labelled `graceful_leave`.
+    Left,
 }
 
 /// Per-peer entry consumed by the SWIM loop.
@@ -731,7 +748,7 @@ impl Disseminator {
 /// Running SWIM loop. Owns the shutdown signal for the protocol task;
 /// the receive task is aborted from within the protocol task on shutdown.
 pub struct GossipLoop {
-    shutdown_tx: Option<oneshot::Sender<()>>,
+    shutdown_tx: std::sync::Mutex<Option<oneshot::Sender<()>>>,
     _protocol_join: JoinHandle<()>,
     local_port: u16,
 }
@@ -1180,7 +1197,7 @@ impl GossipLoop {
         let cipher_proto = cfg.cipher.clone();
         let disseminator_proto = disseminator.clone();
         let join_registry_proto = join_registry.clone();
-        let _self_incarnation_proto = self_incarnation.clone();
+        let self_incarnation_proto = self_incarnation.clone();
         let protocol_join: JoinHandle<()> = tokio::spawn(async move {
             let protocol_period =
                 Duration::from_millis(protocol_cfg.swim_protocol_period_ms.max(1));
@@ -1207,9 +1224,20 @@ impl GossipLoop {
                 tokio::select! {
                     biased;
                     _ = &mut shutdown_rx => {
+                        announce_graceful_leave(
+                            &protocol_cfg,
+                            &peers_proto,
+                            &socket_proto,
+                            cipher_proto.as_ref(),
+                            &seq_proto,
+                            &self_incarnation_proto,
+                            &disseminator_proto,
+                        )
+                        .await;
                         tracing::info!(
                             node_id = %protocol_cfg.node_id,
-                            "SWIM loop shutting down"
+                            event = "mesh_graceful_leave",
+                            "SWIM loop shutting down; leave announced"
                         );
                         recv_task.abort();
                         break;
@@ -1329,6 +1357,7 @@ impl GossipLoop {
                                         PeerState::Alive => alive += 1,
                                         PeerState::Suspect { .. } => suspect += 1,
                                         PeerState::Dead => dead += 1,
+                                        PeerState::Left => {}
                                     }
                                 }
                             }
@@ -1348,15 +1377,28 @@ impl GossipLoop {
         });
 
         Ok(Self {
-            shutdown_tx: Some(shutdown_tx),
+            shutdown_tx: std::sync::Mutex::new(Some(shutdown_tx)),
             _protocol_join: protocol_join,
             local_port,
         })
     }
 
-    /// Signal the loop to stop.
-    pub fn shutdown(mut self) {
-        if let Some(tx) = self.shutdown_tx.take() {
+    /// Signal the loop to stop. The protocol task announces `Left` to
+    /// live peers before it exits, so a clean shutdown is not mistaken
+    /// for a crash.
+    pub fn shutdown(self) {
+        self.request_shutdown();
+    }
+
+    /// Same as [`Self::shutdown`] but usable from `&self` (an `Arc<MeshNode>`
+    /// cannot call a consuming method).
+    pub(crate) fn request_shutdown(&self) {
+        if let Some(tx) = self
+            .shutdown_tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
             let _ = tx.send(());
         }
     }
@@ -1369,9 +1411,7 @@ impl GossipLoop {
 
 impl Drop for GossipLoop {
     fn drop(&mut self) {
-        if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(());
-        }
+        self.request_shutdown();
     }
 }
 
@@ -1691,6 +1731,49 @@ fn normalize_join_address(address: &str, from: SocketAddr) -> Option<String> {
     Some(format!("{host}:{port}"))
 }
 
+/// How many live peers receive an active leave Ping. Dissemination is
+/// otherwise piggybacked on Ping/Ack, and a departing node stops
+/// probing, so passive propagation will not carry the news.
+const LEAVE_FANOUT: usize = 8;
+
+async fn announce_graceful_leave(
+    cfg: &GossipLoopConfig,
+    peers: &Arc<RwLock<PeerTable>>,
+    socket: &Arc<UdpSocket>,
+    cipher: Option<&crate::crypto::Cipher>,
+    seq_gen: &Arc<AtomicU64>,
+    self_incarnation: &Arc<AtomicU64>,
+    disseminator: &Arc<Disseminator>,
+) {
+    let incarnation = self_incarnation
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    let leave = PeerUpdate {
+        node_id: cfg.node_id.clone(),
+        state: PeerStateWire::Left,
+        incarnation,
+    };
+    disseminator.push(leave.clone());
+    let addrs = live_peer_addresses(peers, &cfg.node_id);
+    for addr in addrs.into_iter().take(LEAVE_FANOUT) {
+        let Ok(target) = addr.parse::<SocketAddr>() else {
+            continue;
+        };
+        let seq = seq_gen.fetch_add(1, Ordering::Relaxed);
+        send_msg(
+            socket,
+            cipher,
+            &GossipMsg::Ping {
+                seq,
+                from: cfg.node_id.clone(),
+                updates: vec![leave.clone()],
+            },
+            target,
+        )
+        .await;
+    }
+}
+
 fn live_peer_addresses(peers: &Arc<RwLock<PeerTable>>, excluded_node_id: &str) -> Vec<String> {
     peers
         .read()
@@ -1902,7 +1985,7 @@ pub(super) fn count_maybe_alive(peers: &Arc<RwLock<PeerTable>>) -> usize {
     };
     guard
         .iter()
-        .filter(|p| !matches!(p.state, PeerState::Dead))
+        .filter(|p| !matches!(p.state, PeerState::Dead | PeerState::Left))
         .count()
 }
 
@@ -1972,14 +2055,15 @@ mod tests {
     // scope so the existing test bodies keep compiling unchanged.
     use super::dissemination::{apply_update, apply_updates, decide_transition, TransitionOutcome};
     use super::ping_req::pick_indirect_witnesses;
-    use super::probe::{sweep_dead_for_gc, sweep_suspects_to_dead};
+    use super::probe::{sweep_dead_for_gc, sweep_suspects_to_dead, transition_to_alive};
     // Per-phase metrics constants the tests assert on; these used to live
     // inline in the parent module's `use crate::metrics::{...}` block but
     // now belong to the phase modules. Re-import here so `super::*` still
     // covers everything tests reference.
     use crate::metrics::{
         DISSEM_IGNORE_STALE_INCARNATION, DISSEM_IGNORE_TERMINAL_DEAD, DISSEM_IGNORE_UNKNOWN_PEER,
-        DISSEM_TRANS_DEAD_ALIVE, MESH_DISSEMINATION_UPDATES_IGNORED, MESH_PROBE_DIRECT_SUCCESS,
+        DISSEM_TRANS_ALIVE_LEFT, DISSEM_TRANS_DEAD_ALIVE, DISSEM_TRANS_LEFT_ALIVE,
+        MESH_DISSEMINATION_UPDATES_IGNORED, MESH_PROBE_DIRECT_SUCCESS,
     };
 
     /// Serializes tests that read+assert on the global `MESH_ADDR_MAP_UPDATES`
@@ -2147,6 +2231,33 @@ mod tests {
         let guard = peers.read().unwrap();
         let entry = guard.get_by_node_id("peer-a").expect("peer-a present");
         assert!(matches!(entry.state, PeerState::Alive));
+    }
+
+    #[test]
+    fn an_ack_does_not_revive_a_peer_that_has_left() {
+        let now = Instant::now();
+        let left_entry = PeerEntry {
+            node_id: "peer-a".to_string(),
+            addr: "127.0.0.1:1".to_string(),
+            state: PeerState::Left,
+            last_ack: now - Duration::from_secs(1),
+            last_heartbeat: now - Duration::from_secs(1),
+            incarnation: 3,
+            last_transition: now - Duration::from_millis(100),
+        };
+        let peers = Arc::new(RwLock::new(PeerTable::from_entries(vec![left_entry])));
+        let disseminator = Arc::new(Disseminator::new());
+        transition_to_alive(&peers, "peer-a", "127.0.0.1:1", Some(&disseminator));
+        let guard = peers.read().unwrap();
+        let entry = guard.get_by_node_id("peer-a").expect("peer-a present");
+        assert!(
+            matches!(entry.state, PeerState::Left),
+            "an in-flight ACK must not resurrect a graceful leave"
+        );
+        assert!(
+            disseminator.drain_for_send(16).is_empty(),
+            "an ignored leave ACK must not rebroadcast Alive"
+        );
     }
 
     #[test]
@@ -3099,6 +3210,74 @@ mod tests {
             TransitionOutcome::Accept {
                 new_state: PeerState::Alive,
                 transition_label: DISSEM_TRANS_DEAD_ALIVE,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_self_declared_leave_is_accepted_from_alive_and_is_not_dead() {
+        let outcome = decide_transition(
+            PeerState::Alive,
+            3,
+            &PeerUpdate {
+                node_id: "b".into(),
+                state: PeerStateWire::Left,
+                incarnation: 3,
+            },
+        );
+        assert!(matches!(
+            outcome,
+            TransitionOutcome::Accept {
+                new_state: PeerState::Left,
+                transition_label: DISSEM_TRANS_ALIVE_LEFT,
+                ..
+            }
+        ));
+        let from_dead = decide_transition(
+            PeerState::Dead,
+            3,
+            &PeerUpdate {
+                node_id: "b".into(),
+                state: PeerStateWire::Left,
+                incarnation: 99,
+            },
+        );
+        assert!(matches!(
+            from_dead,
+            TransitionOutcome::Ignore(DISSEM_IGNORE_TERMINAL_DEAD)
+        ));
+    }
+
+    #[test]
+    fn a_left_peer_rejoins_on_higher_incarnation_alive() {
+        let same = decide_transition(
+            PeerState::Left,
+            3,
+            &PeerUpdate {
+                node_id: "b".into(),
+                state: PeerStateWire::Alive,
+                incarnation: 3,
+            },
+        );
+        assert!(matches!(
+            same,
+            TransitionOutcome::Ignore(DISSEM_IGNORE_TERMINAL_DEAD)
+        ));
+        let rejoin = decide_transition(
+            PeerState::Left,
+            3,
+            &PeerUpdate {
+                node_id: "b".into(),
+                state: PeerStateWire::Alive,
+                incarnation: 4,
+            },
+        );
+        assert!(matches!(
+            rejoin,
+            TransitionOutcome::Accept {
+                new_state: PeerState::Alive,
+                transition_label: DISSEM_TRANS_LEFT_ALIVE,
                 ..
             }
         ));

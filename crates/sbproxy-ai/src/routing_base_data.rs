@@ -45,13 +45,14 @@
 //! the handler config, like the router) and converted to a
 //! [`CelValue::Shared`], so each request binds it by reference-count bump
 //! rather than deep copy. Reload swaps in a new handler config, whose
-//! catalog rebuilds against the then-current price table; `set_price_table`
-//! runs inside `from_config`, before any request can trigger the build.
+//! catalog rebuilds against that origin's price table. Two origins with
+//! different `model_prices` therefore keep distinct catalogs (WOR-2431).
 
 use std::collections::{BTreeSet, HashMap};
 
 use sbproxy_extension::cel::CelValue;
 
+use crate::budget::PriceTable;
 use crate::provider::ProviderConfig;
 
 /// Build the `ai.catalog` document for one origin's provider set, already
@@ -61,8 +62,11 @@ use crate::provider::ProviderConfig;
 /// This is only called from the policy-gated view sites, so the warning
 /// below fires exactly when a configured policy is about to read an empty
 /// catalog, once per config generation (the caller caches the result).
-pub fn build_catalog_cel(providers: &[ProviderConfig]) -> CelValue {
-    let entries = catalog_entries(providers);
+pub(crate) fn build_catalog_cel(
+    providers: &[ProviderConfig],
+    price_table: &PriceTable,
+) -> CelValue {
+    let entries = catalog_entries(providers, price_table);
     if entries.is_empty() && providers.iter().all(|p| p.models.is_empty()) {
         // A provider with no `models:` defers to the provider catalog and is
         // perfectly serviceable, but it declares nothing for this document,
@@ -79,7 +83,10 @@ pub fn build_catalog_cel(providers: &[ProviderConfig]) -> CelValue {
 
 /// The owned entries behind [`build_catalog_cel`], separated so tests can
 /// inspect content without reaching into the converted form.
-fn catalog_entries(providers: &[ProviderConfig]) -> HashMap<String, CelValue> {
+fn catalog_entries(
+    providers: &[ProviderConfig],
+    price_table: &PriceTable,
+) -> HashMap<String, CelValue> {
     // BTreeSet: dedupe across providers and keep iteration deterministic.
     let models: BTreeSet<&str> = providers
         .iter()
@@ -89,7 +96,7 @@ fn catalog_entries(providers: &[ProviderConfig]) -> HashMap<String, CelValue> {
     let mut entries = HashMap::new();
     for model in models {
         let mut entry = HashMap::new();
-        if let Some(price) = crate::budget::catalog_price(model) {
+        if let Some(price) = crate::budget::catalog_price_in(price_table, model) {
             entry.insert(
                 "input_per_million".to_string(),
                 CelValue::Float(price.input_per_million),
@@ -102,7 +109,7 @@ fn catalog_entries(providers: &[ProviderConfig]) -> HashMap<String, CelValue> {
         // WOR-2647: one resolution, shared with the `/v1/models`
         // listing. Two derivations of the same fact is how a policy and
         // a client end up reading different windows for one model.
-        let facts = crate::context_window::model_facts(model);
+        let facts = crate::context_window::model_facts_from_table(model, price_table);
         if let Some(window) = facts.context_window {
             entry.insert(
                 "context_window".to_string(),
@@ -146,7 +153,7 @@ mod tests {
             // Duplicate declaration across providers must not duplicate entries.
             provider_with_models(&["gpt-4o"]),
         ];
-        let entries = catalog_entries(&providers);
+        let entries = catalog_entries(&providers, &PriceTable::new());
         assert_eq!(entries.len(), 1, "unknown models must be omitted");
 
         let CelValue::Map(entry) = &entries["gpt-4o"] else {
@@ -167,10 +174,88 @@ mod tests {
     }
 
     #[test]
+    fn two_operator_tables_keep_distinct_catalog_prices() {
+        let providers = [provider_with_models(&["split-priced-model"])];
+        let cheap = crate::budget::build_price_table(
+            &[(
+                "split-priced-model".to_string(),
+                crate::budget::ModelPriceConfig {
+                    input_per_million: 1.0,
+                    output_per_million: 2.0,
+                    cache_read_per_million: 0.0,
+                    cache_write_per_million: 0.0,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            None,
+        );
+        let dear = crate::budget::build_price_table(
+            &[(
+                "split-priced-model".to_string(),
+                crate::budget::ModelPriceConfig {
+                    input_per_million: 9.0,
+                    output_per_million: 8.0,
+                    cache_read_per_million: 0.0,
+                    cache_write_per_million: 0.0,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            None,
+        );
+        let cheap_entries = catalog_entries(&providers, &cheap);
+        let dear_entries = catalog_entries(&providers, &dear);
+        let CelValue::Map(cheap_entry) = &cheap_entries["split-priced-model"] else {
+            panic!("cheap entry must be a map");
+        };
+        let CelValue::Map(dear_entry) = &dear_entries["split-priced-model"] else {
+            panic!("dear entry must be a map");
+        };
+        assert!(matches!(
+            cheap_entry["input_per_million"],
+            CelValue::Float(v) if (v - 1.0).abs() < 1e-12
+        ));
+        assert!(matches!(
+            dear_entry["input_per_million"],
+            CelValue::Float(v) if (v - 9.0).abs() < 1e-12
+        ));
+    }
+
+    #[test]
+    fn two_operator_tables_keep_distinct_catalog_windows() {
+        let providers = [provider_with_models(&["split-window-model"])];
+        let dir = tempfile::tempdir().expect("temp dir");
+        let card = dir.path().join("card.json");
+        std::fs::write(&card, r#"{"split-window-model":{"max_output_tokens":64}}"#)
+            .expect("write rate card");
+        let windowed = crate::budget::build_price_table(
+            &HashMap::<String, crate::budget::ModelPriceConfig>::new(),
+            Some(card.to_str().expect("utf8 path")),
+        );
+        let windowed_entries = catalog_entries(&providers, &windowed);
+        let empty_entries = catalog_entries(&providers, &PriceTable::new());
+        let CelValue::Map(windowed_entry) = &windowed_entries["split-window-model"] else {
+            panic!("windowed entry must be a map");
+        };
+        assert!(matches!(
+            windowed_entry["max_output_tokens"],
+            CelValue::Int(64)
+        ));
+        assert!(
+            !empty_entries.contains_key("split-window-model"),
+            "an origin with no rate card must not inherit another origin's window"
+        );
+    }
+
+    #[test]
     fn the_built_catalog_is_shared() {
         let providers = [provider_with_models(&["gpt-4o"])];
         assert!(
-            matches!(build_catalog_cel(&providers), CelValue::Shared(_)),
+            matches!(
+                build_catalog_cel(&providers, &PriceTable::new()),
+                CelValue::Shared(_)
+            ),
             "the catalog must bind by refcount bump, not deep copy"
         );
     }

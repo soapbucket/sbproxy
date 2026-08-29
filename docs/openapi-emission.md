@@ -1,9 +1,9 @@
 # OpenAPI Emission
-*Last modified: 2026-08-27*
+*Last modified: 2026-08-28*
 
 SBproxy documents and governs your API. It does not just proxy it.
 
-When you put SBproxy in front of an upstream service, the gateway already knows the routes, the auth schemes, the rate limits, and the response cache. OpenAPI emission turns that knowledge into a published OpenAPI 3.0 document that buyers can consume with standard tooling (Postman, Swagger UI, ReadMe.io, Stainless, SDK generators) without ever seeing your YAML config or talking to the upstream.
+When you put SBproxy in front of an upstream service, the gateway already knows the routes, the auth schemes, the rate limits, and the response cache. OpenAPI emission turns that knowledge into a published OpenAPI document (3.0.3 by default, 3.1 on request) that buyers can consume with standard tooling (Postman, Swagger UI, ReadMe.io, Stainless, SDK generators) without ever seeing your YAML config or talking to the upstream.
 
 The result: SBproxy is the single source of truth for what your API looks like, on the wire, right now.
 
@@ -263,6 +263,13 @@ curl -s -H 'Host: api.localhost' \
 ```
 
 Off by default. Set `expose_openapi: true` on the origin to publish. Useful for SDK generators, contract testing, and buyer-side discovery without coupling consumers to the admin API. Unlike the admin endpoint, this surface rebuilds and re-renders the document on every request; it is not cached by revision.
+
+The document is OpenAPI 3.0.3 by default. Pass `version=3.1` (or `version=3.1.0`) to get OpenAPI 3.1.0, which rewrites Schema Objects onto JSON Schema 2020-12: `nullable: true` becomes `type: [T, "null"]`, boolean `exclusiveMinimum`/`exclusiveMaximum` become numeric, and schema `example` becomes `examples`. `version=3.0` and `version=3.0.3` keep the default. Any other value is `400`. The admin `/api/openapi.json` surface stays 3.0.3.
+
+```bash
+curl -s -H 'Host: api.localhost' \
+  'http://127.0.0.1:8080/.well-known/openapi.json?version=3.1'
+```
 
 ```yaml
 origins:

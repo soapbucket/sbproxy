@@ -23,6 +23,8 @@
 //! - [`schema_drift`] / [`cassette_drift`] - CI drift detection (drift CLI).
 //! - [`egress`] - Deterministic allowlist for gateway-originated traffic.
 //! - [`auth`] - Run-as-user upstream credential minting (WOR-1792).
+//! - [`auth_state`] - Server runtime vs per-tool-call auth challenges
+//!   (WOR-2110).
 //! - [`stdio`] - Supervised persistent stdio sessions for local MCP
 //!   servers (one child per configured server, WOR-2453).
 //! - [`peer_profile`] - Per-tenant downgrade-resistant negotiation
@@ -30,6 +32,7 @@
 
 pub mod access_control;
 pub mod auth;
+pub mod auth_state;
 pub mod cassette_drift;
 pub mod cedar_hook;
 pub mod codemode_ts;

@@ -109,10 +109,8 @@ impl PeerEvictor {
     ///
     /// The one production caller is the SWIM sweep, which passes
     /// `dead_timeout` when a Suspect peer outlives `suspect_timeout`.
-    /// There is no graceful-leave caller: no leave message exists on the
-    /// wire, so a departing node is only ever noticed by the failure
-    /// detector. The `graceful_leave` reason on [`metrics::MESH_PEER_EVICTED`]
-    /// carries the detail.
+    /// A self-declared departure passes `graceful_leave` when a
+    /// `PeerStateWire::Left` update is applied.
     pub fn evict(&self, peer: &str, reason: &str) {
         {
             let mut map = self.failures.lock().expect("mutex poisoned");

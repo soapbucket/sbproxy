@@ -1,10 +1,10 @@
-//! Emit an OpenAPI 3.0 document describing the routes a gateway config exposes.
+//! Emit an OpenAPI document describing the routes a gateway config exposes.
 //!
 //! Walks a [`sbproxy_config::CompiledConfig`] snapshot and produces an
-//! OpenAPI 3.0 JSON document covering paths, methods, parameters, security
-//! schemes, response codes, CORS, and cache directives. Buyers consume the
-//! emitted spec with standard tooling (Postman, Swagger UI, ReadMe.io,
-//! Stainless, etc.).
+//! OpenAPI 3.0.3 JSON document by default (3.1.0 when a caller asks) covering
+//! paths, methods, parameters, security schemes, response codes, CORS, and
+//! cache directives. Buyers consume the emitted spec with standard tooling
+//! (Postman, Swagger UI, ReadMe.io, Stainless, etc.).
 //!
 //! # Mapping
 //!
@@ -63,8 +63,13 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod dialect;
+
+use dialect::to_openapi_31;
 use sbproxy_config::{CompiledConfig, RawForwardRule};
 use serde_json::{json, Map, Value};
+
+pub use dialect::{InvalidOpenApiVersion, OpenApiVersion};
 
 /// The verbs an origin with an empty `allowed_methods` is described as
 /// serving.
@@ -105,13 +110,31 @@ impl std::fmt::Display for EmissionWarning {
     }
 }
 
-/// Build an OpenAPI 3.0 document from a compiled config snapshot.
+/// Build an OpenAPI 3.0.3 document from a compiled config snapshot.
 ///
 /// When `host_filter` is `Some(host)`, only origins whose hostname matches
 /// the filter are emitted - used by the per-host `/.well-known/openapi.json`
 /// endpoint. When `None`, every configured origin is included.
+///
+/// 3.0.3 is the default. Call [`build_for_version`] for 3.1.
 pub fn build(snapshot: &CompiledConfig, host_filter: Option<&str>) -> Value {
-    build_document(snapshot, host_filter).0
+    build_for_version(snapshot, host_filter, OpenApiVersion::V303)
+}
+
+/// Build an OpenAPI document in the requested version.
+///
+/// 3.0.3 is produced directly. 3.1.0 is that document with the schema
+/// dialect rewritten to JSON Schema 2020-12.
+pub fn build_for_version(
+    snapshot: &CompiledConfig,
+    host_filter: Option<&str>,
+    version: OpenApiVersion,
+) -> Value {
+    let spec = build_document(snapshot, host_filter).0;
+    match version {
+        OpenApiVersion::V303 => spec,
+        OpenApiVersion::V310 => to_openapi_31(spec),
+    }
 }
 
 /// Everything a config reload would want to warn about in one pass over
@@ -1296,6 +1319,24 @@ mod tests {
         assert!(spec["info"].is_object());
         assert!(spec["paths"].is_object());
         assert!(spec["servers"].is_array());
+    }
+
+    #[test]
+    fn build_for_version_31_rewrites_the_openapi_field_and_leaves_303_unchanged() {
+        let snap = make_minimal_snapshot();
+        let v303 = build(&snap, None);
+        let v303_again = build_for_version(&snap, None, OpenApiVersion::V303);
+        assert_eq!(v303, v303_again, "3.0.3 must stay the default output");
+        assert_eq!(v303["openapi"], "3.0.3");
+
+        let v31 = build_for_version(&snap, None, OpenApiVersion::V310);
+        assert_eq!(v31["openapi"], "3.1.0");
+        assert_eq!(
+            v31["jsonSchemaDialect"],
+            "https://json-schema.org/draft/2020-12/schema"
+        );
+        // Same paths and operations; only the dialect changed.
+        assert_eq!(v31["paths"], v303["paths"]);
     }
 
     #[test]

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Soap Bucket LLC
 
-//! MCP OAuth broker operator surface (`GET /admin/mcp-oauth`).
+//! MCP OAuth broker and federated MCP runtime operator surfaces
+//! (`GET /admin/mcp-oauth`, `GET /admin/mcp-runtime`).
 //!
 //! `sbproxy-mcp-gateway` ships its own `GET {base_path}/admin/status`
 //! for a host that embeds the crate's axum router. sbproxy is not that
@@ -18,8 +19,12 @@
 //! `mcp` action, which is what makes the broker half consistent with
 //! the federation half's `GET /admin/federation`.
 //!
-//! A console page for this is separate scope, under the admin console
-//! epic; `docs/admin-api-reference.md` says so beside the route.
+//! `GET /admin/mcp-runtime` is the WOR-2110 surface: each federated
+//! server's discriminated runtime state (`starting` / `ready` /
+//! `authRequired` / `error` / `stopped`) plus in-flight tool-call
+//! step-up challenges, distinct from operator enable/disable intent.
+//! A console page for both is separate scope, under the admin console
+//! epic; `docs/admin-api-reference.md` says so beside the routes.
 
 use serde_json::json;
 
@@ -33,6 +38,12 @@ pub fn dispatch(method: &str, path: &str) -> Option<Resp> {
     match path_only {
         "/admin/mcp-oauth" if method.eq_ignore_ascii_case("GET") => Some(status()),
         "/admin/mcp-oauth" => Some((
+            405,
+            "application/json",
+            r#"{"error":"method not allowed"}"#.to_string(),
+        )),
+        "/admin/mcp-runtime" if method.eq_ignore_ascii_case("GET") => Some(runtime()),
+        "/admin/mcp-runtime" => Some((
             405,
             "application/json",
             r#"{"error":"method not allowed"}"#.to_string(),
@@ -82,6 +93,32 @@ fn status() -> Resp {
     )
 }
 
+/// `GET /admin/mcp-runtime`: discriminated server runtime state and
+/// in-flight tool-call auth challenges (WOR-2110). A console page is
+/// separate scope, under the admin console epic.
+fn runtime() -> Resp {
+    let pipeline = crate::reload::current_pipeline();
+    let mut federations = Vec::new();
+    for action in &pipeline.actions {
+        let sbproxy_modules::action::Action::Mcp(mcp) = action else {
+            continue;
+        };
+        federations.push(mcp.federation.runtime_status_json());
+    }
+    if federations.is_empty() {
+        return (
+            200,
+            "application/json",
+            json!({ "enabled": false }).to_string(),
+        );
+    }
+    (
+        200,
+        "application/json",
+        json!({ "enabled": true, "federations": federations }).to_string(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,6 +140,23 @@ mod tests {
     #[test]
     fn a_query_string_does_not_stop_the_route_matching() {
         assert!(dispatch("GET", "/admin/mcp-oauth?pretty=1").is_some());
+        assert!(dispatch("GET", "/admin/mcp-runtime?pretty=1").is_some());
+    }
+
+    #[test]
+    fn mcp_runtime_without_federation_reports_disabled_rather_than_404() {
+        let (status, content_type, body) = runtime();
+        assert_eq!(status, 200);
+        assert_eq!(content_type, "application/json");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(value["enabled"], false);
+    }
+
+    #[test]
+    fn mcp_runtime_rejects_non_get() {
+        let (status, _, body) = dispatch("POST", "/admin/mcp-runtime").expect("claimed");
+        assert_eq!(status, 405);
+        assert!(body.contains("method not allowed"));
     }
 
     #[test]

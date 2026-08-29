@@ -9685,6 +9685,7 @@ dependencies = [
  "compact_str 0.8.1",
  "http 1.4.0",
  "inventory",
+ "jsonschema 0.47.0",
  "sbproxy-config",
  "serde",
  "serde_json",
