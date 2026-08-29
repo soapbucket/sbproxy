@@ -1,0 +1,4 @@
+{
+  "type": "fixed",
+  "message": "The response cache no longer stores a `Set-Cookie` header. A shared cache entry is replayed to every caller that matches its key, so a stored cookie was handed to clients it was never issued for; with an `abtest` origin that meant a cached A/B response pinned every later client to the first one's variant."
+}

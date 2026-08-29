@@ -238,6 +238,19 @@ fn response_cache_store_refusal<'a>(
 /// either of them changed. `ETag`, `Last-Modified`, and
 /// `Content-Digest` are the upstream's, computed over the upstream's
 /// representation, which is exactly what the cache stores.
+///
+/// # `Set-Cookie` never goes in
+///
+/// Separate from the coding question and for a different reason. The
+/// entry is keyed on the request, so it is replayed to every caller
+/// that matches the key; a `Set-Cookie` inside it is handed to clients
+/// it was never minted for. That is what RFC 9111 section 7.3 warns
+/// shared caches about, and WOR-2671 turned it into something
+/// observable: `abtest` appends its sticky pin in `response_filter`
+/// just above the block that calls this, so before this strip a cached
+/// A/B response pinned every later client to the first one's variant.
+/// The client whose request missed still gets its own cookie; only the
+/// stored copy is dropped.
 fn cacheable_response_headers(
     headers: &http::HeaderMap,
     proxy_coded: bool,
@@ -259,6 +272,28 @@ fn cacheable_response_headers(
             continue;
         }
         if proxy_coded && name == "content-encoding" {
+            continue;
+        }
+        // WOR-2671: never store a `Set-Cookie` in a shared cache.
+        //
+        // This cache is keyed on the request, not on the client, so one
+        // stored entry is replayed to every caller that matches the key.
+        // A `Set-Cookie` captured into it is therefore handed to clients
+        // it was never minted for. RFC 9111 section 7.3 names this for
+        // shared caches specifically, and the `abtest` action made it
+        // concrete here: its sticky pin is appended in `response_filter`
+        // just above the block that captures these headers, so a cached
+        // A/B response pinned every later client to the first one's
+        // variant and quietly merged two cohorts into one.
+        //
+        // Stripped rather than refusing to store the response, because
+        // the body is still perfectly cacheable and refusing would turn
+        // any origin that sets a cookie into an uncacheable one. The
+        // client that triggered the miss still receives its own
+        // `Set-Cookie`: this only governs the copy that goes into the
+        // entry, and `abtest` mints a fresh pin for any later client
+        // that arrives without one.
+        if name == "set-cookie" || name == "set-cookie2" {
             continue;
         }
         if let Ok(value) = value.to_str() {
@@ -10169,6 +10204,39 @@ origins:
             );
         }
         headers
+    }
+
+    /// A shared cache entry must never carry a `Set-Cookie`.
+    ///
+    /// The entry is keyed on the request, so it is replayed to every
+    /// caller that matches; a cookie stored in it is handed to clients
+    /// it was never minted for. WOR-2671 made this observable rather
+    /// than theoretical: `abtest` appends its sticky pin in
+    /// `response_filter` immediately above the block that captures
+    /// these headers, so a cached A/B response pinned every later
+    /// client to the first one's variant and merged two cohorts into
+    /// one. The e2e that caught it is
+    /// `a_cached_abtest_response_never_replays_the_first_client_pin`.
+    #[test]
+    fn a_captured_header_set_never_carries_a_cookie() {
+        let captured = cacheable_response_headers(
+            &response_headers(&[
+                ("content-type", "application/json"),
+                ("set-cookie", "sb_ab_variant=experiment; Path=/; HttpOnly"),
+                ("set-cookie2", "legacy=value"),
+                ("etag", "\"abc\""),
+            ]),
+            false,
+        );
+        let names: Vec<&str> = captured.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            !names.contains(&"set-cookie") && !names.contains(&"set-cookie2"),
+            "a cookie reached the cache entry: {captured:?}"
+        );
+        // The rest of the response is still cacheable: the fix drops one
+        // header, it does not refuse the entry.
+        assert!(names.contains(&"content-type"));
+        assert!(names.contains(&"etag"));
     }
 
     /// A cache entry must not claim a content coding the cache is not

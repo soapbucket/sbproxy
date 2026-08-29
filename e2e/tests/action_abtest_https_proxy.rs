@@ -332,3 +332,112 @@ origins:
     assert_eq!(entry["status"], json!(502));
     assert_eq!(entry["method"], json!("GET"));
 }
+
+/// The sticky pin and the response cache, together.
+///
+/// The pin is appended in `response_filter`, and the response cache
+/// captures headers later in that same function, so a stored entry can
+/// carry the `Set-Cookie` the proxy just minted. If it does, and the
+/// entry is replayed, a second client that sent no cookie is handed the
+/// first client's pin. That is not a slow cache: it silently corrupts
+/// every result the A/B split exists to produce, because two clients
+/// that were never assigned the same variant now report as one cohort.
+/// In shape it is a cross-client cookie leak, even though the value
+/// this cookie carries today is only a variant name.
+///
+/// Three properties, in the order they matter:
+///
+/// 1. A cached hit must not replay a `Set-Cookie`.
+/// 2. A second client sending no cookie gets its own pin, not the
+///    first client's.
+/// 3. The cache still works on this origin, so property 1 is not
+///    passing because nothing was ever cached.
+#[test]
+fn a_cached_abtest_response_never_replays_the_first_client_pin() {
+    let experiment =
+        MockUpstream::start(json!({"variant": "experiment"})).expect("experiment upstream");
+    let yaml = format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "abtest-cache.localhost":
+    action:
+      type: abtest
+      sticky_cookie: sb_ab_variant
+      variants:
+        - name: experiment
+          url: "{}"
+          weight: 1
+    response_cache:
+      enabled: true
+      ttl: 60
+      cacheable_methods: [GET]
+      cacheable_status: [200]
+"#,
+        experiment.base_url(),
+    );
+    let proxy = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
+
+    // First client, no cookie: takes the pick and is handed a pin.
+    let first = proxy
+        .get("/cached", "abtest-cache.localhost")
+        .expect("first client request");
+    assert_eq!(first.status, 200);
+    let first_pin = first
+        .headers
+        .get("set-cookie")
+        .expect("a first visit is handed a pin")
+        .clone();
+    assert!(first_pin.starts_with("sb_ab_variant=experiment;"));
+
+    // Warm the cache. Poll rather than assume the store is synchronous.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut cached = None;
+    while std::time::Instant::now() < deadline {
+        let response = proxy
+            .get("/cached", "abtest-cache.localhost")
+            .expect("cache poll");
+        if response
+            .headers
+            .get("x-sbproxy-cache")
+            .is_some_and(|v| v == "HIT")
+        {
+            cached = Some(response);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let Some(hit) = cached else {
+        // Property 3 failed: nothing cached, so properties 1 and 2 would
+        // pass vacuously. Say so rather than reporting a green run.
+        panic!(
+            "the response cache never served a HIT on an abtest origin, so this test \
+             cannot show anything about what a hit replays"
+        );
+    };
+
+    // Property 1: the replayed entry carries no pin.
+    assert!(
+        !hit.headers.contains_key("set-cookie"),
+        "a cached abtest response replayed a Set-Cookie; every client served from this \
+         entry would be pinned to the first client's variant: {:?}",
+        hit.headers.get("set-cookie")
+    );
+
+    // Property 2: a client arriving fresh still gets its own pin, so the
+    // fix cannot be "stop minting pins on a cacheable origin".
+    let second = proxy
+        .get("/cached-other", "abtest-cache.localhost")
+        .expect("second client request");
+    assert_eq!(second.status, 200);
+    let second_pin = second
+        .headers
+        .get("set-cookie")
+        .expect("a second client with no cookie must be handed its own pin");
+    assert!(
+        second_pin.starts_with("sb_ab_variant=experiment;"),
+        "unexpected pin for the second client: {second_pin}"
+    );
+}
