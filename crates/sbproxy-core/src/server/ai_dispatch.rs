@@ -22853,6 +22853,35 @@ mod external_guardrail_context_tests {
             )
         }
 
+        /// Starts of SSE data frames carrying a JSON payload in a
+        /// relayed response.
+        ///
+        /// Starts, not completed frames: this matches the `data:`
+        /// prefix and the byte that opens its JSON payload, and never
+        /// looks for the terminating blank line, so a caller waiting on
+        /// `n` has `n - 1` frames delivered whole and one begun.
+        /// Callers want a lower bound on delivered content and get one;
+        /// the caller below needs 9 completion tokens and waits for
+        /// about 70.
+        ///
+        /// `data: [DONE]` and the response headers are deliberately not
+        /// counted: a caller waiting on this wants frames the usage
+        /// estimator can draw completion text out of.
+        fn delivered_sse_frames(buffer: &[u8]) -> usize {
+            // Spelled as a code point rather than written out.
+            // `scripts/scan-pub-item-usage.py` brace-counts `#[cfg(test)]`
+            // regions, so an unbalanced brace inside a literal here
+            // extends the region it computes past the end of this module
+            // and mis-files the production references below it as test
+            // consumers. `sbproxy_ai::model_group::routing_name` was the
+            // one that moved.
+            const JSON_OPEN: u8 = 0x7b;
+            buffer
+                .windows(7)
+                .filter(|window| window.starts_with(b"data: ") && window[6] == JSON_OPEN)
+                .count()
+        }
+
         /// A downstream client that reads the streamed response and
         /// breaks its connection when the test says so.
         ///
@@ -22864,6 +22893,40 @@ mod external_guardrail_context_tests {
         async fn streaming_downstream_session(
             body: serde_json::Value,
         ) -> (Session, tokio::sync::oneshot::Sender<()>, DownstreamClient) {
+            let (session, close, client, _delivered) =
+                streaming_downstream_session_watching_frames(body, None).await;
+            (session, close, client)
+        }
+
+        /// The same client, plus a signal that fires once it has read
+        /// `announce_frames` data frames off the relayed response.
+        ///
+        /// This is the happens-before edge a test needs before it can
+        /// drop a dispatch mid-stream. The bytes the client counts are
+        /// the relay's own downstream writes, and the relay only makes
+        /// them from inside `relay_ai_stream`, which is downstream of
+        /// the point where the settle guard is armed. Reading them is
+        /// therefore proof that the guard exists.
+        ///
+        /// A wall-clock deadline is not that proof and cannot be made
+        /// into one by raising it. The request side of a dispatch builds
+        /// the model's BPE table on the first call in a process, which
+        /// is a synchronous block no timer can preempt: on a loaded
+        /// machine the whole deadline can pass before the relay exists
+        /// at all, and the test then reads the unarmed `None` and
+        /// reports a settlement failure that never happened.
+        ///
+        /// `None` counts nothing and never fires, which is what every
+        /// caller that does not need the edge wants.
+        async fn streaming_downstream_session_watching_frames(
+            body: serde_json::Value,
+            announce_frames: Option<usize>,
+        ) -> (
+            Session,
+            tokio::sync::oneshot::Sender<()>,
+            DownstreamClient,
+            tokio::sync::oneshot::Receiver<()>,
+        ) {
             let body = serde_json::to_vec(&body).expect("request JSON");
             let mut wire = format!(
                 "POST /v1/chat/completions HTTP/1.1\r\nHost: ai.test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
@@ -22877,7 +22940,9 @@ mod external_guardrail_context_tests {
                 .expect("bind downstream fixture");
             let address = listener.local_addr().expect("downstream address");
             let (close, mut closed) = tokio::sync::oneshot::channel::<()>();
+            let (announce, delivered) = tokio::sync::oneshot::channel::<()>();
             let mut client = DownstreamClient::new(tokio::spawn(async move {
+                let mut announce = announce_frames.map(|wanted| (wanted, announce));
                 let mut stream = tokio::net::TcpStream::connect(address)
                     .await
                     .expect("connect downstream fixture");
@@ -22894,7 +22959,17 @@ mod external_guardrail_context_tests {
                         }
                         read = stream.read(&mut chunk) => match read {
                             Ok(0) | Err(_) => return response,
-                            Ok(read) => response.extend_from_slice(&chunk[..read]),
+                            Ok(read) => {
+                                response.extend_from_slice(&chunk[..read]);
+                                let reached = announce.as_ref().is_some_and(|(wanted, _)| {
+                                    delivered_sse_frames(&response) >= *wanted
+                                });
+                                if reached {
+                                    if let Some((_, tx)) = announce.take() {
+                                        let _ = tx.send(());
+                                    }
+                                }
+                            }
                         },
                     }
                 }
@@ -22928,7 +23003,7 @@ mod external_guardrail_context_tests {
                     panic!("parse downstream request timed out: {error:?}");
                 }
             }
-            (session, close, client)
+            (session, close, client, delivered)
         }
 
         fn stream_probe_config(upstream_url: &str) -> sbproxy_ai::AiHandlerConfig {
@@ -23861,9 +23936,25 @@ mod external_guardrail_context_tests {
         /// reason, and this is the exit that proves it, since a panic
         /// unwinds through the same guard by the language's own
         /// guarantee.
+        ///
+        /// The drop is taken on the frames the client has read, not on a
+        /// clock. "Mid-stream" is a position in the dispatch, and a
+        /// deadline cannot name it: the request side builds the model's
+        /// BPE table on the first call in a process, a synchronous block
+        /// no timer preempts, and under the test lane's parallelism that
+        /// block outran a two-second deadline often enough to red the
+        /// gate. The dispatch was then dropped before `relay_ai_stream`
+        /// had armed any guard, and a test about what the settlement
+        /// does reported that there had been no settlement. Counting
+        /// relayed frames is the edge that does name the position: the
+        /// relay writes them, and only from inside the guard's scope.
         #[tokio::test]
         async fn a_dropped_dispatch_still_settles_what_the_stream_delivered() {
             const CAP: u64 = 20;
+            // Comfortably more completion text than `CAP`, and far
+            // fewer frames than the fixture will supply, so the drop
+            // lands mid-flight with the cap already exceeded.
+            const FRAMES_BEFORE_DROP: usize = 32;
             let hostname = "dropped-stream-cap.test";
             let pipeline = crate::pipeline::CompiledPipeline::default();
 
@@ -23876,29 +23967,62 @@ mod external_guardrail_context_tests {
             )
             .await;
             let config = stream_capped_config(&first_url, CAP);
-            let (mut session, close, client) =
-                streaming_downstream_session(stream_probe_request()).await;
+            let (mut session, close, client, delivered) =
+                streaming_downstream_session_watching_frames(
+                    stream_probe_request(),
+                    Some(FRAMES_BEFORE_DROP),
+                )
+                .await;
             let mut context = crate::context::RequestContext::new();
-            let dropped = tokio::time::timeout(
-                Duration::from_millis(2000),
-                super::super::handle_ai_proxy(
-                    &mut session,
-                    &config,
-                    &pipeline,
-                    hostname,
-                    &mut context,
-                    None,
-                ),
-            )
-            .await;
+            // Boxed so the drop below is the future's own drop. A
+            // `Pin<&mut _>` from `tokio::pin!` would only end the borrow
+            // at the end of the scope, which is after the assertions
+            // that need the settlement to have happened.
+            let mut dispatch = Box::pin(super::super::handle_ai_proxy(
+                &mut session,
+                &config,
+                &pipeline,
+                hostname,
+                &mut context,
+                None,
+            ));
+            // The watchdog is not the synchronization; it is the bound
+            // on a relay that never delivers, which is a real failure
+            // and says so.
+            let mut delivered =
+                std::pin::pin!(tokio::time::timeout(Duration::from_secs(30), delivered));
+            let finished = tokio::select! {
+                result = dispatch.as_mut() => Some(result),
+                reached = delivered.as_mut() => {
+                    reached
+                        .expect(
+                            "the relay never delivered its first frames downstream, so the \
+                             dispatch was never mid-stream and this test could not run",
+                        )
+                        .expect(
+                            "the downstream client task ended before it counted the frames, \
+                             so the relay closed the socket or the fixture itself failed",
+                        );
+                    None
+                }
+            };
             assert!(
-                dropped.is_err(),
-                "the fixture has to still be streaming when the future is dropped"
+                finished.is_none(),
+                "the fixture has to still be streaming when the future is dropped, but the \
+                 dispatch returned first: {finished:?}"
             );
+            // The drop, and with it the guard's `Drop`.
+            drop(dispatch);
             assert_eq!(
                 context.ai_usage_source,
                 Some("estimated"),
                 "the dropped dispatch has to settle from what it received"
+            );
+            let settled = context.ai_tokens_in.unwrap_or(0) + context.ai_tokens_out.unwrap_or(0);
+            assert!(
+                settled > CAP,
+                "the abandoned stream settled {settled} tokens, which does not spend the \
+                 {CAP}-token cap the refusal below depends on"
             );
             let _ = close.send(());
             first_upstream.outcome.abort();

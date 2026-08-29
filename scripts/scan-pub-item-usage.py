@@ -121,10 +121,15 @@ def cfg_test_line_ranges(lines: list[str]) -> list[tuple[int, int]]:
     """Line ranges (1-based, inclusive) covered by a `#[cfg(test)]` block.
 
     Brace-counted rather than parsed. Braces inside string or char
-    literals would throw the count off; in practice a `#[cfg(test)]`
-    module's first line is `mod tests {` and the counting holds. A miscount
-    would mis-file a reference as production, which is the conservative
-    direction: it makes an item look more used, not less.
+    literals throw the count off, and not in a safe direction. An
+    unbalanced opening brace in a literal inside the block extends the
+    range past the block's real end, which files the production
+    references that follow it as test consumers and drives this count
+    UP. A test fixture that matched on the byte string `data: {` did
+    exactly that and moved `sbproxy_ai::model_group::routing_name` into
+    the test-only pile. Only an unbalanced *closing* brace ends the
+    range early, and that is the direction that makes an item look more
+    used rather than less.
 
     The attribute does not always sit on a braced item. `#[cfg(test)] mod
     test_env;` and `#[cfg(test)] type Alias = ...;` carry no block at all,
