@@ -1012,7 +1012,7 @@ impl GitBinaryCloner {
             // which is the fallback path failing at exactly the job it
             // exists to do.
             let target =
-                self.resolve_local_checkout_target(dest, scratch, sha, &remaining(started));
+                self.resolve_local_checkout_target(dest, scratch, sha, || remaining(started));
             let Some(target) = target else {
                 return Err(ConfigSourceError::RevisionMismatch(format!(
                     "{sha} is not present in {} after a full fetch; the pin names a revision \
@@ -1069,24 +1069,33 @@ impl GitBinaryCloner {
         dest: &Path,
         scratch: &Path,
         pin: &str,
-        timeout: &Duration,
+        mut remaining: impl FnMut() -> Duration,
     ) -> Option<String> {
         let branch = pin.strip_prefix("refs/heads/").unwrap_or(pin);
         for candidate in [pin.to_string(), format!("refs/remotes/origin/{branch}")] {
-            let resolved = self
-                .run(
-                    &[
-                        "rev-parse",
-                        "--verify",
-                        "--quiet",
-                        &format!("{candidate}^{{commit}}"),
-                    ],
-                    Some(dest),
-                    scratch,
-                    *timeout,
-                    None,
-                )
-                .ok()?;
+            // `continue`, not `?`: a failed invocation is this candidate
+            // failing, not the lookup failing. Short-circuiting on the
+            // first error skipped the remote-tracking spelling whenever
+            // the first `rev-parse` timed out, and the caller then
+            // blamed the pin for a timeout with "the pin names a
+            // revision this repository does not contain".
+            let Ok(resolved) = self.run(
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("{candidate}^{{commit}}"),
+                ],
+                Some(dest),
+                scratch,
+                // Recomputed per call, like every other invocation in
+                // `clone_at`: a budget captured once hands the second
+                // lookup time the first already spent.
+                remaining(),
+                None,
+            ) else {
+                continue;
+            };
             if resolved.success {
                 let sha = resolved.stdout.trim().to_string();
                 if !sha.is_empty() {

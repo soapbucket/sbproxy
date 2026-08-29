@@ -934,6 +934,60 @@
         }
       ],
       "description": "Fleet rollbacks the config authority was asked to run, by target and result. target=\"previous\" is the one-step undo; target=\"archived\" is POST /admin/config-authority/rollback with a to_revision naming an entry in the archive ring. result=\"refused\" means nothing was published and the revision counter did not move: usually a revision the ring no longer holds, or an older payload that stopped validating after a binary upgrade. Read the authority log for which. This is the authority's own view; sbproxy_config_apply_total on each node says whether the fleet took the new revision."
+    },
+    {
+      "id": 15,
+      "title": "Operator Fallback Probes",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 56
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (increase(sbproxy_operator_fallback_probes_total[1h]))",
+          "legendFormat": "{{outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "The Kubernetes operator asking each proxy pod whether it is serving a configuration its boot fallback restored. outcome=\"pinned\" means config delivery to that SBProxy is suspended and an operator has to clear the pin with DELETE /admin/config/fallback. Every other non-configured outcome is a fail-open the operator takes deliberately: \"unreachable\", \"refused\" and \"unreadable\" all mean it could not ask and reconciled anyway, so a series climbing there is a suspension that has silently stopped working. \"unowned\" means a pod carried the SBProxy's instance label but was not created by its workload; it was not probed and was not sent the admin credential, and a non-zero rate is worth looking at. \"budget_exhausted\" means the fleet is larger than one pass can probe."
     }
   ],
   "templating": {

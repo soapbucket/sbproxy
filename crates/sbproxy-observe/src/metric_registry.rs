@@ -2357,6 +2357,30 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_operator_config_delivery_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_operator_config_delivery"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["state"],
+        description:
+            "Operator config-delivery decisions per reconcile, by state.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_operator_fallback_probes_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_operator_fallback_probe"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["outcome"],
+        description:
+            "Operator boot-fallback probes against proxy pods, by outcome.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_config_bundle_age_seconds",
         kind: MetricKind::Gauge,
         writer: Writer::Recorder("set_config_bundle_age_seconds"),

@@ -3042,8 +3042,18 @@ fn boot_document(
     // has to: the walk cannot know the configured document failed
     // without trying it, and it applies the same two steps to a
     // candidate so "works" means the same thing on both sides.
+    // The configured document's own directory: a relative
+    // extension-bundle path resolves against it at boot, so the
+    // construct check has to use the same base.
+    let base_dir = std::path::Path::new(config_path)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map_or_else(
+            || std::path::PathBuf::from("."),
+            std::path::Path::to_path_buf,
+        );
     let primary = match &read {
-        Ok(yaml) => match boot_candidate_compiles(yaml) {
+        Ok(yaml) => match boot_candidate_compiles(yaml, &base_dir) {
             Ok(()) => return Ok((yaml.clone(), None)),
             Err(reason) => anyhow::anyhow!("{reason}"),
         },
@@ -3064,7 +3074,7 @@ fn boot_document(
     match crate::config_boot::walk_for_bootable(
         &boot_config,
         boot_config.boot.max_attempts,
-        boot_candidate_compiles,
+        |yaml| boot_candidate_compiles(yaml, &base_dir),
     ) {
         Ok(document) => {
             // The pin carries why the configured document failed, not
@@ -3094,11 +3104,42 @@ fn boot_document(
     }
 }
 
-/// Whether one candidate document resolves its `source:` pointer and
-/// compiles.
-fn boot_candidate_compiles(yaml: &str) -> Result<(), String> {
+/// Whether one candidate document resolves its `source:` pointer,
+/// compiles, **and constructs**.
+///
+/// The third step is the one that matters and the one this used to be
+/// missing. `compile_config` leaves `action`, `policies`, `transforms`
+/// and `authentication` as opaque JSON, so an unknown action type, a
+/// policy that will not build, a bad regex, or a JSON schema that does
+/// not compile all pass it and then fail in
+/// `CompiledPipeline::from_config_at` well after this decision has been
+/// made. Module construction is where most operator typos land, so
+/// "works" without it excluded the majority of the failures a boot
+/// fallback exists for.
+///
+/// The cost of the gap was worse on the **primary** document than on a
+/// candidate. A primary that compiled returned early and skipped the
+/// walk entirely, so a node whose operator had asked for a fallback
+/// exited fatally with no pin, no boot counter, and no walk, and every
+/// restart repeated it.
+///
+/// [`CompiledPipeline::from_config_for_validation_at`] is the
+/// purpose-built, side-effect-free construct check the config authority
+/// already runs before it publishes a payload to a fleet, under
+/// `PipelineConstructionMode::Validation` with no background tasks
+/// started. Using it here makes the boot fallback's "does this work"
+/// test the same question every other pre-apply gate in this workspace
+/// asks.
+///
+/// `base_dir` is the configured document's own directory, because a
+/// relative extension-bundle path in a candidate resolves against it
+/// exactly as it would at boot.
+fn boot_candidate_compiles(yaml: &str, base_dir: &std::path::Path) -> Result<(), String> {
     let resolved = crate::config_source::resolve(yaml).map_err(|error| format!("{error:#}"))?;
-    sbproxy_config::compile_config(&resolved.text).map_err(|error| format!("{error:#}"))?;
+    let compiled =
+        sbproxy_config::compile_config(&resolved.text).map_err(|error| format!("{error:#}"))?;
+    crate::pipeline::CompiledPipeline::from_config_for_validation_at(compiled, base_dir)
+        .map_err(|error| format!("{error:#}"))?;
     Ok(())
 }
 
@@ -8861,6 +8902,90 @@ egress:
         );
     }
 
+    /// A document that compiles and then fails to construct is a
+    /// failure the boot fallback must act on.
+    ///
+    /// `compile_config` leaves `action`, `policies`, `transforms` and
+    /// `authentication` as opaque JSON, so an unknown action type
+    /// passes it and fails later at
+    /// `CompiledPipeline::from_config_at`. While the pre-check stopped
+    /// at `compile_config`, the primary document's early return skipped
+    /// the walk entirely: the process exited fatally with no pin, no
+    /// boot counter and no walk, on every restart, on a node whose
+    /// operator had explicitly asked for a fallback. Module
+    /// construction is where most operator typos land, so the gap
+    /// covered the majority of the failures the feature exists for.
+    #[test]
+    fn a_document_that_compiles_but_does_not_construct_is_rescued_by_the_ring() {
+        crate::config_boot::reset_for_test();
+        let temp = tempfile::tempdir().expect("temp dir");
+        let config_path = temp.path().join("sb.yml");
+        // Compiles cleanly: `type` is opaque JSON to `compile_config`.
+        // Fails at construction with "unknown action type".
+        let will_not_construct = r#"
+proxy:
+  http_bind_port: 0
+  config_history:
+    enabled: true
+    dir: RING_DIR
+origins:
+  "api.test":
+    action:
+      type: load_balancerr
+"#
+        .replace("RING_DIR", &temp.path().join("ring").to_string_lossy());
+        std::fs::write(&config_path, &will_not_construct).expect("write");
+
+        // The document really does pass the two steps the pre-check
+        // used to stop at, so this test is measuring the third one and
+        // not a parse error.
+        let resolved =
+            crate::config_source::resolve(&will_not_construct).expect("source: resolves");
+        sbproxy_config::compile_config(&resolved.text)
+            .expect("it compiles; that is the whole point");
+
+        let good = "proxy:\n  http_bind_port: 0\n";
+        let _history = ring_with_a_good_revision(&temp.path().join("ring"), good);
+
+        let (yaml, pin) = boot_document(
+            config_path.to_str().expect("utf-8"),
+            Some(sbproxy_config::BootFallbackMode::LastKnownGood),
+        )
+        .expect("the ring holds a revision that constructs");
+
+        assert_eq!(
+            yaml, good,
+            "the node boots on the ring's revision, not on the document that will not construct",
+        );
+        let pin = pin.expect("a rescued boot is pinned");
+        let reason = pin
+            .reason
+            .expect("the pin names why the configured document failed");
+        assert!(
+            reason.contains("unknown action type"),
+            "and the reason is the construction failure itself: {reason}",
+        );
+        crate::config_boot::reset_for_test();
+    }
+
+    /// The construct step is in the candidate walk too, not only on the
+    /// primary. A ring entry that compiles and does not construct must
+    /// be walked past rather than booted onto.
+    #[test]
+    fn the_walk_skips_a_candidate_that_compiles_but_does_not_construct() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        assert!(
+            boot_candidate_compiles(
+                "origins:\n  \"api.test\":\n    action:\n      type: load_balancerr\n",
+                temp.path(),
+            )
+            .is_err_and(|reason| reason.contains("unknown action type")),
+            "the candidate test and the primary test have to be the same question",
+        );
+        boot_candidate_compiles("proxy:\n  http_bind_port: 0\n", temp.path())
+            .expect("a document that constructs still passes");
+    }
+
     /// WOR-2459, tightened in the fix round (Major 6). With
     /// `fallback: off` the boot path is byte-identical to the release
     /// before this one, and "byte-identical" is a stronger claim than
@@ -8891,7 +9016,8 @@ egress:
 
         // And the error the operator sees is still the compile error,
         // raised by the same step `run` has always run on these bytes.
-        let reason = boot_candidate_compiles(&yaml).expect_err("a misspelled key must not compile");
+        let reason = boot_candidate_compiles(&yaml, std::path::Path::new("."))
+            .expect_err("a misspelled key must not compile");
         assert!(
             reason.contains("http2_cleartextt"),
             "the compile error is what the operator sees: {reason}",

@@ -765,6 +765,38 @@ fn the_rollback_route_takes_an_optional_to_revision_and_refuses_a_malformed_one(
         serde_json::json!([1, 2, 3, 4, 5, 6]),
     );
 
+    // The query-string spelling is refused rather than discarded. The
+    // sibling publish route on this prefix takes `?mode=`, so
+    // `?to_revision=` is the spelling an operator reaches for, and
+    // silently running the one-step rollback with a 200 is the exact
+    // outcome the malformed-body 400 exists to prevent.
+    let before = authority.current_revision();
+    let (status, by_query) = {
+        let (status, _content_type, body) = sbproxy_core::config_authority::dispatch(
+            "POST",
+            "/admin/config-authority/rollback?to_revision=1",
+            None,
+        )
+        .expect("the route must be owned by this dispatcher");
+        (
+            status,
+            serde_json::from_str::<serde_json::Value>(&body).expect("a JSON body"),
+        )
+    };
+    assert_eq!(status, 400, "{by_query}");
+    assert_eq!(by_query["code"], "invalid_to_revision");
+    assert!(
+        by_query["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("not a query parameter")),
+        "the refusal says where the field belongs: {by_query}",
+    );
+    assert_eq!(
+        authority.current_revision(),
+        before,
+        "and nothing was published",
+    );
+
     // A body that is present but unusable is refused rather than silently
     // treated as the one-step rollback, which would roll the fleet to a
     // document the operator did not name.

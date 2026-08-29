@@ -1445,7 +1445,7 @@ pub fn dispatch(method: &str, path: &str, body: Option<&str>) -> Option<AdminRes
     let path_only = path.split('?').next().unwrap_or(path);
     match path_only {
         PUBLISH_PATH => Some(dispatch_publish(method, query, body)),
-        ROLLBACK_PATH => Some(dispatch_rollback(method, body)),
+        ROLLBACK_PATH => Some(dispatch_rollback(method, query, body)),
         STATUS_PATH => Some(dispatch_status(method)),
         SUBSCRIBERS_PATH => Some(dispatch_subscribers(method, body)),
         SUBSCRIBER_REVOKE_PATH => Some(dispatch_revoke(method, body)),
@@ -1533,13 +1533,32 @@ fn dispatch_publish(method: &str, query: Option<&str>, body: Option<&str>) -> Ad
 /// a silently ignored field: an operator who meant to name a revision
 /// and got the one-step rollback instead would have rolled the fleet to
 /// the wrong document.
-fn dispatch_rollback(method: &str, body: Option<&str>) -> AdminResponse {
+fn dispatch_rollback(method: &str, query: Option<&str>, body: Option<&str>) -> AdminResponse {
     if !method.eq_ignore_ascii_case("POST") {
         return method_not_allowed();
     }
     let Some(authority) = current_authority() else {
         return not_publishing();
     };
+    // The sibling route on this prefix takes `?mode=`, so
+    // `?to_revision=39` is the spelling an operator reaches for. It was
+    // silently discarded, and the one-step rollback ran with a `200`,
+    // which is exactly the outcome the malformed-body `400` below
+    // exists to prevent. Refused rather than honored: a query parameter
+    // is not this route's contract, and guessing which one the caller
+    // meant on a fleet-wide rollback is worse than saying so.
+    if let Some(named) = query_param(query, "to_revision") {
+        return json(
+            400,
+            serde_json::json!({
+                "error": format!(
+                    "to_revision is a JSON body field, not a query parameter; send                      {{\"to_revision\": {named}}} as the request body"
+                ),
+                "code": "invalid_to_revision",
+                "revision_consumed": false,
+            }),
+        );
+    }
     let to_revision = match parse_to_revision(body) {
         Ok(to_revision) => to_revision,
         Err(response) => return response,

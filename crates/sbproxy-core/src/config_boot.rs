@@ -118,12 +118,45 @@ pub struct PinnedRevision {
     pub reason: Option<String>,
 }
 
+/// What replaces a redacted value in a pin reason.
+const REDACTED: &str = "[REDACTED]";
+
+/// The phrase the secret resolver's refusal is built around.
+///
+/// `resolve_secret_reference` bails with
+/// `<field> references the secret '<value>' but no secret backend is
+/// configured` and echoes `<value>` verbatim, so an operator who inlined
+/// a literal credential where a `secret://` reference belongs has that
+/// credential in the compile error. That error reaches
+/// [`PinnedRevision::reason`], `GET /admin/config/fallback`, and from
+/// there a Kubernetes condition message any CR reader can see.
+const SECRET_ECHO_MARKER: &str = "references the secret '";
+
 impl PinnedRevision {
-    /// A pin carrying the failure that caused the fallback, truncated to
-    /// 512 characters on a character boundary.
+    /// A pin carrying the failure that caused the fallback, scrubbed
+    /// and truncated to 512 characters on a character boundary.
+    ///
+    /// # Why this scrubs
+    ///
+    /// The reason is a compile or resolve failure over an
+    /// operator-authored document, and two shapes in that document can
+    /// carry a credential into the message: a URL with userinfo, which
+    /// [`sbproxy_config::scrub_credentials`] strips, and an inline
+    /// literal where a secret reference belongs, which the resolver
+    /// echoes between single quotes. Both are removed here, at the one
+    /// place a boot failure becomes a value this process will serve.
+    ///
+    /// This is a second line rather than the first. The right place to
+    /// stop the second shape is the resolver's own message, and the
+    /// documented answer is not to inline a literal at all. What makes
+    /// scrubbing worth doing here anyway is the audience: before this,
+    /// the echo reached an admin-authenticated route; the operator
+    /// copies it into a CR condition that `kubectl get sbproxy` shows to
+    /// anyone with read access to the namespace.
     #[must_use]
     pub fn with_reason(revision: u64, digest: String, reason: &str) -> Self {
-        let trimmed = reason.trim();
+        let scrubbed = redact_secret_echo(&sbproxy_config::scrub_credentials(reason));
+        let trimmed = scrubbed.trim();
         let bounded = match trimmed.char_indices().nth(MAX_FALLBACK_REASON_CHARS) {
             Some((cut, _)) => format!("{}...", &trimmed[..cut]),
             None => trimmed.to_string(),
@@ -134,6 +167,35 @@ impl PinnedRevision {
             reason: (!bounded.is_empty()).then_some(bounded),
         }
     }
+}
+
+/// Replace the value the secret resolver echoes between single quotes.
+///
+/// Deliberately narrow: it rewrites only the text between the quotes
+/// that follow [`SECRET_ECHO_MARKER`], so the rest of the message, which
+/// is what makes the failure diagnosable, survives intact.
+fn redact_secret_echo(reason: &str) -> String {
+    let mut out = String::with_capacity(reason.len());
+    let mut rest = reason;
+    while let Some(index) = rest.find(SECRET_ECHO_MARKER) {
+        let (before, tail) = rest.split_at(index + SECRET_ECHO_MARKER.len());
+        out.push_str(before);
+        match tail.find('\'') {
+            Some(end) => {
+                out.push_str(REDACTED);
+                out.push('\'');
+                rest = &tail[end + 1..];
+            }
+            // An unterminated quote: drop the remainder rather than
+            // guess where the value ends.
+            None => {
+                out.push_str(REDACTED);
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// One candidate the walk tried and why it did not boot.
@@ -904,6 +966,62 @@ mod tests {
         let history = history_config_from_broken_document("\t: [unbalanced\n");
         assert_eq!(history.dir, "/var/lib/sbproxy/config-history");
         assert!(history.enabled);
+    }
+
+    /// The reason is a compile failure over an operator-authored
+    /// document, and it is served on an admin route and copied into a
+    /// Kubernetes condition any CR reader can see.
+    #[test]
+    fn a_fallback_reason_carries_no_credential_into_the_admin_surface() {
+        let inline = PinnedRevision::with_reason(
+            1,
+            "digest".to_string(),
+            "source.credential references the secret 'ghp_exampleliteraltoken' but no secret \
+             backend is configured to resolve it; declare one under proxy.secrets.backends",
+        )
+        .reason
+        .expect("a reason");
+        assert!(
+            !inline.contains("ghp_exampleliteraltoken"),
+            "an inlined literal must not reach the admin surface: {inline}",
+        );
+        assert!(inline.contains("[REDACTED]"), "{inline}");
+        assert!(
+            inline.contains("proxy.secrets.backends"),
+            "and the rest of the message, which is what makes it diagnosable, survives: \
+             {inline}",
+        );
+
+        let url = PinnedRevision::with_reason(
+            1,
+            "digest".to_string(),
+            "source: clone of https://user:ghp_exampleurltoken@git.example.com/acme/cfg.git \
+             failed",
+        )
+        .reason
+        .expect("a reason");
+        assert!(
+            !url.contains("ghp_exampleurltoken") && !url.contains("user:"),
+            "userinfo in a URL must not reach it either: {url}",
+        );
+        assert!(url.contains("git.example.com"), "{url}");
+
+        // An unterminated quote drops the remainder rather than guessing.
+        let ragged = PinnedRevision::with_reason(
+            1,
+            "digest".to_string(),
+            "source.credential references the secret 'ghp_exampleunterminated",
+        )
+        .reason
+        .expect("a reason");
+        assert!(!ragged.contains("ghp_exampleunterminated"), "{ragged}");
+
+        // An ordinary compile failure is untouched.
+        let ordinary = "origins.\"api.test\": unknown action type: statik";
+        assert_eq!(
+            PinnedRevision::with_reason(1, "digest".to_string(), ordinary).reason,
+            Some(ordinary.to_string()),
+        );
     }
 
     #[test]
