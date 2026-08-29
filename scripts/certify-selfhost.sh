@@ -36,6 +36,12 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# Eleven lanes below select tests by name or by target, and both exit 0
+# when the selection is empty. A renamed test or an emptied target would
+# turn a certification lane into a `pass` recorded against a run of zero
+# tests, which is the one verdict this script exists to make impossible.
+. "$REPO_ROOT/scripts/lib/expect-tests.sh"
+
 STAMP="$(date -u +%Y-%m-%dT%H-%M-%SZ)"
 CERT_DIR="${SBPROXY_CERT_DIR:-$REPO_ROOT/.cert-evidence/$STAMP}"
 CERT_MODEL="${CERT_MODEL:-qwen2.5-0.5b-instruct}"
@@ -165,7 +171,10 @@ run_lane_command() {
   {
     echo "# lane: $lane"
     echo "# expected: $(lane_expected "$lane")"
-    echo "# command: $*"
+    # `$*` is the wrapper when a lane goes through counted_lane, and the
+    # evidence has to record the command that was certified, not the name
+    # of the function that ran it. SH-23 lists these as distinct claims.
+    echo "# command: ${LANE_COMMAND:-$*}"
     echo "# started: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo
   } >"$log"
@@ -182,21 +191,79 @@ simple_lane() {
   else
     record "$lane" fail "exit nonzero; see $lane.log"
   fi
+  LANE_COMMAND=""
+}
+
+# counted_lane <lane> <count-spec> <command...>
+#
+# simple_lane, plus an assertion on how many tests actually ran. Every
+# lane below selects tests by `--test <target>` or by name, and both exit
+# 0 when the selection is empty: a renamed test or an emptied target would
+# be recorded as `pass` against a run of zero tests, which is the one
+# verdict this script's header says is impossible. `>=1` where the
+# membership legitimately moves, an exact count where the lane names
+# individual tests.
+counted_lane() {
+  local lane="$1" spec="$2"
+  shift 2
+  LANE_COMMAND="$*"
+  simple_lane "$lane" _run_counted "$spec" "$lane" "$@"
+}
+
+_run_counted() {
+  local spec="$1" lane="$2"
+  shift 2
+  expect_tests "$spec" "$lane" -- "$@"
+}
+
+# counted_lane_each <lane> <count-spec> <flag> <value>[,<value>...] <command...>
+#
+# counted_lane, once per value, with `<flag> <value>` appended to the
+# command each time.
+#
+# `expect_tests` sums the `test result:` lines across every binary a
+# single invocation runs, which is right for a selection that names
+# tests and wrong for one that names targets or packages: `>=1` over
+# `--test A --test B` asserts only that A and B together ran something,
+# so an emptied A is invisible behind B's count. That is the same
+# zero-match hole this whole helper exists to close, one level up. One
+# invocation per target is the only spelling that sees it.
+#
+# The lane keeps its name, its log and its row in the record; what
+# multiplies is the assertion, not the bookkeeping.
+counted_lane_each() {
+  local lane="$1" spec="$2" flag="$3" values="$4"
+  shift 4
+  LANE_COMMAND="$* (run once per $flag: $values)"
+  simple_lane "$lane" _run_counted_each "$spec" "$lane" "$flag" "$values" "$@"
+}
+
+_run_counted_each() {
+  local spec="$1" lane="$2" flag="$3" values="$4"
+  shift 4
+  local rc=0 value
+  local -a list
+  # The IFS assignment is a prefix on `read`, so it is scoped to that
+  # command and the command being certified still sees the caller's.
+  IFS=',' read -r -a list <<<"$values"
+  for value in "${list[@]}"; do
+    expect_tests "$spec" "$lane $flag $value" -- "$@" "$flag" "$value" || rc=1
+  done
+  return "$rc"
 }
 
 # --- lanes --------------------------------------------------------------
 
 lane_deterministic() {
-  simple_lane deterministic env PATH="$HOME/.cargo/bin:$PATH" \
-    cargo nextest run --profile ci \
-      -p sbproxy-model-host -p sbproxy-capability \
-      --no-fail-fast
+  counted_lane_each deterministic '>=1' -p sbproxy-model-host,sbproxy-capability \
+    env PATH="$HOME/.cargo/bin:$PATH" \
+    cargo nextest run --profile ci --no-fail-fast
 }
 
 lane_cpu() {
-  simple_lane cpu env PATH="$HOME/.cargo/bin:$PATH" \
-    cargo nextest run --profile ci -p sbproxy-model-host \
-      --test local_admission --test cold_start_policy --no-fail-fast
+  counted_lane_each cpu '>=1' --test local_admission,cold_start_policy \
+    env PATH="$HOME/.cargo/bin:$PATH" \
+    cargo nextest run --profile ci -p sbproxy-model-host --no-fail-fast
 }
 
 lane_apple_metal_probe() {
@@ -241,25 +308,25 @@ lane_nvidia_multi_gpu() {
       "needs 2+ visible NVIDIA devices, this host has ${devices:-0}"
     return
   fi
-  simple_lane nvidia_multi_gpu env PATH="$HOME/.cargo/bin:$PATH" \
-    cargo nextest run --profile ci -p sbproxy-model-host \
-      --test runtime_replicas --test placement --no-fail-fast
+  counted_lane_each nvidia_multi_gpu '>=1' --test runtime_replicas,placement \
+    env PATH="$HOME/.cargo/bin:$PATH" \
+    cargo nextest run --profile ci -p sbproxy-model-host --no-fail-fast
 }
 
 lane_air_gapped() {
-  simple_lane air_gapped env PATH="$HOME/.cargo/bin:$PATH" \
-    cargo nextest run --profile ci -p sbproxy-model-host \
-      --test artifact_policy --test artifact_manager --no-fail-fast
+  counted_lane_each air_gapped '>=1' --test artifact_policy,artifact_manager \
+    env PATH="$HOME/.cargo/bin:$PATH" \
+    cargo nextest run --profile ci -p sbproxy-model-host --no-fail-fast
 }
 
 lane_split_cluster() {
-  simple_lane split_cluster env PATH="$HOME/.cargo/bin:$PATH" \
+  counted_lane split_cluster '>=1' env PATH="$HOME/.cargo/bin:$PATH" \
     SBPROXY_E2E_BIN="$SBPROXY_BIN" \
     cargo test -p sbproxy-e2e --test model_cluster_dispatch -- --nocapture
 }
 
 lane_symmetric_cluster() {
-  simple_lane symmetric_cluster env PATH="$HOME/.cargo/bin:$PATH" \
+  counted_lane symmetric_cluster '>=1' env PATH="$HOME/.cargo/bin:$PATH" \
     SBPROXY_E2E_BIN="$SBPROXY_BIN" \
     cargo test -p sbproxy-e2e --test model_cluster_control -- --nocapture
 }
@@ -269,14 +336,14 @@ lane_symmetric_cluster() {
 # name rather than pretending to be separate binaries. Naming them
 # separately is the point: SH-23 lists them as distinct claims.
 lane_three_node_kill() {
-  simple_lane three_node_kill env PATH="$HOME/.cargo/bin:$PATH" \
+  counted_lane three_node_kill 1 env PATH="$HOME/.cargo/bin:$PATH" \
     SBPROXY_E2E_BIN="$SBPROXY_BIN" \
     cargo test -p sbproxy-e2e --test model_cluster_control \
       cluster_converges_and_admin_calls_out_an_unhealthy_worker -- --nocapture
 }
 
 lane_rolling_update() {
-  simple_lane rolling_update env PATH="$HOME/.cargo/bin:$PATH" \
+  counted_lane rolling_update '>=1' env PATH="$HOME/.cargo/bin:$PATH" \
     cargo nextest run --profile ci -p sbproxy-model-host \
       --test runtime_reconcile --no-fail-fast
 }
@@ -286,7 +353,7 @@ lane_key_revoke() {
     record key_revoke unsupported "redis-server is not on PATH; the lane spawns its own instance"
     return
   fi
-  simple_lane key_revoke env PATH="$HOME/.cargo/bin:$PATH" \
+  counted_lane key_revoke '>=1' env PATH="$HOME/.cargo/bin:$PATH" \
     SBPROXY_E2E_BIN="$SBPROXY_BIN" SBPROXY_E2E_REQUIRE_REDIS=1 \
     cargo test -p sbproxy-e2e --test key_replicas -- --nocapture
 }
@@ -296,13 +363,13 @@ lane_strict_budget() {
     record strict_budget unsupported "redis-server is not on PATH; the lane spawns its own instance"
     return
   fi
-  simple_lane strict_budget env PATH="$HOME/.cargo/bin:$PATH" \
+  counted_lane strict_budget '>=1' env PATH="$HOME/.cargo/bin:$PATH" \
     SBPROXY_E2E_BIN="$SBPROXY_BIN" SBPROXY_E2E_REQUIRE_REDIS=1 \
     cargo test -p sbproxy-e2e --test governance_strict -- --nocapture
 }
 
 lane_external_provider() {
-  simple_lane external_provider env PATH="$HOME/.cargo/bin:$PATH" \
+  counted_lane external_provider 1 env PATH="$HOME/.cargo/bin:$PATH" \
     SBPROXY_E2E_BIN="$SBPROXY_BIN" \
     cargo test -p sbproxy-e2e --test model_cluster_dispatch \
       managed_cold_fallback_advances_a_non_fallback_router -- --nocapture

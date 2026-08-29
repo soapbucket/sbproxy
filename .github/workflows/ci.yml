@@ -289,9 +289,29 @@ jobs:
           # with `-E 'test(pooled_connection_recovers_after_redis_kill_and_restart)'`.
           # Neither restart timing probe is part of the required PR gate. The
           # gate keeps the secure-DSN / live-Lua-state contracts only.
-          cargo nextest run --workspace --exclude sbproxy-e2e --locked --profile ci \
-            --run-ignored only -j1 \
-            -E '(binary(redis_secure) & not test(pooled_connection_recovers_after_redis_kill_and_restart)) + test(compression_store::redis::tests::live_redis_) + test(semantic_cache_runtime::redis::tests::live_redis_semantic_) + binary(governance_redis) + binary(quota_pool_redis)'
+          # Four disjoint groups instead of one five-term union, and a
+          # count on each. The union ran as a single filterset for a
+          # while, and nextest's refusal of a zero match cannot see
+          # inside it: two of the five terms are name-scoped module
+          # prefixes, so renaming `live_redis_semantic_` would drop six
+          # tests out of a required lane while three `binary()` terms
+          # kept the run non-empty and the step green. Same tests, run
+          # once each; the groups do not overlap.
+          . scripts/lib/expect-tests.sh
+          expect_tests 9 "live Redis store contracts" -- \
+            cargo nextest run --workspace --exclude sbproxy-e2e --locked --profile ci \
+              --run-ignored only -j1 \
+              -E 'test(compression_store::redis::tests::live_redis_) + test(semantic_cache_runtime::redis::tests::live_redis_semantic_)'
+          expect_tests '>=1' "redis_secure (minus the restart probe)" -- \
+            cargo nextest run --workspace --exclude sbproxy-e2e --locked --profile ci \
+              --run-ignored only -j1 \
+              -E 'binary(redis_secure) & not test(pooled_connection_recovers_after_redis_kill_and_restart)'
+          expect_tests '>=1' "governance_redis" -- \
+            cargo nextest run --workspace --exclude sbproxy-e2e --locked --profile ci \
+              --run-ignored only -j1 -E 'binary(governance_redis)'
+          expect_tests '>=1' "quota_pool_redis" -- \
+            cargo nextest run --workspace --exclude sbproxy-e2e --locked --profile ci \
+              --run-ignored only -j1 -E 'binary(quota_pool_redis)'
 
       # The two Redis restart-recovery probes are timing probes: they kill
       # and restart a daemon and time the reconnect, which is exactly the
@@ -303,9 +323,19 @@ jobs:
       - name: Redis restart probes (non-blocking)
         continue-on-error: true
         run: |
-          cargo nextest run --workspace --exclude sbproxy-e2e --locked --profile ci \
-            --run-ignored only -j1 \
-            -E 'test(storage::async_redis::tests::redis_connection_recovers_after_server_restart) + test(pooled_connection_recovers_after_redis_kill_and_restart)'
+          # Entirely name-scoped: two individual test names, no binary
+          # or package term to keep the run non-empty if one is renamed.
+          # `continue-on-error` means a red here does not block, which is
+          # why it is not a gating hole, but a silent zero is still a
+          # lane reporting on nothing. Accepted deliberately: no pull
+          # request goes red on this count, it reports in the run and
+          # nothing else, and that is the trade the non-blocking posture
+          # above already made.
+          . scripts/lib/expect-tests.sh
+          expect_tests 2 "Redis restart probes" -- \
+            cargo nextest run --workspace --exclude sbproxy-e2e --locked --profile ci \
+              --run-ignored only -j1 \
+              -E 'test(storage::async_redis::tests::redis_connection_recovers_after_server_restart) + test(pooled_connection_recovers_after_redis_kill_and_restart)'
 
       # nextest does not execute doctests, so they need their own pass.
       - name: doctests
@@ -546,8 +576,10 @@ jobs:
   # `needs:` list, so it is not.
   #
   # Everything here is grep, python, or git plumbing. The lane finishes in
-  # well under a minute and never restores a cargo cache, which is also
-  # why it can afford to be unconditional.
+  # a minute or two (the attribute-placement parser is the largest
+  # single cost, fifteen to twenty-five seconds over 1,400 files) and
+  # never restores a cargo cache, which is also why it can afford to be
+  # unconditional.
   guards:
     name: guards
     runs-on: ubuntu-latest
@@ -614,6 +646,51 @@ jobs:
           # attribute main's commits to this branch.
           STACK_BUDGET_BASE_REF: ${{ github.event.pull_request.base.sha || github.sha }}
         run: bash scripts/check-stack-budget-ratchet.sh
+
+      # The two attribute guards and the test-count helper. All three
+      # are detectors, and a detector that has quietly stopped detecting
+      # reads exactly like a clean tree; these fixtures are the only
+      # thing that can tell the difference. The theft fixtures are the
+      # two real hunks from `cf77910e9` and `eb42165a5` taken verbatim.
+      - name: attribute guard fixtures
+        run: |
+          python3 scripts/check-attribute-theft.py --self-test
+          python3 scripts/check-attribute-placement.py --self-test
+          bash scripts/lib/expect-tests.sh --self-test
+
+      # An item inserted between an attribute block and the item it was
+      # attached to takes the block with it: the rustdoc, the `#[test]`,
+      # the `#[derive]`. The stolen lines are unchanged context in the
+      # diff, so the review sees a new item with a doc comment above it,
+      # which is what a new item is supposed to look like. Twenty-one of
+      # these are in the last 260 merges and sixteen were still live
+      # when this guard was written. One had moved the rustdoc that
+      # explains why a stack-budget test runs on a worker-sized thread
+      # onto a `size_of` probe that runs no dispatch at all; another took
+      # `#[cfg(unix)]` off a test that shells out to `/bin/kill`, while
+      # the helper that test calls kept its own gate.
+      #
+      # It is here rather than in `lint` for the same reason the stack
+      # ratchet above is: it is diff-scoped, it needs history a depth-1
+      # checkout does not have, and it fails closed rather than skipping
+      # when no base resolves.
+      - name: no insertion landed inside an attribute block
+        env:
+          # Same shape and same reason as the two next door.
+          ATTRIBUTE_THEFT_BASE_REF: ${{ github.event.pull_request.base.sha || github.sha }}
+        run: python3 scripts/check-attribute-theft.py --check
+
+      # `#[test]` above a `static`, a `const`, a `use`, or a function
+      # taking arguments, and `#[ignore]` or `#[should_panic]` on a
+      # function that is not a test. rustc refuses the first four under
+      # `--test` and says nothing about the last two anywhere; this
+      # covers all six in every cfg, including the feature and target
+      # combinations no lane compiles, and it runs on every pull request
+      # rather than behind `changes.outputs.code`. Fifteen to twenty-five
+      # seconds of python over 1,400 files, measured. Tree-scoped, so
+      # nothing here needs a base.
+      - name: attributes sit on items they can apply to
+        run: python3 scripts/check-attribute-placement.py --check
 
       # A merge that commits its own conflict markers ships corrupted
       # files. One reached main's CHANGELOG on 2026-08-19 through a gate
@@ -725,9 +802,28 @@ jobs:
       # held an ignored stub of the same idea. Same package selection as
       # the two targets already here, so it adds no rebuild.
       - name: observability budgets (cardinality + redaction)
-        run: >-
-          cargo test --workspace --locked
-          --test cardinality --test metrics_per_agent --test redaction
+        run: |
+          # `--test <target>` with no name filter. cargo errors on a
+          # target that does not exist, but a target that still exists
+          # and has emptied runs zero tests and exits 0. `>=1` closes
+          # that at no maintenance cost: the number never moves.
+          #
+          # One call per target, and that part is load bearing.
+          # `expect_tests` sums the `test result:` lines across every
+          # binary a single cargo invocation runs, so `>=1` over three
+          # targets in one call asserts only that the three together ran
+          # something: an emptied `redaction` would hide behind
+          # cardinality's count and this required lane would stay green
+          # with the redaction budgets unchecked, which is the exact
+          # shape this guard exists to refuse. The three calls share the
+          # build; only the harness runs three times.
+          . scripts/lib/expect-tests.sh
+          expect_tests '>=1' "observability budgets: cardinality" -- \
+            cargo test --workspace --locked --test cardinality
+          expect_tests '>=1' "observability budgets: metrics_per_agent" -- \
+            cargo test --workspace --locked --test metrics_per_agent
+          expect_tests '>=1' "observability budgets: redaction" -- \
+            cargo test --workspace --locked --test redaction
 
   e2e-subset:
     name: e2e subset (required)
@@ -817,11 +913,29 @@ jobs:
       - name: e2e subset (shipped-example behavior)
         env:
           SBPROXY_E2E_BIN: ${{ github.workspace }}/target/debug/sbproxy
-        run: >-
-          cargo test --workspace --locked
-          --test static_action --test body_routing --test sessions
-          --test admin_reload --test transform_json
-          -- --test-threads=1
+        run: |
+          # `--test <target>` with no name filter. cargo errors on a
+          # target that does not exist, but a target that still exists
+          # and has emptied runs zero tests and exits 0. `>=1` closes
+          # that at no maintenance cost: the number never moves.
+          #
+          # One call per target. `expect_tests` sums the `test result:`
+          # lines across every binary a single cargo invocation runs, so
+          # `>=1` over five targets in one call asserts only that the
+          # five together ran something, and an emptied `sessions` would
+          # hide behind the other four in a required lane. Same build,
+          # same single-threaded harness, five assertions instead of one.
+          . scripts/lib/expect-tests.sh
+          expect_tests '>=1' "e2e subset: static_action" -- \
+            cargo test --workspace --locked --test static_action -- --test-threads=1
+          expect_tests '>=1' "e2e subset: body_routing" -- \
+            cargo test --workspace --locked --test body_routing -- --test-threads=1
+          expect_tests '>=1' "e2e subset: sessions" -- \
+            cargo test --workspace --locked --test sessions -- --test-threads=1
+          expect_tests '>=1' "e2e subset: admin_reload" -- \
+            cargo test --workspace --locked --test admin_reload -- --test-threads=1
+          expect_tests '>=1' "e2e subset: transform_json" -- \
+            cargo test --workspace --locked --test transform_json -- --test-threads=1
 
   payments:
     name: payments (settlement features)

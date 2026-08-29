@@ -205,6 +205,30 @@ Confirm it with `ps aux | grep -iE 'syspolicyd|XprotectService'` (sustained CPU)
 it with `sudo spctl --global-disable` (no reboot; re-enable with `--global-enable`) or by
 rebooting. It comes back after a restart, so expect to do this again.
 
+## Two ways a diff lies about itself
+
+**An insertion inside an attribute block.** Everything attached to an item ahead of the item,
+its rustdoc, its `#[test]`, its `#[derive]`, binds to whatever item comes next. Put a new item
+between the block and its owner and the block moves onto the newcomer, which keeps its body and
+loses its meaning. The stolen lines are unchanged context in the diff, so the review sees a new
+item with a doc comment above it, which is exactly what a new item should look like. Sixteen of
+these were live on main when `scripts/check-attribute-theft.py` was written, out of twenty-one in
+the last 260 merges. Two of the sixteen were triaged as having healed on their own and had not;
+read both sides of the file before you write that word. Put a new item at a `}` boundary, not after a doc comment, and when you do
+land next to one, read the doc comment above your insertion and ask whose it is.
+
+`scripts/check-attribute-placement.py` catches the same damage from the other side: an attribute
+that cannot apply to the item under it. It parses rather than greps, and it reads every cfg,
+which matters because rustc's own refusal of `#[test]` on a `static` only happens in a
+configuration something compiles with `--test`, and because `#[ignore]` and `#[should_panic]` on
+a function that is not a test are silent everywhere.
+
+**A filtered test selection that matches nothing.** `cargo test`, `--exact` and `--ignored` all
+exit 0 when the filter selects no tests, printing `0 passed; 2857 filtered out` on the way.
+Three of those reached main in one change. Every selection that names individual tests goes
+through `expect_tests <count> <label> -- <command>` from `scripts/lib/expect-tests.sh`; when you
+rename a test, the count in that call moves in the same commit.
+
 ## Ratchets only fall
 
 The seven `scripts/*-baseline.count` files may only go down. Use the workspace's

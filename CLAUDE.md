@@ -1,5 +1,5 @@
 # sbproxy (Rust workspace)
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-28*
 
 The active implementation of sbproxy. Cargo workspace with ~20
 crates under `crates/`, an e2e suite under `e2e/`, examples under
@@ -20,6 +20,8 @@ ten-minute build.
 | unwrap/expect/panic ratchet | `bash scripts/check-unwrap-ratchet.sh` |
 | Operator URLs at log lines | `bash scripts/check-log-url-ratchet.sh` |
 | AI dispatch stack budget | `bash scripts/check-stack-budget-ratchet.sh` |
+| Attribute placement | `python3 scripts/check-attribute-placement.py --check` |
+| Attribute theft (diff-scoped) | `python3 scripts/check-attribute-theft.py --check` |
 | Spec citations | `bash scripts/check-spec-citations.sh` |
 | Env mutation | `bash scripts/check-env-mutation.sh` |
 | Durable file modes | `bash scripts/check-durable-file-modes.sh` |
@@ -99,6 +101,60 @@ schema, the type list, and when a fragment is required.
 content under `## [Unreleased]`, and a commit that edits `CHANGELOG.md`
 without touching `docs/.changes/` in the same diff. A release cut needs
 no flag: assembling deletes fragments, so it touches both.
+
+### An insertion can steal the item below it
+
+An attribute block is everything attached to an item ahead of the item
+itself: its rustdoc, its `#[test]`, its `#[derive]`. Rust binds that
+block to whatever item comes next, so an item inserted between the block
+and its owner takes the whole block with it. The owner keeps its body
+and loses its meaning.
+
+It reads as a clean diff, which is why it kept happening. The stolen
+lines are unchanged context, and the review sees a new item with a doc
+comment above it, which is what a new item is supposed to look like.
+Twenty-one of these are in the last 260 merges and sixteen were still
+live when the guard was written. One had moved the rustdoc explaining why
+a stack-budget test runs on a worker-sized thread onto a `size_of` probe
+that runs no dispatch at all, on the exact path that was overflowing its
+stack a day later. Another took `#[cfg(unix)]` off a test that shells out
+to `/bin/kill`. Two more were triaged as healed and were not: one of them
+put a `pub fn`'s rustdoc summary on a different function.
+
+Reading the hunk is not enough to decide it. git anchors a `-U0` hunk one
+line early when the insertion's tail matches the line above the insertion
+point, and appending a `#[test] fn` before another `#[test] fn` produces
+exactly that, so the guard compares the victim's block before and after
+in the two files rather than trusting the diff's shape.
+
+`scripts/check-attribute-theft.py --check` refuses that one shape and
+nothing else. It is diff-scoped and needs a merge base, so it fails
+closed rather than skipping when none resolves, and it lives in the
+`guards` lane, whose checkout is full depth. `--self-test` replays the
+two real hunks verbatim.
+
+`scripts/check-attribute-placement.py --check` catches the same damage
+from the other side, by parsing rather than grepping: an attribute that
+cannot apply to the item it sits on. rustc refuses `#[test]` on a
+`static`, a `const`, a `use`, or a function taking arguments, but only
+in a configuration something compiles with `--test`, which leaves every
+feature and target no lane enables. `#[ignore]` and `#[should_panic]` on
+a function that is not a test are silent everywhere.
+
+### A filtered test selection that matches nothing exits 0
+
+`cargo test`, `--exact` and `--ignored` all exit 0 when the filter
+selects no tests. The run prints `0 passed; 2857 filtered out` and the
+step goes green having checked nothing. Three of those reached main in
+one change on 2026-08-28.
+
+Every selection that names individual tests goes through
+`expect_tests <count> <label> -- <command>` from
+`scripts/lib/expect-tests.sh`, which reads the count out of the libtest
+or nextest summary the way `check.sh` reads the junit `tests="N"`
+attribute, and fails when the count is wrong or unreadable. Use the
+exact count, not `>=1`: a selection that names two tests and runs one is
+as wrong as one that runs none.
 
 ### The gate validates the working tree; `git push` ships HEAD
 
