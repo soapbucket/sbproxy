@@ -230,8 +230,24 @@ jobs:
           echo "Pebble did not become reachable on https://localhost:14000/dir"
           exit 1
 
+      # `--ignored` selects the seven Pebble-dependent tests in that
+      # file. It is a filter, and a filter that matches nothing exits 0,
+      # so dropping an `#[ignore]` would quietly shrink the ACME lane a
+      # release is signed off against. Assert the count; the number moves
+      # in the same commit that adds or removes one of them.
+      #
+      # Which lane notices, since nothing here runs on a pull request:
+      # this workflow triggers on a `v*` tag push and the 09:30 UTC cron
+      # only. An eighth ignored test merges green and reddens the next
+      # nightly, or the tag build if it lands after one. Say it rather
+      # than let the next reader assume the PR that breaks the count is
+      # the PR that goes red.
       - name: run acme integration tests
-        run: cargo test -p sbproxy-tls --test acme_integration --locked -- --ignored
+        run: |
+          set -euo pipefail
+          . scripts/lib/expect-tests.sh
+          expect_tests 7 "acme integration (Pebble)" -- \
+            cargo test -p sbproxy-tls --test acme_integration --locked -- --ignored
 
   llms-full-corpus:
     name: llms-full.txt is current

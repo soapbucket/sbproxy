@@ -75,37 +75,54 @@ jobs:
       # That already happened once on this branch, with `--exact` and a
       # bare test name selecting none of 2857 tests and passing. Count
       # the tests that ran and fail if it is not the two expected.
+      #
+      # The counting used to be four lines of `sed` inlined here, which
+      # made this the only step in the repository that did it. It is
+      # `scripts/lib/expect-tests.sh` now, and the three other selections
+      # in this file go through the same helper.
       - name: request-path stack budget
         run: |
           set -euo pipefail
-          cargo test -p sbproxy-core --locked --lib \
-            dispatch_path_stays_inside_its_stack_budget -- --nocapture 2>&1 \
+          . scripts/lib/expect-tests.sh
+          expect_tests 2 "request-path stack budget" -- \
+            cargo test -p sbproxy-core --locked --lib \
+              dispatch_path_stays_inside_its_stack_budget -- --nocapture \
             | tee /tmp/stack-budget.log
-          ran="$(sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' /tmp/stack-budget.log \
-            | head -1)"
-          if [ "${ran:-0}" -ne 2 ]; then
-            echo "::error::expected 2 stack budget tests, ran ${ran:-0}. A renamed or removed"
-            echo "::error::test makes this step pass while checking nothing."
-            exit 1
-          fi
           grep -E 'STACK_HIGH_WATER_BYTES' /tmp/stack-budget.log
 
       - name: build sbproxy binary
         run: cargo build -p sbproxy --locked
 
+      # The declared residual of the two steps below, closed. No name
+      # filter here, so the exact-count argument does not apply, but a
+      # target that still exists and has emptied runs zero tests and
+      # exits 0 just the same. `>=1` never needs maintaining.
       - name: Phase 1 request path
-        run: >-
-          cargo test -p sbproxy-e2e --locked --test context_compression_phase1
-          -- --test-threads=1
+        run: |
+          set -euo pipefail
+          . scripts/lib/expect-tests.sh
+          expect_tests '>=1' "Phase 1 request path" -- \
+            cargo test -p sbproxy-e2e --locked --test context_compression_phase1 \
+              -- --test-threads=1
 
+      # The two below name one test each with `--exact`, which is the
+      # exact spelling that selected none of 2857 tests and exited 0 on
+      # this branch. Counting them was the fix for the step above and
+      # was never applied here.
       - name: governed selector precedence
-        run: >-
-          cargo test -p sbproxy-e2e --locked --test governed_key_policy
-          dynamic_compression_profile_changes_context_and_header_overrides_it
-          -- --exact --test-threads=1
+        run: |
+          set -euo pipefail
+          . scripts/lib/expect-tests.sh
+          expect_tests 1 "governed selector precedence" -- \
+            cargo test -p sbproxy-e2e --locked --test governed_key_policy \
+              dynamic_compression_profile_changes_context_and_header_overrides_it \
+              -- --exact --test-threads=1
 
       - name: Anthropic native compression
-        run: >-
-          cargo test -p sbproxy-e2e --locked --test ai_native_inbound
-          anthropic_native_upstream_receives_the_compressed_message_list
-          -- --exact --test-threads=1
+        run: |
+          set -euo pipefail
+          . scripts/lib/expect-tests.sh
+          expect_tests 1 "Anthropic native compression" -- \
+            cargo test -p sbproxy-e2e --locked --test ai_native_inbound \
+              anthropic_native_upstream_receives_the_compressed_message_list \
+              -- --exact --test-threads=1
