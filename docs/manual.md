@@ -387,8 +387,10 @@ sbproxy cedar replay -f proposed.yml --against traffic.jsonl \
 
 `--baseline` diffs each sample's verdict against that file's Cedar
 source. A moved verdict is a policy-change preview (exit 1), the
-analogue of a traffic replay before `apply`. `--origin` restricts
-extraction to one hostname when several origins carry Cedar.
+analogue of a traffic replay before `apply`. `--origin` restricts extraction to one hostname when several origins
+carry Cedar. When more than one origin has `cedar_policies`,
+`--origin` is required: replay compiles one live hook, not a merged
+PolicySet of every origin.
 
 Exit codes:
 

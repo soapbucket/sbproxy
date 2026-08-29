@@ -100,7 +100,7 @@ Replay is the traffic-shaped preview, not a second plan:
 sbproxy cedar replay -f proposed.yml --against traffic.jsonl --baseline live.yml
 ```
 
-Each JSONL line is `{principal, resource, expected?, action?, id?}`. `principal` and `resource` must be Cedar UIDs (`Agent::"anonymous"`, `ToolInvocation::"demo/search_repos"`). `action` defaults to `Action::"MCP::CallTool"`. Exit 0 when every `expected` label holds and (with `--baseline`) no verdict moved; 1 when a sample missed or a verdict changed; 2 when the sample, the YAML, or the Cedar source could not be compiled.
+Each JSONL line is `{principal, resource, expected?, action?, id?}`. `principal` and `resource` must be Cedar UIDs (`Agent::"anonymous"`, `ToolInvocation::"demo/search_repos"`). `action` defaults to `Action::"MCP::CallTool"`. Replay compiles one origin the way the live hook does (merged schema, including `schema_override`). When several origins have Cedar, pass `--origin`. Exit 0 when every `expected` label holds and (with `--baseline`) no verdict moved; 1 when a sample missed or a verdict changed; 2 when the sample, the YAML, or the Cedar source could not be compiled.
 
 `sbproxy audit verify` already covers the audit trail. This binary does not add a Cedar verifier.
 

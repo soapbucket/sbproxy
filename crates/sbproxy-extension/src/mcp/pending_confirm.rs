@@ -464,9 +464,15 @@ mod tests {
             ttl,
             t0(),
         );
-        let ParkOutcome::Held { hold_id, .. } = first else {
+        let ParkOutcome::Held {
+            hold_id,
+            fresh: first_fresh,
+            ..
+        } = first
+        else {
             panic!("expected Held, got {first:?}");
         };
+        assert!(first_fresh, "the first park must be a fresh insert");
         store
             .approve(&hold_id, "secops@example.com", t0())
             .expect("approve");
@@ -496,9 +502,55 @@ mod tests {
             t0(),
         );
         assert!(
-            matches!(again, ParkOutcome::Held { .. }),
+            matches!(again, ParkOutcome::Held { fresh: true, .. }),
             "an approval is single-use; a second call must park again, got {again:?}"
         );
+    }
+
+    #[test]
+    fn collapsing_onto_a_pending_hold_is_not_fresh() {
+        let store = PendingConfirmStore::in_memory();
+        let args = json!({"n": 1});
+        let ttl = Duration::from_secs(600);
+        let first = store.park(
+            "digest-a",
+            "crm.delete",
+            "mcp.example.com",
+            "vk_analyst",
+            "acme",
+            "high-risk tool",
+            &args,
+            ttl,
+            t0(),
+        );
+        let ParkOutcome::Held {
+            hold_id,
+            fresh: true,
+            ..
+        } = first
+        else {
+            panic!("expected fresh Held, got {first:?}");
+        };
+        let second = store.park(
+            "digest-a",
+            "crm.delete",
+            "mcp.example.com",
+            "vk_analyst",
+            "acme",
+            "high-risk tool",
+            &args,
+            ttl,
+            t0(),
+        );
+        let ParkOutcome::Held {
+            hold_id: again,
+            fresh: false,
+            ..
+        } = second
+        else {
+            panic!("retry on a pending hold must not be fresh, got {second:?}");
+        };
+        assert_eq!(again, hold_id);
     }
 
     #[test]

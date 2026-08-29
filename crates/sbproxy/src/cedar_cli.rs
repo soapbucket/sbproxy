@@ -5,14 +5,31 @@
 //! Lives in its own module so the JSONL / compile / report path is
 //! testable without going through clap. The clap types stay in
 //! `main.rs` next to the other subcommands.
+//!
+//! Replay matches one live MCP hook: a single origin's
+//! `cedar_policies` compiled with [`merged_schema`] (default MCP
+//! schema plus that origin's `schema_override`). Concatenating every
+//! origin into one `PolicySet` would mix forbids across gateways.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context};
 use sbproxy_extension::cedar::{
-    compile_all, format_text, parse_jsonl, replay, schema::default_schema, CedarEvaluator,
-    ReplayReport,
+    compile_all, format_text, parse_jsonl, replay,
+    schema::{merged_schema, McpSchemaConfig},
+    CedarEvaluator, ReplayReport,
 };
+
+/// One origin's Cedar block, the same unit the live hook compiles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CedarOriginSource {
+    /// Origin hostname (`origins:` map key).
+    pub host: String,
+    /// Cedar source from `cedar_policies.policies`.
+    pub policies: String,
+    /// Optional `cedar_policies.schema_override`.
+    pub schema_override: Option<String>,
+}
 
 /// Arguments for `sbproxy cedar replay`.
 #[derive(Debug, Clone)]
@@ -24,7 +41,8 @@ pub struct CedarReplayRequest {
     pub against: PathBuf,
     /// Optional baseline `sb.yml`. When set, the report diffs verdicts.
     pub baseline: Option<PathBuf>,
-    /// Restrict extraction to one origin hostname.
+    /// Restrict extraction to one origin hostname. Required when the
+    /// document has more than one Cedar origin.
     pub origin: Option<String>,
     /// `text` or `json`.
     pub json: bool,
@@ -36,14 +54,17 @@ pub struct CedarReplayRequest {
 pub fn handle_cedar_replay(req: &CedarReplayRequest) -> anyhow::Result<i32> {
     let proposed_yaml = std::fs::read_to_string(&req.config)
         .with_context(|| format!("read {}", req.config.display()))?;
-    let proposed_src = cedar_sources_from_yaml(&proposed_yaml, req.origin.as_deref())?;
-    let proposed = evaluator_from_sources(&proposed_src)?;
+    let proposed_src = select_one_origin(cedar_sources_from_yaml(
+        &proposed_yaml,
+        req.origin.as_deref(),
+    )?)?;
+    let proposed = evaluator_from_origin(&proposed_src)?;
 
     let baseline = if let Some(path) = req.baseline.as_ref() {
         let yaml =
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        let src = cedar_sources_from_yaml(&yaml, req.origin.as_deref())?;
-        Some(evaluator_from_sources(&src)?)
+        let src = select_one_origin(cedar_sources_from_yaml(&yaml, req.origin.as_deref())?)?;
+        Some(evaluator_from_origin(&src)?)
     } else {
         None
     };
@@ -78,17 +99,48 @@ fn print_report(report: &ReplayReport, json: bool, sample_path: &Path) -> anyhow
     Ok(())
 }
 
-fn evaluator_from_sources(sources: &[(String, String)]) -> anyhow::Result<CedarEvaluator> {
-    let refs: Vec<(&str, &str)> = sources
-        .iter()
-        .map(|(id, src)| (id.as_str(), src.as_str()))
-        .collect();
-    let (schema, _) = default_schema().map_err(|error| anyhow!("default MCP schema: {error}"))?;
-    let compiled = compile_all(&refs, Some(&schema)).map_err(|error| anyhow!("{error}"))?;
-    CedarEvaluator::new(compiled.policy_set, Some(schema)).map_err(|error| anyhow!("{error}"))
+/// Compile the way the live MCP action does: one origin, merged schema,
+/// policy id `cedar_policies`.
+fn evaluator_from_origin(source: &CedarOriginSource) -> anyhow::Result<CedarEvaluator> {
+    let schema_config = McpSchemaConfig {
+        mcp_primitives_enabled: true,
+        workspace_override: source.schema_override.clone(),
+    };
+    let (schema, _) = merged_schema(&schema_config)
+        .map_err(|error| anyhow!("origin '{}': {error}", source.host))?
+        .ok_or_else(|| {
+            anyhow!(
+                "origin '{}': default MCP schema unexpectedly disabled",
+                source.host
+            )
+        })?;
+    let compiled = compile_all(
+        &[("cedar_policies", source.policies.as_str())],
+        Some(&schema),
+    )
+    .map_err(|error| anyhow!("origin '{}': {error}", source.host))?;
+    CedarEvaluator::new(compiled.policy_set, Some(schema))
+        .map_err(|error| anyhow!("origin '{}': {error}", source.host))
 }
 
-/// Pull every `origins.<host>.action.cedar_policies.policies` string.
+/// Live evaluation is one hook per origin. Mixing two Cedar sets into
+/// one PolicySet would let origin B's catch-all forbid deny origin A's
+/// traffic, which the live path never does.
+fn select_one_origin(mut sources: Vec<CedarOriginSource>) -> anyhow::Result<CedarOriginSource> {
+    match sources.len() {
+        0 => Err(anyhow!("no origins.*.action.cedar_policies.policies found")),
+        1 => Ok(sources.remove(0)),
+        _ => {
+            let hosts: Vec<&str> = sources.iter().map(|s| s.host.as_str()).collect();
+            Err(anyhow!(
+                "multiple origins have cedar_policies ({}); pass --origin so replay matches one live hook",
+                hosts.join(", ")
+            ))
+        }
+    }
+}
+
+/// Pull every `origins.<host>.action.cedar_policies` block.
 ///
 /// # Errors
 ///
@@ -97,7 +149,7 @@ fn evaluator_from_sources(sources: &[(String, String)]) -> anyhow::Result<CedarE
 pub fn cedar_sources_from_yaml(
     yaml: &str,
     origin_filter: Option<&str>,
-) -> anyhow::Result<Vec<(String, String)>> {
+) -> anyhow::Result<Vec<CedarOriginSource>> {
     let doc: serde_yaml::Value =
         serde_yaml::from_str(yaml).map_err(|error| anyhow!("parse YAML: {error}"))?;
     let Some(origins) = doc.get("origins").and_then(|v| v.as_mapping()) else {
@@ -113,18 +165,26 @@ pub fn cedar_sources_from_yaml(
                 continue;
             }
         }
-        let Some(policies) = origin
-            .get("action")
-            .and_then(|a| a.get("cedar_policies"))
-            .and_then(|c| c.get("policies"))
-            .and_then(|p| p.as_str())
-        else {
+        let Some(cedar) = origin.get("action").and_then(|a| a.get("cedar_policies")) else {
+            continue;
+        };
+        let Some(policies) = cedar.get("policies").and_then(|p| p.as_str()) else {
             continue;
         };
         if policies.trim().is_empty() {
             continue;
         }
-        sources.push((host.to_string(), policies.to_string()));
+        let schema_override = cedar
+            .get("schema_override")
+            .and_then(|p| p.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        sources.push(CedarOriginSource {
+            host: host.to_string(),
+            policies: policies.to_string(),
+            schema_override,
+        });
     }
     if sources.is_empty() {
         return Err(match origin_filter {
@@ -147,18 +207,42 @@ origins:
       cedar_policies:
         policies: |
           permit(principal, action, resource);
+        schema_override: |
+          entity AcmeWidget = {
+            sku: String,
+          };
   other.example.com:
     action:
       type: proxy
       url: https://example.com
 "#;
 
+    const TWO_CEDAR: &str = r#"
+origins:
+  a.example.com:
+    action:
+      type: mcp
+      cedar_policies:
+        policies: |
+          permit(principal, action, resource);
+  b.example.com:
+    action:
+      type: mcp
+      cedar_policies:
+        policies: |
+          forbid(principal, action, resource);
+"#;
+
     #[test]
     fn extracts_cedar_from_mcp_origin() {
         let sources = cedar_sources_from_yaml(YAML, None).expect("extract");
         assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0].0, "mcp.example.com");
-        assert!(sources[0].1.contains("permit("));
+        assert_eq!(sources[0].host, "mcp.example.com");
+        assert!(sources[0].policies.contains("permit("));
+        assert!(sources[0]
+            .schema_override
+            .as_deref()
+            .is_some_and(|s| s.contains("AcmeWidget")));
     }
 
     #[test]
@@ -166,5 +250,30 @@ origins:
         let err =
             cedar_sources_from_yaml(YAML, Some("missing.example.com")).expect_err("must fail");
         assert!(err.to_string().contains("missing.example.com"));
+    }
+
+    #[test]
+    fn two_cedar_origins_require_origin_flag() {
+        let sources = cedar_sources_from_yaml(TWO_CEDAR, None).expect("extract");
+        let err = select_one_origin(sources).expect_err("must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("--origin"), "{msg}");
+        assert!(msg.contains("a.example.com"), "{msg}");
+        assert!(msg.contains("b.example.com"), "{msg}");
+    }
+
+    #[test]
+    fn origin_flag_picks_one_of_two_cedar_origins() {
+        let sources = cedar_sources_from_yaml(TWO_CEDAR, Some("a.example.com")).expect("extract");
+        let one = select_one_origin(sources).expect("one");
+        assert_eq!(one.host, "a.example.com");
+        assert!(one.policies.contains("permit("));
+    }
+
+    #[test]
+    fn evaluator_uses_schema_override_the_live_hook_would() {
+        let sources = cedar_sources_from_yaml(YAML, None).expect("extract");
+        let one = select_one_origin(sources).expect("one");
+        evaluator_from_origin(&one).expect("compile with AcmeWidget override");
     }
 }

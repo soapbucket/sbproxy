@@ -1578,7 +1578,9 @@ struct CedarReplayArgs {
     /// sample's verdict against this file's Cedar source.
     #[arg(long = "baseline")]
     baseline: Option<PathBuf>,
-    /// Restrict extraction to one origin hostname.
+    /// Restrict extraction to one origin hostname. Required when more
+    /// than one origin has `cedar_policies`, so replay matches one live
+    /// hook instead of mixing policy sets.
     #[arg(long = "origin")]
     origin: Option<String>,
     /// Output format. `text` (default) prints one line per sample;
