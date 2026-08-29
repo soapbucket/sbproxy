@@ -183,6 +183,7 @@ fn serves_ok(port: u16) -> bool {
     response.starts_with(b"HTTP/1.1 200")
 }
 
+#[cfg(unix)]
 #[test]
 fn sigterm_cleanly_releases_a_prepared_public_listener() {
     let root = temp_dir("sigterm");
