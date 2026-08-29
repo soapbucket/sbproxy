@@ -2788,7 +2788,7 @@ per_surface_rate_limits:
 | `external` | list | `[]` | External HTTP guardrail adapters and failure policy. See [External AI guardrails](guardrails.md). |
 | `mesh` | object | unset | Runs input detectors as a cascade and fuses verdicts under a quorum rule (`block_threshold`, `redact_on_flag`, `cache`, `cache_capacity`, `latency_budget_ms`). See [ai-guardrail-mesh.md](ai-guardrail-mesh.md). |
 
-Each `input` / `output` entry is an object with a `type` field and type-specific config. Built-in types: `pii`, `secrets`, `injection` (deprecated compatibility alias `prompt_injection`), `toxicity`, `jailbreak`, `content_safety`, `schema`, `regex`, `regex_guard`, `context_poisoning`, `agent_alignment`, `classifier`. The two injection names preserve their existing blocking fields but use the same canonical heuristic matcher as `prompt_injection_v2`. See [ai-gateway.md](ai-gateway.md#guardrails) for per-guardrail fields.
+Each `input` / `output` entry is an object with a `type` field and type-specific config. Built-in types: `pii`, `secrets`, `injection` (deprecated compatibility alias `prompt_injection`), `toxicity`, `jailbreak`, `content_safety`, `schema`, `regex`, `regex_guard`, `license_leak`, `context_poisoning`, `agent_alignment`, `classifier`. The two injection names preserve their existing blocking fields but use the same canonical heuristic matcher as `prompt_injection_v2`. See [ai-gateway.md](ai-gateway.md#guardrails) for per-guardrail fields.
 
 ##### Safety guardrail modes
 
@@ -3097,6 +3097,127 @@ See [mcp.md](mcp.md) for federation, RBAC, OpenAPI-backed tools, sessions,
 versioning, and cost attribution, and [mcp-compose.md](mcp-compose.md) for
 `type: local` servers: config-declared tools, HTTP and step-DAG handlers,
 and response shaping.
+
+### abtest
+
+([config](../examples/ab-test-routing/))
+
+Split traffic across weighted backend variants for an A/B test. A request
+that arrives without the sticky cookie takes a weighted pick and the
+response hands the client its pin; a returning client carrying that cookie
+stays on the same variant, so a multi-request user journey never sees a
+different variant mid-flight.
+
+```yaml
+origins:
+  "app.example.com":
+    action:
+      type: abtest
+      sticky_cookie: sb_ab_variant
+      variants:
+        - name: control
+          url: https://control.internal:8080
+          weight: 50
+        - name: experiment
+          url: https://experiment.internal:8080
+          weight: 50
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `variants` | list | required, non-empty | Backend variants. Each entry is `name`, `url`, `weight`. |
+| `sticky_cookie` | string | `sb_ab_variant` | Cookie name used to pin a client to its assigned variant across requests. |
+
+A request that arrives without the cookie takes a weighted roll, and the
+response carries `Set-Cookie: <sticky_cookie>=<variant>; Path=/;
+Max-Age=2592000; SameSite=Lax; HttpOnly` so the next request from that
+client reaches the same variant. A request that already carries the
+cookie is routed by it and is not restamped, so the thirty-day window
+counts from the first visit rather than sliding forward on every
+request. The value is the variant name from your own config; nothing the
+caller sent is written into it.
+
+A cookie naming a variant that has since been removed from `variants`
+falls through to a fresh roll, so shrinking an experiment does not strand
+the clients pinned to the variant you dropped.
+
+A request carrying the sticky cookie with a value matching a configured
+variant's `name` always routes to that variant. Everything else gets a
+fresh weighted-random pick: a variant's share of traffic is its `weight`
+divided by the sum of all weights, and a total weight of `0` (every
+variant weighted `0`) falls back to the first configured variant rather
+than dividing by zero. Do not set the sticky cookie from your
+application as well: the proxy already stamps it, and a second
+`Set-Cookie` with the same name leaves it to the browser which one wins.
+If the backend needs to know which variant served a request, read it from
+the cookie the proxy set rather than minting your own.
+
+`abtest` cannot be combined with `response_cache` on the same origin, and
+the config is refused at load if you try. That holds whether the `abtest`
+is the origin's own action or sits in one of its `forward_rules` entries,
+because the parent origin's cache is consulted before a rule is selected
+either way. The cache lookup runs before the variant is picked, and the
+variant is not part of the cache key, so a cache hit would serve one
+variant's body to clients assigned another and the split would report
+weights it never applied. Disable `response_cache` on this origin, or put
+the cached content on its own.
+
+Each variant's `url` accepts the same host **and path** as a `proxy`
+action: `https://b.example.com/v2` sends the request to `/v2` prefixed
+onto the client's own path, exactly as a `proxy` action with that URL
+would. `host_override`, `retry`, and `service_discovery` are not
+supported on a per-variant basis.
+
+Every request that reaches this action **and resolves to a usable
+upstream** records
+`sbproxy_action_abtest_variant_selected_total{origin, variant}`, whether
+the pick came from the sticky cookie or a fresh roll, so the observed
+ratio between variants reflects the configured weights over time (absent
+a skew in how often sticky-cookie holders return). A request whose
+selected variant has a `url` that does not parse is refused with `502`
+and is not counted, so a gap between this counter and the origin's
+request count is a malformed variant URL rather than a routing bug.
+
+### https_proxy
+
+([config](../examples/https-forward-proxy/))
+
+Relay a request to the host it already resolved to (the inbound `Host`
+header), but only when that host is on an explicit allow-list. Where every
+other action in this section proxies to a URL fixed in config, this one
+has no `url` field at all: think of it as a narrower version of `proxy`
+for an origin whose hostname key is a wildcard (`"*.internal.io"`) and
+that wants to relay only a named subset of the hosts the wildcard would
+otherwise match, refusing the rest with `403` instead of quietly
+forwarding them.
+
+```yaml
+origins:
+  "*.internal.io":
+    action:
+      type: https_proxy
+      allowed_hosts:
+        - api.internal.io
+        - "*.svc.internal.io"
+      require_auth: true
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `allowed_hosts` | list | required, non-empty | Hosts permitted through the relay. Exact match or a `*.suffix` wildcard. |
+| `connect_timeout_ms` | int | `5000` | Upstream connect timeout applied to the relayed connection. |
+| `require_auth` | bool | `false` | When true, the origin must also configure an `authentication:` provider; a request with no successful `Allow` decision is refused with `401` regardless of `allowed_hosts`. |
+
+This is a guarded TLS reverse-proxy action, not an HTTP `CONNECT` tunnel: it
+forwards the HTTP request to the resolved host over TLS on port `443` and
+cannot create a raw byte tunnel. The relay is always HTTPS to port `443` on the resolved host, with the
+inbound request forwarded otherwise unchanged (no `Host` rewrite, matching
+the source concept this ports: the destination is whatever host the
+client asked for, not a URL the operator configured). A denied host gets
+`403`; every decision, allowed or denied, records
+`sbproxy_action_https_proxy_decisions_total{origin, decision}` so a
+sustained run of `deny` is visible before it is mistaken for the relay
+being broken.
 
 ### noop
 
@@ -3962,7 +4083,7 @@ The access log records the matched principal's source under the `principal_kind`
 
 Policies are evaluated before the action runs. They enforce rate limits, security rules, and access controls. The `policies` field is a sibling of `action` and is an array of policy objects.
 
-SBproxy ships twenty-eight policy types: `rate_limiting`, `rate_limit_budget`, `ip_filter`, `expression`, `rego`, `waf`, `ddos`, `csrf`, `security_headers`, `request_limit`, `sri`, `assertion`, `request_validator`, `body_threat_protection`, `content_digest`, `concurrent_limit`, `ai_crawl_control`, `object_authz`, `exposed_credentials`, `page_shield`, `dlp`, `openapi_validation`, `prompt_injection_v2`, `http_framing`, `agent_class`, `a2a`, `semantic_constraint`, and `agent_budget`. This page documents the most common ones; the rest have their own pages.
+SBproxy ships thirty policy types: `rate_limiting`, `rate_limit_budget`, `ip_filter`, `expression`, `rego`, `waf`, `ddos`, `csrf`, `security_headers`, `request_limit`, `sri`, `assertion`, `request_validator`, `body_threat_protection`, `content_digest`, `concurrent_limit`, `ai_crawl_control`, `object_authz`, `exposed_credentials`, `page_shield`, `dlp`, `openapi_validation`, `prompt_injection_v2`, `http_framing`, `agent_class`, `a2a`, `semantic_constraint`, `agent_budget`, `geoip`, and `user_agent_parser`. This page documents the most common ones; the rest have their own pages.
 
 ### rate_limiting
 
@@ -4415,6 +4536,14 @@ policies:
 | `cookie_same_site` | string | | SameSite attribute (`Strict`, `Lax`, `None`) |
 | `exempt_paths` | list | | Paths exempt from CSRF checking |
 
+`csrf` mints a token on every safe-method response, whether or not the
+caller already holds one, and the proxy appends it as a `Set-Cookie`. If
+this origin also enables `response_cache`, a stored entry can replay that
+cookie to a later caller, which hands a second caller the first caller's
+token. Read
+[Who a cached entry belongs to](#who-a-cached-entry-belongs-to) before
+combining the two.
+
 ### request_limit
 
 Cap request body size, header count, header value size, URL length, and query string length. Any field left unset means that dimension is not checked.
@@ -4530,7 +4659,7 @@ policies:
 
 ### owasp_api_top10 (pack)
 
-Not one of the twenty-eight policy types above. `owasp_api_top10` is a
+Not one of the thirty policy types above. `owasp_api_top10` is a
 pseudo-policy: the compiler reads it before any policy is compiled,
 expands it into the real synthesized policies and transforms named
 below, and removes this entry so it never reaches a policy module's own
@@ -4570,13 +4699,59 @@ available at `GET /admin/owasp-api-pack`
 ([admin-api-reference.md](admin-api-reference.md#get-adminowasp-api-pack))
 and in `sbproxy plan`'s text output.
 
+### geoip
+
+Resolve the client IP to country, continent, city, and ASN against a
+MaxMind-compatible `.mmdb`. A producer, not a gate: it never denies, and
+a missing database or an unresolved client IP is a metric outcome rather
+than an error. Full page: [request-enrichment.md](request-enrichment.md).
+
+```yaml
+policies:
+  - type: geoip
+    # Path to a MaxMind-compatible .mmdb file. Optional. Omitted, the
+    # policy falls back to the binary's embedded copy, which is a
+    # zero-byte placeholder in an OSS build, so the lookup records
+    # `result="no_database"` and adds nothing.
+    database_path: /opt/geoip/GeoLite2-City.mmdb
+    # Stamp X-Geo-Country, X-Geo-Continent, X-Geo-City, and X-Geo-Asn on
+    # the upstream request for the fields the lookup found. Default true.
+    inject_headers: true
+```
+
+### user_agent_parser
+
+Parse the `User-Agent` header into browser, OS, and device type, plus a
+headless-automation-library label (`headless_chrome`, `phantomjs`,
+`puppeteer`, `playwright`, `selenium`). Independent of the JA4-based
+headless detector, which reads the TLS fingerprint rather than the
+header; a request can trip either, both, or neither. Also never denies.
+Full page: [request-enrichment.md](request-enrichment.md).
+
+```yaml
+policies:
+  - type: user_agent_parser
+    # Header carrying the parse result as JSON on the upstream request.
+    # Default "x-parsed-ua".
+    inject_header: x-parsed-ua
+    # Whether to stamp `inject_header` at all. Default true; set false to
+    # populate the request context for hooks without touching the
+    # upstream request.
+    inject: true
+```
+
+Both policies feed `geo_country`, `geo_asn`, and `ua_headless_library`
+to any registered `AnomalyDetectorHook` or `IdentityResolverHook`
+whether or not header injection is on. Runnable:
+[`examples/request-enrichment/`](../examples/request-enrichment/).
+
 ---
 
 ## Transforms
 
 Transforms modify the response body before it reaches the client. They are specified as a list under `transforms` and run in order. Reach for transforms when you need to reshape API responses for different consumers.
 
-SBproxy supports twenty-five transform types: `json`, `json_projection`, `json_schema`, `template`, `replace_strings`, `normalize`, `encoding`, `format_convert`, `payload_limit`, `discard`, `sse_chunking`, `html`, `optimize_html`, `html_to_markdown`, `markdown`, `css`, `lua_json`, `javascript`, `js_json`, `wasm`, `boilerplate`, `citation_block`, `json_envelope`, `cel`, `a2a_agent_card_rewrite`, plus a `noop` for testing.
+SBproxy supports twenty-eight transform types: `json`, `json_projection`, `json_schema`, `ai_schema`, `template`, `replace_strings`, `normalize`, `encoding`, `format_convert`, `payload_limit`, `discard`, `sse_chunking`, `html`, `optimize_html`, `html_to_markdown`, `markdown`, `pdf_markdown`, `css`, `lua`, `lua_json`, `javascript`, `js_json`, `wasm`, `boilerplate`, `citation_block`, `json_envelope`, `cel`, `a2a_agent_card_rewrite`, plus a `noop` for testing. `pdf_markdown` needs the optional `transform-pdf` build; every other type is in the default binary.
 
 ### json
 
@@ -5037,6 +5212,35 @@ reads. If that is your origin and the content really is identical for everyone,
 the answer is a `request_modifier` upstream of SBproxy that strips the cookie,
 or leaving `response_cache` off for that origin and caching at a layer that
 knows the content is public.
+
+**What the partition does not protect: a cookie the proxy itself mints.**
+The key is drawn from the `Cookie` header the caller *sends*. A caller that
+sends none lands in the cookie-less partition along with every other caller
+that sends none, and that is the partition a first-time visitor is in. If the
+response stored for that partition carries a `Set-Cookie` the proxy minted
+while serving it, every later cookie-less caller is served that same
+`Set-Cookie` from the entry.
+
+Three features mint a cookie on this path, and the risk differs by what the
+cookie carries:
+
+- **`sessions`** mints a session identifier. A second caller can be handed the
+  first caller's session id, which means they share a session.
+- **`csrf`** mints a CSRF token on safe-method responses. A second caller can
+  be handed the first caller's token.
+- **`abtest`** mints a variant pin. This one is refused outright: an `abtest`
+  action, on the origin or in any of its `forward_rules`, cannot be combined
+  with `response_cache`, because the cached *body* is wrong too and the config
+  is rejected at load.
+
+Treat a shared session identifier as an authentication problem, not a caching
+one. Until this is fixed at the storage layer, either leave `response_cache`
+off on an origin that configures `sessions` or `csrf`, or, if you must run
+both, put the cached content on an origin that mints neither. If you have
+already been running that combination, bump `response_cache.epoch` after
+changing the configuration: the epoch is part of the key's config
+fingerprint, so raising it partitions away from every entry written before,
+including any that carry a minted cookie.
 
 Two more dimensions are stamped the same way and for the same reason:
 
@@ -5802,6 +6006,13 @@ origins:
 | `allow_non_ssl` | bool | false | Allow sessions over plain HTTP |
 
 Sessions disable themselves implicitly when the block is omitted.
+
+A session cookie is minted when the caller sends none, and the proxy
+appends it as a `Set-Cookie`. If this origin also enables
+`response_cache`, a stored entry can replay that cookie to a later
+caller, which means two callers share one session. Read
+[Who a cached entry belongs to](#who-a-cached-entry-belongs-to) before
+combining the two.
 
 ---
 

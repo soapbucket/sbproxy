@@ -1233,6 +1233,22 @@ from tests; this branch adds nothing to either bucket beyond the two already
 recorded above. The gap to main's own 1523 is this branch's own items, counted
 here and not there, for the reasons written against them.
 
+2026-08-28 (WOR-2668 / WOR-2670 / WOR-2671): test-only 324 -> 323,
+unreferenced 1525 -> 1524. Wiring the new module types through
+sbproxy-core gave production callers to items the scanner had only seen
+used from tests, and reading AbTestSelection::sticky_cookie from
+response_filter gave a cross-file caller to a field that had none.
+Nothing was renamed and nothing was narrowed; both counts are locked so
+the ground is not handed back on the next branch.
+
 2026-08-29 (WOR-2421): unreferenced 1525 -> 1524. Parallel-input chain
 predicates and the session wait helper are cfg(test) rather than pub, so
 they leave this bucket and rustc polices them.
+
+2026-08-29 (merge of main #1247 into WOR-2668 / WOR-2670 / WOR-2671):
+unreferenced 1524 -> 1523. Both sides of this merge emptied items out of
+this bucket independently, and each recorded 1525 -> 1524 against its own
+base, so the merged tree is one lower than either. Neither branch
+narrowed anything to get there; the count is re-derived from the merged
+tree and locked here rather than carried at whichever number was true
+before the merge.

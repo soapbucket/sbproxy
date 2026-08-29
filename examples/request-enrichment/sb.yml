@@ -1,0 +1,50 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# GeoIP + User-Agent request enrichment.
+#
+# Two policies, each a typed producer that never denies a request:
+#
+# - geoip: resolves the client IP to country/continent/city/ASN via a
+#   MaxMind-compatible MMDB. This OSS build ships a zero-byte embedded
+#   placeholder, so without database_path the policy still runs (and
+#   records the no_database metric outcome) but adds no X-Geo-*
+#   headers. Point database_path at a real GeoLite2 or IPinfo Lite
+#   .mmdb to see them.
+# - user_agent_parser: parses the User-Agent header into browser/OS/
+#   device-type plus a headless-automation-library signal, and
+#   stamps the JSON result onto X-Parsed-Ua.
+#
+# Both also populate sbproxy_plugin::RequestContextView (geo_country,
+# geo_asn, ua_headless_library) for any registered AnomalyDetectorHook
+# or IdentityResolverHook. See docs/request-enrichment.md.
+#
+# Run:
+#   make run CONFIG=examples/request-enrichment/sb.yml
+#
+# Test (ordinary browser, no headless signal):
+#   curl -s -H 'Host: api.local' \
+#        -H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0' \
+#        http://127.0.0.1:8080/get | jq '.headers["x-parsed-ua"] | fromjson'
+#
+# Test (headless-automation client):
+#   curl -s -H 'Host: api.local' \
+#        -H 'User-Agent: Mozilla/5.0 (X11; Linux x86_64) HeadlessChrome/120.0.6099.109 Safari/537.36' \
+#        http://127.0.0.1:8080/get | jq '.headers["x-parsed-ua"] | fromjson | .headless_library'
+#
+# Expected: the second command prints "headless_chrome".
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    policies:
+      - type: geoip
+        inject_headers: true
+
+      - type: user_agent_parser
+        inject_header: x-parsed-ua
+        inject: true

@@ -21,6 +21,7 @@ Usage:
 """
 
 import argparse
+import datetime
 import re
 import sys
 from pathlib import Path
@@ -34,6 +35,14 @@ LINK_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)")
 IMAGE_RE = re.compile(r"^!\[[^\]]*\]\([^)]*\)\s*$")
 LAST_MODIFIED_RE = re.compile(r"^\*Last modified:.*\*$")
 COUNT_LINE_RE = re.compile(r"^_\d+ examples on disk\._$")
+# The one line in the file the table rewrite does not own. Left
+# unmanaged it merges badly: two branches regenerate on different
+# days, git keeps whichever side it likes, `--check` passes because
+# the table matches, and the file claims a date older than the rows
+# beneath it.
+GENERATION_STAMP_RE = re.compile(
+    r"(`python3 scripts/gen-examples-catalog\.py` on )\d{4}-\d{2}-\d{2}(\.)"
+)
 
 
 def clean(text: str) -> str:
@@ -156,6 +165,18 @@ def rewrite(content: str, rows: list[str]) -> str:
     return "\n".join(lines[:t0] + section + lines[tail:])
 
 
+def stamp_generation_date(content: str, generated_on: str) -> str:
+    """Put today's date on the line that says when this was generated."""
+    stamped, replacements = GENERATION_STAMP_RE.subn(
+        lambda match: f"{match.group(1)}{generated_on}{match.group(2)}",
+        content,
+        count=1,
+    )
+    if replacements != 1:
+        sys.exit("error: no examples catalog generation stamp in examples/README.md")
+    return stamped
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -178,6 +199,7 @@ def main() -> None:
         return
 
     if new != old:
+        new = stamp_generation_date(new, datetime.date.today().isoformat())
         CATALOG_FILE.write_text(new, encoding="utf-8")
         print(f"{n} examples; catalog rewritten")
     else:

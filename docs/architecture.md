@@ -203,7 +203,7 @@ implemented as a sequence of `ProxyHttp` callbacks; the per-request work happens
 those callbacks rather than in a separate dispatcher.
 
 The full path, from listener to access log. Every box is a stage this section names; the
-action-dispatch branches are the fifteen action types cataloged in
+action-dispatch branches are the seventeen action types cataloged in
 [features.md](features.md#6-reference-every-action-type):
 
 ```mermaid
@@ -415,7 +415,10 @@ embedders, registered by a function call at startup rather than through `invento
 - `AnomalyDetectorHook` (`register_anomaly_hook`) dispatches in `response_filter`,
   once per request, after the identity, fingerprint, and rate signals are populated.
   The OSS pipeline forwards verdicts to whatever sink the hook wires and does not act
-  on them itself.
+  on them itself. Its `RequestContextView` input also carries `geo_country` /
+  `geo_asn` (from the `geoip` policy) and `ua_headless_library` (from
+  `user_agent_parser`), when those policies are configured for the origin; see
+  [request-enrichment.md](request-enrichment.md).
 
 OSS builds register none of the three. [request-flow.md](request-flow.md) shows their
 exact pipeline placement next to every other attachment point.

@@ -32,6 +32,7 @@ pub mod ddos;
 pub mod dlp;
 pub mod exposed_creds;
 pub mod expression;
+pub mod geoip;
 pub mod http_framing;
 pub mod ip_filter;
 pub mod object_authz;
@@ -46,7 +47,42 @@ pub mod request_validator;
 pub mod response_phase;
 pub mod semantic_constraint;
 pub(crate) mod shared_admission;
+pub mod user_agent;
 pub mod waf;
+
+/// Turn a Prometheus registration result into an `Option`, logging
+/// rather than ending the process when a family fails to register.
+///
+/// A duplicate or invalid registration is a bug in this crate, so it
+/// trips a `debug_assert` and shows up in any test run. In a release
+/// binary it must not be fatal: the enforcer whose counter failed
+/// still has a request to decide, and killing the proxy over a
+/// missing panel trades a whole origin for a graph. The caller holds
+/// the `Option` in a `LazyLock` and skips the `inc()` when it is
+/// `None`, so the panel reading that family stays flat for the life
+/// of the process and every other panel keeps reporting.
+///
+/// This exists instead of `.expect()` because production code in this
+/// workspace may not add an unwrap or expect site;
+/// `scripts/check-unwrap-ratchet.sh` counts them and the count only
+/// falls.
+fn registered<M>(result: prometheus::Result<M>, family: &'static str) -> Option<M> {
+    match result {
+        Ok(metric) => Some(metric),
+        Err(error) => {
+            debug_assert!(
+                false,
+                "metric family {family} must register exactly once: {error}"
+            );
+            tracing::warn!(
+                metric = family,
+                %error,
+                "metric family did not register; every panel reading it stays flat for this process"
+            );
+            None
+        }
+    }
+}
 
 pub use a2a::A2AEnforcer;
 pub use agent_budget::AgentBudgetEnforcer;
@@ -61,6 +97,7 @@ pub use ddos::DdosEnforcer;
 pub use dlp::DlpEnforcer;
 pub use exposed_creds::ExposedCredsEnforcer;
 pub use expression::ExpressionEnforcer;
+pub use geoip::GeoIpEnforcer;
 pub use http_framing::HttpFramingEnforcer;
 pub use ip_filter::IpFilterEnforcer;
 pub use object_authz::ObjectAuthzEnforcer;
@@ -74,4 +111,5 @@ pub use request_limit::RequestLimitEnforcer;
 pub use request_validator::RequestValidatorEnforcer;
 pub use response_phase::{AssertionEnforcer, PageShieldEnforcer, SecHeadersEnforcer, SriEnforcer};
 pub use semantic_constraint::SemanticConstraintEnforcer;
+pub use user_agent::UserAgentEnforcer;
 pub use waf::WafEnforcer;

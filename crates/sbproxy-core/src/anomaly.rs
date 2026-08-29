@@ -1105,6 +1105,10 @@ mod tests {
             ja4_trustworthy: ja4.is_some(),
             headless_library: headless,
             client_ip: ip,
+            // WOR-2668: no enrichment policy runs in this fixture.
+            geo_country: None,
+            geo_asn: None,
+            ua_headless_library: None,
         }
     }
 

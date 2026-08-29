@@ -1,0 +1,31 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# PDF-to-Markdown transform.
+#
+# Replaces an `application/pdf` upstream response with a Markdown
+# projection (the same MarkdownProjection shape `html_to_markdown`
+# produces), so a downstream JSON envelope or `x-markdown-tokens`
+# header sees the same shape regardless of source format.
+#
+# Requires the `transform-pdf` cargo feature (off by default; see
+# docs/transforms.md#pdf_markdown---pdf-to-markdown-projection). Build
+# and run with:
+#
+#   cargo run -p sbproxy --features sbproxy-modules/transform-pdf -- \
+#     serve -f examples/transform-pdf-markdown/sb.yml
+#
+# Test (against a PDF-serving upstream on test.sbproxy.dev, mirroring
+# the convention examples/transform-html uses for its HTML fixture):
+#   curl -s -H 'Host: pdf.local' http://127.0.0.1:8080/pdf
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "pdf.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    transforms:
+      - type: pdf_markdown
+        max_pages: 50
+        token_bytes_ratio: 0.25
