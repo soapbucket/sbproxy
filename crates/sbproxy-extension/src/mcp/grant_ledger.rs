@@ -92,7 +92,7 @@ pub enum GrantStatus {
         /// Unix seconds when the window ended.
         expired_at_unix: u64,
     },
-    /// The ledger is at [`MAX_GRANT_ROWS`] and this row does not
+    /// The ledger is at its 10,000-row ceiling and this row does not
     /// already exist, so a new observation cannot be recorded.
     Saturated,
 }
