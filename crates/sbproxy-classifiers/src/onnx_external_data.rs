@@ -8,7 +8,7 @@
 //! An ONNX `TensorProto` may set `data_location: EXTERNAL` and name a file in
 //! its `external_data` `location` entry instead of carrying the tensor inline.
 //! The runtime is then expected to open that file and use its bytes as the
-//! tensor. `tract-onnx` up to 0.21.17 resolved the value as
+//! tensor. `tract-onnx` up to and including 0.21.16 resolved the value as
 //! `PathBuf::from(model_dir).join(location)` with no containment check, and
 //! `Path::join` with an absolute argument discards the base. A model carrying
 //! `location: "/etc/ssl/private/server.key"` read that file, and one carrying
@@ -21,11 +21,13 @@
 //!
 //! # Why refuse rather than confine
 //!
-//! `tract-onnx` 0.22.3 confines the value to the model directory, but this
-//! workspace is held at 0.21 because 0.22 regresses the Gather op to a panic
-//! on out-of-range indices (see `deny.toml` and `docs/model-pinning.md`). So
-//! this is not a second layer behind an upstream fix, it is the layer that
-//! closes the advisory here. Three reasons it is written this way:
+//! `tract-onnx` confines the value to the model directory from 0.21.17
+//! onward, but this workspace resolves 0.21.10 and cannot move: 0.21.17 is
+//! blocked by an exact `libm` pin one layer down, and 0.22 and 0.23 regress
+//! the Gather op to a panic on out-of-range indices. See `deny.toml` and
+//! `docs/model-pinning.md`. So this is not a second layer behind an upstream
+//! fix, it is the layer that closes the advisory here. Three reasons it is
+//! written this way:
 //!
 //! - A confined reference is still an **unbounded read**. Size budgets measure
 //!   the `.onnx` file, so a 900-byte model naming a 40 GB sibling passes every
@@ -44,8 +46,11 @@
 //! `location` value is a host path the attacker chose in order to learn
 //! whether it exists, so echoing it into a log, an error, or a metric label
 //! would turn the refusal into the disclosure it exists to prevent. Note that
-//! tract's own confinement error does echo the location, which is a further
-//! reason to refuse before the runtime ever sees the proto.
+//! tract's own confinement error, from 0.21.17 onward, does echo the location
+//! back, which is a further reason to refuse before the runtime ever sees the
+//! proto. That refusal is also stricter than tract's: tract checks path
+//! components, so it admits a symlink inside the model directory that points
+//! out of it, while refusing the reference outright never resolves anything.
 
 use anyhow::{anyhow, Result};
 use tract_onnx::pb::{
@@ -363,7 +368,7 @@ mod tests {
     /// `data_location` and `external_data` are independent fields. tract takes
     /// the external branch off the first alone, so a detector that only reads
     /// the second is narrower than the runtime it guards, and the reverse
-    /// leaves a model that declares a location the runtime may later honour.
+    /// leaves a model that declares a location the runtime may later honor.
     #[test]
     fn external_data_without_the_location_marker_is_refused() {
         let model = ModelProto {

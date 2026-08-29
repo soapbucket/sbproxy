@@ -115,11 +115,22 @@ ignore = [
   # only because tract-onnx depends on it, and every model this process
   # loads goes through the ONNX path.
   #
-  # BLOCKED, re-verified 2026-08-29 (WOR-2694), and the blocker changed.
-  # The old blocker was a libm conflict: tract-data 0.21.16 and 0.21.17 pin
-  # `libm = "=0.2.11"` exactly while wasmtime-internal-core needs
-  # `^0.2.16`. That is still true, but 0.22 relaxes the pin to `^0.2.11`
-  # and does resolve, so the libm story is no longer the reason.
+  # BLOCKED, re-verified 2026-08-29 (WOR-2694) by extracting the .crate
+  # tarballs rather than trusting a summary. Two separate blockers, and the
+  # cheapest way out is the first one:
+  #
+  # 0.21.17 is the release to want. It carries the containment fix for the
+  # ONNX external_data read AND the NNEF fix (from 0.21.16), and it has
+  # none of the Gather regression below: its Gather is still the checked
+  # `data_view.get(&*icoords).context("Invalid gather")?`. It is blocked by
+  # exactly one character. tract-data 0.21.17 declares
+  # `libm = "=0.2.11"`, an exact pin, while wasmtime-internal-core needs
+  # `^0.2.16` and this lockfile resolves libm 0.2.16. Drop the `=` and it
+  # resolves. That is the upstream ask: a 0.21.18 patch relaxing one
+  # requirement, which is a far smaller request than the alternative below.
+  #
+  # 0.22 and 0.23 do resolve, because they already write that requirement
+  # as a caret. They are refused for a different reason.
   #
   # The reason now is a panic regression. tract 0.22 added an unchecked
   # block-copy fast path to the Gather op (tract-core/src/ops/array/

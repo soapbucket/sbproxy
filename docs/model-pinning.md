@@ -141,14 +141,19 @@ Version floor: `tract-onnx` 0.21, held there deliberately. That is worth
 stating plainly, because the advisory that motivates this section is fixed
 upstream and we are not taking the fix.
 
-Both advisories against the 0.21 line are fixed from 0.21.16 and 0.21.17
-onward, but those two releases do not resolve in this dependency graph:
-`tract-data` at both pins `libm = "=0.2.11"` as an exact requirement while
-`wasmtime-internal-core` needs `libm ^0.2.16`, and no resolution satisfies
-both. 0.22 relaxes that same requirement to `^0.2.11` and does resolve.
+The NNEF overflow is fixed from 0.21.16, and the `external_data` read from
+0.21.17. **0.21.17 is the release worth wanting**: it closes both, and it
+predates the Gather regression described below, so it is the only version in
+reach that is strictly better than what we run.
 
-It also regresses correctness. 0.22 added an unchecked block-copy fast path
-to the Gather op that indexes a slice directly:
+It is blocked by exactly one character. `tract-data` 0.21.17 declares
+`libm = "=0.2.11"`, an exact pin, while `wasmtime-internal-core` needs
+`libm ^0.2.16` and this lockfile resolves `libm 0.2.16`. Remove the `=` and
+the graph resolves. 0.22 and 0.23 already write that same requirement as a
+caret, which is why they resolve where 0.21.17 cannot.
+
+But they regress correctness, and 0.21.17 does not. 0.22 added an unchecked
+block-copy fast path to the Gather op that indexes a slice directly:
 
 ```text
 let input_offset = resolved_index * block_len;
@@ -164,9 +169,14 @@ panics a worker on the AI request path instead of failing cleanly, and the
 prompt-injection tests that assert a typed inference failure catch it.
 0.23 carries the same fast path.
 
-So the trade on offer is an unreachable NNEF integer overflow against a
-panic on a live request path, and it is refused. `deny.toml` carries
-GHSA-x5mv-8wgw-29hg with an expiry and the reasoning beside it.
+So the trade on offer from 0.22 and 0.23 is an unreachable NNEF integer
+overflow against a panic on a live request path, and it is refused.
+`deny.toml` carries GHSA-x5mv-8wgw-29hg with an expiry and the reasoning
+beside it.
+
+The way out is not to bounds-check Gather across two major lines. It is to
+ask tract for a 0.21.18 that relaxes one exact pin, which unblocks a release
+that is already correct on both counts.
 
 **The file-read advisory is not being carried.** GHSA-h668-6x6g-f8r5 is
 closed by the refusal described above, which is why that refusal is written

@@ -27,7 +27,7 @@
 use std::path::{Path, PathBuf};
 
 use prost_011::Message as _;
-use sbproxy_classifiers::{OnnxClassifier, OnnxEmbedder, OnnxTokenClassifier};
+use sbproxy_classifiers::{LoadOptions, OnnxClassifier, OnnxEmbedder, OnnxTokenClassifier};
 use tract_onnx::pb::{
     tensor_proto, GraphProto, ModelProto, OperatorSetIdProto, StringStringEntryProto, TensorProto,
     ValueInfoProto,
@@ -198,4 +198,38 @@ fn a_self_contained_model_still_loads() {
     classifier
         .classify("hello")
         .expect("a loaded classifier still classifies");
+}
+
+/// The byte-snapshot loader, which is the guardrail embedding classifier's
+/// path and the only one that takes bytes rather than a path.
+///
+/// tract alone would already refuse here, because the reader API has no model
+/// directory to resolve against. That is exactly why this test exists: the
+/// walk runs on this path too, so the refusal is ours and carries our wording
+/// rather than depending on a runtime property that a future tract could
+/// change. Without this the loader family would be the one seam with no test.
+#[test]
+fn the_byte_snapshot_embedder_refuses_external_data() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decoy = dir.path().join("secret.bin");
+    std::fs::write(&decoy, DECOY_BYTES).expect("write decoy");
+
+    let model_bytes = model_with_external_tensor(&decoy.display().to_string());
+    let tokenizer_bytes = std::fs::read(fixture("tiny_tokenizer.json")).expect("read tokenizer");
+
+    let error = match OnnxEmbedder::load_from_bytes_with_options(
+        &model_bytes,
+        &tokenizer_bytes,
+        &LoadOptions::default(),
+    ) {
+        Ok(_) => panic!("a byte snapshot declaring external data must be refused"),
+        Err(error) => error,
+    };
+
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("external tensor data"),
+        "refusal should name the external-data seam, got: {message}"
+    );
+    assert_discloses_nothing(&message, &decoy);
 }

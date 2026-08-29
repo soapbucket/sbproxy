@@ -22,9 +22,12 @@ description = "Pure-Rust ONNX inference + tokenizer wrapper for sbproxy detector
 # which holds whichever tract is underneath. The NNEF overflow has no
 # call site in this workspace and is carried in deny.toml with an expiry.
 #
-# Why not bump. 0.21.16 and 0.21.17 do not resolve: `tract-data` pins
-# `libm = "=0.2.11"` exactly while `wasmtime-internal-core` needs
-# `^0.2.16`. 0.22 and 0.23 do resolve, but both added an unchecked
+# Why not bump. 0.21.17 is the release to want: it fixes both advisories
+# and predates the Gather regression below. It does not resolve, and is
+# blocked by one character: `tract-data` 0.21.17 pins `libm = "=0.2.11"`
+# exactly while `wasmtime-internal-core` needs `^0.2.16` and the lockfile
+# resolves 0.2.16. 0.22 and 0.23 write that same requirement as a caret and
+# do resolve, but both added an unchecked
 # block-copy fast path to the Gather op that panics on an out-of-range
 # index where 0.21 returned an error, turning an ordinary tokenizer and
 # model vocabulary mismatch into a panic on the AI request path.
