@@ -25,9 +25,17 @@
 //!   returns `{"data": {"ciphertext": "vault:v1:<base64>"}}`.
 //! * `POST {addr}/v1/{mount}/decrypt/{key}` with `{"ciphertext": ...}`
 //!   returns `{"data": {"plaintext": <base64>}}`.
-//! * `GET {addr}/v1/{mount}/keys/{key}` is the liveness and authorization
-//!   probe: it answers 200 only while the token is valid and the policy
-//!   still grants read on the key.
+//!
+//! Those two are the whole wire surface. The liveness probe is not a third
+//! endpoint: it is one `encrypt` followed by one `decrypt` of a fixed
+//! non-secret constant, so it needs exactly the grant the credential path
+//! needs and no more. It deliberately does **not** read
+//! `GET {addr}/v1/{mount}/keys/{key}`, which an earlier version used and
+//! which needs `read` on a third path. The least-privilege policy in
+//! `docs/key-management.md` grants `update` on encrypt and decrypt and
+//! nothing else; a key-read probe fails forever against that policy on a
+//! healthy deployment, and passes forever through a revocation that drops
+//! encrypt and decrypt while leaving the key readable.
 //!
 //! The `vault:v1:` prefix carries the key version, which is why a Transit
 //! key can be rotated without re-wrapping a single stored envelope: old
@@ -555,6 +563,205 @@ mod tests {
             revoked.contains("no longer authorized"),
             "a 403 is the revoked-grant case and must say so: {revoked}"
         );
+    }
+
+    /// A one-shot HTTP server that records each request line and answers
+    /// from a canned script.
+    ///
+    /// `Connection: close` on every response so `ureq` opens a fresh
+    /// connection per call and the accept loop stays one-request-per-accept.
+    fn scripted_vault(responses: Vec<String>) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Non-blocking with a deadline rather than a blocking accept. A
+        // test server that waits forever for a request the code under
+        // test stopped making wedges the whole lane, and the code under
+        // test is exactly what a revert changes.
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Read, Write};
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            for body in responses {
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if std::time::Instant::now() >= deadline {
+                                return;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(_) => return,
+                    }
+                };
+                stream.set_nonblocking(false).expect("blocking stream");
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .expect("read timeout");
+                let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    return;
+                }
+                let mut length = 0usize;
+                loop {
+                    let mut header = String::new();
+                    if reader.read_line(&mut header).is_err() || header.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(v) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut payload = vec![0u8; length];
+                let _ = reader.read_exact(&mut payload);
+                let _ = tx.send(request_line.trim().to_string());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), rx)
+    }
+
+    /// The probe's HTTP shape, which is the change this whole round is
+    /// named for and which nothing pinned.
+    ///
+    /// Reverting `liveness()` to `self.url("keys")` plus `ureq::get` left
+    /// every test in this file green: construction tests do not dial,
+    /// the URL test asserts `url("encrypt")` without saying who calls it,
+    /// the `Debug` and error-shape pins do not care about the method, and
+    /// the closed-port test fails identically for a GET and a POST. The
+    /// only brake was incidental, an unused-const warning that deleting
+    /// the const in the same revert clears.
+    ///
+    /// This asserts the two requests Vault actually receives. A key-read
+    /// probe sends one `GET /v1/transit/keys/sbproxy-root` and reddens
+    /// every assertion here.
+    #[test]
+    fn the_liveness_probe_uses_encrypt_and_decrypt_and_not_a_key_read() {
+        use base64::Engine as _;
+        let ciphertext = "vault:v1:c2Jwcm94eQ==";
+        let plaintext = base64::engine::general_purpose::STANDARD.encode(LIVENESS_PROBE_VALUE);
+        let (address, requests) = scripted_vault(vec![
+            format!(r#"{{"data":{{"ciphertext":"{ciphertext}"}}}}"#),
+            format!(r#"{{"data":{{"plaintext":"{plaintext}"}}}}"#),
+        ]);
+
+        let client = TransitClient::new(TransitConfig {
+            address,
+            mount: "transit".to_string(),
+            key_name: "sbproxy-root".to_string(),
+            token: "hvs.PROBE".to_string(),
+            namespace: None,
+        })
+        .expect("builds");
+
+        client
+            .liveness(&[])
+            .expect("the scripted round trip succeeds");
+
+        let first = requests.recv().expect("a first request");
+        let second = requests.recv().expect("a second request");
+        assert_eq!(
+            first, "POST /v1/transit/encrypt/sbproxy-root HTTP/1.1",
+            "the probe must exercise `update` on encrypt, which is the capability the \
+             credential path needs. A key read needs `read` on a third path the \
+             least-privilege policy deliberately does not grant"
+        );
+        assert_eq!(
+            second, "POST /v1/transit/decrypt/sbproxy-root HTTP/1.1",
+            "and decrypt, which is the capability a narrow revocation drops first. An \
+             encrypt-only probe stays green through exactly that revocation"
+        );
+        assert!(
+            requests.try_recv().is_err(),
+            "two calls, not three: the probe must not also read the key"
+        );
+    }
+
+    /// A 403 on either leg is the revoked-grant signal, and it has to
+    /// reach the caller as one so the purge arm runs.
+    #[test]
+    fn a_revoked_grant_on_either_leg_is_reported_as_unauthorized() {
+        for (label, responses) in [
+            ("encrypt", vec![]),
+            (
+                "decrypt",
+                vec![r#"{"data":{"ciphertext":"vault:v1:c2Jwcm94eQ=="}}"#.to_string()],
+            ),
+        ] {
+            // An empty script means the first request gets no response and
+            // the connection closes, so build the 403 case explicitly.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            let ok_count = responses.len();
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking listener");
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                for i in 0..=ok_count {
+                    let mut stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                if std::time::Instant::now() >= deadline {
+                                    return;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(5));
+                            }
+                            Err(_) => return,
+                        }
+                    };
+                    stream.set_nonblocking(false).expect("blocking stream");
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    let body = if i < ok_count {
+                        responses[i].clone()
+                    } else {
+                        r#"{"errors":["permission denied"]}"#.to_string()
+                    };
+                    let status = if i < ok_count {
+                        "200 OK"
+                    } else {
+                        "403 Forbidden"
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                }
+            });
+
+            let client = TransitClient::new(TransitConfig {
+                address: format!("http://127.0.0.1:{port}"),
+                mount: "transit".to_string(),
+                key_name: "sbproxy-root".to_string(),
+                token: "hvs.PROBE".to_string(),
+                namespace: None,
+            })
+            .expect("builds");
+
+            let error = client.liveness(&[]).expect_err("a 403 must fail the probe");
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains("no longer authorized"),
+                "a 403 on the {label} leg is the revoked-grant case and must say so: {rendered}"
+            );
+        }
     }
 
     /// The pin that can actually fail, for the property round one's M1 was

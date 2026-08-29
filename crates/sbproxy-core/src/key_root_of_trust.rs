@@ -390,6 +390,17 @@ pub(crate) async fn probe_once(root: &Arc<dyn RootOfTrust>) {
     // grace window" into a hard fail for credentials this probe has
     // nothing to say about, on the tick of the outage the grace window
     // exists for.
+    //
+    // "Stops now" in the warn above is one resolve wide. No lock spans the
+    // two calls and none can: they are different objects with different
+    // mutexes. A resolution that read a cached data key before the first
+    // call and inserts after the second re-warms a root-backed entry. The
+    // exposure is bounded rather than open-ended, because `cached()` hands
+    // back the *remaining* window and that becomes the new entry's
+    // `max_hold`, so the re-warmed entry dies at the original deadline and
+    // the published bound is not extended. A lock that closed the race
+    // would have to be held across a network call on the credential path,
+    // which is a worse trade than a sentence.
     root.purge_cache();
     crate::key_plane::invalidate_root_backed_resolved_credentials();
 }

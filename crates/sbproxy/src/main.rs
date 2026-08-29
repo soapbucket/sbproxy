@@ -14906,6 +14906,74 @@ hooks:
         assert_eq!(arr[4]["base_url"], "https://api.example.com");
     }
 
+    /// The second pass `sbproxy config print` runs, and the reason it
+    /// exists: a key-name allowlist cannot cover
+    /// `root_of_trust.address`, because `address` is a non-secret key name
+    /// almost everywhere else in the schema. The userinfo is masked by
+    /// position instead, and the host survives so the operator can still
+    /// read which key service is configured.
+    ///
+    /// Deleting the `redact_secrets` call from `handle_config_print`
+    /// reddens the first two assertions. The third is the marker
+    /// consistency: `mask_secrets` stamps `***MASKED***` and this pass
+    /// must not restamp the same value as `[REDACTED]`, or one surface
+    /// shows two markers for the same thing.
+    #[test]
+    fn config_print_masks_a_url_userinfo_and_keeps_one_marker() {
+        let mut v = serde_json::json!({
+            "key_management": {
+                "crypto": {
+                    "master_key": "literal-master-secret",
+                    "root_of_trust": {
+                        "address": "https://sbproxy:hvs.PRINTMUSTNOTAPPEAR@vault.internal:8200",
+                        "token": "literal-transit-token",
+                    }
+                }
+            }
+        });
+        mask_secrets(&mut v);
+        let rendered =
+            sbproxy_observe::redact::redact_secrets(&serde_yaml::to_string(&v).expect("renders"));
+
+        assert!(
+            !rendered.contains("hvs.PRINTMUSTNOTAPPEAR"),
+            "the address carries userinfo and no key-name rule covers it: {rendered}"
+        );
+        assert!(
+            rendered.contains("https://[REDACTED]@vault.internal:8200"),
+            "the host has to survive, or the operator cannot tell which Vault this is: \
+             {rendered}"
+        );
+        for masked in ["literal-master-secret", "literal-transit-token"] {
+            assert!(!rendered.contains(masked), "{masked} leaked: {rendered}");
+        }
+
+        // One surface, one marker, said as two counts rather than as a
+        // disjunction that can be true for the wrong reason.
+        //
+        // The two passes are complementary and this fixture shows all
+        // three cases. `token` is on `is_secret_key`, so `mask_secrets`
+        // stamps it `***MASKED***` and the pattern pass must leave that
+        // alone. `master_key` is **not** on `is_secret_key`, and is
+        // covered only by `RE_CREDENTIAL_KEY` in the pattern pass, so it
+        // comes out `[REDACTED]`. The address is under a key name neither
+        // rule knows and is masked by position.
+        //
+        // Dropping the `***MASKED***` arm from `masks_value` restamps the
+        // token and reddens both counts.
+        assert_eq!(
+            rendered.matches("***MASKED***").count(),
+            1,
+            "the key-name mask keeps its own marker rather than being restamped: {rendered}"
+        );
+        assert_eq!(
+            rendered.matches("[REDACTED]").count(),
+            2,
+            "the pattern pass covers master_key by name and the address by position, and \
+             nothing else on this document: {rendered}"
+        );
+    }
+
     #[test]
     fn config_print_env_interpolation_substitutes_and_passes_through() {
         // An unset variable is left literal.

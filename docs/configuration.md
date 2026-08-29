@@ -1748,10 +1748,11 @@ prefixes, `Authorization` values, and the schema's own key / secret /
 token / password fields), plus a URL's userinfo, which is masked by
 position: `https://user:token@vault.internal:8200` comes back as
 `https://[REDACTED]@vault.internal:8200`, host intact. The authority is
-matched by an allowlist of bytes that are legal in one and are not
-structure in JSON, YAML flow style, or logfmt, so an `@` in a path or a
-query is never reached and the mask cannot run past the field it started
-in; `docs/access-log.md` lists the set. A secret under a
+matched by an allowlist, `[A-Za-z0-9]` plus `-._~%:@`, which excludes both
+`"` and `\` and so cannot leave the JSON string it started in, and
+excludes `&`, `=`, `,`, `;` and whitespace and so cannot cross a query
+parameter, a logfmt pair or a YAML flow scalar either. `docs/access-log.md`
+carries the full reasoning. A secret under a
 name or shape the redactor does not recognize is returned as written,
 which is one more reason the permission boundary above is the real
 control. And it is display

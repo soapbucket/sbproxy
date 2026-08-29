@@ -280,24 +280,32 @@ check_one raw-request-error \
   "$ROOT_DIR/scripts/request-error-ratchet-baseline.count" \
   "raw reqwest errors at a log site" || fail=1
 
-# What these two counts cannot see, printed every run rather than left in
-# a header nobody opens. A guard narrower than its claim is worse than no
-# guard, because the green line reads as coverage.
+# What these two counts cannot see, printed rather than left in a header
+# nobody opens. A guard narrower than its claim is worse than no guard,
+# because the green line reads as coverage.
 #
-# The raw-request-error count is `reqwest`-only, by construction: it keys
-# on `reqwest::Error` at a log site. `sbproxy-vault` reaches Vault, Azure
-# Key Vault, and GCP Secret Manager through `ureq` instead, and `ureq`'s
-# own `Display for Transport` ends with the URL it dialed, userinfo and
-# all. Those four call sites are covered by tests rather than by this
-# ratchet: `transit.rs` has one that dials a real closed port and asserts
-# the address never reaches the rendered error, and `hashicorp.rs`,
-# `azure.rs`, and `gcp.rs` have none.
-cat <<'NOTE'
-  not covered: `ureq` clients. The raw-request-error count keys on
-  reqwest::Error, so the four ureq call sites in sbproxy-vault
-  (transit.rs, hashicorp.rs, azure.rs, gcp.rs) are outside it. ureq's
-  Transport Display carries the dialed URL including userinfo. Only
-  transit.rs has a test pinning that today.
-NOTE
+# The raw-request-error count keys on `reqwest::Error` at a log site.
+# `sbproxy-vault` reaches Vault, Azure Key Vault and GCP Secret Manager
+# through `ureq` instead, and `ureq`'s own `Display for Transport` ends
+# with the URL it dialed, userinfo and all. Those files are counted here
+# rather than listed as a literal, so a fifth client or a second test
+# changes the notice instead of leaving it stale.
+# Skipped under --counts-only, which is the mode the self-test runs a copy
+# of this file in: that copy has no crates/ tree beside it and the notice
+# is not what the self-test is checking.
+if [ "$fail" -eq 0 ] && [ "${1:-}" != "--counts-only" ] &&
+   [ -d "$ROOT_DIR/crates/sbproxy-vault/src" ]; then
+  ureq_files=$(grep -rl 'ureq::' "$ROOT_DIR/crates/sbproxy-vault/src" 2>/dev/null | sort || true)
+  ureq_count=$(printf '%s\n' "$ureq_files" | grep -c . || true)
+  pinned=$(printf '%s\n' "$ureq_files" | while read -r f; do
+    [ -n "$f" ] || continue
+    if grep -q 'never_carries_the_address' "$f"; then basename "$f"; fi
+  done | paste -sd, - )
+  [ -n "$pinned" ] || pinned="none"
+  printf '  not covered: %s ureq client file(s) under crates/sbproxy-vault/src.\n' "$ureq_count"
+  printf '  The raw-request-error count keys on reqwest::Error, so these are\n'
+  printf '  outside it. ureq Transport Display carries the dialed URL including\n'
+  printf '  userinfo. Pinned by a test today: %s\n' "$pinned"
+fi
 
 exit "$fail"

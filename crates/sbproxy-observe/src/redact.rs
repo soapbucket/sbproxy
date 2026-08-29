@@ -18,9 +18,10 @@
 //!   in a URL's userinfo has neither a recognizable shape nor a key
 //!   name in front of it; what identifies it is where it sits, between
 //!   `://` and the last `@` of the authority. The authority is matched
-//!   by an allowlist of bytes that are legal in one and are not
-//!   structure in JSON, YAML flow style, or logfmt, which is what keeps
-//!   a positional rule inside a single field.
+//!   by an allowlist, `[A-Za-z0-9]` plus `-._~%:@`, which is a strict
+//!   subset of the RFC 3986 authority charset. Neither `"` nor `\` is
+//!   in it, and that is what keeps a rule with no key name to anchor on
+//!   inside the JSON string token it started in.
 //!
 //! A credential that is neither a known shape nor under a known name
 //! is returned as written. In particular there is no JWT pattern: a
@@ -86,37 +87,72 @@ use std::sync::LazyLock;
 /// serialize before `user`, `metadata`, `attribution`, and
 /// `request_headers`, so a caller could reach it from a request header.
 ///
-/// So the run is now an allowlist: a byte continues the authority only if
-/// it is **both** legal in a URL authority (RFC 3986) **and** not structure
-/// in JSON, in YAML flow style, or in logfmt. Concretely that is
-/// alphanumerics, `-._~` (unreserved), `%` (percent-encoding),
-/// `!$&*+=` (the sub-delims that are not structure), `:` (userinfo
-/// separator and port), `[` and `]` (IPv6 literal host), and `@` itself.
+/// So the run is an allowlist. A byte continues the authority only if it
+/// is one of:
 ///
-/// Everything else ends the run, and the exclusions are the point:
+/// ```text
+/// A-Z a-z 0-9   - . _ ~   %   :   @
+/// ```
 ///
-/// * `'`, `(`, `)`, `,`, `;` are legal in userinfo and are structure in the
-///   three serializations above. `'`, `,` and `;` are three of the same
-///   four bytes [`RE_PASSWORD`] stops at, for the same reason.
-/// * `/`, `?`, `#` end the authority per RFC 3986. This is what makes
-///   `https://api.example.com?notify=ops@example.com` come back untouched:
-///   the `?` ends the run before the `@` is reached.
-/// * `"`, `{`, `}`, `\`, backtick, `|`, `<`, `>`, and whitespace are
-///   structure or cannot appear in an authority. The closing `"` is the
-///   one that matters most: inside a rendered JSON string value it always
-///   terminates the run, so this rule can never reach the key separator of
-///   the next field.
+/// Unreserved characters, percent-encoding, the `:` that separates user
+/// from password and host from port, and `@` itself. That is a strict
+/// subset of what RFC 3986 permits in an authority, chosen so the run
+/// cannot walk out of the field it started in.
 ///
-/// Because every byte the mask deletes is an allowed byte, and no allowed
-/// byte is structure in any of the three serializations, **this rule cannot
-/// produce a line that stops parsing.** That invariant is pinned by
-/// `a_url_in_a_json_field_keeps_the_line_parseable`, in the test family
-/// this module already keeps for exactly this.
+/// # Why this set and not the wider legal one
 ///
-/// The stated cost, the same one [`RE_PASSWORD`] documents: userinfo that
-/// literally contains one of the excluded bytes ends the run there, so the
-/// URL is not masked at all rather than masked halfway. Failing to mask is
-/// the safe direction here; deleting a key separator is not.
+/// The first allowlist also kept `!$&*+=` and `[]`, on the reasoning that
+/// they are legal in an authority and are not structure. Two of them were:
+/// `&` and `=` are the structural bytes of a query string and of
+/// `application/x-www-form-urlencoded`, a fourth serialization this rule
+/// meets that the reasoning did not name. The access log stores the
+/// client's raw query string with the leading `?` already stripped
+/// (`sbproxy-core`'s `access_log.rs`), so
+/// `u=https://a.example&op=drop_all&next=b@c.example` had no `?` left to
+/// stop on and masked to `u=https://[REDACTED]@c.example`. Nothing leaked,
+/// because the line still parsed and the field-key denylist still ran, but
+/// the caller chose the ordering of their own parameters and therefore
+/// chose which of them survived into their own audit record.
+///
+/// `[` and `]` went with them because they buy nothing: an IPv6 host sits
+/// *after* the `@`, so the run only needs them to keep scanning for a
+/// later `@` that a well-formed URL cannot have.
+/// `https://u:pw@[2001:db8::1]:8200` masks identically either way.
+///
+/// # Why a line still parses, which is not the byte-class argument
+///
+/// An earlier version of this comment claimed the rule cannot break a line
+/// "because no allowed byte is structure". That is false and worth
+/// correcting rather than quietly narrowing: `:` is JSON structure and is
+/// allowed, and it has to be. The property holds for a different and
+/// stronger reason.
+///
+/// The mask deletes exactly the bytes in `[authority, at)`, every one of
+/// which passed `continues_authority`. Neither `"` nor `\` is in that set.
+/// A JSON string ends only at an unescaped `"`, and every escape sequence
+/// begins with `\`. So a deleted span can contain neither a string
+/// terminator nor any part of an escape, and **it cannot leave the JSON
+/// string token it started in.** A `:` inside a string value is not
+/// structure; only one outside a string is, and the run cannot reach it.
+/// That is an argument about the two bytes that delimit the token, not
+/// about the class of every byte in the set, and it is what
+/// `a_url_in_a_json_field_keeps_the_line_parseable` pins.
+///
+/// The other serializations get the same treatment from their own
+/// delimiters rather than from a claim about byte classes: whitespace and
+/// `,` end a YAML flow scalar and a logfmt pair, `&` and `=` end a query
+/// parameter, and none of the five is in the set.
+///
+/// # What it therefore does not mask, stated rather than discovered
+///
+/// Userinfo containing any byte outside the set is not masked at all,
+/// rather than masked halfway. That covers `'`, `(`, `)`, `,`, `;`, `!`,
+/// `$`, `&`, `*`, `+`, `=`, which RFC 3986 permits in userinfo, and **every
+/// non-ASCII byte**, so `https://usér:pw@vault.internal:8200` comes back
+/// verbatim. Failing to mask is the safe direction here and deleting a
+/// delimiter is not, which is the same trade [`RE_PASSWORD`] documents for
+/// its own stop set. The control for what this misses is the field-name
+/// denylist in [`crate::logging`], which never reads a value.
 ///
 /// # The last `@`, not the first
 ///
@@ -130,33 +166,22 @@ use std::sync::LazyLock;
 ///
 /// The arithmetic is byte-wise and stays on character boundaries, because
 /// every byte it compares or splits at is ASCII and no UTF-8 continuation
-/// byte matches one. The scheme run must open with a letter, so a URL glued
-/// directly to a preceding `[0-9+.-]` with no separator
-/// (`8080https://u:p@h`, `v1.2https://u:p@h`) is not masked; every real
-/// separator ends the scheme run correctly.
+/// byte matches one.
+///
+/// The scheme run walks back over `[A-Za-z0-9+.-]` and requires the byte it
+/// lands on to be a letter, so a URL glued directly to a preceding digit
+/// with no separator (`8080https://u:p@h`) is not masked. It is *not* true
+/// that every `[0-9+.-]` prefix has that effect, which an earlier version
+/// of this note claimed: `v1.2https://u:p@h` and `x.https://u:p@h` both
+/// mask, because the walk-back continues through `.` and `-` to a letter.
+/// Over-masking is the safe direction, so the difference is documented
+/// rather than removed.
 fn mask_url_userinfo(input: &str) -> std::borrow::Cow<'_, str> {
-    // Legal in a URL authority *and* not structure in JSON, YAML flow
-    // style, or logfmt. See the allowlist section above: the exclusions
-    // are what keep this rule inside one field.
+    // Unreserved, percent-encoding, `:` and `@`. A strict subset of the
+    // RFC 3986 authority charset; see the allowlist section above for why
+    // `&`, `=`, `[` and `]` are not in it.
     fn continues_authority(c: u8) -> bool {
-        c.is_ascii_alphanumeric()
-            || matches!(
-                c,
-                b'-' | b'.'
-                    | b'_'
-                    | b'~'
-                    | b'%'
-                    | b'!'
-                    | b'$'
-                    | b'&'
-                    | b'*'
-                    | b'+'
-                    | b'='
-                    | b':'
-                    | b'['
-                    | b']'
-                    | b'@'
-            )
+        c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'_' | b'~' | b'%' | b':' | b'@')
     }
 
     let bytes = input.as_bytes();
@@ -447,6 +472,14 @@ fn masks_value(value: &str) -> bool {
     // `token: Bearer [REDACTED]` is already done).
     !is_secret_reference(value)
         && !value.contains("[REDACTED]")
+        // `sbproxy config print` masks by key name first, stamping
+        // `***MASKED***`, and then runs this pass over the rendered
+        // document so a URL's userinfo is caught by position. Without this
+        // arm a value that both passes recognize comes back as
+        // `[REDACTED]` while its neighbours keep `***MASKED***`, so one
+        // operator surface shows two markers for the same thing. Harmless
+        // for secrecy, since it is double-masking, and confusing to read.
+        && !value.contains("***MASKED***")
         && !value.eq_ignore_ascii_case("bearer")
         && !value.eq_ignore_ascii_case("basic")
 }
@@ -1272,7 +1305,8 @@ mod tests {
     }
 
     /// The invariant the whole module is built on, for the one rule that
-    /// matches by position: **a redacted line still parses.**
+    /// matches by position: **a redacted line still parses, and no field
+    /// but the one the URL sits in changes at all.**
     ///
     /// This is the fourth entry in the family above and it exists because
     /// the first version of this rule was the fourth pattern to break the
@@ -1280,18 +1314,34 @@ mod tests {
     /// `@`, `/`, and whitespace, so a URL with no path ran through the
     /// closing quote of its own JSON string and deleted every byte up to
     /// some later `@` in the record. `redact_json_line` applies the
-    /// field-key denylist only on the `Ok` arm, so the line below did not
-    /// merely lose `attribution`: it shipped `prompt` in the clear.
+    /// field-key denylist only on the `Ok` arm, so a line it broke shipped
+    /// `prompt` in the clear.
     ///
-    /// Reverting `continues_authority` to `!matches!(c, b'@' | b'/')`
-    /// plus a whitespace check reddens the first assertion here and
-    /// nothing else in the file.
+    /// **Every block below has to be able to fail under that revert**, and
+    /// an earlier version of this test failed that bar: three of its four
+    /// blocks produced byte-identical output on both sides, which is the
+    /// "asserted by cases that cannot fail" shape a previous round raised
+    /// against someone else's test. Reverting `continues_authority` to
+    /// `!(c == b'/' || c.is_ascii_whitespace())` reddens each block here,
+    /// and `redfirst-round5.txt` records the run.
     #[test]
     fn a_url_in_a_json_field_keeps_the_line_parseable() {
-        // A path-less URL, a later `@` in a different field, and a
-        // denylisted key after both. This is the exact shape a client can
-        // produce: `user_agent` and `referer` are client-set and
-        // serialize before `user` and `prompt`.
+        // 1. The nested shape, which is the actual Blocker mechanism: the
+        //    old rule deleted `"},"user":"ops` and the line **stopped
+        //    parsing**, which is what dropped the denylist for the whole
+        //    record. The flat shape below reddens through field deletion
+        //    instead, so both outcomes are pinned rather than one.
+        let line = r#"{"attribution":{"src":"https://ref.example"},"user":"ops@corp.com","prompt":"leak me"}"#;
+        let out = redact_secrets(line);
+        let parsed: serde_json::Value = serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("redacted line is not JSON ({e}): {out}"));
+        assert_eq!(parsed["attribution"]["src"], "https://ref.example", "{out}");
+        assert_eq!(parsed["user"], "ops@corp.com", "{out}");
+        assert_eq!(parsed["prompt"], "leak me", "{out}");
+
+        // 2. The flat shape a client can produce directly: `user_agent`
+        //    and `referer` are client-set and serialize before `user` and
+        //    `prompt`.
         let line = r#"{"user_agent":"https://ref.example","referer":"b@c","user":"ops@corp.com","prompt":"leak me"}"#;
         let out = redact_secrets(line);
         let parsed: serde_json::Value = serde_json::from_str(&out)
@@ -1301,9 +1351,30 @@ mod tests {
         assert_eq!(parsed["user"], "ops@corp.com", "{out}");
         assert_eq!(parsed["prompt"], "leak me", "{out}");
 
-        // And the case the rule is actually for, in the same shape: the
-        // userinfo goes, the field keeps its quotes, and the record still
-        // parses with every other field intact.
+        // 3. The query string, which is the fourth serialization this rule
+        //    meets and the one an allowlist built only from "legal in an
+        //    authority and not JSON structure" got wrong. The access log
+        //    stores the client's raw query with the leading `?` already
+        //    stripped, so there is no `?` left to stop the run: with `&`
+        //    and `=` in the set this masked to `u=https://[REDACTED]@c.example`
+        //    and the caller had deleted `op=drop_all` from their own audit
+        //    record by choosing the order of their own parameters.
+        let line = r#"{"path":"/v1/api","query":"u=https://a.example&op=drop_all&next=b@c.example","status":200}"#;
+        let out = redact_secrets(line);
+        let parsed: serde_json::Value = serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("redacted line is not JSON ({e}): {out}"));
+        assert_eq!(
+            parsed["query"], "u=https://a.example&op=drop_all&next=b@c.example",
+            "a caller must not be able to delete their own query parameters \
+             from their own record: {out}"
+        );
+
+        // 4. The case the rule is actually for, in the same shape: the
+        //    userinfo goes, the field keeps its quotes, and the record
+        //    still parses with every other field intact. This block pins
+        //    the mask itself rather than the stop set, so it is the one
+        //    that reddens when `mask_url_userinfo` is removed from
+        //    `redact_secrets` rather than when the set is widened.
         let line = r#"{"address":"https://sbproxy:tok3n@vault.internal:8200","user":"ops@corp.com","status":200}"#;
         let out = redact_secrets(line);
         let parsed: serde_json::Value = serde_json::from_str(&out)
@@ -1316,17 +1387,18 @@ mod tests {
         assert_eq!(parsed["status"], 200, "{out}");
         assert!(!out.contains("tok3n"), "{out}");
 
-        // The same invariant in the other two serializations the stop
-        // set names, because a positional rule has no key to anchor on
-        // and these are where it would run off the end.
+        // 5. The same invariant in the other two serializations the stop
+        //    set names. Both use `,` rather than a space before the later
+        //    `@`, because the old rule stopped at whitespace and a
+        //    space-separated fixture passes on both sides of the revert.
         assert_eq!(
-            redact_secrets("{url: https://ref.example, user: ops@corp.com}"),
-            "{url: https://ref.example, user: ops@corp.com}",
-            "YAML flow style"
+            redact_secrets("[https://ref.example,b@c.example]"),
+            "[https://ref.example,b@c.example]",
+            "YAML flow sequence"
         );
         assert_eq!(
-            redact_secrets("url=https://ref.example user=ops@corp.com"),
-            "url=https://ref.example user=ops@corp.com",
+            redact_secrets("url=https://ref.example,next=b@c.example"),
+            "url=https://ref.example,next=b@c.example",
             "logfmt"
         );
     }

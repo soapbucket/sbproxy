@@ -3374,13 +3374,22 @@ mod tests {
     /// Install a plane whose break-glass block is enabled with the given
     /// quorum and roster.
     fn install_break_glass_plane(quorum: usize, approvers: &[&str]) {
+        install_break_glass_plane_with(quorum, approvers, true);
+    }
+
+    /// The same, with `enabled` under the caller's control.
+    ///
+    /// Every break-glass route test used to go through the `enabled: true`
+    /// form, which is why re-adding `review`'s kill-switch guard reddened
+    /// nothing: no test in the workspace ever installed a disabled block.
+    fn install_break_glass_plane_with(quorum: usize, approvers: &[&str], enabled: bool) {
         let crypto = KeyCrypto::new(b"pepper".to_vec(), b"master".to_vec());
         let store: Arc<dyn KeyStore> = Arc::new(MemoryKeyStore::new());
         let cache = Arc::new(TtlCache::new(store, TtlCacheConfig::default()));
         let plane = Arc::new(
             crate::key_plane::KeyPlane::from_parts(crypto, cache, false, false, None)
                 .with_break_glass(sbproxy_config::types::BreakGlassConfig {
-                    enabled: true,
+                    enabled,
                     approvers: approvers.iter().map(|a| a.to_string()).collect(),
                     quorum,
                     max_ttl_secs: 3600,
@@ -5933,6 +5942,182 @@ mod tests {
     /// `approvals=`, `ttl_secs=` and the note, so the sign-off the whole
     /// feature exists to produce vanished on exactly the grants most
     /// likely to want it.
+    /// A grant awaiting review must still be closeable after the kill
+    /// switch is thrown, and after the block is deleted outright.
+    ///
+    /// Both are strands, and both were live. `review` carries no `enabled`
+    /// guard, deliberately: the other three routes create or extend access
+    /// and this one closes it out, so a switch that blocked it would leave
+    /// every open grant unreviewable, with `list()` still publishing the
+    /// queue and `sbproxy_break_glass_open{state="awaiting_review"}` pinned
+    /// above zero for the life of the process. Grants live in a
+    /// process-global `OnceLock` and survive a config reload, so "they are
+    /// gone anyway" was never true.
+    ///
+    /// Deleting the block reaches the same place by a different route: the
+    /// default is `enabled: false, approvers: []`, the compiler validates
+    /// the roster only while `enabled` is true, so every operator becomes
+    /// `NotAnApprover`. An empty roster therefore falls back to "any admin
+    /// who is not the requester", which keeps the property the roster is
+    /// there for.
+    ///
+    /// Re-adding `if !cfg.enabled { return Err(Disabled) }` to `review`
+    /// reddens the first half. Dropping the `approvers.is_empty()` guard
+    /// reddens the second.
+    #[test]
+    fn a_grant_stays_reviewable_after_the_kill_switch_and_after_the_block_is_deleted() {
+        for (label, approvers, enabled) in [
+            ("kill switch thrown", &["bob"][..], false),
+            ("block deleted", &[][..], false),
+        ] {
+            let _g = crate::key_plane::test_plane_guard();
+            crate::break_glass::reset_for_test();
+            // Requested and approved while the feature was on.
+            install_break_glass_plane(1, &["bob"]);
+            let _alice = crate::admin::set_current_admin_actor(Some((
+                "alice".to_string(),
+                sbproxy_config::types::AdminRole::Admin,
+            )));
+            let requested = dispatch(
+                "POST",
+                "/admin/break-glass",
+                Some(r#"{"justification":"incident 9","scope":["cred-openai"],"ttl_secs":1}"#),
+            )
+            .unwrap();
+            assert_eq!(requested.0, 201, "{label}: {}", requested.2);
+            let grant_id = parse(&requested)["grant"]["id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let _bob = crate::admin::set_current_admin_actor(Some((
+                "bob".to_string(),
+                sbproxy_config::types::AdminRole::Admin,
+            )));
+            dispatch(
+                "POST",
+                &format!("/admin/break-glass/{grant_id}/approve"),
+                None,
+            )
+            .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+
+            // Now the operator turns it off, or deletes the block.
+            install_break_glass_plane_with(1, approvers, enabled);
+
+            let reviewed = dispatch(
+                "POST",
+                &format!("/admin/break-glass/{grant_id}/review"),
+                Some(r#"{"note":"closed out after the switch"}"#),
+            )
+            .unwrap();
+            assert_eq!(
+                reviewed.0, 200,
+                "{label}: a grant awaiting review must still close out, or the queue strands \
+                 and the awaiting_review gauge never comes back down: {}",
+                reviewed.2
+            );
+            assert_eq!(parse(&reviewed)["grant"]["state"], "reviewed", "{label}");
+        }
+    }
+
+    /// A refused approval or review reaches the audit channel.
+    ///
+    /// The two refusals are the controls this feature is bought for, and
+    /// both returned before any record was written: an operator caught
+    /// trying to close their own grant left an HTTP 403 and nothing else.
+    /// Deleting either `RefusedGrant::audit` call reddens this.
+    #[test]
+    fn a_refused_break_glass_review_reaches_the_audit_channel() {
+        let _g = crate::key_plane::test_plane_guard();
+        crate::break_glass::reset_for_test();
+        install_break_glass_plane(1, &["bob"]);
+
+        let _alice = crate::admin::set_current_admin_actor(Some((
+            "alice".to_string(),
+            sbproxy_config::types::AdminRole::Admin,
+        )));
+        let requested = dispatch(
+            "POST",
+            "/admin/break-glass",
+            Some(r#"{"justification":"incident 11","scope":["cred-openai"],"ttl_secs":1}"#),
+        )
+        .unwrap();
+        let grant_id = parse(&requested)["grant"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // alice tries to close her own grant.
+        let refused = dispatch(
+            "POST",
+            &format!("/admin/break-glass/{grant_id}/review"),
+            Some(r#"{"note":"nothing to see"}"#),
+        )
+        .unwrap();
+        assert_eq!(refused.0, 403, "{}", refused.2);
+
+        let events = sbproxy_observe::audit_ring::recent_audit_events(
+            10,
+            Some("key"),
+            Some("break_glass_review"),
+            None,
+        );
+        let refusal = events
+            .iter()
+            .find(|e| e.actor.as_deref() == Some("alice"))
+            .unwrap_or_else(|| {
+                panic!("a refused self-review must reach the audit channel: {events:?}")
+            });
+        // The ring renders a record with no `before` as
+        // `"{resource}: {outcome}"`, so this is what it can show: the
+        // record exists, on the right channel, attributed to the operator
+        // who was refused. The reason vocabulary inside it is pinned by
+        // `break_glass::tests::a_refusal_record_names_its_rule_and_bounds_its_context`.
+        let detail = refusal.detail.clone().unwrap_or_default();
+        assert!(
+            detail.contains("refused"),
+            "the refusal must reach the audit channel as a refusal: {detail}"
+        );
+    }
+
+    /// The two break-glass bodies parse through `parse_body`, which is
+    /// where the serde-message scrub lives.
+    ///
+    /// `parse_body`'s own doc says the point of putting it there is that a
+    /// route added later inherits it; these two parsed on their own path
+    /// and did not. Reverting either to a raw `serde_json::from_str` plus
+    /// `format!("invalid JSON body: {e}")` reddens this.
+    #[test]
+    fn a_malformed_break_glass_body_is_scrubbed_before_it_is_echoed() {
+        let _g = crate::key_plane::test_plane_guard();
+        crate::break_glass::reset_for_test();
+        install_break_glass_plane(1, &["bob"]);
+        let _alice = crate::admin::set_current_admin_actor(Some((
+            "alice".to_string(),
+            sbproxy_config::types::AdminRole::Admin,
+        )));
+
+        for (route, body) in [
+            (
+                "/admin/break-glass".to_string(),
+                r#"{"justification":"SENTINEL-BODY-4f2a","scope":[],"ttl_secs":"not-a-number"}"#,
+            ),
+            (
+                "/admin/break-glass/bg_missing/review".to_string(),
+                r#"{"note":SENTINEL-BODY-4f2a}"#,
+            ),
+        ] {
+            let resp = dispatch("POST", &route, Some(body)).unwrap();
+            assert_eq!(resp.0, 400, "{route}: {}", resp.2);
+            assert!(
+                !resp.2.contains("SENTINEL-BODY-4f2a"),
+                "{route}: the serde message must go through the scrub, or a body value \
+                 reaches the response verbatim: {}",
+                resp.2
+            );
+        }
+    }
+
     #[test]
     fn a_reviewers_note_survives_a_large_scope() {
         let _g = crate::key_plane::test_plane_guard();

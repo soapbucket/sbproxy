@@ -12,26 +12,31 @@
 # decryption within unwrap_cache_ttl_secs, or at the next failed liveness
 # probe, whichever comes first.
 #
-# Setup against a dev Vault:
+# Setup against a dev Vault. Run every line: the walkthrough is written to
+# run under the scoped token a customer would actually hand you, because
+# step 4's narrowest revocation is a no-op under a root token.
+#
 #   vault server -dev -dev-root-token-id=root &
 #   export VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root
 #   vault secrets enable transit
-#   vault write -f transit/keys/sbproxy-root deletion_allowed=true
+#   vault write -f transit/keys/sbproxy-root
 #
-#   The dev root token works, and is not what a customer would hand you.
-#   The real grant is two capabilities and nothing else, which is also
-#   exactly what the liveness probe needs:
-#     cat <<'POLICY' | vault policy write sbproxy-transit -
-#     path "transit/encrypt/sbproxy-root" { capabilities = ["update"] }
-#     path "transit/decrypt/sbproxy-root" { capabilities = ["update"] }
-#     POLICY
-#     export SBPROXY_TRANSIT_TOKEN=$(vault token create -policy=sbproxy-transit -field=token)
+#   deletion_allowed is a parameter of the key's config endpoint, not of
+#   key creation. Passing it to the create above returns a response warning
+#   rather than an error, so the key looks created and step 4's delete then
+#   fails with "deletion is not allowed for this key":
+#   vault write transit/keys/sbproxy-root/config deletion_allowed=true
 #
-#   Run the walkthrough under that token to see the shape a customer ships.
-#   With the dev root token instead:
+#   The grant is two capabilities and nothing else, which is exactly what
+#   the liveness probe needs. It does not include read on the key:
+#   cat <<'POLICY' | vault policy write sbproxy-transit -
+#   path "transit/encrypt/sbproxy-root" { capabilities = ["update"] }
+#   path "transit/decrypt/sbproxy-root" { capabilities = ["update"] }
+#   POLICY
+#
 #   export SBPROXY_KEY_PEPPER=a-long-random-server-pepper
 #   export SBPROXY_KEY_MASTER=a-long-random-master-key
-#   export SBPROXY_TRANSIT_TOKEN=root
+#   export SBPROXY_TRANSIT_TOKEN=$(vault token create -policy=sbproxy-transit -field=token)
 #   make run CONFIG=examples/cmk-envelope/sb.yml
 #
 # 1. Confirm the mode. This is the page a security reviewer opens first:
@@ -59,14 +64,18 @@
 #     -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
 #
 # 4. Revoke the grant the way a customer would, then watch decryption stop.
-#    Deleting the key needs deletion_allowed=true, which step 0 set; without
-#    it Vault refuses the delete and the step looks like it did nothing:
-#   vault delete transit/keys/sbproxy-root
+#    The narrowest form first, because it is the one the probe change
+#    exists for: drop decrypt from the policy and leave everything else
+#    standing. A probe that read the key instead of using it would stay
+#    green through this.
+#   cat <<'POLICY' | vault policy write sbproxy-transit -
+#   path "transit/encrypt/sbproxy-root" { capabilities = ["update"] }
+#   POLICY
 #
-#    Any of these does the same job, and the last is the narrowest:
+#    Any of these does the same job:
 #      vault token revoke $SBPROXY_TRANSIT_TOKEN
 #      vault policy delete sbproxy-transit
-#      remove the transit/decrypt/sbproxy-root stanza from that policy
+#      vault delete transit/keys/sbproxy-root   # needs the config step above
 #
 #    The background probe runs every liveness_interval_secs (15 below). Its
 #    first failure drops every cached data key and every already-decrypted

@@ -223,7 +223,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_boilerplate_stripped_bytes_total` | Counter | `stable` | `beta` | `hostname` | Bytes removed by the boilerplate transform, by hostname. |
 | `sbproxy_bot_auth_directory_fetch_failures_total` | Counter | `stable` | `beta` | `url` | Bot-auth hosted key-directory fetches that failed (the verifier serves stale or fails per nonce_policy). |
 | `sbproxy_bot_auth_nonce_replay_total` | Counter | `stable` | `beta` | `policy` | Web Bot Auth signatures rejected (or logged) because the nonce was already observed. |
-| `sbproxy_break_glass_grants_total` | Counter | `stable` | `alpha` | `event` | Break-glass grant transitions, by event (requested, approved, activated, denied, used, expired, reviewed, refused). |
+| `sbproxy_break_glass_grants_total` | Counter | `stable` | `alpha` | `event` | Break-glass grant transitions, by event (requested, approved, activated, denied, used, expired, reviewed, reviewed_without_roster, refused). |
 | `sbproxy_break_glass_open` | Gauge | `stable` | `alpha` | `state` | Break-glass grants currently open, by state (pending_approval, active, awaiting_review). |
 | `sbproxy_budget_share_fail_open_total` | Counter | `stable` | `beta` | `op` | Shared budget store operations that failed and fell open to per-instance enforcement, by operation: `read`, `write`, or `mirror_dropped` (a streamed settlement handed its mirror write to a detached task that never ran, which a shutting-down runtime does). |
 | `sbproxy_budget_share_unavailable` | Gauge | `stable` | `beta` | none | 1 while shared budget enforcement is degraded to per-instance tracking, 0 when the shared store answered. |

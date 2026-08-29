@@ -565,8 +565,17 @@ pub fn invalidate_resolved_credential(id: &str) {
     }
 }
 
-/// Drop every cached resolved secret.
-pub fn invalidate_all_resolved_credentials() {
+/// Drop every cached resolved secret. **Test-only.**
+///
+/// It has no production caller and is `#[cfg(test)]` so it cannot acquire
+/// one by accident. Its survival as a `pub` "drop everything" hammer is
+/// exactly what made the liveness-probe test vacuous for a whole round:
+/// the test called this by hand, so it asserted a function that already
+/// worked rather than the arm the round existed to add. The production
+/// purge is [`invalidate_root_backed_resolved_credentials`], which is
+/// scoped, and the arm that calls it is `key_root_of_trust::probe_once`.
+#[cfg(test)]
+pub(crate) fn invalidate_all_resolved_credentials() {
     if let Some(plane) = current_key_plane() {
         plane.invalidate_all_resolved_credentials();
     }
@@ -621,7 +630,24 @@ impl KeyPlane {
         self.resolved_credentials.lock().len()
     }
 
+    /// Whether `id` is currently in the resolved-credential cache.
+    ///
+    /// A count is not enough and that is not a hypothetical. The purge
+    /// test warmed one root-backed entry and one plaintext entry and
+    /// asserted the survivor count was 1, which is equally true when the
+    /// predicate is inverted and exactly the wrong one survives. Nor does
+    /// re-resolving the survivor prove anything: a miss falls through to
+    /// the store, re-opens the material, and re-inserts, so the call
+    /// returns `Ok` whether the entry survived or was rebuilt. Survival
+    /// has to be read off the map by name.
+    #[cfg(test)]
+    pub(crate) fn resolved_credential_is_cached(&self, id: &str) -> bool {
+        self.resolved_credentials.lock().contains_key(id)
+    }
+
     /// Drop every resolved upstream secret from this plane generation.
+    /// Test-only; see the free function of the same name.
+    #[cfg(test)]
     pub(crate) fn invalidate_all_resolved_credentials(&self) {
         self.resolved_credentials.lock().clear();
     }
@@ -4842,21 +4868,23 @@ mod resolve_credential_secret_tests {
             1,
             "the failure arm must purge the wrapped data keys"
         );
-        assert_eq!(
-            plane.resolved_credential_count(),
-            1,
+        // By name, not by count, and not by re-resolving. A count of 1 is
+        // equally true when the predicate is inverted and exactly the
+        // wrong entry survives, and a re-resolve returns `Ok` either way
+        // because a miss falls through to the store and rebuilds.
+        assert!(
+            !plane.resolved_credential_is_cached("cred-cmk"),
             "a failed probe must drop every credential the root opened. Purging only the \
              wrapped data keys leaves the credential the customer is testing being served from \
              a cache the probe never touched, which is the published clause being false"
         );
         assert!(
-            plane
-                .resolve_credential_secret("cred-plain", None)
-                .await
-                .is_ok(),
-            "the plaintext entry must survive: the customer's root never opened it, and it is \
-             what the stale-serve grace window serves from during the same outage"
+            plane.resolved_credential_is_cached("cred-plain"),
+            "the plaintext entry must survive: the customer's root never opened it, it is what \
+             the stale-serve grace window serves from during the same outage, and a Vault \
+             outage takes the Transit mount and the KV backend down together"
         );
+        assert_eq!(plane.resolved_credential_count(), 1);
     }
 
     /// Blocker 3's seam: a config-seeded `secret:` credential must still

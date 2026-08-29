@@ -2887,9 +2887,15 @@ pub fn record_root_of_trust_operation(operation: &'static str, ok: bool) {
 /// `sbproxy_break_glass_grants_total{event}` (WOR-2573).
 ///
 /// `event` is `requested`, `approved`, `activated`, `denied`, `used`,
-/// `expired`, or `reviewed`. An emergency path that is used more than it
-/// is reviewed is the thing worth alerting on, and that alert is
-/// `expired - reviewed` on this one series.
+/// `expired`, `reviewed`, `reviewed_without_roster`, or `refused`. An
+/// emergency path that is used more than it is reviewed is the thing worth
+/// alerting on, and that alert is `expired - reviewed` on this one series.
+///
+/// `refused` covers a self-approval, a self-review, an operator off the
+/// roster, and a full registry. Which one it was is on the audit record's
+/// structured diff under `reason`, not on this series: a label there would
+/// be a second place to keep the vocabulary honest, and the refusals worth
+/// paging on are worth reading the record for.
 ///
 /// `expired` and `denied` are the two time-driven transitions, and expiry
 /// is computed on read rather than swept, so they are emitted by the first
@@ -2904,7 +2910,7 @@ pub fn record_break_glass(event: &'static str) {
     let counter = C.get_or_init(|| {
         register_int_counter_vec!(
             "sbproxy_break_glass_grants_total",
-            "Break-glass grant transitions, by event (requested, approved, activated, denied, used, expired, reviewed)",
+            "Break-glass grant transitions, by event (requested, approved, activated, denied, used, expired, reviewed, reviewed_without_roster, refused)",
             &["event"],
         )
         .ok()

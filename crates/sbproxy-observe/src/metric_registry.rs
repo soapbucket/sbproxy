@@ -2122,7 +2122,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Alpha,
         registry: Registry::Default,
         labels: &["event"],
-        description: "Break-glass grant transitions, by event (requested, approved, activated, denied, used, expired, reviewed, refused).",
+        description: "Break-glass grant transitions, by event (requested, approved, activated, denied, used, expired, reviewed, reviewed_without_roster, refused).",
         dead_reason: None,
     },
     MetricCapability {

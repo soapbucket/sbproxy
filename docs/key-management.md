@@ -1,6 +1,6 @@
 # SBproxy dynamic key management
 
-*Last modified: 2026-08-28*
+*Last modified: 2026-08-29*
 
 A virtual key is a live, governed resource, not a line of YAML. With the
 `key_management:` block enabled, you mint, revoke, and rotate inbound keys at
@@ -1797,18 +1797,33 @@ Attach it to whatever auth method mints the token in
 
 **Revoking is the point, so it is worth saying exactly what to revoke.** Any of
 these stops decryption inside the bound below: delete the policy, delete or
-revoke the token, remove the two `path` stanzas, or delete the Transit key.
-Dropping only `transit/decrypt/...` is the narrowest form and still works.
+revoke the token, or remove the two `path` stanzas. Dropping only
+`transit/decrypt/...` is the narrowest form and still works. Deleting the
+Transit key also works, but only if the key was created with
+`deletion_allowed=true` on its `config` endpoint; Vault refuses the delete
+otherwise, and answers an unrecognized parameter on key *creation* with a
+warning rather than an error, so it is easy to believe you set it and find
+the delete does nothing.
 
 The liveness probe deliberately needs nothing beyond that policy. It encrypts a
 fixed non-secret probe value and decrypts it again, which is the same pair of
 capabilities the credential path uses, so it cannot fail on a correctly-scoped
-policy and cannot keep passing through a revocation. An earlier version read
-`transit/keys/sbproxy-root` instead, which needs `read` on a third path the
-policy above deliberately does not grant: against a least-privilege policy that
-probe failed forever on a healthy deployment, and against a revocation that
-dropped only encrypt and decrypt it passed forever. Neither is a thing you have
-to configure around now, and the policy above is the whole grant.
+policy and cannot keep passing through a revocation of either capability. An
+earlier version read `transit/keys/sbproxy-root` instead, which needs `read` on
+a third path the policy above deliberately does not grant: against a
+least-privilege policy that probe failed forever on a healthy deployment, and
+against a revocation that dropped only encrypt and decrypt it passed forever.
+Neither is a thing you have to configure around now, and the policy above is
+the whole grant.
+
+One shape it still cannot see, stated rather than left to be found: the probe
+encrypts a fresh value, so it always exercises the *current* key version. A
+customer who rotates and then trims old versions with `min_decryption_version`
+past the version that sealed existing envelopes keeps a green probe while
+those stored credentials stop opening. Nothing is unsafe there, since the
+`unwrap_cache_ttl_secs` bound still holds and the failures are loud at
+resolution time, but the probe is a check that the grant is live, not that
+every stored envelope still opens.
 
 ### The revocation-latency bound
 
@@ -2122,10 +2137,13 @@ Rules the endpoints enforce rather than document:
   queue its own subject can clear is not a review queue. **A refusal is
   recorded**, on the same `key_audit` channel as the transitions, with
   `outcome: refused` and a closed-vocabulary `reason` of `self_approval`,
-  `self_review`, or `not_an_approver`, and counted on
-  `sbproxy_break_glass_grants_total{event="refused"}`. An operator caught
-  trying to close their own grant is the event this feature is bought for, so
-  it leaves more than an HTTP 403.
+  `self_review`, `not_an_approver`, or `registry_full`. `reason` is a field
+  of the record's structured `after` diff, not a top-level `KeyAuditEntry`
+  field, so a SIEM rule selects on `outcome` and reads `after.reason`. The
+  refusal is counted on `sbproxy_break_glass_grants_total{event="refused"}`,
+  which carries no reason dimension. An operator caught trying to close
+  their own grant is the event this feature is bought for, so it leaves more
+  than an HTTP 403.
 * **`review` has no `enabled` guard, and that is deliberate.** `request`,
   `approve`, and `tag_action` all refuse when `break_glass.enabled` is false,
   because those three create or extend access. `review` closes access out. A
@@ -2133,6 +2151,24 @@ Rules the endpoints enforce rather than document:
   grants live in process memory and survive a config reload, so nothing could
   ever reach `reviewed`, and the `awaiting_review` gauge below would stay
   pinned above zero for the life of the process.
+* **An empty roster falls back to "any admin who is not the requester".**
+  Deleting the `break_glass:` block entirely reaches the same strand by a
+  different route, because the block's default is `enabled: false,
+  approvers: []` and the config compiler validates the roster only while
+  `enabled` is true. So an empty roster means the feature was turned off
+  with grants still open, and a plain roster check would refuse every
+  operator. The two-person property survives the fallback, since the
+  requester is still refused; what is given up is "and that person was
+  pre-named". Those sign-offs are recorded with
+  `outcome: reviewed_without_roster` so they are distinguishable in the
+  chain.
+* **Removing `key_management.enabled` hides the queue.** With the whole
+  block gone, `GET /admin/break-glass` reports `{"enabled": false,
+  "grants": []}` and `review` answers `409 disabled`, while the grants stay
+  in process memory and come back if the block returns. The gauges are
+  published as zero rather than left at their last value, so the
+  `awaiting_review` alert cannot sit frozen above zero with no route able
+  to move it. Turning the block off is not a way to close out a queue.
 * **`quorum` is validated at config compile.** Zero is refused, because a grant
   would activate on its first approval while the admin surface reported it as
   quorate; a quorum above the roster is refused too, because you would discover

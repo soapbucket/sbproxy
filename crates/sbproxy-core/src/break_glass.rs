@@ -480,6 +480,19 @@ pub(crate) fn request(
                 )
             });
             if grants.len() >= MAX_TRACKED_GRANTS {
+                drop(grants);
+                // The one refusal whose own error text says "a registry
+                // this full is itself the finding", which is worth
+                // nothing if the finding reaches no record. The others
+                // (`NotFound`, `WrongState`, `AlreadyApproved`) are
+                // operator mistakes against a grant that exists and are
+                // deliberately left to the HTTP status.
+                RefusedGrant {
+                    id: grant.id.clone(),
+                    requested_by: grant.requested_by.clone(),
+                    approvals: 0,
+                }
+                .audit("break_glass_request", &grant.requested_by, "registry_full");
                 return Err(BreakGlassError::RegistryFull(MAX_TRACKED_GRANTS));
             }
         }
@@ -516,11 +529,15 @@ pub(crate) fn approve(id: &str, approver: &str) -> Result<Grant, BreakGlassError
     // person can satisfy is not a two-person rule, and the roster is the
     // place somebody would otherwise "fix" this by adding themselves.
     if grant.requested_by == approver {
-        audit_refusal(grant, "break_glass_approve", approver, "self_approval");
+        let refused = RefusedGrant::of(grant);
+        drop(grants);
+        refused.audit("break_glass_approve", approver, "self_approval");
         return Err(BreakGlassError::SelfApproval);
     }
     if !is_approver(&cfg, approver) {
-        audit_refusal(grant, "break_glass_approve", approver, "not_an_approver");
+        let refused = RefusedGrant::of(grant);
+        drop(grants);
+        refused.audit("break_glass_approve", approver, "not_an_approver");
         return Err(BreakGlassError::NotAnApprover(approver.to_string()));
     }
     let state = grant.state(now, cfg.quorum);
@@ -577,10 +594,15 @@ pub(crate) fn review(id: &str, reviewer: &str, note: &str) -> Result<Grant, Brea
     // guard and kept publishing the queue, and
     // `sbproxy_break_glass_open{state="awaiting_review"}` (the one alert
     // `docs/key-management.md` tells operators to build) stayed pinned above
-    // zero forever. `MAX_TRACKED_GRANTS`' retain evicts only terminal
-    // grants, so removing `Reviewed` as a reachable state also removed the
-    // eviction class and the registry grew monotonically to its refusal
-    // ceiling.
+    // zero forever.
+    //
+    // A first version of this comment added a third consequence, that the
+    // registry then grew to its refusal ceiling. That was also wrong and is
+    // corrected rather than deleted, because it is the same failure as the
+    // one above: `MAX_TRACKED_GRANTS`' retain evicts `Reviewed` **and**
+    // `Denied`, so the eviction class survived; and the retain runs only
+    // inside `request()`, which the guard did block, so nothing could be
+    // added either. Stranding was the whole harm, and it was enough.
     if reviewer.trim().is_empty() {
         return Err(BreakGlassError::NoActor);
     }
@@ -598,13 +620,37 @@ pub(crate) fn review(id: &str, reviewer: &str, note: &str) -> Result<Grant, Brea
     // these off `review` while `approve` has them made the quorum
     // theatre for anyone willing to wait for their own grant to expire.
     if grant.requested_by == reviewer {
-        audit_refusal(grant, "break_glass_review", reviewer, "self_review");
+        let refused = RefusedGrant::of(grant);
+        drop(grants);
+        refused.audit("break_glass_review", reviewer, "self_review");
         return Err(BreakGlassError::SelfReview);
     }
-    if !is_approver(&cfg, reviewer) {
-        audit_refusal(grant, "break_glass_review", reviewer, "not_an_approver");
+    // The roster check, with one exception that exists so the queue
+    // cannot strand.
+    //
+    // An empty roster only reaches here when the block is disabled or
+    // absent: the config compiler refuses an empty `approvers` while
+    // `enabled` is true. So `approvers: []` means an operator turned the
+    // feature off, or deleted the block, while grants were still awaiting
+    // review. With a plain roster check that is a permanent strand,
+    // identical to the one removing `review`'s `enabled` guard fixed:
+    // every operator is `NotAnApprover`, no grant can reach `Reviewed`,
+    // and `sbproxy_break_glass_open{state="awaiting_review"}` stays pinned
+    // above zero for the life of the process.
+    //
+    // So an empty roster falls back to "any admin who is not the
+    // requester". That keeps the property the roster is there for, which
+    // is that a grant its own subject can close is not a reviewed grant,
+    // and gives up only the narrower "and that person was pre-named". The
+    // audit record says which rule ran, so a reviewer reading the chain
+    // can tell a roster sign-off from a fallback one.
+    if !cfg.approvers.is_empty() && !is_approver(&cfg, reviewer) {
+        let refused = RefusedGrant::of(grant);
+        drop(grants);
+        refused.audit("break_glass_review", reviewer, "not_an_approver");
         return Err(BreakGlassError::NotAnApprover(reviewer.to_string()));
     }
+    let roster_was_empty = cfg.approvers.is_empty();
     let state = grant.state(now, cfg.quorum);
     if state != GrantState::AwaitingReview {
         return Err(BreakGlassError::WrongState(state));
@@ -621,7 +667,19 @@ pub(crate) fn review(id: &str, reviewer: &str, note: &str) -> Result<Grant, Brea
     let snapshot = grant.clone();
     drop(grants);
     sbproxy_observe::metrics::record_break_glass("reviewed");
-    audit_with_note(&snapshot, "break_glass_review", "reviewed", note);
+    audit_with_note(
+        &snapshot,
+        "break_glass_review",
+        if roster_was_empty {
+            // A distinct outcome rather than a flag inside the context
+            // string, so a SIEM rule can select these without parsing
+            // free text. It says the roster was gone when this closed.
+            "reviewed_without_roster"
+        } else {
+            "reviewed"
+        },
+        note,
+    );
     refresh_gauges();
     Ok(snapshot)
 }
@@ -687,6 +745,19 @@ pub(crate) fn list(now: DateTime<Utc>) -> serde_json::Value {
 /// instead of the last time something scraped.
 fn refresh_gauges() {
     let Some(cfg) = config() else {
+        // No plane, so no route can move these. Publishing zero is the
+        // only honest reading: `list()` has already stopped showing the
+        // queue, `review()` answers `Disabled`, and an early return here
+        // left `awaiting_review` frozen at whatever the last transition
+        // wrote, for the life of the process, with nothing able to move
+        // it. A frozen alert is worse than a silent one, because it reads
+        // as an open grant nobody is closing.
+        //
+        // The grants are still in memory and come back with the block, so
+        // this is "not currently observable", not "gone".
+        for label in ["pending_approval", "active", "awaiting_review"] {
+            sbproxy_observe::metrics::record_break_glass_open(label, 0.0);
+        }
         return;
     };
     let now = Utc::now();
@@ -725,34 +796,6 @@ fn refresh_gauges() {
 /// than in two that have to be joined on a timestamp.
 fn audit(grant: &Grant, op: &str, outcome: &str) {
     audit_with_note(grant, op, outcome, "");
-}
-
-/// Record a **refused** approval or review on the same channel.
-///
-/// The controls this feature is bought for are the two refusals: a
-/// requester cannot approve their own grant and cannot close it out. Both
-/// return before [`audit`] is reached and `record_break_glass` counts
-/// successes only, so an operator caught trying to self-review left an
-/// HTTP 403 and nothing else. That is precisely the event a security
-/// reviewer opens this feature to find, and it was the one event the
-/// feature did not record.
-///
-/// `actor` is the operator who was refused, which is not
-/// `grant.requested_by` in the roster case, so it is passed rather than
-/// read off the grant. The reason is a closed vocabulary of this module's
-/// own literals, never a formatted error, so nothing variable-length
-/// competes for the 256-byte context budget.
-fn audit_refusal(grant: &Grant, op: &str, actor: &str, reason: &'static str) {
-    sbproxy_observe::KeyAuditEntry::new(op, "break_glass", grant.id.clone())
-        .with_actor(actor.to_string())
-        .with_outcome("refused")
-        .with_context(format!(
-            "reason={reason} requested_by={} approvals={}",
-            grant.requested_by,
-            grant.approvals.len()
-        ))
-        .emit();
-    sbproxy_observe::metrics::record_break_glass("refused");
 }
 
 fn audit_with_note(grant: &Grant, op: &str, outcome: &str, note: &str) {
@@ -811,8 +854,81 @@ fn audit_payload(grant: &Grant, note: &str) -> (String, serde_json::Value) {
     (context, after)
 }
 
-/// Drop every grant. Test-only; a running process has no reason to forget
-/// what happened.
+/// The two non-secret fields a refusal record needs, lifted off the grant
+/// so the audit sink runs without the registry lock.
+///
+/// `emit()` writes a tracing line, pushes the ring, and appends a
+/// keyed-HMAC entry to the chain on disk. Holding the grants mutex across
+/// that made a stalled audit sink block every break-glass operation
+/// including `list()`, while the success paths two lines below had always
+/// dropped the lock first.
+struct RefusedGrant {
+    id: String,
+    requested_by: String,
+    approvals: usize,
+}
+
+impl RefusedGrant {
+    fn of(grant: &Grant) -> Self {
+        Self {
+            id: grant.id.clone(),
+            requested_by: grant.requested_by.clone(),
+            approvals: grant.approvals.len(),
+        }
+    }
+
+    /// Record a **refused** approval or review on the key audit channel.
+    ///
+    /// The controls this feature is bought for are the two refusals: a
+    /// requester cannot approve their own grant and cannot close it out.
+    /// Both return before the success-path [`audit`] is reached and
+    /// `record_break_glass` counts successes only, so an operator caught
+    /// trying to self-review left an HTTP 403 and nothing else. That is
+    /// precisely the event a security reviewer opens this feature to find,
+    /// and it was the one event the feature did not record.
+    ///
+    /// `actor` is the operator who was refused, which is not
+    /// [`Self::requested_by`] in the roster case, so it is passed rather
+    /// than read off the grant.
+    ///
+    /// `requested_by` is an unbounded operator string, checked only for
+    /// non-emptiness, and `with_context` truncates at 256 bytes: a long
+    /// actor id would evict `approvals=` off the end. So it is bounded
+    /// here, the same way the transition record's context carries counters
+    /// rather than the scope. The full value is on the structured diff,
+    /// which is not competing for that budget.
+    fn audit(&self, op: &str, actor: &str, reason: &'static str) {
+        let (context, after) = self.payload(actor, reason);
+        sbproxy_observe::KeyAuditEntry::new(op, "break_glass", self.id.clone())
+            .with_actor(actor.to_string())
+            .with_outcome("refused")
+            .with_context(context)
+            .with_diff(None, Some(after))
+            .emit();
+        sbproxy_observe::metrics::record_break_glass("refused");
+    }
+
+    /// The context string and diff for a refusal, split out for the same
+    /// reason [`audit_payload`] is: the in-memory audit ring renders a
+    /// record with no `before` as `"{resource}: {outcome}"`, so the ring
+    /// can prove the record was written and cannot show what is in it.
+    /// The reason vocabulary is checked here instead of through a route.
+    fn payload(&self, actor: &str, reason: &'static str) -> (String, serde_json::Value) {
+        (
+            format!(
+                "reason={reason} requested_by_len={} approvals={}",
+                self.requested_by.len(),
+                self.approvals
+            ),
+            json!({
+                "reason": reason,
+                "requested_by": self.requested_by,
+                "refused_actor": actor,
+            }),
+        )
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn reset_for_test() {
     registry().grants.lock().clear();
@@ -872,6 +988,38 @@ mod tests {
         );
         assert_eq!(after["scope"].as_array().map(Vec::len), Some(40), "{after}");
         assert_eq!(after["reviewed_by"], "dave", "{after}");
+    }
+
+    /// A refusal record names which rule refused it, and its context
+    /// stays inside the 256-byte budget whatever the operator is called.
+    ///
+    /// `requested_by` is an unbounded operator string checked only for
+    /// non-emptiness, and `with_context` truncates at 256 bytes, so
+    /// interpolating it whole would evict `approvals=` off the end for a
+    /// long actor id. That is the same defect this round fixed one
+    /// function over, so the context carries its length and the value
+    /// itself rides the diff.
+    #[test]
+    fn a_refusal_record_names_its_rule_and_bounds_its_context() {
+        let refused = RefusedGrant {
+            id: "bg_test".to_string(),
+            requested_by: "a".repeat(4096),
+            approvals: 2,
+        };
+        let (context, after) = refused.payload("mallory", "self_review");
+
+        assert!(context.len() < 256, "{}", context.len());
+        assert_eq!(
+            context,
+            "reason=self_review requested_by_len=4096 approvals=2"
+        );
+        assert!(
+            context.contains("approvals=2"),
+            "a long actor id must not evict the counters after it: {context}"
+        );
+        assert_eq!(after["reason"], "self_review", "{after}");
+        assert_eq!(after["refused_actor"], "mallory", "{after}");
+        assert_eq!(after["requested_by"].as_str().map(str::len), Some(4096));
     }
 
     /// A note past the cap says so rather than ending mid-sentence.
