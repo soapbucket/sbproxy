@@ -209,7 +209,7 @@ phase. See [headless-detection.md](headless-detection.md),
 Transforms modify the response body before it reaches the client - they
 are response-side only, run in the order declared under `transforms:`,
 and this is their one attachment point in the pipeline. Four of the
-twenty-six transform types are themselves a scripting hook
+twenty-eight transform types are themselves a scripting hook
 (`cel_script`, `lua_json`, `javascript`/`js_json`, `wasm`), so this stage
 is both a fixed set of built-in reshaping operations and its own
 extension point. See [transforms.md](transforms.md) for the full catalog

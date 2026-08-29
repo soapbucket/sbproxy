@@ -4740,7 +4740,7 @@ whether or not header injection is on. Runnable:
 
 Transforms modify the response body before it reaches the client. They are specified as a list under `transforms` and run in order. Reach for transforms when you need to reshape API responses for different consumers.
 
-SBproxy supports twenty-five transform types: `json`, `json_projection`, `json_schema`, `template`, `replace_strings`, `normalize`, `encoding`, `format_convert`, `payload_limit`, `discard`, `sse_chunking`, `html`, `optimize_html`, `html_to_markdown`, `markdown`, `css`, `lua_json`, `javascript`, `js_json`, `wasm`, `boilerplate`, `citation_block`, `json_envelope`, `cel`, `a2a_agent_card_rewrite`, plus a `noop` for testing.
+SBproxy supports twenty-eight transform types: `json`, `json_projection`, `json_schema`, `ai_schema`, `template`, `replace_strings`, `normalize`, `encoding`, `format_convert`, `payload_limit`, `discard`, `sse_chunking`, `html`, `optimize_html`, `html_to_markdown`, `markdown`, `pdf_markdown`, `css`, `lua`, `lua_json`, `javascript`, `js_json`, `wasm`, `boilerplate`, `citation_block`, `json_envelope`, `cel`, `a2a_agent_card_rewrite`, plus a `noop` for testing. `pdf_markdown` needs the optional `transform-pdf` build; every other type is in the default binary.
 
 ### json
 
@@ -5201,6 +5201,35 @@ reads. If that is your origin and the content really is identical for everyone,
 the answer is a `request_modifier` upstream of SBproxy that strips the cookie,
 or leaving `response_cache` off for that origin and caching at a layer that
 knows the content is public.
+
+**What the partition does not protect: a cookie the proxy itself mints.**
+The key is drawn from the `Cookie` header the caller *sends*. A caller that
+sends none lands in the cookie-less partition along with every other caller
+that sends none, and that is the partition a first-time visitor is in. If the
+response stored for that partition carries a `Set-Cookie` the proxy minted
+while serving it, every later cookie-less caller is served that same
+`Set-Cookie` from the entry.
+
+Three features mint a cookie on this path, and the risk differs by what the
+cookie carries:
+
+- **`sessions`** mints a session identifier. A second caller can be handed the
+  first caller's session id, which means they share a session.
+- **`csrf`** mints a CSRF token on safe-method responses. A second caller can
+  be handed the first caller's token.
+- **`abtest`** mints a variant pin. This one is refused outright: an `abtest`
+  action, on the origin or in any of its `forward_rules`, cannot be combined
+  with `response_cache`, because the cached *body* is wrong too and the config
+  is rejected at load.
+
+Treat a shared session identifier as an authentication problem, not a caching
+one. Until this is fixed at the storage layer, either leave `response_cache`
+off on an origin that configures `sessions` or `csrf`, or, if you must run
+both, put the cached content on an origin that mints neither. If you have
+already been running that combination, bump `response_cache.epoch` after
+changing the configuration: the epoch is part of the key's config
+fingerprint, so raising it partitions away from every entry written before,
+including any that carry a minted cookie.
 
 Two more dimensions are stamped the same way and for the same reason:
 
