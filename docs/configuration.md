@@ -3960,7 +3960,7 @@ The access log records the matched principal's source under the `principal_kind`
 
 Policies are evaluated before the action runs. They enforce rate limits, security rules, and access controls. The `policies` field is a sibling of `action` and is an array of policy objects.
 
-SBproxy ships twenty-eight policy types: `rate_limiting`, `rate_limit_budget`, `ip_filter`, `expression`, `rego`, `waf`, `ddos`, `csrf`, `security_headers`, `request_limit`, `sri`, `assertion`, `request_validator`, `body_threat_protection`, `content_digest`, `concurrent_limit`, `ai_crawl_control`, `object_authz`, `exposed_credentials`, `page_shield`, `dlp`, `openapi_validation`, `prompt_injection_v2`, `http_framing`, `agent_class`, `a2a`, `semantic_constraint`, and `agent_budget`. This page documents the most common ones; the rest have their own pages.
+SBproxy ships thirty policy types: `rate_limiting`, `rate_limit_budget`, `ip_filter`, `expression`, `rego`, `waf`, `ddos`, `csrf`, `security_headers`, `request_limit`, `sri`, `assertion`, `request_validator`, `body_threat_protection`, `content_digest`, `concurrent_limit`, `ai_crawl_control`, `object_authz`, `exposed_credentials`, `page_shield`, `dlp`, `openapi_validation`, `prompt_injection_v2`, `http_framing`, `agent_class`, `a2a`, `semantic_constraint`, `agent_budget`, `geoip`, and `user_agent_parser`. This page documents the most common ones; the rest have their own pages.
 
 ### rate_limiting
 
@@ -4528,7 +4528,7 @@ policies:
 
 ### owasp_api_top10 (pack)
 
-Not one of the twenty-eight policy types above. `owasp_api_top10` is a
+Not one of the thirty policy types above. `owasp_api_top10` is a
 pseudo-policy: the compiler reads it before any policy is compiled,
 expands it into the real synthesized policies and transforms named
 below, and removes this entry so it never reaches a policy module's own
@@ -4567,6 +4567,52 @@ every enabled item, including the ones with no synthesis wired, is
 available at `GET /admin/owasp-api-pack`
 ([admin-api-reference.md](admin-api-reference.md#get-adminowasp-api-pack))
 and in `sbproxy plan`'s text output.
+
+### geoip
+
+Resolve the client IP to country, continent, city, and ASN against a
+MaxMind-compatible `.mmdb`. A producer, not a gate: it never denies, and
+a missing database or an unresolved client IP is a metric outcome rather
+than an error. Full page: [request-enrichment.md](request-enrichment.md).
+
+```yaml
+policies:
+  - type: geoip
+    # Path to a MaxMind-compatible .mmdb file. Optional. Omitted, the
+    # policy falls back to the binary's embedded copy, which is a
+    # zero-byte placeholder in an OSS build, so the lookup records
+    # `result="no_database"` and adds nothing.
+    database_path: /opt/geoip/GeoLite2-City.mmdb
+    # Stamp X-Geo-Country, X-Geo-Continent, X-Geo-City, and X-Geo-Asn on
+    # the upstream request for the fields the lookup found. Default true.
+    inject_headers: true
+```
+
+### user_agent_parser
+
+Parse the `User-Agent` header into browser, OS, and device type, plus a
+headless-automation-library label (`headless_chrome`, `phantomjs`,
+`puppeteer`, `playwright`, `selenium`). Independent of the JA4-based
+headless detector, which reads the TLS fingerprint rather than the
+header; a request can trip either, both, or neither. Also never denies.
+Full page: [request-enrichment.md](request-enrichment.md).
+
+```yaml
+policies:
+  - type: user_agent_parser
+    # Header carrying the parse result as JSON on the upstream request.
+    # Default "x-parsed-ua".
+    inject_header: x-parsed-ua
+    # Whether to stamp `inject_header` at all. Default true; set false to
+    # populate the request context for hooks without touching the
+    # upstream request.
+    inject: true
+```
+
+Both policies feed `geo_country`, `geo_asn`, and `ua_headless_library`
+to any registered `AnomalyDetectorHook` or `IdentityResolverHook`
+whether or not header injection is on. Runnable:
+[`examples/request-enrichment/`](../examples/request-enrichment/).
 
 ---
 

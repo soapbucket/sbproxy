@@ -5112,6 +5112,18 @@ impl ProxyHttp for SbProxy {
                     bool,
                     Option<&str>,
                 ) = (None, false, None);
+                // WOR-2668: GeoIP country/ASN and UA-parsed
+                // headless-library signal, populated by the
+                // `geoip` / `user_agent_parser` builtin enforcers
+                // earlier in the request-phase policy chain. Both
+                // are `None` unless the origin configured the
+                // corresponding policy.
+                let geo_country = ctx.geo_lookup.as_ref().and_then(|g| g.country.as_deref());
+                let geo_asn = ctx.geo_lookup.as_ref().and_then(|g| g.asn);
+                let ua_headless_library = ctx
+                    .parsed_user_agent
+                    .as_ref()
+                    .and_then(|p| p.headless_library.as_deref());
                 let view = sbproxy_plugin::RequestContextView {
                     tenant_id: ctx.tenant_id.as_str(),
                     hostname: ctx.hostname.as_str(),
@@ -5124,6 +5136,9 @@ impl ProxyHttp for SbProxy {
                     ja4_trustworthy: ja4_trust,
                     headless_library: headless_lib,
                     client_ip: ctx.client_ip,
+                    geo_country,
+                    geo_asn,
+                    ua_headless_library,
                 };
                 for hook in hooks.iter() {
                     // WOR-2666: every verdict is counted on

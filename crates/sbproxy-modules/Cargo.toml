@@ -122,6 +122,8 @@ base64.workspace = true
 ring.workspace = true
 ipnetwork.workspace = true
 percent-encoding.workspace = true
+# WOR-2668: MMDB reader for the `geoip` policy.
+maxminddb.workspace = true
 regex.workspace = true
 minijinja.workspace = true
 pulldown-cmark.workspace = true

@@ -1698,6 +1698,22 @@ pub struct RequestContext {
     /// confidence in `[0.0, 1.0]`.
     pub headless_signal: Option<HeadlessSignal>,
 
+    // --- WOR-2668 GeoIP + User-Agent enrichment ---
+    //
+    // Populated by the `geoip` / `user_agent_parser` builtin
+    // enforcers (`builtin_enforcers::geoip`,
+    // `builtin_enforcers::user_agent`) when an origin configures
+    // them. `None` when the policy is not configured for this
+    // origin. Read back into `sbproxy_plugin::RequestContextView`
+    // for `AnomalyDetectorHook` / `IdentityResolverHook` consumers in
+    // `server::proxy_http`.
+    /// GeoIP lookup result for the resolved client IP, if the
+    /// `geoip` policy ran for this origin.
+    pub geo_lookup: Option<sbproxy_modules::GeoLookup>,
+    /// Parsed `User-Agent` header, if the `user_agent_parser` policy
+    /// ran for this origin.
+    pub parsed_user_agent: Option<sbproxy_modules::ParsedUserAgent>,
+
     // --- Wave 7 / A7.2 A2A protocol envelope ---
     //
     // Populated once in `request_filter` by [`sbproxy_modules::detect_a2a`]
@@ -2185,6 +2201,8 @@ impl RequestContext {
             tls_fingerprint: None,
             agent_detection: None,
             headless_signal: None,
+            geo_lookup: None,
+            parsed_user_agent: None,
             a2a: None,
             a2a_denial_body: None,
             deny_payload: None,

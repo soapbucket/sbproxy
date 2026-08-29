@@ -278,6 +278,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_gateway_reconcile_total` | Counter | `stable` | `beta` | `kind`, `result` | Gateway API reconcile attempts, by triggering resource kind and outcome. `kind` is one of GatewayClass, Gateway, HTTPRoute, GRPCRoute, or periodic, so cardinality is bounded by a closed set. |
 | `sbproxy_gateway_status_writes_total` | Counter | `stable` | `beta` | `kind`, `result` | Patches to the `/status` subresource, by resource kind and outcome. A rising error count here is usually RBAC missing the status subresource rather than anything wrong with the reconcile. |
 | `sbproxy_gateway_watch_errors_total` | Counter | `stable` | `beta` | `kind` | Watch stream errors, by Kubernetes resource kind. Distinct from a reconcile error: these come from the API server connection itself, so a rising count against a flat reconcile count means the controller has gone blind rather than broken. |
+| `sbproxy_geoip_lookup_total` | Counter | `stable` | `beta` | `result` | geoip policy lookups, by outcome (hit, miss, no_database, no_client_ip). |
 | `sbproxy_governance_fail_open_total` | Counter | `stable` | `beta` | `key_id` | Governed admissions that bypassed reservation because the governance backend was unavailable and failure_mode is allow_unreserved. |
 | `sbproxy_grpc_status_total` | Counter | `stable` | `beta` | `code` | Observed gRPC status codes, by canonical name. |
 | `sbproxy_hooks_channel_dropped_total` | Counter | `stable` | `beta` | `reason` | Bounded channel sends dropped on the hot path, labeled by drop reason. |
@@ -447,5 +448,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_vault_resolution_total` | Counter | `stable` | `beta` | `backend`, `result` | Vault resolution attempts, by backend and outcome. |
 | `sbproxy_usage_bridge_enqueued_total` | Counter | `stable` | `beta` | `tenant_id`, `reporter`, `resource_type`, `result` | Billable units the request path queued for a usage reporter, by tenant, reporter, resource type, and whether the row was new. |
 | `sbproxy_usage_bridge_gap_total` | Counter | `stable` | `beta` | `tenant_id`, `failure_mode` | Billable units that could not be queued for a usage reporter, by tenant and the posture in force. |
+| `sbproxy_user_agent_headless_total` | Counter | `stable` | `beta` | `library` | user_agent_parser policy runs where a headless-automation-library token matched (headless_chrome, phantomjs, puppeteer, playwright, selenium). |
+| `sbproxy_user_agent_parse_total` | Counter | `stable` | `beta` | `device_type` | user_agent_parser policy runs, by parsed device_type. |
 | `sbproxy_waf_persistent_blocks_total` | Counter | `stable` | `beta` | `origin`, `tenant`, `event`, `key_kind` | WAF persistent (time-boxed) block actions, by lifecycle event and key kind. |
 | `sbproxy_websocket_teardowns_total` | Counter | `stable` | `beta` | `reason`, `direction`, `tenant`, `origin` | WebSocket upgrades refused or tunnels torn down by the gateway, by closed reason, direction, tenant, and origin. Covers both upgrade surfaces: the `websocket` action and AI realtime. |

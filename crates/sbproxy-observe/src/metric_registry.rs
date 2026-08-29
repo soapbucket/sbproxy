@@ -2753,6 +2753,18 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_geoip_lookup_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("lookup_counter"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["result"],
+        description: "geoip policy lookups, by outcome (hit, miss, no_database, \
+             no_client_ip).",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_governance_fail_open_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_governance_fail_open"),
@@ -4787,6 +4799,29 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &["tenant_id", "failure_mode"],
         description: "Billable units that could not be queued for a usage reporter, by tenant and the posture in force.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_user_agent_headless_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("headless_counter"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["library"],
+        description: "user_agent_parser policy runs where a headless-automation-library \
+             token matched (headless_chrome, phantomjs, puppeteer, playwright, selenium).",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_user_agent_parse_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("parse_counter"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["device_type"],
+        description: "user_agent_parser policy runs, by parsed device_type.",
         dead_reason: None,
     },
     MetricCapability {

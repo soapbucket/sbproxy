@@ -1314,6 +1314,8 @@ const MODULE_COVERAGE: &[ModuleCoverage] = &[
     deferred("policy", "dlp"),
     deferred("policy", "exposed_credentials"),
     deferred("policy", "expression"),
+    // WOR-2668: pure lookup, no secret material in its config.
+    deferred("policy", "geoip"),
     deferred("policy", "http_framing"),
     deferred("policy", "ip_filter"),
     deferred("policy", "ip_filtering"),
@@ -1333,6 +1335,8 @@ const MODULE_COVERAGE: &[ModuleCoverage] = &[
     deferred("policy", "security_headers"),
     deferred("policy", "semantic_constraint"),
     deferred("policy", "sri"),
+    // WOR-2668: pure parsing, no secret material in its config.
+    deferred("policy", "user_agent_parser"),
     deferred("policy", "waf"),
     deferred("transform", "a2a_agent_card_rewrite"),
     deferred("transform", "boilerplate"),

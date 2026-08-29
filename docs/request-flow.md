@@ -195,8 +195,11 @@ signals have been populated" (TLS fingerprint, ML classification,
 headless detection, request rate), against every registered hook, with
 verdicts forwarded to whatever sink the hook implementation wires (audit
 log, tracing, reputation updater); the OSS pipeline does not act on the
-verdicts itself. OSS builds register none. See
-[headless-detection.md](headless-detection.md) and
+verdicts itself. OSS builds register none. The signal set now includes
+GeoIP country/ASN and a UA-parsed headless-library label when the
+`geoip` / `user_agent_parser` policies ran earlier in the request
+phase. See [headless-detection.md](headless-detection.md),
+[request-enrichment.md](request-enrichment.md), and
 [plugins.md](plugins.md).
 
 ## 8. Transform pipeline and cache write (`response_body_filter`)

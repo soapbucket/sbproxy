@@ -41,12 +41,13 @@ An origin's `action:` decides what serves the request, and forward rules can pic
 
 ## 7. Reference: every policy type
 
-[policy.md](policy.md) is the catalog, with a one-line job description for each of the twenty-eight `policies:` types and a link to its full documentation. The names, grouped by the job you are hiring for:
+[policy.md](policy.md) is the catalog, with a one-line job description for each of the thirty `policies:` types and a link to its full documentation. The names, grouped by the job you are hiring for:
 
 * **Rate, volume, and budget:** `rate_limiting`, `rate_limit_budget`, `concurrent_limit`, `request_limit`, `ddos`, `ip_filter`, `agent_budget`.
 * **Identity and access:** `object_authz` (BOLA and BFLA enforcement, plus enumeration detection), `agent_class`, `a2a`, `csrf`, `security_headers`.
 * **Content, validation, and DLP:** `request_validator`, `openapi_validation`, `body_threat_protection`, `waf`, `http_framing`, `sri`, `content_digest`, `page_shield`, `dlp`, `exposed_credentials`.
 * **AI-specific:** `ai_crawl_control`, `prompt_injection_v2`, `semantic_constraint`.
+* **Enrichment:** `geoip`, `user_agent_parser`. Neither denies traffic; both annotate the request for downstream identity/anomaly hooks and, optionally, the upstream request. Docs: [request-enrichment.md](request-enrichment.md).
 * **Scripting-driven:** `expression` (CEL), `rego`, `assertion`.
 * **Packs:** `owasp_api_top10` is not a twenty-ninth type. The compiler expands it into entries from the groups above, backs off per item when you author the type yourself, and reports each of the ten items in a five-state manifest, including the ones it does not cover. Docs: [owasp-api-top10.md](owasp-api-top10.md).
 

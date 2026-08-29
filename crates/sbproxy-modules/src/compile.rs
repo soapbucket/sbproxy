@@ -472,6 +472,14 @@ fn compile_policy_with_optional_registry(
         "agent_budget" => Ok(Policy::AgentBudget(std::sync::Arc::new(
             crate::policy::AgentBudgetPolicy::from_config(config.clone())?,
         ))),
+        // WOR-2668: GeoIP lookup and User-Agent parsing. Both are
+        // typed producers, never denials; see `crate::enricher`.
+        "geoip" => Ok(Policy::GeoIp(
+            crate::enricher::geoip::GeoIpPolicy::from_config(config.clone())?,
+        )),
+        "user_agent_parser" => Ok(Policy::UserAgent(
+            crate::enricher::uaparser::UserAgentPolicy::from_config(config.clone())?,
+        )),
         other => match sbproxy_plugin::build_policy_plugin(other, config.clone()) {
             Some(Ok(enforcer)) => Ok(Policy::Plugin(crate::PluginPolicy::linked(enforcer))),
             Some(Err(error)) => {
@@ -1949,6 +1957,42 @@ hooks:
         });
         let policy = compile_policy(&json).unwrap();
         assert_eq!(policy.policy_type(), "agent_budget");
+    }
+
+    #[test]
+    fn compile_policy_geoip() {
+        let json = serde_json::json!({
+            "type": "geoip",
+            "inject_headers": false
+        });
+        let policy = compile_policy(&json).unwrap();
+        assert_eq!(policy.policy_type(), "geoip");
+        assert!(matches!(policy, Policy::GeoIp(_)));
+    }
+
+    #[test]
+    fn compile_policy_geoip_defaults() {
+        let json = serde_json::json!({"type": "geoip"});
+        let policy = compile_policy(&json).unwrap();
+        assert_eq!(policy.policy_type(), "geoip");
+    }
+
+    #[test]
+    fn compile_policy_user_agent_parser() {
+        let json = serde_json::json!({
+            "type": "user_agent_parser",
+            "inject_header": "x-ua-info"
+        });
+        let policy = compile_policy(&json).unwrap();
+        assert_eq!(policy.policy_type(), "user_agent_parser");
+        assert!(matches!(policy, Policy::UserAgent(_)));
+    }
+
+    #[test]
+    fn compile_policy_user_agent_parser_defaults() {
+        let json = serde_json::json!({"type": "user_agent_parser"});
+        let policy = compile_policy(&json).unwrap();
+        assert_eq!(policy.policy_type(), "user_agent_parser");
     }
 
     // --- compile_transform tests ---

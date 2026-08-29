@@ -4952,6 +4952,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "ipnetwork"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf370abdafd54d13e54a620e8c3e1145f28e46cc9d704bc6d94414559df41763"
+
+[[package]]
 name = "iri-string"
 version = "0.7.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5913,6 +5919,19 @@ checksum = "a06de3016e9fae57a36fd14dba131fccf49f74b40b7fbdb472f96e361ec71a08"
 dependencies = [
  "autocfg",
  "rawpointer",
+]
+
+[[package]]
+name = "maxminddb"
+version = "0.27.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76371bd37ce742f8954daabd0fde7f1594ee43ac2200e20c003ba5c3d65e2192"
+dependencies = [
+ "ipnetwork 0.21.1",
+ "log",
+ "memchr",
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -9067,7 +9086,7 @@ dependencies = [
  "hyper-util",
  "include_dir",
  "inventory",
- "ipnetwork",
+ "ipnetwork 0.20.0",
  "jsonwebtoken",
  "loom",
  "lru",
@@ -9202,7 +9221,7 @@ dependencies = [
  "compact_str 0.8.1",
  "hex",
  "http 1.4.0",
- "ipnetwork",
+ "ipnetwork 0.20.0",
  "jsonschema 0.17.1",
  "jsonschema 0.47.0",
  "lru",
@@ -9568,11 +9587,12 @@ dependencies = [
  "hmac 0.13.0",
  "http 1.4.0",
  "inventory",
- "ipnetwork",
+ "ipnetwork 0.20.0",
  "jsonschema 0.17.1",
  "jsonwebtoken",
  "ldap3",
  "lru",
+ "maxminddb",
  "md-5",
  "minijinja",
  "object_store",
@@ -9774,7 +9794,7 @@ dependencies = [
  "hex",
  "hickory-resolver",
  "hmac 0.13.0",
- "ipnetwork",
+ "ipnetwork 0.20.0",
  "prometheus",
  "rand 0.8.6",
  "regex",
