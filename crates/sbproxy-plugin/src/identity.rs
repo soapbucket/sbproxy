@@ -159,6 +159,23 @@ pub struct RequestContextView<'a> {
     pub headless_library: Option<&'a str>,
     /// Client IP address.
     pub client_ip: Option<std::net::IpAddr>,
+    /// ISO 3166-1 alpha-2 country code resolved from `client_ip` by
+    /// the `geoip` policy, when one is configured for the origin.
+    /// `None` when the policy did not run, no client IP was
+    /// resolved, or the database had no record for the address.
+    pub geo_country: Option<&'a str>,
+    /// Autonomous system number from the same GeoIP lookup as
+    /// `geo_country`. `None` under the same conditions.
+    pub geo_asn: Option<u32>,
+    /// Headless-automation-library label (e.g. `"headless_chrome"`,
+    /// `"selenium"`) parsed from the `User-Agent` header by the
+    /// `user_agent_parser` policy, when one is configured for the
+    /// origin. Independent of `headless_library` above, which comes
+    /// from the JA4 TLS fingerprint detector rather than the UA
+    /// string; a request can set either, both, or neither. `None`
+    /// when the policy did not run or the UA matched no known
+    /// headless-automation token.
+    pub ua_headless_library: Option<&'a str>,
 }
 
 /// Snapshot of the per-request signals the [`MlClassifierHook`] reads
@@ -592,6 +609,9 @@ mod tests {
             ja4_trustworthy: true,
             headless_library: None,
             client_ip: None,
+            geo_country: None,
+            geo_asn: None,
+            ua_headless_library: None,
         };
 
         let mut total: usize = 0;

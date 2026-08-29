@@ -165,7 +165,7 @@ Point a framework you already run at the gateway: chat completions through the O
 
 ## Policies
 
-- [policy.md](policy.md) - the policy catalog: all 28 policy types grouped as traffic-shape/abuse, identity/access, content/input safety, AI-specific, and scripting-driven, each linked to wherever it's documented.
+- [policy.md](policy.md) - the policy catalog: all 30 policy types grouped as traffic-shape/abuse, identity/access, content/input safety, AI-specific, enrichment, and scripting-driven, each linked to wherever it's documented.
 - [cedar-policy.md](cedar-policy.md) - Cedar ABAC on MCP `tools/call`: compile-at-load, empty entity store, Confirm as a labelled refusal. Runnable: [`examples/cedar-mcp-full/`](../examples/cedar-mcp-full/).
 - [object-authz.md](object-authz.md) - `object_authz` policy: BOLA + BFLA enforcement with tenant-isolation and enumeration detection.
 - [waf-options.md](waf-options.md) - what the 16-rule WAF baseline catches and what it does not, and the three alternatives when you need more.
@@ -174,6 +174,7 @@ Point a framework you already run at the gateway: chat completions through the O
 - [content-digest.md](content-digest.md) - `content_digest` policy: RFC 9530 request-body verification for integrity-critical inboxes.
 - [anomaly-detection.md](anomaly-detection.md) - the rolling per-agent-class histogram that flags long-tail TLS fingerprints, headless libraries, and per-address rate spikes, and the reputation score it feeds.
 - [headless-detection.md](headless-detection.md) - header-only headless / stealth-browser indicator heuristics surfaced under `request.agent.headless_*`.
+- [request-enrichment.md](request-enrichment.md) - the `geoip` and `user_agent_parser` policies: typed GeoIP and User-Agent producers for identity and anomaly hooks, never denying traffic.
 - [feature-flags.md](feature-flags.md) - the sticky-bucketing flag store plus the `flag_enabled(name, key)` CEL helper.
 
 ## Security

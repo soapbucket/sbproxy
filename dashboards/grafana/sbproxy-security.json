@@ -1589,6 +1589,123 @@
         }
       ],
       "description": "Days since the oldest record of each kind was minted or rotated, published when `GET /admin/credentials` is listed. Compare against the crypto period named in `key_management.crypto.rotation`: 90 days for credentials and inbound keys by default, following NIST SP 800-57 Part 1 Rev 5. This is what turns \"rotate periodically\" into a page. A flat line means nothing is listing the admin API, not that nothing is ageing. Runbook: docs/key-management.md#rotation-cadence."
+    },
+    {
+      "id": 26,
+      "title": "GeoIP Lookups",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 112
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (result) (rate(sbproxy_geoip_lookup_total[5m]))",
+          "legendFormat": "{{result}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Measures geoip policy lookups by outcome (hit, miss, no_database, no_client_ip). Runbook: docs/request-enrichment.md. A rising no_database share means the origin has geoip configured with no reachable MMDB."
+    },
+    {
+      "id": 27,
+      "title": "User-Agent Headless Detections",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 112
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (library) (rate(sbproxy_user_agent_headless_total[5m]))",
+          "legendFormat": "{{library}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (device_type) (rate(sbproxy_user_agent_parse_total[5m]))",
+          "legendFormat": "device_type: {{device_type}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Measures user_agent_parser headless-automation-library detections and overall device_type mix. Runbook: docs/request-enrichment.md. A sudden headless_chrome/puppeteer/selenium spike against a flat device_type total is worth correlating with the JA4 headless_signal in sbproxy-security.json's Bot Detections panel."
     }
   ],
   "templating": {

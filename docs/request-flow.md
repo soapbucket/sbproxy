@@ -143,7 +143,7 @@ Action dispatch is where the traffic-type branch happens; see
 what differs by branch. Built-in action types are enum variants matched
 here: `proxy`, `load_balancer`, `ai_proxy`, `static`, `mock`, `redirect`,
 `echo`, `beacon`, `noop`, `websocket`, `grpc`, `graphql`, `storage`,
-`a2a`, and `mcp`; the complete catalog with a paragraph on each is
+`a2a`, `mcp`, `abtest`, and `https_proxy`; the complete catalog with a paragraph on each is
 [features.md's action reference](features.md#6-reference-every-action-type). A third-party
 action plugin (`Plugin(Box<dyn ActionHandler>)`) pays one indirect call
 here instead of hitting the branch-predicted match; see
@@ -197,8 +197,11 @@ signals have been populated" (TLS fingerprint, ML classification,
 headless detection, request rate), against every registered hook, with
 verdicts forwarded to whatever sink the hook implementation wires (audit
 log, tracing, reputation updater); the OSS pipeline does not act on the
-verdicts itself. OSS builds register none. See
-[headless-detection.md](headless-detection.md) and
+verdicts itself. OSS builds register none. The signal set now includes
+GeoIP country/ASN and a UA-parsed headless-library label when the
+`geoip` / `user_agent_parser` policies ran earlier in the request
+phase. See [headless-detection.md](headless-detection.md),
+[request-enrichment.md](request-enrichment.md), and
 [plugins.md](plugins.md).
 
 ## 8. Transform pipeline and cache write (`response_body_filter`)
@@ -206,7 +209,7 @@ verdicts itself. OSS builds register none. See
 Transforms modify the response body before it reaches the client - they
 are response-side only, run in the order declared under `transforms:`,
 and this is their one attachment point in the pipeline. Four of the
-twenty-six transform types are themselves a scripting hook
+twenty-eight transform types are themselves a scripting hook
 (`cel_script`, `lua_json`, `javascript`/`js_json`, `wasm`), so this stage
 is both a fixed set of built-in reshaping operations and its own
 extension point. See [transforms.md](transforms.md) for the full catalog

@@ -715,6 +715,36 @@ fn apply_transform_with_ctx(
             let host = t.proxy_host.as_deref().unwrap_or(ctx.hostname.as_str());
             t.apply_with_path(body, content_type, ctx.request_path.as_str(), host)
         }
+        // WOR-2670: same shape as `HtmlToMarkdown` above. The PDF
+        // transform builds a full `MarkdownProjection`, so its `title`
+        // and `token_estimate` are put on the context rather than
+        // computed and dropped. That is what makes the module's claim
+        // true, that a downstream `json_envelope` or
+        // `x-markdown-tokens` header sees the same shape whichever
+        // source format the origin served: `json_envelope` reads
+        // `ctx.markdown_projection.title`, and before this it only ever
+        // saw one populated by HTML.
+        #[cfg(feature = "transform-pdf")]
+        Transform::PdfMarkdown(t) => {
+            let is_pdf = content_type
+                .map(|c| {
+                    c.split(';')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .eq_ignore_ascii_case("application/pdf")
+                })
+                .unwrap_or(false);
+            if !is_pdf {
+                return Ok(());
+            }
+            let projection = t.decode(body.as_ref())?;
+            body.clear();
+            body.extend_from_slice(projection.body.as_bytes());
+            ctx.markdown_token_estimate = Some(projection.token_estimate);
+            ctx.markdown_projection = Some(projection);
+            Ok(())
+        }
         // All other transform variants: standard pipeline.
         _ => compiled.transform.apply(body, content_type),
     }

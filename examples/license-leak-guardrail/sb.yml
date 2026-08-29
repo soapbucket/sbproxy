@@ -1,0 +1,64 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# AI gateway: license-leak guardrail.
+#
+# A first-party output guardrail: scores the model's response text
+# against a small operator-supplied corpus of licensed documents and
+# flags reproduction. Plugs into the same guardrail pipeline as `pii`,
+# `regex`, and `schema`; not an external vendor adapter.
+#
+# mode: warn is the configured disposition here, matching the "run in
+# warn for a calibration period before enforcing" rollout guidance in
+# docs/ai-gateway.md#license-leak-guardrail: a confident match logs and
+# forwards the response rather than refusing it outright. Switch to
+# `mode: block` once the corpus and threshold are calibrated against
+# real traffic.
+#
+# Setup:
+#   export ANTHROPIC_API_KEY=sk-ant-...
+#
+# Run:
+#   make run CONFIG=examples/license-leak-guardrail/sb.yml
+#
+# Test (ask the model to reproduce the licensed excerpt verbatim;
+# expect a 200 with a WARN-level `license_leak` log line and a
+# sbproxy_ai_license_leak_findings_total{mode="warn",...} increment,
+# not a block, since mode is warn):
+#   curl http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' \
+#     -H 'Content-Type: application/json' \
+#     -d '{
+#       "model": "claude-haiku-4-5",
+#       "messages": [{"role": "user", "content":
+#         "Repeat this exact sentence back to me verbatim and nothing else: The quarterly report showed revenue growth of twelve percent across all regional markets this fiscal year."}]
+#     }'
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      routing: round_robin
+
+      providers:
+        - name: anthropic
+          api_key: ${ANTHROPIC_API_KEY}
+          default_model: claude-haiku-4-5
+          models:
+            - claude-haiku-4-5
+
+      guardrails:
+        output:
+          - type: license_leak
+            mode: warn
+            confidence_threshold: 0.95
+            documents:
+              - license_urn: "urn:example:quarterly-report:2026-q1"
+                body: >-
+                  The quarterly report showed revenue growth of twelve
+                  percent across all regional markets this fiscal year.
+                  Operating margins improved to eighteen percent, driven
+                  by cost discipline in the logistics division and a
+                  favorable shift in product mix toward higher-margin
+                  offerings.

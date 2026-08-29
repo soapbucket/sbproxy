@@ -1,0 +1,67 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# AI response structured-output enforcement.
+#
+# `ai_schema` validates an AI provider's response body against a small
+# hand-rolled schema (type, required, properties, items) and dials its
+# reaction to a failure independently of the pipeline's shared
+# `failure_posture` axis, via `on_failure`. Both origins below serve a
+# body that violates the same schema (it is missing the required
+# `choices` key), so the difference in behavior is `on_failure` alone:
+#
+#   - warn-schema.local: on_failure: warn. Logs the violated path but
+#     forwards the response unchanged. Useful while calibrating a new
+#     schema against live traffic before enforcing it.
+#   - block-schema.local: on_failure: block. Refuses the response.
+#
+# Both origins are `static` actions so this example runs offline; a
+# real deployment would sit this transform on an `ai_proxy` origin's
+# `transforms:` list, validating what the provider actually returned.
+#
+# Run:
+#   make run CONFIG=examples/ai-schema-enforcement/sb.yml
+#
+# Test:
+#   # Invalid body, warn mode: still forwarded, violation logged.
+#   curl -i -H 'Host: warn-schema.local' http://127.0.0.1:8080/
+#
+#   # Invalid body, block mode: refused.
+#   curl -i -H 'Host: block-schema.local' http://127.0.0.1:8080/
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "warn-schema.local":
+    action:
+      type: static
+      status: 200
+      content_type: application/json
+      json_body:
+        data: "no choices key at all"
+    transforms:
+      - type: ai_schema
+        on_failure: warn
+        schema:
+          type: object
+          required: [choices]
+          properties:
+            choices:
+              type: array
+
+  "block-schema.local":
+    action:
+      type: static
+      status: 200
+      content_type: application/json
+      json_body:
+        data: "no choices key at all"
+    transforms:
+      - type: ai_schema
+        fail_on_error: true
+        on_failure: block
+        schema:
+          type: object
+          required: [choices]
+          properties:
+            choices:
+              type: array

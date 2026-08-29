@@ -3,7 +3,7 @@
 
 The policy engine evaluates a list of policies on every request. Each policy returns one of four verdicts: `Allow`, `Deny`, `AllowWithHeaders`, or `Confirm`. The dispatcher folds the per-policy results into a single decision and applies it before the request reaches the upstream.
 
-SBproxy ships twenty-eight `policies:` list types. This page is the map: every policy, grouped by what it is for, linking to wherever it is actually documented. Some get their own dedicated page; some are documented here; others are a subsection of a broader page such as [api-security.md](api-security.md) or [scripting.md](scripting.md). Two more checks that behave like policies but are not `policies:` list entries are covered separately at the bottom of this page.
+SBproxy ships thirty `policies:` list types. This page is the map: every policy, grouped by what it is for, linking to wherever it is actually documented. Some get their own dedicated page; some are documented here; others are a subsection of a broader page such as [api-security.md](api-security.md) or [scripting.md](scripting.md). Two more checks that behave like policies but are not `policies:` list entries are covered separately at the bottom of this page.
 
 If you are deciding which policy stops which threat, start with the group headings below and [security.md](security.md). If you already know which policy you want and just need the field list, follow its link directly.
 
@@ -45,6 +45,11 @@ If you are deciding which policy stops which threat, start with the group headin
 - `ai_crawl_control` (alias `pay_per_crawl`): the Pay Per Crawl 402 challenge and token ledger for AI crawlers. [ai-crawl-control.md](ai-crawl-control.md).
 - `prompt_injection_v2`: a swappable detector plus an enforcer that maps a score onto an action. [prompt-injection-v2.md](prompt-injection-v2.md).
 - `semantic_constraint`: routes a request through an LLM-as-judge backend for a natural-language rule. [This page](#semantic_constraint).
+
+**Enrichment.** Producers that annotate a request for downstream identity and anomaly hooks; neither denies traffic.
+
+- `geoip`: resolves the client IP to country / continent / city / ASN via a MaxMind-compatible MMDB. [request-enrichment.md](request-enrichment.md).
+- `user_agent_parser`: parses the `User-Agent` header into browser / OS / device-type plus a headless-automation-library signal. [request-enrichment.md](request-enrichment.md).
 
 **Scripting-driven.** Policies whose logic is an expression or module you author rather than a fixed field set.
 

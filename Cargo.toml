@@ -279,6 +279,18 @@ graphql-parser = "0.4.1"
 
 # Networking
 ipnetwork = "0.20"
+# MaxMind-compatible MMDB reader for the `geoip` policy
+# (crates/sbproxy-modules/src/enricher/geoip.rs). ISC-licensed, so no
+# NOTICE entry (that file tracks Apache-2.0-only deps).
+#
+# Floor is 0.27, not the 0.24 this was first written against:
+# RUSTSEC-2025-0132 covers every 0.11..0.27, where `Reader::open_mmap`
+# was declared safe over an inherently unsafe memory map. We only call
+# `Reader::from_source` over an owned `Vec<u8>`, so the unsound path is
+# not one we reach, but cargo-deny gates on the advisory and not on the
+# function, and a floor below the patched release would need an
+# `ignore` entry that outlives the reason for it.
+maxminddb = "0.27"
 
 # Async
 async-trait = "0.1"
