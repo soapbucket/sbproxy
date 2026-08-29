@@ -22,7 +22,19 @@
 //! PATCH  /admin/credentials/{id}          update credential metadata
 //! DELETE /admin/credentials/{id}          delete a credential
 //! POST   /admin/credentials/{id}/revoke|block|unblock
+//! POST   /admin/credentials/{id}/rotate  rotate with a graced overlap (WOR-2567)
+//! POST   /admin/break-glass               request an emergency grant (WOR-2573)
+//! GET    /admin/break-glass               list grants and the review queue
+//! POST   /admin/break-glass/{id}/approve  approve, toward the quorum
+//! POST   /admin/break-glass/{id}/review   record the post-access review
+//! GET    /admin/crypto/root-of-trust      root-of-trust mode and liveness (WOR-2568)
 //! ```
+//!
+//! The three routes added in WOR-2568 and WOR-2573 are JSON only. A
+//! console page for the break-glass request/approve/review flow and for
+//! the root-of-trust panel is deferred to WOR-2574, which owns the admin
+//! console; these routes are what that page reads and are complete on
+//! their own for an operator with curl.
 //!
 //! Every mutation goes through the store then invalidates the cache so the
 //! change takes effect on the next request without a reload. Responses never
@@ -46,7 +58,8 @@ use serde_json::json;
 use crate::key_plane::{block_on_keystore, current_key_plane, KeyPlane};
 use sbproxy_ai::governance::{GovernanceError, GovernanceLimits, SnapshotKey};
 use sbproxy_keystore::record::{
-    BudgetOverride, CredentialMaterial, CredentialRecord, KeyRecord, RecordBudget, RecordStatus,
+    BudgetOverride, CredentialMaterial, CredentialRecord, KeyRecord, LeasePlatform, RecordBudget,
+    RecordStatus,
 };
 use sbproxy_keystore::KeyPolicyCasResult;
 
@@ -153,6 +166,30 @@ fn route(method: &str, path: &str, body: Option<&str>) -> Option<Resp> {
     if let Some(rest) = path.strip_prefix("/admin/credentials/") {
         return Some(credential_subroute(method, rest, body));
     }
+    // WOR-2573. Mounted here rather than in `admin.rs` because a
+    // break-glass grant exists to reach keys and credentials, and its
+    // audit records land on the same `key_audit` channel this module
+    // already writes.
+    if path == "/admin/break-glass" {
+        return Some(if method.eq_ignore_ascii_case("GET") {
+            ok(crate::break_glass::list(Utc::now()))
+        } else if method.eq_ignore_ascii_case("POST") {
+            create_break_glass_grant(body)
+        } else {
+            method_not_allowed()
+        });
+    }
+    if let Some(rest) = path.strip_prefix("/admin/break-glass/") {
+        return Some(break_glass_subroute(method, rest, body));
+    }
+    // WOR-2568.
+    if path == "/admin/crypto/root-of-trust" {
+        return Some(if method.eq_ignore_ascii_case("GET") {
+            get_root_of_trust()
+        } else {
+            method_not_allowed()
+        });
+    }
     None
 }
 
@@ -233,6 +270,11 @@ fn credential_subroute(method: &str, rest: &str, body: Option<&str>) -> Resp {
             "revoke" => set_credential_status(id, RecordStatus::Revoked),
             "block" => set_credential_status(id, RecordStatus::Blocked),
             "unblock" => set_credential_status(id, RecordStatus::Active),
+            // WOR-2567: the credential half of the rotation story. Counted
+            // on the same `sbproxy_key_operations_total` series the key
+            // rotation is, because an operator's "how often do we rotate"
+            // panel should not have to know which resource kind it was.
+            "rotate" => count_key_operation("credential_rotate", rotate_credential(id, body)),
             _ => not_found("unknown credential action"),
         },
         Some(_) => method_not_allowed(),
@@ -1863,6 +1905,24 @@ struct CredentialCreate {
     /// Scheme prefix on the header value. Defaults to `Bearer `. Send an empty
     /// string for raw-value headers such as `x-api-key`.
     scheme: Option<String>,
+    /// Lease this credential from a dynamic-secrets mount instead of
+    /// storing anything static (WOR-2569). Mutually exclusive with
+    /// `secret` and `vault_ref`.
+    #[serde(default)]
+    lease: Option<LeaseRequest>,
+}
+
+/// The `lease:` block of a credential create (WOR-2569).
+#[derive(Debug, Deserialize)]
+struct LeaseRequest {
+    /// Secret reference naming the dynamic-secrets mount, for example
+    /// `vault://aws/creds/sbproxy-bedrock`.
+    reference: String,
+    /// `aws`, `gcp`, `azure`, or `database`.
+    platform: String,
+    /// The mount's configured lease lifetime, in seconds. Resolved
+    /// material is never cached past it.
+    lease_duration_secs: u64,
 }
 
 /// Redacted `Debug` (WOR-2640). `secret` is the plaintext credential an
@@ -1933,9 +1993,23 @@ fn create_credential(body: Option<&str>) -> Resp {
     if sbproxy_config::types::credential_header_is_reserved(&credential_header) {
         return bad_request("header may not be used to carry a credential");
     }
-    let material = match build_material(&plane, &id, c.vault_ref.as_deref(), c.secret.as_deref()) {
-        Ok(m) => m,
-        Err(e) => return bad_request(&e),
+    let material = match &c.lease {
+        Some(lease) => {
+            if c.secret.is_some() || c.vault_ref.is_some() {
+                return bad_request(
+                    "a leased credential stores nothing static, so lease is mutually exclusive \
+                     with secret and vault_ref",
+                );
+            }
+            match build_leased_material(lease, c.provider.as_deref()) {
+                Ok(m) => m,
+                Err(e) => return bad_request(&e),
+            }
+        }
+        None => match build_material(&plane, &id, c.vault_ref.as_deref(), c.secret.as_deref()) {
+            Ok(m) => m,
+            Err(e) => return bad_request(&e),
+        },
     };
     let now = Utc::now();
     let rec = CredentialRecord {
@@ -1954,6 +2028,9 @@ fn create_credential(body: Option<&str>) -> Resp {
         created_at: now,
         updated_at: now,
         source: sbproxy_keystore::record::RecordSource::Api,
+        rotated_at: None,
+        prev_material: None,
+        prev_material_expires_at: None,
     };
     if let Err(e) = store_credential(&plane, rec.clone()) {
         return internal_error(&e);
@@ -1972,6 +2049,17 @@ fn list_credentials() -> Resp {
     let store = plane.cache().store().clone();
     match block_on_keystore(async move { store.list_credentials().await }) {
         Ok(creds) => {
+            // WOR-2567: publish the oldest un-rotated credential's age
+            // here rather than from a timer. This route is what the admin
+            // console and the operator's own scripts already poll, so the
+            // gauge is refreshed by the thing that was going to look at
+            // it anyway, and a deployment that never lists never pays.
+            // Compared against `key_management.crypto.rotation.credential_days`,
+            // this is what turns "rotate periodically" into an alert.
+            let now = Utc::now();
+            if let Some(oldest) = creds.iter().map(|c| c.rotation_age_days(now)).max() {
+                sbproxy_observe::metrics::record_rotation_age_days("credential", oldest as f64);
+            }
             let views: Vec<CredentialView> = creds.iter().map(CredentialView::from).collect();
             ok(json!({ "credentials": views }))
         }
@@ -2097,6 +2185,63 @@ fn set_credential_status(id: &str, status: RecordStatus) -> Resp {
     ok(json!({ "credential": CredentialView::from(&rec) }))
 }
 
+/// Turn a `lease:` request block into leased material, refusing the
+/// combinations that cannot work (WOR-2569).
+///
+/// The refusal on an unsupported provider is the load-bearing one.
+/// Accepting `leased` for OpenAI and quietly reading the reference once
+/// would produce a credential that looks leased on the admin view, never
+/// expires, and is exactly as static as the thing it replaced. Naming the
+/// limitation costs an operator one error and saves them that.
+///
+/// # Errors
+///
+/// An unknown platform, a zero lease duration, or a provider whose
+/// platform cannot mint short-lived credentials.
+fn build_leased_material(
+    lease: &LeaseRequest,
+    provider: Option<&str>,
+) -> Result<CredentialMaterial, String> {
+    let platform = match lease.platform.trim().to_ascii_lowercase().as_str() {
+        "aws" => LeasePlatform::Aws,
+        "gcp" => LeasePlatform::Gcp,
+        "azure" => LeasePlatform::Azure,
+        "database" => LeasePlatform::Database,
+        other => {
+            return Err(format!(
+                "lease.platform '{other}' is not a platform that can mint short-lived \
+                 credentials. Use aws, gcp, azure, or database. Most AI provider API keys have \
+                 no short-TTL issuance to lease against, so there is nothing to mint"
+            ))
+        }
+    };
+    if lease.reference.trim().is_empty() {
+        return Err("lease.reference must name a dynamic-secrets mount".to_string());
+    }
+    if lease.lease_duration_secs == 0 {
+        return Err(
+            "lease.lease_duration_secs must be greater than zero; it is the ceiling on how long \
+             resolved material may be cached"
+                .to_string(),
+        );
+    }
+    if !platform.accepts_provider(provider) {
+        return Err(format!(
+            "provider '{}' cannot be leased against platform '{}'. Leasing needs a platform that \
+             mints short-lived credentials (AWS, GCP, or Azure IAM, or a Vault-fronted database \
+             mount); an AI provider API key has no short-TTL issuance to lease against, so a \
+             leased record would be exactly as static as a stored one",
+            provider.unwrap_or("(none)"),
+            platform.label()
+        ));
+    }
+    Ok(CredentialMaterial::Leased {
+        reference: lease.reference.trim().to_string(),
+        platform,
+        lease_duration_secs: lease.lease_duration_secs,
+    })
+}
+
 /// Build credential material from the request, preferring a vault reference.
 fn build_material(
     plane: &KeyPlane,
@@ -2109,14 +2254,304 @@ fn build_material(
             reference: reference.to_string(),
         })
     } else if let Some(secret) = secret {
-        let envelope = plane
-            .crypto()
-            .seal(id, secret.as_bytes())
-            .map_err(|e| format!("seal credential: {e:#}"))?;
+        // WOR-2568: `seal_async` through `block_on_keystore`, not the
+        // synchronous `seal`. Under a customer-managed root the wrap is a
+        // call to the external key service, and the synchronous path
+        // refuses outright rather than falling back to a local wrap. This
+        // is the admin path, which is what `block_on_keystore` is for.
+        let crypto = plane.crypto().clone();
+        let record_id = id.to_string();
+        let plaintext = secret.as_bytes().to_vec();
+        let envelope =
+            block_on_keystore(async move { crypto.seal_async(&record_id, &plaintext).await })
+                .map_err(|e| format!("seal credential: {e:#}"))?;
         Ok(CredentialMaterial::Envelope { envelope })
     } else {
         Err("credential requires either vault_ref or secret".to_string())
     }
+}
+
+/// Body of `POST /admin/credentials/{id}/rotate` (WOR-2567).
+#[derive(Deserialize)]
+struct RotateCredentialBody {
+    /// New plaintext secret, sealed into an envelope under whichever root
+    /// of trust is configured. Mutually exclusive with `vault_ref`.
+    #[serde(default)]
+    secret: Option<String>,
+    /// New secret reference. Mutually exclusive with `secret`.
+    #[serde(default)]
+    vault_ref: Option<String>,
+    /// How long the previous material stays usable, in seconds. Defaults
+    /// to `key_management.crypto.rotation.credential_grace_secs`. Zero
+    /// retires the old material immediately, which is the right choice
+    /// when the old secret is known to be compromised.
+    #[serde(default)]
+    grace_secs: Option<u64>,
+}
+
+/// Rotate an upstream credential's material with a bounded overlap window.
+///
+/// `rotate_key` has done this for inbound keys since WOR-1554, and
+/// rotating an upstream credential was a full `PATCH` overwrite with no
+/// overlap: the instant the write landed, every request presented the new
+/// secret, and if that secret was not yet live at the provider the
+/// deployment took the outage. This is the same dual-validity shape from
+/// the other side.
+///
+/// What "dual validity" means here is narrower than for an inbound key and
+/// worth stating plainly, because the two are easy to conflate. sbproxy
+/// *presents* an upstream credential rather than validating one, so there
+/// is no old-value acceptance to do. The overlap is a fallback: the new
+/// material is what every request uses, and the previous material is
+/// reached only when the new one will not open or the upstream refuses it,
+/// and only while the window is open. A rotation that works never presents
+/// the retired secret at all.
+///
+/// The response never carries either secret. Unlike `rotate_key`, which
+/// mints a token and shows it once, this endpoint is given the new secret
+/// by the operator, so there is nothing to show back.
+fn rotate_credential(id: &str, body: Option<&str>) -> Resp {
+    let plane = match plane_or_err() {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let request: RotateCredentialBody = match body {
+        Some(raw) if !raw.trim().is_empty() => match serde_json::from_str(raw) {
+            Ok(v) => v,
+            Err(e) => return bad_request(&format!("invalid JSON body: {e}")),
+        },
+        _ => return bad_request("rotate requires a new secret or vault_ref"),
+    };
+    if request.secret.is_some() && request.vault_ref.is_some() {
+        return bad_request("rotate accepts either secret or vault_ref, not both");
+    }
+    let mut rec = match load_credential(&plane, id) {
+        Ok(Some(r)) => r,
+        Ok(None) => return not_found("credential not found"),
+        Err(e) => return internal_error(&e),
+    };
+    if rec.status == RecordStatus::Revoked {
+        // Revoked is terminal for a key and is terminal here too: a
+        // rotation that quietly reactivated a revoked credential would
+        // make revocation reversible by anyone who can rotate.
+        return (
+            409,
+            "application/json",
+            r#"{"error":"credential is revoked; revocation is terminal"}"#.to_string(),
+        );
+    }
+    let material = match build_material(
+        &plane,
+        id,
+        request.vault_ref.as_deref(),
+        request.secret.as_deref(),
+    ) {
+        Ok(m) => m,
+        Err(e) => return bad_request(&e),
+    };
+    let grace_secs = request
+        .grace_secs
+        .unwrap_or_else(|| plane.credential_rotation_grace_secs());
+    let now = Utc::now();
+    let previous = std::mem::replace(&mut rec.material, material);
+    if grace_secs == 0 {
+        rec.prev_material = None;
+        rec.prev_material_expires_at = None;
+    } else {
+        rec.prev_material = Some(previous);
+        rec.prev_material_expires_at = Some(now + chrono::Duration::seconds(grace_secs as i64));
+    }
+    rec.rotated_at = Some(now);
+    rec.updated_at = now;
+    if let Err(e) = store_credential(&plane, rec.clone()) {
+        return internal_error(&e);
+    }
+    // Drop both the record cache and the resolved-secret cache: without
+    // the second, every replica keeps presenting the pre-rotation
+    // plaintext it already opened until its own TTL lapses, which is the
+    // failure mode a rotation exists to close.
+    invalidate(&plane, id);
+    audit_mutation_scoped("rotate", "credential", id, rec.tenant_id.as_deref(), None);
+    ok(json!({
+        "credential": CredentialView::from(&rec),
+        "overlap": {
+            "grace_secs": grace_secs,
+            "previous_material_expires_at": rec.prev_material_expires_at,
+            "effect": if grace_secs == 0 {
+                "the previous material was retired immediately"
+            } else {
+                "the previous material is used only if the new material will not resolve, and only until it expires"
+            },
+        },
+    }))
+}
+
+// --- Break-glass (WOR-2573) and root of trust (WOR-2568) ---
+
+/// Body of `POST /admin/break-glass`.
+#[derive(Deserialize)]
+struct BreakGlassRequestBody {
+    /// Why this grant is needed. Read by the post-access reviewer.
+    justification: String,
+    /// Key or credential ids, or tenant names, this grant covers.
+    #[serde(default)]
+    scope: Vec<String>,
+    /// Requested lifetime. Refused above
+    /// `key_management.break_glass.max_ttl_secs` rather than clamped.
+    ttl_secs: u64,
+}
+
+/// Body of `POST /admin/break-glass/{id}/review`.
+#[derive(Deserialize)]
+struct BreakGlassReviewBody {
+    /// The reviewer's note. Bounded and non-secret; it lands in the audit
+    /// chain beside the grant.
+    #[serde(default)]
+    note: String,
+}
+
+fn break_glass_subroute(method: &str, rest: &str, body: Option<&str>) -> Resp {
+    let mut parts = rest.splitn(2, '/');
+    let id = parts.next().unwrap_or("");
+    let action = parts.next();
+    if id.is_empty() {
+        return not_found("missing break-glass grant id");
+    }
+    let Some(actor) = crate::admin::current_admin_actor() else {
+        return break_glass_error(&crate::break_glass::BreakGlassError::NoActor);
+    };
+    if !method.eq_ignore_ascii_case("POST") {
+        return method_not_allowed();
+    }
+    match action {
+        Some("approve") => match crate::break_glass::approve(id, &actor) {
+            Ok(grant) => ok(json!({ "grant": grant_view(&grant) })),
+            Err(e) => break_glass_error(&e),
+        },
+        Some("review") => {
+            let note = match body {
+                Some(raw) if !raw.trim().is_empty() => {
+                    match serde_json::from_str::<BreakGlassReviewBody>(raw) {
+                        Ok(v) => v.note,
+                        Err(e) => return bad_request(&format!("invalid JSON body: {e}")),
+                    }
+                }
+                _ => String::new(),
+            };
+            match crate::break_glass::review(id, &actor, &note) {
+                Ok(grant) => ok(json!({ "grant": grant_view(&grant) })),
+                Err(e) => break_glass_error(&e),
+            }
+        }
+        _ => not_found("unknown break-glass action"),
+    }
+}
+
+fn create_break_glass_grant(body: Option<&str>) -> Resp {
+    let Some(actor) = crate::admin::current_admin_actor() else {
+        return break_glass_error(&crate::break_glass::BreakGlassError::NoActor);
+    };
+    let request: BreakGlassRequestBody = match body {
+        Some(raw) if !raw.trim().is_empty() => match serde_json::from_str(raw) {
+            Ok(v) => v,
+            Err(e) => return bad_request(&format!("invalid JSON body: {e}")),
+        },
+        _ => return bad_request("break-glass requires justification, scope, and ttl_secs"),
+    };
+    match crate::break_glass::request(
+        &actor,
+        &request.justification,
+        request.scope,
+        request.ttl_secs,
+    ) {
+        Ok(grant) => created(json!({ "grant": grant_view(&grant) })),
+        Err(e) => break_glass_error(&e),
+    }
+}
+
+/// The JSON view of one grant, rendered against the live config so the
+/// "approvals still needed" count reflects the configured quorum.
+fn grant_view(grant: &crate::break_glass::Grant) -> serde_json::Value {
+    match current_key_plane() {
+        Some(plane) => grant.view(Utc::now(), plane.break_glass()),
+        None => json!({ "id": grant.id }),
+    }
+}
+
+/// Map a break-glass refusal onto an HTTP status.
+///
+/// 403 for the two that are authorization decisions (self-approval, not an
+/// approver), 409 for a state mismatch, 404 for an unknown id, 400 for a
+/// malformed request. A self-approval attempt gets its own status because
+/// it is the one an operator is most likely to try and most needs to
+/// understand was deliberate.
+fn break_glass_error(error: &crate::break_glass::BreakGlassError) -> Resp {
+    use crate::break_glass::BreakGlassError as E;
+    let status = match error {
+        E::Disabled => 409,
+        E::NoActor => 401,
+        E::TtlOutOfRange(_) | E::UnscopedRequest | E::NoJustification => 400,
+        E::NotFound => 404,
+        E::SelfApproval | E::NotAnApprover(_) => 403,
+        E::AlreadyApproved | E::WrongState(_) | E::RegistryFull(_) => 409,
+    };
+    (
+        status,
+        "application/json",
+        json!({ "error": error.to_string() }).to_string(),
+    )
+}
+
+/// `GET /admin/crypto/root-of-trust` (WOR-2568).
+///
+/// The page a security reviewer opens first: is our root of trust
+/// customer-held right now, when did we last confirm the key service still
+/// authorizes us, and how long after a revocation does decryption actually
+/// stop. That last number is the product claim, so it is printed rather
+/// than left for the reader to derive from a TTL somewhere else.
+///
+/// A JSON route rather than a console page. The console surface is
+/// WOR-2574's; this route is what that page will read, and it is complete
+/// on its own for an operator with curl.
+fn get_root_of_trust() -> Resp {
+    let Some(plane) = current_key_plane() else {
+        return ok(json!({
+            "mode": "disabled",
+            "detail": "key_management is not enabled, so no key plane holds a root of trust",
+        }));
+    };
+    let Some(root) = plane.crypto().root_of_trust() else {
+        return ok(json!({
+            "mode": "local",
+            "detail": "the envelope data key is wrapped by a key derived from \
+                       key_management.crypto.master_key, which this process holds. Revoking an \
+                       external grant does not stop decryption in this mode.",
+            "rotation": {
+                "master_key_days": plane.master_key_crypto_period_days(),
+                "credential_days": plane.credential_crypto_period_days(),
+                "inbound_key_days": plane.inbound_key_crypto_period_days(),
+            },
+        }));
+    };
+    let window = root.revocation_window().as_secs();
+    let status = crate::key_root_of_trust::describe(root);
+    ok(json!({
+        "mode": "customer_managed",
+        "kek": root.kek_name(),
+        "revocation_window_secs": window,
+        "detail": format!(
+            "the envelope data key is wrapped by the external key service and is never held here. \
+             After the customer revokes sbproxy's grant, decryption of customer-managed \
+             credentials stops within {window} seconds, or at the next failed liveness probe, \
+             whichever comes first."
+        ),
+        "liveness": status,
+        "rotation": {
+            "master_key_days": plane.master_key_crypto_period_days(),
+            "credential_days": plane.credential_crypto_period_days(),
+            "inbound_key_days": plane.inbound_key_crypto_period_days(),
+        },
+    }))
 }
 
 // --- Response DTOs (never carry secrets) ---
@@ -2263,6 +2698,25 @@ struct CredentialView {
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     source: sbproxy_keystore::record::RecordSource,
+    /// When the material was last rotated, distinct from `updated_at`
+    /// which any metadata patch moves (WOR-2567).
+    rotated_at: Option<DateTime<Utc>>,
+    /// Days since the last rotation, or since creation when it has never
+    /// been rotated. The number an operator compares against the named
+    /// crypto period in `key_management.crypto.rotation`.
+    rotation_age_days: i64,
+    /// Whether a rotation overlap window is currently open, and when it
+    /// closes. Never says what the previous material was.
+    rotation_overlap_expires_at: Option<DateTime<Utc>>,
+    /// Names the customer-managed root of trust this credential's
+    /// envelope is wrapped under, when it is (WOR-2568). Absent for a
+    /// locally-wrapped envelope, a vault reference, or plaintext. Not a
+    /// secret: it is the mount and key name the operator configured.
+    root_of_trust: Option<String>,
+    /// Lease platform and duration for a leased credential (WOR-2569).
+    /// Absent for every other storage shape. Never the leased material.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lease: Option<serde_json::Value>,
 }
 
 impl From<&CredentialRecord> for CredentialView {
@@ -2271,6 +2725,19 @@ impl From<&CredentialRecord> for CredentialView {
             CredentialMaterial::VaultRef { reference } => ("vault_ref", Some(reference.clone())),
             CredentialMaterial::Envelope { .. } => ("encrypted", None),
             CredentialMaterial::Plaintext { .. } => ("plaintext", None),
+            CredentialMaterial::Leased { reference, .. } => ("leased", Some(reference.clone())),
+        };
+        let lease = match &r.material {
+            CredentialMaterial::Leased {
+                platform,
+                lease_duration_secs,
+                ..
+            } => Some(json!({
+                "platform": platform.label(),
+                "lease_duration_secs": lease_duration_secs,
+                "detail": "material is minted on demand and never cached past the lease; sbproxy                            re-leases at use time rather than renewing ahead of expiry",
+            })),
+            _ => None,
         };
         Self {
             id: r.id.clone(),
@@ -2286,6 +2753,14 @@ impl From<&CredentialRecord> for CredentialView {
             created_at: r.created_at,
             updated_at: r.updated_at,
             source: r.source,
+            rotated_at: r.rotated_at,
+            rotation_age_days: r.rotation_age_days(Utc::now()),
+            rotation_overlap_expires_at: r.prev_material_expires_at.filter(|at| *at > Utc::now()),
+            root_of_trust: match &r.material {
+                CredentialMaterial::Envelope { envelope } => envelope.kek.clone(),
+                _ => None,
+            },
+            lease,
         }
     }
 }
@@ -2445,6 +2920,15 @@ fn audit_mutation_scoped(
 ) {
     let mut entry = sbproxy_observe::KeyAuditEntry::new(op, kind, id);
     if let Some(actor) = crate::admin::current_admin_actor() {
+        // WOR-2573: an action taken while this operator holds an active
+        // break-glass grant carries the grant id, so a reviewer pulls the
+        // whole session by one key instead of correlating timestamps.
+        // Tagged here, at the one audit seam every key and credential
+        // mutation in this module already funnels through, rather than at
+        // each handler: a handler added later is tagged by construction.
+        if let Some(grant_id) = crate::break_glass::tag_action(&actor) {
+            entry = entry.with_context(format!("break_glass_grant={grant_id}"));
+        }
         entry = entry.with_actor(actor);
     }
     if let Some(tenant_id) = tenant_id {
@@ -2767,6 +3251,25 @@ mod tests {
 
     fn install_test_plane() {
         install_test_plane_with_store(Arc::new(MemoryKeyStore::new()));
+    }
+
+    /// Install a plane whose break-glass block is enabled with the given
+    /// quorum and roster.
+    fn install_break_glass_plane(quorum: usize, approvers: &[&str]) {
+        let crypto = KeyCrypto::new(b"pepper".to_vec(), b"master".to_vec());
+        let store: Arc<dyn KeyStore> = Arc::new(MemoryKeyStore::new());
+        let cache = Arc::new(TtlCache::new(store, TtlCacheConfig::default()));
+        let plane = Arc::new(
+            crate::key_plane::KeyPlane::from_parts(crypto, cache, false, false, None)
+                .with_break_glass(sbproxy_config::types::BreakGlassConfig {
+                    enabled: true,
+                    approvers: approvers.iter().map(|a| a.to_string()).collect(),
+                    quorum,
+                    max_ttl_secs: 3600,
+                    review_window_secs: 86_400,
+                }),
+        );
+        crate::key_plane::install_key_plane_for_test(plane);
     }
 
     fn parse(resp: &Resp) -> serde_json::Value {
@@ -4759,5 +5262,438 @@ mod tests {
         // "credential has no material" error needs that distinction.
         let empty = CredentialUpdate::default();
         assert!(format!("{empty:?}").contains("secret: None"));
+    }
+
+    // --- WOR-2567: credential rotation with a graced overlap ---
+
+    /// The seam: rotating an upstream credential keeps the previous
+    /// material usable for a bounded window, and the response says the
+    /// window is open without saying what the previous material was.
+    ///
+    /// Before this the only way to change an upstream secret was a
+    /// `PATCH` overwrite: the instant it landed every request presented
+    /// the new value, and a value the provider had not activated yet took
+    /// the deployment down with it.
+    #[test]
+    fn rotating_a_credential_opens_a_bounded_overlap_window() {
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane();
+
+        let created = dispatch(
+            "POST",
+            "/admin/credentials",
+            Some(r#"{"id":"cred-rot","name":"openai","secret":"sk-old-secret"}"#),
+        )
+        .unwrap();
+        assert_eq!(created.0, 201, "{}", created.2);
+        assert!(
+            parse(&created)["credential"]["rotated_at"].is_null(),
+            "a credential that has never been rotated has no rotation timestamp"
+        );
+
+        let rotated = dispatch(
+            "POST",
+            "/admin/credentials/cred-rot/rotate",
+            Some(r#"{"secret":"sk-new-secret","grace_secs":300}"#),
+        )
+        .unwrap();
+        assert_eq!(rotated.0, 200, "{}", rotated.2);
+        let body = parse(&rotated);
+        assert_eq!(body["overlap"]["grace_secs"], 300);
+        assert!(
+            !body["overlap"]["previous_material_expires_at"].is_null(),
+            "the overlap window must have a stated end: {}",
+            rotated.2
+        );
+        assert!(
+            !body["credential"]["rotated_at"].is_null(),
+            "a rotation stamps rotated_at, which is what rotation age is measured from"
+        );
+        // The one thing this response must never do.
+        for forbidden in ["sk-old-secret", "sk-new-secret"] {
+            assert!(
+                !rotated.2.contains(forbidden),
+                "a rotation response leaked credential material: {}",
+                rotated.2
+            );
+        }
+
+        // The overlap is visible on the record, again without the value.
+        let fetched = dispatch("GET", "/admin/credentials/cred-rot", None).unwrap();
+        assert!(
+            !parse(&fetched)["credential"]["rotation_overlap_expires_at"].is_null(),
+            "the overlap window is visible on the detail view: {}",
+            fetched.2
+        );
+        for forbidden in ["sk-old-secret", "sk-new-secret"] {
+            assert!(!fetched.2.contains(forbidden), "{}", fetched.2);
+        }
+    }
+
+    /// `grace_secs: 0` retires the old material immediately, which is
+    /// what an operator rotating a compromised secret needs. An overlap
+    /// that could not be turned off would keep a leaked key working for
+    /// five minutes after the operator did the one thing that was
+    /// supposed to stop it.
+    #[test]
+    fn a_zero_grace_rotation_retires_the_previous_material_at_once() {
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane();
+        dispatch(
+            "POST",
+            "/admin/credentials",
+            Some(r#"{"id":"cred-burn","name":"openai","secret":"sk-leaked"}"#),
+        )
+        .unwrap();
+        let rotated = dispatch(
+            "POST",
+            "/admin/credentials/cred-burn/rotate",
+            Some(r#"{"secret":"sk-fresh","grace_secs":0}"#),
+        )
+        .unwrap();
+        assert_eq!(rotated.0, 200, "{}", rotated.2);
+        let body = parse(&rotated);
+        assert_eq!(body["overlap"]["grace_secs"], 0);
+        assert!(
+            body["overlap"]["previous_material_expires_at"].is_null(),
+            "a zero grace leaves no overlap window at all: {}",
+            rotated.2
+        );
+        assert!(
+            body["credential"]["rotation_overlap_expires_at"].is_null(),
+            "{}",
+            rotated.2
+        );
+    }
+
+    /// Revocation stays terminal. A rotate that reactivated a revoked
+    /// credential would make revocation reversible by anyone who can
+    /// rotate, which is a strictly wider set than anyone who can
+    /// un-revoke, because un-revoking is not an operation at all.
+    #[test]
+    fn a_revoked_credential_cannot_be_rotated_back_into_service() {
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane();
+        dispatch(
+            "POST",
+            "/admin/credentials",
+            Some(r#"{"id":"cred-dead","name":"openai","secret":"sk-old"}"#),
+        )
+        .unwrap();
+        dispatch("POST", "/admin/credentials/cred-dead/revoke", None).unwrap();
+        let rotated = dispatch(
+            "POST",
+            "/admin/credentials/cred-dead/rotate",
+            Some(r#"{"secret":"sk-new"}"#),
+        )
+        .unwrap();
+        assert_eq!(rotated.0, 409, "{}", rotated.2);
+        assert!(rotated.2.contains("terminal"), "{}", rotated.2);
+    }
+
+    // --- WOR-2573: break-glass ---
+
+    /// The seam: a grant needs a quorum of *other* operators, and the
+    /// requester is never one of them even when the roster names them.
+    ///
+    /// A two-person rule one person can satisfy is not a two-person rule,
+    /// and the roster is exactly where somebody would otherwise close the
+    /// gap by adding themselves.
+    #[test]
+    fn a_break_glass_grant_needs_a_quorum_and_refuses_self_approval() {
+        let _g = crate::key_plane::test_plane_guard();
+        crate::break_glass::reset_for_test();
+        install_break_glass_plane(2, &["alice", "bob", "carol"]);
+
+        let _actor = crate::admin::set_current_admin_actor(Some((
+            "alice".to_string(),
+            sbproxy_config::types::AdminRole::Admin,
+        )));
+        let requested = dispatch(
+            "POST",
+            "/admin/break-glass",
+            Some(r#"{"justification":"incident 4412","scope":["cred-openai"],"ttl_secs":600}"#),
+        )
+        .unwrap();
+        assert_eq!(requested.0, 201, "{}", requested.2);
+        let grant_id = parse(&requested)["grant"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(parse(&requested)["grant"]["state"], "pending_approval");
+
+        // Alice is on the roster and still cannot approve her own request.
+        let self_approve = dispatch(
+            "POST",
+            &format!("/admin/break-glass/{grant_id}/approve"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(self_approve.0, 403, "{}", self_approve.2);
+        assert!(
+            self_approve
+                .2
+                .contains("cannot be approved by the operator who requested it"),
+            "{}",
+            self_approve.2
+        );
+
+        // One approval is not the quorum of two.
+        let _bob = crate::admin::set_current_admin_actor(Some((
+            "bob".to_string(),
+            sbproxy_config::types::AdminRole::Admin,
+        )));
+        let first = dispatch(
+            "POST",
+            &format!("/admin/break-glass/{grant_id}/approve"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(first.0, 200, "{}", first.2);
+        assert_eq!(parse(&first)["grant"]["state"], "pending_approval");
+        assert_eq!(parse(&first)["grant"]["approvals_needed"], 1);
+
+        // Somebody not on the roster cannot make up the difference.
+        let _mallory = crate::admin::set_current_admin_actor(Some((
+            "mallory".to_string(),
+            sbproxy_config::types::AdminRole::Admin,
+        )));
+        let outsider = dispatch(
+            "POST",
+            &format!("/admin/break-glass/{grant_id}/approve"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(outsider.0, 403, "{}", outsider.2);
+
+        // The second roster approver activates it.
+        let _carol = crate::admin::set_current_admin_actor(Some((
+            "carol".to_string(),
+            sbproxy_config::types::AdminRole::Admin,
+        )));
+        let second = dispatch(
+            "POST",
+            &format!("/admin/break-glass/{grant_id}/approve"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(second.0, 200, "{}", second.2);
+        assert_eq!(parse(&second)["grant"]["state"], "active");
+        assert_eq!(parse(&second)["grant"]["approvals_needed"], 0);
+    }
+
+    /// A grant with no scope is refused. An unscoped break-glass grant is
+    /// a standing admin credential with extra paperwork, and shipping one
+    /// would make the whole feature theatre.
+    #[test]
+    fn an_unscoped_or_over_long_break_glass_request_is_refused() {
+        let _g = crate::key_plane::test_plane_guard();
+        crate::break_glass::reset_for_test();
+        install_break_glass_plane(2, &["alice", "bob"]);
+        let _actor = crate::admin::set_current_admin_actor(Some((
+            "alice".to_string(),
+            sbproxy_config::types::AdminRole::Admin,
+        )));
+
+        let unscoped = dispatch(
+            "POST",
+            "/admin/break-glass",
+            Some(r#"{"justification":"incident","scope":[],"ttl_secs":600}"#),
+        )
+        .unwrap();
+        assert_eq!(unscoped.0, 400, "{}", unscoped.2);
+        assert!(unscoped.2.contains("non-empty scope"), "{}", unscoped.2);
+
+        // Above the cap is refused rather than clamped, so the requester
+        // finds out now instead of when the grant expires early.
+        let too_long = dispatch(
+            "POST",
+            "/admin/break-glass",
+            Some(r#"{"justification":"incident","scope":["c1"],"ttl_secs":99999}"#),
+        )
+        .unwrap();
+        assert_eq!(too_long.0, 400, "{}", too_long.2);
+        assert!(too_long.2.contains("max_ttl_secs"), "{}", too_long.2);
+
+        let unjustified = dispatch(
+            "POST",
+            "/admin/break-glass",
+            Some(r#"{"justification":"","scope":["c1"],"ttl_secs":600}"#),
+        )
+        .unwrap();
+        assert_eq!(unjustified.0, 400, "{}", unjustified.2);
+    }
+
+    /// Actions taken while a grant is active carry the grant id, so a
+    /// reviewer pulls the whole session by one key instead of correlating
+    /// timestamps against a window they have to reconstruct.
+    #[test]
+    fn an_action_under_an_active_grant_is_tagged_with_the_grant_id() {
+        let _g = crate::key_plane::test_plane_guard();
+        crate::break_glass::reset_for_test();
+        install_break_glass_plane(1, &["bob"]);
+
+        let _alice = crate::admin::set_current_admin_actor(Some((
+            "alice".to_string(),
+            sbproxy_config::types::AdminRole::Admin,
+        )));
+        let requested = dispatch(
+            "POST",
+            "/admin/break-glass",
+            Some(r#"{"justification":"incident 55","scope":["cred-x"],"ttl_secs":600}"#),
+        )
+        .unwrap();
+        let grant_id = parse(&requested)["grant"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let _bob = crate::admin::set_current_admin_actor(Some((
+            "bob".to_string(),
+            sbproxy_config::types::AdminRole::Admin,
+        )));
+        let approved = dispatch(
+            "POST",
+            &format!("/admin/break-glass/{grant_id}/approve"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(parse(&approved)["grant"]["state"], "active");
+
+        // Alice, holding the active grant, mints a key. The audit seam
+        // every key mutation funnels through tags it.
+        let _alice = crate::admin::set_current_admin_actor(Some((
+            "alice".to_string(),
+            sbproxy_config::types::AdminRole::Admin,
+        )));
+        let minted = dispatch("POST", "/admin/keys", Some(r#"{"name":"emergency"}"#)).unwrap();
+        assert_eq!(minted.0, 201, "{}", minted.2);
+
+        let listed = dispatch("GET", "/admin/break-glass", None).unwrap();
+        let body = parse(&listed);
+        let grant = body["grants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["id"] == grant_id.as_str())
+            .expect("the grant is listed");
+        assert_eq!(
+            grant["actions_taken"], 1,
+            "the mint taken under the grant is counted against it: {}",
+            listed.2
+        );
+    }
+
+    // --- WOR-2569: leased credentials ---
+
+    /// The seam: `lease` is refused for a provider whose platform cannot
+    /// mint short-lived credentials, and the refusal names the limitation.
+    ///
+    /// This is the acceptance line that matters most, because the failure
+    /// it prevents is silent. Accepting `lease` for OpenAI and reading the
+    /// reference once would produce a record that reads "leased" on the
+    /// admin view, never expires, and is exactly as static as the stored
+    /// secret it replaced. An operator would believe they had short-lived
+    /// upstream credentials and would not.
+    #[test]
+    fn leasing_is_refused_for_a_provider_that_cannot_mint_short_lived_credentials() {
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane();
+
+        let refused = dispatch(
+            "POST",
+            "/admin/credentials",
+            Some(
+                r#"{"id":"cred-openai-leased","name":"openai","provider":"openai",
+                    "lease":{"reference":"vault://aws/creds/x","platform":"aws",
+                             "lease_duration_secs":900}}"#,
+            ),
+        )
+        .unwrap();
+        assert_eq!(refused.0, 400, "{}", refused.2);
+        assert!(
+            refused.2.contains("no short-TTL issuance to lease against"),
+            "the refusal must name why, not just say no: {}",
+            refused.2
+        );
+
+        // A platform that does not exist is refused with the four that do.
+        let bad_platform = dispatch(
+            "POST",
+            "/admin/credentials",
+            Some(
+                r#"{"id":"cred-bad-platform","provider":"bedrock",
+                    "lease":{"reference":"vault://aws/creds/x","platform":"openai",
+                             "lease_duration_secs":900}}"#,
+            ),
+        )
+        .unwrap();
+        assert_eq!(bad_platform.0, 400, "{}", bad_platform.2);
+        assert!(
+            bad_platform.2.contains("aws, gcp, azure, or database"),
+            "{}",
+            bad_platform.2
+        );
+
+        // A zero lease is refused: it is the cache ceiling, and a zero
+        // ceiling would mean the material may never be served at all.
+        let zero = dispatch(
+            "POST",
+            "/admin/credentials",
+            Some(
+                r#"{"id":"cred-zero","provider":"bedrock",
+                    "lease":{"reference":"vault://aws/creds/x","platform":"aws",
+                             "lease_duration_secs":0}}"#,
+            ),
+        )
+        .unwrap();
+        assert_eq!(zero.0, 400, "{}", zero.2);
+    }
+
+    /// A leased credential stores nothing static, and the admin view says
+    /// so without ever naming material.
+    #[test]
+    fn a_leased_credential_reports_its_platform_and_lease_and_no_material() {
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane();
+
+        let created = dispatch(
+            "POST",
+            "/admin/credentials",
+            Some(
+                r#"{"id":"cred-bedrock","name":"bedrock-prod","provider":"bedrock",
+                    "lease":{"reference":"vault://aws/creds/sbproxy-bedrock","platform":"aws",
+                             "lease_duration_secs":900}}"#,
+            ),
+        )
+        .unwrap();
+        assert_eq!(created.0, 201, "{}", created.2);
+        let body = parse(&created);
+        assert_eq!(body["credential"]["storage"], "leased");
+        assert_eq!(body["credential"]["lease"]["platform"], "aws");
+        assert_eq!(body["credential"]["lease"]["lease_duration_secs"], 900);
+        // The mount reference is not a secret and an operator has to be
+        // able to read it to fix a typo; the leased material never appears
+        // because it is never stored.
+        assert_eq!(
+            body["credential"]["vault_ref"],
+            "vault://aws/creds/sbproxy-bedrock"
+        );
+
+        // Mixing lease with a stored secret is refused rather than one
+        // silently winning.
+        let mixed = dispatch(
+            "POST",
+            "/admin/credentials",
+            Some(
+                r#"{"id":"cred-mixed","provider":"bedrock","secret":"sk-static",
+                    "lease":{"reference":"vault://aws/creds/x","platform":"aws",
+                             "lease_duration_secs":900}}"#,
+            ),
+        )
+        .unwrap();
+        assert_eq!(mixed.0, 400, "{}", mixed.2);
+        assert!(mixed.2.contains("mutually exclusive"), "{}", mixed.2);
+        assert!(!mixed.2.contains("sk-static"), "{}", mixed.2);
     }
 }

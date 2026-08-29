@@ -7311,6 +7311,9 @@ origins:
                     "env:SBPROXY_TEST_LIFECYCLE_PEPPER_DOES_NOT_EXIST_ANYWHERE".to_string(),
                 ),
                 master_key: None,
+                allow_ephemeral_secrets: false,
+                root_of_trust: None,
+                rotation: Default::default(),
             },
             ..Default::default()
         }
@@ -7353,6 +7356,9 @@ origins:
             crypto: sbproxy_config::types::KeyCryptoConfig {
                 pepper: Some("pinned-pepper".to_string()),
                 master_key: None,
+                allow_ephemeral_secrets: false,
+                root_of_trust: None,
+                rotation: Default::default(),
             },
             ..Default::default()
         };
