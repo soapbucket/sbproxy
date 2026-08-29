@@ -64,8 +64,9 @@ impl OnnxCatBoostScorer {
         // Parse the protobuf, then translate it with no model directory in the
         // parsing context. `model_for_path` hands tract the model's own
         // directory, which is what GHSA-h668-6x6g-f8r5 resolves an
-        // attacker-chosen `external_data` `location` against: up to 0.21.17
-        // that resolution was `PathBuf::from(dir).join(location)` with no
+        // attacker-chosen `external_data` `location` against: up to and
+        // including 0.21.16 that resolution was
+        // `PathBuf::from(dir).join(location)` with no
         // containment check, so an absolute path or a `..` walk read any file
         // the proxy user can open. `model_for_proto_model` passes no
         // directory, which is the state ONNX reserves for "external data
