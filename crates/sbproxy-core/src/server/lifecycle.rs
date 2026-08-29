@@ -1876,9 +1876,17 @@ struct RevisionRecordingInput<'a> {
     /// misreport a git-sourced base as
     /// [`sbproxy_config::BaseOrigin::Local`].
     origin: sbproxy_config::BaseOrigin,
-    /// Who or what produced this revision: `"file_watcher"`,
-    /// `"config_authority"`, `"config_refresh_poller"`, an admin
-    /// operator id, or `"boot"`.
+    /// Who or what produced this revision.
+    ///
+    /// The whole vocabulary, because a partial list here is what let
+    /// `docs/config-rollback.md` document a value this field never
+    /// holds: `"file_watcher"`, `"config_authority"`,
+    /// `"config_refresh_poller"`, `"boot"`, `"boot_fallback"`,
+    /// `"auto_revert"`, `"rollback"` or `"rollback:<operator>"`, and
+    /// `"api"` or the authenticated operator's own id.
+    ///
+    /// Never empty. The CLI renders an absent field as `-`, which no
+    /// apply path produces.
     actor: &'a str,
 }
 
