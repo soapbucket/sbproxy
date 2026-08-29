@@ -231,12 +231,13 @@ impl RootOfTrust for CustomerManagedRoot {
     }
 
     // The five below are why this impl block exists in the shape it does.
-    // They are not defaults worth inheriting: the trait's defaults answer
-    // "no liveness story", and every runtime caller holds an
-    // `Arc<dyn RootOfTrust>`, so an inherent method with the same name is
-    // invisible to all of them. Leaving these off the trait is what made
-    // the background probe a no-op, the cache un-purgeable, and the admin
-    // surface report a healthy root as never-probed.
+    // Every runtime caller holds an `Arc<dyn RootOfTrust>`, so an inherent
+    // method with the same name is invisible to all of them. Leaving these
+    // off the trait is what made the background probe a no-op, the cache
+    // un-purgeable, and the admin surface report a healthy root as
+    // never-probed. The trait carried defaults then, which is what let that
+    // happen quietly; it has none now, so the same slip is a compile error
+    // rather than a wrong number on an operator's screen.
 
     async fn probe_liveness(&self) -> Result<()> {
         let client = self.client.clone();
