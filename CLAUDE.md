@@ -114,7 +114,8 @@ It reads as a clean diff, which is why it kept happening. The stolen
 lines are unchanged context, and the review sees a new item with a doc
 comment above it, which is what a new item is supposed to look like.
 Twenty-one of these are in the last 260 merges and sixteen were still
-live when the guard was written. One had moved the rustdoc explaining why
+live when the guard was written; a seventeenth arrived from main while
+the guard was in review, and the guard caught it the moment main moved. One had moved the rustdoc explaining why
 a stack-budget test runs on a worker-sized thread onto a `size_of` probe
 that runs no dispatch at all, on the exact path that was overflowing its
 stack a day later. Another took `#[cfg(unix)]` off a test that shells out

@@ -12,7 +12,9 @@ green, and the review sees a new item with a doc comment above it, which
 is what a new item is supposed to look like.
 
 Twenty-one are in the last 260 first-parent merges, one every twelve, and
-sixteen were still live when this was written. Two of them:
+sixteen were still live when this was written; a seventeenth arrived from
+main at `9a6c2b3e2` while the guard was in review, and is repaired with
+them. Two of them:
 
     cf77910e9  crates/sbproxy-core/src/server/ai_dispatch.rs
 
@@ -1153,6 +1155,30 @@ def self_test() -> int:
         failures.append("an item did not consume its attribute block")
     if block_open_at(['let s = "a string with #[test] inside";'], 1) is not False:
         failures.append("an attribute inside a string literal opened a block")
+
+    # --- `locate_owner`'s window. --------------------------------------
+    # The predicted index is exact for a pure insertion, so every other
+    # fixture here hits it and none of them reaches the window. That is
+    # what let the window be narrowed to nothing with the self-test still
+    # green: `None` means report, so shrinking it fails loud rather than
+    # silently, but a behavior the docstring advertises and no fixture
+    # exercises is an untested claim, which is the thing this file exists
+    # to refuse. These land the victim's head off the prediction, both
+    # ways and at the stated edge.
+    owner_head = "fn victim() {}"
+    if locate_owner([owner_head], 0, owner_head) != 0:
+        failures.append("locate_owner missed the victim at the predicted index")
+    for shift in (1, 5):
+        below = ["filler"] * shift + [owner_head]
+        if locate_owner(below, 0, owner_head) != shift:
+            failures.append(f"locate_owner missed a victim {shift} line(s) below the prediction")
+        above = [owner_head] + ["filler"] * shift
+        if locate_owner(above, shift, owner_head) != 0:
+            failures.append(f"locate_owner missed a victim {shift} line(s) above the prediction")
+    if locate_owner(["filler"] * 6 + [owner_head], 0, owner_head) is not None:
+        failures.append("locate_owner reached past the plus-or-minus-five window it advertises")
+    if locate_owner([], 0, owner_head) is not None:
+        failures.append("locate_owner found a victim in an empty post-image")
 
     for failure in failures:
         print(f"self-test: {failure}", file=sys.stderr)

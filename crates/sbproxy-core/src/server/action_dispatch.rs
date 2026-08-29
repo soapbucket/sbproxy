@@ -11023,22 +11023,6 @@ mod mcp_scope_enforcement_tests {
     }
 }
 
-/// Map an upstream failure without reflecting untrusted detail to a modern
-/// caller. The legacy branch deliberately retains its frozen wire message.
-///
-/// WOR-2587 review: an `McpPolicyHook` deny/confirm collapses into a
-/// generic `anyhow::Error` at the `McpFederation` call-tool seam (see
-/// [`sbproxy_extension::mcp::McpPolicyDeniedError`]'s own doc
-/// comment). Recovering the structured JSON-RPC code and the
-/// operator-authored deny/confirm reason here, for both protocol eras,
-/// is what closes that gap: a policy hook refusing a call is a
-/// deterministic decision about the request, not a server fault, so it
-/// gets the same `-32602 INVALID_PARAMS` code `action_dispatch`'s own
-/// RBAC deny path uses instead of falling through to a blanket
-/// `-32603 INTERNAL_ERROR`, and a modern-protocol caller gets the same
-/// human-readable reason (including an `@confirm` annotation's text)
-/// the legacy era's frozen `{legacy_context}: {error}` formatting
-/// already happened to retain.
 fn mcp_approval_pending_response(
     id: Option<serde_json::Value>,
     hold_id: &str,
@@ -11104,6 +11088,22 @@ fn mcp_notify_approval_webhook(
     });
 }
 
+/// Map an upstream failure without reflecting untrusted detail to a modern
+/// caller. The legacy branch deliberately retains its frozen wire message.
+///
+/// WOR-2587 review: an `McpPolicyHook` deny/confirm collapses into a
+/// generic `anyhow::Error` at the `McpFederation` call-tool seam (see
+/// [`sbproxy_extension::mcp::McpPolicyDeniedError`]'s own doc
+/// comment). Recovering the structured JSON-RPC code and the
+/// operator-authored deny/confirm reason here, for both protocol eras,
+/// is what closes that gap: a policy hook refusing a call is a
+/// deterministic decision about the request, not a server fault, so it
+/// gets the same `-32602 INVALID_PARAMS` code `action_dispatch`'s own
+/// RBAC deny path uses instead of falling through to a blanket
+/// `-32603 INTERNAL_ERROR`, and a modern-protocol caller gets the same
+/// human-readable reason (including an `@confirm` annotation's text)
+/// the legacy era's frozen `{legacy_context}: {error}` formatting
+/// already happened to retain.
 fn mcp_upstream_failure_response(
     id: Option<serde_json::Value>,
     is_modern: bool,

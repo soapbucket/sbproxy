@@ -213,7 +213,7 @@ between the block and its owner and the block moves onto the newcomer, which kee
 loses its meaning. The stolen lines are unchanged context in the diff, so the review sees a new
 item with a doc comment above it, which is exactly what a new item should look like. Sixteen of
 these were live on main when `scripts/check-attribute-theft.py` was written, out of twenty-one in
-the last 260 merges. Two of the sixteen were triaged as having healed on their own and had not;
+the last 260 merges, and a seventeenth arrived from main while the guard was in review. Two of the sixteen were triaged as having healed on their own and had not;
 read both sides of the file before you write that word. Put a new item at a `}` boundary, not after a doc comment, and when you do
 land next to one, read the doc comment above your insertion and ask whose it is.
 

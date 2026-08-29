@@ -664,7 +664,8 @@ jobs:
       # diff, so the review sees a new item with a doc comment above it,
       # which is what a new item is supposed to look like. Twenty-one of
       # these are in the last 260 merges and sixteen were still live
-      # when this guard was written. One had moved the rustdoc that
+      # when this guard was written, and a seventeenth arrived from main
+      # while the guard was in review. One had moved the rustdoc that
       # explains why a stack-budget test runs on a worker-sized thread
       # onto a `size_of` probe that runs no dispatch at all; another took
       # `#[cfg(unix)]` off a test that shells out to `/bin/kill`, while
