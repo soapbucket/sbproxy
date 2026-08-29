@@ -33,6 +33,8 @@ const nav = [
   { to: "/users", label: "users" },
   { to: "/operators", label: "operators" },
   { to: "/cluster", label: "cluster" },
+  { to: "/federation", label: "federation" },
+  { to: "/licensing", label: "licensing" },
 ];
 </script>
 

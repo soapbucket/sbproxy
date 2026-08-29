@@ -160,6 +160,18 @@ const routes = [
     meta: { title: "Audit", documentation: "audit-log" },
   },
   {
+    path: "/federation",
+    name: "federation",
+    component: () => import("./views/FederationView.vue"),
+    meta: { title: "Federation", documentation: "federation" },
+  },
+  {
+    path: "/licensing",
+    name: "licensing",
+    component: () => import("./views/LicensingView.vue"),
+    meta: { title: "Licensing", documentation: "comp-marketplace" },
+  },
+  {
     path: "/cluster",
     name: "cluster",
     component: () => import("./views/ClusterView.vue"),

@@ -1,0 +1,4 @@
+{
+  "type": "added",
+  "message": "Admin console: Federation and Licensing pages, backed by the existing `GET /admin/federation` and `GET /admin/licensing` routes."
+}
