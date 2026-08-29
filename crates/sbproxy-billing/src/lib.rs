@@ -123,9 +123,10 @@ pub use error::BillingError;
 pub use money::{CurrencyCode, Money};
 pub use types::{
     derive_attempt_id, derive_intent_id, derive_receipt_key, provider_idempotency_key,
-    AdvertisedRail, AttemptOperation, AttemptStatus, FailureCategory, IntentStatus, PaymentProof,
-    PaymentProtocol, PaymentRequirement, PaymentRequirementDraft, RecoveryEnvelopeRecord,
-    RequirementTerms, SafeFailure, SettlementRail, SettlementReceipt, SignedPaymentRequirement,
+    x402_facilitator_payer_hash, AdvertisedRail, AttemptOperation, AttemptStatus, FailureCategory,
+    IntentStatus, PaymentProof, PaymentProtocol, PaymentRequirement, PaymentRequirementDraft,
+    RecoveryEnvelopeRecord, RequirementTerms, SafeFailure, SettlementRail, SettlementReceipt,
+    SignedPaymentRequirement,
 };
 
 #[cfg(feature = "runtime")]

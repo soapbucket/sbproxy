@@ -164,6 +164,17 @@ impl FacilitatorTransport for RecordingFacilitator {
 struct RecordingGate {
     stamps: Arc<AtomicUsize>,
     delay_ms: u64,
+    attributed: Arc<AtomicUsize>,
+}
+
+impl RecordingGate {
+    fn new(stamps: Arc<AtomicUsize>, delay_ms: u64) -> Self {
+        Self {
+            stamps,
+            delay_ms,
+            attributed: Arc::new(AtomicUsize::new(0)),
+        }
+    }
 }
 
 struct LifecycleGate {
@@ -225,6 +236,19 @@ impl SettleDispatchGate for RecordingGate {
             tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
         }
         self.stamps.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn attribute_facilitator_payer(
+        &self,
+        _intent_id: &str,
+        payer: &str,
+    ) -> Result<(), BillingError> {
+        assert!(
+            !payer.is_empty(),
+            "the settler must not attribute an empty facilitator payer"
+        );
+        self.attributed.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -555,6 +579,7 @@ async fn verify_then_settle_commits_a_receipt_from_real_values() {
     let required = frozen_required();
     let payload = frozen_payload();
 
+    let gate = RecordingGate::new(stamps.clone(), 0);
     let settlement = settler
         .authorize_and_settle(
             X402AuthorizationRequest {
@@ -562,10 +587,7 @@ async fn verify_then_settle_commits_a_receipt_from_real_values() {
                 payload: &payload,
                 now_ms: 1_800_000_000_000,
             },
-            &RecordingGate {
-                stamps: stamps.clone(),
-                delay_ms: 0,
-            },
+            &gate,
         )
         .await
         .expect("a verified and settled payment authorizes");
@@ -593,6 +615,11 @@ async fn verify_then_settle_commits_a_receipt_from_real_values() {
         ]
     );
     assert_eq!(stamps.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        gate.attributed.load(Ordering::SeqCst),
+        1,
+        "verify must persist the hashed facilitator payer before settle"
+    );
 }
 
 #[tokio::test]
@@ -958,10 +985,7 @@ async fn a_verify_rejection_never_prepares_or_calls_settle() {
                     payload: &payload,
                     now_ms: 1_800_000_000_000,
                 },
-                &RecordingGate {
-                    stamps: stamps.clone(),
-                    delay_ms: 0,
-                },
+                &RecordingGate::new(stamps.clone(), 0),
             )
             .await,
         "an invalid payment must not authorize",
@@ -994,10 +1018,7 @@ async fn a_settle_without_an_authoritative_success_does_not_authorize() {
                     payload: &payload,
                     now_ms: 1_800_000_000_000,
                 },
-                &RecordingGate {
-                    stamps: Arc::new(AtomicUsize::new(0)),
-                    delay_ms: 0,
-                },
+                &RecordingGate::new(Arc::new(AtomicUsize::new(0)), 0),
             )
             .await,
         "an ambiguous settle must not authorize",
@@ -1026,10 +1047,7 @@ async fn an_authoritative_settle_failure_is_terminal_not_ambiguous() {
                     payload: &payload,
                     now_ms: 1_800_000_000_000,
                 },
-                &RecordingGate {
-                    stamps: Arc::new(AtomicUsize::new(0)),
-                    delay_ms: 0,
-                },
+                &RecordingGate::new(Arc::new(AtomicUsize::new(0)), 0),
             )
             .await,
         "an authoritative settle failure must not authorize",
@@ -1063,10 +1081,7 @@ async fn settle_answered(status: u16, fixture: &str) -> (BillingError, usize, us
                     payload: &payload,
                     now_ms: 1_800_000_000_000,
                 },
-                &RecordingGate {
-                    stamps: stamps.clone(),
-                    delay_ms: 0,
-                },
+                &RecordingGate::new(stamps.clone(), 0),
             )
             .await,
         "a settle outside 2xx must not authorize",
@@ -1151,10 +1166,7 @@ async fn connection_loss_after_settle_dispatch_needs_reconciliation() {
                     payload: &payload,
                     now_ms: 1_800_000_000_000,
                 },
-                &RecordingGate {
-                    stamps: stamps.clone(),
-                    delay_ms: 0,
-                },
+                &RecordingGate::new(stamps.clone(), 0),
             )
             .await,
         "a lost connection after dispatch must not authorize",
@@ -1189,10 +1201,7 @@ async fn a_verify_timeout_fails_closed_before_any_dispatch() {
                     payload: &payload,
                     now_ms: 1_800_000_000_000,
                 },
-                &RecordingGate {
-                    stamps: stamps.clone(),
-                    delay_ms: 0,
-                },
+                &RecordingGate::new(stamps.clone(), 0),
             )
             .await,
         "a verify timeout must not authorize",
@@ -1223,10 +1232,7 @@ async fn blowing_the_total_deadline_after_dispatch_needs_reconciliation() {
                     payload: &payload,
                     now_ms: 1_800_000_000_000,
                 },
-                &RecordingGate {
-                    stamps: Arc::new(AtomicUsize::new(0)),
-                    delay_ms: TOTAL_MS * 4,
-                },
+                &RecordingGate::new(Arc::new(AtomicUsize::new(0)), TOTAL_MS * 4),
             )
             .await,
         "a blown total deadline must not authorize",
@@ -1259,10 +1265,7 @@ async fn an_open_breaker_returns_immediately_with_no_call() {
                     payload: &payload,
                     now_ms: 1_800_000_000_000,
                 },
-                &RecordingGate {
-                    stamps: Arc::new(AtomicUsize::new(0)),
-                    delay_ms: 0,
-                },
+                &RecordingGate::new(Arc::new(AtomicUsize::new(0)), 0),
             )
             .await,
         "an open breaker must not authorize",
@@ -1279,10 +1282,7 @@ async fn an_open_breaker_returns_immediately_with_no_call() {
                 payload: &payload,
                 now_ms: 1_800_000_000_100,
             },
-            &RecordingGate {
-                stamps: Arc::new(AtomicUsize::new(0)),
-                delay_ms: 0,
-            },
+            &RecordingGate::new(Arc::new(AtomicUsize::new(0)), 0),
         )
         .await
         .expect("the half-open probe is admitted");
@@ -1313,10 +1313,7 @@ async fn a_mismatched_payload_never_reaches_the_facilitator() {
                     payload: &payload,
                     now_ms: 1_800_000_000_000,
                 },
-                &RecordingGate {
-                    stamps: Arc::new(AtomicUsize::new(0)),
-                    delay_ms: 0,
-                },
+                &RecordingGate::new(Arc::new(AtomicUsize::new(0)), 0),
             )
             .await,
         "a cheaper obligation must not reach the facilitator",

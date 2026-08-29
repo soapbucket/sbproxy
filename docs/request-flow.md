@@ -1,6 +1,6 @@
 # Request flow
 
-*Last modified: 2026-08-25*
+*Last modified: 2026-08-28*
 
 Every request SBproxy accepts runs through one pipeline, implemented as a
 sequence of Pingora `ProxyHttp` callbacks: `request_filter`,
@@ -172,7 +172,9 @@ The actual origin call branches by traffic type:
   Guardrail mesh hooks (`ai_guardrail_input`, `ai_guardrail_output`) and
   `ai_tool_call` can each return `release`, `flag`, `block`, or (where the
   manifest declares `execution.mutates: true`) `mutate` to rewrite the
-  content in place before the next hook runs. Output and tool-call hooks
+  content in place before the next hook runs. An inspect-only input hook
+  may set `execution.mode: parallel` to run alongside the upstream call
+  and cancel it on reject. Output and tool-call hooks
   run on both buffered and streamed completions. A streamed `mutate` that
   cannot be written back as the client's wire shape is refused rather than
   shipping the original. See [ai-gateway.md](ai-gateway.md),

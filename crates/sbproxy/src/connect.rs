@@ -1560,9 +1560,10 @@ fn client_notes(client: Client) -> String {
             "    run it as: codex --profile {PROVIDER_NAME}\n\
              \x20   credential: Codex reads ${CODEX_ENV_KEY}. This verb writes the variable's \
              name, never its value.\n\
-             \x20   note: Codex only accepts wire_api = \"{CODEX_WIRE_API}\". The gateway serves \
-             stateless /v1/responses and refuses a request carrying previous_response_id, \
-             conversation, or store: true with a 400 naming the field.\n"
+             \x20   note: Codex only accepts wire_api = \"{CODEX_WIRE_API}\". A first turn that \
+             resends the full conversation in input works. Compact, resume, and any follow-up \
+             that sends previous_response_id, conversation, or store: true get a 400 naming \
+             the field; the gateway does not hold server-side Responses state.\n"
         ),
         Client::ClaudeCode => "    credential: Claude Code reads $ANTHROPIC_AUTH_TOKEN. This \
              verb writes the variable's name, never its value.\n"
@@ -1686,6 +1687,27 @@ base_url = "https://example.invalid/v1"
             "{rendered}"
         );
         assert!(rendered.contains(r#"wire_api = "responses""#), "{rendered}");
+    }
+
+    #[test]
+    fn client_notes_name_the_codex_flows_that_400() {
+        // WOR-2659 option 1: keep the stateful-Responses refusal, and say
+        // on the connect page which Codex flows hit it.
+        let notes = client_notes(Client::Codex);
+        assert!(
+            notes.contains("Compact") && notes.contains("resume"),
+            "the note has to name the flows, not only the fields:\n{notes}"
+        );
+        assert!(
+            notes.contains("previous_response_id")
+                && notes.contains("conversation")
+                && notes.contains("store: true"),
+            "{notes}"
+        );
+        assert!(
+            notes.contains("resends the full conversation in input works"),
+            "{notes}"
+        );
     }
 
     #[test]

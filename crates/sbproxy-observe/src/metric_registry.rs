@@ -1070,6 +1070,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_ai_parallel_moderation_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_ai_parallel_moderation"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["outcome"],
+        description: "Inspect-only input hooks that ran alongside the upstream call, by allow, block, cancelled_upstream, or refused.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_ai_safety_guardrail_verdicts_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_safety_guardrail_verdict"),
@@ -1482,7 +1493,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["provider", "outcome"],
-        description: "AI provider attempts during failover/selection, by provider and outcome.",
+        description: "AI provider attempts during failover/selection, by provider and outcome (`success`, `error`, `client_disconnected`, `moderation_cancelled`).",
         dead_reason: None,
     },
     MetricCapability {
@@ -5367,7 +5378,7 @@ pub fn run_scoped_label_gaps(
 pub fn render_markdown() -> String {
     let mut out = String::from(
         "# Metrics stability\n\
-         *Last modified: 2026-08-26*\n\n\
+         *Last modified: 2026-08-28*\n\n\
          *Generated from the executable metric registry. Do not hand-edit; run \
          `cargo run -q -p sbproxy-observe --bin generate-metrics-stability > \
          docs/metrics-stability.md`.*\n\n\
