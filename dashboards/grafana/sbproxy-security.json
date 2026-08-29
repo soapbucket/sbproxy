@@ -1259,13 +1259,103 @@
     },
     {
       "id": 20,
+      "title": "MCP grant expiry",
+      "type": "timeseries",
+      "description": "Time-boxed MCP RBAC grants that elapsed, by tenant and policy. A rise means reviewed access is still being used after its window closed, and the matching tools/call is being refused until an operator renews it.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 88
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(sbproxy_mcp_grant_expired_total[5m])",
+          "legendFormat": "{{tenant}} / {{policy}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "min": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 21,
+      "title": "MCP approval holds",
+      "type": "timeseries",
+      "description": "High-risk MCP tool calls parked for an operator, by tenant. The caller's connection is not held open; a retry after approve consumes the snapshot once.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 88
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(sbproxy_mcp_approval_hold_total[5m])",
+          "legendFormat": "{{tenant}} / {{outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "min": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 22,
       "title": "GeoIP Lookups",
       "type": "timeseries",
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 12,
-        "y": 80
+        "x": 0,
+        "y": 96
       },
       "datasource": {
         "type": "prometheus",
@@ -1312,14 +1402,14 @@
       "description": "Measures geoip policy lookups by outcome (hit, miss, no_database, no_client_ip). Runbook: docs/request-enrichment.md. A rising no_database share means the origin has geoip configured with no reachable MMDB."
     },
     {
-      "id": 21,
+      "id": 23,
       "title": "User-Agent Headless Detections",
       "type": "timeseries",
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 0,
-        "y": 88
+        "x": 12,
+        "y": 96
       },
       "datasource": {
         "type": "prometheus",

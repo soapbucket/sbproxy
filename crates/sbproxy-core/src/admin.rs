@@ -6267,6 +6267,12 @@ pub fn handle_admin_request(
     if let Some(response) = crate::admin_mcp_oauth::dispatch(method, path) {
         return response;
     }
+    // WOR-2386 / WOR-2454: time-boxed grant ledger and snapshot-bound
+    // approval holds. JSON routes are the operator surface; a console
+    // page is deferred.
+    if let Some(response) = crate::admin_mcp_grants::dispatch(method, path, body) {
+        return response;
+    }
 
     // Classifier cache and bounded unavailable-stage health. This is kept
     // behind the operator-auth gate because configured origin identifiers and

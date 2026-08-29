@@ -979,6 +979,18 @@ const HOST_FILE_KEYS: &[HostFileKey] = &[
         remedy: "leave the lockfile path to the layer this node owns",
         host_path_value: None,
     },
+    HostFileKey {
+        scope: KeyScope::Under("grant_ledger"),
+        key: "path",
+        remedy: "leave the grant ledger file to the layer this node owns",
+        host_path_value: None,
+    },
+    HostFileKey {
+        scope: KeyScope::Under("approval"),
+        key: "store",
+        remedy: "leave the approval store file to the layer this node owns",
+        host_path_value: None,
+    },
     // --- model, tokenizer and rule-pack weights -----------------------
     HostFileKey {
         scope: KeyScope::Anywhere,
@@ -2956,6 +2968,14 @@ mod tests {
         (
             "tool_versioning.lockfile",
             "origins:\n  api:\n    action:\n      type: mcp\n      tool_versioning:\n        lockfile: /etc/sbproxy/mcp.lock\n",
+        ),
+        (
+            "grant_ledger.path",
+            "origins:\n  api:\n    action:\n      type: mcp\n      grant_ledger:\n        path: /etc/sbproxy/mcp-grants.json\n      federated_servers:\n        - origin: upstream\n",
+        ),
+        (
+            "approval.store",
+            "origins:\n  api:\n    action:\n      type: mcp\n      approval:\n        store: /etc/sbproxy/mcp-approvals.json\n      federated_servers:\n        - origin: upstream\n",
         ),
         (
             "model_path",

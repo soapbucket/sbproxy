@@ -1,6 +1,6 @@
 # MCP security
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-28*
 
 For a row-by-row scorecard against the OWASP MCP Top 10, coverage stated
 plainly as full, partial, or out of gateway scope, see
@@ -138,6 +138,23 @@ whole origin, and per-tool quotas cap how often any of it can be called.
 
 A call past the window returns JSON-RPC error `-32099` rather than reaching the
 upstream. A tool outside the allowlist is not advertised and not callable.
+
+A reviewed grant can also expire. Set `ttl` on a `tool_access[]` row and
+`grant_ledger.path` so a restart cannot silently extend the window. After `ttl`
+elapses the matching `tools/call` is refused with JSON-RPC `-32098` until
+`POST /api/mcp/grants/renew`.
+
+High-risk tools can require a human at the gateway (not MCP elicitation).
+`approval.store` plus `approval.tools[]` (prefer `digest`) parks the call,
+returns `-32097` immediately, and resumes once on a retry after
+`POST /api/mcp/approvals/{id}/approve`. Approvals bind to the tool contract and
+canonical arguments, so a rename does not consume another tool's decision.
+TrueFoundry is the surveyed SOTA for this gate. A console page is deferred.
+
+A reviewed grant can also expire. Set `ttl` on a `tool_access[]` row and
+`grant_ledger.path` so the window survives a restart. After the ttl elapses
+the matching `tools/call` is refused with JSON-RPC `-32098` until
+`POST /api/mcp/grants/renew`.
 
 **Still yours.** Deciding what the right scope is. The gateway enforces the
 list you write; it has no opinion about whether `gh.delete_repo` belongs on it.

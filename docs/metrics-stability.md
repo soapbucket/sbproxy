@@ -331,6 +331,8 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_mcp_tool_quota_registry_saturated_total` | Counter | `stable` | `beta` | none | MCP tools/call refused because the per-tool quota store was at capacity, globally or for the caller's tenant. |
 | `sbproxy_mcp_content_filter_total` | Counter | `stable` | `beta` | `tenant`, `category`, `verdict` | MCP content-filter (secrets/pii) triggers, by tenant, category, and verdict. |
 | `sbproxy_mcp_result_policy_total` | Counter | `stable` | `beta` | `tenant`, `rule`, `verdict` | MCP result-policy rule triggers, by tenant, rule name, and verdict. |
+| `sbproxy_mcp_grant_expired_total` | Counter | `stable` | `beta` | `tenant`, `policy` | MCP tools/call refused because a time-boxed RBAC grant elapsed, by tenant and policy. |
+| `sbproxy_mcp_approval_hold_total` | Counter | `stable` | `beta` | `tenant`, `outcome` | MCP tools/call parked for operator approval, by tenant and outcome. |
 | `sbproxy_mcp_tool_cost_usd_total` | Counter | `stable` | `beta` | `tool`, `server` | MCP tool-call cost in USD, by tool and owning server. |
 | `sbproxy_mcp_tool_dispatch_duration_seconds` | Histogram | `stable` | `beta` | `tool` | MCP tool dispatch duration, by tool name. |
 | `sbproxy_mcp_tool_dispatch_total` | Counter | `stable` | `beta` | `tool`, `result` | MCP tool dispatch attempts, by tool name and outcome. |

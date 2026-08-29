@@ -6675,6 +6675,56 @@ pub fn record_mcp_result_policy(tenant: &str, rule: &str, verdict: &'static str)
         .inc();
 }
 
+/// Record one time-boxed MCP RBAC grant that elapsed
+/// (`sbproxy_mcp_grant_expired_total{tenant, policy}`, WOR-2386).
+/// `policy` is the `rbac_policies` label, so cardinality is bounded by
+/// config. Registration failure yields no counter rather than a
+/// panic, matching [`record_fallback_served`].
+pub fn record_mcp_grant_expired(tenant: &str, policy: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_mcp_grant_expired_total",
+            "MCP tools/call refused because a time-boxed RBAC grant elapsed, by tenant and policy",
+            &["tenant", "policy"],
+        )
+        .ok()
+    });
+    if let Some(counter) = counter {
+        let tenant = sanitize_label("tenant", tenant);
+        let policy = sanitize_label("policy", policy);
+        counter
+            .with_label_values(&[tenant.as_str(), policy.as_str()])
+            .inc();
+    }
+}
+
+/// Record one gateway-originated MCP approval hold
+/// (`sbproxy_mcp_approval_hold_total{tenant, outcome}`, WOR-2454).
+/// `outcome` is a closed set: `held` when a call is parked for an
+/// operator, `saturated` when the hold table refused a new row.
+/// Registration failure yields no counter rather than a
+/// panic, matching [`record_fallback_served`].
+pub fn record_mcp_approval_hold(tenant: &str, outcome: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_mcp_approval_hold_total",
+            "MCP tools/call parked for operator approval, by tenant and outcome",
+            &["tenant", "outcome"],
+        )
+        .ok()
+    });
+    if let Some(counter) = counter {
+        let tenant = sanitize_label("tenant", tenant);
+        counter.with_label_values(&[tenant.as_str(), outcome]).inc();
+    }
+}
+
 /// Record one session-flow enforcement outcome that was not a plain
 /// allow, on `sbproxy_mcp_flow_total{tenant, rule, verdict}` (WOR-2384,
 /// MCP06; fix round 1 added the confidentiality-axis and pair-rule
@@ -9685,6 +9735,34 @@ mod tests {
             }),
             "sbproxy_mcp_argument_policy_total did not register or did not carry \
              the tenant/rule/verdict labels: {counted:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_grant_expired_is_counted_with_tenant_and_policy_labels() {
+        record_mcp_grant_expired("acme", "analyst");
+
+        let counted = gathered_series("sbproxy_mcp_grant_expired_total");
+        assert!(
+            counted.iter().any(|(labels, value)| {
+                labels.contains("tenant=acme") && labels.contains("policy=analyst") && *value >= 1.0
+            }),
+            "sbproxy_mcp_grant_expired_total did not register or did not carry \
+             the tenant/policy labels: {counted:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_approval_hold_is_counted_with_tenant_and_outcome_labels() {
+        record_mcp_approval_hold("acme", "held");
+
+        let counted = gathered_series("sbproxy_mcp_approval_hold_total");
+        assert!(
+            counted.iter().any(|(labels, value)| {
+                labels.contains("tenant=acme") && labels.contains("outcome=held") && *value >= 1.0
+            }),
+            "sbproxy_mcp_approval_hold_total did not register or did not carry \
+             the tenant/outcome labels: {counted:?}"
         );
     }
 
