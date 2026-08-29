@@ -69,6 +69,11 @@ origins:
         enabled: true
         ttl: "30m"
 
+      # Time-boxed grants (WOR-2386). 720h is long enough that the
+      # walkthrough below still works; renew via POST /api/mcp/grants/renew.
+      grant_ledger:
+        path: /tmp/sbproxy-mcp-governance-grants.json
+
       # Default-deny. `analyst` can call the two tools this
       # walkthrough drives on purpose; `reports.echo` is left off the
       # allowed list so the RBAC-denied test call has something real
@@ -81,6 +86,7 @@ origins:
               allowed:
                 - "reports.hello"
                 - "crm.echo"
+              ttl: "720h"
           tool_quotas:
             - tool_name: "reports.hello"
               principals: []

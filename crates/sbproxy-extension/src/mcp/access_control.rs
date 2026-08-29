@@ -130,6 +130,14 @@ pub struct ToolAccessRule {
     /// is "deny all" per WOR-1066, NOT "allow all".
     #[serde(default)]
     pub allowed: Vec<String>,
+    /// Optional grant lifetime (WOR-2386). Same duration strings as
+    /// `tool_quotas[].rate.per` (`30s`, `15m`, `24h`, `7d`). Sub-second
+    /// values are accepted at parse and stored as a 1s floor: the
+    /// ledger's clock is unix seconds. Absent means the grant does not
+    /// expire. A rule with `ttl` requires `grant_ledger.path` on the
+    /// MCP action so a restart cannot silently extend the window.
+    #[serde(default)]
+    pub ttl: Option<String>,
 }
 
 /// Policy controlling which MCP tools each principal may invoke.
@@ -164,6 +172,10 @@ pub enum ToolAccessDecision {
     /// The principal is denied. The caller should return a JSON-RPC
     /// error and the upstream must not be contacted.
     Deny,
+    /// The matching rule's `ttl` has elapsed since last renewal
+    /// (WOR-2386). Same wire effect as [`Self::Deny`], with a distinct
+    /// reason so an operator can renew rather than edit YAML.
+    Expired,
 }
 
 impl ToolAccessPolicy {
@@ -203,6 +215,103 @@ impl ToolAccessPolicy {
         } else {
             ToolAccessDecision::Deny
         }
+    }
+
+    /// RBAC check that also applies a time-boxed grant (WOR-2386).
+    ///
+    /// A matching allow with no `ttl` is [`ToolAccessDecision::Allow`].
+    /// A matching allow with `ttl` consults `ledger`; an elapsed or
+    /// saturated window is [`ToolAccessDecision::Expired`].
+    pub fn check_with_ledger(
+        &self,
+        principal: &Principal,
+        tool: &str,
+        policy_label: &str,
+        origin: &str,
+        ledger: &crate::mcp::grant_ledger::GrantLedger,
+        now: std::time::SystemTime,
+    ) -> ToolAccessDecision {
+        use crate::mcp::grant_ledger::{GrantKey, GrantStatus};
+        for rule in &self.tool_access {
+            let matches_principal =
+                rule.principals.is_empty() || rule.principals.iter().any(|s| s.matches(principal));
+            if !matches_principal {
+                continue;
+            }
+            if rule.allowed.iter().any(|t| t == "*" || t == tool) {
+                let Some(ttl) = rule.ttl.as_deref() else {
+                    return ToolAccessDecision::Allow;
+                };
+                let ttl = match parse_quota_window(ttl) {
+                    Ok(ttl) => ttl,
+                    Err(_) => return ToolAccessDecision::Expired,
+                };
+                let key = GrantKey {
+                    origin: origin.to_string(),
+                    policy: policy_label.to_string(),
+                    tool: tool.to_string(),
+                    principal_id: principal_id_for(principal),
+                    tenant_id: principal.tenant_id.as_str().to_string(),
+                };
+                return match ledger.observe(&key, ttl, now) {
+                    GrantStatus::Active { .. } => ToolAccessDecision::Allow,
+                    GrantStatus::Expired { .. } | GrantStatus::Saturated => {
+                        ToolAccessDecision::Expired
+                    }
+                };
+            }
+            return ToolAccessDecision::Deny;
+        }
+        if self.default_allow {
+            ToolAccessDecision::Allow
+        } else {
+            ToolAccessDecision::Deny
+        }
+    }
+
+    /// True when any rule carries a `ttl`.
+    pub fn has_time_boxed_grants(&self) -> bool {
+        self.tool_access.iter().any(|rule| rule.ttl.is_some())
+    }
+
+    /// Configured grant lifetime for `tool`. Exact tool-name matches
+    /// beat a `*` rule. Rules with no `ttl` are skipped so a catch-all
+    /// without a window cannot hide a later time-boxed grant.
+    pub fn matching_grant_ttl(
+        &self,
+        principal: Option<&Principal>,
+        tool: &str,
+    ) -> Option<std::time::Duration> {
+        let mut star = None;
+        for rule in &self.tool_access {
+            let matches_principal = match principal {
+                None => true,
+                Some(principal) => {
+                    rule.principals.is_empty()
+                        || rule.principals.iter().any(|s| s.matches(principal))
+                }
+            };
+            if !matches_principal {
+                continue;
+            }
+            if !rule.allowed.iter().any(|t| t == "*" || t == tool) {
+                continue;
+            }
+            let Some(ttl) = rule
+                .ttl
+                .as_deref()
+                .and_then(|ttl| parse_quota_window(ttl).ok())
+            else {
+                continue;
+            };
+            if rule.allowed.iter().any(|t| t == tool) {
+                return Some(ttl);
+            }
+            if star.is_none() && rule.allowed.iter().any(|t| t == "*") {
+                star = Some(ttl);
+            }
+        }
+        star
     }
 
     /// Filter the given list of tool names down to the ones the
@@ -248,6 +357,27 @@ impl ToolAccessPolicy {
                      ({error}); accepted suffixes are ms, s, m, h, d \
                      (for example 30s, 15m, 24h, 7d)",
                     rule.tool_name, rule.rate.per
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Check that every `tool_access[].ttl` in this policy parses.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the offending rule.
+    pub fn validate_grant_ttls(&self) -> Result<(), String> {
+        for (index, rule) in self.tool_access.iter().enumerate() {
+            let Some(ttl) = rule.ttl.as_deref() else {
+                continue;
+            };
+            parse_quota_window(ttl).map_err(|error| {
+                format!(
+                    "tool_access[{index}] has an unparseable ttl '{ttl}' \
+                     ({error}); accepted suffixes are ms, s, m, h, d \
+                     (for example 30s, 15m, 24h, 7d)"
                 )
             })?;
         }
@@ -708,7 +838,8 @@ fn warn_quota_registry_saturated(tool: &str, scope: &'static str, cap: usize) {
 /// callers. Empty string is the synthetic key used by anonymous
 /// traffic (the credentials epic introduces a typed
 /// `Principal::anonymous` for that lane).
-fn principal_id_for(principal: &Principal) -> String {
+/// Identity the grant ledger and quota store share for one caller.
+pub fn principal_id_for(principal: &Principal) -> String {
     if let Some(vk) = &principal.virtual_key {
         if !vk.name.is_empty() {
             return vk.name.clone();
@@ -779,6 +910,7 @@ mod tests {
                     ..Default::default()
                 }],
                 allowed: vec![],
+                ..Default::default()
             }],
             tool_quotas: vec![],
         };
@@ -812,6 +944,7 @@ mod tests {
                     ..Default::default()
                 }],
                 allowed: vec!["search".to_string()],
+                ..Default::default()
             }],
             tool_quotas: vec![],
         };
@@ -832,6 +965,7 @@ mod tests {
                     ..Default::default()
                 }],
                 allowed: vec!["*".to_string()],
+                ..Default::default()
             }],
             tool_quotas: vec![],
         };
@@ -855,6 +989,7 @@ mod tests {
                     ..Default::default()
                 }],
                 allowed: vec!["*".to_string()],
+                ..Default::default()
             }],
             tool_quotas: vec![],
         };
@@ -880,6 +1015,7 @@ mod tests {
                     ..Default::default()
                 }],
                 allowed: vec!["search".to_string(), "list_projects".to_string()],
+                ..Default::default()
             }],
             tool_quotas: vec![],
         };
@@ -892,6 +1028,141 @@ mod tests {
         let filtered = policy.filter_tools(&p, &tools);
         let names: Vec<&str> = filtered.iter().map(|s| s.as_str()).collect();
         assert_eq!(names, vec!["search", "list_projects"]);
+    }
+
+    #[test]
+    fn time_boxed_grant_expires_until_renewed() {
+        use crate::mcp::grant_ledger::GrantLedger;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let policy = ToolAccessPolicy {
+            default_allow: false,
+            tool_access: vec![ToolAccessRule {
+                principals: vec![],
+                allowed: vec!["reports.hello".to_string()],
+                ttl: Some("60s".to_string()),
+            }],
+            tool_quotas: vec![],
+        };
+        let ledger = GrantLedger::in_memory();
+        let p = principal("acme", "u", None, None, Some("vk_analyst"));
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        assert_eq!(
+            policy.check_with_ledger(
+                &p,
+                "reports.hello",
+                "analyst",
+                "mcp.example.com",
+                &ledger,
+                t0
+            ),
+            ToolAccessDecision::Allow
+        );
+        let later = t0 + Duration::from_secs(61);
+        assert_eq!(
+            policy.check_with_ledger(
+                &p,
+                "reports.hello",
+                "analyst",
+                "mcp.example.com",
+                &ledger,
+                later
+            ),
+            ToolAccessDecision::Expired
+        );
+        ledger
+            .renew(
+                &crate::mcp::grant_ledger::GrantKey {
+                    origin: "mcp.example.com".to_string(),
+                    policy: "analyst".to_string(),
+                    tool: "reports.hello".to_string(),
+                    principal_id: "vk_analyst".to_string(),
+                    tenant_id: "acme".to_string(),
+                },
+                Duration::from_secs(60),
+                later,
+            )
+            .expect("renew");
+        assert_eq!(
+            policy.check_with_ledger(
+                &p,
+                "reports.hello",
+                "analyst",
+                "mcp.example.com",
+                &ledger,
+                later
+            ),
+            ToolAccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn matching_grant_ttl_skips_rules_without_ttl_and_prefers_exact_name() {
+        let policy = ToolAccessPolicy {
+            default_allow: false,
+            tool_access: vec![
+                ToolAccessRule {
+                    principals: vec![],
+                    allowed: vec!["*".to_string()],
+                    ttl: None,
+                },
+                ToolAccessRule {
+                    principals: vec![],
+                    allowed: vec!["*".to_string()],
+                    ttl: Some("30s".to_string()),
+                },
+                ToolAccessRule {
+                    principals: vec![],
+                    allowed: vec!["reports.hello".to_string()],
+                    ttl: Some("90s".to_string()),
+                },
+            ],
+            tool_quotas: vec![],
+        };
+        assert_eq!(
+            policy.matching_grant_ttl(None, "reports.hello"),
+            Some(std::time::Duration::from_secs(90))
+        );
+        assert_eq!(
+            policy.matching_grant_ttl(None, "other.tool"),
+            Some(std::time::Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn matching_grant_ttl_uses_the_named_principal() {
+        let policy = ToolAccessPolicy {
+            default_allow: false,
+            tool_access: vec![
+                ToolAccessRule {
+                    principals: vec![McpPrincipalSelector {
+                        virtual_key: Some("vk_analyst".to_string()),
+                        ..Default::default()
+                    }],
+                    allowed: vec!["reports.hello".to_string()],
+                    ttl: Some("8h".to_string()),
+                },
+                ToolAccessRule {
+                    principals: vec![McpPrincipalSelector {
+                        virtual_key: Some("vk_admin".to_string()),
+                        ..Default::default()
+                    }],
+                    allowed: vec!["reports.hello".to_string()],
+                    ttl: Some("30d".to_string()),
+                },
+            ],
+            tool_quotas: vec![],
+        };
+        let analyst = principal("acme", "u", None, None, Some("vk_analyst"));
+        let admin = principal("acme", "u", None, None, Some("vk_admin"));
+        assert_eq!(
+            policy.matching_grant_ttl(Some(&analyst), "reports.hello"),
+            Some(std::time::Duration::from_secs(8 * 3600))
+        );
+        assert_eq!(
+            policy.matching_grant_ttl(Some(&admin), "reports.hello"),
+            Some(std::time::Duration::from_secs(30 * 24 * 3600))
+        );
     }
 
     // --- Quota tests ---

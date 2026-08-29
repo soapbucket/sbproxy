@@ -14,6 +14,10 @@ pub const METHOD_NOT_FOUND: i32 = -32601;
 pub const INVALID_PARAMS: i32 = -32602;
 /// JSON-RPC 2.0 internal error: server encountered an unexpected failure.
 pub const INTERNAL_ERROR: i32 = -32603;
+/// JSON-RPC error code for a time-boxed MCP grant that has elapsed.
+pub const GRANT_EXPIRED: i32 = -32098;
+/// JSON-RPC error code for a tool call parked for human approval.
+pub const APPROVAL_PENDING: i32 = -32097;
 
 // --- Protocol version negotiation (WOR-1641) ---
 
