@@ -23,6 +23,12 @@
  * carrying the header and no session is refused exactly as before.
  */
 
+import {
+  capabilityForRequest,
+  hasCapability,
+  refusalReason,
+} from "./lib/rbac";
+
 /**
  * Marks a request as this app's own, so the server suppresses the Basic
  * challenge on a 401 (WOR-2688). Sent on every call, safe and unmutating.
@@ -54,6 +60,66 @@ export function setWarningHandler(handler: ((msg: string) => void) | null): void
  */
 function isAuthProbePath(path: string): boolean {
   return path.startsWith("/admin/login") || path.startsWith("/admin/session");
+}
+
+/*
+ * WOR-2576: the console's own copy of the server's RBAC rule.
+ *
+ * The role the server resolved for this session, as `role_label` spells
+ * it, held the same way the CSRF token is and set by `useAuth` from the
+ * login and session responses. `null` means the session probe has not
+ * answered yet, which is every cold load.
+ */
+let sessionRole: string | null = null;
+
+/**
+ * Record the role the server resolved for this session, so the client
+ * can refuse a call the server would refuse anyway and the UI can
+ * disable the control rather than render a 403 toast.
+ *
+ * Passing `null` returns the client to its "role not yet known" state,
+ * which gates nothing.
+ */
+export function setSessionRole(role: string | null): void {
+  sessionRole = role;
+}
+
+/**
+ * The auth routes themselves, which are never gated.
+ *
+ * `POST /admin/login` is a mutation made in exactly the state where no
+ * role is known, and `POST /admin/logout` has to work for every role
+ * including one this build does not recognize, or a mis-set role would
+ * strand an operator inside a console they cannot sign out of.
+ */
+function isUngatedAuthPath(path: string): boolean {
+  return isAuthProbePath(path) || path.startsWith("/admin/logout");
+}
+
+/**
+ * Refuse a call this session's role may not make, before it reaches the
+ * network.
+ *
+ * This is not authorization. `crates/sbproxy-core/src/admin.rs:8043`
+ * refuses every state-changing method from a `read_only` operator, and
+ * `admin.rs:6608` / `admin_compression.rs:489` refuse the two
+ * admin-only reads; those are the enforcers and they run whatever this
+ * function does. What this buys is a console that can disable a control
+ * and explain it, and a single choke point that a test can prove closed
+ * rather than a scatter of `v-if`s that a test can only prove drawn.
+ *
+ * It can only ever refuse. Nothing here grants anything, so the failure
+ * mode of a wrong answer is a lost affordance, never gained access.
+ */
+function assertCapability(method: string, path: string): void {
+  if (isUngatedAuthPath(path)) return;
+  // Role not yet resolved. Not the same as a role that lacks the
+  // capability: gating here would refuse the console's own cold load.
+  if (sessionRole === null) return;
+  const needed = capabilityForRequest(method, path);
+  if (!needed) return;
+  if (hasCapability(sessionRole, needed)) return;
+  throw new ApiError(403, refusalReason(needed, sessionRole), "");
 }
 
 // or authenticated via Basic. Set from the login / session responses.
@@ -212,6 +278,7 @@ async function request(
   path: string,
   body?: unknown,
 ): Promise<Response> {
+  assertCapability(method, path);
   const init: RequestInit = {
     method,
     credentials: "same-origin",
@@ -289,6 +356,11 @@ async function sendRaw(
   rawBody: string,
   contentType = "application/yaml",
 ): Promise<string> {
+  // `sendRaw` builds its own fetch rather than going through `request`,
+  // so the gate is applied here too. A guard on only one of the two
+  // fetch call sites would be narrower than the surface it claims, and
+  // the config editor is the caller that would have escaped it.
+  assertCapability(method, path);
   const init: RequestInit = {
     method,
     credentials: "same-origin",
@@ -1471,6 +1543,106 @@ export interface ConfigWriteConflict {
   remedy?: string;
 }
 
+/* ---- OpenID Federation (GET /admin/federation) ---- */
+
+/** What this proxy requires of a peer presenting an entity statement. */
+export interface FederationPeerTrust {
+  configured: boolean;
+  /** Whether a peer statement is required or merely verified when present. */
+  required?: boolean;
+  header?: string;
+  pinned_anchors?: number;
+  cached_peer_decisions?: number;
+}
+
+/**
+ * `GET /admin/federation`.
+ *
+ * A process with no `federation` block answers `{"enabled": false}`
+ * rather than 404, so an operator polling it can tell "off" from a typo
+ * in the path. No key material appears: the signing key is named by its
+ * `kid` only.
+ */
+export interface FederationStatus {
+  enabled: boolean;
+  entity_id?: string;
+  signing_algorithm?: string;
+  signing_kid?: string;
+  published_keys?: number;
+  authority_hints?: number;
+  trust_marks?: number;
+  metadata_policy_configured?: boolean;
+  lifetime_secs?: number;
+  refresh_margin_secs?: number;
+  /** `null` when the entity statement could not be built, which is the
+   *  same failure the well-known route answers 503 with. The rest of the
+   *  response stays readable while it is broken, on purpose. */
+  cache_remaining_secs?: number | null;
+  peer_trust?: FederationPeerTrust;
+}
+
+/* ---- CoMP / OLP licensing (GET /admin/licensing) ---- */
+
+/** RFC 7662 / RFC 7009 introspection and revocation, when mounted. */
+export interface LicensingOlpIntrospect {
+  enabled: boolean;
+  introspect_path?: string;
+  revoke_path?: string;
+  /** Variant name only. The redb path, and especially a Redis URL, are
+   *  operator configuration and a Redis URL routinely carries a password
+   *  in its userinfo. */
+  revocation_store?: "memory" | "redb" | "redis";
+}
+
+/** One origin's OLP issuer, or `{enabled: false}`. */
+export interface LicensingOlp {
+  enabled: boolean;
+  signing_kid?: string;
+  issuer?: string;
+  default_scope?: string;
+  default_ttl_secs?: number;
+  /** Whether the Encrypted Media Standard content-key claim is stamped.
+   *  The seed itself never appears. */
+  content_key_configured?: boolean;
+  introspect?: LicensingOlpIntrospect;
+}
+
+/** One origin's CoMP marketplace bridge, or `{enabled: false}`. */
+export interface LicensingComp {
+  enabled: boolean;
+  publisher_domain?: string;
+  publisher_name?: string;
+  tier_count?: number;
+  /** Only OLP tiers are redeemable for a token. The two counts differ
+   *  whenever the catalog carries `cap` or `public` tiers. */
+  olp_tier_count?: number;
+  /** `null` until a rotation has been activated. Every quote request
+   *  fails closed until one is. */
+  active_signing_kid?: string | null;
+  trusted_kid_count?: number;
+  manifest_hash?: string;
+  generated_at?: string;
+  endpoints?: { manifest?: string; quote?: string; redeem?: string };
+}
+
+/** One origin with a CoMP bridge, an OLP issuer, or both. */
+export interface LicensingOrigin {
+  hostname: string;
+  comp: LicensingComp;
+  olp: LicensingOlp;
+}
+
+/**
+ * `GET /admin/licensing`.
+ *
+ * `enabled` is false when no origin has either half, which is a
+ * configuration state and not a fault.
+ */
+export interface LicensingStatus {
+  enabled: boolean;
+  origins: LicensingOrigin[];
+}
+
 export interface DriftResponse {
   // Real server shape (GET /admin/drift).
   drift?: boolean;
@@ -1548,7 +1720,92 @@ export interface ConfigHistoryEntry {
 export interface ConfigHistoryResponse {
   lineage: string;
   lkg_revision: number | null;
+  /** Which revision is under judgment right now, if any. An operator
+   *  looking at an `lkg_revision` that has not moved needs to know
+   *  whether a soak window is still open or the last candidate did not
+   *  promote (WOR-2458). */
+  soak_revision: number | null;
   entries: ConfigHistoryEntry[];
+  /** Applied revisions and refused candidates in one list, newest first
+   *  (WOR-2462). Additive: `entries` keeps its shape and meaning. */
+  timeline: ConfigTimelineRow[];
+}
+
+/** Whether a timeline row is a revision that applied or a candidate the
+ *  node refused. */
+export type ConfigTimelineKind = "applied" | "rejected";
+
+/**
+ * One row of `GET /admin/config/history`'s `timeline`.
+ *
+ * The two kinds are a union in the server's JSON rather than two arrays,
+ * because the point of the list is their interleaving: a refusal has to
+ * appear in its correct place among the applied revisions or the
+ * operator reads "nothing has changed since 09:00" when the truth is
+ * "everything since 09:00 was refused". Fields belonging to only one
+ * kind are optional here for that reason; read `kind` first.
+ */
+export interface ConfigTimelineRow {
+  kind: ConfigTimelineKind;
+  /** When this row happened: `applied_at` for an applied revision,
+   *  `last_seen_at` for a refusal, which is the refusal the operator is
+   *  living with now rather than the first one. */
+  at: string;
+  digest: string;
+  provenance: string;
+  /** Applied rows only. */
+  revision?: number;
+  state?: ConfigHistoryEntry["state"];
+  applied_at?: string;
+  actor?: string;
+  blast_radius?: ConfigHistoryBlastRadius | null;
+  degraded?: string[];
+  /** Refused rows only. */
+  reason?: string;
+  stage?: string;
+  /** Secret-redacted server-side before it is sent. */
+  detail?: string;
+  first_seen_at?: string;
+  last_seen_at?: string;
+  /** How many polls have been refused with this reason. One is a typo;
+   *  hundreds is an incident. */
+  count?: number;
+}
+
+/**
+ * Body for `POST /admin/config/rollback`.
+ *
+ * `revision`, `digest`, and `target` are mutually exclusive server-side;
+ * naming two is a 400 rather than a silent precedence rule.
+ */
+export interface ConfigRollbackRequest {
+  revision?: number;
+  digest?: string;
+  target?: string;
+  expected_current?: number;
+  lineage?: string;
+  /** The typed confirmation. The server checks this; the console's
+   *  `rollbackGate` only decides whether to offer the button. */
+  confirm_revision?: number;
+  force?: boolean;
+}
+
+/** Result of a successful `POST /admin/config/rollback`. */
+export interface ConfigRollbackResult {
+  rolled_back: boolean;
+  restored_revision: number;
+  restored_digest: string;
+  previous_revision: number | null;
+  appended_revision: number | null;
+  blast_radius: ConfigHistoryBlastRadius | null;
+  degraded: string[];
+  soaking: boolean;
+  secrets_fingerprint_changed: boolean;
+  /** Always `true`. The half of the recovery this route cannot do: the
+   *  next watcher event, SIGHUP, or authority bundle re-applies whatever
+   *  the source of truth still says. */
+  config_file_unchanged: boolean;
+  warnings: string[];
 }
 
 /** GET /admin/config/history/{digest}. `document` is the stored
@@ -3021,6 +3278,10 @@ export const api = {
   // Config
   openapi: () => getJson<Record<string, unknown>>("/api/openapi.json"),
   drift: () => getJson<DriftResponse>("/admin/drift"),
+  // WOR-2574: the two routes that shipped with "a console page is
+  // separate scope" written beside them.
+  federation: () => getJson<FederationStatus>("/admin/federation"),
+  licensing: () => getJson<LicensingStatus>("/admin/licensing"),
   reload: () => sendJson<unknown>("POST", "/admin/reload"),
   targets: () => getJson<unknown>("/api/health/targets"),
 
@@ -3298,6 +3559,16 @@ export const api = {
     getJson<ConfigHistoryDetail>(
       `/admin/config/history/${encodeURIComponent(digest)}`,
     ),
+  /**
+   * Roll the running config back to a stored revision (WOR-2460).
+   *
+   * A `409` here is the server's own refusal, not a transport failure:
+   * `confirm_revision` missing on a restart or breaking rollback, a
+   * lineage mismatch, or an `expected_current` that moved under the
+   * operator. The caller reads `ApiError.body` for the `code`.
+   */
+  configRollback: (request: ConfigRollbackRequest) =>
+    sendJson<ConfigRollbackResult>("POST", "/admin/config/rollback", request),
 
   // Rate-limit budget audit trail (WOR-1761) + fleet metrics (WOR-1762).
   auditRecent: (limit = 100) => getJson<AuditRow[]>(`/api/audit/recent?limit=${limit}`),

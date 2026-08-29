@@ -7,6 +7,7 @@ import StatCard from "../components/StatCard.vue";
 import StatusBadge from "../components/StatusBadge.vue";
 import { api, type MeterReceipt, type MeterVerifyResult } from "../api";
 import { useAsync } from "../composables/useAsync";
+import { useCapabilities } from "../composables/useCapabilities";
 import { toast } from "../composables/useToasts";
 import { formatTime, relativeTime, shortId } from "../lib/format";
 import {
@@ -23,6 +24,7 @@ import {
   verifyTone,
 } from "../lib/meter";
 import Tooltip from "../components/Tooltip.vue";
+import ReadOnlyNotice from "../components/ReadOnlyNotice.vue";
 
 const groupBy = ref("tenant");
 const tenantFilter = ref("");
@@ -119,6 +121,11 @@ async function verify(): Promise<void> {
 function fmt(n: number | undefined | null): string {
   return typeof n === "number" ? n.toLocaleString() : "n/a";
 }
+
+// WOR-2576: every state-changing control on this page is refused for a
+// read_only operator by the admin server, so the console disables it and
+// says why rather than offering a button that answers 403.
+const { canMutate, whyNot } = useCapabilities();
 </script>
 
 <template>
@@ -130,6 +137,8 @@ function fmt(n: number | undefined | null): string {
       <button class="sb-btn sb-btn--sm" @click="reload">Refresh</button>
     </template>
   </PageHeader>
+
+  <ReadOnlyNotice action="Verifying the receipt chain" />
 
   <ErrorState
     v-if="summary.error.value && !summary.data.value"
@@ -322,7 +331,8 @@ function fmt(n: number | undefined | null): string {
 
     <h2 class="section">Receipts</h2>
     <div class="verify">
-      <button class="sb-btn sb-btn--sm" :disabled="verifying" @click="verify">
+      <button
+            :title="canMutate ? undefined : whyNot('mutate')" class="sb-btn sb-btn--sm" :disabled="verifying || !canMutate" @click="verify">
         {{ verifying ? "Verifying…" : "Verify chain" }}
       </button>
       <span v-if="verifyResult" :class="`verify__line verify__line--${verifyTone(verifyResult)}`">
@@ -387,7 +397,8 @@ function fmt(n: number | undefined | null): string {
                   <dd>{{ receipt.signature ?? "unsigned chain link" }}</dd>
                 </dl>
                 <pre class="drill__doc sb-mono">{{ receiptDocument(receipt) }}</pre>
-                <button class="sb-btn sb-btn--sm" :disabled="verifying" @click="verify">
+                <button
+            :title="canMutate ? undefined : whyNot('mutate')" class="sb-btn sb-btn--sm" :disabled="verifying || !canMutate" @click="verify">
                   Verify the chain this receipt is on
                 </button>
               </td>

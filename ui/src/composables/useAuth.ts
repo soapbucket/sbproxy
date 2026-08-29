@@ -1,5 +1,5 @@
 import { ref } from "vue";
-import { api, setCsrfToken, setUnauthorizedHandler } from "../api";
+import { api, setCsrfToken, setSessionRole, setUnauthorizedHandler } from "../api";
 
 // Module-level (singleton) auth state shared across the app.
 const authenticated = ref(false);
@@ -28,6 +28,10 @@ setUnauthorizedHandler(() => {
     sessionExpired.value = true;
   }
   authenticated.value = false;
+  // The session is gone, so the role it carried is no longer a fact
+  // about anything. Clear it rather than gating the next sign-in
+  // attempt on a role that expired with the cookie.
+  setSessionRole(null);
 });
 
 export function useAuth() {
@@ -37,6 +41,12 @@ export function useAuth() {
       authenticated.value = !!s.authenticated;
       username.value = s.username ?? "";
       role.value = s.role ?? "";
+      // WOR-2576: hand the role to the API client so it can refuse a
+      // call this role may not make, instead of the operator learning it
+      // from a 403 toast. A session with no role reported leaves the
+      // client ungated and the server the only judge, which is the
+      // pre-existing behavior.
+      setSessionRole(s.role ?? null);
       // Recover the CSRF token from an existing session cookie so a page
       // reload does not lose the ability to make mutations.
       if (s.authenticated && s.via_session && s.csrf_token) {
@@ -44,6 +54,7 @@ export function useAuth() {
       }
     } catch {
       authenticated.value = false;
+      setSessionRole(null);
     } finally {
       ready.value = true;
     }
@@ -55,6 +66,7 @@ export function useAuth() {
     sessionExpired.value = false;
     username.value = r.username;
     role.value = r.role;
+    setSessionRole(r.role ?? null);
   }
 
   async function logout(): Promise<void> {
@@ -65,6 +77,7 @@ export function useAuth() {
       username.value = "";
       role.value = "";
       setCsrfToken(null);
+      setSessionRole(null);
     }
   }
 

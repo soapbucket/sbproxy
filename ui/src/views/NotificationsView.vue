@@ -19,12 +19,19 @@ import {
   type NotifySubscription,
 } from "../api";
 import { useAsync } from "../composables/useAsync";
+import { useCapabilities } from "../composables/useCapabilities";
 import PageHeader from "../components/PageHeader.vue";
 import ErrorState from "../components/ErrorState.vue";
 import EmptyState from "../components/EmptyState.vue";
 import StatCard from "../components/StatCard.vue";
 import StatusBadge from "../components/StatusBadge.vue";
 import ClickToCopy from "../components/ClickToCopy.vue";
+
+// WOR-2576: every control on this page below the tables mutates a
+// subscription or a deadletter. A read_only operator may read all of it
+// and is refused all of it, so the buttons carry the reason instead of a
+// 403 toast.
+const { canMutate, whyNot } = useCapabilities();
 
 const summary = useAsync(() => api.notifySummary());
 const subscriptions = useAsync(() => api.notifySubscriptions());
@@ -267,7 +274,13 @@ async function loadMoreDeadletters() {
       />
       <button
         class="sb-btn sb-btn--sm sb-btn--primary"
-        :disabled="busy === '__create' || !newUrl.trim() || !parseFilters(newFilters).length"
+        :disabled="
+          busy === '__create' ||
+          !canMutate ||
+          !newUrl.trim() ||
+          !parseFilters(newFilters).length
+        "
+        :title="canMutate ? undefined : whyNot('mutate')"
         @click="create"
       >
         subscribe
@@ -316,14 +329,15 @@ async function loadMoreDeadletters() {
               <div class="actions">
                 <button
                   class="sb-btn sb-btn--sm"
-                  :disabled="busy === row.subscription_id"
+                  :disabled="busy === row.subscription_id || !canMutate"
+                  :title="canMutate ? undefined : whyNot('mutate')"
                   @click="setActive(row, !row.active)"
                 >
                   {{ row.active ? "pause" : "resume" }}
                 </button>
                 <button
                   class="sb-btn sb-btn--sm"
-                  :disabled="busy === row.subscription_id"
+                  :disabled="busy === row.subscription_id || !canMutate"
                   title="Mint a new signing key. The previous secret stops working immediately."
                   @click="rotate(row)"
                 >
@@ -331,7 +345,7 @@ async function loadMoreDeadletters() {
                 </button>
                 <button
                   class="sb-btn sb-btn--sm"
-                  :disabled="busy === row.subscription_id"
+                  :disabled="busy === row.subscription_id || !canMutate"
                   title="Delete the subscription. Its deadletters are kept."
                   @click="remove(row)"
                 >
@@ -378,7 +392,7 @@ async function loadMoreDeadletters() {
               <div class="actions">
                 <button
                   class="sb-btn sb-btn--sm"
-                  :disabled="busy === record.delivery_id"
+                  :disabled="busy === record.delivery_id || !canMutate"
                   title="Re-send under the original event id. The record leaves the queue once the worker takes it."
                   @click="replay(record)"
                 >
@@ -386,7 +400,7 @@ async function loadMoreDeadletters() {
                 </button>
                 <button
                   class="sb-btn sb-btn--sm"
-                  :disabled="busy === record.delivery_id"
+                  :disabled="busy === record.delivery_id || !canMutate"
                   title="Drop the record without replaying it. The receiver never gets this event."
                   @click="discard(record)"
                 >

@@ -8,7 +8,9 @@ import ModalDialog from "../components/ModalDialog.vue";
 import ModelFilesTable from "../components/ModelFilesTable.vue";
 import PageHeader from "../components/PageHeader.vue";
 import StorageBackendOps from "../components/StorageBackendOps.vue";
+import ReadOnlyNotice from "../components/ReadOnlyNotice.vue";
 import { useAsync } from "../composables/useAsync";
+import { useCapabilities } from "../composables/useCapabilities";
 import { toast } from "../composables/useToasts";
 import { formatBytes } from "../lib/format";
 import { parsePrometheus } from "../lib/metrics";
@@ -148,6 +150,11 @@ function refresh() {
   void filesReq.run();
   void metricsReq.run();
 }
+
+// WOR-2576: every state-changing control on this page is refused for a
+// read_only operator by the admin server, so the console disables it and
+// says why rather than offering a button that answers 403.
+const { canMutate, whyNot } = useCapabilities();
 </script>
 
 <template>
@@ -158,7 +165,7 @@ function refresh() {
     <template #actions>
       <button
         class="sb-btn"
-        :disabled="gcBusy || Boolean(gcDisabledReason) || !cacheConfigured"
+        :disabled="gcBusy || Boolean(gcDisabledReason) || !cacheConfigured || !canMutate"
         :title="gcDisabledReason ?? undefined"
         @click="runGc"
       >
@@ -169,6 +176,8 @@ function refresh() {
       </button>
     </template>
   </PageHeader>
+
+  <ReadOnlyNotice action="Deleting artifacts and running garbage collection" />
 
   <ErrorState v-if="filesReq.error.value" :error="filesReq.error.value" @retry="refresh" />
   <template v-else>
@@ -241,8 +250,9 @@ function refresh() {
         Cancel
       </button>
       <button
+            :title="canMutate ? undefined : whyNot('mutate')"
         class="sb-btn sb-btn--danger"
-        :disabled="Boolean(deleteBusy)"
+        :disabled="Boolean(deleteBusy) || !canMutate"
         @click="confirmDelete"
       >
         {{ deleteBusy ? "Deleting..." : "Delete artifact" }}

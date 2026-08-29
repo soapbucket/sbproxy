@@ -18,6 +18,7 @@ import {
   type KeyPolicyDraft,
 } from "../api";
 import { useAsync } from "../composables/useAsync";
+import { useCapabilities } from "../composables/useCapabilities";
 import { toast } from "../composables/useToasts";
 import { formatNumber, formatUsd, formatTime, shortId } from "../lib/format";
 import PageHeader from "../components/PageHeader.vue";
@@ -26,6 +27,7 @@ import ErrorState from "../components/ErrorState.vue";
 import EmptyState from "../components/EmptyState.vue";
 import ModalDialog from "../components/ModalDialog.vue";
 import CopyText from "../components/CopyText.vue";
+import ReadOnlyNotice from "../components/ReadOnlyNotice.vue";
 
 const keysReq = useAsync(() => api.keys());
 const keys = computed<AdminKey[]>(() => asList<AdminKey>(keysReq.data.value, "keys", "items", "data"));
@@ -808,6 +810,11 @@ function overrideRaiseSummary(k: AdminKey): string {
   if (grant.max_tokens_increase) parts.push(`+${formatNumber(grant.max_tokens_increase)} tokens`);
   return parts.join(", ");
 }
+
+// WOR-2576: every state-changing control on this page is refused for a
+// read_only operator by the admin server, so the console disables it and
+// says why rather than offering a button that answers 403.
+const { canMutate, whyNot } = useCapabilities();
 </script>
 
 <template>
@@ -827,6 +834,8 @@ function overrideRaiseSummary(k: AdminKey): string {
       </button>
     </template>
   </PageHeader>
+
+  <ReadOnlyNotice action="Creating, editing, rotating and revoking keys" />
 
   <ErrorState
     v-if="policySchemaReq.error.value"
@@ -994,23 +1003,26 @@ function overrideRaiseSummary(k: AdminKey): string {
               Usage
             </button>
             <button
+            :title="canMutate ? undefined : whyNot('mutate')"
               class="sb-btn sb-btn--sm"
               :disabled="
                 !policySchemaReq.succeeded.value || statusOf(k) === 'revoked'
-              "
+               || !canMutate"
               @click="openEdit(k)"
             >
               Edit
             </button>
             <button
+            :title="canMutate ? undefined : whyNot('mutate')"
               v-if="statusOf(k) !== 'revoked'"
               class="sb-btn sb-btn--sm"
-              :disabled="rowBusy === keyId(k) + 'rotate'"
+              :disabled="rowBusy === keyId(k) + 'rotate' || !canMutate"
               @click="doAction(k, 'rotate')"
             >
               Rotate
             </button>
             <button
+            :disabled="!canMutate"
               v-if="statusOf(k) !== 'revoked' && !k.budget_override"
               class="sb-btn sb-btn--sm"
               title="Grant a temporary budget raise that expires on its own"
@@ -1021,43 +1033,47 @@ function overrideRaiseSummary(k: AdminKey): string {
             <button
               v-else-if="statusOf(k) !== 'revoked' && k.budget_override"
               class="sb-btn sb-btn--sm"
-              :disabled="rowBusy === keyId(k) + 'clear-boost'"
+              :disabled="rowBusy === keyId(k) + 'clear-boost' || !canMutate"
               title="End the temporary raise now; the base budget resumes immediately"
               @click="clearBoost(k)"
             >
               Clear raise
             </button>
             <button
+            :title="canMutate ? undefined : whyNot('mutate')"
               v-if="statusOf(k) === 'active' && supportsPolicyAction('block')"
               class="sb-btn sb-btn--sm"
-              :disabled="rowBusy === keyId(k) + 'block'"
+              :disabled="rowBusy === keyId(k) + 'block' || !canMutate"
               @click="doAction(k, 'block')"
             >
               Block
             </button>
             <button
+            :title="canMutate ? undefined : whyNot('mutate')"
               v-else-if="
                 statusOf(k) === 'blocked' && supportsPolicyAction('unblock')
               "
               class="sb-btn sb-btn--sm"
-              :disabled="rowBusy === keyId(k) + 'unblock'"
+              :disabled="rowBusy === keyId(k) + 'unblock' || !canMutate"
               @click="doAction(k, 'unblock')"
             >
               Unblock
             </button>
             <button
+            :title="canMutate ? undefined : whyNot('mutate')"
               v-if="
                 statusOf(k) !== 'revoked' && supportsPolicyAction('revoke')
               "
               class="sb-btn sb-btn--sm sb-btn--danger"
-              :disabled="rowBusy === keyId(k) + 'revoke'"
+              :disabled="rowBusy === keyId(k) + 'revoke' || !canMutate"
               @click="doAction(k, 'revoke')"
             >
               Revoke
             </button>
             <button
+            :title="canMutate ? undefined : whyNot('mutate')"
               class="sb-btn sb-btn--sm sb-btn--danger"
-              :disabled="rowBusy === keyId(k) + 'delete'"
+              :disabled="rowBusy === keyId(k) + 'delete' || !canMutate"
               @click="doDelete(k)"
             >
               Delete
@@ -1338,7 +1354,8 @@ function overrideRaiseSummary(k: AdminKey): string {
     </form>
     <template #footer>
       <button class="sb-btn" @click="showCreate = false">Cancel</button>
-      <button class="sb-btn sb-btn--primary" :disabled="createBusy" @click="submitCreate">
+      <button
+            :title="canMutate ? undefined : whyNot('mutate')" class="sb-btn sb-btn--primary" :disabled="createBusy || !canMutate" @click="submitCreate">
         {{ createBusy ? "Creating..." : "Create key" }}
       </button>
     </template>
@@ -1419,7 +1436,8 @@ function overrideRaiseSummary(k: AdminKey): string {
     </form>
     <template #footer>
       <button class="sb-btn" @click="closeBoost">Cancel</button>
-      <button class="sb-btn sb-btn--primary" :disabled="boostBusy" @click="submitBoost">
+      <button
+            :title="canMutate ? undefined : whyNot('mutate')" class="sb-btn sb-btn--primary" :disabled="boostBusy || !canMutate" @click="submitBoost">
         {{ boostBusy ? "Granting..." : "Grant raise" }}
       </button>
     </template>
@@ -1447,9 +1465,10 @@ function overrideRaiseSummary(k: AdminKey): string {
       <div class="preview-panel__header">
         <strong>Effective policy preview</strong>
         <button
+            :title="canMutate ? undefined : whyNot('mutate')"
           class="sb-btn sb-btn--sm"
           type="button"
-          :disabled="previewBusy"
+          :disabled="previewBusy || !canMutate"
           @click="loadPreview()"
         >
           {{ previewBusy ? "Refreshing..." : "Refresh preview" }}

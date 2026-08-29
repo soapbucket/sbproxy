@@ -1,0 +1,4 @@
+{
+  "type": "added",
+  "message": "Admin console: role-aware controls. A read-only session now sees disabled controls carrying the server rule that refuses them, and the admin API client refuses a gated call before it reaches the network."
+}

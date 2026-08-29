@@ -7,12 +7,14 @@ import {
   type AlertRule,
 } from "../api";
 import { useAsync } from "../composables/useAsync";
+import { useCapabilities } from "../composables/useCapabilities";
 import { toast } from "../composables/useToasts";
 import { formatNumber, formatTime } from "../lib/format";
 import PageHeader from "../components/PageHeader.vue";
 import StatusBadge from "../components/StatusBadge.vue";
 import ErrorState from "../components/ErrorState.vue";
 import EmptyState from "../components/EmptyState.vue";
+import ReadOnlyNotice from "../components/ReadOnlyNotice.vue";
 
 // A firing alert nobody sees is the failure mode this page exists to
 // prevent, so it refreshes on its own.
@@ -148,6 +150,11 @@ function channelDescriptor(channel: AlertChannel): string {
 }
 
 const newestHistory = computed(() => [...(snapshot.value?.history ?? [])].reverse());
+
+// WOR-2576: every state-changing control on this page is refused for a
+// read_only operator by the admin server, so the console disables it and
+// says why rather than offering a button that answers 403.
+const { canMutate, whyNot } = useCapabilities();
 </script>
 
 <template>
@@ -159,6 +166,8 @@ const newestHistory = computed(() => [...(snapshot.value?.history ?? [])].revers
       <button class="sb-btn sb-btn--primary" @click="req.run">Refresh</button>
     </template>
   </PageHeader>
+
+  <ReadOnlyNotice action="Sending a test notification" />
 
   <p
     v-if="req.loading.value && !snapshot"
@@ -274,8 +283,9 @@ const newestHistory = computed(() => [...(snapshot.value?.history ?? [])].revers
               </div>
             </dl>
             <button
+            :title="canMutate ? undefined : whyNot('mutate')"
               class="sb-btn sb-btn--sm"
-              :disabled="testingIndex !== null"
+              :disabled="testingIndex !== null || !canMutate"
               :aria-label="`Test ${channel.type} channel ${channel.index}`"
               @click="testChannel(channel)"
             >

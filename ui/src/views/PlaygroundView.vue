@@ -9,6 +9,7 @@ import {
   type PlaygroundChatResult,
 } from "../api";
 import { useAsync } from "../composables/useAsync";
+import { useCapabilities } from "../composables/useCapabilities";
 import { formatMs, formatNumber, formatUsd, shortId } from "../lib/format";
 import {
   beginReplay,
@@ -24,6 +25,7 @@ import StatCard from "../components/StatCard.vue";
 import StatusBadge from "../components/StatusBadge.vue";
 import ErrorState from "../components/ErrorState.vue";
 import EmptyState from "../components/EmptyState.vue";
+import ReadOnlyNotice from "../components/ReadOnlyNotice.vue";
 
 const route = useRoute();
 const router = useRouter();
@@ -259,6 +261,11 @@ async function send() {
     sending.value = false;
   }
 }
+
+// WOR-2576: every state-changing control on this page is refused for a
+// read_only operator by the admin server, so the console disables it and
+// says why rather than offering a button that answers 403.
+const { canMutate, whyNot } = useCapabilities();
 </script>
 
 <template>
@@ -270,6 +277,8 @@ async function send() {
       <button class="sb-btn sb-btn--sm" @click="refresh">Refresh</button>
     </template>
   </PageHeader>
+
+  <ReadOnlyNotice action="Dispatching a completion" />
 
   <ErrorState
     v-if="endpointsReq.error.value"
@@ -375,7 +384,7 @@ async function send() {
         <span class="sb-faint hint">Ctrl/Cmd + Enter to send</span>
         <button
           class="sb-btn sb-btn--primary"
-          :disabled="sending || !prompt.trim() || !selectedOrigin || !selectedKeyId"
+          :disabled="sending || !prompt.trim() || !selectedOrigin || !selectedKeyId || !canMutate"
           :title="!selectedKeyId ? 'Choose an active virtual key to dispatch as' : undefined"
           @click="send"
         >

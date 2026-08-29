@@ -18,6 +18,7 @@ import {
   type AgentRegistrySummary,
 } from "../api";
 import { useAsync } from "../composables/useAsync";
+import { useCapabilities } from "../composables/useCapabilities";
 import PageHeader from "../components/PageHeader.vue";
 import ErrorState from "../components/ErrorState.vue";
 import EmptyState from "../components/EmptyState.vue";
@@ -27,6 +28,12 @@ import StatusBadge from "../components/StatusBadge.vue";
 const summary = useAsync(() => api.agentRegistrySummary());
 const registrations = useAsync(() => api.agentRegistrations());
 const catalog = useAsync(() => api.agentRegistryCatalog());
+
+// WOR-2576: the approval queue is the mutating half of this page. A
+// read_only operator may read the queue and is refused every decision,
+// both by the API client and by the admin server, so the controls are
+// disabled with the reason rather than rendered live.
+const { canMutate, whyNot } = useCapabilities();
 
 const filter = ref<AgentRegistrationState | "all">("pending");
 const reasons = ref<Record<string, string>>({});
@@ -198,7 +205,8 @@ async function refreshFeed() {
                 <button
                   v-if="row.state === 'pending'"
                   class="sb-btn sb-btn--sm"
-                  :disabled="busy === row.agent_id"
+                  :disabled="busy === row.agent_id || !canMutate"
+                  :title="canMutate ? undefined : whyNot('mutate')"
                   @click="decide(row, 'approve')"
                 >
                   approve
@@ -206,9 +214,11 @@ async function refreshFeed() {
                 <button
                   v-if="row.state === 'pending'"
                   class="sb-btn sb-btn--sm"
-                  :disabled="busy === row.agent_id || !reasons[row.agent_id]?.trim()"
+                  :disabled="busy === row.agent_id || !canMutate || !reasons[row.agent_id]?.trim()"
                   :title="
-                    reasons[row.agent_id]?.trim()
+                    !canMutate
+                      ? whyNot('mutate')
+                      : reasons[row.agent_id]?.trim()
                       ? 'Reject permanently. This description cannot be resubmitted.'
                       : 'A rejection needs a reason: it refuses this description for good.'
                   "
@@ -219,7 +229,8 @@ async function refreshFeed() {
                 <button
                   v-if="row.state === 'approved'"
                   class="sb-btn sb-btn--sm"
-                  :disabled="busy === row.agent_id"
+                  :disabled="busy === row.agent_id || !canMutate"
+                  :title="canMutate ? undefined : whyNot('mutate')"
                   @click="decide(row, 'revoke')"
                 >
                   revoke
@@ -254,7 +265,12 @@ async function refreshFeed() {
       binary on purpose.
     </p>
     <div v-else class="feed-actions">
-      <button class="sb-btn sb-btn--sm" :disabled="busy === '__feed'" @click="refreshFeed">
+      <button
+        class="sb-btn sb-btn--sm"
+        :disabled="busy === '__feed' || !canMutate"
+        :title="canMutate ? undefined : whyNot('mutate')"
+        @click="refreshFeed"
+      >
         reverify feed
       </button>
       <span v-if="catalogData?.expired" class="expired sb-mono">

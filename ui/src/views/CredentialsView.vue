@@ -2,6 +2,7 @@
 import { computed, onMounted, reactive, ref } from "vue";
 import { api, asList, ApiError, type Credential } from "../api";
 import { useAsync } from "../composables/useAsync";
+import { useCapabilities } from "../composables/useCapabilities";
 import { toast } from "../composables/useToasts";
 import { formatTime, shortId } from "../lib/format";
 import PageHeader from "../components/PageHeader.vue";
@@ -9,6 +10,7 @@ import StatusBadge from "../components/StatusBadge.vue";
 import ErrorState from "../components/ErrorState.vue";
 import EmptyState from "../components/EmptyState.vue";
 import ModalDialog from "../components/ModalDialog.vue";
+import ReadOnlyNotice from "../components/ReadOnlyNotice.vue";
 
 const req = useAsync(() => api.credentials());
 const creds = computed<Credential[]>(() =>
@@ -101,6 +103,11 @@ async function doDelete(c: Credential) {
 function statusOf(c: Credential): string {
   return String(c.status ?? "active");
 }
+
+// WOR-2576: every state-changing control on this page is refused for a
+// read_only operator by the admin server, so the console disables it and
+// says why rather than offering a button that answers 403.
+const { canMutate, whyNot } = useCapabilities();
 </script>
 
 <template>
@@ -113,6 +120,8 @@ function statusOf(c: Credential): string {
       <button class="sb-btn sb-btn--primary" @click="showCreate = true">Add credential</button>
     </template>
   </PageHeader>
+
+  <ReadOnlyNotice action="Adding, blocking, revoking and deleting credentials" />
 
   <ErrorState v-if="req.error.value" :error="req.error.value" @retry="req.run" />
   <EmptyState v-else-if="!creds.length" message="No credentials configured.">
@@ -165,31 +174,35 @@ function statusOf(c: Credential): string {
               `vault://` reference and let the resolver pick it up).
             -->
             <button
+            :title="canMutate ? undefined : whyNot('mutate')"
               v-if="c.status !== 'blocked'"
               class="sb-btn sb-btn--sm"
-              :disabled="rowBusy === credId(c) + 'block'"
+              :disabled="rowBusy === credId(c) + 'block' || !canMutate"
               @click="doAction(c, 'block')"
             >
               Block
             </button>
             <button
+            :title="canMutate ? undefined : whyNot('mutate')"
               v-else
               class="sb-btn sb-btn--sm"
-              :disabled="rowBusy === credId(c) + 'unblock'"
+              :disabled="rowBusy === credId(c) + 'unblock' || !canMutate"
               @click="doAction(c, 'unblock')"
             >
               Unblock
             </button>
             <button
+            :title="canMutate ? undefined : whyNot('mutate')"
               class="sb-btn sb-btn--sm sb-btn--danger"
-              :disabled="rowBusy === credId(c) + 'revoke'"
+              :disabled="rowBusy === credId(c) + 'revoke' || !canMutate"
               @click="doAction(c, 'revoke')"
             >
               Revoke
             </button>
             <button
+            :title="canMutate ? undefined : whyNot('mutate')"
               class="sb-btn sb-btn--sm sb-btn--danger"
-              :disabled="rowBusy === credId(c) + 'delete'"
+              :disabled="rowBusy === credId(c) + 'delete' || !canMutate"
               @click="doDelete(c)"
             >
               Delete
@@ -247,7 +260,8 @@ function statusOf(c: Credential): string {
     </div>
     <template #footer>
       <button class="sb-btn" @click="showCreate = false">Cancel</button>
-      <button class="sb-btn sb-btn--primary" :disabled="busy" @click="submit">
+      <button
+            :title="canMutate ? undefined : whyNot('mutate')" class="sb-btn sb-btn--primary" :disabled="busy || !canMutate" @click="submit">
         {{ busy ? "Saving..." : "Save credential" }}
       </button>
     </template>

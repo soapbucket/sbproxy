@@ -3,6 +3,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRoute } from "vue-router";
 import { api, type ContentSample, type RequestFilters, type RequestLog } from "../api";
 import { useAsync } from "../composables/useAsync";
+import { useCapabilities } from "../composables/useCapabilities";
 import { useAuth } from "../composables/useAuth";
 import { toast } from "../composables/useToasts";
 import { formatMs, formatNumber, formatTime, formatUsd, shortId } from "../lib/format";
@@ -24,6 +25,7 @@ import StatusBadge from "../components/StatusBadge.vue";
 import ErrorState from "../components/ErrorState.vue";
 import EmptyState from "../components/EmptyState.vue";
 import ClickToCopy from "../components/ClickToCopy.vue";
+import ReadOnlyNotice from "../components/ReadOnlyNotice.vue";
 
 const route = useRoute();
 const { role } = useAuth();
@@ -422,6 +424,11 @@ function detailFields(request: RequestLog): DetailField[] {
 function canReplay(request: RequestLog): boolean {
   return replayQueryFor(request) !== null;
 }
+
+// WOR-2576: every state-changing control on this page is refused for a
+// read_only operator by the admin server, so the console disables it and
+// says why rather than offering a button that answers 403.
+const { canMutate, whyNot } = useCapabilities();
 </script>
 
 <template>
@@ -447,6 +454,8 @@ function canReplay(request: RequestLog): boolean {
     </template>
   </PageHeader>
 
+  <ReadOnlyNotice action="Changing the running log level" />
+
   <div v-if="live && streamState === 'reconnecting'" class="sb-card stream-state">
     Stream disconnected; retrying. If this persists after a proxy restart, sign in
     again.
@@ -461,17 +470,19 @@ function canReplay(request: RequestLog): boolean {
       @keydown.enter="applyLogLevel(levelDraft)"
     />
     <button
+            :title="canMutate ? undefined : whyNot('mutate')"
       class="sb-btn sb-btn--sm"
-      :disabled="levelBusy"
+      :disabled="levelBusy || !canMutate"
       @click="applyLogLevel(levelDraft)"
     >
       Set
     </button>
     <button
+            :title="canMutate ? undefined : whyNot('mutate')"
       v-for="preset in LEVEL_PRESETS"
       :key="preset"
       class="sb-btn sb-btn--sm preset"
-      :disabled="levelBusy"
+      :disabled="levelBusy || !canMutate"
       @click="applyLogLevel(preset)"
     >
       {{ preset }}

@@ -2,12 +2,14 @@
 import { computed, onMounted, reactive, ref } from "vue";
 import { api, flattenPromptOverlay, ApiError, type PromptEntry } from "../api";
 import { useAsync } from "../composables/useAsync";
+import { useCapabilities } from "../composables/useCapabilities";
 import { toast } from "../composables/useToasts";
 import PageHeader from "../components/PageHeader.vue";
 import StatusBadge from "../components/StatusBadge.vue";
 import ErrorState from "../components/ErrorState.vue";
 import EmptyState from "../components/EmptyState.vue";
 import ModalDialog from "../components/ModalDialog.vue";
+import ReadOnlyNotice from "../components/ReadOnlyNotice.vue";
 
 const req = useAsync(() => api.prompts());
 onMounted(req.run);
@@ -110,6 +112,11 @@ async function submitPin() {
     pinBusy.value = false;
   }
 }
+
+// WOR-2576: every state-changing control on this page is refused for a
+// read_only operator by the admin server, so the console disables it and
+// says why rather than offering a button that answers 403.
+const { canMutate, whyNot } = useCapabilities();
 </script>
 
 <template>
@@ -122,10 +129,14 @@ async function submitPin() {
     </template>
   </PageHeader>
 
+  <ReadOnlyNotice action="Adding and pinning prompt versions" />
+
   <ErrorState v-if="req.error.value" :error="req.error.value" @retry="req.run" />
   <EmptyState v-else-if="!prompts.length" message="No prompt overlays configured.">
     <div style="margin-top: 16px;">
-      <button class="sb-btn sb-btn--primary" @click="openNewPrompt">Create first prompt</button>
+      <button
+            :title="canMutate ? undefined : whyNot('mutate')"
+            :disabled="!canMutate" class="sb-btn sb-btn--primary" @click="openNewPrompt">Create first prompt</button>
     </div>
   </EmptyState>
 
@@ -155,8 +166,12 @@ async function submitPin() {
       </div>
 
       <div class="prompt__actions">
-        <button class="sb-btn sb-btn--sm" @click="openAdd(p)">Add version</button>
-        <button class="sb-btn sb-btn--sm" @click="openPin(p)">Pin version</button>
+        <button
+            :title="canMutate ? undefined : whyNot('mutate')"
+            :disabled="!canMutate" class="sb-btn sb-btn--sm" @click="openAdd(p)">Add version</button>
+        <button
+            :title="canMutate ? undefined : whyNot('mutate')"
+            :disabled="!canMutate" class="sb-btn sb-btn--sm" @click="openPin(p)">Pin version</button>
       </div>
     </div>
   </div>
@@ -188,8 +203,9 @@ async function submitPin() {
     <template #footer>
       <button class="sb-btn" @click="showAdd = false">Cancel</button>
       <button
+            :title="canMutate ? undefined : whyNot('mutate')"
         class="sb-btn sb-btn--primary"
-        :disabled="addBusy || !addForm.host || !addForm.name || !addForm.version || !addForm.template"
+        :disabled="addBusy || !addForm.host || !addForm.name || !addForm.version || !addForm.template || !canMutate"
         @click="submitAdd"
       >
         {{ addBusy ? "Adding..." : (addForm.isNew ? "Create prompt" : "Add version") }}
@@ -212,7 +228,8 @@ async function submitPin() {
     </div>
     <template #footer>
       <button class="sb-btn" @click="showPin = false">Cancel</button>
-      <button class="sb-btn sb-btn--primary" :disabled="pinBusy || !pinVersion" @click="submitPin">
+      <button
+            :title="canMutate ? undefined : whyNot('mutate')" class="sb-btn sb-btn--primary" :disabled="pinBusy || !pinVersion || !canMutate" @click="submitPin">
         {{ pinBusy ? "Pinning..." : "Pin version" }}
       </button>
     </template>

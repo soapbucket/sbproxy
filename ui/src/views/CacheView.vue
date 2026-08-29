@@ -2,12 +2,14 @@
 import { computed, onMounted, ref } from "vue";
 import { api, type CacheStatus } from "../api";
 import { useAsync } from "../composables/useAsync";
+import { useCapabilities } from "../composables/useCapabilities";
 import { toast } from "../composables/useToasts";
 import { parsePrometheus, findFamily, sumSamples } from "../lib/metrics";
 import { formatNumber, formatTime } from "../lib/format";
 import PageHeader from "../components/PageHeader.vue";
 import StatCard from "../components/StatCard.vue";
 import ErrorState from "../components/ErrorState.vue";
+import ReadOnlyNotice from "../components/ReadOnlyNotice.vue";
 
 const statusReq = useAsync(() => api.cacheStatus());
 const metricsReq = useAsync(() => api.metrics());
@@ -132,6 +134,11 @@ const evictAllPolicies = () =>
     "Evict key policies",
     "Evicted all cached key policies",
   );
+
+// WOR-2576: every state-changing control on this page is refused for a
+// read_only operator by the admin server, so the console disables it and
+// says why rather than offering a button that answers 403.
+const { canMutate, whyNot } = useCapabilities();
 </script>
 
 <template>
@@ -152,6 +159,8 @@ const evictAllPolicies = () =>
       <button class="sb-btn sb-btn--sm" @click="refresh">Refresh</button>
     </template>
   </PageHeader>
+
+  <ReadOnlyNotice action="Purging cache entries and evicting key policy" />
 
   <ErrorState v-if="statusReq.error.value" :error="statusReq.error.value" @retry="refresh" />
   <template v-else>
@@ -177,14 +186,16 @@ const evictAllPolicies = () =>
       </p>
       <template v-else>
         <div class="action">
-          <button class="sb-btn" :disabled="busy === 'all'" @click="purgeAll">
+          <button
+            :title="canMutate ? undefined : whyNot('mutate')" class="sb-btn" :disabled="busy === 'all' || !canMutate" @click="purgeAll">
             Purge everything
           </button>
           <span class="sb-faint">Clears the whole {{ backend }} cache.</span>
         </div>
         <div class="action">
           <input v-model="purgeKey" class="sb-input" placeholder="cache key" />
-          <button class="sb-btn" :disabled="!purgeKey || busy === 'key'" @click="purgeByKey">
+          <button
+            :title="canMutate ? undefined : whyNot('mutate')" class="sb-btn" :disabled="!purgeKey || busy === 'key' || !canMutate" @click="purgeByKey">
             Purge key
           </button>
         </div>
@@ -196,8 +207,9 @@ const evictAllPolicies = () =>
             :disabled="!prefixSupported"
           />
           <button
+            :title="canMutate ? undefined : whyNot('mutate')"
             class="sb-btn"
-            :disabled="!purgePrefix || !prefixSupported || busy === 'prefix'"
+            :disabled="!purgePrefix || !prefixSupported || busy === 'prefix' || !canMutate"
             @click="purgeByPrefix"
           >
             Purge prefix
@@ -217,12 +229,14 @@ const evictAllPolicies = () =>
       </p>
       <div class="action">
         <input v-model="evictId" class="sb-input" placeholder="key id" />
-        <button class="sb-btn" :disabled="!evictId || busy === 'evict'" @click="evictKey">
+        <button
+            :title="canMutate ? undefined : whyNot('mutate')" class="sb-btn" :disabled="!evictId || busy === 'evict' || !canMutate" @click="evictKey">
           Evict key
         </button>
       </div>
       <div class="action">
-        <button class="sb-btn" :disabled="busy === 'evict-all'" @click="evictAllPolicies">
+        <button
+            :title="canMutate ? undefined : whyNot('mutate')" class="sb-btn" :disabled="busy === 'evict-all' || !canMutate" @click="evictAllPolicies">
           Evict all policies
         </button>
       </div>

@@ -4,6 +4,7 @@ import {
   api,
   ApiError,
   setCsrfToken,
+  setSessionRole,
   type ClusterDeploymentBundleDraft,
   type DeploymentReplacementRequest,
   type ExtensionInventorySnapshot,
@@ -589,5 +590,120 @@ describe("admin client marker (WOR-2688)", () => {
         headers: expect.objectContaining({ "X-Requested-With": "XMLHttpRequest" }),
       }),
     );
+  });
+});
+
+/*
+ * WOR-2576. The negative half of the console RBAC story, and the half
+ * that decides whether the gating is worth anything.
+ *
+ * Hiding a nav link is not authorization. What is checked here is that a
+ * session the server resolved as `read_only` cannot issue a gated call
+ * from this client **at all**: the request never reaches `fetch`, so
+ * there is nothing for a hidden button, a typed URL, or a devtools
+ * console to route around on the client side.
+ *
+ * What this is NOT: authorization. The enforcer is the admin server, at
+ * `crates/sbproxy-core/src/admin.rs:8043` for every state-changing
+ * method and at `admin.rs:6608` / `admin_compression.rs:489` for the two
+ * admin-only reads. This client gate can only ever refuse, never grant,
+ * so a bug in it costs an operator an affordance and can never hand one
+ * access. Anything reaching the server with a `read_only` session is
+ * refused there whatever this file does.
+ */
+describe("console RBAC refuses a gated call before it reaches the wire (WOR-2576)", () => {
+  afterEach(() => {
+    setSessionRole(null);
+  });
+
+  it("refuses a mutation from a read_only session without calling fetch", async () => {
+    const fetchMock = stubFetch('{"ok":true}');
+    setSessionRole("read_only");
+
+    await expect(api.setLogLevel("debug")).rejects.toBeInstanceOf(ApiError);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses a raw-body mutation too, which is a second fetch call site", async () => {
+    // `sendRaw` builds its own `fetch` init rather than going through
+    // `request`, so a guard installed in only one of the two would be
+    // narrower than the surface it claims to cover. The config editor is
+    // the caller that would have escaped.
+    const fetchMock = stubFetch("saved");
+    setSessionRole("read_only");
+
+    await expect(api.putConfig("proxy: {}\n")).rejects.toBeInstanceOf(ApiError);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses the admin-only content read from a read_only session", async () => {
+    const fetchMock = stubFetch('{"request_id":"r1"}');
+    setSessionRole("read_only");
+
+    await expect(api.requestContent("r1")).rejects.toBeInstanceOf(ApiError);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses a role the console does not recognize, rather than assuming it is privileged", async () => {
+    const fetchMock = stubFetch('{"ok":true}');
+    setSessionRole("key-operator");
+
+    await expect(api.setLogLevel("debug")).rejects.toBeInstanceOf(ApiError);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses with a 403 carrying the server's own rule, so the UI can explain it", async () => {
+    stubFetch('{"ok":true}');
+    setSessionRole("read_only");
+
+    const error = await api.setLogLevel("debug").catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect((error as ApiError).status).toBe(403);
+  });
+
+  it("lets an admin session through untouched", async () => {
+    const fetchMock = stubFetch('{"level":"debug"}');
+    setSessionRole("admin");
+
+    await api.setLogLevel("debug");
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("still allows a read from a read_only session, which is the whole point of the role", async () => {
+    const fetchMock = stubFetch('{"drift":false}');
+    setSessionRole("read_only");
+
+    await api.drift();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  /*
+   * Two different unknowns, and conflating them breaks the console.
+   *
+   * A role of `null` is "the session probe has not answered yet", which
+   * is every cold load, and the sign-in POST itself happens in exactly
+   * that state. Refusing there would make the console unable to log in.
+   * A role that resolved to a string this build does not recognize is
+   * the other unknown, and that one denies (above).
+   */
+  it("does not gate before the session probe has resolved a role", async () => {
+    const fetchMock = stubFetch('{"authenticated":true,"role":"admin"}');
+    setSessionRole(null);
+
+    await api.login("admin", "changeme");
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("never gates the sign-out call, so a wrong role cannot strand an operator in the console", async () => {
+    const fetchMock = stubFetch('{"ok":true}');
+    setSessionRole("key-operator");
+
+    await api.logout();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
