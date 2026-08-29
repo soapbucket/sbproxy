@@ -2788,7 +2788,7 @@ per_surface_rate_limits:
 | `external` | list | `[]` | External HTTP guardrail adapters and failure policy. See [External AI guardrails](guardrails.md). |
 | `mesh` | object | unset | Runs input detectors as a cascade and fuses verdicts under a quorum rule (`block_threshold`, `redact_on_flag`, `cache`, `cache_capacity`, `latency_budget_ms`). See [ai-guardrail-mesh.md](ai-guardrail-mesh.md). |
 
-Each `input` / `output` entry is an object with a `type` field and type-specific config. Built-in types: `pii`, `secrets`, `injection` (deprecated compatibility alias `prompt_injection`), `toxicity`, `jailbreak`, `content_safety`, `schema`, `regex`, `regex_guard`, `context_poisoning`, `agent_alignment`, `classifier`. The two injection names preserve their existing blocking fields but use the same canonical heuristic matcher as `prompt_injection_v2`. See [ai-gateway.md](ai-gateway.md#guardrails) for per-guardrail fields.
+Each `input` / `output` entry is an object with a `type` field and type-specific config. Built-in types: `pii`, `secrets`, `injection` (deprecated compatibility alias `prompt_injection`), `toxicity`, `jailbreak`, `content_safety`, `schema`, `regex`, `regex_guard`, `license_leak`, `context_poisoning`, `agent_alignment`, `classifier`. The two injection names preserve their existing blocking fields but use the same canonical heuristic matcher as `prompt_injection_v2`. See [ai-gateway.md](ai-gateway.md#guardrails) for per-guardrail fields.
 
 ##### Safety guardrail modes
 

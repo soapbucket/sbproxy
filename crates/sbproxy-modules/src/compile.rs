@@ -26,14 +26,16 @@ use crate::policy::{
     RateLimitPolicy, RequestLimitPolicy, SecHeadersPolicy, SemanticConstraintPolicy, SriPolicy,
     WafPolicy,
 };
+#[cfg(feature = "transform-pdf")]
+use crate::transform::PdfToMarkdownTransform;
 use crate::transform::{
-    A2aAgentCardRewriter, BoilerplateTransform, CelScriptTransform, CitationBlockTransform,
-    CssTransform, DiscardTransform, EncodingTransform, FormatConvertTransform,
-    HtmlToMarkdownTransform, HtmlTransform, JavaScriptTransform, JsJsonTransform,
-    JsonEnvelopeTransform, JsonProjectionTransform, JsonSchemaTransform, JsonTransform,
-    LuaJsonTransform, LuaTransform, MarkdownTransform, NormalizeTransform, OptimizeHtmlTransform,
-    PayloadLimitTransform, ReplaceStringsTransform, SseChunkingTransform, TemplateTransform,
-    Transform, WasmTransform,
+    A2aAgentCardRewriter, AiSchemaTransform, BoilerplateTransform, CelScriptTransform,
+    CitationBlockTransform, CssTransform, DiscardTransform, EncodingTransform,
+    FormatConvertTransform, HtmlToMarkdownTransform, HtmlTransform, JavaScriptTransform,
+    JsJsonTransform, JsonEnvelopeTransform, JsonProjectionTransform, JsonSchemaTransform,
+    JsonTransform, LuaJsonTransform, LuaTransform, MarkdownTransform, NormalizeTransform,
+    OptimizeHtmlTransform, PayloadLimitTransform, ReplaceStringsTransform, SseChunkingTransform,
+    TemplateTransform, Transform, WasmTransform,
 };
 
 /// Compile a JSON action config into an Action enum variant.
@@ -524,6 +526,9 @@ fn compile_transform_with_optional_registry(
         "json_schema" => Ok(Transform::JsonSchema(JsonSchemaTransform::from_config(
             config.clone(),
         )?)),
+        "ai_schema" => Ok(Transform::AiSchema(AiSchemaTransform::from_config(
+            config.clone(),
+        )?)),
         "template" => Ok(Transform::Template(TemplateTransform::from_config(
             config.clone(),
         )?)),
@@ -558,6 +563,20 @@ fn compile_transform_with_optional_registry(
         "markdown" => Ok(Transform::Markdown(MarkdownTransform::from_config(
             config.clone(),
         )?)),
+        #[cfg(feature = "transform-pdf")]
+        "pdf_markdown" => Ok(Transform::PdfMarkdown(PdfToMarkdownTransform::from_config(
+            config.clone(),
+        )?)),
+        // Named explicitly (rather than falling through to the
+        // `unknown transform type` catch-all below) so an operator who
+        // authors `type: pdf_markdown` against a binary built without
+        // `transform-pdf` gets told why, not just that the type is
+        // unrecognized.
+        #[cfg(not(feature = "transform-pdf"))]
+        "pdf_markdown" => anyhow::bail!(
+            "transform type \"pdf_markdown\" requires the `transform-pdf` cargo feature, \
+             which this build was compiled without"
+        ),
         "css" => Ok(Transform::Css(CssTransform::from_config(config.clone())?)),
         "lua" => Ok(Transform::Lua(LuaTransform::from_config(config.clone())?)),
         "lua_json" => Ok(Transform::LuaJson(LuaJsonTransform::from_config(

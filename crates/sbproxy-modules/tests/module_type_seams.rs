@@ -18,7 +18,7 @@
 //! these types and fails there at the assertion rather than at the
 //! `use` line.
 
-use sbproxy_modules::compile_policy;
+use sbproxy_modules::{compile_policy, compile_transform};
 
 // --- WOR-2668: enrichment producers ---------------------------------------
 
@@ -56,4 +56,29 @@ fn user_agent_parser_policy_type_string_compiles_with_no_keys_set() {
     let policy = compile_policy(&serde_json::json!({ "type": "user_agent_parser" }))
         .expect("`type: user_agent_parser` compiles with every key defaulted");
     assert_eq!(policy.policy_type(), "user_agent_parser");
+}
+
+// --- WOR-2670: transform types --------------------------------------------
+
+#[test]
+fn ai_schema_transform_type_string_compiles_to_the_ai_schema_variant() {
+    let transform = compile_transform(&serde_json::json!({
+        "type": "ai_schema",
+        "schema": { "type": "object", "required": ["answer"] },
+        "on_failure": "warn",
+    }))
+    .expect("`type: ai_schema` is a known transform type");
+    assert_eq!(transform.transform_type(), "ai_schema");
+}
+
+/// `pdf_markdown` lives behind the optional `transform-pdf` feature, so
+/// the type string is only expected to resolve when that feature is on.
+/// Without it the arm must still be absent rather than compiling to
+/// something else.
+#[cfg(feature = "transform-pdf")]
+#[test]
+fn pdf_markdown_transform_type_string_compiles_to_the_pdf_variant() {
+    let transform = compile_transform(&serde_json::json!({ "type": "pdf_markdown" }))
+        .expect("`type: pdf_markdown` is a known transform type under transform-pdf");
+    assert_eq!(transform.transform_type(), "pdf_markdown");
 }

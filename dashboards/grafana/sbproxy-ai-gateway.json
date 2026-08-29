@@ -2625,6 +2625,60 @@
         }
       ],
       "description": "Tool-call frames an enforcing ai_tool_call hook or an agent-alignment guard held back that never reached the client. cause=blocked is by design: a guardrail or extension ended the stream and the held frames went with it. cause=unjudged should be flat zero; any rate there means a client received an assistant turn whose tool call the gateway silently deleted. Runbook: docs/operator-runbook.md#ai-gateway. When unjudged is non-zero, check the stream for an upstream that ends without a finish_reason and confirm the guard session is judging every call."
+    },
+    {
+      "id": 45,
+      "title": "License-Leak Guardrail Findings",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 9,
+        "x": 0,
+        "y": 197
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "bars",
+            "pointSize": 5,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (mode, method) (rate(sbproxy_ai_license_leak_findings_total[5m]))",
+          "legendFormat": "{{mode}} / {{method}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "License-leak guardrail confident matches by disposition and detector. Fires for warn/log matches too, not only blocks, so calibration volume is visible before a route is promoted to mode: block. Blocking dispositions also appear on \"Guardrail Triggers by Type\" under category=\"license_leak\"."
     }
   ],
   "templating": {

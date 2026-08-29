@@ -880,6 +880,69 @@
         }
       ],
       "description": "Rollback attempts, by outcome. outcome=\"reverted\" is the one to alert on: it means a node undid a config change on its own after a failed soak, with soak.auto_revert armed, and nobody asked it to. outcome=\"applied\" is an operator using POST /admin/config/rollback, and the two are disjoint so this query is unambiguous. outcome=\"rejected\" climbing during an incident means rollbacks are being refused: read the config_rollback events for the reason, which is usually an unknown revision, a stale expected_current, or a restart-class change nobody confirmed."
+    },
+    {
+      "id": 14,
+      "title": "PDF Transform Decode Errors",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 48
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "bars",
+            "pointSize": 5,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (error_kind) (rate(sbproxy_transform_pdf_decode_errors_total[5m]))",
+          "legendFormat": "{{error_kind}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(sbproxy_transform_pdf_pages_decoded_total[5m]))",
+          "legendFormat": "pages decoded",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "pdf_markdown transform (requires the transform-pdf cargo feature): decode failures by error kind, alongside the successful pages-decoded rate for scale."
     }
   ],
   "templating": {

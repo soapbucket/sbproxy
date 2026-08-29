@@ -11,6 +11,7 @@ mod context_poisoning_rules;
 // constants without duplicating the lists.
 pub mod injection;
 mod jailbreak;
+mod license_leak;
 pub mod mesh;
 mod pii;
 mod regex_guard;
@@ -33,6 +34,10 @@ pub use context_poisoning::{
 pub use context_poisoning_rules::{ContextPoisoningRule, CONTEXT_POISONING_RULES};
 pub use injection::InjectionGuardrail;
 pub use jailbreak::JailbreakGuardrail;
+pub use license_leak::{
+    LicenseLeakGuardrail, LicenseLeakGuardrailConfig, LicenseLeakMode, LicenseLeakTimeoutAction,
+    LicensedDocument,
+};
 pub use mesh::{GuardrailMesh, GuardrailMeshConfig, MeshDecision};
 pub use pii::{PiiAction, PiiGuardrail};
 pub use regex_guard::{RegexAction, RegexGuardrail};
@@ -110,6 +115,9 @@ pub enum Guardrail {
     Schema(SchemaGuardrail),
     /// Regular expression based deny-list guardrail.
     Regex(RegexGuardrail),
+    /// First-party licensed-text-leakage detector for AI output. See
+    /// `license_leak` module docs for the full contract.
+    LicenseLeak(LicenseLeakGuardrail),
     /// Context-poisoning detection guardrail. Flags untrusted
     /// retrieval content that tries to influence a subsequent tool
     /// call.
@@ -139,6 +147,7 @@ impl Guardrail {
             Self::SafetyClassifier(g) => g.name(),
             Self::Schema(_) => "schema",
             Self::Regex(_) => "regex",
+            Self::LicenseLeak(_) => "license_leak",
             Self::ContextPoisoning(_) => "context_poisoning",
             Self::AgentAlignment(_) => "agent_alignment",
             Self::Classifier(_) => "classifier",
@@ -156,6 +165,7 @@ impl Guardrail {
             Self::SafetyClassifier(g) => g.check(content),
             Self::Schema(g) => g.check(content),
             Self::Regex(g) => g.check(content),
+            Self::LicenseLeak(g) => g.check(content),
             Self::ContextPoisoning(g) => g.check(content),
             // Alignment is body-shape-aware; the text view of
             // assistant messages loses `tool_calls`, so the
@@ -317,6 +327,13 @@ impl Guardrail {
             // result; the stream session routes it to close-time
             // evaluation.
             Self::Schema(_) => false,
+            // The heuristic (token-shingle Jaccard overlap) and
+            // embedding-stub detectors need the complete response
+            // text; an accumulating prefix is not prefix-stable for
+            // either, the same reasoning that keeps `Schema` and
+            // `SafetyClassifier` off the per-chunk path. See the
+            // `license_leak` module docs.
+            Self::LicenseLeak(_) => false,
             Self::ContextPoisoning(_) => true,
             // WOR-1810: these four are case-insensitive substring
             // matchers. Substring matching over an accumulating prefix
@@ -870,6 +887,9 @@ pub fn compile_guardrail(config: &serde_json::Value) -> Result<Guardrail> {
         "regex" => Ok(Guardrail::Regex(regex_guard::RegexGuardrail::from_config(
             config,
         )?)),
+        "license_leak" => Ok(Guardrail::LicenseLeak(
+            license_leak::LicenseLeakGuardrail::from_config(config)?,
+        )),
         "classifier" => Ok(Guardrail::Classifier(
             classifier::ClassifierGuardrail::from_config(config)?,
         )),
@@ -911,10 +931,11 @@ pub fn compile_pipeline(config: &GuardrailsConfig) -> Result<GuardrailPipeline> 
         // WOR-2174: schema entries default to close-time evaluation
         // alongside classifier-backed entries; an intermediate delta
         // is rarely complete JSON, so a per-delta schema verdict would
-        // terminate valid streams.
+        // terminate valid streams. `license_leak` joins them for the
+        // same reason its `streaming_safe()` returns `false`.
         let close_by_default = matches!(
             guardrail,
-            Guardrail::SafetyClassifier(_) | Guardrail::Schema(_)
+            Guardrail::SafetyClassifier(_) | Guardrail::Schema(_) | Guardrail::LicenseLeak(_)
         );
         pipeline.output.push(guardrail);
         // Per-entry streaming policy rides the same raw entry; unknown

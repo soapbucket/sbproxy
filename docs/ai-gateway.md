@@ -1644,7 +1644,7 @@ remain unavailable.
 
 Input guardrails inspect the parsed prompt ahead of egress ([config](../examples/ai-guardrails/)).
 
-The built-in pipeline supports ten guardrail types: `pii`, `injection`, `jailbreak`, `toxicity`, `content_safety`, `schema`, `regex`, `context_poisoning`, `agent_alignment`, and `classifier`. Built-in guardrails run on input (before the provider call) or output (after), and they can block, flag, or rewrite content. For HTTP policy services, use [external guardrail adapters](guardrails.md). For CEL-based request gating see the CEL section below, and [configuration.md](configuration.md#guardrails-guardrails) for the per-type field schema.
+The built-in pipeline supports eleven guardrail types: `pii`, `injection`, `jailbreak`, `toxicity`, `content_safety`, `schema`, `regex`, `license_leak`, `context_poisoning`, `agent_alignment`, and `classifier`. Built-in guardrails run on input (before the provider call) or output (after), and they can block, flag, or rewrite content. For HTTP policy services, use [external guardrail adapters](guardrails.md). For CEL-based request gating see the CEL section below, and [configuration.md](configuration.md#guardrails-guardrails) for the per-type field schema.
 
 An external guardrail entry carries two independent settings that are easy to confuse. `mode` picks when the adapter runs and, in the `logging_only` case, says it must never refuse; that is the enforcement axis. `failure_posture` says what happens when the adapter cannot be reached, is too slow, or returns something that is not a verdict; that is the failure axis. They compose: a guardrail can sit in `mode: logging_only` during rollout while already declaring `failure_posture: closed` for the day it starts enforcing. Accepted values are `closed` (refuse, the default), `open` (admit), and `degraded` (admit, and record that the content was never scanned; prefer this over `open`). `observe` is rejected on this axis, because a provider that never answered leaves no verdict to shadow-record; `mode: logging_only` is the observe-shaped setting, on the other axis. The older boolean spelling `fail_open: true|false` still parses and still means `open` and `closed`; setting both to values that disagree is a config-load error naming both keys. Field reference and the per-provider contracts are in [guardrails.md](guardrails.md). A Bedrock provider entry can also carry `bedrock_guardrail`, which asks Bedrock to evaluate the guardrail inside the `Converse` generation instead of as a separate `ApplyGuardrail` call; that control has no failure posture, and the two are compared in [guardrails.md](guardrails.md#bedrock-guardrails-inline-on-the-converse-call).
 
@@ -1908,6 +1908,32 @@ The schema compiles once, when the configuration is published, and the full comp
 The guardrail judges the assistant payload, not the transport envelope. For OpenAI Chat responses that is `choices[].message.content` (multiple choices concatenate in index order), for OpenAI Responses it is the assistant message output items, and for Anthropic Messages it is the text content blocks. This is the same canonical extraction the classifier-backed output guardrails use, so a route that translates between provider formats validates the same payload on every surface. The extracted text is parsed as JSON before validation; when the schema's top-level `type` is exactly `string`, the text is validated directly as a string instance instead. A response the gateway cannot map to an assistant payload fails closed with a `schema` block: an unrecognized response shape, a tool-call-only turn with no content, or a body that is not valid UTF-8.
 
 A block reports the failing JSON path and the schema keyword in the form `Schema validation failed at /summary (keyword: type)`. The offending value never appears in the error, because it is model output that would otherwise be relayed into the client-visible error body. Missing `required` property names are the one exception; those names come from the operator's schema, not from the response.
+
+### License-leak guardrail
+
+`type: license_leak` scores the model's output text against a small operator-supplied corpus of licensed documents and flags reproduction. It is a first-party detector in this same pipeline, not an [external guardrail adapter](guardrails.md).
+
+```yaml
+guardrails:
+  output:
+    - type: license_leak
+      mode: warn
+      documents:
+        - license_urn: "urn:example:article:2026-04-12"
+          body: "The full text of the licensed document..."
+```
+
+Three signals combine into one verdict: a rolling 32-character substring match against the corpus (a verbatim quote), three heuristic rules (a 200+ character unbroken run with no attribution marker, a 5-word shingle overlap of 0.70+ against a single document, or three or more distinct verbatim spans against the same document), and a token-shingle Jaccard overlap standing in for embedding similarity (no ONNX model ships with this guardrail; the stub is biased toward verbatim and near-verbatim text and under-detects aggressive paraphrase).
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `mode` | string | `warn` | `block` refuses the response; `redact` currently behaves identically to `block` (the pipeline's block-or-pass interface has no channel for returning rewritten content, the same limitation `pii`'s `mask` action documents); `warn` forwards the response and logs at `WARN`; `log` forwards and logs at `INFO`. |
+| `confidence_threshold` | float | `0.95` | Clamped to `[0.85, 0.99]`. |
+| `max_eval_ms` | int | `50` | Soft wall-clock budget. The detector is not preemptible mid-scan; exceeding this substitutes `timeout_action` for `mode`. |
+| `timeout_action` | string | `warn` | `block` \| `warn` \| `log`, applied instead of `mode` when `max_eval_ms` is exceeded. |
+| `documents` | list | `[]` | `license_urn` + `body` pairs. Empty is a documented no-op, for staging the integration before publishing a corpus. |
+
+Not prefix-stable (the heuristic and stub detectors need the complete text), so a streaming response evaluates once at stream close, the same as `schema` and the classifier-backed guardrails; there is no lower-time-to-first-byte windowed mode. A confident match increments `sbproxy_ai_license_leak_findings_total{mode, method}` regardless of disposition, and a blocking one (`block` or `redact`) additionally increments `sbproxy_ai_guardrail_blocks_total{category="license_leak"}`. Verified against [`examples/license-leak-guardrail/sb.yml`](../examples/license-leak-guardrail/).
 
 ### Context-poisoning guardrail
 
@@ -3941,7 +3967,8 @@ The proxy exposes aggregate AI usage as Prometheus metrics. The `/metrics` endpo
 | `sbproxy_ai_gateway_decisions_total` | Counter | `decision`, `reason` | One terminal admission decision per AI request. `decision="rejected"` counts requests refused before provider dispatch, with the bounded outcome in `reason`; admitted requests use `reason="none"`. This is the numerator and denominator for gateway rejection-rate panels and alerts |
 | `sbproxy_ai_data_posture_filter_total` | Counter | `constraint`, `outcome`, `tenant` | Requests whose provider candidate set the data-posture constraint narrowed (`outcome="filtered"`) or refused outright (`outcome="refused"`). See [Provider data posture](#provider-data-posture) |
 | `sbproxy_ai_failovers_total` | Counter | `from_provider`, `to_provider`, `reason` | Provider failover events |
-| `sbproxy_ai_guardrail_blocks_total` | Counter | `category` | Guardrail block events (pii, injection, jailbreak, etc.) |
+| `sbproxy_ai_guardrail_blocks_total` | Counter | `category` | Guardrail block events (pii, injection, jailbreak, license_leak, etc.) |
+| `sbproxy_ai_license_leak_findings_total` | Counter | `mode`, `method` | License-leak guardrail confident matches, one per evaluation regardless of `mode`, so `warn`/`log` volume is visible before promoting a route to `block` |
 | `sbproxy_ai_translation_dropped_total` | Counter | `surface`, `field` | Request fields dropped in translation: an inbound `/v1/messages` or `/v1/responses` body becoming the canonical chat shape, or that canonical body becoming an Anthropic Messages body on the way upstream. On the inbound seams `surface` matches `sbproxy_ai_surface_requests_total`, so the ratio is a drop rate; the provider leg reports under `anthropic_translator`, which no inbound surface uses. `field` is a bounded class (`anthropic.messages.content`, `responses.text`, `anthropic.request.seed`, ...). The matching log line is `AI proxy: request fields dropped in translation`, which carries the origin and tenant on the inbound seams |
 | `sbproxy_ai_safety_guardrail_verdicts_total` | Counter | `guardrail`, `class`, `backend`, `verdict` | Toxicity, jailbreak, and content-safety evaluations, including whether keyword or classifier mode produced the verdict |
 | `sbproxy_ai_reasoning_policy_attempts_total` | Counter | `provider`, `outcome` | Per-provider concise-reasoning result: `native`, `prompt_fallback`, `off`, `tool_bypass`, or `code_bypass` |

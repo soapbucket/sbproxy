@@ -85,6 +85,9 @@ rag-vector-pinecone = ["rag", "sbproxy-rag/vector-pinecone"]
 rag-vector-qdrant = ["rag", "sbproxy-rag/vector-qdrant"]
 rag-vector-redis = ["rag", "sbproxy-rag/vector-redis"]
 rag-vector-weaviate = ["rag", "sbproxy-rag/vector-weaviate"]
+# Forwards to `sbproxy-modules/transform-pdf` (the `pdf_markdown`
+# transform). Off by default; see that feature's doc comment for why.
+transform-pdf = ["sbproxy-modules/transform-pdf"]
 # WOR-2100: authoritative payment settlement. `payments` pulls in the
 # billing crate's durable store, dispatch gate, authoritative service, and
 # recovery-only worker, and compiles `billing_runtime`. Each rail feature
