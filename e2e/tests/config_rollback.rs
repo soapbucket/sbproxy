@@ -534,37 +534,50 @@ fn a_bad_config_soaks_reverts_survives_a_restart_and_rolls_forward() {
 
     // --- 4. Kill, corrupt the file, restart on the ring.
     node.kill();
-    // Break the origin, not the `proxy:` block. That is both the
-    // realistic case (a typo inside an origin) and the only one the
-    // fallback can act on: the ring's directory is named by the very
-    // document that is broken, so a lenient partial parse has to be
-    // able to recover `proxy.config_history` out of it. A document
-    // whose `proxy:` block is unparseable falls back to the packaged
-    // default directory, which on a real node is /var/lib/sbproxy and
-    // is not the ring this node has been writing.
+    // Break the origin, not the `proxy:` block. The ring's directory is
+    // named by the very document that is broken, so a lenient partial
+    // parse has to be able to recover `proxy.config_history` out of it;
+    // a document whose `proxy:` block is unparseable falls back to the
+    // packaged default directory, which on a real node is
+    // /var/lib/sbproxy and is not the ring this node has been writing.
+    //
+    // The break is a **construct-only** failure on purpose. An unknown
+    // action type compiles cleanly and fails when the module is built,
+    // which is where most operator typos land. That class used to walk
+    // straight past the fallback: the pre-check stopped at
+    // `compile_config`, the primary document's early return skipped the
+    // ring walk entirely, and the process exited
+    // `Fatal: unknown action type: load_balancerr` with no pin, no boot
+    // counter and no walk, on every restart. Step 4 is the end-to-end
+    // proof that it does not any more.
     std::fs::write(
         &config_path,
-        good.replace(
-            "  \"api.local\":\n",
-            "  \"api.local\":\n    typo_nobody_meant_to_type: true\n",
-        ),
+        good.replace("type: load_balancer\n", "type: load_balancerr\n"),
     )
     .expect("corrupt the config");
-    // Prove the corruption is one the boot path actually refuses. A
-    // "corrupt" document that the parser shrugs at would leave the rest
-    // of this arc testing an ordinary restart.
+    // Prove the corruption is the class this step means to cover, and
+    // that it really is refused. A "corruption" the parser shrugs at
+    // would leave the rest of this arc testing an ordinary restart, and
+    // a *compile* failure would not exercise the construct check at
+    // all. `validate` prints the two apart, so assert on which one.
     let refused = Command::new(proxy_binary_path())
         .arg("validate")
         .arg("-f")
         .arg(&config_path)
         .output()
         .expect("run validate");
-    assert!(
-        String::from_utf8_lossy(&refused.stdout).contains("did not compile")
-            || String::from_utf8_lossy(&refused.stderr).contains("did not compile"),
-        "the corrupted document must fail to compile:\nstdout: {}\nstderr: {}",
+    let validate_says = format!(
+        "{}{}",
         String::from_utf8_lossy(&refused.stdout),
         String::from_utf8_lossy(&refused.stderr),
+    );
+    assert!(
+        validate_says.contains("a module failed to construct"),
+        "step 4 covers the construct-only class, not a parse error: {validate_says}",
+    );
+    assert!(
+        validate_says.contains("unknown action type: load_balancerr"),
+        "and the failure is the one this step planted: {validate_says}",
     );
     let rescued = Node::start(
         &config_path,
@@ -585,8 +598,10 @@ fn a_bad_config_soaks_reverts_survives_a_restart_and_rolls_forward() {
     let pin = rescued.admin("GET", "/admin/config/fallback", None).json();
     assert_eq!(pin["active"], true, "{pin}");
     assert!(
-        pin["reason"].as_str().is_some_and(|why| !why.is_empty()),
-        "the pin names why the configured document failed: {pin}",
+        pin["reason"]
+            .as_str()
+            .is_some_and(|why| why.contains("unknown action type: load_balancerr")),
+        "the pin names why the configured document failed, in the words the proxy used: {pin}",
     );
 
     // --- 5. The watcher is suspended, so touching the directory moves

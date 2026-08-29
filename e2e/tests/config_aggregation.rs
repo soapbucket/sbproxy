@@ -114,6 +114,23 @@ fn admin(port: u16, method: &str, path: &str) -> Reply {
     }
 }
 
+/// Wait for something to accept a TCP connection on `port`.
+///
+/// Weaker than the harness's HTTP probe on purpose: a TLS listener
+/// cannot answer one, and a kernel-accepted connection with no accept
+/// loop behind it would still connect. The caller follows this with a
+/// real request, which is the assertion that matters.
+fn wait_for_tcp(port: u16, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("nothing accepting TCP on 127.0.0.1:{port} within {timeout:?}");
+}
+
 fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
     let deadline = Instant::now() + CONVERGE;
     while Instant::now() < deadline {
@@ -606,8 +623,16 @@ origins:
     let harness = ProxyHarness::start_with_workspace(&yaml, &[]).expect("start authority");
     ProxyHarness::wait_for_port(admin_port, Duration::from_secs(30))
         .expect("authority admin port never bound");
-    ProxyHarness::wait_for_port(bundle_port, Duration::from_secs(30))
-        .expect("authority bundle listener never bound");
+    if ca_file.is_some() {
+        // `ProxyHarness::wait_for_port` is an HTTP-level probe, by
+        // design, and it cannot complete against a TLS listener. Wait
+        // for the accept loop at the TCP level here; the handshake in
+        // the test itself is what proves the acceptor really built.
+        wait_for_tcp(bundle_port, Duration::from_secs(30));
+    } else {
+        ProxyHarness::wait_for_port(bundle_port, Duration::from_secs(30))
+            .expect("authority bundle listener never bound");
+    }
     LiveAuthority {
         _harness: harness,
         admin_port,
