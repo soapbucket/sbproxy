@@ -1637,6 +1637,43 @@ mod tests {
         assert!(pipeline.has_output());
     }
 
+    /// The seam `license_leak` has to cross to reach an operator:
+    /// `compile_guardrail`'s `type` match.
+    ///
+    /// Everything else about the guardrail can be written and unit
+    /// tested and still be unreachable, because an unmatched `type`
+    /// string is not a compile error, it is a config an operator writes
+    /// and `compile_pipeline` refuses at load with "unknown guardrail
+    /// type". This is the WOR-2670 red-first test for that arm; the
+    /// policy, transform, and action seams are pinned in
+    /// `sbproxy-modules/tests/module_type_seams.rs`.
+    #[test]
+    fn license_leak_guardrail_type_string_compiles_and_reaches_the_pipeline() {
+        let entry = serde_json::json!({
+            "type": "license_leak",
+            "mode": "warn",
+            "documents": [
+                { "license_urn": "urn:example:doc:1", "body": "the licensed body text" },
+            ],
+        });
+
+        let guardrail =
+            compile_guardrail(&entry).expect("`type: license_leak` is a known guardrail type");
+        assert!(matches!(guardrail, Guardrail::LicenseLeak(_)));
+
+        // And through the pipeline an operator actually configures,
+        // rather than only through the compiler in isolation.
+        let pipeline = compile_pipeline(&GuardrailsConfig {
+            input: vec![],
+            output: vec![entry],
+            mesh: None,
+            external: Vec::new(),
+        })
+        .expect("a license_leak output entry compiles into a pipeline");
+        assert_eq!(pipeline.output.len(), 1);
+        assert!(pipeline.has_output());
+    }
+
     /// Two `pii` entries with disjoint pattern sets are a legal
     /// pipeline, and both blocks are named `"pii"`. The indexed check
     /// must report the instance that actually blocked (the second:
