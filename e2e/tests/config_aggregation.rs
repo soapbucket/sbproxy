@@ -155,11 +155,7 @@ fn start_stub_upstream() -> LoopbackServer {
             .trim()
             .to_string();
         let body = format!("upstream-for:{host}");
-        Some((
-            "200 OK",
-            "text/plain".to_string(),
-            body.into_bytes(),
-        ))
+        Some(("200 OK", "text/plain".to_string(), body.into_bytes()))
     })
 }
 
@@ -454,7 +450,10 @@ struct AggregateRun {
 
 impl AggregateRun {
     fn combined(&self) -> String {
-        format!("--- stdout ---\n{}\n--- stderr ---\n{}", self.stdout, self.stderr)
+        format!(
+            "--- stdout ---\n{}\n--- stderr ---\n{}",
+            self.stdout, self.stderr
+        )
     }
 }
 
@@ -634,6 +633,63 @@ proxy:
     )
 }
 
+/// The `requests_per_minute` the node's composed `origins:` map carries
+/// for `host`, or `None` when nothing composed for it yet.
+///
+/// Read out of `GET /admin/config/effective`'s `yaml` field rather than
+/// by substring, because the same number is the right answer for one
+/// host and the wrong one for another: the floor is 600 and only
+/// checkout overrides it.
+fn composed_rate_limit(admin_port: u16, host: &str) -> Option<u64> {
+    let effective = admin(admin_port, "GET", "/admin/config/effective");
+    if effective.status != 200 {
+        return None;
+    }
+    let document = effective.json();
+    let yaml = document["yaml"].as_str()?;
+    let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).ok()?;
+    parsed
+        .get("origins")?
+        .get(host)?
+        .get("policies")?
+        .as_sequence()?
+        .iter()
+        .find(|policy| {
+            policy.get("type").and_then(serde_yaml::Value::as_str) == Some("rate_limiting")
+        })?
+        .get("requests_per_minute")?
+        .as_u64()
+}
+
+/// Every policy `type` the node composed for `host`.
+fn composed_policy_types(admin_port: u16, host: &str) -> Vec<String> {
+    let effective = admin(admin_port, "GET", "/admin/config/effective");
+    let document = effective.json();
+    let Some(yaml) = document["yaml"].as_str() else {
+        return Vec::new();
+    };
+    let Ok(parsed) = serde_yaml::from_str::<serde_yaml::Value>(yaml) else {
+        return Vec::new();
+    };
+    parsed
+        .get("origins")
+        .and_then(|origins| origins.get(host))
+        .and_then(|origin| origin.get("policies"))
+        .and_then(serde_yaml::Value::as_sequence)
+        .map(|policies| {
+            policies
+                .iter()
+                .filter_map(|policy| {
+                    policy
+                        .get("type")
+                        .and_then(serde_yaml::Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// What the node answers for `host`, as `(status, body)`.
 fn node_get(node: &ProxyHarness, host: &str) -> (u16, String) {
     match node.get("/", host) {
@@ -655,7 +711,8 @@ fn two_project_repos_one_aggregator_and_a_node_that_was_handed_no_origins() {
     let serve_root = dir.path().join("git");
     std::fs::create_dir_all(&serve_root).expect("create git root");
 
-    let checkout = ProjectRepo::create(dir.path(), &serve_root, "checkout", &checkout_profile(1200));
+    let checkout =
+        ProjectRepo::create(dir.path(), &serve_root, "checkout", &checkout_profile(1200));
     let billing = ProjectRepo::create(dir.path(), &serve_root, "billing", &billing_profile());
     let git_server = start_git_server(serve_root.clone());
     let upstream = start_stub_upstream();
@@ -705,7 +762,10 @@ fn two_project_repos_one_aggregator_and_a_node_that_was_handed_no_origins() {
     });
     for host in [CHECKOUT_HOST, HOOKS_HOST, BILLING_HOST] {
         let (status, body) = node_get(&node, host);
-        assert_eq!(status, 200, "{host} should be served by the composed bundle");
+        assert_eq!(
+            status, 200,
+            "{host} should be served by the composed bundle"
+        );
         assert!(
             body.starts_with("upstream-for:"),
             "{host} reached the stub upstream: {body}",
@@ -716,18 +776,29 @@ fn two_project_repos_one_aggregator_and_a_node_that_was_handed_no_origins() {
     let effective = admin(node_admin, "GET", "/admin/config/effective");
     assert_eq!(effective.status, 200, "{}", effective.body);
     let document = effective.body;
+    // Asserted on the parsed document rather than by substring:
+    // composition strips `name`, `locked` and `disabled` before it
+    // emits, because the modules these lists feed reject unknown keys,
+    // and the floor's 600 is the *right* answer for the two hosts that
+    // never overrode it.
+    let checkout_policies = composed_policy_types(node_admin, CHECKOUT_HOST);
     assert!(
-        document.contains("platform_headers_lock"),
-        "the platform's locked policy reached the node: {document}",
+        checkout_policies.contains(&"security_headers".to_string()),
+        "the platform's locked policy reached the node: {checkout_policies:?}\n{document}",
     );
     assert!(
-        document.contains("checkout_request_limit"),
-        "the project's own added policy reached the node",
+        checkout_policies.contains(&"request_limit".to_string()),
+        "the project's own added policy reached the node: {checkout_policies:?}",
     );
-    assert!(
-        document.contains("1200"),
-        "the project's override of the unlocked default is at the project's value, not the \
-         platform's 600",
+    assert_eq!(
+        composed_rate_limit(node_admin, CHECKOUT_HOST),
+        Some(1200),
+        "the project's override of the unlocked default is at the project's value",
+    );
+    assert_eq!(
+        composed_rate_limit(node_admin, BILLING_HOST),
+        Some(600),
+        "and a project that never overrode it stays on the platform's floor",
     );
 
     // --- A project merges a change to its own repository. One
@@ -737,9 +808,7 @@ fn two_project_repos_one_aggregator_and_a_node_that_was_handed_no_origins() {
     let second = publish_round(&runtime, authority.admin_port);
     assert!(second.success, "second publish: {}", second.combined());
     wait_until("the node to take the project's merged change", || {
-        admin(node_admin, "GET", "/admin/config/effective")
-            .body
-            .contains("2400")
+        composed_rate_limit(node_admin, CHECKOUT_HOST) == Some(2400)
     });
 
     // --- The platform raises a default in the runtime document. Both
@@ -759,9 +828,8 @@ fn two_project_repos_one_aggregator_and_a_node_that_was_handed_no_origins() {
     let third = publish_round(&runtime, authority.admin_port);
     assert!(third.success, "third publish: {}", third.combined());
     wait_until("the node to take the platform's raised floor", || {
-        admin(node_admin, "GET", "/admin/config/effective")
-            .body
-            .contains("900")
+        composed_rate_limit(node_admin, BILLING_HOST) == Some(900)
+            && composed_rate_limit(node_admin, HOOKS_HOST) == Some(900)
     });
 
     // --- Nothing the aggregator could read from its own environment
@@ -775,8 +843,7 @@ fn two_project_repos_one_aggregator_and_a_node_that_was_handed_no_origins() {
     // --- A bad configuration that did get published is undone by
     // `config-authority rollback`, and the node returns to the previous
     // behavior.
-    let before_rollback = admin(node_admin, "GET", "/admin/config/effective").body;
-    assert!(before_rollback.contains("900"));
+    assert_eq!(composed_rate_limit(node_admin, BILLING_HOST), Some(900));
     let status = admin(
         authority.admin_port,
         "GET",
@@ -815,8 +882,8 @@ fn two_project_repos_one_aggregator_and_a_node_that_was_handed_no_origins() {
         String::from_utf8_lossy(&rollback.stderr),
     );
     wait_until("the node to converge on the rolled-back revision", || {
-        let document = admin(node_admin, "GET", "/admin/config/effective").body;
-        document.contains("1200") && !document.contains("2400")
+        composed_rate_limit(node_admin, CHECKOUT_HOST) == Some(1200)
+            && composed_rate_limit(node_admin, BILLING_HOST) == Some(600)
     });
     assert_eq!(
         node_get(&node, CHECKOUT_HOST).0,
@@ -835,7 +902,8 @@ fn a_node_boots_from_its_cached_bundle_with_the_authority_gone() {
     let dir = tempfile::tempdir().expect("temp dir");
     let serve_root = dir.path().join("git");
     std::fs::create_dir_all(&serve_root).expect("create git root");
-    let checkout = ProjectRepo::create(dir.path(), &serve_root, "checkout", &checkout_profile(1200));
+    let checkout =
+        ProjectRepo::create(dir.path(), &serve_root, "checkout", &checkout_profile(1200));
     let billing = ProjectRepo::create(dir.path(), &serve_root, "billing", &billing_profile());
     let git_server = start_git_server(serve_root.clone());
     let upstream = start_stub_upstream();
@@ -844,7 +912,14 @@ fn a_node_boots_from_its_cached_bundle_with_the_authority_gone() {
     let runtime = dir.path().join("runtime.yml");
     std::fs::write(
         &runtime,
-        runtime_yaml(&checkout, &billing, git_server.port, &upstream_target, 600, ""),
+        runtime_yaml(
+            &checkout,
+            &billing,
+            git_server.port,
+            &upstream_target,
+            600,
+            "",
+        ),
     )
     .expect("write runtime config");
 
@@ -919,7 +994,8 @@ fn offline_fixture() -> OfflineFixture {
     let dir = tempfile::tempdir().expect("temp dir");
     let serve_root = dir.path().join("git");
     std::fs::create_dir_all(&serve_root).expect("create git root");
-    let checkout = ProjectRepo::create(dir.path(), &serve_root, "checkout", &checkout_profile(1200));
+    let checkout =
+        ProjectRepo::create(dir.path(), &serve_root, "checkout", &checkout_profile(1200));
     let billing = ProjectRepo::create(dir.path(), &serve_root, "billing", &billing_profile());
     let git_server = start_git_server(serve_root);
     let upstream = start_stub_upstream();
@@ -968,7 +1044,11 @@ fn a_profile_that_touches_a_locked_default_fails_the_compose_and_names_the_proje
     // The good round first, so the failure below is a change and not the
     // starting state.
     let (good, wrote) = compose_offline(&runtime, &out);
-    assert!(good.success && wrote, "baseline compose: {}", good.combined());
+    assert!(
+        good.success && wrote,
+        "baseline compose: {}",
+        good.combined()
+    );
     let baseline = std::fs::read_to_string(&out).expect("read composed");
 
     fixture.checkout.merge(
@@ -1019,7 +1099,9 @@ fn a_profile_that_does_not_compile_is_attributed_to_its_entry() {
     let runtime = fixture.runtime(600, "");
     let out = fixture.root.join("composed.yml");
 
-    fixture.billing.merge("name: billing\nspec:\n  api:\n    base:\n      action:\n  \t- not yaml\n");
+    fixture
+        .billing
+        .merge("name: billing\nspec:\n  api:\n    base:\n      action:\n  \t- not yaml\n");
     let (refused, wrote) = compose_offline(&runtime, &out);
     assert!(
         !refused.success,
@@ -1067,7 +1149,10 @@ fn a_second_entry_claiming_a_taken_host_fails_the_compose_by_name() {
         "two entries cannot both claim one host: {}",
         refused.combined(),
     );
-    assert!(!wrote, "and nothing is written before the clash is resolved");
+    assert!(
+        !wrote,
+        "and nothing is written before the clash is resolved"
+    );
     let message = refused.combined();
     assert!(
         message.contains(CHECKOUT_HOST),

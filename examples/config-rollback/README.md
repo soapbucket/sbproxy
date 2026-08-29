@@ -73,22 +73,35 @@ The health check on the target fails twice in a row, the upstream-health signal 
 
 ```bash
 curl -s -u admin:demo-change-me http://127.0.0.1:9090/admin/config/history \
-  | jq '{lkg_revision, entries: [.entries[] | {revision, state, verdict: .soak_verdict.outcome}]}'
+  | jq '{lkg_revision, entries: [.entries[] | {revision, state}]}'
 ```
 
 ```json
 {
   "lkg_revision": 1,
   "entries": [
-    { "revision": 1, "state": "good", "verdict": "passed" },
-    { "revision": 2, "state": "applied", "verdict": "failed" }
+    { "revision": 2, "state": "applied" },
+    { "revision": 1, "state": "good" }
   ]
 }
 ```
 
-`lkg_revision` is still 1. That is the whole feature in one number: the broken document is recorded, it is serving, and it did not become the thing this node falls back to.
+`lkg_revision` is still 1. That is the whole feature in one number: the broken document is recorded, it is serving, and it did not become the thing this node falls back to. Revision 2 stays `applied` forever; only a passing window turns an entry `good`.
 
-`sbproxy_config_soak_verdict_total{verdict="failed",signal="upstream_health"}` moved at the same time, which is the alert to hang on this.
+The ring's rows carry the state, not the verdict. Which signal caught it is on the metric, which is also where the alert goes:
+
+```bash
+curl -s -u admin:demo-change-me http://127.0.0.1:9090/metrics \
+  | grep sbproxy_config_soak_verdict_total
+```
+
+```
+sbproxy_config_soak_verdict_total{signal="operator_probe",verdict="passed"} 1
+sbproxy_config_soak_verdict_total{signal="upstream_health",verdict="failed"} 1
+sbproxy_config_soak_verdict_total{signal="upstream_health",verdict="passed"} 1
+```
+
+One row per signal per verdict. The operator probe passed, because the admin port is fine; the upstream-health signal failed, and one non-abstaining failure is a failed window whatever else passed.
 
 ## Undo it
 

@@ -201,7 +201,13 @@ struct Node {
 }
 
 impl Node {
-    fn start(config_path: &Path, http_port: u16, admin_port: u16, args: &[&str], dir: &Path) -> Self {
+    fn start(
+        config_path: &Path,
+        http_port: u16,
+        admin_port: u16,
+        args: &[&str],
+        dir: &Path,
+    ) -> Self {
         let stdout = dir.join(format!("node-{admin_port}.out"));
         let stderr = dir.join(format!("node-{admin_port}.err"));
         let child = Command::new(proxy_binary_path())
@@ -260,6 +266,20 @@ impl Node {
             .and_then(|line| line.split_whitespace().nth(1)?.parse().ok())
     }
 
+    /// The value of one labeled counter sample, or `0.0` when the
+    /// series does not exist yet.
+    ///
+    /// A counter that has never been incremented has no series at all,
+    /// so "absent" and "zero" are the same answer to the question these
+    /// assertions ask.
+    fn counter(&self, series: &str) -> f64 {
+        self.metrics()
+            .lines()
+            .find(|line| line.starts_with(series))
+            .and_then(|line| line.split_whitespace().last()?.parse().ok())
+            .unwrap_or(0.0)
+    }
+
     /// The body this node serves for `host`, or `None` when it did not
     /// answer 200.
     fn serves(&self, host: &str) -> Option<String> {
@@ -308,6 +328,16 @@ impl Drop for Node {
     }
 }
 
+/// The status this node answers for `api.local`, or `0` when the
+/// request did not complete.
+fn node_error_status(node: &Node) -> u16 {
+    client()
+        .get(format!("http://127.0.0.1:{}/", node.http_port))
+        .header("host", "api.local")
+        .send()
+        .map_or(0, |response| response.status().as_u16())
+}
+
 /// Poll `condition` until it is true or `CONVERGE` elapses.
 fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
     let deadline = Instant::now() + CONVERGE;
@@ -315,7 +345,7 @@ fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
         if condition() {
             return;
         }
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(250));
     }
     panic!("timed out waiting for {what}");
 }
@@ -348,6 +378,11 @@ fn node_yaml(
     port: {admin_port}
     username: {ADMIN_USER}
     password: {ADMIN_PASSWORD}
+    # This suite polls the admin API to observe ring state, and the
+    # shipped 240-per-minute limit is a rate a poll loop reaches in
+    # seconds. Raised here rather than slowed down there, so a wait
+    # stays responsive enough to catch a transition.
+    rate_limit_per_minute: 100000
   extensions:
     upstream:
       allow_private_cidrs:
@@ -404,14 +439,7 @@ fn a_bad_config_soaks_reverts_survives_a_restart_and_rolls_forward() {
     let http_port = pick_port();
     let admin_port = pick_port();
 
-    let good = node_yaml(
-        http_port,
-        admin_port,
-        &history,
-        upstream.port,
-        true,
-        true,
-    );
+    let good = node_yaml(http_port, admin_port, &history, upstream.port, true, true);
     std::fs::write(&config_path, &good).expect("write config");
 
     // --- 1. Boot on a good config, serve, and watch the soak promote it.
@@ -439,36 +467,37 @@ fn a_bad_config_soaks_reverts_survives_a_restart_and_rolls_forward() {
     let broken = node_yaml(http_port, admin_port, &history, dead, true, true);
     node.rewrite_config(&broken);
     let reloaded = node.reload();
-    assert_eq!(reloaded.status, 200, "the broken config compiles: {}", reloaded.body);
+    assert_eq!(
+        reloaded.status, 200,
+        "the broken config compiles: {}",
+        reloaded.body
+    );
     wait_until("the broken revision to be recorded", || {
         node.history()["entries"].as_array().map(Vec::len) >= Some(2)
     });
+    assert_eq!(
+        node_error_status(&node),
+        502,
+        "the broken document really did break traffic:\n{}",
+        node.log(),
+    );
 
-    // The soak fails on the upstream-health signal, and the pointer does
-    // not move. Both halves matter: a soak that failed but promoted
-    // anyway would leave the fallback with a broken rollback target.
-    wait_until("the soak to fail on the broken revision", || {
-        let entries = node.history();
-        entries["entries"]
-            .as_array()
-            .and_then(|rows| rows.iter().find(|row| row["revision"] == 2))
-            .is_some_and(|row| row["soak_verdict"]["outcome"] == "failed")
+    // The soak fails, and it fails on the upstream-health signal
+    // specifically. The ring's own rows carry the state rather than the
+    // verdict, so the signal comes off the metric that names it, which
+    // is also the series an operator alerts on.
+    let failing_signal = concat!(
+        "sbproxy_config_soak_verdict_total{signal=\"upstream_health\",",
+        "verdict=\"failed\"}",
+    );
+    wait_until("the soak to fail on the upstream-health signal", || {
+        node.counter(failing_signal) >= 1.0
     });
     let after_soak = node.history();
     assert_eq!(
         after_soak["lkg_revision"],
         serde_json::json!(1),
         "a failed soak must not advance last known good: {after_soak}",
-    );
-    let failed = after_soak["entries"]
-        .as_array()
-        .and_then(|rows| rows.iter().find(|row| row["revision"] == 2))
-        .expect("revision 2 in the ring")
-        .clone();
-    let explanation = failed["soak_verdict"].to_string();
-    assert!(
-        explanation.contains("upstream"),
-        "the verdict names the signal that failed: {explanation}",
     );
 
     // --- 3. auto_revert is armed, so the node goes back and serves again.
@@ -484,9 +513,39 @@ fn a_bad_config_soaks_reverts_survives_a_restart_and_rolls_forward() {
 
     // --- 4. Kill, corrupt the file, restart on the ring.
     node.kill();
-    std::fs::write(&config_path, "proxy:\n  http_bind_portt: nonsense\n")
-        .expect("corrupt the config");
-    let mut rescued = Node::start(
+    // Break the origin, not the `proxy:` block. That is both the
+    // realistic case (a typo inside an origin) and the only one the
+    // fallback can act on: the ring's directory is named by the very
+    // document that is broken, so a lenient partial parse has to be
+    // able to recover `proxy.config_history` out of it. A document
+    // whose `proxy:` block is unparseable falls back to the packaged
+    // default directory, which on a real node is /var/lib/sbproxy and
+    // is not the ring this node has been writing.
+    std::fs::write(
+        &config_path,
+        good.replace(
+            "  \"api.local\":\n",
+            "  \"api.local\":\n    typo_nobody_meant_to_type: true\n",
+        ),
+    )
+    .expect("corrupt the config");
+    // Prove the corruption is one the boot path actually refuses. A
+    // "corrupt" document that the parser shrugs at would leave the rest
+    // of this arc testing an ordinary restart.
+    let refused = Command::new(proxy_binary_path())
+        .arg("validate")
+        .arg("-f")
+        .arg(&config_path)
+        .output()
+        .expect("run validate");
+    assert!(
+        String::from_utf8_lossy(&refused.stdout).contains("did not compile")
+            || String::from_utf8_lossy(&refused.stderr).contains("did not compile"),
+        "the corrupted document must fail to compile:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr),
+    );
+    let rescued = Node::start(
         &config_path,
         http_port,
         admin_port,
@@ -569,11 +628,7 @@ fn a_bad_config_soaks_reverts_survives_a_restart_and_rolls_forward() {
     });
 
     // --- 7. Roll back to a named earlier revision through the admin API.
-    let rollback = rescued.admin(
-        "POST",
-        "/admin/config/rollback",
-        Some(r#"{"revision":1}"#),
-    );
+    let rollback = rescued.admin("POST", "/admin/config/rollback", Some(r#"{"revision":1}"#));
     assert_eq!(rollback.status, 200, "rollback: {}", rollback.body);
     let rolled = rollback.json();
     assert_eq!(rolled["rolled_back"], true, "{rolled}");
@@ -624,7 +679,9 @@ fn the_same_broken_config_promotes_once_the_upstream_signal_is_switched_off() {
     });
 
     let dead = closed_port();
-    node.rewrite_config(&node_yaml(http_port, admin_port, &history, dead, false, false));
+    node.rewrite_config(&node_yaml(
+        http_port, admin_port, &history, dead, false, false,
+    ));
     let reloaded = node.reload();
     assert_eq!(reloaded.status, 200, "{}", reloaded.body);
 
@@ -637,11 +694,15 @@ fn the_same_broken_config_promotes_once_the_upstream_signal_is_switched_off() {
         .and_then(|rows| rows.iter().find(|row| row["revision"] == 2))
         .expect("revision 2");
     assert_eq!(
-        second["soak_verdict"]["outcome"], "passed",
+        second["state"], "good",
         "with the upstream signal off the same document promotes: {entries}",
     );
     assert_eq!(
-        second["state"], "good",
-        "and it is never marked reverted, because nothing failed",
+        node.counter(concat!(
+            "sbproxy_config_soak_verdict_total{signal=\"upstream_health\",",
+            "verdict=\"failed\"}",
+        )),
+        0.0,
+        "and the signal that caught it in the sibling test never reported: {entries}",
     );
 }

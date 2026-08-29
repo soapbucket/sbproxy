@@ -1639,7 +1639,7 @@ mod tests {
     }
 
     /// The `SBProxy` under reconcile, and the `SBProxyConfig` it names.
-    fn suspension_fixtures(admin_port: i32) -> (SBProxy, serde_json::Value) {
+    fn suspension_fixtures(admin_port: i32, config: &str) -> (SBProxy, serde_json::Value) {
         let mut sbp: SBProxy = serde_json::from_value(serde_json::json!({
             "apiVersion": "sbproxy.dev/v1alpha1",
             "kind": "SBProxy",
@@ -1658,7 +1658,7 @@ mod tests {
             "apiVersion": "sbproxy.dev/v1alpha1",
             "kind": "SBProxyConfig",
             "metadata": { "name": "edge-config", "namespace": "sbproxy" },
-            "spec": { "config": "proxy:\n  http_bind_port: 8080\n" },
+            "spec": { "config": config },
         });
         (sbp, cfg)
     }
@@ -1666,9 +1666,13 @@ mod tests {
     /// Run one reconcile against a recording apiserver, with the pod's
     /// admin port pointed at `stub_port`. Returns every request issued.
     async fn drive_one_reconcile(stub_port: u16) -> Vec<String> {
+        drive_one_reconcile_with(stub_port, "proxy:\n  http_bind_port: 8080\n").await
+    }
+
+    async fn drive_one_reconcile_with(stub_port: u16, config: &str) -> Vec<String> {
         use tower::ServiceExt as _;
 
-        let (sbp, cfg) = suspension_fixtures(i32::from(stub_port));
+        let (sbp, cfg) = suspension_fixtures(i32::from(stub_port), config);
         let recorded: Recorded = Arc::new(StdMutex::new(Vec::new()));
         let seen = Arc::clone(&recorded);
         let cfg_body = cfg.clone();
@@ -1780,6 +1784,32 @@ mod tests {
                 .iter()
                 .any(|request| request.starts_with("PATCH") && request.contains("configmaps")),
             "a node that is not pinned gets its config pushed: {requests:?}",
+        );
+    }
+
+    /// The `auto_revert` refusal is an enforcement, not just a
+    /// function. Driven through the same reconcile so a call site that
+    /// was never wired would show up here rather than pass on the pure
+    /// function alone.
+    #[tokio::test]
+    async fn a_config_arming_auto_revert_is_never_rolled_out_under_the_operator() {
+        let stub = FallbackStub::start(r#"{"active":false}"#);
+        let requests = drive_one_reconcile_with(
+            stub.port,
+            "proxy:\n  config_history:\n    enabled: true\n    soak:\n      auto_revert: true\n",
+        )
+        .await;
+        for kind in ["configmaps", "services", "deployments", "statefulsets"] {
+            assert!(
+                !requests.iter().any(|request| request.contains(kind)),
+                "an auto_revert config must not roll out; saw {kind} in {requests:?}",
+            );
+        }
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.starts_with("PATCH") && request.contains("/status")),
+            "and the refusal reaches the CR as lastError: {requests:?}",
         );
     }
 
