@@ -149,6 +149,9 @@ mod tests {
             created_at: now(),
             updated_at: now(),
             source: Default::default(),
+            rotated_at: None,
+            prev_material: None,
+            prev_material_expires_at: None,
         };
         store.put_credential(cred.clone()).await.unwrap();
         let got = store.get_credential("c1").await.unwrap().unwrap();

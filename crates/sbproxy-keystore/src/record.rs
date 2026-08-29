@@ -379,6 +379,109 @@ pub enum CredentialMaterial {
         /// The raw secret.
         value: String,
     },
+    /// A credential minted on demand by a dynamic-secrets engine, valid only
+    /// for its lease (WOR-2569).
+    ///
+    /// Nothing static is stored: the record holds the mount that mints the
+    /// credential, not a credential. Every resolution that cannot be served
+    /// from cache mints a fresh one, and the cache is never allowed to
+    /// outlive the lease.
+    ///
+    /// The scope is cloud IAM and Vault-fronted database credentials, and it
+    /// is a scope rather than a limitation of this implementation. Most AI
+    /// provider API keys, OpenAI's and Anthropic's included, have no
+    /// short-TTL issuance to lease against: there is no STS equivalent, so
+    /// there is nothing to mint. `docs/key-management.md` states that up
+    /// front rather than implying blanket dynamic-secrets support the
+    /// provider ecosystem does not allow.
+    Leased {
+        /// Secret reference naming the dynamic-secrets mount that mints the
+        /// credential, for example `vault://aws/creds/sbproxy-bedrock`.
+        /// Read through the same resolver every other reference uses.
+        reference: String,
+        /// Which platform the lease is against. Recorded so a credential
+        /// bound to a provider that cannot lease is refused rather than
+        /// silently degrading to a static read.
+        platform: LeasePlatform,
+        /// The mount's configured lease lifetime, in seconds. sbproxy never
+        /// caches resolved material past this, and does not learn it from
+        /// the mount: set it to match what the mount is configured for.
+        lease_duration_secs: u64,
+    },
+}
+
+/// Platforms whose credentials can actually be leased (WOR-2569).
+///
+/// A closed set, and the closure is the point. `leased` on a provider whose
+/// platform has no lease concept is refused with the limitation named,
+/// rather than accepted and quietly turned into a static read that never
+/// expires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeasePlatform {
+    /// AWS IAM, through Vault's AWS secrets engine or an STS role
+    /// assumption the mount performs. Covers Bedrock.
+    Aws,
+    /// Google Cloud IAM, through Vault's GCP secrets engine. Covers Vertex.
+    Gcp,
+    /// Azure AD, through Vault's Azure secrets engine. Covers Azure OpenAI
+    /// and Foundry.
+    Azure,
+    /// A Vault-fronted database credential. Not an AI provider at all, and
+    /// accepted for any provider label because the platform's own lease is
+    /// what bounds it.
+    Database,
+}
+
+impl LeasePlatform {
+    /// Whether a credential bound to `provider` can be leased against this
+    /// platform.
+    ///
+    /// The match is on the provider label an operator wrote, so it is a
+    /// prefix test rather than an exhaustive catalog: the AI provider
+    /// catalog has dozens of entries and enumerating the ones that
+    /// *cannot* lease would be a list that goes stale the day a provider
+    /// is added. Naming the few that can, and refusing the rest, goes
+    /// stale in the safe direction.
+    ///
+    /// [`Self::Database`] accepts anything: a Vault-fronted database
+    /// credential is not an AI provider credential, and the provider label
+    /// on such a record is whatever the operator found useful.
+    pub fn accepts_provider(self, provider: Option<&str>) -> bool {
+        if self == Self::Database {
+            return true;
+        }
+        let Some(provider) = provider.map(str::to_ascii_lowercase) else {
+            // No provider label means nothing to contradict. The platform
+            // still bounds the lease.
+            return true;
+        };
+        let provider = provider.as_str();
+        match self {
+            Self::Aws => {
+                provider.starts_with("aws")
+                    || provider.contains("bedrock")
+                    || provider == "sagemaker"
+            }
+            Self::Gcp => {
+                provider.starts_with("gcp")
+                    || provider.starts_with("google")
+                    || provider.contains("vertex")
+            }
+            Self::Azure => provider.starts_with("azure") || provider.contains("foundry"),
+            Self::Database => true,
+        }
+    }
+
+    /// The operator-facing name, for an error message and the admin view.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Aws => "aws",
+            Self::Gcp => "gcp",
+            Self::Azure => "azure",
+            Self::Database => "database",
+        }
+    }
 }
 
 /// Redacted `Debug` (WOR-2640). Only [`Self::Plaintext`] holds a
@@ -401,6 +504,19 @@ impl std::fmt::Debug for CredentialMaterial {
             Self::Plaintext { .. } => f
                 .debug_struct("Plaintext")
                 .field("value", &"[REDACTED]")
+                .finish(),
+            // A mount reference is not a secret, for the same reason a
+            // `VaultRef` reference is not: an operator has to be able to
+            // read it to fix a typo in it.
+            Self::Leased {
+                reference,
+                platform,
+                lease_duration_secs,
+            } => f
+                .debug_struct("Leased")
+                .field("reference", reference)
+                .field("platform", platform)
+                .field("lease_duration_secs", lease_duration_secs)
                 .finish(),
         }
     }
@@ -461,6 +577,34 @@ pub struct CredentialRecord {
     /// Provenance, for reload precedence.
     #[serde(default)]
     pub source: RecordSource,
+    /// When this credential's material was last replaced by a rotation, as
+    /// opposed to any other update (WOR-2567).
+    ///
+    /// Distinct from `updated_at`, which any metadata patch moves. Rotation
+    /// age is what an operator alerts on against the named crypto period in
+    /// `key_management.crypto.rotation`, and a record whose name was edited
+    /// last week has not been rotated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotated_at: Option<DateTime<Utc>>,
+    /// The material this credential carried before the most recent
+    /// rotation, kept usable for a bounded overlap (WOR-2567).
+    ///
+    /// `rotate_key` has given inbound keys a dual-validity window since
+    /// WOR-1554; this is the same idea from the other side. sbproxy
+    /// *presents* an upstream credential rather than validating one, so
+    /// the overlap is not about accepting an old value: it is about the
+    /// window between installing a new provider key here and that key
+    /// becoming live at the provider. Inside the window, material that
+    /// will not resolve or is refused falls back to this one instead of
+    /// failing the request.
+    ///
+    /// Cleared when [`Self::prev_material_expires_at`] passes, so the old
+    /// secret does not sit in the store indefinitely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_material: Option<CredentialMaterial>,
+    /// When [`Self::prev_material`] stops being usable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_material_expires_at: Option<DateTime<Utc>>,
 }
 
 fn default_cred_kind() -> String {
@@ -482,6 +626,27 @@ impl CredentialRecord {
     /// Whether the credential is `Active`.
     pub fn is_usable(&self) -> bool {
         self.status == RecordStatus::Active
+    }
+
+    /// The previous material, if a rotation left one and its window is
+    /// still open at `now` (WOR-2567).
+    ///
+    /// A method rather than two field reads at the call site because the
+    /// window has to be checked everywhere the material is: a caller that
+    /// reads `prev_material` and forgets `prev_material_expires_at` is a
+    /// caller that presents a retired provider key forever.
+    pub fn usable_prev_material(&self, now: DateTime<Utc>) -> Option<&CredentialMaterial> {
+        let expires = self.prev_material_expires_at?;
+        (expires > now)
+            .then_some(self.prev_material.as_ref())
+            .flatten()
+    }
+
+    /// Days since this credential's material was last rotated, or since it
+    /// was created when it never has been (WOR-2567).
+    pub fn rotation_age_days(&self, now: DateTime<Utc>) -> i64 {
+        let since = self.rotated_at.unwrap_or(self.created_at);
+        (now - since).num_days()
     }
 }
 
@@ -779,6 +944,9 @@ mod tests {
             created_at: now(),
             updated_at: now(),
             source: RecordSource::Config,
+            rotated_at: None,
+            prev_material: None,
+            prev_material_expires_at: None,
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains("\"kind\":\"vault_ref\""), "{json}");
@@ -807,5 +975,36 @@ mod tests {
             reference: "vault://prod/openai".to_string(),
         };
         assert!(format!("{by_ref:?}").contains("vault://prod/openai"));
+    }
+
+    /// WOR-2569: the closed platform set, and the direction it goes stale.
+    ///
+    /// Naming the providers that *can* lease and refusing the rest means a
+    /// provider added to the catalog tomorrow is refused until somebody
+    /// looks at it. The other direction, enumerating what cannot lease,
+    /// would accept it silently.
+    #[test]
+    fn only_platforms_that_mint_short_lived_credentials_accept_a_provider() {
+        assert!(LeasePlatform::Aws.accepts_provider(Some("bedrock")));
+        assert!(LeasePlatform::Aws.accepts_provider(Some("aws-bedrock")));
+        assert!(LeasePlatform::Gcp.accepts_provider(Some("vertex")));
+        assert!(LeasePlatform::Gcp.accepts_provider(Some("google-vertex")));
+        assert!(LeasePlatform::Azure.accepts_provider(Some("azure-openai")));
+        // A Vault-fronted database credential is not an AI provider at
+        // all, so its provider label is whatever the operator found
+        // useful and nothing here has an opinion.
+        assert!(LeasePlatform::Database.accepts_provider(Some("postgres-analytics")));
+
+        // The refusals. Each of these would otherwise be a record that
+        // reads "leased" and never expires.
+        for provider in ["openai", "anthropic", "mistral", "cohere", "groq"] {
+            for platform in [LeasePlatform::Aws, LeasePlatform::Gcp, LeasePlatform::Azure] {
+                assert!(
+                    !platform.accepts_provider(Some(provider)),
+                    "{provider} has no short-TTL issuance to lease against {}",
+                    platform.label()
+                );
+            }
+        }
     }
 }

@@ -227,8 +227,25 @@ fn random_hex(n: usize) -> String {
 pub struct Envelope {
     /// AEAD scheme tag for forward migration (currently `aes-256-gcm.v1`).
     pub alg: String,
+    /// Names the external root of trust that wrapped [`Self::wrapped_dek`],
+    /// when the DEK was wrapped by a customer-managed KMS rather than by a
+    /// key derived from the locally-held master (WOR-2568).
+    ///
+    /// `None` is the local root: `wrapped_dek` is `wrap_nonce ||
+    /// AES-256-GCM(HKDF(master), DEK)` and this process can open the
+    /// envelope on its own. `Some(name)` is the customer-managed root:
+    /// `wrapped_dek` is the opaque ciphertext the external KMS returned,
+    /// and opening the envelope requires that KMS to be reachable and to
+    /// still authorize this caller. The two are deliberately distinguished
+    /// by a field on the record rather than by which key happens to be
+    /// configured at open time, so a customer-managed envelope cannot
+    /// silently fall back to a local unwrap when the config changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kek: Option<String>,
     /// The data key wrapped (encrypted) under the master key, with its own
-    /// nonce prefixed by the wrapping helper.
+    /// nonce prefixed by the wrapping helper. Under a customer-managed root
+    /// ([`Self::kek`] is `Some`) this is instead the UTF-8 bytes of the
+    /// opaque ciphertext string the external KMS returned.
     #[serde(with = "hex_bytes")]
     pub wrapped_dek: Vec<u8>,
     /// The 96-bit nonce used to encrypt the payload under the data key.
@@ -281,6 +298,7 @@ pub fn seal_envelope(master: &[u8], record_id: &str, plaintext: &[u8]) -> Result
 
     Ok(Envelope {
         alg: ENVELOPE_ALG_V1.to_string(),
+        kek: None,
         wrapped_dek,
         nonce: nonce.to_vec(),
         ciphertext,
@@ -291,6 +309,18 @@ pub fn seal_envelope(master: &[u8], record_id: &str, plaintext: &[u8]) -> Result
 pub fn open_envelope(master: &[u8], record_id: &str, env: &Envelope) -> Result<Vec<u8>> {
     if env.alg != ENVELOPE_ALG_V1 {
         return Err(anyhow!("unsupported envelope alg '{}'", env.alg));
+    }
+    // A customer-managed envelope never opens on the local path, whatever
+    // the process happens to hold. Without this the whole claim collapses
+    // to "we prefer the KMS when it is configured": drop the
+    // `root_of_trust` block from the config, restart, and every envelope
+    // the customer's key wrapped would open again under the local master.
+    if let Some(kek) = &env.kek {
+        return Err(anyhow!(
+            "envelope is wrapped under the customer-managed root of trust '{kek}' and cannot be \
+             opened locally; configure key_management.crypto.root_of_trust so the external key \
+             service can unwrap it"
+        ));
     }
     let aad = record_id.as_bytes();
     if env.wrapped_dek.len() <= AES_GCM_NONCE_LEN {
@@ -323,23 +353,137 @@ fn derive_wrap_key(master: &[u8]) -> [u8; AES256_KEY_LEN] {
         .expect("hkdf returns the requested length")
 }
 
+/// The external key service that wraps and unwraps envelope data keys when
+/// `key_management.crypto.root_of_trust` names a customer-managed root
+/// (WOR-2568).
+///
+/// This is deliberately a *service* interface, not a key-fetch interface.
+/// There is no `fn root_key(&self) -> Vec<u8>`, because the whole point of
+/// a customer-managed root is that sbproxy never holds the key that opens
+/// the envelope. The DEK crosses the boundary; the key that wrapped it does
+/// not. That is the same shape HashiCorp Vault's Transit engine exposes
+/// (`/v1/transit/encrypt` and `/v1/transit/decrypt` return ciphertext and
+/// plaintext, never the key) and the same shape AWS KMS `Encrypt`/`Decrypt`
+/// take, and it is what makes revoking the customer's grant actually stop
+/// sbproxy from decrypting rather than merely inconvenience it.
+///
+/// Both operations are `async` and are expected to be network calls. A
+/// caching layer belongs in the implementation, and its TTL is the
+/// deployment's stated revocation latency: however long an implementation
+/// caches an unwrap, that is how long a revoked grant keeps working.
+#[async_trait::async_trait]
+pub trait RootOfTrust: Send + Sync + std::fmt::Debug {
+    /// Stable, non-secret name of the external key. Persisted into
+    /// [`Envelope::kek`] so an envelope names the key version-family it was
+    /// wrapped under and an operator can tell two roots apart in a store.
+    fn kek_name(&self) -> &str;
+
+    /// Wrap a freshly generated 32-byte data key, returning the opaque
+    /// ciphertext the external service produced.
+    ///
+    /// # Errors
+    ///
+    /// Any failure to reach or be authorized by the external service. There
+    /// is deliberately no local fallback: a wrap that cannot reach the
+    /// customer's key must fail rather than silently produce an envelope
+    /// only sbproxy can open.
+    async fn wrap_dek(&self, dek: &[u8]) -> Result<String>;
+
+    /// Unwrap a ciphertext previously produced by [`Self::wrap_dek`].
+    ///
+    /// # Errors
+    ///
+    /// Any failure to reach or be authorized by the external service,
+    /// including a revoked grant. Fail-closed: no cached-forever fallback.
+    async fn unwrap_dek(&self, wrapped: &str) -> Result<Vec<u8>>;
+
+    /// How long this implementation may serve an unwrap from its own cache.
+    /// This is the deployment's revocation-latency bound and is reported on
+    /// the admin surface verbatim.
+    fn revocation_window(&self) -> std::time::Duration;
+
+    /// Confirm the external service is reachable and still authorizes this
+    /// caller, recording the result for [`Self::last_liveness_ok`].
+    ///
+    /// On the trait rather than on one implementation because the admin
+    /// surface and the background probe both hold a `dyn RootOfTrust` and
+    /// neither has any business knowing which concrete root is installed.
+    /// The default answers "no liveness story", which is the honest
+    /// answer for a test double.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the external service reported. A permission error is the
+    /// revoked-grant case.
+    async fn probe_liveness(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Unix seconds of the last *successful* liveness confirmation, or
+    /// `None` when none has succeeded in this process.
+    fn last_liveness_unix(&self) -> Option<u64> {
+        None
+    }
+
+    /// Whether the most recent liveness check succeeded.
+    fn last_liveness_ok(&self) -> bool {
+        false
+    }
+
+    /// How many unwrapped data keys are currently cached and still inside
+    /// [`Self::revocation_window`]. This is how much decrypt capability a
+    /// revocation still has to age out.
+    fn cached_dek_count(&self) -> usize {
+        0
+    }
+
+    /// Drop every cached data key, so a revocation takes effect now rather
+    /// than at the end of each entry's own window.
+    fn purge_cache(&self) {}
+}
+
 /// A consolidated crypto handle holding the two server secrets the key plane
 /// needs: the `pepper` (inbound-key hashing) and the `master` (upstream-credential
 /// envelope). One handle is shared by the auth, admin, and dispatch layers so
 /// the secrets live in a single place.
+///
+/// When `root` is set the credential envelope's data key is wrapped by an
+/// external key service instead of by a key derived from `master` (WOR-2568).
+/// `pepper` and `master` stay locally held either way: `pepper` hashes
+/// inbound virtual keys and `master` derives the key-audit fingerprint key
+/// and still opens envelopes sealed before the customer-managed root was
+/// turned on. The customer-managed claim covers the upstream-credential
+/// envelope and says so in `docs/key-management.md`; it does not cover the
+/// inbound-key hashes.
 #[derive(Clone)]
 pub struct KeyCrypto {
     pepper: Vec<u8>,
     master: Vec<u8>,
+    root: Option<std::sync::Arc<dyn RootOfTrust>>,
 }
 
 impl KeyCrypto {
-    /// Build a handle from the server pepper and master key.
+    /// Build a handle from the server pepper and master key, with the local
+    /// root of trust (the master wraps envelope data keys).
     pub fn new(pepper: impl Into<Vec<u8>>, master: impl Into<Vec<u8>>) -> Self {
         Self {
             pepper: pepper.into(),
             master: master.into(),
+            root: None,
         }
+    }
+
+    /// Attach a customer-managed root of trust. Every envelope sealed after
+    /// this point carries [`Envelope::kek`] and can only be opened while the
+    /// external service is reachable and still authorizes this caller.
+    pub fn with_root_of_trust(mut self, root: std::sync::Arc<dyn RootOfTrust>) -> Self {
+        self.root = Some(root);
+        self
+    }
+
+    /// The customer-managed root of trust, when one is configured.
+    pub fn root_of_trust(&self) -> Option<&std::sync::Arc<dyn RootOfTrust>> {
+        self.root.as_ref()
     }
 
     /// Mint a brand-new inbound key (id, one-time token, at-rest hash).
@@ -383,14 +527,122 @@ impl KeyCrypto {
         record.verify_secret(secret, &self.pepper, now)
     }
 
-    /// Seal an upstream secret into an envelope bound to `record_id`.
+    /// Seal an upstream secret into an envelope bound to `record_id` under
+    /// the *local* root.
+    ///
+    /// # Errors
+    ///
+    /// Refuses outright when a customer-managed root is configured. That
+    /// refusal is the structural half of WOR-2568: a synchronous seal
+    /// cannot reach a network key service, so leaving this path working
+    /// under a customer-managed root is exactly how the feature would
+    /// regress into "resolve once, hold forever" the next time somebody
+    /// adds a call site. Use [`Self::seal_async`], which covers both roots.
     pub fn seal(&self, record_id: &str, plaintext: &[u8]) -> Result<Envelope> {
+        if let Some(root) = &self.root {
+            return Err(anyhow!(
+                "a customer-managed root of trust ('{}') is configured, so an envelope cannot be \
+                 sealed on the synchronous local path; call seal_async",
+                root.kek_name()
+            ));
+        }
         seal_envelope(&self.master, record_id, plaintext)
     }
 
-    /// Open an envelope sealed by [`Self::seal`].
+    /// Open an envelope sealed under the local root.
+    ///
+    /// # Errors
+    ///
+    /// A customer-managed envelope ([`Envelope::kek`] is `Some`) is refused
+    /// here whatever this process holds; use [`Self::open_async`].
     pub fn open(&self, record_id: &str, env: &Envelope) -> Result<Vec<u8>> {
         open_envelope(&self.master, record_id, env).context("open credential envelope")
+    }
+
+    /// Seal an upstream secret into an envelope bound to `record_id`, under
+    /// whichever root of trust is configured.
+    ///
+    /// With no customer-managed root this is [`Self::seal`]. With one, a
+    /// fresh DEK encrypts the payload locally (AES-256-GCM, `record_id` as
+    /// AAD, exactly as before) and the external service wraps the DEK. The
+    /// AAD stays on the local payload step rather than being pushed into
+    /// the KMS call, because associated-data support is not uniform across
+    /// KMS products and the binding it provides (this ciphertext belongs to
+    /// this record) is already load bearing where it is.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the external service's failure. No local fallback.
+    pub async fn seal_async(&self, record_id: &str, plaintext: &[u8]) -> Result<Envelope> {
+        let Some(root) = &self.root else {
+            return seal_envelope(&self.master, record_id, plaintext);
+        };
+        let aad = record_id.as_bytes();
+        let dek = random_aes256_key();
+        let nonce = random_aes_gcm_nonce();
+        let ciphertext = aes256gcm_encrypt(&dek, &nonce, plaintext, aad)?;
+        let wrapped = root
+            .wrap_dek(&dek)
+            .await
+            .context("wrap the credential data key under the customer-managed root of trust")?;
+        Ok(Envelope {
+            alg: ENVELOPE_ALG_V1.to_string(),
+            kek: Some(root.kek_name().to_string()),
+            wrapped_dek: wrapped.into_bytes(),
+            nonce: nonce.to_vec(),
+            ciphertext,
+        })
+    }
+
+    /// Open an envelope under whichever root wrapped it.
+    ///
+    /// The envelope decides, not the config: a `kek`-less envelope opens
+    /// locally even when a customer-managed root is configured (so turning
+    /// the feature on does not brick credentials sealed before it), and a
+    /// `kek`-bearing envelope needs the external service even if a local
+    /// master is also present.
+    ///
+    /// # Errors
+    ///
+    /// A customer-managed envelope with no configured root, a `kek`
+    /// mismatch against the configured root, or any failure of the external
+    /// service including a revoked grant.
+    pub async fn open_async(&self, record_id: &str, env: &Envelope) -> Result<Vec<u8>> {
+        let Some(kek) = env.kek.as_deref() else {
+            return self.open(record_id, env);
+        };
+        let Some(root) = &self.root else {
+            return Err(anyhow!(
+                "envelope is wrapped under the customer-managed root of trust '{kek}' but no \
+                 key_management.crypto.root_of_trust is configured to unwrap it"
+            ));
+        };
+        if root.kek_name() != kek {
+            return Err(anyhow!(
+                "envelope names the root of trust '{kek}' but the configured root is '{}'",
+                root.kek_name()
+            ));
+        }
+        if env.alg != ENVELOPE_ALG_V1 {
+            return Err(anyhow!("unsupported envelope alg '{}'", env.alg));
+        }
+        let wrapped = std::str::from_utf8(&env.wrapped_dek)
+            .context("customer-managed wrapped DEK is not utf-8 ciphertext")?;
+        let dek_bytes = root
+            .unwrap_dek(wrapped)
+            .await
+            .context("unwrap the credential data key under the customer-managed root of trust")?;
+        let dek: [u8; AES256_KEY_LEN] = dek_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("unwrapped DEK is not {AES256_KEY_LEN} bytes"))?;
+        let nonce: [u8; AES_GCM_NONCE_LEN] = env
+            .nonce
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("envelope nonce is not {AES_GCM_NONCE_LEN} bytes"))?;
+        aes256gcm_decrypt(&dek, &nonce, &env.ciphertext, record_id.as_bytes())
+            .context("open credential envelope")
     }
 }
 
@@ -447,6 +699,7 @@ mod tests {
     fn envelope_serde_roundtrips_as_hex() {
         let env = Envelope {
             alg: ENVELOPE_ALG_V1.to_string(),
+            kek: None,
             wrapped_dek: vec![1, 2, 3],
             nonce: vec![4, 5, 6],
             ciphertext: vec![7, 8, 9, 10],
@@ -621,5 +874,159 @@ mod tests {
             "the rotated secret reached Debug: {rendered}"
         );
         assert!(rendered.contains(&rotated.secret_hash));
+    }
+
+    // --- WOR-2568: the customer-managed root of trust ---
+
+    /// A stand-in external key service. Wrapping is a reversible encoding
+    /// the stub can undo, which is enough to prove the data key crossed the
+    /// boundary; what matters is *who* can undo it, and `revoked` is how a
+    /// test takes that ability away mid-run the way a customer revoking a
+    /// KMS grant does.
+    #[derive(Debug)]
+    struct StubRoot {
+        name: String,
+        revoked: std::sync::atomic::AtomicBool,
+    }
+
+    impl StubRoot {
+        fn new(name: &str) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                name: name.to_string(),
+                revoked: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+        fn revoke(&self) {
+            self.revoked
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn is_revoked(&self) -> bool {
+            self.revoked.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RootOfTrust for StubRoot {
+        fn kek_name(&self) -> &str {
+            &self.name
+        }
+        async fn wrap_dek(&self, dek: &[u8]) -> Result<String> {
+            if self.is_revoked() {
+                return Err(anyhow!("grant revoked"));
+            }
+            Ok(format!("stub:v1:{}", hex::encode(dek)))
+        }
+        async fn unwrap_dek(&self, wrapped: &str) -> Result<Vec<u8>> {
+            if self.is_revoked() {
+                return Err(anyhow!("grant revoked"));
+            }
+            let body = wrapped
+                .strip_prefix("stub:v1:")
+                .ok_or_else(|| anyhow!("not a stub ciphertext"))?;
+            Ok(hex::decode(body)?)
+        }
+        fn revocation_window(&self) -> std::time::Duration {
+            std::time::Duration::from_secs(0)
+        }
+    }
+
+    /// The seam: with a customer-managed root configured, the key that
+    /// wraps the envelope's data key is never held by this process. The
+    /// proof is negative and has to be, because "we called a KMS" is not
+    /// the claim: a process holding the master key that a local seal would
+    /// have used still cannot open the envelope.
+    #[tokio::test]
+    async fn a_customer_managed_envelope_does_not_open_under_the_local_master() {
+        let root = StubRoot::new("stub/root-a");
+        let crypto =
+            KeyCrypto::new(b"pepper".to_vec(), b"master".to_vec()).with_root_of_trust(root.clone());
+        let env = crypto
+            .seal_async("cred-1", b"upstream-secret")
+            .await
+            .expect("seal under the customer-managed root");
+        assert_eq!(env.kek.as_deref(), Some("stub/root-a"));
+
+        // The same master, on the local path, must not open it.
+        let local = KeyCrypto::new(b"pepper".to_vec(), b"master".to_vec());
+        let err = format!(
+            "{:#}",
+            local
+                .open("cred-1", &env)
+                .expect_err("a customer-managed envelope must never open locally")
+        );
+        assert!(
+            err.contains("customer-managed root of trust"),
+            "the refusal must name why: {err}"
+        );
+
+        // And it does open through the external service.
+        let opened = crypto
+            .open_async("cred-1", &env)
+            .await
+            .expect("open through the external root");
+        assert_eq!(opened, b"upstream-secret");
+    }
+
+    /// Revoking the customer's grant stops decryption, rather than merely
+    /// making it slower. This is the whole enterprise claim: the vendor's
+    /// copy becomes unreadable.
+    #[tokio::test]
+    async fn revoking_the_external_grant_stops_the_envelope_opening() {
+        let root = StubRoot::new("stub/root-b");
+        let crypto =
+            KeyCrypto::new(b"pepper".to_vec(), b"master".to_vec()).with_root_of_trust(root.clone());
+        let env = crypto.seal_async("cred-2", b"secret").await.expect("seal");
+        assert_eq!(crypto.open_async("cred-2", &env).await.unwrap(), b"secret");
+
+        root.revoke();
+        let err = format!(
+            "{:#}",
+            crypto
+                .open_async("cred-2", &env)
+                .await
+                .expect_err("a revoked grant must stop decryption")
+        );
+        assert!(err.contains("revoked"), "{err}");
+    }
+
+    /// Turning the feature on must not brick credentials sealed before it,
+    /// and turning it off must not un-brick the ones sealed after. The
+    /// envelope decides, not the config.
+    #[tokio::test]
+    async fn the_envelope_names_its_root_and_the_config_does_not_override_it() {
+        let local = KeyCrypto::new(b"pepper".to_vec(), b"master".to_vec());
+        let legacy = local.seal("cred-3", b"older-secret").expect("local seal");
+        assert!(legacy.kek.is_none());
+
+        let root = StubRoot::new("stub/root-c");
+        let cmk =
+            KeyCrypto::new(b"pepper".to_vec(), b"master".to_vec()).with_root_of_trust(root.clone());
+        // Legacy envelopes keep opening after the switch.
+        assert_eq!(
+            cmk.open_async("cred-3", &legacy).await.unwrap(),
+            b"older-secret"
+        );
+        // The synchronous seal is refused outright under a customer-managed
+        // root, so no later call site can quietly produce a locally-wrapped
+        // envelope while the config claims a customer-held root.
+        let err = format!(
+            "{:#}",
+            cmk.seal("cred-3", b"nope")
+                .expect_err("the sync seal must refuse under a customer-managed root")
+        );
+        assert!(err.contains("seal_async"), "{err}");
+
+        // An envelope wrapped by a different root is refused, not attempted.
+        let other = KeyCrypto::new(b"pepper".to_vec(), b"master".to_vec())
+            .with_root_of_trust(StubRoot::new("stub/root-d"));
+        let sealed = cmk.seal_async("cred-3", b"x").await.expect("seal");
+        let err = format!(
+            "{:#}",
+            other
+                .open_async("cred-3", &sealed)
+                .await
+                .expect_err("a mismatched root must be refused")
+        );
+        assert!(err.contains("stub/root-c"), "{err}");
     }
 }

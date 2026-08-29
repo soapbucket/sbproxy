@@ -502,6 +502,9 @@ mod tests {
             created_at: ts(),
             updated_at: ts(),
             source: Default::default(),
+            rotated_at: None,
+            prev_material: None,
+            prev_material_expires_at: None,
         };
         s.put_credential(cred.clone()).await.unwrap();
         assert_eq!(s.get_credential("c1").await.unwrap().unwrap(), cred);
