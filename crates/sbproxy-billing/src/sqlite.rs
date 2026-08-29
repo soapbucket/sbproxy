@@ -29,9 +29,11 @@
 //! on, so an unresolved payment withholds fresh challenges from the payer it
 //! stranded instead of from every payer of the route. Nullable with no
 //! default: a row written by an older build has no payer scope, and the
-//! query treats `NULL` as "matches every payer", which is exactly the
-//! route-wide behavior those rows were written under. An upgrade therefore
-//! cannot turn an existing unresolved intent into a second bill.
+//! query treats `NULL` as "matches every payer of this route", which is
+//! exactly the route-wide behavior those rows were written under. WOR-2302
+//! later fills a NULL from a facilitator `/verify` through
+//! [`SqliteSettlementStore::attribute_payer_hash`]; an unidentified
+//! request then matches only remaining NULL rows, not attributed ones.
 //!
 //! # Migration 3
 //!
@@ -719,6 +721,38 @@ impl SettlementStore for SqliteSettlementStore {
         .await
     }
 
+    async fn attribute_payer_hash(
+        &self,
+        intent_id: &str,
+        payer_hash: &str,
+    ) -> Result<(), BillingError> {
+        if payer_hash.trim().is_empty() {
+            return Err(BillingError::InvalidRequirement("payer_hash"));
+        }
+        let intent_id = intent_id.to_string();
+        let payer_hash = payer_hash.to_string();
+        let now_ms = self.clock.now_ms();
+        self.call(move |connection| {
+            let transaction = begin_immediate(connection)?;
+            load_intent(&transaction, &intent_id)?.ok_or(BillingError::IntentNotFound)?;
+            // WHERE payer_hash IS NULL is the restamp guard. An already
+            // attributed row is a success: the first writer's scope stays.
+            transaction
+                .execute(
+                    "UPDATE payment_intents
+                        SET payer_hash = ?1, updated_at_ms = ?2
+                      WHERE intent_id = ?3 AND payer_hash IS NULL",
+                    params![payer_hash, now_ms, intent_id],
+                )
+                .map_err(|_| BillingError::Storage("attribute payer hash"))?;
+            transaction
+                .commit()
+                .map_err(|_| BillingError::Storage("commit payer hash"))?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn finalize_requirement(
         &self,
         intent_id: &str,
@@ -1362,7 +1396,8 @@ impl SettlementStore for SqliteSettlementStore {
                     "SELECT intent_id FROM payment_intents
                       WHERE tenant_id = ?1 AND origin_id = ?2 AND route = ?3
                         AND status = ?4
-                        AND (payer_hash IS NULL OR ?5 IS NULL OR payer_hash = ?5)
+                        AND (payer_hash IS NULL
+                             OR (?5 IS NOT NULL AND payer_hash = ?5))
                       ORDER BY created_at_ms
                       LIMIT 1",
                     params![

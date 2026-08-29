@@ -1,6 +1,6 @@
 # Connect your coding agents to a governed gateway
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-28*
 
 Four pages used to live here, one per editor, each ending in the same paragraph about budgets and ledgers. They went stale in the way hand-written setup instructions always go stale: Codex changed the value its `wire_api` key accepts and our page kept telling people to write the old one, which current Codex refuses to load at all.
 
@@ -51,7 +51,7 @@ codex  Codex CLI
     +wire_api = "responses"
     run it as: codex --profile sbproxy
     credential: Codex reads $SBPROXY_API_KEY. This verb writes the variable's name, never its value.
-    note: Codex only accepts wire_api = "responses". The gateway serves stateless /v1/responses and refuses a request carrying previous_response_id, conversation, or store: true with a 400 naming the field.
+    note: Codex only accepts wire_api = "responses". A first turn that resends the full conversation in input works. Compact, resume, and any follow-up that sends previous_response_id, conversation, or store: true get a 400 naming the field; the gateway does not hold server-side Responses state.
 
 claude-code  Claude Code
     found: not installed
@@ -204,7 +204,13 @@ export SBPROXY_API_KEY=sbp_...
 codex --profile sbproxy
 ```
 
-Two things to know before you rely on this. `wire_api = "responses"` is not a preference; codex-cli 0.149.0 rejects a provider carrying `wire_api = "chat"` outright, telling you to set `"responses"` instead. And the gateway serves `/v1/responses` statelessly: a request carrying `previous_response_id`, `conversation`, or `store: true` names server-side state the gateway does not hold, and it comes back as a 400 naming the field rather than silently running without the turns it referenced. Whether a given Codex build sends those fields to a custom provider is the open question on this path, and the honest answer today is that it depends on the build. If you hit that 400, this is why.
+Two things to know before you rely on this. `wire_api = "responses"` is not a preference; codex-cli 0.149.0 rejects a provider carrying `wire_api = "chat"` outright, telling you to set `"responses"` instead. And the gateway serves `/v1/responses` statelessly. These Codex flows 400, naming the field, rather than silently running without the turns they referenced:
+
+- **Compact**, which continues from a stored Responses id via `previous_response_id`.
+- **Resume**, which rejoins a stored conversation or sends `conversation`.
+- Any follow-up that sets `store: true`, asking the gateway to keep server-side state.
+
+A first turn, and any later turn that resends the full conversation in `input` without those fields, works. That split is the WOR-2659 ruling: the refusal stays, and this page names the hole instead of hiding it behind a chat `wire_api` Codex will not load.
 
 If you want the profile applied without typing the flag, alias it:
 

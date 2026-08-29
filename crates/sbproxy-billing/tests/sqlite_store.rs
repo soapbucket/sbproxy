@@ -815,8 +815,8 @@ async fn an_unresolved_intent_only_withholds_from_the_payer_it_belongs_to() {
     );
     assert_eq!(
         guard(&store, None).await,
-        Some(stuck),
-        "a request with no identity cannot be proved to be someone else",
+        None,
+        "WOR-2302: an attributed intent no longer withholds from unidentified callers",
     );
 }
 
@@ -845,6 +845,46 @@ async fn an_intent_with_no_payer_scope_withholds_from_everyone() {
     // rather than attempted on every open.
     let reopened = handle(&path, &clock);
     assert_eq!(guard(&reopened, Some("payer-a")).await, Some(legacy));
+}
+
+#[tokio::test]
+async fn attributing_an_x402_payer_stops_unidentified_callers_waiting_on_it() {
+    // WOR-2302: after `/verify` names a payer, the stranded intent is no
+    // longer "could be anyone". Other anonymous x402 callers of the same
+    // route are billable. The first-ever stall (the row still NULL) still
+    // withholds everyone, which `an_intent_with_no_payer_scope_withholds_from_everyone`
+    // pins.
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory.path().join("settlement.sqlite3");
+    let clock = TestClock::new(START_MS);
+    let store = handle(&path, &clock);
+
+    let stuck = stranded_intent(&store, "req-x402", "key-x402", None).await;
+    let hash = sbproxy_billing::x402_facilitator_payer_hash("tenant-1", "0xabc");
+    store
+        .attribute_payer_hash(&stuck, &hash)
+        .await
+        .expect("attribute");
+
+    assert_eq!(
+        guard(&store, None).await,
+        None,
+        "an attributed x402 intent must not stall other anonymous payers",
+    );
+    assert_eq!(
+        guard(&store, Some(&hash)).await,
+        Some(stuck.clone()),
+        "the hashed payer still waits on their own stuck payment",
+    );
+    store
+        .attribute_payer_hash(&stuck, "another-hash")
+        .await
+        .expect("restamp is a no-op");
+    assert_eq!(
+        guard(&store, Some(&hash)).await,
+        Some(stuck),
+        "a later attribute must not move the row onto a different payer",
+    );
 }
 
 // --- WOR-2317: the unattributable hold has a deadline ---
@@ -968,8 +1008,8 @@ async fn a_payer_scoped_intent_has_no_deadline() {
     );
     assert_eq!(
         guard(&store, None).await,
-        Some(stuck),
-        "and an unidentified request still cannot be proved to be someone else",
+        None,
+        "WOR-2302: an attributed hold no longer stalls unidentified callers",
     );
 }
 

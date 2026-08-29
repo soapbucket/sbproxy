@@ -1258,3 +1258,17 @@ named by the `archive_keep` validation error in `sbproxy-config/src/types.rs`,
 the second narrowed to a private const with its bound restated in prose, and
 the third is named by the suspension warn log in the operator's `main.rs`,
 which is the line an operator greps before reading the condition.
+2026-08-29 (WOR-2421): unreferenced 1525 -> 1524. Parallel-input chain
+predicates and the session wait helper are cfg(test) rather than pub, so
+they leave this bucket and rustc polices them.
+
+2026-08-29 (WOR-2432/2455 closeout, merged with main at c1b393ad): recounted
+against the merged tree. Tests-only 325, unchanged. Unreferenced 1525, which
+is the figure the merge conflicted on: this branch carried 1526 and main
+1524, and neither describes the tree they make together. Main narrowed one
+item this branch does not touch; this branch's own addition
+(`ConfigAuthority::rollback_to`) is still the single item recorded above.
+The re-review round added no `pub` item to either bucket: `consumed_revision`
+on both error types is private, because its only production caller is in the
+same file, and its per-variant test moved into that module rather than
+staying an integration test that would have forced it public.

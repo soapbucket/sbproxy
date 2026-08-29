@@ -1,6 +1,6 @@
 # Payment settlement
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-28*
 
 `proxy.payments` is how SBproxy charges for a request and proves it was
 paid. It is Apache-2.0, it is off unless you configure it, and it holds
@@ -139,20 +139,30 @@ them is the conservative answer to a question the proxy cannot settle. An
 intent written before this scoping existed carries no payer, so it could
 be anybody's payment that is stuck. An intent minted for a caller the
 proxy could not identify carries no payer for the same reason. And a
-request that arrives with no identity of its own waits on every
-unresolved intent for the route, because nothing rules out that it is the
-payer whose money is already gone.
+request that arrives with no identity of its own waits only on
+unresolved intents that still have no payer hash: a first-ever stall
+from a never-verified anonymous payer is still route-wide.
 
-No settlement rail supplies a payer identity of its own at this point,
-which is why the scope key comes from the request rather than from the
-credential. The challenge path is by definition the path where no live
-quote token addresses a durable challenge. Lightning and direct Stripe
-carry no client credential at all, and a Lightning invoice records no
-payer even after it is paid. A Payment HTTP Authentication credential
-binds to one challenge rather than to a payer. An x402 payload digest
-identifies one payment rather than one payer, so a client that re-signed
-would read as a stranger and be handed the second bill this rule exists
-to prevent.
+No settlement rail supplies a payer identity of its own at challenge
+time, which is why the scope key usually comes from the request rather
+than from the credential. The challenge path is by definition the path
+where no live quote token addresses a durable challenge. Lightning and
+direct Stripe carry no client credential at all, and a Lightning invoice
+records no payer even after it is paid. A Payment HTTP Authentication
+credential binds to one challenge rather than to a payer. An x402
+payload digest identifies one payment rather than one payer, so a client
+that re-signed would read as a stranger and be handed the second bill
+this rule exists to prevent.
+
+WOR-2302 closes the anonymous x402 hole one redemption later. After
+`/verify` succeeds, the facilitator-supplied `payer` is hashed
+(domain-separated SHA-256, never the raw address) onto the intent. That
+row then withholds only from that hash. Other anonymous x402 callers of
+the same route are billable again. The residual this ticket accepts is
+the first stall of a never-verified payer, and a later challenge from
+the same wallet that still presents no identity at mint time: those stay
+unkeyed. The hashed payer never reaches a metric label, a log line, or a
+response body.
 
 The refusal is still worth alerting on. On a rail with an authoritative
 status query the wait is one worker sweep. On a rail without one, x402 v2

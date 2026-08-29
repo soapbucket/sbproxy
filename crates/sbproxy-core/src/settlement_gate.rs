@@ -65,11 +65,14 @@
 //! not one payer, so a client that re-signs would read as a new payer and
 //! be handed the second bill this guard exists to prevent.
 //!
-//! Requests the proxy cannot identify keep the original behavior on both
-//! sides: an intent minted for one stores no scope key and blocks every
-//! payer, and a request carrying no identity waits on every unresolved
-//! intent for the route. The narrowing only ever separates two payers the
-//! proxy can actually tell apart.
+//! Requests the proxy cannot identify still mint a NULL-scoped intent, so a
+//! first-ever stall from a never-verified payer is route-wide. WOR-2302
+//! fills that NULL from an x402 facilitator's `VerifyResponse.payer` (hashed,
+//! never logged) once `/verify` succeeds. An attributed row then matches
+//! only that hash: unidentified callers of the same route are billable
+//! again. The residual this ticket accepts is that the same anonymous
+//! wallet's next challenge is still unidentified at mint time and is not
+//! keyed off the previous hash.
 //!
 //! # How long the unattributable case waits
 //!
@@ -1910,6 +1913,13 @@ mod tests {
         ) -> Result<CreateIntent, BillingError> {
             Err(BillingError::Storage("induced store failure"))
         }
+        async fn attribute_payer_hash(
+            &self,
+            _intent_id: &str,
+            _payer_hash: &str,
+        ) -> Result<(), BillingError> {
+            Err(BillingError::Storage("induced store failure"))
+        }
         async fn finalize_requirement(
             &self,
             _intent_id: &str,
@@ -2880,17 +2890,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unidentified_request_waits_on_an_identified_payers_stuck_payment() {
+    async fn an_unidentified_request_is_not_withheld_by_an_identified_payers_stuck_payment() {
         let gate = Gate::x402();
         strand_as(&gate, "agent:gptbot").await;
 
-        // The conservative direction. This request carries no identity, so
-        // it cannot be proved to be someone other than the stranded payer,
-        // and guessing costs a double charge.
+        // WOR-2302: an attributed intent names a payer. An unidentified
+        // request is therefore someone else, and withholding the route
+        // from them is the revenue loss this ticket exists to stop. The
+        // residual is that the original payer coming back without their
+        // credential also gets a new challenge.
         let anonymous = expect_respond(gate.decide_with(&crawler_headers()).await);
         assert_eq!(
-            anonymous.status, 503,
-            "no identity means no proof this is a different payer",
+            anonymous.status, 402,
+            "an attributed stuck payment must not stall unidentified callers",
         );
     }
 
@@ -3045,8 +3057,8 @@ mod tests {
         );
         let anonymous = expect_respond(gate.decide_with(&crawler_headers()).await);
         assert_eq!(
-            anonymous.status, 503,
-            "an unidentified request still cannot be proved to be someone else",
+            anonymous.status, 402,
+            "an attributed hold no longer stalls unidentified callers",
         );
     }
 
