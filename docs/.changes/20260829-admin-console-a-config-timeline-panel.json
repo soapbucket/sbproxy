@@ -1,0 +1,4 @@
+{
+  "type": "added",
+  "message": "Admin console: a Config timeline panel showing refused config candidates interleaved with applied revisions, and a Roll back control on each history row."
+}

@@ -6,6 +6,7 @@ import {
   ApiError,
   type ConfigHistoryDetail,
   type ConfigHistoryEntry,
+  type ConfigTimelineRow,
   type ConfigWriteConflict,
   type EffectiveConfigResponse,
   type TargetHealth,
@@ -26,10 +27,12 @@ import {
   degradedSummary,
   historyStateTone,
   isConfigHistoryDisabled,
+  rollbackGate,
 } from "../lib/config-history";
 import ConfigForm from "../components/ConfigForm.vue";
 import { parse as parseYaml } from "yaml";
 import { useAsync } from "../composables/useAsync";
+import { useCapabilities } from "../composables/useCapabilities";
 import { toast } from "../composables/useToasts";
 import { formatMs, formatTime, shortId } from "../lib/format";
 import PageHeader from "../components/PageHeader.vue";
@@ -400,6 +403,112 @@ async function loadHistoryDetail(entry: ConfigHistoryEntry) {
     historyDetailLoading.value = false;
   }
 }
+
+// ---- config timeline and rollback (WOR-2462 / WOR-2460) ----
+//
+// The applied table above reads `entries`. This reads `timeline`, which
+// interleaves the candidates the node refused among the revisions it
+// applied. The two answer different questions and the second one is the
+// one an operator asks during an incident: an `lkg_revision` that has
+// not moved for three hours looks identical in the applied table whether
+// nothing was offered or everything offered was refused.
+const timelineRows = computed<ConfigTimelineRow[]>(
+  () => configHistory.data.value?.timeline ?? [],
+);
+
+// Which revision is mid-soak, if any. Same reason: an unmoved lkg
+// pointer with a soak in flight is healthy, and one without is not.
+const soakRevision = computed<number | null>(
+  () => configHistory.data.value?.soak_revision ?? null,
+);
+
+function timelineKindTone(row: ConfigTimelineRow): "ok" | "err" {
+  return row.kind === "rejected" ? "err" : "ok";
+}
+
+const { canMutate, whyNot } = useCapabilities();
+
+// The rollback form. `rollbackTarget` is the revision an operator picked
+// off a row; `rollbackTyped` is what they typed into the confirmation.
+const rollbackTarget = ref<number | null>(null);
+const rollbackTypedConfirmation = ref("");
+const rollbackBusy = ref(false);
+const rollbackResult = ref<string | null>(null);
+
+/*
+ * The client half of the typed-confirmation rule, finally wired.
+ *
+ * `rollbackGate` shipped with the route and nothing called it. It is the
+ * affordance: it decides whether to offer the button. The enforcer is
+ * `POST /admin/config/rollback`'s own `confirm_revision` check, and the
+ * two do not read the same radius. This one is handed the radius the
+ * history entry stored, measured against the revision before it when it
+ * applied; the route measures the running document against the target at
+ * call time. They can disagree in either direction and the route decides,
+ * which is why `confirm_revision` is sent on every submission rather than
+ * only when this gate asked for it.
+ */
+const rollbackEntry = computed<ConfigHistoryEntry | null>(
+  () =>
+    historyEntries.value.find((entry) => entry.revision === rollbackTarget.value) ??
+    null,
+);
+
+const rollbackDecision = computed(() =>
+  rollbackTarget.value === null
+    ? null
+    : rollbackGate(
+        rollbackEntry.value?.blast_radius ?? null,
+        rollbackTarget.value,
+        rollbackTypedConfirmation.value,
+      ),
+);
+
+function openRollback(entry: ConfigHistoryEntry) {
+  rollbackTarget.value = entry.revision;
+  rollbackTypedConfirmation.value = "";
+  rollbackResult.value = null;
+}
+
+function cancelRollback() {
+  rollbackTarget.value = null;
+  rollbackTypedConfirmation.value = "";
+}
+
+async function submitRollback() {
+  const target = rollbackTarget.value;
+  if (target === null) return;
+  // Belt and braces with the disabled attribute: a template that lost
+  // its binding in a refactor would otherwise submit unconfirmed.
+  if (!canMutate.value || !rollbackDecision.value?.canSubmit) return;
+  rollbackBusy.value = true;
+  rollbackResult.value = null;
+  try {
+    const result = await api.configRollback({
+      revision: rollbackTarget.value ?? undefined,
+      // Always sent. The server is the enforcer and reads its own
+      // radius; a submission the client thought needed no confirmation
+      // still carries one rather than being refused with a 409.
+      confirm_revision: target,
+    });
+    // Lead with the thing the route cannot do for the operator. A
+    // rollback that reports success and says nothing about the file
+    // leaves them believing the incident is closed.
+    rollbackResult.value = result.config_file_unchanged
+      ? `Rolled back to revision ${result.restored_revision}. This node's config file is unchanged, so the next watcher event, SIGHUP, source poll, or authority bundle re-applies whatever the source of truth still says. Fix it before then.`
+      : `Rolled back to revision ${result.restored_revision}.`;
+    for (const warning of result.warnings) toast.warn("Rollback warning", warning);
+    configHistory.run();
+    cancelRollback();
+  } catch (e) {
+    // A 409 here is the route's own refusal (an unconfirmed restart or
+    // breaking rollback, a lineage mismatch, an `expected_current` that
+    // moved), not a transport failure, and the operator needs to read it.
+    toast.error(e, "Roll back config");
+  } finally {
+    rollbackBusy.value = false;
+  }
+}
 </script>
 
 <template>
@@ -628,11 +737,125 @@ async function loadHistoryDetail(entry: ConfigHistoryEntry) {
                   <template v-else-if="historyDetail">
                     <p class="sb-faint sb-mono">digest {{ entry.digest }}</p>
                     <pre class="sb-code">{{ historyDetail.plan_text }}</pre>
+                    <div class="rollback">
+                      <button
+                        v-if="rollbackTarget !== entry.revision"
+                        class="sb-btn sb-btn--sm"
+                        :disabled="!canMutate"
+                        :title="canMutate ? 'Restore this revision into the running process' : whyNot('mutate')"
+                        @click.stop="openRollback(entry)"
+                      >
+                        Roll back to revision {{ entry.revision }}
+                      </button>
+                      <div v-else class="rollback__form" @click.stop>
+                        <p class="sb-faint">
+                          This restores revision {{ entry.revision }} into the running
+                          process. It does not touch this node's config file: the next
+                          watcher event, SIGHUP, source poll, or authority bundle
+                          re-applies whatever the source of truth still says.
+                        </p>
+                        <label
+                          v-if="rollbackDecision?.requiresTypedConfirmation"
+                          class="rollback__confirm"
+                        >
+                          <span class="sb-faint">{{ rollbackDecision?.reason }}</span>
+                          <input
+                            v-model="rollbackTypedConfirmation"
+                            class="sb-input sb-mono"
+                            :placeholder="String(entry.revision)"
+                            aria-label="Type the target revision to confirm"
+                          />
+                        </label>
+                        <div class="rollback__actions">
+                          <button
+                            class="sb-btn sb-btn--primary sb-btn--sm"
+                            :disabled="
+                              rollbackBusy || !canMutate || !rollbackDecision?.canSubmit
+                            "
+                            @click="submitRollback"
+                          >
+                            {{ rollbackBusy ? "Rolling back..." : "Confirm rollback" }}
+                          </button>
+                          <button class="sb-btn sb-btn--sm" @click="cancelRollback">
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                      <p v-if="rollbackResult" class="sb-faint rollback__result">
+                        {{ rollbackResult }}
+                      </p>
+                    </div>
                   </template>
                 </div>
               </td>
             </tr>
           </template>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Applied revisions and refused candidates in one list (WOR-2462) -->
+  <section class="section">
+    <div class="section__head">
+      <h2>Config timeline</h2>
+      <span class="sb-faint">Applied revisions and refused candidates, newest first</span>
+      <span class="sb-faint sb-mono" v-if="soakRevision !== null">
+        rev {{ soakRevision }} soaking
+      </span>
+    </div>
+    <EmptyState
+      v-if="historyDisabled"
+      message="Config history is not enabled on this node. Set proxy.config_history.enabled to record applied revisions and refused candidates."
+    />
+    <ErrorState
+      v-else-if="configHistory.error.value"
+      :error="configHistory.error.value"
+      @retry="configHistory.run"
+    />
+    <EmptyState
+      v-else-if="!timelineRows.length && !configHistory.loading.value"
+      message="Nothing recorded yet. A refused candidate appears here as soon as one is offered."
+    />
+    <div class="table-wrap" v-else>
+      <table class="sb-table">
+        <thead>
+          <tr>
+            <th>When</th>
+            <th>Kind</th>
+            <th>Revision</th>
+            <th>Provenance</th>
+            <th>Detail</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="row in timelineRows" :key="`${row.kind}-${row.digest}-${row.at}`">
+            <td class="sb-muted" :title="row.at">{{ formatTime(row.at) }}</td>
+            <td>
+              <StatusBadge :label="row.kind" :tone="timelineKindTone(row)" />
+            </td>
+            <td class="sb-mono">{{ row.revision ?? "n/a" }}</td>
+            <td class="sb-mono">{{ row.provenance }}</td>
+            <td>
+              <template v-if="row.kind === 'rejected'">
+                <div class="sb-mono">{{ row.reason }} at {{ row.stage }}</div>
+                <div v-if="row.count && row.count > 1" class="sb-faint">
+                  refused {{ row.count }} times, still current
+                </div>
+                <div v-if="row.detail" class="sb-faint timeline-detail">{{ row.detail }}</div>
+              </template>
+              <template v-else>
+                <StatusBadge
+                  v-if="row.state"
+                  :label="row.state"
+                  :tone="historyStateTone(row.state)"
+                />
+                <span v-if="row.degraded?.length" class="sb-faint">
+                  {{ degradedSummary(row.degraded) }}
+                </span>
+              </template>
+            </td>
+          </tr>
         </tbody>
       </table>
     </div>
@@ -896,5 +1119,32 @@ async function loadHistoryDetail(entry: ConfigHistoryEntry) {
 .owned-elsewhere td {
   padding: 0.2rem 0.5rem 0.2rem 0;
   vertical-align: top;
+}
+
+.rollback {
+  margin-top: var(--sb-space-4);
+  padding-top: var(--sb-space-3);
+  border-top: 1px solid var(--sb-border);
+}
+.rollback__form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sb-space-3);
+}
+.rollback__confirm {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sb-space-2);
+}
+.rollback__actions {
+  display: flex;
+  gap: var(--sb-space-2);
+}
+.rollback__result {
+  margin-top: var(--sb-space-3);
+}
+.timeline-detail {
+  max-width: 60ch;
+  overflow-wrap: anywhere;
 }
 </style>
