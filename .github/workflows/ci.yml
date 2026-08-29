@@ -451,14 +451,15 @@ jobs:
       - name: no process-global env mutation outside test helpers
         run: bash scripts/check-env-mutation.sh
 
-      # Every ONNX load refuses external tensor data (WOR-2694).
-      # tract's model_for_path parses and translates in one call and
-      # hands tract the model's directory, which is what
-      # GHSA-h668-6x6g-f8r5 resolves an attacker-chosen `location`
-      # against. Loaders parse the proto, refuse external data, then
-      # translate with no directory. Shares one script with
-      # scripts/check.sh.
-      - name: every ONNX load refuses external tensor data
+      # No call site hands tract a model directory (WOR-2694).
+      # model_for_path parses and translates in one call and hands tract
+      # the model's directory, which is what GHSA-h668-6x6g-f8r5
+      # resolves an attacker-chosen `location` against. So do
+      # parse_with_template, Onnx::parse, and a hand-built
+      # ParsingContext, and all five are banned. Loaders parse the
+      # proto, refuse external data, then translate with no directory.
+      # Shares one script with scripts/check.sh.
+      - name: no call site hands tract a model directory
         run: bash scripts/check-onnx-model-loaders.sh
 
       # Durable sinks create their files owner-only, through
