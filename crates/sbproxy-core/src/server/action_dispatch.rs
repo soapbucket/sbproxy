@@ -8962,8 +8962,6 @@ fn mcp_server_approval_refusal_for_non_tool_call(
     }
 }
 
-/// WOR-1792 / GS: mint upstream Authorization for run-as-user without
-/// mutating tool arguments. Identity and tokens never enter args.
 /// The authorizer the MCP run-as-user token exchange dials under.
 ///
 /// WOR-2620: the one production call site passed a literal `None`, so
@@ -8986,6 +8984,8 @@ fn mcp_token_exchange_gate() -> Option<sbproxy_security::egress::EgressAuthorize
     )
 }
 
+/// WOR-1792 / GS: mint upstream Authorization for run-as-user without
+/// mutating tool arguments. Identity and tokens never enter args.
 async fn mcp_prepare_run_as_user_auth(
     arguments: serde_json::Value,
     auth_config: &sbproxy_extension::mcp::auth::McpUpstreamAuthConfig,
@@ -9489,12 +9489,6 @@ fn record_billable_tool_call(ctx: &RequestContext, tool_name: &str, server: &str
 #[cfg(not(feature = "payments"))]
 fn record_billable_tool_call(_ctx: &RequestContext, _tool_name: &str, _server: &str) {}
 
-/// WOR-1644: attribute one MCP `tools/call` into the usage plane.
-/// Records the dispatch count and duration on
-/// `sbproxy_mcp_tool_dispatch_*`, the resolved cost on
-/// `sbproxy_mcp_tool_cost_usd_total`, and emits one `LlmUsageEvent`
-/// (keyed by tenant, principal, server, tool) to every configured
-/// usage sink, so tool spend lands in the same stream as model spend.
 /// Record one MCP tool dispatch on the decision family and audit feed.
 ///
 /// `mcp.tool` is a gateway decision in the sense the audit surface
@@ -9708,6 +9702,13 @@ fn record_mcp_scope_decision(ctx: &RequestContext, method: &str, required_scope:
     );
 }
 
+/// WOR-1644: attribute one MCP `tools/call` into the usage plane.
+/// Records the dispatch count and duration on
+/// `sbproxy_mcp_tool_dispatch_*`, the resolved cost on
+/// `sbproxy_mcp_tool_cost_usd_total`, and emits one `LlmUsageEvent`
+/// (keyed by tenant, principal, server, tool) to every configured
+/// usage sink, so tool spend lands in the same stream as model spend.
+///
 /// Returns `true` when the caller must refuse the tool call outright
 /// because `events.fail_closed` names `mcp_governance_decision` and the
 /// evidence record for this call could not be queued (WOR-2384). `false`
@@ -11307,22 +11308,6 @@ mod mcp_scope_enforcement_tests {
     }
 }
 
-/// Map an upstream failure without reflecting untrusted detail to a modern
-/// caller. The legacy branch deliberately retains its frozen wire message.
-///
-/// WOR-2587 review: an `McpPolicyHook` deny/confirm collapses into a
-/// generic `anyhow::Error` at the `McpFederation` call-tool seam (see
-/// [`sbproxy_extension::mcp::McpPolicyDeniedError`]'s own doc
-/// comment). Recovering the structured JSON-RPC code and the
-/// operator-authored deny/confirm reason here, for both protocol eras,
-/// is what closes that gap: a policy hook refusing a call is a
-/// deterministic decision about the request, not a server fault, so it
-/// gets the same `-32602 INVALID_PARAMS` code `action_dispatch`'s own
-/// RBAC deny path uses instead of falling through to a blanket
-/// `-32603 INTERNAL_ERROR`, and a modern-protocol caller gets the same
-/// human-readable reason (including an `@confirm` annotation's text)
-/// the legacy era's frozen `{legacy_context}: {error}` formatting
-/// already happened to retain.
 fn mcp_approval_pending_response(
     id: Option<serde_json::Value>,
     hold_id: &str,
@@ -11388,6 +11373,22 @@ fn mcp_notify_approval_webhook(
     });
 }
 
+/// Map an upstream failure without reflecting untrusted detail to a modern
+/// caller. The legacy branch deliberately retains its frozen wire message.
+///
+/// WOR-2587 review: an `McpPolicyHook` deny/confirm collapses into a
+/// generic `anyhow::Error` at the `McpFederation` call-tool seam (see
+/// [`sbproxy_extension::mcp::McpPolicyDeniedError`]'s own doc
+/// comment). Recovering the structured JSON-RPC code and the
+/// operator-authored deny/confirm reason here, for both protocol eras,
+/// is what closes that gap: a policy hook refusing a call is a
+/// deterministic decision about the request, not a server fault, so it
+/// gets the same `-32602 INVALID_PARAMS` code `action_dispatch`'s own
+/// RBAC deny path uses instead of falling through to a blanket
+/// `-32603 INTERNAL_ERROR`, and a modern-protocol caller gets the same
+/// human-readable reason (including an `@confirm` annotation's text)
+/// the legacy era's frozen `{legacy_context}: {error}` formatting
+/// already happened to retain.
 fn mcp_upstream_failure_response(
     id: Option<serde_json::Value>,
     is_modern: bool,

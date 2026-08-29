@@ -749,9 +749,6 @@ impl ProxyHarness {
         }
     }
 
-    /// Build (or return) the lazy-initialised blocking HTTP client.
-    /// Construction is deferred so harness creation does not trigger
-    /// reqwest's internal runtime drop in async contexts.
     /// Send a built request, and when the transport fails, attach the tail
     /// of the proxy's own stderr to the error.
     ///
@@ -787,6 +784,9 @@ impl ProxyHarness {
         all[all.len().saturating_sub(lines)..].join("\n")
     }
 
+    /// Build (or return) the lazy-initialised blocking HTTP client.
+    /// Construction is deferred so harness creation does not trigger
+    /// reqwest's internal runtime drop in async contexts.
     fn http_client(&self) -> &reqwest::blocking::Client {
         self.client.get_or_init(|| {
             reqwest::blocking::Client::builder()

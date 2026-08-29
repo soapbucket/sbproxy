@@ -3529,22 +3529,6 @@ fn carry_inbound_identity_into_stamped_principal(
     }
 }
 
-/// Stamp a guardrail block onto the request context, and count it.
-///
-/// These were two separate concerns until the counter turned out to have no
-/// writer at all. `sbproxy_ai_guardrail_blocks_total` was declared, published
-/// as a stable metric, and drawn on a Grafana panel, while
-/// `record_guardrail_block` was called from nowhere. The panel read a flat
-/// zero, which is indistinguishable from a guardrail that never fires, which
-/// is exactly what an operator would conclude.
-///
-/// Setting the context fields and the counter in one place is the only
-/// arrangement in which the dashboard cannot silently disagree with the access
-/// log: a new block path has to go through here to stamp the context, and
-/// stamping the context increments the counter.
-/// WOR-2096: both the origin flag and the governed key's policy must
-/// consent before any redacted content sample is retained. Fail closed:
-/// no effective policy (unkeyed or native traffic) means no capture.
 /// WOR-2651: whether a prompt-cache lease may re-order this request's
 /// candidates, and whether one may be recorded for it.
 ///
@@ -3571,6 +3555,9 @@ fn cache_affinity_may_reorder(
     configured && !is_failover && !has_routing_policy_plan && !strategy_owns_order
 }
 
+/// WOR-2096: both the origin flag and the governed key's policy must
+/// consent before any redacted content sample is retained. Fail closed:
+/// no effective policy (unkeyed or native traffic) means no capture.
 fn content_capture_allowed(config: &AiHandlerConfig, ctx: &RequestContext) -> bool {
     config.capture_content
         && ctx
@@ -3579,6 +3566,19 @@ fn content_capture_allowed(config: &AiHandlerConfig, ctx: &RequestContext) -> bo
             .is_some_and(|policy| policy.allow_content_capture)
 }
 
+/// Stamp a guardrail block onto the request context, and count it.
+///
+/// These were two separate concerns until the counter turned out to have no
+/// writer at all. `sbproxy_ai_guardrail_blocks_total` was declared, published
+/// as a stable metric, and drawn on a Grafana panel, while
+/// `record_guardrail_block` was called from nowhere. The panel read a flat
+/// zero, which is indistinguishable from a guardrail that never fires, which
+/// is exactly what an operator would conclude.
+///
+/// Setting the context fields and the counter in one place is the only
+/// arrangement in which the dashboard cannot silently disagree with the access
+/// log: a new block path has to go through here to stamp the context, and
+/// stamping the context increments the counter.
 fn mark_guardrail_block(ctx: &mut RequestContext, category: String) {
     sbproxy_ai::ai_metrics::record_guardrail_block(&category);
     ctx.ai_outcome = Some("guardrail_block".to_string());
