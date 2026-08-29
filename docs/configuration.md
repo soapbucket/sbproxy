@@ -3141,13 +3141,6 @@ A cookie naming a variant that has since been removed from `variants`
 falls through to a fresh roll, so shrinking an experiment does not strand
 the clients pinned to the variant you dropped.
 
-`abtest` cannot be combined with `response_cache` on the same origin, and
-the config is refused at load if you try. The cache lookup runs before
-the variant is picked, and the variant is not part of the cache key, so a
-cache hit would serve one variant's body to clients assigned another and
-the split would report weights it never applied. Disable
-`response_cache` on this origin, or put the cached content on its own.
-
 A request carrying the sticky cookie with a value matching a configured
 variant's `name` always routes to that variant. Everything else gets a
 fresh weighted-random pick: a variant's share of traffic is its `weight`
@@ -3158,6 +3151,16 @@ application as well: the proxy already stamps it, and a second
 `Set-Cookie` with the same name leaves it to the browser which one wins.
 If the backend needs to know which variant served a request, read it from
 the cookie the proxy set rather than minting your own.
+
+`abtest` cannot be combined with `response_cache` on the same origin, and
+the config is refused at load if you try. That holds whether the `abtest`
+is the origin's own action or sits in one of its `forward_rules` entries,
+because the parent origin's cache is consulted before a rule is selected
+either way. The cache lookup runs before the variant is picked, and the
+variant is not part of the cache key, so a cache hit would serve one
+variant's body to clients assigned another and the split would report
+weights it never applied. Disable `response_cache` on this origin, or put
+the cached content on its own.
 
 Each variant's `url` accepts the same host **and path** as a `proxy`
 action: `https://b.example.com/v2` sends the request to `/v2` prefixed
