@@ -15553,13 +15553,24 @@ async fn refuse_if_parallel_input_blocks(
 mod parallel_input_join_sites {
     #[test]
     fn refuse_if_parallel_input_blocks_is_called_from_every_non_race_short_circuit() {
+        // Needles stay brace-balanced. This file's cfg(test) ranges are
+        // counted by `{` / `}` even inside comments and strings, and an
+        // unmatched opener extends the test range over production code.
         let src = include_str!("ai_dispatch.rs");
         let replay = src
-            .find("AiIdempotencyEngagement::Replayed { response } => {\n            if refuse_if_parallel_input_blocks")
-            .expect("idempotency replay in handle_ai_proxy must join parallel input");
+            .find("mut idem_capture) = match engage_ai_idempotency")
+            .expect("POST idempotency engagement");
+        assert!(
+            src[replay..replay.saturating_add(800)].contains("refuse_if_parallel_input_blocks"),
+            "idempotency replay in handle_ai_proxy must join parallel input"
+        );
         let hit = src
-            .find("SemanticLookupOutcome::Hit(hit)) => {\n                            if refuse_if_parallel_input_blocks(")
-            .expect("semantic-cache hit in handle_ai_proxy must join parallel input");
+            .find("SemanticLookupOutcome::Hit(hit)) =>")
+            .expect("semantic-cache hit arm");
+        assert!(
+            src[hit..hit.saturating_add(400)].contains("refuse_if_parallel_input_blocks"),
+            "semantic-cache hit in handle_ai_proxy must join parallel input"
+        );
         let race = src
             .find("if race_mode\n        && refuse_if_parallel_input_blocks")
             .expect("raced fan-out in handle_ai_proxy must join parallel input");
