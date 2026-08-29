@@ -5123,17 +5123,6 @@ response_modifiers:
 
 Cache responses at the origin level to reduce backend load and improve response times for cacheable content. The `response_cache` block is a sibling of `action`.
 
-An entry is keyed on the request, not on the caller, so one stored
-response is replayed to every client whose request matches that key.
-`Set-Cookie` is therefore never stored: a cookie captured into an entry
-would be handed to clients it was never issued for. The client whose
-request missed still receives its own `Set-Cookie` normally; only the
-copy that would have gone into the entry is dropped, and the response
-stays cacheable. This is the same reasoning that stops a
-request-dependent `wasm` transform from sharing an origin with
-`response_cache` (see [scripting.md](scripting.md)), applied to the
-response side.
-
 ```yaml
 origins:
   "api.example.com":
