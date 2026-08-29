@@ -3375,6 +3375,28 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_mcp_grant_expired_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_mcp_grant_expired"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["tenant", "policy"],
+        description: "MCP tools/call refused because a time-boxed RBAC grant elapsed, by tenant and policy.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_mcp_approval_hold_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_mcp_approval_hold"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["tenant", "outcome"],
+        description: "MCP tools/call parked for operator approval, by tenant and outcome.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_mcp_tool_cost_usd_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_mcp_tool_cost"),
@@ -5008,6 +5030,12 @@ pub const TENANT_SCOPED_METRICS: &[&str] = &[
     // and flow counters directly above.
     "sbproxy_mcp_content_filter_total",
     "sbproxy_mcp_result_policy_total",
+    // WOR-2386. A time-boxed grant expiry is a security-policy outcome
+    // for one tenant's tool-call traffic.
+    "sbproxy_mcp_grant_expired_total",
+    // WOR-2454. A parked high-risk tool call is a security-policy
+    // outcome for one tenant's tool-call traffic.
+    "sbproxy_mcp_approval_hold_total",
     // Every meter family with a tenant dimension. Tenant-relevant is not a
     // judgment call here: a metering counter exists to say what one
     // customer owes, and one that merged every customer's units into a
