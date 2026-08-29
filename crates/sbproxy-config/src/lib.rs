@@ -62,9 +62,10 @@ pub mod validate;
 pub use cluster::*;
 pub use compiler::*;
 pub use config_authority::{
-    AuthorityStore, AuthorityStoreError, CredentialSeed, IssuedSubscriberCredential,
-    SubscriberAuthError, SubscriberRecord, AUTHORITY_STATE_SCHEMA_VERSION, CREDENTIAL_ID_BYTES,
-    CREDENTIAL_SECRET_BYTES, MAX_SUBSCRIBERS, SUBSCRIBER_TOKEN_PREFIX,
+    ApplyStatus, AuthorityStore, AuthorityStoreError, CredentialSeed, IssuedSubscriberCredential,
+    SubscriberApplyReport, SubscriberAuthError, SubscriberRecord, AUTHORITY_STATE_SCHEMA_VERSION,
+    CREDENTIAL_ID_BYTES, CREDENTIAL_SECRET_BYTES, MAX_APPLY_ERROR_CHARS, MAX_SUBSCRIBERS,
+    SUBSCRIBER_TOKEN_PREFIX,
 };
 pub use config_bundle::{
     is_valid_bundle_identifier, BundleAlgorithm, BundleError, BundleMode, ConfigBundle,

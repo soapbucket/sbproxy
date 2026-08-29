@@ -167,6 +167,16 @@ struct StubState {
     last_if_none_match: Option<String>,
     /// Subscriber identity header from the most recent request.
     last_subscriber_id: Option<String>,
+    /// WOR-2464: the apply-report headers from the most recent request,
+    /// so a test can prove what this node told the authority it applied
+    /// rather than only what it fetched.
+    last_apply_status: Option<String>,
+    /// `x-sbproxy-applied-revision` from the most recent request.
+    last_applied_revision: Option<String>,
+    /// `x-sbproxy-applied-hash` from the most recent request.
+    last_applied_hash: Option<String>,
+    /// `x-sbproxy-config-error` from the most recent request.
+    last_apply_error: Option<String>,
 }
 
 /// A stub config authority: one conditional GET, one response.
@@ -212,6 +222,11 @@ impl StubAuthority {
                         state.last_if_none_match = header_value(&request, "if-none-match");
                         state.last_subscriber_id =
                             header_value(&request, "x-sbproxy-subscriber-id");
+                        state.last_apply_status = header_value(&request, "x-sbproxy-config-status");
+                        state.last_applied_revision =
+                            header_value(&request, "x-sbproxy-applied-revision");
+                        state.last_applied_hash = header_value(&request, "x-sbproxy-applied-hash");
+                        state.last_apply_error = header_value(&request, "x-sbproxy-config-error");
                         (state.not_modified, state.body.clone())
                     };
                     let response = if not_modified {
@@ -699,6 +714,105 @@ async fn a_bundle_that_does_not_compile_is_refused_and_the_previous_pipeline_kee
             .expect("document")
             .contains("http2_cleartextt"),
         "the misspelling an operator has to find is in the stored document",
+    );
+}
+
+/// WOR-2464. Seen is not applied. A node that applied cleanly says so on
+/// its next fetch, in OpAMP's `RemoteConfigStatus` vocabulary, and names
+/// the config hash it is serving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_clean_apply_is_reported_on_the_next_fetch() {
+    let _serial = SERIAL.lock().await;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let dir = temp.path();
+    let (mut subscriber, stub) =
+        applied_baseline(dir, "report-local.test", "report-authority.test").await;
+
+    // The first cycle applied; nothing was reported on it, because the
+    // node had decided nothing when it made that request.
+    assert_eq!(
+        stub.state.lock().expect("stub state").last_apply_status,
+        None,
+        "a node reports what it applied, and on the first fetch it has applied nothing",
+    );
+
+    // The next cycle carries the report. `304` is enough: the report
+    // rides the fetch the subscriber already makes.
+    stub.answer_not_modified();
+    assert_eq!(subscriber.poll_once().await, CycleResult::NotModified);
+    let state = stub.state.lock().expect("stub state");
+    assert_eq!(
+        state.last_apply_status.as_deref(),
+        Some("applied"),
+        "a clean apply reports APPLIED",
+    );
+    assert_eq!(
+        state.last_applied_revision.as_deref(),
+        Some("5"),
+        "and names the revision it is actually serving",
+    );
+    assert!(
+        state
+            .last_applied_hash
+            .as_deref()
+            .is_some_and(|hash| !hash.is_empty()),
+        "and the config hash, which is what OpAMP's RemoteConfigStatus is keyed on: {:?}",
+        state.last_applied_hash,
+    );
+    assert_eq!(
+        state.last_apply_error, None,
+        "a clean apply carries no error",
+    );
+}
+
+/// WOR-2464, the gap this ticket exists to close. A node that refused a
+/// bundle reports FAILED with the reason, and keeps reporting the
+/// revision it is **actually serving** rather than the one it refused. A
+/// fleet where three nodes did this used to look identical from the
+/// authority's side to a fleet that applied cleanly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_bundle_reports_failed_and_keeps_naming_the_revision_it_serves() {
+    let _serial = SERIAL.lock().await;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let dir = temp.path();
+    let (mut subscriber, stub) =
+        applied_baseline(dir, "refused-local.test", "refused-authority.test").await;
+
+    stub.serve(
+        sign(6, BundleMode::Overlay, "proxy:\n  http2_cleartextt: true\n")
+            .to_json()
+            .expect("encode"),
+    );
+    assert_eq!(subscriber.poll_once().await, CycleResult::CompileFailed);
+    assert_eq!(subscriber.revision(), 5, "the cursor did not move");
+
+    // The refusal is reported on the following fetch.
+    stub.answer_not_modified();
+    let _ = subscriber.poll_once().await;
+    let state = stub.state.lock().expect("stub state");
+    assert_eq!(
+        state.last_apply_status.as_deref(),
+        Some("failed"),
+        "a refusal reports FAILED",
+    );
+    assert_eq!(
+        state.last_applied_revision.as_deref(),
+        Some("5"),
+        "and names revision 5, which this node is serving, not the 6 it refused. that \
+         distinction is the whole ticket",
+    );
+    let error = state
+        .last_apply_error
+        .as_deref()
+        .expect("a failure carries its reason");
+    assert!(
+        error.contains("http2_cleartextt"),
+        "the reason names the misspelling an operator has to find: {error}",
+    );
+    assert!(
+        !error.contains('\n') && !error.contains('\r'),
+        "and it is header safe, or reqwest would refuse the request and this node would \
+         silently stop reporting: {error:?}",
     );
 }
 

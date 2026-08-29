@@ -476,6 +476,96 @@ fn reload_from_config_text(config_path: &str, yaml: &str) -> anyhow::Result<Relo
     result
 }
 
+/// Apply a document read back out of the config revision ring, through
+/// the ordinary reload transaction (WOR-2460).
+///
+/// A rollback is an ordinary candidate. It resolves, it compiles, it
+/// publishes through the same prepare-and-publish body every other
+/// reload goes through, and the soak the transaction arms judges it like
+/// any other revision. Treating a rollback as a privileged path that
+/// skips validation is how rolling back becomes the incident: the stored
+/// document published cleanly once, but "once" was possibly before an
+/// upgrade tightened a validation rule, and the document that will not
+/// construct on this binary has to be refused with the pipeline pointer
+/// untouched rather than half-applied. `AuthorityStore::rollback` takes
+/// the same position for the same reason on the publisher side.
+///
+/// Not [`reload_from_config_yaml`], for three reasons, each of which is
+/// a behavior difference rather than a naming one:
+///
+/// * The **suspension guard** there refuses a pinned node's local
+///   reloads. A rollback is an explicit act (an operator asking, or the
+///   soak's own auto-revert acting on evidence), the same class as
+///   `POST /admin/reload`, which
+///   [`crate::config_boot::reload_suspended`] already keeps live. A
+///   pinned node is exactly where a rollback is most likely to be needed.
+/// * The **audit source** is `rollback`, not `file_watcher`. Blaming the
+///   watcher for the single most consequential operator action in this
+///   feature is the defect that verification residual R3 fixed next
+///   door.
+/// * The **ring actor** is the caller's, so `sbproxy config history`
+///   shows who rolled the node back rather than a generic label.
+///
+/// `ring_actor` is `rollback:<operator>` for the admin route and
+/// `auto_revert` for the soak's own revert. It reaches the ring entry
+/// this apply appends; the stable `rollback` label the audit record
+/// carries is separate, so the audit vocabulary stays closed while the
+/// history column stays specific.
+///
+/// # Errors
+///
+/// Returns `Err` under exactly the conditions
+/// [`reload_from_config_yaml`] does: an unresolvable `source:` pointer
+/// (which a stored blob never carries, since the ring stores
+/// post-resolution text), a document that does not compile on this
+/// binary, or a pipeline that does not construct. The running pipeline
+/// keeps serving in every one of those cases.
+pub(crate) fn reload_from_stored_revision(
+    config_path: &str,
+    yaml: &str,
+    ring_actor: &str,
+) -> anyhow::Result<ReloadOutcome> {
+    let result = {
+        let _reload_guard = CONFIG_RELOAD_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reload_from_config_yaml_locked(config_path, yaml, ring_actor, None)
+    };
+    match &result {
+        Ok(_) => sbproxy_observe::metrics::record_config_reload("success"),
+        Err(_) => sbproxy_observe::metrics::record_config_reload("failure"),
+    }
+    audit_reload_outcome("rollback", config_path, &result);
+    if let Err(error) = &result {
+        // The refused candidate is kept like any other (WOR-2462), and
+        // this is the one an operator most needs to find later: a
+        // rollback target that no longer constructs is a revision the
+        // ring will keep offering and the node will keep refusing, and
+        // the stored refusal is what says why without reproducing it.
+        //
+        // `CompileFailed` covers all three ways this can fail by its own
+        // definition ("did not compile, could not be constructed, or
+        // still carried an unresolved `${VAR}` reference"), and the
+        // three are not separable here anyway: the reload transaction
+        // returns one `anyhow::Error`. Which of them it was is in the
+        // stored `detail`, and `stage: "rollback"` already separates
+        // these from a subscriber cycle's refusals.
+        crate::config_subscriber::record_refusal(
+            yaml,
+            &crate::config_subscriber::CycleRefusal::new(
+                crate::config_subscriber::CycleResult::CompileFailed,
+                crate::path_redact::sanitise_path_in_error(
+                    &format!("{error:#}"),
+                    std::path::Path::new(config_path),
+                ),
+            ),
+            "rollback",
+            sbproxy_config::BaseOrigin::Local,
+        );
+    }
+    result
+}
+
 /// Emit a `config_audit` record for a reload outcome on a non-admin path
 /// (WOR-2486): the file watcher, SIGHUP, the remote config-source
 /// refresh poller, the config-authority bundle apply, and the
@@ -4242,6 +4332,12 @@ pub fn run_with_fallback(
             )));
 
         let admin_state = std::sync::Arc::new(admin_state_inner);
+        // Owned before the `move` closure below takes everything else:
+        // the soak supervisor drives a rollback when `auto_revert` is
+        // armed and a window fails, and the reload transaction needs the
+        // config path to resolve relative paths inside the restored
+        // document (WOR-2461).
+        let soak_config_path = config_path.to_string();
         // WOR-1718: install the global handle so the pipeline's logging
         // hook can feed the request-log ring buffer + SSE tail.
         crate::admin::install_admin_log_sink(admin_state.clone());
@@ -4271,7 +4367,7 @@ pub fn run_with_fallback(
                 // window in flight, running the operator probe on its
                 // cadence, and closing the window when it is due. A
                 // no-op on every node that never arms one.
-                crate::config_soak::spawn();
+                crate::config_soak::spawn(soak_config_path);
                 // WOR-2664 review: without this the configured feed was read
                 // only when a human POSTed /admin/agent-registry/refresh, so
                 // every restart served whatever the store had cached and a

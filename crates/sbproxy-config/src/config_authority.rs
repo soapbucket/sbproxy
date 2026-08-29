@@ -251,6 +251,12 @@ pub struct SubscriberRecord {
     /// file into a write-amplifier.
     #[serde(default, skip_serializing)]
     last_seen_at_unix_ms: Option<u64>,
+    /// What this subscriber last said it **applied** (WOR-2464), as
+    /// distinct from what it was served. `None` for a subscriber that
+    /// has never reported one: an older build, or one that has not
+    /// polled since this authority started.
+    #[serde(default)]
+    applied: Option<SubscriberApplyReport>,
 }
 
 impl std::fmt::Debug for SubscriberRecord {
@@ -264,6 +270,7 @@ impl std::fmt::Debug for SubscriberRecord {
             .field("revoked_at_unix_ms", &self.revoked_at_unix_ms)
             .field("last_seen_revision", &self.last_seen_revision)
             .field("last_seen_at_unix_ms", &self.last_seen_at_unix_ms)
+            .field("applied", &self.applied)
             .finish()
     }
 }
@@ -312,6 +319,171 @@ impl SubscriberRecord {
     pub const fn last_seen_at_unix_ms(&self) -> Option<u64> {
         self.last_seen_at_unix_ms
     }
+
+    /// What this subscriber last reported it applied (WOR-2464).
+    ///
+    /// `None` means **unknown**, not "applied". A subscriber on an older
+    /// build sends no report and must not be rendered as healthy: a
+    /// status page that showed "applied" for a node that has never said
+    /// so is worse than one that says nothing, because it answers the
+    /// rollout question wrongly with confidence.
+    #[must_use]
+    pub const fn applied(&self) -> Option<&SubscriberApplyReport> {
+        self.applied.as_ref()
+    }
+}
+
+/// How a subscriber's last apply attempt went, in OpenTelemetry OpAMP's
+/// `RemoteConfigStatus` vocabulary (WOR-2464).
+///
+/// OpAMP settled this shape already: a last remote config hash, a status
+/// of `APPLYING` / `APPLIED` / `FAILED`, and an error message. Reusing
+/// those semantics rather than inventing a fourth spelling costs nothing
+/// now and keeps the door open if this ever speaks OpAMP properly.
+///
+/// One value is ours: [`Self::AppliedDegraded`]. The node already
+/// distinguishes a clean apply from one that published while a subsystem
+/// stayed on prior state (`ReloadOutcome::is_fully_applied`), the two
+/// counters are disjoint on the node, and folding them together on the
+/// trip upstream would hide exactly the reload an operator most needs to
+/// see. OpAMP has no such value, so a future OpAMP bridge maps this onto
+/// `APPLIED` and carries the detail in the message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplyStatus {
+    /// A candidate is in flight: fetched and being applied.
+    Applying,
+    /// Applied cleanly.
+    Applied,
+    /// Published, with at least one subsystem left on prior state.
+    AppliedDegraded,
+    /// Refused. The node keeps serving what it had.
+    Failed,
+}
+
+impl ApplyStatus {
+    /// The wire label, identical to what serde writes.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Applying => "applying",
+            Self::Applied => "applied",
+            Self::AppliedDegraded => "applied_degraded",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// Parse one wire label. `None` for anything else, which is how an
+    /// unknown value from a newer or hostile subscriber is dropped
+    /// rather than stored.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "applying" => Some(Self::Applying),
+            "applied" => Some(Self::Applied),
+            "applied_degraded" => Some(Self::AppliedDegraded),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// Longest error message an authority stores from a subscriber
+/// (WOR-2464).
+///
+/// The message is subscriber-supplied text that lands in an
+/// admin-facing status page and in the authority's own state file, so it
+/// is bounded at the trust boundary rather than trusted to be short. The
+/// same 512-byte ceiling the decision-audit `reason` field and
+/// `RejectionMetadata::detail` already use.
+pub const MAX_APPLY_ERROR_CHARS: usize = 512;
+
+/// What one subscriber last told this authority it applied (WOR-2464).
+///
+/// # Seen is not applied
+///
+/// Before this existed, the authority tracked only the revision each
+/// subscriber was **served**. A fleet where three nodes fetched r42,
+/// refused it on `compile_failed`, and kept serving r41 looked identical
+/// from here to a fleet that applied it cleanly, and the operator found
+/// out from a customer. This is the node's own answer coming back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubscriberApplyReport {
+    /// How the last attempt went.
+    pub status: ApplyStatus,
+    /// The revision the node is **actually serving**. On a refusal this
+    /// stays at the revision it kept serving rather than moving to the
+    /// one it refused, which is the whole point.
+    pub revision: u64,
+    /// Content digest of that revision.
+    pub config_hash: String,
+    /// Why the last attempt failed, bounded to
+    /// [`MAX_APPLY_ERROR_CHARS`]. Absent on every non-failure.
+    #[serde(default)]
+    pub error: Option<String>,
+    /// The node's own soak verdict for what it is serving, when it runs
+    /// a soak: `successful`, `failed`, or `inconclusive`. Absent on a
+    /// node with `proxy.config_history` off, which is most of them.
+    #[serde(default)]
+    pub soak_verdict: Option<String>,
+    /// Whether the node is serving a configuration its boot fallback
+    /// rescued from its own ring rather than the one it was handed. A
+    /// node in that state applies authority bundles but has a local
+    /// document underneath that does not work, which is a different
+    /// problem from a refusal and needs saying separately.
+    #[serde(default)]
+    pub fallback_active: bool,
+    /// When this report arrived, in unix milliseconds.
+    ///
+    /// In memory only, like [`SubscriberRecord::last_seen_at_unix_ms`]
+    /// and for the same reason: it changes on every poll, and a fleet of
+    /// a thousand nodes polling every thirty seconds would otherwise
+    /// turn the state file into a write amplifier. An authority restart
+    /// therefore reports the applied revision it persisted with no
+    /// arrival time, which the status page renders as an unknown poll
+    /// state until the next poll.
+    #[serde(default, skip_serializing)]
+    pub reported_at_unix_ms: Option<u64>,
+}
+
+impl SubscriberApplyReport {
+    /// Whether the durable half of two reports differs.
+    ///
+    /// The arrival time is deliberately excluded: it changes on every
+    /// poll and persisting it is the write amplification this type's
+    /// documentation refuses.
+    #[must_use]
+    pub fn durable_part_differs(&self, other: &Self) -> bool {
+        self.status != other.status
+            || self.revision != other.revision
+            || self.config_hash != other.config_hash
+            || self.error != other.error
+            || self.soak_verdict != other.soak_verdict
+            || self.fallback_active != other.fallback_active
+    }
+
+    /// Bound the free-text fields at the trust boundary.
+    fn bounded(mut self) -> Self {
+        self.error = self
+            .error
+            .map(|error| truncate_chars(&error, MAX_APPLY_ERROR_CHARS));
+        self.soak_verdict = self
+            .soak_verdict
+            .map(|verdict| truncate_chars(&verdict, 32));
+        self.config_hash = truncate_chars(&self.config_hash, 128);
+        self
+    }
+}
+
+/// Truncate on a character boundary, appending an ellipsis marker when
+/// anything was dropped.
+fn truncate_chars(value: &str, limit: usize) -> String {
+    if value.chars().count() <= limit {
+        return value.to_string();
+    }
+    let kept: String = value.chars().take(limit).collect();
+    format!("{kept}...")
 }
 
 /// Why a presented subscriber credential was refused.
@@ -724,6 +896,7 @@ impl AuthorityStore {
             created_at_unix_ms: now_unix_ms,
             revoked_at_unix_ms: None,
             last_seen_revision: 0,
+            applied: None,
             last_seen_at_unix_ms: None,
         };
         let mut next = self.state.clone();
@@ -869,6 +1042,62 @@ impl AuthorityStore {
             return Ok(());
         }
         record.last_seen_revision = revision;
+        let snapshot = self.state.clone();
+        self.save_state(&snapshot)
+    }
+
+    /// Record what a subscriber says it **applied** (WOR-2464).
+    ///
+    /// `published_high_water` is the highest revision this authority has
+    /// ever published. A report naming anything above it is refused
+    /// rather than stored: a compromised or buggy node that could claim
+    /// revision 9999 would make the fleet view say the rollout is
+    /// complete, which is the one answer an operator acts on without
+    /// checking. The refusal is the caller's to log; the previous report
+    /// is left in place, because a stale true answer beats a fresh
+    /// false one.
+    ///
+    /// Persisted only when the durable half changes, the same discipline
+    /// [`Self::record_seen`] keeps and for the same reason: the arrival
+    /// time moves on every poll, and a large fleet polling every thirty
+    /// seconds would otherwise rewrite the state file constantly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthorityStoreError::Invalid`] when the report claims a
+    /// revision the authority has never published, and
+    /// [`AuthorityStoreError::Io`] or [`AuthorityStoreError::Json`] when
+    /// a changed report cannot be persisted. The in-memory value is
+    /// updated before the write in the second case, because the
+    /// subscriber genuinely said it.
+    pub fn record_applied(
+        &mut self,
+        credential_id: &str,
+        report: SubscriberApplyReport,
+        published_high_water: u64,
+        now_unix_ms: u64,
+    ) -> Result<(), AuthorityStoreError> {
+        if report.revision > published_high_water {
+            return Err(AuthorityStoreError::invalid(format!(
+                "subscriber reported applying revision {} but this authority has never \
+                 published anything above revision {published_high_water}; the report \
+                 is discarded",
+                report.revision
+            )));
+        }
+        let Some(record) = self.state.subscribers.get_mut(credential_id) else {
+            return Ok(());
+        };
+        let mut report = report.bounded();
+        report.reported_at_unix_ms = Some(now_unix_ms);
+        let durable_change = record
+            .applied
+            .as_ref()
+            .is_none_or(|previous| previous.durable_part_differs(&report));
+        record.applied = Some(report);
+        if !durable_change {
+            return Ok(());
+        }
         let snapshot = self.state.clone();
         self.save_state(&snapshot)
     }
@@ -1284,6 +1513,174 @@ mod tests {
             );
         }
         assert_eq!(store.subscriber_count(), 0);
+    }
+
+    /// WOR-2464. The durable half of an apply report survives a restart,
+    /// the arrival time does not, and the free-text fields are bounded
+    /// at the trust boundary. All three are properties of a fleet view
+    /// an operator makes a rollback decision on.
+    #[test]
+    fn an_apply_report_persists_its_durable_half_and_bounds_its_free_text() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let credential_id = {
+            let mut store = store(temp.path());
+            let issued = store
+                .register_subscriber("edge-01", &seed(1), NOW)
+                .expect("register");
+            let credential_id = issued.record().credential_id().to_string();
+
+            let report = SubscriberApplyReport {
+                status: ApplyStatus::Failed,
+                revision: 4,
+                config_hash: "sha-4".to_string(),
+                error: Some("x".repeat(MAX_APPLY_ERROR_CHARS + 200)),
+                soak_verdict: Some("failed".to_string()),
+                fallback_active: true,
+                reported_at_unix_ms: None,
+            };
+            store
+                .record_applied(&credential_id, report, 9, NOW)
+                .expect("a revision at or below the high-water mark is accepted");
+            let stored = store
+                .subscriber(&credential_id)
+                .expect("record")
+                .applied()
+                .expect("a report");
+            assert_eq!(stored.status, ApplyStatus::Failed);
+            assert_eq!(stored.reported_at_unix_ms, Some(NOW));
+            let error = stored.error.as_deref().expect("an error");
+            assert!(
+                error.chars().count() <= MAX_APPLY_ERROR_CHARS + 3,
+                "subscriber-supplied text is bounded before it reaches a state file and an \
+                 admin page: {} chars",
+                error.chars().count(),
+            );
+            assert!(error.ends_with("..."), "and it says it was cut");
+
+            // A revision above the high-water mark is refused, and the
+            // previous report is left in place: a stale true answer
+            // beats a fresh false one.
+            let error = store
+                .record_applied(
+                    &credential_id,
+                    SubscriberApplyReport {
+                        status: ApplyStatus::Applied,
+                        revision: 9_999,
+                        config_hash: "sha-forged".to_string(),
+                        error: None,
+                        soak_verdict: None,
+                        fallback_active: false,
+                        reported_at_unix_ms: None,
+                    },
+                    9,
+                    NOW + 1,
+                )
+                .expect_err("a node cannot claim a revision that was never published");
+            assert!(error.to_string().contains("9999"), "{error}");
+            assert_eq!(
+                store
+                    .subscriber(&credential_id)
+                    .expect("record")
+                    .applied()
+                    .expect("still the old report")
+                    .status,
+                ApplyStatus::Failed,
+            );
+
+            // An unknown credential is ignored rather than fabricating a
+            // record, the same way `record_seen` treats one.
+            store
+                .record_applied(
+                    "not-registered",
+                    SubscriberApplyReport {
+                        status: ApplyStatus::Applied,
+                        revision: 1,
+                        config_hash: String::new(),
+                        error: None,
+                        soak_verdict: None,
+                        fallback_active: false,
+                        reported_at_unix_ms: None,
+                    },
+                    9,
+                    NOW,
+                )
+                .expect("ignored");
+            assert_eq!(store.subscriber_count(), 1);
+            credential_id
+        };
+
+        let restarted = store(temp.path());
+        let stored = restarted
+            .subscriber(&credential_id)
+            .expect("record")
+            .applied()
+            .expect("the durable half survives");
+        assert_eq!(stored.status, ApplyStatus::Failed);
+        assert_eq!(stored.revision, 4);
+        assert_eq!(stored.config_hash, "sha-4");
+        assert!(
+            stored.reported_at_unix_ms.is_none(),
+            "the arrival time is in memory only, so the status page says the poll state is \
+             unknown after a restart rather than claiming the node just reported",
+        );
+    }
+
+    /// WOR-2464. The durable comparison ignores the arrival time, which
+    /// is the whole of what keeps a thousand nodes polling every thirty
+    /// seconds from rewriting the state file constantly.
+    #[test]
+    fn only_the_durable_half_of_an_apply_report_counts_as_a_change() {
+        let base = SubscriberApplyReport {
+            status: ApplyStatus::Applied,
+            revision: 4,
+            config_hash: "sha".to_string(),
+            error: None,
+            soak_verdict: None,
+            fallback_active: false,
+            reported_at_unix_ms: Some(NOW),
+        };
+        let later = SubscriberApplyReport {
+            reported_at_unix_ms: Some(NOW + 60_000),
+            ..base.clone()
+        };
+        assert!(
+            !base.durable_part_differs(&later),
+            "a re-report of the same state is not a write",
+        );
+        let moved = SubscriberApplyReport {
+            revision: 5,
+            ..base.clone()
+        };
+        assert!(base.durable_part_differs(&moved));
+        let degraded = SubscriberApplyReport {
+            status: ApplyStatus::AppliedDegraded,
+            ..base.clone()
+        };
+        assert!(
+            base.durable_part_differs(&degraded),
+            "and a clean apply turning degraded is a change worth persisting",
+        );
+    }
+
+    /// WOR-2464. The wire labels are a closed set that round-trips, so a
+    /// node and an authority on different builds cannot disagree about
+    /// what `applied_degraded` means.
+    #[test]
+    fn every_apply_status_round_trips_through_its_wire_label() {
+        for status in [
+            ApplyStatus::Applying,
+            ApplyStatus::Applied,
+            ApplyStatus::AppliedDegraded,
+            ApplyStatus::Failed,
+        ] {
+            assert_eq!(ApplyStatus::parse(status.as_str()), Some(status));
+        }
+        assert_eq!(ApplyStatus::parse("teleported"), None);
+        assert_eq!(
+            ApplyStatus::parse("APPLIED"),
+            None,
+            "the labels are lowercase"
+        );
     }
 
     #[test]

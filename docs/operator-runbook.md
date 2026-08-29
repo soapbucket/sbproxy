@@ -973,6 +973,106 @@ out the window. `POST /admin/config/confirm` closes it now and answers with
 the verdict and every signal's reasoning, so the pipeline can fail its own
 step when the answer is not `passed`.
 
+#### Rolling back
+
+`POST /admin/config/rollback`, or `sbproxy config rollback`, re-applies a
+revision the ring already holds. It is the escape hatch, and it works
+whether or not anything else is armed.
+
+```bash
+# What is in the ring, and which revision is last known good.
+sbproxy config history
+
+# What rolling back to 41 would change, before doing it.
+sbproxy config diff 41
+
+# Do it, refusing if somebody else moved this node since you looked.
+sbproxy config rollback --to 41 --expected-current 43
+```
+
+Four things to know before you reach for it at three in the morning.
+
+1. **It soaks.** A rollback is an ordinary candidate: it compiles, it
+   publishes through the same transaction, and its own window opens. It is
+   not a privileged path, because rolling into a second bad config is a
+   real thing that happens under pressure. `POST /admin/config/confirm`
+   closes that window early once you have checked.
+2. **It does not rewrite your config file.** The response says so
+   (`config_file_unchanged`) and puts it in `warnings`. The next filesystem
+   event, SIGHUP, `source:` poll, or authority bundle re-applies whatever
+   the source of truth still says, so fixing that is the second half of
+   the recovery. On a node the fallback has pinned, the local triggers are
+   already suspended and you have longer; on a healthy node you do not.
+3. **A restart-class rollback needs confirming.** If the diff between what
+   is running and the target touches a listener port, the `proxy.admin`
+   block, cluster identity, or an origin's action or auth type, the route
+   refuses until you name the revision back (`--confirm 41`). Swapping the
+   pipeline pointer does not rebind a socket, and plan to restart.
+4. **History is append-only.** The rollback appends a new entry carrying
+   the restored document and marks the revision you left as `reverted`.
+   The `lkg` pointer does not move to the rollback: what is good is still
+   whatever a soak promoted, and the rollback's own candidate has to earn
+   that the same way.
+
+A rollback to a document that no longer constructs on this build answers
+`422` with the compile error, the running configuration keeps serving, and
+the refused candidate lands in `GET /admin/config/rejected` with `rollback`
+as its stage. That is the case worth rehearsing: a revision that was good
+in October need not still construct after an upgrade tightened validation.
+
+#### Letting a failed soak revert on its own
+
+`proxy.config_history.soak.auto_revert` is off by default and most
+deployments should leave it that way for a while. With it off the soak
+still runs, still promotes, and still alerts; you get the last-known-good
+pointer and the metrics without handing a node permission to undo a change
+nobody asked it to undo. Run it off long enough to calibrate
+`soak.min_requests` and `soak.max_error_rate_delta` against your real
+traffic first, because the failure mode is asymmetric: a flapping upstream
+during a deploy window reverts a good config, you re-apply it, it reverts
+again, and the safety feature is now the incident.
+
+Once armed, a failed soak re-applies the last known good **only** when the
+change was one an in-process swap can undo. Watch these:
+
+| Reading | What happened |
+|---|---|
+| `sbproxy_config_apply_total{outcome="reverted"}` climbing | A node undid a change on its own. Disjoint from `applied`, which manual rollbacks count, so this query is only ever about automatic action. |
+| `sbproxy_config_apply_total{outcome="declined"}` climbing | An armed node failed a soak and decided **not** to revert. Alert on this beside `reverted`: a change that fails everywhere and is declined everywhere leaves `reverted` flat, which reads the same as nothing having failed. The `config_rollback` event carries the reason (`not_arc_swappable`, `radius_unknown`, `would_loop`, `already_on_last_known_good`, `no_last_known_good`, `history_unavailable`). |
+| WARN naming a `blast_radius` of `restart` or `breaking` | The soak failed and the node did **not** revert, because swapping back would leave listeners or the admin server in a state neither configuration describes. Boot fallback and a manual rollback are the answer. |
+| ERROR saying the revision an earlier revert restored has failed its own soak | Both the new config and the last known good are failing the same signals. Nothing is retried; this needs a person. |
+| ERROR saying an automatic revert was refused | The rescue target did not compile. The running pipeline is untouched and nothing loops. |
+
+An `inconclusive` verdict never reverts. A window where every signal
+abstained measured nothing, and reverting on no information is the false
+positive that gets this feature switched off.
+
+#### Which nodes actually applied it
+
+`GET /admin/config-authority/status` answers "31 of 34 nodes applied r42,
+3 failed: unknown policy type `waf_v3`" rather than leaving you to infer
+it from who fetched. Read `applied_current_count`, `apply_failed_count`,
+and `apply_unknown_count` first, then the per-subscriber rows.
+
+Three distinctions on that page are worth learning before you need them:
+
+* `up_to_date` is about the revision a node was **served**.
+  `applied_up_to_date` is about the revision it is **running**. A node that
+  fetched r42, refused it, and kept serving r41 is `true` on the first and
+  `false` on the second, and before this existed it looked identical to a
+  clean apply.
+* `apply_status: "unknown"` is not `applied`. It means an older build, or a
+  node that has not polled since this authority restarted. Do not read it
+  as healthy.
+* `poll_state` separates a node that has gone quiet (`stale`) from one that
+  polled and failed (`recent`, with `apply_status: "failed"`). The first
+  needs a look at the node; the second needs a look at the config.
+
+`soak_verdict` on each row is that node's own answer about what it is
+serving. A fleet where every node reports `applied` and six report
+`soak_verdict: "failed"` is a rollout to stop, and it is the reading that
+turns a fleet rollback into a decision rather than a guess.
+
 #### Booting on the last known good config
 
 When the config a node is told to boot on does not work, the node exits 1,

@@ -4006,6 +4006,62 @@ pub fn record_config_soak_verdict(verdict: &str, signal: &str) {
     }
 }
 
+/// Count one rollback attempt on `sbproxy_config_apply_total{outcome}`
+/// (WOR-2460, WOR-2461).
+///
+/// Narrower than its name reads, and deliberately so: this family counts
+/// what the **rollback** paths did, not every config apply. Ordinary
+/// applies are already counted by `sbproxy_config_reload_total{result}`
+/// and by `sbproxy_config_bundle_fetch_total{result}`, and a second
+/// family covering the same events would give two different answers to
+/// "how many applies happened" depending on which one an operator
+/// happened to graph.
+///
+/// `outcome` is a closed string:
+///
+/// | Outcome | Meaning |
+/// |---|---|
+/// | `applied` | A rollback candidate compiled and published; the node is now serving the restored revision |
+/// | `rejected` | A rollback was refused before anything was applied: an unknown target, a stale `expected_current`, a lineage break, an unconfirmed restart-class radius, or a document that no longer compiles on this binary |
+/// | `reverted` | An **automatic** revert fired: a soak failed with `auto_revert` armed and the node re-applied its last known good |
+/// | `declined` | A soak failed with `auto_revert` armed and the node decided **not** to revert: the change was not one an arc-swap can undo, its radius could not be measured, reverting would loop, or there was nowhere to go |
+///
+/// `reverted` and `applied` are disjoint by construction: an auto-revert
+/// counts `reverted` and a manual rollback counts `applied`, so
+/// "did anything roll this fleet back without an operator" is one query
+/// rather than a subtraction.
+///
+/// `declined` exists because its absence made a whole fleet's inaction
+/// unreadable. Every declining arm returns before the apply, so without
+/// it a change that failed its soak on thirty nodes and reverted on none
+/// left `reverted` flat, which is the same reading as "no soak failed".
+/// The reason for each decline is on the `config_rollback` event rather
+/// than on a label here, because the reason set is open enough that
+/// putting it in a label would be a cardinality decision rather than a
+/// naming one.
+///
+/// A node running the default `auto_revert: false` does **not** count
+/// `declined`. It is the default, so counting it would fire on every
+/// failed soak on almost every node and bury the four answers that need
+/// acting on. That an unarmed node did nothing is already readable from
+/// `sbproxy_config_soak_verdict_total{verdict="failed"}`.
+pub fn record_config_apply(outcome: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_config_apply_total",
+            "Config rollback attempts, by outcome",
+            &["outcome"],
+        )
+        .ok()
+    });
+    if let Some(counter) = counter {
+        counter.with_label_values(&[outcome]).inc();
+    }
+}
+
 /// Count one refused config candidate on
 /// `sbproxy_config_rejected_total{reason}` (WOR-2462).
 ///

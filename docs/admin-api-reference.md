@@ -2950,6 +2950,15 @@ it, and the pipeline can fail its own step on the answer.
 | `verdict` | string | `passed`, `failed`, or `inconclusive`. |
 | `promoted` | bool | Whether the last-known-good pointer moved. True only for `passed`. |
 | `signals[]` | array | One row per signal: its `outcome` (`passed`, `failed`, `abstain`) and the explanation it gave, secret-redacted the same way `GET /admin/config/rejected` redacts a stored refusal. |
+| `auto_revert` | object | Present only on a `failed` verdict, and `null` otherwise, so a pipeline cannot mistake "the soak passed" for "auto-revert declined". Carries `acted` (whether anything about what is serving changed), a stable `reason` (`disarmed`, `not_arc_swappable`, `radius_unknown`, `would_loop`, `already_on_last_known_good`, `reverted`, or a rollback refusal code), and a `detail` sentence. On `reverted` it also names `restored_revision`, `restored_digest`, and `appended_revision`. |
+
+A confirmation that comes back `failed` is a failed soak, so it arms the
+same automatic revert a timed close would. Wiring only the timer would
+mean a pipeline that confirms early gets the verdict and not the
+consequence, which is the worst half of both behaviors. With
+`proxy.config_history.soak.auto_revert` off, which is the default, the
+`auto_revert` object reports `reason: "disarmed"` and nothing about what
+is serving changed.
 
 Mutating, so a read-only operator is refused.
 
@@ -2959,6 +2968,131 @@ Mutating, so a read-only operator is refused.
 | `404` | `proxy.config_history` is absent or `enabled: false`. |
 | `409` | No soak is in flight. Body: `{"error": "no config soak is in flight"}`. Either no reload has happened, or its window already closed. |
 | `503` | The block is enabled but the ring failed to open at boot. |
+
+---
+
+### `POST /admin/config/rollback`
+
+Re-apply a config revision this node already stored. The escape hatch,
+needed whatever else is armed.
+
+A rollback is an ordinary candidate: it resolves, it compiles, it publishes
+through the same reload transaction every other apply goes through, and it
+soaks. A stored document that no longer constructs on this build is refused
+with the compile error and the running configuration keeps serving.
+
+The request body is a JSON object; an empty `{}` rolls back to the last
+known good. `sbproxy config rollback` is the same call with flags, and
+[manual.md](manual.md#config-rollback--config-diff---move-a-running-proxy-back-to-a-stored-revision)
+has the runnable form.
+
+| Body field | Type | Description |
+|---|---|---|
+| `revision` | number | Roll back to this ring revision. |
+| `digest` | string | Roll back to this content digest. |
+| `target` | string | `"last-known-good"`, the default. An empty body `{}` means this. |
+| `expected_current` | number | Refuse unless this is the revision running now. Absent proceeds. |
+| `lineage` | string | Refuse unless this is the ring's lineage, absent `force`. |
+| `confirm_revision` | number | Name the target revision back to accept a `restart` or `breaking` rollback. |
+| `force` | bool | Proceed across a lineage break. |
+
+`revision`, `digest`, and `target` are mutually exclusive.
+
+```json
+{
+  "rolled_back": true,
+  "restored_revision": 41,
+  "restored_digest": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a5",
+  "previous_revision": 43,
+  "appended_revision": 44,
+  "blast_radius": "reload",
+  "degraded": [],
+  "soaking": true,
+  "secrets_fingerprint_changed": false,
+  "config_file_unchanged": true,
+  "warnings": [
+    "this node's config file is unchanged: the next file-watcher event, SIGHUP, source: poll, or authority bundle re-applies whatever the source of truth still says. fix it before then"
+  ]
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `restored_revision` | number | The ring revision whose document is now serving. |
+| `previous_revision` | number | The revision that was running before this rollback. Marked `reverted` only when `appended_revision` is non-null: a rollback onto the document already running is deduplicated by the ring, so it appends nothing and annotates nothing. |
+| `appended_revision` | number | The **new** entry this rollback appended. History is append-only, so a rollback is itself in the history. `null` when the restored document is byte identical to what was already running. |
+| `blast_radius` | string | `hitless`, `reload`, `restart`, or `breaking`, computed between the two stored documents. `null` in three cases: the ring holds no prior entry to compare against, the running revision's stored blob could not be read, or either document no longer parses. A `null` radius is treated as one that needs confirming, not as a safe one. |
+| `soaking` | bool | Whether a soak window is now open on the restored revision. |
+| `secrets_fingerprint_changed` | bool | The secret backends moved since the restored document applied, so a `${VAR}`, `vault://`, or `secret://` reference inside it may resolve to a different value now. |
+| `config_file_unchanged` | bool | Always `true`. This route applies a document; it does not rewrite the node's config file. |
+| `warnings[]` | array | Human-readable strings for everything above that needs an operator's attention. |
+
+Mutating, so a read-only operator is refused. Authenticated exactly like
+`POST /admin/reload`.
+
+| Status | When |
+|---|---|
+| `200` | The rollback applied. |
+| `400` | The body is not a JSON object, or names more than one target. |
+| `404` | `proxy.config_history` is absent or `enabled: false`; or no revision was ever promoted (`no_last_known_good`); or the named revision or digest is not in the ring (`unknown_revision`, `unknown_digest`, with `available_revisions` / `available_digests` naming what is). |
+| `409` | A precondition the caller can fix and retry: `stale_expected_current` (both revisions named), `lineage_mismatch` (both lineages named), `restart_not_confirmed` (the radius named), `unknown_radius_not_confirmed` (the radius could not be measured, so confirming is required rather than assumed unnecessary). |
+| `422` | `apply_failed`: the stored document no longer constructs on this build. The running configuration is untouched, and the refused candidate is kept under `rejected/` with `rollback` as its stage. |
+| `500` | The stored blob could not be read, or no config path is wired on this node. |
+| `503` | The block is enabled but the ring failed to open at boot. |
+
+Every attempt, accepted or refused, publishes a `config_rollback` event
+carrying the trigger (`manual` or `auto_revert`), the actor, and both
+revisions. A success counts on
+`sbproxy_config_apply_total{outcome="applied"}` and a refusal on
+`{outcome="rejected"}`; an automatic revert counts `{outcome="reverted"}`,
+disjoint from the manual one.
+
+An armed node that decides **not** to revert also publishes a
+`config_rollback` event, with `outcome: "declined"` and a `reason` of
+`not_arc_swappable`, `radius_unknown`, `would_loop`,
+`already_on_last_known_good`, `no_last_known_good`, or
+`history_unavailable`, and counts `{outcome="declined"}`. Without it a
+change that failed its soak fleet-wide and reverted nowhere left the
+`reverted` counter flat, which reads the same as no soak having failed.
+A node running the default `auto_revert: false` does not count
+`declined`.
+
+---
+
+### `GET /admin/config/diff`
+
+A plan between two stored config revisions, or between what is running and
+one stored revision. Reads only: no reload, no ring write, no pointer move.
+
+| Query parameter | Description |
+|---|---|
+| `to` | Required. A revision number, or `last-known-good`. |
+| `from` | A revision number, or `last-known-good`. Defaults to the merged, pre-resolution document this node is running, the same one `GET /admin/config/effective` answers with. |
+
+```json
+{
+  "from": {"revision": 38, "digest": "..."},
+  "to": {"revision": 41, "digest": "..."},
+  "max_blast_radius": "reload",
+  "changes": 3,
+  "plan_text": "~ origins.api.example.com.action.target\n..."
+}
+```
+
+`plan_text` is rendered from the original stored bytes and secret-redacted
+afterwards, the same ordering `GET /admin/config/history/{digest}` uses:
+redacting first can corrupt the YAML a literal secret sits inside.
+
+Read-only operators may call this.
+
+| Status | When |
+|---|---|
+| `200` | Rendered. |
+| `400` | `to` is missing, or a side is neither a revision number nor `last-known-good`. |
+| `404` | The ring is not enabled; a named revision is not in it (with `available_revisions`); or `last-known-good` names nothing yet. |
+| `422` | A stored document does not parse as a configuration. |
+| `500` | A stored blob could not be read. |
+| `503` | The running configuration could not be resolved for the `from` default, or the ring failed to open at boot. |
 
 ---
 
@@ -4098,9 +4232,72 @@ model.
 |---|---|---|
 | POST | `/admin/config-authority/publish?mode=overlay\|replace` | Publish the request body as a signed bundle. Returns the new revision, content digest, and ETag. |
 | POST | `/admin/config-authority/rollback` | Republish a previous revision under a new revision number. |
-| GET | `/admin/config-authority/status` | Current revision, digest, ETag, signing key id, and each subscriber's last-seen revision. |
+| GET | `/admin/config-authority/status` | Current revision, digest, ETag, signing key id, and per subscriber both the revision it was last served and the revision it reports having applied. |
 | GET, POST | `/admin/config-authority/subscribers` | List subscribers, or register one with `{"subscriber_id": ...}`. |
 | POST | `/admin/config-authority/subscribers/revoke` | Revoke by `credential_id`, or all credentials for a `subscriber_id`. |
+
+
+### `GET /admin/config-authority/status`: applied, not just fetched
+
+Seen is not applied. A fleet where three nodes fetched r42, refused it on
+`compile_failed`, and kept serving r41 used to look identical from the
+authority's side to a fleet that applied it cleanly, and the operator found
+out from a customer. Subscribers now report what they **applied** on their
+next poll, and the status page carries both answers side by side.
+
+The field semantics are OpenTelemetry OpAMP's `RemoteConfigStatus`: a last
+remote config hash, a status, and an error message. One value is ours,
+`applied_degraded`, because the node already distinguishes a clean apply
+from one that published while a subsystem stayed on prior state, and
+folding the two together on the trip upstream would hide exactly the
+reload an operator most needs to see.
+
+```json
+{
+  "current_revision": 42,
+  "applied_current_count": 31,
+  "apply_failed_count": 3,
+  "apply_unknown_count": 0,
+  "subscribers": [
+    {
+      "subscriber_id": "edge-07",
+      "last_seen_revision": 42,
+      "up_to_date": true,
+      "apply_status": "failed",
+      "applied_revision": 41,
+      "applied_config_hash": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a5",
+      "apply_error": "unknown policy type `waf_v3`",
+      "soak_verdict": null,
+      "fallback_active": false,
+      "applied_up_to_date": false,
+      "poll_state": "recent"
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `applied_current_count` | number | Subscribers whose reported applied revision is the one currently published. |
+| `apply_failed_count` | number | Subscribers whose last attempt failed. |
+| `apply_unknown_count` | number | Subscribers that have never reported: an older build, or one that has not polled since this authority started. |
+| `apply_status` | string | `applying`, `applied`, `applied_degraded`, `failed`, or `unknown`. **`unknown` is not `applied`**: a subscriber that has never said so is never rendered as healthy. |
+| `applied_revision` | number | The revision that node is **serving**. On a refusal this stays at the revision it kept, not the one it refused, which is the whole point. `null` when unknown. |
+| `applied_config_hash` | string | Content digest of that revision. |
+| `apply_error` | string | Why the last attempt failed, bounded to 512 characters at the authority. |
+| `soak_verdict` | string | That node's own soak verdict for what it is serving (`successful`, `failed`, `inconclusive`), when it runs `proxy.config_history`. A fleet where every node reports `applied` and six report `soak_verdict: failed` is a rollout to stop. |
+| `fallback_active` | bool | Whether that node is serving a configuration its boot fallback rescued. It applies bundles fine and still has a broken local document underneath, which is a different problem from a refusal. |
+| `applied_up_to_date` | bool | Whether the applied revision is the published one. Distinct from `up_to_date`, which is about the revision the node was *served*. |
+| `poll_state` | string | `recent`, `stale` (nothing for more than five minutes, ten missed polls at the default interval), or `unknown`. Three states, not two: fetch times are held in memory only, so after an authority restart the honest answer is neither, and a restart must not make every node look like it went silent. |
+
+The report rides the bundle fetch the subscriber already makes, so it
+carries the existing subscriber credential and adds **no new auth
+surface**. Two consequences worth stating: it is at most one poll interval
+stale, the same freshness `last_seen_revision` already has; and a report
+naming a revision above what this authority has ever published is
+discarded with a warning rather than stored, because one compromised node
+that could claim revision 9999 would make the fleet view say the rollout
+is complete.
 
 ---
 

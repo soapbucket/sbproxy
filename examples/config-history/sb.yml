@@ -26,7 +26,10 @@
 #   curl -s -u admin:demo-change-me http://127.0.0.1:9090/admin/config/history | jq .
 #   curl -s -u admin:demo-change-me http://127.0.0.1:9090/admin/config/rejected | jq .
 #   curl -s -u admin:demo-change-me -X POST http://127.0.0.1:9090/admin/config/confirm | jq .
+#   curl -s -u admin:demo-change-me 'http://127.0.0.1:9090/admin/config/diff?to=1' | jq .
 #   sbproxy config history --password demo-change-me
+#   sbproxy config diff 1 --password demo-change-me
+#   sbproxy config rollback --to 1 --password demo-change-me
 #
 # The full walkthrough, including the trivial edit + reload that
 # appends a second entry and the `config show` call that proves the
@@ -67,6 +70,17 @@ proxy:
         url: http://127.0.0.1:9090/healthz
         expect_status: 200
         interval_secs: 5
+
+      # Off, which is the default, and stated here because it is the
+      # one key in this block that acts on production without an
+      # operator. With it off the soak still runs, still promotes, and
+      # still alerts; POST /admin/config/rollback is how a human undoes
+      # a bad change. Arm it only after running this way long enough to
+      # calibrate min_requests and max_error_rate_delta against real
+      # traffic, and know that it arms only for a diff an arc-swap can
+      # undo: a listener port or an origin action type change is left
+      # to boot fallback and a manual rollback.
+      auto_revert: false
 
     # Boot on the ring when the config file does not work. Off by
     # default in production; on here so the walkthrough can break the

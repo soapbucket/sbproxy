@@ -3870,7 +3870,7 @@ fn handle_config_fallback_clear(state: &AdminState) -> (u16, &'static str, Strin
 /// already failing its upstream-health signal is not promoted just
 /// because somebody confirmed it. Reporting the verdict back is what
 /// lets the pipeline fail its own step on it.
-fn handle_config_confirm() -> (u16, &'static str, String) {
+fn handle_config_confirm(state: &AdminState) -> (u16, &'static str, String) {
     // Answered before the soak state is consulted, so a node that never
     // opted into the ring gets the same "not enabled" body as its
     // sibling routes rather than a confusing 409.
@@ -3907,13 +3907,527 @@ fn handle_config_confirm() -> (u16, &'static str, String) {
             })
         })
         .collect();
+    // WOR-2461: a confirmation runs the same judgment a timed close
+    // runs, so a confirmation that comes back `failed` is a failed soak
+    // and arms the same automatic revert. Wiring only the timer would
+    // have meant a pipeline that confirms early gets the verdict and not
+    // the consequence, which is the worst half of both behaviors. This
+    // handler already runs on a blocking thread, so it calls the
+    // decision directly where the soak supervisor needs `spawn_blocking`.
+    let auto_revert = if closed.verdict == sbproxy_config::SoakVerdict::Failed {
+        let config_path = state
+            .config_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned());
+        Some(crate::config_rollback::auto_revert_after_failed_soak(
+            config_path.as_deref(),
+            closed.revision,
+            &closed.digest,
+            closed.auto_revert,
+        ))
+    } else {
+        None
+    };
     let body = serde_json::json!({
         "revision": closed.revision,
         "verdict": crate::config_soak::verdict_label(closed.verdict),
         "promoted": closed.verdict == sbproxy_config::SoakVerdict::Successful,
         "signals": signals,
+        // Present only on a failed verdict, and `null` everywhere else,
+        // so a pipeline reading this cannot mistake "the soak passed"
+        // for "auto-revert declined".
+        "auto_revert": auto_revert.as_ref().map(config_auto_revert_json),
     });
     (200, "application/json", body.to_string())
+}
+
+/// Render an [`crate::config_rollback::AutoRevertDecision`] for the
+/// confirm route's response.
+///
+/// Every arm says what is serving now, because that is the question a
+/// deploy pipeline is about to make a decision on, and "the soak failed"
+/// alone does not answer it.
+fn config_auto_revert_json(
+    decision: &crate::config_rollback::AutoRevertDecision,
+) -> serde_json::Value {
+    use crate::config_rollback::AutoRevertDecision;
+    match decision {
+        AutoRevertDecision::Disarmed => serde_json::json!({
+            "acted": false,
+            "reason": "disarmed",
+            "detail": "proxy.config_history.soak.auto_revert is off, which is the default; this node is \
+                       still serving the revision that failed",
+        }),
+        AutoRevertDecision::NotArcSwappable(radius) => serde_json::json!({
+            "acted": false,
+            "reason": "not_arc_swappable",
+            "blast_radius": crate::config_rollback::blast_radius_label(*radius),
+            "detail": "an in-process swap cannot undo a change of this class; use \
+                       POST /admin/config/rollback and plan to restart",
+        }),
+        AutoRevertDecision::RadiusUnknown => serde_json::json!({
+            "acted": false,
+            "reason": "radius_unknown",
+            "detail": "no blast radius is recorded for the failing revision, so this node cannot \
+                       know an in-process swap would undo it",
+        }),
+        AutoRevertDecision::WouldLoop => serde_json::json!({
+            "acted": false,
+            "reason": "would_loop",
+            "detail": "this is the revision an earlier automatic revert restored, and it has now \
+                       failed its own soak; escalating rather than reverting to itself",
+        }),
+        AutoRevertDecision::AlreadyOnLastKnownGood => serde_json::json!({
+            "acted": false,
+            "reason": "already_on_last_known_good",
+            "detail": "the last known good is the document already running",
+        }),
+        AutoRevertDecision::Reverted(outcome) => serde_json::json!({
+            "acted": true,
+            "reason": "reverted",
+            "restored_revision": outcome.restored_revision,
+            "restored_digest": outcome.restored_digest,
+            "appended_revision": outcome.appended_revision,
+            "detail": "this node re-applied its last known good; the restored document soaks like \
+                       any other candidate",
+        }),
+        AutoRevertDecision::Refused(refusal) => serde_json::json!({
+            "acted": false,
+            "reason": refusal.as_str(),
+            "detail": sbproxy_observe::redact::redact_secrets(&refusal.to_string()),
+        }),
+    }
+}
+
+/// `POST /admin/config/rollback`: re-apply a config revision this node
+/// already stored (WOR-2460).
+///
+/// The escape hatch, and the one route in this feature that changes what
+/// is serving. Authenticated exactly like `POST /admin/reload`: the
+/// connection handler's admin credential and its RBAC gate run before
+/// this is reached, so a read-only operator cannot roll a node back.
+///
+/// # Body
+///
+/// A JSON object. Every field is optional and an empty body is the
+/// documented shortest form, `{}`, which rolls back to the last known
+/// good.
+///
+/// | Field | Meaning |
+/// |---|---|
+/// | `revision` | Roll back to this ring revision number |
+/// | `digest` | Roll back to this content digest |
+/// | `target` | `"last-known-good"`, the default |
+/// | `expected_current` | Refuse unless this is the revision running now |
+/// | `lineage` | Refuse unless this is the ring's lineage, absent `force` |
+/// | `confirm_revision` | Type the target revision back to accept a restart-class or breaking rollback |
+/// | `force` | Proceed across a lineage break |
+///
+/// `revision`, `digest`, and `target` are mutually exclusive; naming two
+/// is a `400` rather than a silent precedence rule, because guessing
+/// which one an operator meant during an incident is the wrong kind of
+/// helpful.
+///
+/// # What the response says that an operator has to read
+///
+/// `config_file_unchanged` is always `true`, and it is on the response
+/// rather than in a doc because it is the half of the recovery this
+/// route cannot do. See [`crate::config_rollback`]'s module
+/// documentation.
+///
+/// # The console's Roll back button is deferred to WOR-2574
+///
+/// **There is no button in the Vue console that calls this yet.** Until
+/// there is, this route and `sbproxy config rollback` are the operator
+/// surface, and the console will call this same route when it lands.
+/// WOR-2574 owns `ui/src/views/ConfigView.vue`, so drawing the button
+/// belongs with the rest of the console work rather than here.
+///
+/// The client half of the typed-confirmation rule is written and tested
+/// ahead of it, as `rollbackGate` in `ui/src/lib/config-history.ts`: a
+/// `restart` or `breaking` rollback, and one whose radius is unknown,
+/// may not submit until the operator types the target revision back.
+/// That function is the affordance and nothing calls it yet; this
+/// route's `confirm_revision` check is the enforcer and is what
+/// actually refuses.
+///
+/// The two do not read the same radius, which whoever wires the button
+/// has to close. `rollbackGate` is handed the radius
+/// `GET /admin/config/history` stored on the entry, measured against the
+/// revision before it when it applied; this route measures the running
+/// document against the target at call time. They can disagree in either
+/// direction, and this route decides.
+fn handle_config_rollback(state: &AdminState, body: Option<&str>) -> (u16, &'static str, String) {
+    // Answered before the ring is consulted, so a node that never opted
+    // into `proxy.config_history` gets the same "not enabled" body as
+    // its sibling routes rather than a confusing refusal about a
+    // revision.
+    if let Err(response) = config_history_open_recorder() {
+        return response;
+    }
+    let parsed =
+        match body.map(str::trim).filter(|body| !body.is_empty()) {
+            None => serde_json::Value::Object(serde_json::Map::new()),
+            Some(text) => match serde_json::from_str::<serde_json::Value>(text) {
+                Ok(value) if value.is_object() => value,
+                Ok(_) => return (
+                    400,
+                    "application/json",
+                    r#"{"error":"the request body must be a JSON object","code":"bad_request"}"#
+                        .to_string(),
+                ),
+                Err(error) => {
+                    return (
+                        400,
+                        "application/json",
+                        serde_json::json!({
+                            "error": format!("invalid JSON body: {error}"),
+                            "code": "bad_request",
+                        })
+                        .to_string(),
+                    )
+                }
+            },
+        };
+
+    let target = match rollback_target_from_body(&parsed) {
+        Ok(target) => target,
+        Err(message) => {
+            return (
+                400,
+                "application/json",
+                serde_json::json!({"error": message, "code": "bad_request"}).to_string(),
+            )
+        }
+    };
+    let request = crate::config_rollback::RollbackRequest {
+        target,
+        expected_current: parsed
+            .get("expected_current")
+            .and_then(serde_json::Value::as_u64),
+        expected_lineage: parsed
+            .get("lineage")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        confirm_revision: parsed
+            .get("confirm_revision")
+            .and_then(serde_json::Value::as_u64),
+        force: parsed
+            .get("force")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        actor: current_admin_actor(),
+        trigger: crate::config_rollback::RollbackTrigger::Manual,
+    };
+
+    let config_path = state
+        .config_path
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
+    match crate::config_rollback::rollback(config_path.as_deref(), &request) {
+        Ok(outcome) => {
+            let mut warnings: Vec<String> = Vec::new();
+            if outcome.secrets_fingerprint_changed {
+                warnings.push(
+                    "the secrets fingerprint in force when this revision applied differs from \
+                     the one running now, so a ${VAR}, vault:// or secret:// reference inside \
+                     it may resolve to a different value than it did then"
+                        .to_string(),
+                );
+            }
+            if !outcome.degraded.is_empty() {
+                warnings.push(format!(
+                    "the restored revision published with these subsystems on prior state: {}",
+                    outcome.degraded.join(", ")
+                ));
+            }
+            warnings.push(
+                "this node's config file is unchanged: the next file-watcher event, SIGHUP, \
+                 source: poll, or authority bundle re-applies whatever the source of truth \
+                 still says. fix it before then"
+                    .to_string(),
+            );
+            let body = serde_json::json!({
+                "rolled_back": true,
+                "restored_revision": outcome.restored_revision,
+                "restored_digest": outcome.restored_digest,
+                "previous_revision": outcome.previous_revision,
+                "appended_revision": outcome.appended_revision,
+                "blast_radius": outcome.blast_radius.map(crate::config_rollback::blast_radius_label),
+                "degraded": outcome.degraded,
+                // The rollback candidate soaks like any other, so the
+                // pointer has not moved to it yet. A pipeline that
+                // wants it promoted now calls POST /admin/config/confirm.
+                "soaking": crate::config_soak::in_flight_revision().is_some(),
+                "secrets_fingerprint_changed": outcome.secrets_fingerprint_changed,
+                "config_file_unchanged": outcome.config_file_unchanged,
+                "warnings": warnings,
+            });
+            (200, "application/json", body.to_string())
+        }
+        Err(refusal) => {
+            let mut body = serde_json::json!({
+                // Redacted for display, the same pass the confirm route
+                // and the stored-rejection listing already apply: an
+                // `apply_failed` detail is a compile error, and a
+                // compile error routinely quotes the offending YAML.
+                "error": sbproxy_observe::redact::redact_secrets(&refusal.to_string()),
+                "code": refusal.as_str(),
+                "rolled_back": false,
+            });
+            if let crate::config_rollback::RollbackRefusal::UnknownRevision { available, .. } =
+                &refusal
+            {
+                body["available_revisions"] = serde_json::json!(available);
+            }
+            if let crate::config_rollback::RollbackRefusal::UnknownDigest { available, .. } =
+                &refusal
+            {
+                body["available_digests"] = serde_json::json!(available);
+            }
+            (refusal.http_status(), "application/json", body.to_string())
+        }
+    }
+}
+
+/// Read the three mutually exclusive target fields out of a rollback
+/// body.
+///
+/// Split out so the exclusivity rule is one function with its own test
+/// rather than a chain of `if let` arms whose precedence nobody can
+/// state.
+fn rollback_target_from_body(
+    body: &serde_json::Value,
+) -> Result<crate::config_rollback::RollbackTarget, String> {
+    let revision = body.get("revision").and_then(serde_json::Value::as_u64);
+    let digest = body.get("digest").and_then(serde_json::Value::as_str);
+    let named = body.get("target").and_then(serde_json::Value::as_str);
+    let count = usize::from(revision.is_some())
+        + usize::from(digest.is_some())
+        + usize::from(named.is_some());
+    if count > 1 {
+        return Err(
+            "name exactly one of `revision`, `digest`, or `target`; naming two leaves it \
+             ambiguous which revision you meant"
+                .to_string(),
+        );
+    }
+    if let Some(revision) = revision {
+        return Ok(crate::config_rollback::RollbackTarget::Revision(revision));
+    }
+    if let Some(digest) = digest {
+        return Ok(crate::config_rollback::RollbackTarget::Digest(
+            digest.to_string(),
+        ));
+    }
+    match named {
+        None | Some("last-known-good") => Ok(crate::config_rollback::RollbackTarget::LastKnownGood),
+        Some(other) => Err(format!(
+            "`target` accepts only \"last-known-good\"; got \"{other}\". name a specific \
+             revision with `revision` or a specific document with `digest`"
+        )),
+    }
+}
+
+/// `GET /admin/config/diff?from=<rev>&to=<rev>`: a plan between two
+/// stored revisions, or between what is running and one stored revision
+/// (WOR-2460).
+///
+/// Junos has both forms and the second is the one people actually want
+/// mid-incident: `show | compare rollback n` diffs against one stored
+/// revision, and `show system rollback 3 compare 1` diffs two stored
+/// revisions that need not be adjacent. Cisco's `show archive config
+/// differences` is the same idea. `plan()` already takes two
+/// `ConfigFile` values, so this is argument plumbing rather than new
+/// logic.
+///
+/// `from` defaults to what is running, which makes the one-argument
+/// form `?to=<rev>` the same answer `GET /admin/config/history/{digest}`
+/// gives for that revision. Both parameters accept a revision number or
+/// the literal `last-known-good`.
+///
+/// Touches nothing: no reload, no ring write, no pointer move.
+fn handle_config_diff(state: &AdminState, path: &str) -> (u16, &'static str, String) {
+    let recorder = match config_history_open_recorder() {
+        Ok(recorder) => recorder,
+        Err(response) => return response,
+    };
+    let Some(to) = rl_query_param(path, "to") else {
+        return (
+            400,
+            "application/json",
+            r#"{"error":"`to` is required: name a revision number or last-known-good","code":"bad_request"}"#
+                .to_string(),
+        );
+    };
+    let to = match resolve_diff_side(&recorder, to) {
+        Ok(side) => side,
+        Err(response) => return response,
+    };
+    let from = match rl_query_param(path, "from") {
+        Some(from) => match resolve_diff_side(&recorder, from) {
+            Ok(side) => side,
+            Err(response) => return response,
+        },
+        None => match running_document_for_diff(state) {
+            Ok(text) => DiffSide {
+                revision: None,
+                digest: None,
+                document: text,
+            },
+            Err(message) => {
+                return (
+                    503,
+                    "application/json",
+                    serde_json::json!({"error": message, "code": "running_config_unreadable"})
+                        .to_string(),
+                )
+            }
+        },
+    };
+
+    let baseline = match serde_yaml::from_str::<sbproxy_config::ConfigFile>(&from.document) {
+        Ok(config) => config,
+        Err(error) => {
+            return (
+                422,
+                "application/json",
+                serde_json::json!({
+                    "error": format!("the `from` document does not parse: {error}"),
+                    "code": "unparseable_revision",
+                })
+                .to_string(),
+            )
+        }
+    };
+    let proposed = match serde_yaml::from_str::<sbproxy_config::ConfigFile>(&to.document) {
+        Ok(config) => config,
+        Err(error) => {
+            return (
+                422,
+                "application/json",
+                serde_json::json!({
+                    "error": format!("the `to` document does not parse: {error}"),
+                    "code": "unparseable_revision",
+                })
+                .to_string(),
+            )
+        }
+    };
+    let report = sbproxy_config::plan(&baseline, &proposed);
+    // Rendered from the original bytes and redacted afterwards, the
+    // ordering `handle_config_history_detail` documents: redacting
+    // first can corrupt the YAML a literal secret sits inside, and the
+    // diff would then be a diff of two mangled documents.
+    let plan_text = sbproxy_observe::redact::redact_secrets(&sbproxy_config::render_text(&report));
+    let body = serde_json::json!({
+        "from": {"revision": from.revision, "digest": from.digest},
+        "to": {"revision": to.revision, "digest": to.digest},
+        "max_blast_radius": crate::config_rollback::blast_radius_label(report.max_blast_radius),
+        "changes": report.summary.added + report.summary.changed + report.summary.removed,
+        "plan_text": plan_text,
+    });
+    (200, "application/json", body.to_string())
+}
+
+/// One side of a `GET /admin/config/diff`.
+struct DiffSide {
+    /// Ring revision, absent for the running configuration.
+    revision: Option<u64>,
+    /// Content digest, absent for the running configuration.
+    digest: Option<String>,
+    /// The document itself, unredacted: the caller redacts the rendered
+    /// plan after computing it.
+    document: String,
+}
+
+/// Resolve one `from=` / `to=` value to a stored document.
+fn resolve_diff_side(
+    recorder: &Arc<crate::config_history::ConfigHistoryRecorder>,
+    value: &str,
+) -> Result<DiffSide, (u16, &'static str, String)> {
+    let entry = if value == "last-known-good" {
+        recorder.lkg().ok_or_else(|| {
+            (
+                404,
+                "application/json",
+                r#"{"error":"no config revision has been promoted to last known good on this node yet","code":"no_last_known_good"}"#
+                    .to_string(),
+            )
+        })?
+    } else {
+        let revision: u64 = value.parse().map_err(|_| {
+            (
+                400,
+                "application/json",
+                serde_json::json!({
+                    "error": format!(
+                        "`{value}` is neither a revision number nor last-known-good"
+                    ),
+                    "code": "bad_request",
+                })
+                .to_string(),
+            )
+        })?;
+        recorder
+            .entries()
+            .into_iter()
+            .find(|entry| entry.revision == revision)
+            .ok_or_else(|| {
+                (
+                    404,
+                    "application/json",
+                    serde_json::json!({
+                        "error": format!(
+                            "revision {revision} is not in this node's config revision ring"
+                        ),
+                        "code": "unknown_revision",
+                        "available_revisions": recorder
+                            .entries()
+                            .iter()
+                            .map(|entry| entry.revision)
+                            .collect::<Vec<_>>(),
+                    })
+                    .to_string(),
+                )
+            })?
+    };
+    let document = recorder.read_blob(&entry.digest).map_err(|error| {
+        (
+            500,
+            "application/json",
+            serde_json::json!({
+                "error": format!("read stored revision: {error}"),
+                "code": "read_failed",
+            })
+            .to_string(),
+        )
+    })?;
+    Ok(DiffSide {
+        revision: Some(entry.revision),
+        digest: Some(entry.digest),
+        document: String::from_utf8_lossy(&document).into_owned(),
+    })
+}
+
+/// The merged, pre-resolution document this node is running, for the
+/// `from=` default.
+///
+/// The same document `GET /admin/config/effective` answers with rather
+/// than the raw file: a git-sourced or authority-owned node's own file
+/// may be nothing but a `source:` pointer, and diffing a stored revision
+/// against a pointer would report the whole configuration as removed.
+fn running_document_for_diff(state: &AdminState) -> Result<String, String> {
+    let path = state
+        .config_path
+        .as_ref()
+        .ok_or_else(|| "this admin server has no config path wired".to_string())?;
+    let local = std::fs::read_to_string(path)
+        .map_err(|error| format!("read the running config: {error}"))?;
+    let layers = crate::config_effective::current_layers(&local);
+    crate::config_effective::effective_config(&layers)
+        .map(|effective| effective.yaml)
+        .map_err(|error| format!("resolve the running config: {error}"))
 }
 
 /// `GET /admin/config/rejected`: every candidate config this node
@@ -6533,7 +7047,32 @@ pub fn handle_admin_request(
     // judgment. POST only: it is a state change.
     if path_only == "/admin/config/confirm" {
         if method.eq_ignore_ascii_case("POST") {
-            return handle_config_confirm();
+            return handle_config_confirm(state);
+        }
+        return (
+            405,
+            "application/json",
+            r#"{"error":"method not allowed"}"#.to_string(),
+        );
+    }
+    // WOR-2460: the escape hatch. POST only, and it changes what is
+    // serving, so it sits behind the same admin auth and the same RBAC
+    // gate `POST /admin/reload` does.
+    if path_only == "/admin/config/rollback" {
+        if method.eq_ignore_ascii_case("POST") {
+            return handle_config_rollback(state, body);
+        }
+        return (
+            405,
+            "application/json",
+            r#"{"error":"method not allowed"}"#.to_string(),
+        );
+    }
+    // WOR-2460: diff two stored revisions, or one stored revision
+    // against what is running. Reads only.
+    if path_only == "/admin/config/diff" {
+        if method.eq_ignore_ascii_case("GET") {
+            return handle_config_diff(state, path);
         }
         return (
             405,
@@ -12530,6 +13069,209 @@ origin_sources:
         }
     }
 
+    // --- /admin/config/rollback and /admin/config/diff (WOR-2460) ---
+
+    /// Seed a ring by hand with three documents and promote the first,
+    /// so the diff and rollback route tests have non-adjacent revisions
+    /// to name.
+    fn seed_three_revisions(dir: &std::path::Path) {
+        let mut store = sbproxy_config::RevisionStore::open(dir, 20, None).expect("open ring");
+        for (index, yaml) in [
+            "proxy: {}\n# one\n",
+            "proxy:\n  http_bind_port: 8080\n",
+            "proxy:\n  http_bind_port: 8081\n",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            store
+                .append(
+                    yaml.as_bytes(),
+                    sbproxy_config::AppendMetadata {
+                        provenance: BaseOrigin::Local,
+                        blast_radius: None,
+                        secrets_fingerprint: None,
+                        actor: Some("seed".to_string()),
+                        applied_at: 1_700_000_000_000 + index as u64,
+                        degraded: Vec::new(),
+                    },
+                )
+                .expect("append");
+        }
+        store.mark_good(1).expect("promote the first");
+    }
+
+    /// WOR-2460: "Rollback requires the same admin auth as
+    /// `POST /admin/reload`". The route is the one surface in this
+    /// feature that changes what is serving, so the unauthenticated and
+    /// wrong-method answers are part of the contract rather than
+    /// incidental.
+    #[test]
+    fn config_rollback_requires_admin_auth_and_only_accepts_post() {
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+
+        let (status, _, _) =
+            handle_admin_request("POST", "/admin/config/rollback", &state, None, Some("{}"));
+        assert_eq!(status, 401, "an unauthenticated rollback is refused");
+        for method in ["GET", "PUT", "DELETE", "PATCH"] {
+            let (status, _, _) = handle_admin_request(
+                method,
+                "/admin/config/rollback",
+                &state,
+                Some(&auth),
+                Some("{}"),
+            );
+            assert_eq!(status, 405, "{method} must not roll a node back");
+        }
+        // Opt-in like every sibling: a node with no ring answers the
+        // same "not enabled" body rather than a confusing refusal about
+        // a revision it was never asked for.
+        let (status, _, body) = handle_admin_request(
+            "POST",
+            "/admin/config/rollback",
+            &state,
+            Some(&auth),
+            Some("{}"),
+        );
+        assert_eq!(status, 404);
+        assert_eq!(body, r#"{"error":"config history is not enabled"}"#);
+    }
+
+    /// WOR-2460. Naming two targets is a refusal rather than a silent
+    /// precedence rule: guessing which revision an operator meant
+    /// mid-incident is the wrong kind of helpful.
+    #[test]
+    fn a_rollback_body_naming_two_targets_is_refused() {
+        let ambiguous = serde_json::json!({"revision": 3, "digest": "abc"});
+        let error = rollback_target_from_body(&ambiguous).expect_err("two targets is ambiguous");
+        assert!(error.contains("exactly one"), "{error}");
+
+        assert_eq!(
+            rollback_target_from_body(&serde_json::json!({}))
+                .expect("an empty body is the shortest form"),
+            crate::config_rollback::RollbackTarget::LastKnownGood,
+        );
+        assert_eq!(
+            rollback_target_from_body(&serde_json::json!({"revision": 3}))
+                .expect("a revision is a target"),
+            crate::config_rollback::RollbackTarget::Revision(3),
+        );
+        let unknown = rollback_target_from_body(&serde_json::json!({"target": "yesterday"}))
+            .expect_err("only one named target exists");
+        assert!(unknown.contains("last-known-good"), "{unknown}");
+    }
+
+    /// WOR-2460: "`sbproxy config diff --from <a> --to <b>` renders a
+    /// plan between two stored revisions without touching the running
+    /// config, including for two non-adjacent revisions."
+    #[test]
+    fn config_diff_renders_a_plan_between_two_non_adjacent_stored_revisions() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_three_revisions(dir.path());
+        let _recorder = install_test_history_recorder(dir.path());
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        let before = crate::reload::current_pipeline_full();
+
+        let (status, _, body) = handle_admin_request(
+            "GET",
+            "/admin/config/diff?from=1&to=3",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 200, "{body}");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(parsed["from"]["revision"], 1);
+        assert_eq!(parsed["to"]["revision"], 3);
+        assert_eq!(
+            parsed["max_blast_radius"], "restart",
+            "revision 3 binds a different listener port than revision 1",
+        );
+        assert!(
+            parsed["changes"].as_u64().unwrap_or(0) > 0,
+            "two different documents have to produce at least one change: {body}",
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&before, &crate::reload::current_pipeline_full()),
+            "a diff reads; it must not move the running configuration",
+        );
+
+        // `last-known-good` is accepted on either side, which is the
+        // form an operator reaches for without first looking up a
+        // number.
+        let (status, _, body) = handle_admin_request(
+            "GET",
+            "/admin/config/diff?from=last-known-good&to=3",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 200, "{body}");
+
+        // An unknown revision names what is available rather than 500ing.
+        let (status, _, body) = handle_admin_request(
+            "GET",
+            "/admin/config/diff?from=1&to=99",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 404);
+        assert!(body.contains("available_revisions"), "{body}");
+
+        for method in ["POST", "DELETE"] {
+            let (status, _, _) =
+                handle_admin_request(method, "/admin/config/diff?to=3", &state, Some(&auth), None);
+            assert_eq!(status, 405, "{method} is not a way to read a diff");
+        }
+        crate::config_history::clear_config_history_recorder();
+    }
+
+    /// WOR-2460, the route's own refusal shape. The engine's refusals
+    /// are tested next door; this pins that the HTTP layer carries the
+    /// status, the stable code, and the availability list an operator
+    /// needs to make a second call correctly.
+    #[test]
+    fn a_rollback_to_an_unknown_revision_answers_404_with_what_is_available() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_three_revisions(dir.path());
+        let _recorder = install_test_history_recorder(dir.path());
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+
+        let (status, _, body) = handle_admin_request(
+            "POST",
+            "/admin/config/rollback",
+            &state,
+            Some(&auth),
+            Some(r#"{"revision": 99}"#),
+        );
+        assert_eq!(status, 404, "{body}");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(parsed["code"], "unknown_revision");
+        assert_eq!(parsed["rolled_back"], false);
+        assert_eq!(
+            parsed["available_revisions"],
+            serde_json::json!([1, 2, 3]),
+            "naming the alternatives is what saves a second call mid-incident",
+        );
+
+        // A body that is not an object at all is a 400 rather than a
+        // silent default to last-known-good: rolling a node back
+        // because a client sent malformed JSON is not a helpful default.
+        let (status, _, body) = handle_admin_request(
+            "POST",
+            "/admin/config/rollback",
+            &state,
+            Some(&auth),
+            Some("[1,2,3]"),
+        );
+        assert_eq!(status, 400, "{body}");
+        crate::config_history::clear_config_history_recorder();
+    }
+
     /// WOR-2459. The fallback pin is readable on every node, and
     /// clearing it is refused when nothing is pinned.
     #[test]
@@ -12699,7 +13441,7 @@ origin_sources:
         let _recorder = install_test_history_recorder(dir.path());
         crate::config_soak::clear();
 
-        let (status, _, body) = handle_config_confirm();
+        let (status, _, body) = handle_config_confirm(&make_state());
         crate::config_history::clear_config_history_recorder();
         assert_eq!(status, 409);
         assert_eq!(body, r#"{"error":"no config soak is in flight"}"#);
@@ -12732,7 +13474,7 @@ origin_sources:
             crate::config_soak::ProbeObservation::Ok,
         );
 
-        let (status, _, body) = handle_config_confirm();
+        let (status, _, body) = handle_config_confirm(&make_state());
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
         let promoted = recorder.lkg().map(|lkg| lkg.revision);
         crate::config_history::clear_config_history_recorder();

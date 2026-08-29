@@ -826,6 +826,60 @@
         }
       ],
       "description": "Config candidates this node refused before applying, by reason. denied_path and confinement_refused mean an authority bundle reached for something this node owns; compile_failed on a quiet fleet usually means a local file edit that never took. GET /admin/config/rejected has the document and the refusing check's own message for each one."
+    },
+    {
+      "id": 13,
+      "title": "Config Rollbacks",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 48
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (increase(sbproxy_config_apply_total[1h]))",
+          "legendFormat": "{{outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Rollback attempts, by outcome. outcome=\"reverted\" is the one to alert on: it means a node undid a config change on its own after a failed soak, with soak.auto_revert armed, and nobody asked it to. outcome=\"applied\" is an operator using POST /admin/config/rollback, and the two are disjoint so this query is unambiguous. outcome=\"rejected\" climbing during an incident means rollbacks are being refused: read the config_rollback events for the reason, which is usually an unknown revision, a stale expected_current, or a restart-class change nobody confirmed."
     }
   ],
   "templating": {

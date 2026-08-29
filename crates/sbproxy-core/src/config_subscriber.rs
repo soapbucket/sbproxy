@@ -113,6 +113,115 @@ pub const BUNDLE_ENDPOINT_PATH: &str = "/config-authority/v1/bundle";
 /// scope what it publishes without inspecting the credential.
 pub const SUBSCRIBER_ID_HEADER: &str = "x-sbproxy-subscriber-id";
 
+/// Headers a subscriber sends on every fetch to report what it actually
+/// **applied**, as distinct from what it was served (WOR-2464).
+///
+/// # Why headers, and why on the fetch
+///
+/// The acceptance line is "adds no new auth surface". A second endpoint
+/// would need its own authentication, its own rate limit, and its own
+/// abuse story; riding the fetch the subscriber already makes reuses the
+/// bearer credential, the per-credential rate limiter, and the
+/// credential-versus-header identity check that are already there. The
+/// report is at most one poll interval stale as a result, which for a
+/// fleet view is the same freshness `last_seen_revision` already has.
+///
+/// The field semantics are OpenTelemetry OpAMP's `RemoteConfigStatus`:
+/// last remote config hash, a status, and an error message. See
+/// [`sbproxy_config::ApplyStatus`] for the one value that is ours.
+///
+/// Every one of these is optional on the wire. A subscriber from an
+/// older build sends none of them and the authority renders it as
+/// **unknown** rather than as applied.
+pub const APPLY_STATUS_HEADER: &str = "x-sbproxy-config-status";
+
+/// Header carrying the revision this node is actually serving. On a
+/// refusal it names the revision the node **kept**, not the one it
+/// refused.
+pub const APPLIED_REVISION_HEADER: &str = "x-sbproxy-applied-revision";
+
+/// Header carrying the content digest of the revision this node is
+/// serving.
+pub const APPLIED_HASH_HEADER: &str = "x-sbproxy-applied-hash";
+
+/// Header carrying why the last apply attempt failed.
+///
+/// Redacted and bounded before it is sent: the text is a compile error,
+/// and a compile error routinely quotes the offending YAML, which on a
+/// merged document includes this node's own local half that the
+/// authority never wrote.
+pub const APPLY_ERROR_HEADER: &str = "x-sbproxy-config-error";
+
+/// Header carrying this node's soak verdict for what it is serving,
+/// when it runs a soak (WOR-2458). Absent on a node with
+/// `proxy.config_history` off.
+pub const SOAK_VERDICT_HEADER: &str = "x-sbproxy-soak-verdict";
+
+/// Header carrying whether this node is serving a configuration its boot
+/// fallback rescued from its own ring (WOR-2459).
+///
+/// Distinct from a refusal on purpose: such a node applies the
+/// authority's bundles fine and still has a broken local document
+/// underneath, which is a problem the fleet view has to be able to state
+/// separately.
+pub const FALLBACK_ACTIVE_HEADER: &str = "x-sbproxy-fallback-active";
+
+/// Longest apply-error string a subscriber puts on the wire.
+///
+/// Matches [`sbproxy_config::MAX_APPLY_ERROR_CHARS`], which is where the
+/// authority bounds it again on receipt. Bounded on both sides
+/// deliberately: this side keeps a well-behaved node from sending a
+/// megabyte of YAML through a header, and that side is the one that has
+/// to hold against a node that is not well behaved.
+const MAX_APPLY_ERROR_HEADER_CHARS: usize = sbproxy_config::MAX_APPLY_ERROR_CHARS;
+
+/// Reduce one string to something safe to put in an HTTP header value.
+///
+/// Drops every control character, which is what stops a newline in a
+/// compile error from splitting the header block, and bounds the result.
+/// `reqwest` would refuse an invalid header value rather than send it,
+/// so without this a node whose compile error contained a newline would
+/// have silently stopped reporting.
+fn header_safe(value: &str, limit: usize) -> String {
+    let cleaned: String = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(limit)
+        .collect();
+    cleaned.trim().to_string()
+}
+
+/// This node's own soak verdict for the revision it is serving
+/// (WOR-2458), for the fleet report (WOR-2464).
+///
+/// Read off the config revision ring's newest entry, which is the
+/// document the reload transaction most recently published. `None` on a
+/// node with `proxy.config_history` off, which is most of them, and
+/// `None` while a window is still open, because "not judged yet" and
+/// "judged inconclusive" are different answers and the authority should
+/// not be told the second when the first is true.
+///
+/// Why the authority wants it at all: `applied` says the document
+/// constructed, and this epic's whole argument is that constructing is
+/// not evidence that a config works. A fleet where 34 of 34 nodes report
+/// `applied` and 6 of them report `soak_verdict: failed` is a rollout to
+/// stop, and without this it looks like a clean one.
+fn local_soak_verdict() -> Option<&'static str> {
+    let recorder = crate::config_history::current_config_history_recorder()?;
+    let verdict = recorder.entries().last()?.soak_verdict?;
+    Some(match verdict {
+        sbproxy_config::SoakVerdict::Successful => "successful",
+        sbproxy_config::SoakVerdict::Failed => "failed",
+        sbproxy_config::SoakVerdict::Inconclusive => "inconclusive",
+    })
+}
+
 /// Suffix appended to `cache_path` for the anti-replay cursor file.
 pub const CURSOR_FILE_SUFFIX: &str = ".cursor";
 
@@ -607,6 +716,24 @@ pub struct ConfigSubscriber {
     /// accelerator existed. Managed-service subscribers are in nobody's
     /// gossip cluster, so that path is the one that has to stay boring.
     gossip: Option<crate::config_gossip::ConfigGossipWatcher>,
+    /// How the last apply attempt went, for the report this subscriber
+    /// puts on its next fetch (WOR-2464).
+    ///
+    /// `None` until the first cycle completes, which is what makes a
+    /// node that has not yet decided anything report nothing rather than
+    /// claiming a clean apply it has not made.
+    last_apply_status: Option<sbproxy_config::ApplyStatus>,
+    /// Why the last attempt failed, already redacted and bounded.
+    last_apply_error: Option<String>,
+    /// Whether the most recent successful apply published with a
+    /// subsystem left on prior state.
+    ///
+    /// A separate flag rather than a fifth [`CycleResult`] variant:
+    /// `CycleResult` is a closed set with a metric label per value and
+    /// four consumers that match it exhaustively, and a degraded apply
+    /// **is** an apply for every one of them. This is the one place the
+    /// distinction matters.
+    last_apply_degraded: bool,
     /// Cursor revision at which a gossip hint last shortened the wait.
     ///
     /// Bounds the accelerator to one early pull per applied revision. Without
@@ -636,6 +763,7 @@ impl std::fmt::Debug for ConfigSubscriber {
             .field("keys", &self.keys.as_ref().map(VerifyingKeySet::len))
             .field("cursor", &self.cursor)
             .field("gossip_accelerated", &self.gossip.is_some())
+            .field("last_apply_status", &self.last_apply_status)
             .finish_non_exhaustive()
     }
 }
@@ -706,6 +834,9 @@ impl ConfigSubscriber {
             // point the cluster is up.
             gossip: None,
             gossip_pulled_at_cursor: None,
+            last_apply_status: None,
+            last_apply_error: None,
+            last_apply_degraded: false,
         };
         subscriber.load_keys();
         Ok(subscriber)
@@ -1074,6 +1205,9 @@ impl ConfigSubscriber {
                     "config_authority",
                     candidate.base_origin.clone(),
                 );
+                self.record_apply_failure(&format!(
+                    "rejected by the reload transaction: {error:#}"
+                ));
                 return CycleResult::CompileFailed;
             }
         };
@@ -1081,6 +1215,7 @@ impl ConfigSubscriber {
         // A reload that published the pipeline while a subsystem stayed
         // on prior state is not a clean apply, and the two counters are
         // disjoint so neither hides the other.
+        self.last_apply_degraded = !outcome.is_fully_applied();
         if outcome.is_fully_applied() {
             sbproxy_observe::metrics::record_config_bundle_applied();
             tracing::info!(revision = candidate.revision, "config bundle applied",);
@@ -1279,6 +1414,9 @@ impl ConfigSubscriber {
             .client
             .get(&url)
             .header(SUBSCRIBER_ID_HEADER, self.subscriber_id.as_str());
+        for (name, value) in self.apply_report_headers() {
+            request = request.header(name, value);
+        }
         if let Some(etag) = cursor_etag(&self.cursor) {
             request = request.header(reqwest::header::IF_NONE_MATCH, etag);
         }
@@ -1374,6 +1512,11 @@ impl ConfigSubscriber {
                                 "config_authority",
                                 base_origin_for(&base_yaml),
                             );
+                            // WOR-2464: the reason string the authority
+                            // needs. Captured here, where the refusal's
+                            // own detail is in hand, rather than
+                            // reconstructed from the result label.
+                            self.record_apply_failure(&refusal.detail);
                             refusal.result
                         }
                     }
@@ -1383,9 +1526,108 @@ impl ConfigSubscriber {
             }
         };
         sbproxy_observe::metrics::record_config_bundle_fetch(result.as_str());
+        // WOR-2464: remember what this cycle decided, so the *next*
+        // fetch can tell the authority. Recorded after the metric and
+        // before the staleness warning, at the one place every arm
+        // converges, rather than at each of the six that produce a
+        // result.
+        self.remember_apply_outcome(result);
         self.publish_age();
         self.warn_if_stale();
         result
+    }
+
+    /// Fold one cycle result into the apply report the next fetch
+    /// carries (WOR-2464).
+    ///
+    /// The three groups are deliberate:
+    ///
+    /// * A **refusal** sets `failed` and keeps the detail. The reported
+    ///   revision stays `self.cursor.revision`, which the refusal did
+    ///   not advance, so the authority learns the node is still serving
+    ///   the older revision rather than the one it refused. That is the
+    ///   whole gap this ticket closes.
+    /// * An **apply** sets `applied` or `applied_degraded` from the
+    ///   reload outcome, and clears the error.
+    /// * A cycle that decided **nothing** ([`CycleResult::NotModified`],
+    ///   [`CycleResult::Unreachable`], [`CycleResult::ReloadBusy`])
+    ///   leaves the previous report alone. Overwriting it would let one
+    ///   unreachable poll erase the record of the refusal before it, and
+    ///   an authority that cannot be reached is not evidence about what
+    ///   this node applied.
+    fn remember_apply_outcome(&mut self, result: CycleResult) {
+        use sbproxy_config::ApplyStatus;
+        match result {
+            CycleResult::Applied => {
+                self.last_apply_status = Some(if self.last_apply_degraded {
+                    ApplyStatus::AppliedDegraded
+                } else {
+                    ApplyStatus::Applied
+                });
+                self.last_apply_error = None;
+            }
+            CycleResult::VerifyFailed
+            | CycleResult::CompileFailed
+            | CycleResult::DeniedPath
+            | CycleResult::ConfinementRefused => {
+                self.last_apply_status = Some(ApplyStatus::Failed);
+                // `last_apply_error` was set by `record_apply_failure`
+                // at the refusing site, which is the only place the
+                // detail exists. A refusal that reached here without one
+                // reports the stable label, which is still better than
+                // an empty message.
+                if self.last_apply_error.is_none() {
+                    self.last_apply_error = Some(result.as_str().to_string());
+                }
+            }
+            CycleResult::NotModified | CycleResult::Unreachable | CycleResult::ReloadBusy => {}
+        }
+    }
+
+    /// Record the detail behind a refusal, for the apply report.
+    ///
+    /// Redacted and header-safed here rather than at send time so the
+    /// value held in memory is already the value that goes on the wire:
+    /// one transformation, one thing to reason about, and no way for a
+    /// later reader of this field to get the unredacted text by
+    /// accident.
+    fn record_apply_failure(&mut self, detail: &str) {
+        self.last_apply_error = Some(header_safe(
+            &sbproxy_observe::redact::redact_secrets(detail),
+            MAX_APPLY_ERROR_HEADER_CHARS,
+        ));
+    }
+
+    /// The apply-report headers for one fetch (WOR-2464).
+    ///
+    /// Empty before the first cycle completes: a node that has decided
+    /// nothing reports nothing, and the authority renders that as
+    /// unknown. Every value is bounded and control-character free, so a
+    /// compile error containing a newline cannot make `reqwest` refuse
+    /// the request and silently stop this node reporting at all.
+    fn apply_report_headers(&self) -> Vec<(&'static str, String)> {
+        let Some(status) = self.last_apply_status else {
+            return Vec::new();
+        };
+        let mut headers = vec![
+            (APPLY_STATUS_HEADER, status.as_str().to_string()),
+            (APPLIED_REVISION_HEADER, self.cursor.revision.to_string()),
+            (
+                APPLIED_HASH_HEADER,
+                header_safe(&self.cursor.content_digest, 128),
+            ),
+            (
+                FALLBACK_ACTIVE_HEADER,
+                crate::config_boot::on_fallback().to_string(),
+            ),
+        ];
+        if let Some(error) = self.last_apply_error.as_deref() {
+            headers.push((APPLY_ERROR_HEADER, error.to_string()));
+        }
+        if let Some(verdict) = local_soak_verdict() {
+            headers.push((SOAK_VERDICT_HEADER, verdict.to_string()));
+        }
+        headers
     }
 
     /// Sleep until the next cycle is due.
