@@ -77,7 +77,7 @@ origins:
 }
 
 #[test]
-fn abtest_existing_sticky_cookie_pins_its_matching_variant_without_setting_a_cookie() {
+fn abtest_existing_sticky_cookie_pins_its_variant_and_is_not_restamped() {
     let control = MockUpstream::start(json!({"variant": "control"})).expect("control upstream");
     let experiment =
         MockUpstream::start(json!({"variant": "experiment"})).expect("experiment upstream");
@@ -124,7 +124,99 @@ origins:
     assert!(experiment.captured().is_empty());
     assert!(
         !response.headers.contains_key("set-cookie"),
-        "abtest does not establish sticky cookies itself"
+        "a client that already carries the pin must not be restamped, so the \
+         Max-Age window counts from its first visit rather than sliding"
+    );
+}
+
+/// The wire half of the sticky pin.
+///
+/// `abtest_mints_a_sticky_pin_for_a_client_that_arrives_without_one` in
+/// `action_dispatch.rs` proves the request phase decides to set a
+/// cookie. It cannot prove the response phase emits it, because that
+/// append happens in `response_filter` against a real Pingora session.
+/// This is the test that reads the header off the wire and then spends
+/// it, which is the property an operator running an experiment actually
+/// depends on: two requests from the same client land on one variant.
+#[test]
+fn abtest_first_visit_is_handed_a_pin_that_routes_the_next_request() {
+    let control = MockUpstream::start(json!({"variant": "control"})).expect("control upstream");
+    let experiment =
+        MockUpstream::start(json!({"variant": "experiment"})).expect("experiment upstream");
+    let yaml = format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "abtest.localhost":
+    action:
+      type: abtest
+      sticky_cookie: sb_ab_variant
+      variants:
+        - name: control
+          url: "{}"
+          weight: 0
+        - name: experiment
+          url: "{}"
+          weight: 1
+"#,
+        control.base_url(),
+        experiment.base_url(),
+    );
+    let proxy = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
+
+    // First visit: no cookie, so the weighted roll picks `experiment`
+    // (control is weighted 0) and the response carries the pin.
+    let first = proxy
+        .get("/first", "abtest.localhost")
+        .expect("send first request");
+    assert_eq!(first.status, 200);
+    assert_eq!(
+        first.json().expect("JSON response")["variant"],
+        "experiment"
+    );
+    let set_cookie = first
+        .headers
+        .get("set-cookie")
+        .expect("a first visit must be handed a sticky pin");
+    assert!(
+        set_cookie.starts_with("sb_ab_variant=experiment;"),
+        "the pin names the configured cookie and the selected variant: {set_cookie}"
+    );
+    for flag in ["Path=/", "SameSite=Lax", "HttpOnly"] {
+        assert!(
+            set_cookie.contains(flag),
+            "pin is missing {flag}: {set_cookie}"
+        );
+    }
+
+    // Second visit: send the pin back. It has to reach the same variant,
+    // and it must not be restamped.
+    let pin = set_cookie
+        .split(';')
+        .next()
+        .expect("cookie name=value pair")
+        .to_string();
+    let second = proxy
+        .get_with_headers("/second", "abtest.localhost", &[("cookie", &pin)])
+        .expect("send second request");
+    assert_eq!(second.status, 200);
+    assert_eq!(
+        second.json().expect("JSON response")["variant"],
+        "experiment"
+    );
+    assert!(
+        !second.headers.contains_key("set-cookie"),
+        "the returning client already carries the pin and must not be restamped"
+    );
+    assert_eq!(
+        experiment.captured().len(),
+        2,
+        "both requests must land on the pinned variant"
+    );
+    assert!(
+        control.captured().is_empty(),
+        "the zero-weight variant must never be reached"
     );
 }
 
