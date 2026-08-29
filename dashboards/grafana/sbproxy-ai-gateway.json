@@ -2625,6 +2625,60 @@
         }
       ],
       "description": "Tool-call frames an enforcing ai_tool_call hook or an agent-alignment guard held back that never reached the client. cause=blocked is by design: a guardrail or extension ended the stream and the held frames went with it. cause=unjudged should be flat zero; any rate there means a client received an assistant turn whose tool call the gateway silently deleted. Runbook: docs/operator-runbook.md#ai-gateway. When unjudged is non-zero, check the stream for an upstream that ends without a finish_reason and confirm the guard session is judging every call."
+    },
+    {
+      "id": 45,
+      "title": "Parallel Moderation Outcomes",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 197
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "bars",
+            "pointSize": 5,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(sbproxy_ai_parallel_moderation_total[5m]))",
+          "legendFormat": "{{outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Inspect-only input hooks that ran alongside the upstream call. allow is the zero-latency path. cancelled_upstream is a reject that dropped an in-flight generation, which the provider may still bill. block is a reject that landed after the provider had already answered. Runbook: docs/operator-runbook.md#ai-gateway."
     }
   ],
   "templating": {

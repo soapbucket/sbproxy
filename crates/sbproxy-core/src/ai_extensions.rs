@@ -1,5 +1,7 @@
 //! Request-local adaptation between the AI hub and extension events.
 
+use std::future::Future;
+
 use sbproxy_ai::format::{ContentPartDelta, FinishReason, HubChunk};
 use sbproxy_ai::guardrails::stream::CompletedToolCall;
 use sbproxy_extension::bundle::{AiChainVerdict, AiExtensionChain, AiExtensionSession};
@@ -67,6 +69,25 @@ impl AiExtensionBlock {
             message: "An AI extension rewrote content this response shape cannot carry".to_owned(),
         }
     }
+}
+
+/// How a parallel inspect-only input hook settled against one provider attempt.
+pub(crate) enum ParallelModerationRace<T> {
+    /// The hook allowed, or none was armed. Carry the attempt result forward.
+    Attempt(T),
+    /// The upstream finished, then the hook blocked. Keep the attempt for
+    /// billing and still refuse the client.
+    BlockedAfterAnswer {
+        /// The hook's client-safe refusal.
+        block: AiExtensionBlock,
+        /// The attempt result, including a transport error.
+        result: T,
+    },
+    /// The hook blocked first. The attempt future was dropped.
+    Cancelled {
+        /// The hook's client-safe refusal.
+        block: AiExtensionBlock,
+    },
 }
 
 /// AI hook state pinned to one request and one pipeline generation.
@@ -209,6 +230,49 @@ impl AiRequestExtensions {
             Some(_) => Err(AiExtensionBlock::runtime_failure()),
             None => Ok(None),
         }
+    }
+
+    /// Race one provider attempt against an armed parallel input hook.
+    ///
+    /// A block that lands first drops `attempt`, which is the cancellation
+    /// of the in-flight `reqwest` call. A block that lands after the
+    /// attempt still returns that result so billing can record an
+    /// answered call.
+    pub(crate) async fn race_provider_attempt<T>(
+        &mut self,
+        attempt: impl Future<Output = T>,
+    ) -> ParallelModerationRace<T> {
+        let Some(task) = self.session.take_parallel_task() else {
+            return ParallelModerationRace::Attempt(attempt.await);
+        };
+        tokio::pin!(attempt);
+        tokio::pin!(task);
+        tokio::select! {
+            biased;
+            result = &mut attempt => match join_parallel_result(task.await) {
+                Ok(()) => ParallelModerationRace::Attempt(result),
+                Err(block) => ParallelModerationRace::BlockedAfterAnswer { block, result },
+            },
+            verdict = &mut task => match join_parallel_result(verdict) {
+                Ok(()) => ParallelModerationRace::Attempt(attempt.await),
+                Err(block) => {
+                    drop(attempt);
+                    ParallelModerationRace::Cancelled { block }
+                }
+            },
+        }
+    }
+
+    /// Await an armed parallel input hook before a raced fan-out.
+    ///
+    /// Raced dispatch fans out to every eligible provider at once, so a
+    /// block here refuses before those extra calls start rather than
+    /// cancelling N in-flight generations.
+    pub(crate) async fn wait_parallel(&mut self) -> Result<(), AiExtensionBlock> {
+        let Some(task) = self.session.take_parallel_task() else {
+            return Ok(());
+        };
+        join_parallel_task(task).await
     }
 
     /// Returns the canonical output text a hook rewrote, or `None`
@@ -573,6 +637,43 @@ impl AiRequestExtensions {
     }
 }
 
+fn join_parallel_result(
+    verdict: Result<sbproxy_plugin::PluginResult<AiChainVerdict>, tokio::task::JoinError>,
+) -> Result<(), AiExtensionBlock> {
+    match verdict {
+        Ok(Ok(AiChainVerdict::Release | AiChainVerdict::Mutated)) => {
+            sbproxy_ai::ai_metrics::record_ai_parallel_moderation("allow");
+            Ok(())
+        }
+        Ok(Ok(AiChainVerdict::Block {
+            status,
+            code,
+            message,
+        })) => Err(AiExtensionBlock {
+            status,
+            code,
+            message,
+        }),
+        Ok(Err(_)) | Err(_) => Err(AiExtensionBlock::runtime_failure()),
+    }
+}
+
+async fn join_parallel_task(
+    task: tokio::task::JoinHandle<sbproxy_plugin::PluginResult<AiChainVerdict>>,
+) -> Result<(), AiExtensionBlock> {
+    join_parallel_result(task.await)
+}
+
+pub(crate) async fn race_provider_attempt_optional<T>(
+    extensions: Option<&mut AiRequestExtensions>,
+    attempt: impl Future<Output = T>,
+) -> ParallelModerationRace<T> {
+    match extensions {
+        Some(ext) => ext.race_provider_attempt(attempt).await,
+        None => ParallelModerationRace::Attempt(attempt.await),
+    }
+}
+
 fn bounded_id(value: &str) -> String {
     if value.len() <= MAX_EVENT_ID_BYTES {
         return value.to_owned();
@@ -931,6 +1032,36 @@ mod tests {
             .unwrap_err();
         assert_eq!(block.status, 422);
         assert_eq!(block.code, "fixture_input");
+    }
+
+    #[tokio::test]
+    async fn parallel_input_bundle_does_not_block_serial_guard_input() {
+        let (_directory, chain) = chain(
+            "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: parallel-input\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nhooks:\n  - kind: ai_guardrail_input\n    type: inspect_input\n    export: inspect\n    execution:\n      mode: parallel\n",
+            r#"export function inspect(input) { if (input.event.messages[0].content !== "blocked") throw new Error("wrong input"); return {version:"sbproxy-envelope/v1",decision:"block",status:422,code:"fixture_parallel",message:"fixture blocked"}; }"#,
+        );
+        let mut request = AiRequestExtensions::start(&chain, "request-1", "model-1").unwrap();
+
+        let mutated = request
+            .guard_input(
+                "original",
+                &json!({"messages": [{"role": "user", "content": "blocked"}]}),
+            )
+            .await
+            .expect("serial lane must release a parallel-only hook");
+        assert!(mutated.is_none());
+
+        let raced = request.race_provider_attempt(async { "attempted" }).await;
+        match raced {
+            super::ParallelModerationRace::Cancelled { block }
+            | super::ParallelModerationRace::BlockedAfterAnswer { block, .. } => {
+                assert_eq!(block.status, 422);
+                assert_eq!(block.code, "fixture_parallel");
+            }
+            super::ParallelModerationRace::Attempt(_) => {
+                panic!("parallel block must refuse the attempt")
+            }
+        }
     }
 
     #[tokio::test]

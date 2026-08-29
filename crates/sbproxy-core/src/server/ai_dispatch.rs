@@ -283,6 +283,10 @@ enum ProviderAttemptOutcome {
     /// observed. A quota-pool admission refusal settles earlier still
     /// and is not an attempt at all, so it does not reach here.
     NotDialed,
+    /// The in-flight call was dropped because a parallel input hook
+    /// blocked (WOR-2421). Counted as an error for per-provider load,
+    /// never as a health sample: nothing about the provider was learned.
+    Cancelled,
 }
 
 impl ProviderAttemptOutcome {
@@ -297,6 +301,7 @@ impl ProviderAttemptOutcome {
     const fn metric_label(self) -> &'static str {
         match self {
             Self::Answered(status) if status < 400 => "success",
+            Self::Cancelled => "moderation_cancelled",
             _ => "error",
         }
     }
@@ -315,7 +320,7 @@ impl ProviderAttemptOutcome {
         match self {
             Self::Answered(status) => Some(status < 500),
             Self::NoResponse => Some(false),
-            Self::NotDialed => None,
+            Self::NotDialed | Self::Cancelled => None,
         }
     }
 }
@@ -497,6 +502,11 @@ mod provider_attempt_outcome_tests {
             (ProviderAttemptOutcome::Answered(503), "error", Some(false)),
             (ProviderAttemptOutcome::NoResponse, "error", Some(false)),
             (ProviderAttemptOutcome::NotDialed, "error", None),
+            (
+                ProviderAttemptOutcome::Cancelled,
+                "moderation_cancelled",
+                None,
+            ),
         ] {
             assert_eq!(outcome.metric_label(), label, "{outcome:?}");
             assert_eq!(outcome.upstream_health(), health, "{outcome:?}");
@@ -12616,6 +12626,15 @@ pub(super) async fn handle_ai_proxy(
     let race_mode =
         router.is_race() && !is_stream && provider_order.len() >= 2 && !has_managed_local;
     if race_mode {
+        if let Some(extensions) = ai_extensions.as_mut() {
+            if let Err(block) = extensions.wait_parallel().await {
+                sbproxy_ai::ai_metrics::record_ai_parallel_moderation("block");
+                send_ai_extension_block_response(session, ctx, &ai_span, block).await?;
+                return Ok(());
+            }
+        }
+    }
+    if race_mode {
         use futures::stream::{FuturesUnordered, StreamExt as _};
         enum RacedAttemptError {
             Upstream(anyhow::Error),
@@ -13245,188 +13264,245 @@ pub(super) async fn handle_ai_proxy(
         // frame. Boxed, the frame carries a pointer, which is smaller
         // than what was there before.
         let pre_header_budget = pre_header_timeout.filter(|_| is_stream);
-        let result: anyhow::Result<reqwest::Response> =
-            {
-                let mut attempt_future =
-                    Box::pin(run_routed_provider_attempt(&router, provider_idx, async {
-                        if distributed_managed {
-                            let managed_body = serde_json::to_vec(&attempt_body)
-                                .map(bytes::Bytes::from)
-                                .map_err(anyhow::Error::from);
-                            match managed_body {
-                                Ok(managed_body) => {
-                                    let origin = ctx
-                                        .origin_idx
-                                        .and_then(|index| ctx.pipeline.config.origins.get(index))
-                                        .map(|origin| origin.origin_id.to_string())
-                                        .unwrap_or_else(|| ctx.hostname.to_string());
-                                    let prefix_key = extract_prefix_key(&attempt_body, 1024);
-                                    let requested_adapter = attempt_body
-                                        .get("adapter")
-                                        .or_else(|| attempt_body.get("lora_adapter"))
-                                        .and_then(serde_json::Value::as_str)
-                                        .map(str::to_string);
-                                    let preferred_region = ctx
-                                        .principal
-                                        .attrs
-                                        .metadata
-                                        .get("region")
-                                        .cloned()
-                                        .or_else(|| ctx.request_geo.clone());
-                                    let maximum = buffered_body_limit(config.max_body_size);
-                                    let managed =
-                                        crate::server::model_host::distributed_managed_upstream(
-                                            crate::server::model_host::ManagedDistributedRequest {
-                                                origin: &origin,
-                                                provider,
-                                                requested_model: (!model.is_empty())
-                                                    .then_some(model.as_str()),
-                                                request_id: ctx.request_id.as_str(),
-                                                tenant_id: ctx.tenant_id.as_str(),
-                                                governed_key_id: ctx.principal.api_key_id(),
-                                                policy_revision: &peer_policy_revision,
-                                                path: &path,
-                                                body: managed_body,
-                                                content_type: Some("application/json"),
-                                                priority: crate::server::model_host::lane_class_for(
-                                                    ctx.ai_lane_priority,
-                                                ),
-                                                prefix_key: &prefix_key,
-                                                preferred_region: preferred_region.as_deref(),
-                                                requested_adapter: requested_adapter.as_deref(),
-                                                max_body_bytes: maximum,
-                                                quota_attempt,
-                                            },
-                                        )
-                                        .instrument(attempt_span)
-                                        .await;
-                                    match managed {
-                                Ok(Some(upstream)) => {
-                                    local_public_model = Some(upstream.public_model);
-                                    ctx.managed_model_permit = upstream.local_permit;
-                                    ctx.managed_route_class = upstream.route_class;
-                                    ctx.managed_route_trace = Some(upstream.trace);
-                                    Ok(upstream.response)
-                                }
-                                Ok(None) => Err(anyhow::anyhow!(
-                                    "distributed managed provider did not produce an attempt"
-                                )),
-                                Err(crate::server::model_host::ManagedDistributedError::Quota(
-                                    error,
-                                )) => Err(anyhow::Error::new(error)),
-                                Err(error) => {
-                                    if let Some(trace) = error.trace() {
-                                        ctx.managed_route_trace = Some(trace.clone());
-                                    }
-                                    if let Some(reason) = error.public_reason() {
-                                        ctx.managed_fallback_reason = Some(reason);
-                                    }
-                                    Err(anyhow::Error::new(error))
-                                }
-                            }
-                                }
-                                Err(error) => Err(error),
-                            }
-                        } else {
-                            async {
-                                if let Some((bypass_body, native_path)) = upstream_call {
-                                    dispatch_client
-                                        .forward_native_bypass_with_quota(
+        let result: anyhow::Result<reqwest::Response> = {
+            let attempt_future =
+                Box::pin(run_routed_provider_attempt(&router, provider_idx, async {
+                    if distributed_managed {
+                        let managed_body = serde_json::to_vec(&attempt_body)
+                            .map(bytes::Bytes::from)
+                            .map_err(anyhow::Error::from);
+                        match managed_body {
+                            Ok(managed_body) => {
+                                let origin = ctx
+                                    .origin_idx
+                                    .and_then(|index| ctx.pipeline.config.origins.get(index))
+                                    .map(|origin| origin.origin_id.to_string())
+                                    .unwrap_or_else(|| ctx.hostname.to_string());
+                                let prefix_key = extract_prefix_key(&attempt_body, 1024);
+                                let requested_adapter = attempt_body
+                                    .get("adapter")
+                                    .or_else(|| attempt_body.get("lora_adapter"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(str::to_string);
+                                let preferred_region = ctx
+                                    .principal
+                                    .attrs
+                                    .metadata
+                                    .get("region")
+                                    .cloned()
+                                    .or_else(|| ctx.request_geo.clone());
+                                let maximum = buffered_body_limit(config.max_body_size);
+                                let managed =
+                                    crate::server::model_host::distributed_managed_upstream(
+                                        crate::server::model_host::ManagedDistributedRequest {
+                                            origin: &origin,
                                             provider,
-                                            &method_str,
-                                            native_path,
-                                            bypass_body,
+                                            requested_model: (!model.is_empty())
+                                                .then_some(model.as_str()),
+                                            request_id: ctx.request_id.as_str(),
+                                            tenant_id: ctx.tenant_id.as_str(),
+                                            governed_key_id: ctx.principal.api_key_id(),
+                                            policy_revision: &peer_policy_revision,
+                                            path: &path,
+                                            body: managed_body,
+                                            content_type: Some("application/json"),
+                                            priority: crate::server::model_host::lane_class_for(
+                                                ctx.ai_lane_priority,
+                                            ),
+                                            prefix_key: &prefix_key,
+                                            preferred_region: preferred_region.as_deref(),
+                                            requested_adapter: requested_adapter.as_deref(),
+                                            max_body_bytes: maximum,
                                             quota_attempt,
-                                        )
-                                        .await
-                                } else {
-                                    dispatch_client
-                                        .forward_request_with_quota(
-                                            provider,
-                                            &path,
-                                            &attempt_body,
-                                            quota_attempt,
-                                        )
-                                        .await
+                                        },
+                                    )
+                                    .instrument(attempt_span)
+                                    .await;
+                                match managed {
+                                    Ok(Some(upstream)) => {
+                                        local_public_model = Some(upstream.public_model);
+                                        ctx.managed_model_permit = upstream.local_permit;
+                                        ctx.managed_route_class = upstream.route_class;
+                                        ctx.managed_route_trace = Some(upstream.trace);
+                                        Ok(upstream.response)
+                                    }
+                                    Ok(None) => Err(anyhow::anyhow!(
+                                        "distributed managed provider did not produce an attempt"
+                                    )),
+                                    Err(
+                                        crate::server::model_host::ManagedDistributedError::Quota(
+                                            error,
+                                        ),
+                                    ) => Err(anyhow::Error::new(error)),
+                                    Err(error) => {
+                                        if let Some(trace) = error.trace() {
+                                            ctx.managed_route_trace = Some(trace.clone());
+                                        }
+                                        if let Some(reason) = error.public_reason() {
+                                            ctx.managed_fallback_reason = Some(reason);
+                                        }
+                                        Err(anyhow::Error::new(error))
+                                    }
                                 }
                             }
-                            .instrument(attempt_span)
-                            .await
+                            Err(error) => Err(error),
                         }
-                    }));
-                match pre_header_budget {
-                    Some(budget) => match tokio::time::timeout(budget, attempt_future).await {
-                        Ok(inner) => inner,
-                        Err(_elapsed) => Err(anyhow::Error::new(PreHeaderTimeoutElapsed {
-                            budget_ms: u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
-                        })),
-                    },
-                    // WOR-2690: the same await, now watched. `select!`
-                    // polls its branches one after another rather than
-                    // nesting them, so the deepest stack this reaches is
-                    // still the provider call's own; the idle probe is a
-                    // one-byte socket read polled through a `Box`, and
-                    // this frame grows by two pointers and a
-                    // discriminant. That matters here and nowhere else:
-                    // `handle_ai_proxy` runs on a Pingora worker with the
-                    // std 2MB stack and has already overflowed it once,
-                    // on a single nested `.await` added to this path,
-                    // while every unit test stayed green.
-                    None if cancel_on_client_disconnect => {
-                        let mut watch = Box::pin(downstream_hard_disconnect(
-                            session,
-                            config.cancel_on_half_close,
-                        ));
-                        // Biased so a provider response that is already
-                        // in hand wins a tie. Having paid for the answer,
-                        // the cheapest thing left to do with it is try to
-                        // deliver it.
-                        let raced = tokio::select! {
-                            biased;
-                            attempted = &mut attempt_future => Ok(attempted),
-                            observed = &mut watch => Err(observed),
-                        };
-                        match raced {
-                            Ok(attempted) => attempted,
-                            Err(DownstreamLiveness::Gone(cause)) => {
-                                // Dropping the attempt future is the
-                                // cancellation: it drops the in-flight
-                                // `reqwest` call, which closes the
-                                // connection the provider is generating
-                                // into. It also releases the
-                                // shared-quota reservation and the
-                                // router's in-flight slot, both of which
-                                // are documented cancellation-safe, and
-                                // it releases the borrow of `ctx` that
-                                // the record below needs.
-                                drop(attempt_future);
-                                let cancelled = cancel_upstream_for_client_disconnect(
-                                    ctx,
-                                    &ai_span,
-                                    &provider.name,
-                                    attempt,
-                                    attempt_start.elapsed(),
-                                    &cause,
-                                );
-                                return Err(cancelled);
+                    } else {
+                        async {
+                            if let Some((bypass_body, native_path)) = upstream_call {
+                                dispatch_client
+                                    .forward_native_bypass_with_quota(
+                                        provider,
+                                        &method_str,
+                                        native_path,
+                                        bypass_body,
+                                        quota_attempt,
+                                    )
+                                    .await
+                            } else {
+                                dispatch_client
+                                    .forward_request_with_quota(
+                                        provider,
+                                        &path,
+                                        &attempt_body,
+                                        quota_attempt,
+                                    )
+                                    .await
                             }
-                            // A half-close, or a byte arriving after the
-                            // request body. Neither is a departure, so
-                            // the provider call carries on, unwatched
-                            // from here: the watch cannot be re-armed
-                            // without spinning, because both of those
-                            // signals stay readable once they arrive.
-                            //
-                            // The residual is real and is documented in
-                            // `docs/ai-gateway.md`: a client that
-                            // half-closed and then vanished keeps its
-                            // generation until a write to it fails.
-                            Err(DownstreamLiveness::Inconclusive) => attempt_future.await,
                         }
+                        .instrument(attempt_span)
+                        .await
                     }
-                    None => attempt_future.await,
+                }));
+            let raced = match pre_header_budget {
+                Some(budget) => {
+                    crate::ai_extensions::race_provider_attempt_optional(
+                        ai_extensions.as_mut(),
+                        async {
+                            match tokio::time::timeout(budget, attempt_future).await {
+                                Ok(inner) => inner,
+                                Err(_elapsed) => Err(anyhow::Error::new(PreHeaderTimeoutElapsed {
+                                    budget_ms: u64::try_from(budget.as_millis())
+                                        .unwrap_or(u64::MAX),
+                                })),
+                            }
+                        },
+                    )
+                    .await
+                }
+                // WOR-2690: the same await, now watched. `select!`
+                // polls its branches one after another rather than
+                // nesting them, so the deepest stack this reaches is
+                // still the provider call's own; the idle probe is a
+                // one-byte socket read polled through a `Box`, and
+                // this frame grows by two pointers and a
+                // discriminant. That matters here and nowhere else:
+                // `handle_ai_proxy` runs on a Pingora worker with the
+                // std 2MB stack and has already overflowed it once,
+                // on a single nested `.await` added to this path,
+                // while every unit test stayed green.
+                None if cancel_on_client_disconnect => {
+                    let mut parallel_race =
+                        Box::pin(crate::ai_extensions::race_provider_attempt_optional(
+                            ai_extensions.as_mut(),
+                            attempt_future,
+                        ));
+                    let mut watch = Box::pin(downstream_hard_disconnect(
+                        session,
+                        config.cancel_on_half_close,
+                    ));
+                    // Biased so a provider response that is already
+                    // in hand wins a tie. Having paid for the answer,
+                    // the cheapest thing left to do with it is try to
+                    // deliver it.
+                    let selected = tokio::select! {
+                        biased;
+                        inner = &mut parallel_race => Ok(inner),
+                        observed = &mut watch => Err(observed),
+                    };
+                    match selected {
+                        Ok(inner) => inner,
+                        Err(DownstreamLiveness::Gone(cause)) => {
+                            // Dropping the attempt future is the
+                            // cancellation: it drops the in-flight
+                            // `reqwest` call, which closes the
+                            // connection the provider is generating
+                            // into. It also releases the
+                            // shared-quota reservation and the
+                            // router's in-flight slot, both of which
+                            // are documented cancellation-safe, and
+                            // it releases the borrow of `ctx` that
+                            // the record below needs.
+                            drop(parallel_race);
+                            let cancelled = cancel_upstream_for_client_disconnect(
+                                ctx,
+                                &ai_span,
+                                &provider.name,
+                                attempt,
+                                attempt_start.elapsed(),
+                                &cause,
+                            );
+                            return Err(cancelled);
+                        }
+                        // A half-close, or a byte arriving after the
+                        // request body. Neither is a departure, so
+                        // the provider call carries on, unwatched
+                        // from here: the watch cannot be re-armed
+                        // without spinning, because both of those
+                        // signals stay readable once they arrive.
+                        //
+                        // The residual is real and is documented in
+                        // `docs/ai-gateway.md`: a client that
+                        // half-closed and then vanished keeps its
+                        // generation until a write to it fails.
+                        Err(DownstreamLiveness::Inconclusive) => parallel_race.await,
+                    }
+                }
+                None => {
+                    crate::ai_extensions::race_provider_attempt_optional(
+                        ai_extensions.as_mut(),
+                        attempt_future,
+                    )
+                    .await
                 }
             };
+            match raced {
+                crate::ai_extensions::ParallelModerationRace::Attempt(result) => result,
+                crate::ai_extensions::ParallelModerationRace::BlockedAfterAnswer {
+                    block,
+                    result,
+                } => {
+                    match &result {
+                        Ok(resp) => record_provider_attempt_outcome(
+                            &router,
+                            provider_idx,
+                            &provider.name,
+                            ProviderAttemptOutcome::Answered(resp.status().as_u16()),
+                        ),
+                        Err(_) => record_provider_attempt_outcome(
+                            &router,
+                            provider_idx,
+                            &provider.name,
+                            ProviderAttemptOutcome::NoResponse,
+                        ),
+                    }
+                    sbproxy_ai::ai_metrics::record_ai_parallel_moderation("block");
+                    send_ai_extension_block_response(session, ctx, &ai_span, block).await?;
+                    return Ok(());
+                }
+                crate::ai_extensions::ParallelModerationRace::Cancelled { block } => {
+                    record_provider_attempt_outcome(
+                        &router,
+                        provider_idx,
+                        &provider.name,
+                        ProviderAttemptOutcome::Cancelled,
+                    );
+                    sbproxy_ai::ai_metrics::record_ai_parallel_moderation("cancelled_upstream");
+                    send_ai_extension_block_response(session, ctx, &ai_span, block).await?;
+                    return Ok(());
+                }
+            }
+        };
         ctx.ai_serve_model = local_public_model.clone();
 
         match result {
@@ -22571,6 +22647,19 @@ mod external_guardrail_context_tests {
         content_type: Option<&'static str>,
         status: u16,
     ) -> (String, Arc<AtomicUsize>) {
+        slow_upstream_fixture_with_status(body, content_type, status, Duration::ZERO).await
+    }
+
+    async fn slow_upstream_fixture(body: Vec<u8>, delay: Duration) -> (String, Arc<AtomicUsize>) {
+        slow_upstream_fixture_with_status(body, Some("application/json"), 200, delay).await
+    }
+
+    async fn slow_upstream_fixture_with_status(
+        body: Vec<u8>,
+        content_type: Option<&'static str>,
+        status: u16,
+        delay: Duration,
+    ) -> (String, Arc<AtomicUsize>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind upstream fixture");
@@ -22581,6 +22670,9 @@ mod external_guardrail_context_tests {
             let (mut stream, _) = listener.accept().await.expect("accept upstream request");
             observed.fetch_add(1, Ordering::SeqCst);
             drain_upstream_request(&mut stream).await;
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             let content_type_header = content_type
                 .map(|content_type| format!("content-type: {content_type}\r\n"))
                 .unwrap_or_default();
@@ -27468,6 +27560,90 @@ origins:
                 "model": "requested-model",
                 "phase": "input"
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn bundled_serial_input_blocks_before_the_proxy_contacts_upstream() {
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"choices":[]}"#).await;
+        let config = openai_proxy_config(&upstream_url);
+        let (_directory, pipeline) = pipeline_with_ai_javascript(
+            "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: serial-input\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nhooks:\n  - kind: ai_guardrail_input\n    type: inspect_input\n    export: inspect\n",
+            r#"export function inspect() { return {version:"sbproxy-envelope/v1",decision:"block",status:422,code:"fixture_serial",message:"serial refused"}; }"#,
+        );
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("serial input refusal is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response UTF-8");
+        assert!(response.starts_with("HTTP/1.1 422"), "{response}");
+        assert!(response.contains("fixture_serial"), "{response}");
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            0,
+            "serial input must not contact the upstream model"
+        );
+    }
+
+    #[tokio::test]
+    async fn bundled_parallel_input_contacts_upstream_then_cancels_on_reject() {
+        let (upstream_url, upstream_hits) = slow_upstream_fixture(
+            canonical_chat_response("should-not-reach-the-client"),
+            Duration::from_millis(800),
+        )
+        .await;
+        let config = openai_proxy_config(&upstream_url);
+        let (_directory, pipeline) = pipeline_with_ai_javascript(
+            "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: parallel-input\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nsandbox:\n  budget_ms: 1000\n  memory_mb: 16\n  stack_kb: 512\n  max_buffer_bytes: 1048576\n  max_output_bytes: 1048576\n  max_fuel: 1000000000\nhooks:\n  - kind: ai_guardrail_input\n    type: inspect_input\n    export: inspect\n    execution:\n      mode: parallel\n",
+            r#"export function inspect() { const start = Date.now(); while (Date.now() - start < 150) {} return {version:"sbproxy-envelope/v1",decision:"block",status:451,code:"fixture_parallel",message:"parallel refused"}; }"#,
+        );
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("parallel input refusal is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response UTF-8");
+        assert!(response.starts_with("HTTP/1.1 451"), "{response}");
+        assert!(response.contains("fixture_parallel"), "{response}");
+        assert!(
+            !response.contains("should-not-reach-the-client"),
+            "{response}"
+        );
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            1,
+            "parallel input must start the upstream call before refusing"
         );
     }
 

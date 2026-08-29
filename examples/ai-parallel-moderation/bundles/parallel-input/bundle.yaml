@@ -1,0 +1,22 @@
+apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: parallel-input
+version: 1.0.0
+runtime: javascript
+entry: inspect.js
+sha256: feacf7d3c09bcfdcc81b4b562609ede0a9846db3b96882019a6e22a4db537520
+hooks:
+  - kind: ai_guardrail_input
+    type: parallel_moderation
+    export: inspect
+    execution:
+      mode: parallel
+failure_posture: closed
+sandbox:
+  budget_ms: 50
+  memory_mb: 16
+  stack_kb: 512
+  max_buffer_bytes: 1048576
+  max_output_bytes: 1048576
+  max_fuel: 100000000
+permissions: []

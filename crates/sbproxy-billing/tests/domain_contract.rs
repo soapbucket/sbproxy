@@ -9,9 +9,9 @@ use std::collections::BTreeMap;
 
 use sbproxy_billing::money::{CurrencyCode, Money};
 use sbproxy_billing::types::{
-    digests_equal, provider_idempotency_key, AdvertisedRail, AttemptOperation, IntentStatus,
-    PaymentProof, PaymentProtocol, PaymentRequirement, PaymentRequirementDraft, RequirementTerms,
-    SettlementRail, SettlementReceipt,
+    digests_equal, provider_idempotency_key, x402_facilitator_payer_hash, AdvertisedRail,
+    AttemptOperation, IntentStatus, PaymentProof, PaymentProtocol, PaymentRequirement,
+    PaymentRequirementDraft, RequirementTerms, SettlementRail, SettlementReceipt,
 };
 use sbproxy_billing::BillingError;
 
@@ -273,6 +273,29 @@ fn an_idempotency_key_binds_the_generation_and_the_proof() {
     assert!(first.starts_with("sbp1_"));
     // The credential must not be recoverable from a key a provider displays.
     assert!(!first.contains("spt_value"));
+}
+
+#[test]
+fn an_x402_facilitator_payer_hash_does_not_carry_the_address() {
+    // WOR-2302: the column holds a derived scope key. A dump of the
+    // settlement database must not be a list of wallet addresses.
+    let payer = "0x2222222222222222222222222222222222222222";
+    let hash = x402_facilitator_payer_hash("tenant-1", payer);
+    assert_eq!(
+        hash,
+        x402_facilitator_payer_hash("tenant-1", payer),
+        "the same tenant and payer must mint one stable scope key"
+    );
+    assert_eq!(hash.len(), 32, "16-byte hex");
+    assert!(
+        !hash.contains(payer) && !hash.to_lowercase().contains("2222"),
+        "the stored key must not carry its own input: {hash}",
+    );
+    assert_ne!(
+        hash,
+        x402_facilitator_payer_hash("tenant-2", payer),
+        "the same wallet under two tenants must not share a scope key",
+    );
 }
 
 #[test]

@@ -1070,6 +1070,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_ai_parallel_moderation_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_ai_parallel_moderation"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["outcome"],
+        description: "Inspect-only input hooks that ran alongside the upstream call, by allow, block, or cancelled_upstream.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_ai_safety_guardrail_verdicts_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_safety_guardrail_verdict"),
@@ -1482,7 +1493,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["provider", "outcome"],
-        description: "AI provider attempts during failover/selection, by provider and outcome.",
+        description: "AI provider attempts during failover/selection, by provider and outcome (`success`, `error`, `client_disconnected`, `moderation_cancelled`).",
         dead_reason: None,
     },
     MetricCapability {

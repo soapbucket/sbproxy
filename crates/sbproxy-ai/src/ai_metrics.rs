@@ -595,6 +595,17 @@ static AI_GUARDRAIL_BLOCKS: LazyLock<CounterVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+static AI_PARALLEL_MODERATION: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_parallel_moderation_total",
+            "Inspect-only input hooks that ran alongside the upstream call"
+        ),
+        &["outcome"]
+    )
+    .unwrap()
+});
+
 static AI_SAFETY_GUARDRAIL_VERDICTS: LazyLock<CounterVec> = LazyLock::new(|| {
     register_counter_vec!(
         Opts::new(
@@ -1855,6 +1866,20 @@ pub fn record_provider_error(provider: &str, error_kind: &str) {
 /// Record a guardrail block.
 pub fn record_guardrail_block(category: &str) {
     AI_GUARDRAIL_BLOCKS.with_label_values(&[category]).inc();
+}
+
+/// Record one inspect-only input hook that ran alongside the upstream call.
+///
+/// `outcome` is a closed set: `allow`, `block` (the hook refused after
+/// the provider had already answered), and `cancelled_upstream` (the
+/// hook blocked first and the in-flight call was dropped). A cancelled
+/// call may still be billed by the provider.
+pub fn record_ai_parallel_moderation(outcome: &str) {
+    let outcome = match outcome {
+        "allow" | "block" | "cancelled_upstream" => outcome,
+        _ => "unknown",
+    };
+    AI_PARALLEL_MODERATION.with_label_values(&[outcome]).inc();
 }
 
 /// Record one built-in safety guardrail evaluation.
@@ -3993,6 +4018,18 @@ mod tests {
             .iter()
             .find(|f| f.name() == "sbproxy_ai_guardrail_blocks_total");
         assert!(blocks.is_some());
+    }
+
+    #[test]
+    fn test_record_ai_parallel_moderation() {
+        record_ai_parallel_moderation("allow");
+        record_ai_parallel_moderation("block");
+        record_ai_parallel_moderation("cancelled_upstream");
+        let families = prometheus::gather();
+        let family = families
+            .iter()
+            .find(|f| f.name() == "sbproxy_ai_parallel_moderation_total");
+        assert!(family.is_some());
     }
 
     #[test]
