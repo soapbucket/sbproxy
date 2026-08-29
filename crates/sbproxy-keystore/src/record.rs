@@ -650,9 +650,10 @@ impl CredentialRecord {
     /// Whether this record carries a raw, unsealed secret in *any* of its
     /// material slots.
     ///
-    /// [`CredentialMaterial::is_plaintext`] answers the question for one
-    /// slot. This answers it for the record, and the difference is load
-    /// bearing: WOR-2567 gave a record a second slot, `prev_material`, and
+    /// `CredentialMaterial::is_plaintext` answers the question for one slot,
+    /// and is crate-private precisely so that this is the only answer
+    /// reachable from outside. This one asks the record, and the difference
+    /// is load bearing: WOR-2567 gave a record a second slot, and
     /// the two guards that keep plaintext off shared surfaces (the mesh
     /// keystore's `put_credential` and the TTL cache's second-tier
     /// publish) were both written when there was only one. A rotation of a
