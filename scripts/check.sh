@@ -564,6 +564,20 @@ batch_env_mutation() {
   bash "$ROOT/scripts/check-env-mutation.sh"
 }
 
+# CI: ci.yml lint lane, "no call site hands tract a model directory"
+# (WOR-2694). Pure grep, in two tiers. Nothing may call tract's
+# model_for_path / model_for_read, which parse and translate in one call
+# and leave no point at which a caller can refuse an external_data
+# reference; nor parse_with_template, Onnx::parse, or a hand-built
+# ParsingContext, which take the model directory directly. That
+# directory is the state GHSA-h668-6x6g-f8r5 turns into an arbitrary
+# file read. The script's header states what a line-oriented grep
+# cannot see, and its name is the property it actually verifies rather
+# than the broader one the tests cover.
+batch_onnx_model_loaders() {
+  bash "$ROOT/scripts/check-onnx-model-loaders.sh"
+}
+
 # CI: ci.yml lint lane, "durable sinks create files owner-only"
 # (WOR-2626). Pure grep, plus fixtures that prove the detector still
 # detects. Production code in the four sink crates must reach
@@ -653,6 +667,7 @@ run_batch "read-only source and doc scans" \
   batch_attribute_theft "no insertion landed inside an attribute block" \
   batch_spec_citations "spec citation hygiene" \
   batch_env_mutation "no process-global env mutation outside test helpers" \
+  batch_onnx_model_loaders "no call site hands tract a model directory" \
   batch_durable_file_modes "durable sinks create files owner-only" \
   batch_secret_debug_registry "secret-bearing types do not derive Debug" \
   batch_metric_visibility "every stable metric has a dashboard panel (ratchet)" \
