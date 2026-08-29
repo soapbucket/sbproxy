@@ -10,6 +10,30 @@ description = "Pure-Rust ONNX inference + tokenizer wrapper for sbproxy detector
 # Pure-Rust ONNX runtime. Avoids the C++ ONNX Runtime + system libs that
 # `ort` would pull in, which is critical for cross-compile and for
 # building on hosts without onnxruntime installed.
+#
+# Held at 0.21 deliberately (WOR-2694). Two advisories are open against
+# this line: GHSA-h668-6x6g-f8r5, an arbitrary file read through
+# unsanitized ONNX `external_data`, and GHSA-x5mv-8wgw-29hg /
+# RUSTSEC-2026-0217, an integer overflow in the NNEF `.dat` parser.
+#
+# The file read is closed in this crate rather than by a bump: see
+# `src/onnx_external_data.rs`. Every loader refuses external tensor data
+# and then translates with no model directory in the parsing context,
+# which holds whichever tract is underneath. The NNEF overflow has no
+# call site in this workspace and is carried in deny.toml with an expiry.
+#
+# Why not bump. 0.21.17 is the release to want: it fixes both advisories
+# and predates the Gather regression below. It does not resolve, and is
+# blocked by one character: `tract-data` 0.21.17 pins `libm = "=0.2.11"`
+# exactly while `wasmtime-internal-core` needs `^0.2.16` and the lockfile
+# resolves 0.2.16. 0.22 and 0.23 write that same requirement as a caret and
+# do resolve, but both added an unchecked
+# block-copy fast path to the Gather op that panics on an out-of-range
+# index where 0.21 returned an error, turning an ordinary tokenizer and
+# model vocabulary mismatch into a panic on the AI request path.
+#
+# `sbproxy-agent-detect` and `sbproxy-modules` carry the same version.
+# Keep the three in step.
 tract-onnx = "0.21"
 # Hugging Face tokenizers. Pure Rust, supports BPE / WordPiece / etc.
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }

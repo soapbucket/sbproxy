@@ -89,9 +89,17 @@ impl OnnxEmbedder {
         )?;
         let tokenizer = Tokenizer::from_file(tokenizer_path)
             .map_err(|e| anyhow!("failed to load tokenizer at {tokenizer_path:?}: {e}"))?;
-        let model = tract_onnx::onnx()
-            .model_for_path(model_path)
-            .with_context(|| format!("failed to parse ONNX model at {model_path:?}"))?
+        // Parse, refuse external tensor data, then translate with no model
+        // directory in the parsing context. See `onnx_external_data` and
+        // GHSA-h668-6x6g-f8r5.
+        let onnx = tract_onnx::onnx();
+        let model_proto = onnx
+            .proto_model_for_path(model_path)
+            .with_context(|| format!("failed to parse ONNX model at {model_path:?}"))?;
+        crate::reject_external_tensor_data(&model_proto)?;
+        let model = onnx
+            .model_for_proto_model(&model_proto)
+            .context("failed to translate ONNX embedding model")?
             .into_optimized()
             .context("failed to optimise ONNX model")?
             .into_runnable()
@@ -124,9 +132,14 @@ impl OnnxEmbedder {
         let tokenizer = Tokenizer::from_bytes(tokenizer_bytes)
             .map_err(|e| anyhow!("failed to load tokenizer from verified snapshot: {e}"))?;
         let mut model_reader = std::io::Cursor::new(model_bytes);
-        let model = tract_onnx::onnx()
-            .model_for_read(&mut model_reader)
-            .context("failed to parse ONNX model from verified snapshot")?
+        let onnx = tract_onnx::onnx();
+        let model_proto = onnx
+            .proto_model_for_read(&mut model_reader)
+            .context("failed to parse ONNX model from verified snapshot")?;
+        crate::reject_external_tensor_data(&model_proto)?;
+        let model = onnx
+            .model_for_proto_model(&model_proto)
+            .context("failed to translate ONNX embedding model from verified snapshot")?
             .into_optimized()
             .context("failed to optimise ONNX model")?
             .into_runnable()
