@@ -2254,14 +2254,6 @@ async fn send_idempotency_cache_hit(
     Ok(status)
 }
 
-/// Build a `{"error": "<message>"}` JSON body with the message
-/// correctly escaped (WOR-1738).
-///
-/// The error message can carry client-controlled text (for example an
-/// AI request's `model` field echoed back in a 403), so it must be
-/// escaped rather than interpolated into a hand-built JSON string. A
-/// quote or backslash in the message would otherwise break the envelope
-/// or inject sibling fields.
 /// Classify a resolved `security_headers` entry as a CSP emission, and in
 /// which mode.
 ///
@@ -2321,6 +2313,14 @@ pub(crate) fn record_stranded_cel_header_mutation(hostname: &str, reason: &'stat
 /// chain that produced them faulted terminally.
 pub(crate) const CEL_MUTATIONS_DROPPED_REASON: &str = "cel_mutations_dropped_on_transform_failure";
 
+/// Build a `{"error": "<message>"}` JSON body with the message
+/// correctly escaped (WOR-1738).
+///
+/// The error message can carry client-controlled text (for example an
+/// AI request's `model` field echoed back in a 403), so it must be
+/// escaped rather than interpolated into a hand-built JSON string. A
+/// quote or backslash in the message would otherwise break the envelope
+/// or inject sibling fields.
 pub(super) fn error_json_body(message: &str) -> String {
     serde_json::json!({ "error": message }).to_string()
 }
@@ -7334,14 +7334,13 @@ mod wor_2477_panic_containment_tests {
     }
 }
 
-/// A generated (`static` / `mock`) response body goes through the same
-/// origin transform chain a proxied body does, so a transform that
-/// faults there has to reach the same `failure_posture`.
+/// The CEL header phases: which request and response phases a
+/// `headers:` transform is allowed to run in, and what happens at the
+/// ones it is not.
 ///
-/// Retrospective review of PR #1153 found it did not: every fault was a
-/// `warn!` and the loop continued with the untransformed buffer, so a
-/// redaction transform declared `closed` shipped the exact bytes it
-/// existed to strip.
+/// Left undocumented for a while because the block above it belonged to
+/// `generated_body_failure_posture_tests` and was read as this module's
+/// own.
 #[cfg(test)]
 mod cel_header_phase_gate_tests {
     use super::*;
@@ -7482,6 +7481,14 @@ mod cel_header_phase_gate_tests {
     }
 }
 
+/// A generated (`static` / `mock`) response body goes through the same
+/// origin transform chain a proxied body does, so a transform that
+/// faults there has to reach the same `failure_posture`.
+///
+/// Retrospective review of PR #1153 found it did not: every fault was a
+/// `warn!` and the loop continued with the untransformed buffer, so a
+/// redaction transform declared `closed` shipped the exact bytes it
+/// existed to strip.
 #[cfg(test)]
 mod generated_body_failure_posture_tests {
     use super::*;

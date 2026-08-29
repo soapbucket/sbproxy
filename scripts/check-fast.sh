@@ -83,6 +83,7 @@ CHECKS=(
   "operator URLs at log lines||bash scripts/check-log-url-ratchet.sh"
   "unwrap/expect/panic in production code||bash scripts/check-unwrap-ratchet.sh"
   "AI dispatch path stack budget||bash scripts/check-stack-budget-ratchet.sh"
+  "attributes sit on items they can apply to||python3 scripts/check-attribute-placement.py --check"
   "secret-resolver drift||python3 scripts/check-secret-resolver-drift.py"
   "generated tapes and GIF wiring|make|make tapes-check"
 
@@ -116,6 +117,7 @@ CHECKS=(
   "every stable metric has a dashboard panel||bash scripts/check-metric-visibility.sh"
 
   # --- Things a merge breaks.
+  "no insertion inside an attribute block||python3 scripts/check-attribute-theft.py --check"
   "no committed merge-conflict markers||check_conflict_markers"
   "no internal tracker placeholders||check_tracker_placeholders"
   "changelog entries are fragments||python3 scripts/changelog-fragments.py --check"
@@ -141,7 +143,10 @@ check_gate_helpers() {
     && python3 scripts/lib/cert_record.py --self-test \
     && python3 scripts/tests/test_cert_record.py \
     && python3 scripts/lib/notice_coverage.py --self-test \
-    && python3 scripts/tests/test_notice_coverage.py
+    && python3 scripts/tests/test_notice_coverage.py \
+    && python3 scripts/check-attribute-theft.py --self-test \
+    && python3 scripts/check-attribute-placement.py --self-test \
+    && bash scripts/lib/expect-tests.sh --self-test
 }
 
 # docs/llms-full.txt is regenerated at release prep and is normally absent

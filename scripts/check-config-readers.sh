@@ -25,13 +25,22 @@ COVERAGE_TEST='key_registry::tests::every_dispatchable_module_declares_whether_i
 # this reuse whatever the lane already built.
 #
 # nextest is preferred because it fails when a filter matches nothing, so
-# renaming either test cannot silently turn this gate into a no-op.
+# renaming either test cannot silently turn this gate into a no-op. That
+# is only half the property, though: nextest refuses zero matches and
+# accepts one of two, and the `cargo test` fallback below accepts zero
+# outright. `0 passed; 2857 filtered out` with a green exit is what that
+# looks like, and it shipped on 2026-08-28. Both arms assert the count.
+. "$ROOT/scripts/lib/expect-tests.sh"
+
 if cargo nextest --version >/dev/null 2>&1; then
-  cargo nextest run --workspace --exclude sbproxy-e2e --locked \
-    -E "test(=${READER_TEST}) + test(=${COVERAGE_TEST})"
+  expect_tests 2 "config-reader coverage (nextest)" -- \
+    cargo nextest run --workspace --exclude sbproxy-e2e --locked \
+      -E "test(=${READER_TEST}) + test(=${COVERAGE_TEST})"
 else
-  cargo test --workspace --exclude sbproxy-e2e --locked --lib \
-    "${READER_TEST}" -- --exact
-  cargo test --workspace --exclude sbproxy-e2e --locked --lib \
-    "${COVERAGE_TEST}" -- --exact
+  expect_tests 1 "$READER_TEST" -- \
+    cargo test --workspace --exclude sbproxy-e2e --locked --lib \
+      "${READER_TEST}" -- --exact
+  expect_tests 1 "$COVERAGE_TEST" -- \
+    cargo test --workspace --exclude sbproxy-e2e --locked --lib \
+      "${COVERAGE_TEST}" -- --exact
 fi

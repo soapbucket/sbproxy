@@ -198,23 +198,51 @@ jobs:
       # wrong behavior for an exactly-once property: a nondeterministic
       # double-serve would be retried into green.
       #
-      # --no-fail-fast because settlement_gate sorts before usage_bridge,
-      # so without it one settlement failure suppresses the usage-bridge
-      # results entirely and every rerun looks like a different bug.
+      # --no-fail-fast so one failing test does not suppress the rest of
+      # its own target's results and every rerun looks like a different
+      # bug. The two targets are two invocations now (see the count
+      # assertion in the step), and the `|| rc=1` there is what keeps a
+      # settlement failure from suppressing the usage-bridge run.
       #
       # `set -o pipefail` before the tee: GitHub's default shell is
       # `bash -e`, which does NOT enable pipefail, and without it the
       # step's exit status would be tee's and every failure would report
-      # green. Nothing runs after the pipeline, so the step status is
-      # cargo's status.
+      # green. The step ends on an explicit `exit`, so the status is the
+      # worst of the two runs rather than the last tee's.
       - name: payments e2e
         env:
           SBPROXY_E2E_PAYMENTS_BIN: ${{ github.workspace }}/target/payments/release/sbproxy
         run: |
           set -o pipefail
-          cargo test -p sbproxy-e2e --locked --no-fail-fast \
-            --test settlement_gate --test usage_bridge \
-            -- --test-threads=1 2>&1 | tee payments-e2e.log
+          # `--test <target>` with no name filter. cargo errors on a
+          # target that does not exist, but a target that still exists
+          # and has emptied runs zero tests and exits 0. `>=1` closes
+          # that at no maintenance cost: the number never moves.
+          #
+          # One call per target. `expect_tests` sums the `test result:`
+          # lines across every binary a single cargo invocation runs, so
+          # `>=1` over both targets in one call would let an emptied
+          # settlement_gate hide behind usage_bridge's count, which is
+          # the failure this assertion was added to refuse.
+          #
+          # `|| rc=1` rather than letting `bash -e` stop at the first
+          # failure, for the same reason `--no-fail-fast` is here: a
+          # settlement failure must not suppress the usage-bridge
+          # results, or every rerun looks like a different bug. Both run,
+          # both append to the log the next step reads, and the step
+          # exits non-zero if either did.
+          . scripts/lib/expect-tests.sh
+          rc=0
+          : > payments-e2e.log
+          expect_tests '>=1' "payments e2e: settlement_gate" -- \
+            cargo test -p sbproxy-e2e --locked --no-fail-fast \
+              --test settlement_gate \
+              -- --test-threads=1 2>&1 | tee -a payments-e2e.log || rc=1
+          expect_tests '>=1' "payments e2e: usage_bridge" -- \
+            cargo test -p sbproxy-e2e --locked --no-fail-fast \
+              --test usage_bridge \
+              -- --test-threads=1 2>&1 | tee -a payments-e2e.log || rc=1
+          exit $rc
 
       # Names the failures. A scheduled lane nobody reads is the same as
       # no lane, so the failing test names go into the run summary and

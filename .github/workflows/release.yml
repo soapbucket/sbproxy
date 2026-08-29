@@ -373,22 +373,43 @@ jobs:
           echo "git ref:      ${GITHUB_REF_NAME}"
           echo "runner:       $(uname -srm)"
 
+      # Fifteen `--test <target>` selections and no name filter on any
+      # of them. cargo errors on a target that does not exist, so the
+      # shape that gets through is a target that still exists and has
+      # emptied: zero tests, exit 0, a release signed off against a suite
+      # that ran nothing. `>=1` says "this selected something" and needs
+      # no maintenance, unlike an exact count on fifteen moving targets.
+      #
+      # One call per target, never several targets in one call.
+      # `expect_tests` sums the `test result:` lines across every binary
+      # a single cargo invocation runs, so `>=1` over a multi-target
+      # invocation only asserts that the targets together ran something
+      # and an emptied one hides behind its neighbours.
       - name: deterministic model-host DoD suite
         run: |
           set -euo pipefail
-          cargo test -p sbproxy-model-host --test engine_drivers --locked
-          cargo test -p sbproxy-model-host --test cuda_build --locked
-          cargo test -p sbproxy-model-host --test runtime_reconcile --locked
-          cargo test -p sbproxy-model-host --test local_admission --locked
-          cargo test -p sbproxy-core --test model_host_reload --locked
-          cargo test -p sbproxy --test models_lifecycle_cli --locked
-          cargo test -p sbproxy-model-host --test placement --locked
-          cargo test -p sbproxy-model-host --test capability_contract --locked
-          cargo test -p sbproxy-ai --test managed_replica_routing --locked
-          cargo test -p sbproxy-core --test cluster_control_plane --locked
-          cargo test -p sbproxy-core --test model_plane_envelope --test model_plane_transport --test managed_replica_dispatch --locked
-          SBPROXY_E2E_BIN="${PWD}/target/debug/sbproxy" cargo test -p sbproxy-e2e --test model_cluster_control --locked -- --nocapture
-          SBPROXY_E2E_BIN="${PWD}/target/debug/sbproxy" cargo test -p sbproxy-e2e --test model_cluster_dispatch --locked -- --nocapture
+          . scripts/lib/expect-tests.sh
+          expect_tests '>=1' "engine_drivers" -- cargo test -p sbproxy-model-host --test engine_drivers --locked
+          expect_tests '>=1' "cuda_build" -- cargo test -p sbproxy-model-host --test cuda_build --locked
+          expect_tests '>=1' "runtime_reconcile" -- cargo test -p sbproxy-model-host --test runtime_reconcile --locked
+          expect_tests '>=1' "local_admission" -- cargo test -p sbproxy-model-host --test local_admission --locked
+          expect_tests '>=1' "model_host_reload" -- cargo test -p sbproxy-core --test model_host_reload --locked
+          expect_tests '>=1' "models_lifecycle_cli" -- cargo test -p sbproxy --test models_lifecycle_cli --locked
+          expect_tests '>=1' "placement" -- cargo test -p sbproxy-model-host --test placement --locked
+          expect_tests '>=1' "capability_contract" -- cargo test -p sbproxy-model-host --test capability_contract --locked
+          expect_tests '>=1' "managed_replica_routing" -- cargo test -p sbproxy-ai --test managed_replica_routing --locked
+          expect_tests '>=1' "cluster_control_plane" -- cargo test -p sbproxy-core --test cluster_control_plane --locked
+          expect_tests '>=1' "model_plane_envelope" -- cargo test -p sbproxy-core --test model_plane_envelope --locked
+          expect_tests '>=1' "model_plane_transport" -- cargo test -p sbproxy-core --test model_plane_transport --locked
+          expect_tests '>=1' "managed_replica_dispatch" -- cargo test -p sbproxy-core --test managed_replica_dispatch --locked
+          # Exported rather than prefixed: an assignment prefix on a
+          # shell function outlives the call in bash, which is a wart
+          # worth not leaving for the next reader.
+          export SBPROXY_E2E_BIN="${PWD}/target/debug/sbproxy"
+          expect_tests '>=1' "model_cluster_control" -- \
+            cargo test -p sbproxy-e2e --test model_cluster_control --locked -- --nocapture
+          expect_tests '>=1' "model_cluster_dispatch" -- \
+            cargo test -p sbproxy-e2e --test model_cluster_dispatch --locked -- --nocapture
 
   certify-model-host-apple-silicon:
     # Blocking since the v1.9.0 cycle. The lane's two historical failure

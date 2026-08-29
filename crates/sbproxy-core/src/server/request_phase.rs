@@ -781,8 +781,6 @@ async fn drain_body_for_signature_verification(
     }
 }
 
-/// Handle an incoming request before proxying. See the trait method
-/// `<SbProxy as ProxyHttp>::request_filter` for the phase contract.
 /// Run the origin's `cache.key` event, if it has one.
 ///
 /// Returns the plan, plus whether the cache must be bypassed entirely.
@@ -1237,6 +1235,8 @@ async fn serve_comp_well_known(
     Ok(false)
 }
 
+/// Handle an incoming request before proxying. See the trait method
+/// `<SbProxy as ProxyHttp>::request_filter` for the phase contract.
 pub(super) async fn request_filter(
     session: &mut Session,
     ctx: &mut RequestContext,

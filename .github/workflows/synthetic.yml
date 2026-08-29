@@ -210,12 +210,27 @@ jobs:
       - name: chaos hot-reload e2e
         # `--ignored` rather than `--include-ignored` so this job
         # only runs the chaos test, not every other e2e in the crate.
+        #
+        # `--ignored` is a filter, and a filter that matches nothing
+        # exits 0. Deleting the `#[ignore]` from
+        # `chaos_hot_reload_under_sustained_load` would leave this job
+        # green while running no chaos test at all, which is the whole
+        # of what this workflow is for. There is one ignored test in
+        # that file; assert it.
+        #
+        # Which lane notices: this job is gated on the `run-synthetic`
+        # label or a manual dispatch, so no ordinary pull request reads
+        # this count. A commit that breaks it merges green and reddens
+        # whenever somebody next asks for a synthetic run, which may be
+        # a long way from the commit that did it.
         run: |
           set -euo pipefail
           mkdir -p target/chaos-logs
-          cargo test -p sbproxy-e2e --locked \
-            --test chaos_hot_reload \
-            -- --ignored --nocapture 2>&1 \
+          . scripts/lib/expect-tests.sh
+          expect_tests 1 "chaos hot-reload" -- \
+            cargo test -p sbproxy-e2e --locked \
+              --test chaos_hot_reload \
+              -- --ignored --nocapture \
             | tee target/chaos-logs/cargo-test-output.txt
 
       - name: upload failure artifacts
