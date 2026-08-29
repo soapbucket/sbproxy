@@ -33,7 +33,7 @@
 //! - [`schema`]: the default MCP entity/action schema Cedar policies
 //!   are authored against, plus workspace-override merging and the
 //!   schema-evolution validate-before-apply check.
-//! - [`replay`]: offline evaluation of recorded MCP tool-call samples
+//! - [`mod@replay`]: offline evaluation of recorded MCP tool-call samples
 //!   against compiled Cedar source. `sbproxy cedar replay` is the
 //!   operator surface; this module is the engine so the CLI and the
 //!   tests share one verdict mapping.
