@@ -4536,6 +4536,14 @@ policies:
 | `cookie_same_site` | string | | SameSite attribute (`Strict`, `Lax`, `None`) |
 | `exempt_paths` | list | | Paths exempt from CSRF checking |
 
+`csrf` mints a token on every safe-method response, whether or not the
+caller already holds one, and the proxy appends it as a `Set-Cookie`. If
+this origin also enables `response_cache`, a stored entry can replay that
+cookie to a later caller, which hands a second caller the first caller's
+token. Read
+[Who a cached entry belongs to](#who-a-cached-entry-belongs-to) before
+combining the two.
+
 ### request_limit
 
 Cap request body size, header count, header value size, URL length, and query string length. Any field left unset means that dimension is not checked.
@@ -5998,6 +6006,13 @@ origins:
 | `allow_non_ssl` | bool | false | Allow sessions over plain HTTP |
 
 Sessions disable themselves implicitly when the block is omitted.
+
+A session cookie is minted when the caller sends none, and the proxy
+appends it as a `Set-Cookie`. If this origin also enables
+`response_cache`, a stored entry can replay that cookie to a later
+caller, which means two callers share one session. Read
+[Who a cached entry belongs to](#who-a-cached-entry-belongs-to) before
+combining the two.
 
 ---
 

@@ -111,12 +111,12 @@ Verified against [`examples/transform-json-schema/sb.yml`](../examples/transform
 
 ### `ai_schema` - AI structured-output enforcement
 
-A second schema-shaped transform, aimed specifically at AI provider responses rather than any JSON body. Where `json_schema` validates with the standard `jsonschema` crate under the pipeline's shared `failure_posture` axis, `ai_schema` carries its own small type/`required`/`properties`/`items` validator and its own three-way `on_failure` mode, so an operator can calibrate a new schema against live traffic in `warn` before promoting it to `block`.
+A second schema-shaped transform, aimed specifically at AI provider responses rather than any JSON body. Where `json_schema` validates with the standard `jsonschema` crate under the pipeline's shared `failure_posture` axis, `ai_schema` carries its own small type/`required`/`properties`/`items` validator and its own `on_failure` mode with three values (`block`, `warn`, `passthrough`), so an operator can calibrate a new schema against live traffic in `warn` before promoting it to `block`.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `schema` | object | required | The schema document (a hand-rolled subset: `type`, `required`, `properties`, `items`, not full JSON Schema). |
-| `on_failure` | string | `block` | `block` refuses the response (an `Err`, subject to `failure_posture` like any other transform error); `warn` logs every violated path and forwards the response; any other value forwards silently. |
+| `on_failure` | string | `block` | One of `block`, `warn`, `passthrough`. `block` refuses the response (an `Err`, subject to `failure_posture` like any other transform error); `warn` logs every violated path and forwards the response; `passthrough` forwards the response and says nothing. The set is closed: any other value is refused at config load, so a typo cannot quietly downgrade a blocking check to a no-op. |
 
 ```yaml
 transforms:

@@ -1929,7 +1929,8 @@ Three signals combine into one verdict: a rolling 32-character substring match a
 |-------|------|---------|-------------|
 | `mode` | string | `warn` | `block` refuses the response; `redact` currently behaves identically to `block` (the pipeline's block-or-pass interface has no channel for returning rewritten content, the same limitation `pii`'s `mask` action documents); `warn` forwards the response and logs at `WARN`; `log` forwards and logs at `INFO`. |
 | `confidence_threshold` | float | `0.95` | Clamped to `[0.85, 0.99]`. |
-| `max_eval_ms` | int | `50` | Soft wall-clock budget. The detector is not preemptible mid-scan; exceeding this substitutes `timeout_action` for `mode`. |
+| `max_scan_bytes` | int | `262144` (256 KiB) | Hard cap on how much of a response is scanned, applied before the detectors allocate. Text past the cap is not examined, so an oversize response can only be under-detected, never falsely blocked. Clamped to at least 32 bytes (one substring shingle), so a cap of `0` cannot silently disable the guardrail. |
+| `max_eval_ms` | int | `50` | Soft wall-clock budget, and a disposition selector rather than a bound: it is read after the scan has finished, so `max_scan_bytes` above is what actually limits the work. The detector is not preemptible mid-scan; exceeding this substitutes `timeout_action` for `mode`. |
 | `timeout_action` | string | `warn` | `block` \| `warn` \| `log`, applied instead of `mode` when `max_eval_ms` is exceeded. |
 | `documents` | list | `[]` | `license_urn` + `body` pairs. Empty is a documented no-op, for staging the integration before publishing a corpus. |
 
