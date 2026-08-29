@@ -137,14 +137,40 @@ covering it asserts on tract's wording. What it is not is unprotected: a
 model naming a path outside its own directory is refused there too, and the
 guard script is what keeps that call site in the two-step shape.
 
-Version floor: `tract-onnx` 0.22, which `Cargo.lock` resolves to 0.22.3.
+Version floor: `tract-onnx` 0.21, held there deliberately. That is worth
+stating plainly, because the advisory that motivates this section is fixed
+upstream and we are not taking the fix.
+
 Both advisories against the 0.21 line are fixed from 0.21.16 and 0.21.17
-onward, but those two patch releases are unreachable from this dependency
-graph: `tract-data` at both pins `libm = "=0.2.11"` as an exact requirement,
-while `wasmtime-internal-core` needs `libm ^0.2.16`, and no resolution
-satisfies both. 0.22 relaxes the same requirement to `^0.2.11` and keeps the
-plan API this workspace compiles against. 0.23 also carries the fixes, but
-moves `SimplePlan` out of the prelude, drops its third type parameter,
-returns an `Arc` from `into_runnable`, and regenerates the protobuf bindings
-against prost 0.14; that is a migration on its own terms rather than part of
-this fix.
+onward, but those two releases do not resolve in this dependency graph:
+`tract-data` at both pins `libm = "=0.2.11"` as an exact requirement while
+`wasmtime-internal-core` needs `libm ^0.2.16`, and no resolution satisfies
+both. 0.22 relaxes that same requirement to `^0.2.11` and does resolve.
+
+It also regresses correctness. 0.22 added an unchecked block-copy fast path
+to the Gather op that indexes a slice directly:
+
+```text
+let input_offset = resolved_index * block_len;
+output_slice[out_offset..out_offset + block_len]
+    .clone_from_slice(&input_slice[input_offset..input_offset + block_len]);
+```
+
+0.21 used a checked lookup and returned `Invalid gather` as an error. An
+out-of-range index is not exotic here: it is what a tokenizer and a model
+whose vocabularies disagree produce, which is an ordinary operator
+misconfiguration the detector stack is built to survive. On 0.22 that
+panics a worker on the AI request path instead of failing cleanly, and the
+prompt-injection tests that assert a typed inference failure catch it.
+0.23 carries the same fast path.
+
+So the trade on offer is an unreachable NNEF integer overflow against a
+panic on a live request path, and it is refused. `deny.toml` carries
+GHSA-x5mv-8wgw-29hg with an expiry and the reasoning beside it.
+
+**The file-read advisory is not being carried.** GHSA-h668-6x6g-f8r5 is
+closed by the refusal described above, which is why that refusal is written
+to hold whichever tract is underneath rather than to lean on the runtime's
+own containment. The mitigation was verified against 0.21.10 with the
+runtime still vulnerable, which is the only configuration where its
+independence can actually be observed.

@@ -11,27 +11,27 @@ description = "Pure-Rust ONNX inference + tokenizer wrapper for sbproxy detector
 # `ort` would pull in, which is critical for cross-compile and for
 # building on hosts without onnxruntime installed.
 #
-# Floor is 0.22 and may not fall back to 0.21 (WOR-2694). Two advisories
-# are open against the whole 0.21 line: GHSA-h668-6x6g-f8r5, an arbitrary
-# file read through unsanitized ONNX `external_data`, and
-# GHSA-x5mv-8wgw-29hg, an integer overflow in the NNEF `.dat` tensor
-# parser. Both are reachable here because operators supply their own
-# model files.
+# Held at 0.21 deliberately (WOR-2694). Two advisories are open against
+# this line: GHSA-h668-6x6g-f8r5, an arbitrary file read through
+# unsanitized ONNX `external_data`, and GHSA-x5mv-8wgw-29hg /
+# RUSTSEC-2026-0217, an integer overflow in the NNEF `.dat` parser.
 #
-# The 0.21 patches that carry the fixes, 0.21.16 and 0.21.17, do not
-# resolve in this graph: `tract-data` at those versions requires
-# `libm = "=0.2.11"` as an exact pin while `wasmtime-internal-core`
-# requires `libm ^0.2.16`. 0.22 relaxes the same requirement to
-# `^0.2.11`, which both satisfy, and keeps the `SimplePlan<F, O, M>` and
-# `into_runnable` shapes this workspace compiles against. 0.23 carries
-# the fixes too but moves `SimplePlan` out of the prelude, drops its
-# third type parameter, returns an `Arc` from `into_runnable`, and
-# regenerates `pb` against prost 0.14; that is a migration on its own
-# terms, not a security fix.
+# The file read is closed in this crate rather than by a bump: see
+# `src/onnx_external_data.rs`. Every loader refuses external tensor data
+# and then translates with no model directory in the parsing context,
+# which holds whichever tract is underneath. The NNEF overflow has no
+# call site in this workspace and is carried in deny.toml with an expiry.
 #
-# `sbproxy-agent-detect` and `sbproxy-modules` carry the same floor.
+# Why not bump. 0.21.16 and 0.21.17 do not resolve: `tract-data` pins
+# `libm = "=0.2.11"` exactly while `wasmtime-internal-core` needs
+# `^0.2.16`. 0.22 and 0.23 do resolve, but both added an unchecked
+# block-copy fast path to the Gather op that panics on an out-of-range
+# index where 0.21 returned an error, turning an ordinary tokenizer and
+# model vocabulary mismatch into a panic on the AI request path.
+#
+# `sbproxy-agent-detect` and `sbproxy-modules` carry the same version.
 # Keep the three in step.
-tract-onnx = "0.22"
+tract-onnx = "0.21"
 # Hugging Face tokenizers. Pure Rust, supports BPE / WordPiece / etc.
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 

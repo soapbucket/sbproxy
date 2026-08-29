@@ -21,9 +21,11 @@
 //!
 //! # Why refuse rather than confine
 //!
-//! `tract-onnx` 0.22.3 confines the value to the model directory, and this
-//! workspace requires it. Refusal is a second, independent layer, for three
-//! reasons:
+//! `tract-onnx` 0.22.3 confines the value to the model directory, but this
+//! workspace is held at 0.21 because 0.22 regresses the Gather op to a panic
+//! on out-of-range indices (see `deny.toml` and `docs/model-pinning.md`). So
+//! this is not a second layer behind an upstream fix, it is the layer that
+//! closes the advisory here. Three reasons it is written this way:
 //!
 //! - A confined reference is still an **unbounded read**. Size budgets measure
 //!   the `.onnx` file, so a 900-byte model naming a 40 GB sibling passes every

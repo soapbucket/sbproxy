@@ -12,9 +12,11 @@
 //! `location: "/etc/passwd"` read `/etc/passwd` and `location: "../../secret"`
 //! walked out of the model directory. Operators point sbproxy at model files
 //! they did not author, so the bytes of that field are attacker-controlled.
-//! This workspace runs 0.22.3 or later, which confines the value to the model
-//! directory; refusing outright is the layer that does not depend on which
-//! tract is underneath.
+//! This workspace is held at 0.21, where that resolution is still
+//! unsanitized, so refusing outright is what closes the advisory rather than
+//! a belt beside an upstream brace. These tests therefore run against a
+//! vulnerable runtime, which is the only configuration in which they prove
+//! anything.
 //!
 //! Every loader in this crate parses the protobuf first and then translates
 //! it with no model directory in the parsing context, which is the state the

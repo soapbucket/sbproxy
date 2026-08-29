@@ -239,6 +239,6 @@ sbproxy-vault = { path = "../sbproxy-vault", features = ["test-support"] }
 smallvec.workspace = true
 tempfile = "3"
 prost11 = { package = "prost", version = "0.11" }
-tract-onnx = "0.22"
+tract-onnx = "0.21"
 tokio = { workspace = true, features = ["full", "test-util"] }
 proptest.workspace = true
