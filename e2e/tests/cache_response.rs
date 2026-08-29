@@ -1156,9 +1156,64 @@ origins:
         .err()
         .map(|e| e.to_string())
         .expect("an abtest action on a cached origin must refuse to boot");
+    // Assert the refusal's own sentence, not a word that appears free in
+    // the child's stderr: the origin here is named `cache.localhost`, so
+    // `contains("cache")` would pass on the hostname alone.
     assert!(
-        error.contains("abtest") && error.contains("cache"),
-        "the refusal must name the action and the cache: {error}"
+        error.contains("not part of the cache key"),
+        "the refusal must explain why, not merely mention a cache: {error}"
+    );
+    assert!(
+        error.contains("the origin's own action"),
+        "the refusal must say where the abtest was found: {error}"
+    );
+}
+
+/// The same refusal when the `abtest` is reached through a forward rule
+/// rather than being the origin's own action.
+///
+/// The parent origin's action is `proxy` and its cache is enabled; the
+/// cache lookup runs before rule selection, so the composition is the
+/// one being refused even though `origin.action` looks innocent. A guard
+/// reading only the origin's own action boots this config.
+#[test]
+fn an_abtest_behind_a_forward_rule_on_a_cached_origin_refuses_at_boot() {
+    let config = r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "fwd.localhost":
+    action:
+      type: proxy
+      url: "http://127.0.0.1:9"
+    forward_rules:
+      - rules:
+          - match: /split
+        origin:
+          action:
+            type: abtest
+            variants:
+              - name: control
+                url: "http://127.0.0.1:9"
+                weight: 50
+              - name: experiment
+                url: "http://127.0.0.1:9"
+                weight: 50
+    response_cache:
+      enabled: true
+      ttl: 60
+"#;
+    let error = ProxyHarness::start_with_yaml(config)
+        .err()
+        .map(|e| e.to_string())
+        .expect("an abtest behind a forward rule on a cached origin must refuse to boot");
+    assert!(
+        error.contains("not part of the cache key"),
+        "the refusal must explain why: {error}"
+    );
+    assert!(
+        error.contains("`forward_rules` entry"),
+        "the refusal must say the abtest came from a forward rule: {error}"
     );
 }
 
@@ -1183,6 +1238,34 @@ origins:
 "#;
     let proxy = ProxyHarness::start_with_yaml(config)
         .expect("abtest without response_cache is a supported pairing");
+    drop(proxy);
+
+    // And the forward-rule shape, so the guard is scoped to the pairing
+    // rather than to `abtest` appearing anywhere on the origin.
+    let via_rule = r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "fwd-nocache.localhost":
+    action:
+      type: proxy
+      url: "http://127.0.0.1:9"
+    forward_rules:
+      - rules:
+          - match: /split
+        origin:
+          action:
+            type: abtest
+            variants:
+              - name: control
+                url: "http://127.0.0.1:9"
+                weight: 50
+              - name: experiment
+                url: "http://127.0.0.1:9"
+                weight: 50
+"#;
+    let proxy = ProxyHarness::start_with_yaml(via_rule)
+        .expect("an abtest forward rule without response_cache is supported");
     drop(proxy);
 }
 

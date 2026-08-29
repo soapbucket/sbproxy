@@ -3402,6 +3402,11 @@ impl CompiledPipeline {
             proxy_wasm_filters.push(proxy_wasm_filter);
             let origin_action_is_mcp = matches!(&action, Action::Mcp(_));
             let origin_action_is_ai_proxy = matches!(&action, Action::AiProxy(_));
+            // WOR-2671, captured here for the same reason as the line
+            // above: `action` is moved into `actions` below, and the
+            // response-cache guard that needs this answer runs after
+            // the forward rules compile.
+            let origin_action_is_abtest = matches!(&action, Action::AbTest(_));
             // WOR-2630: which response phase this origin's `cel` header
             // rules run in. Captured here because `action` is moved into
             // `actions` a few lines down, and the transform compile that
@@ -3571,53 +3576,6 @@ impl CompiledPipeline {
                         dependent.transform.transform_type()
                     );
                 }
-                // WOR-2671: the same rule, one level up, for an action
-                // rather than a transform.
-                //
-                // `abtest` picks a variant per client, and the pick
-                // happens in `handle_action`, which runs *after* the
-                // cache lookup in `request_filter`. The variant is not a
-                // dimension of the cache key
-                // (`sbproxy_cache::compute_cache_key`: workspace,
-                // tenant, hostname, method, path, caller identity,
-                // query, Vary, config fingerprint), and it cannot
-                // usefully become one, because nothing has chosen it yet
-                // when the key is built.
-                //
-                // So a hit replays whichever variant's body the first
-                // caller in that key partition happened to be assigned.
-                // Callers with no cookie share one partition, which is
-                // exactly the first-visit traffic an experiment is
-                // measuring. Two cohorts merge into one and the split
-                // reports weights it never applied.
-                //
-                // This is refused rather than mitigated because there is
-                // no cookie-level or header-level remedy for it: the
-                // wrong bytes are already in the entry. Stripping
-                // `Set-Cookie` from stored entries, which was tried and
-                // reverted, removes the cross-client pin and leaves the
-                // mis-served body untouched.
-                //
-                // Deliberately narrower than "every action that mints a
-                // per-client cookie". `sessions` and `csrf` mint in the
-                // same function and have their own cross-client exposure
-                // on this seam, but their *bodies* are correct: the
-                // response a cookie-less caller gets is the same
-                // whichever cookie-less caller asked. That is a cache
-                // storage-posture problem with a general fix, and it is
-                // tracked separately. `abtest` is the only one of the
-                // three where the cached body itself is wrong.
-                if origin_action_type == "abtest" {
-                    anyhow::bail!(
-                        "origin `{}`: an `abtest` action picks a variant per client, after the \
-                         response-cache lookup has already run, and the variant is not part of \
-                         the cache key; a cache hit would serve one variant's body to clients \
-                         assigned another and the split would report weights it never applied. \
-                         Remove the action, disable `response_cache`, or split the cached \
-                         content onto its own origin",
-                        origin.origin_id
-                    );
-                }
             }
             // WOR-2630: a `cel` transform's `headers:` rules run in
             // whichever response phase can still change a header, and
@@ -3679,6 +3637,69 @@ impl CompiledPipeline {
                             .map(|rule| rule.action.response_transform_phase()),
                     )
                     .collect();
+            // WOR-2671: `abtest` anywhere on a cached origin, the origin's
+            // own action or any forward rule's.
+            //
+            // An `abtest` action picks its variant in `handle_action`,
+            // which runs after the response-cache lookup in
+            // `request_filter`, and the variant is not a dimension of
+            // `compute_cache_key`. It cannot usefully become one: nothing
+            // has chosen a variant when the key is built. So a hit
+            // replays whichever variant's body the first caller in that
+            // key partition drew. `caller_identity` hashes the whole
+            // `Cookie` header, so every caller arriving without one
+            // shares a partition, and that is exactly the first-visit
+            // traffic an experiment measures. Two cohorts merge and the
+            // split reports weights it never applied.
+            //
+            // Refused rather than mitigated because there is no
+            // response-side remedy: by the time any header could be
+            // inspected the wrong bytes are already in the entry.
+            //
+            // Scanned across forward rules for the same reason
+            // `route_phases` just above is: an origin whose own action is
+            // `proxy` can still route to an `abtest` through a
+            // `forward_rules` entry, the parent origin's cache is
+            // consulted at `request_phase.rs` before rule selection, and
+            // the variant body is captured all the same. A guard that
+            // read only the origin's own action would have read as
+            // protection while the composition it names went on booting.
+            //
+            // Deliberately narrower than "every action that mints a
+            // per-client cookie". `sessions` and `csrf` mint on this same
+            // seam and have their own cross-client exposure, but their
+            // response *bodies* are correct and their exposure predates
+            // this branch. That is a cache storage-posture problem,
+            // tracked on its own; `abtest` is the only one where the
+            // cached body itself is wrong.
+            if origin
+                .response_cache
+                .as_ref()
+                .is_some_and(|cache| cache.enabled)
+            {
+                let abtest_route = if origin_action_is_abtest {
+                    Some("the origin's own action")
+                } else if origin_fwd_rules
+                    .iter()
+                    .any(|rule| matches!(&rule.action, Action::AbTest(_)))
+                {
+                    Some("a `forward_rules` entry on this origin")
+                } else {
+                    None
+                };
+                if let Some(where_from) = abtest_route {
+                    anyhow::bail!(
+                        "origin `{}`: {} is an `abtest`, which picks a variant per client after \
+                         the response-cache lookup has already run, and the variant is not part \
+                         of the cache key; a cache hit would serve one variant's body to clients \
+                         assigned another and the split would report weights it never applied. \
+                         Remove the action, disable `response_cache`, or split the cached \
+                         content onto its own origin",
+                        origin.origin_id,
+                        where_from
+                    );
+                }
+            }
             let buffered_somewhere =
                 route_phases.contains(&sbproxy_modules::action::ResponseTransformPhase::Buffered);
             let streaming_somewhere =
@@ -7702,6 +7723,97 @@ origins:
         assert!(error.contains("lua_json"), "{error}");
         assert!(error.contains("t.example.com"), "{error}");
         assert!(error.contains("response cache"), "{error}");
+    }
+
+    fn abtest_action_json() -> serde_json::Value {
+        serde_json::json!({
+            "type": "abtest",
+            "variants": [
+                {"name": "control", "url": "http://localhost:3000", "weight": 50},
+                {"name": "experiment", "url": "http://localhost:3001", "weight": 50},
+            ],
+        })
+    }
+
+    /// The action-level sibling of the transform refusal above
+    /// (WOR-2671). A unit test rather than only an e2e, because e2e is
+    /// not a lane CI runs, and a guard whose only coverage never runs in
+    /// CI is a guard that can be deleted without anything going red.
+    #[test]
+    fn a_cached_origin_refuses_an_abtest_action() {
+        let mut config =
+            make_config_with_transforms("t.example.com", abtest_action_json(), Vec::new());
+        config.origins[0].response_cache = Some(sbproxy_config::ResponseCacheConfig {
+            enabled: true,
+            ..Default::default()
+        });
+        let error = match CompiledPipeline::from_config(config) {
+            Ok(_) => panic!("an abtest action on a cached origin must refuse"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("abtest"), "{error}");
+        assert!(error.contains("t.example.com"), "{error}");
+        assert!(error.contains("the origin's own action"), "{error}");
+        assert!(error.contains("not part of the cache key"), "{error}");
+    }
+
+    /// The hole the first version of this guard left open.
+    ///
+    /// An origin whose own action is `proxy` can still route to an
+    /// `abtest` through a `forward_rules` entry. The parent origin's
+    /// cache is consulted before rule selection, so the composition is
+    /// exactly the one being refused; a guard reading only
+    /// `origin.action_config` would boot this config and read as
+    /// protection while providing none.
+    #[test]
+    fn a_cached_origin_refuses_an_abtest_reached_through_a_forward_rule() {
+        let mut config = make_config_with_transforms(
+            "t.example.com",
+            serde_json::json!({"type": "proxy", "url": "http://localhost:3000"}),
+            Vec::new(),
+        );
+        config.origins[0].response_cache = Some(sbproxy_config::ResponseCacheConfig {
+            enabled: true,
+            ..Default::default()
+        });
+        config.origins[0].forward_rules = vec![serde_json::from_value(serde_json::json!({
+            "rules": [{"match": "/split"}],
+            "origin": {"action": abtest_action_json()},
+        }))
+        .expect("a forward rule carrying an abtest action")];
+
+        let error = match CompiledPipeline::from_config(config) {
+            Ok(_) => {
+                panic!("an abtest reached through a forward rule on a cached origin must refuse")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("abtest"), "{error}");
+        assert!(error.contains("t.example.com"), "{error}");
+        assert!(
+            error.contains("`forward_rules` entry"),
+            "the refusal must say where the abtest was found: {error}"
+        );
+    }
+
+    /// And neither shape is refused without the cache, so the guard is
+    /// scoped to the pairing rather than to `abtest`.
+    #[test]
+    fn an_abtest_action_without_a_response_cache_compiles() {
+        let direct = make_config_with_transforms("t.example.com", abtest_action_json(), Vec::new());
+        assert!(CompiledPipeline::from_config(direct).is_ok());
+
+        let mut via_rule = make_config_with_transforms(
+            "t.example.com",
+            serde_json::json!({"type": "proxy", "url": "http://localhost:3000"}),
+            Vec::new(),
+        );
+        via_rule.origins[0].forward_rules = vec![serde_json::from_value(serde_json::json!({
+            "rules": [{"match": "/split"}],
+            "origin": {"action": abtest_action_json()},
+        }))
+        .expect("a forward rule carrying an abtest action")];
+        assert!(CompiledPipeline::from_config(via_rule).is_ok());
     }
 
     #[test]
