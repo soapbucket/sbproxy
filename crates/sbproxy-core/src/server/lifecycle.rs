@@ -2840,6 +2840,19 @@ pub struct GraceConfig {
     pub grace_time_secs: Option<u64>,
 }
 
+/// Ask the local mesh node to tell peers it is leaving. Invoked from
+/// the shutdown-phase logger so a SIGTERM announces `Left` during the
+/// grace window rather than waiting for `MeshNode` drop.
+fn announce_mesh_leave() {
+    let Some(handle) = crate::cluster::current_cluster_handle() else {
+        return;
+    };
+    let Some(mesh) = handle.mesh_node() else {
+        return;
+    };
+    mesh.leave();
+}
+
 /// Spawn a background thread that subscribes to the Pingora server's
 /// `execution_phase_watch` broadcast and emits structured tracing
 /// events at each transition. WOR-636.
@@ -2856,19 +2869,6 @@ pub struct GraceConfig {
 /// The subscriber must be acquired **before** `Server::run`
 /// consumes the `Server` value; this function is a no-op when called
 /// after that point because the broadcast sender is dropped.
-/// Ask the local mesh node to tell peers it is leaving. Invoked from
-/// the shutdown-phase logger so a SIGTERM announces `Left` during the
-/// grace window rather than waiting for `MeshNode` drop.
-fn announce_mesh_leave() {
-    let Some(handle) = crate::cluster::current_cluster_handle() else {
-        return;
-    };
-    let Some(mesh) = handle.mesh_node() else {
-        return;
-    };
-    mesh.leave();
-}
-
 pub(super) fn spawn_shutdown_phase_logger(
     mut rx: tokio::sync::broadcast::Receiver<pingora_core::server::ExecutionPhase>,
     grace_seconds: u64,
@@ -4725,18 +4725,6 @@ fn proxy_service_startup_error(payload: &(dyn std::any::Any + Send)) -> anyhow::
 #[cfg(test)]
 pub(crate) static OP_REDACT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// WOR-1067 PR2: walk `server.tenants` and install each tenant's
-/// `observability.cardinality.max_series` cap on the global
-/// [`sbproxy_observe::metrics::global_limiter`]. A tenant without an
-/// `observability.cardinality:` block stays on the proxy-wide cap
-/// (today's behaviour); a tenant that declares the block without a
-/// `max_series:` value gets the
-/// `TENANT_CARDINALITY_DEFAULT_MAX_SERIES` (10_000) fallback so an
-/// operator can opt in to per-tenant tracking without picking a
-/// number.
-///
-/// Called once at boot (from `run`) and on every config reload (from
-/// `reload_from_config_path`) so SIGHUP picks up new tenant caps.
 /// Smallest worker stack sbproxy accepts from `SB_WORKER_STACK_BYTES`.
 ///
 /// One 4 KiB page, matching pingora's own floor. It rules out one thing:
@@ -4789,6 +4777,18 @@ pub(crate) fn resolve_worker_stack_bytes(raw: Option<&str>) -> Option<usize> {
     Some(bytes)
 }
 
+/// WOR-1067 PR2: walk `server.tenants` and install each tenant's
+/// `observability.cardinality.max_series` cap on the global
+/// [`sbproxy_observe::metrics::global_limiter`]. A tenant without an
+/// `observability.cardinality:` block stays on the proxy-wide cap
+/// (today's behaviour); a tenant that declares the block without a
+/// `max_series:` value gets the
+/// `TENANT_CARDINALITY_DEFAULT_MAX_SERIES` (10_000) fallback so an
+/// operator can opt in to per-tenant tracking without picking a
+/// number.
+///
+/// Called once at boot (from `run`) and on every config reload (from
+/// `reload_from_config_path`) so SIGHUP picks up new tenant caps.
 fn install_tenant_cardinality_state(server: &sbproxy_config::ProxyServerConfig) {
     use sbproxy_config::TENANT_CARDINALITY_DEFAULT_MAX_SERIES;
     let limiter = sbproxy_observe::metrics::global_limiter();
@@ -7704,15 +7704,12 @@ mod at_rest_posture_tests {
     }
 }
 
-/// WOR-2318: the `request_events:` block, from YAML through to the sink
-/// the boot path would register.
+/// The config blocks only the boot path reads: the agent registry, the
+/// notifications sink, and the request-event sink's kind, each from YAML
+/// through to what `run` would install.
 ///
-/// These exercise [`build_request_event_sink`] rather than
-/// [`install_request_event_sink`] on purpose. The registered sink is a
-/// process-global `OnceLock`, so only one test per binary could ever
-/// observe an install, and `capture_envelope`'s tests already claim it
-/// in this crate. The builder is where every decision is made; the
-/// installer only hands its result to the setter.
+/// Left undocumented for a while because the block above it belonged to
+/// `request_event_sink_tests` and was read as this module's own.
 #[cfg(test)]
 mod boot_only_block_tests {
     use super::*;
@@ -7893,6 +7890,15 @@ mod boot_only_block_tests {
     }
 }
 
+/// WOR-2318: the `request_events:` block, from YAML through to the sink
+/// the boot path would register.
+///
+/// These exercise [`build_request_event_sink`] rather than
+/// [`install_request_event_sink`] on purpose. The registered sink is a
+/// process-global `OnceLock`, so only one test per binary could ever
+/// observe an install, and `capture_envelope`'s tests already claim it
+/// in this crate. The builder is where every decision is made; the
+/// installer only hands its result to the setter.
 #[cfg(test)]
 mod request_event_sink_tests {
     use super::*;

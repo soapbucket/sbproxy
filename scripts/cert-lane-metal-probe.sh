@@ -13,9 +13,15 @@ export PATH="$HOME/.cargo/bin:$PATH"
 
 python3 "$REPO_ROOT/scripts/lib/cert_record.py" --self-test
 
-cargo nextest run --profile ci -p sbproxy-model-host --features gpu-apple \
-  -E 'test(probes_this_apple_machine) | test(live_rss_at_the_planned_envelope_agrees)' \
-  --no-fail-fast
+# Two named tests, so two is the assertion. nextest refuses a filterset
+# that matches nothing and accepts one that matches one of the two, which
+# is the half a renamed test slips through.
+. "$REPO_ROOT/scripts/lib/expect-tests.sh"
+
+expect_tests 2 "Metal probe lane" -- \
+  cargo nextest run --profile ci -p sbproxy-model-host --features gpu-apple \
+    -E 'test(probes_this_apple_machine) | test(live_rss_at_the_planned_envelope_agrees)' \
+    --no-fail-fast
 
 cargo run --example gpu_cert -p sbproxy-model-host --features gpu-apple -- \
   metal-probe

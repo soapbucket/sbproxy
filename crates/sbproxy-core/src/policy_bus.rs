@@ -366,23 +366,6 @@ pub fn try_publish_decision(audit: DecisionAudit) -> Result<(), Box<AuditRecord>
     send_record(AuditRecord::Decision(Box::new(audit)))
 }
 
-/// Build, scrub, publish, and account for one decision audit record.
-///
-/// The single chokepoint every emitting decision event routes through
-/// (WOR-2405), so the four things that must happen together cannot drift
-/// apart: the operator's PII rules are resolved for this request's
-/// scope, the reason is scrubbed by [`DecisionAudit`]'s constructor, the
-/// record is published, and the outcome is counted either as emitted or
-/// as dropped.
-///
-/// `route` is the origin **hostname** the PII scopes are keyed by, which
-/// is not necessarily `origin_id`, the configured identity the audit
-/// record carries. They are equal in today's configs and the two
-/// arguments exist so a future config can separate them without silently
-/// skipping the origin-scoped redactor.
-///
-/// Returns whether the record reached the bus, so a caller that wants to
-/// log the loss can, though the drop is already counted here.
 /// [`emit_decision_audit`] plus structured detail about what the
 /// decision did.
 ///

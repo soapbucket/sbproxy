@@ -3678,9 +3678,6 @@ fn serialized_json_len(value: &serde_json::Value) -> usize {
     }
 }
 
-/// Best-effort extraction of token counts and finish_reason from an
-/// OpenAI-shaped response body. Returns `None`s when the upstream
-/// shape differs.
 /// Longest `finish_reason` a shadow row or log line will carry.
 ///
 /// The value is copied out of a target's response body, and since it
@@ -3692,6 +3689,9 @@ fn serialized_json_len(value: &serde_json::Value) -> usize {
 /// legitimate value, `content_filter`, is 14 bytes.
 const MAX_SHADOW_FINISH_REASON_BYTES: usize = 64;
 
+/// Best-effort extraction of token counts and finish_reason from an
+/// OpenAI-shaped response body. Returns `None`s when the upstream
+/// shape differs.
 fn parse_shadow_metadata(body: &[u8]) -> (Option<u64>, Option<u64>, Option<String>) {
     let v: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,

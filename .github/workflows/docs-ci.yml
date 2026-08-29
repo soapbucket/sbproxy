@@ -107,11 +107,18 @@ jobs:
           fi
           bash scripts/docs-ci.sh
 
+      # The filterset names one test. nextest refuses a filterset that
+      # matches nothing, which `cargo test` does not, but "at least one"
+      # is not the assertion worth having when the selection names
+      # exactly one: count it.
       - name: documentation configs match canonical examples
         run: |
+          set -euo pipefail
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/sync-doc-configs.py --check
-          cargo nextest run -p sbproxy-config --test validate_examples \
-            -E 'test(every_oss_example_compiles)' --locked
+          . scripts/lib/expect-tests.sh
+          expect_tests 1 "every_oss_example_compiles" -- \
+            cargo nextest run -p sbproxy-config --test validate_examples \
+              -E 'test(every_oss_example_compiles)' --locked
 
       - name: generated tapes and GIF wiring are current
         run: make tapes-check

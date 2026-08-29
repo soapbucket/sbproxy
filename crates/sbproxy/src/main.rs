@@ -9849,16 +9849,6 @@ fn handle_authority_init(args: &AuthorityInitArgs) -> anyhow::Result<i32> {
     Ok(0)
 }
 
-/// `sbproxy config authority publish`: validate the payload the way the
-/// authority will, then publish it over the admin API.
-///
-/// The local validation is the same function the server route runs, so a
-/// payload that would be refused is refused here, before a revision number
-/// is spent on it.
-///
-/// Exit codes: 0 published (or validated under `--validate-only`), 1 CLI or
-/// IO error, 3 the payload was refused locally and nothing was sent, 4 the
-/// authority refused it, 7 the authority was unreachable.
 /// Publish a composed document through the config authority's admin
 /// route.
 ///
@@ -10188,6 +10178,16 @@ fn aggregate_summary_json(
     })
 }
 
+/// `sbproxy config authority publish`: validate the payload the way the
+/// authority will, then publish it over the admin API.
+///
+/// The local validation is the same function the server route runs, so a
+/// payload that would be refused is refused here, before a revision number
+/// is spent on it.
+///
+/// Exit codes: 0 published (or validated under `--validate-only`), 1 CLI or
+/// IO error, 3 the payload was refused locally and nothing was sent, 4 the
+/// authority refused it, 7 the authority was unreachable.
 fn handle_authority_publish(args: &AuthorityPublishArgs) -> anyhow::Result<i32> {
     let path = args.config.as_deref().ok_or_else(|| {
         anyhow::anyhow!(

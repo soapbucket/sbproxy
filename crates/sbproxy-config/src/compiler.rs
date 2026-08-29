@@ -1203,13 +1203,6 @@ pub(crate) fn validate_decision_script(
     }
 }
 
-/// Validate `observability.log.custom_fields:` at config-load time.
-///
-/// Each field must declare exactly one value source (`value`, or
-/// `source` + `engine`), have a non-empty unique name, and name a
-/// supported engine. WASM is rejected with a pointer to the reason:
-/// inline `source` is text, and a WASM log field would need a compiled
-/// module path instead.
 /// Validate one origin's `comp:` block (WOR-2673).
 ///
 /// Every refusal here is a catalog an operator would otherwise publish
@@ -1399,6 +1392,13 @@ fn validate_comp_marketplace(
     Ok(())
 }
 
+/// Validate `observability.log.custom_fields:` at config-load time.
+///
+/// Each field must declare exactly one value source (`value`, or
+/// `source` + `engine`), have a non-empty unique name, and name a
+/// supported engine. WASM is rejected with a pointer to the reason:
+/// inline `source` is text, and a WASM log field would need a compiled
+/// module path instead.
 fn validate_custom_log_fields(fields: &[crate::CustomLogFieldConfig]) -> Result<()> {
     let mut seen = std::collections::HashSet::new();
     for field in fields {
@@ -6424,10 +6424,6 @@ origins:
         compile_config(yaml).expect("a known event label with a boolean toggle must compile");
     }
 
-    /// Validating the block is not the same as delivering it. The
-    /// request path reads `CompiledConfig.decision_audit`, so a config
-    /// that parses and validates but never reaches the snapshot is a
-    /// feed the operator configured and no decision point can see.
     #[test]
     fn a_tenant_scope_decision_audit_is_validated_too() {
         // The proxy-scope guard alone would let a tenant write the typo
@@ -6494,6 +6490,10 @@ origins:
         );
     }
 
+    /// Validating the block is not the same as delivering it. The
+    /// request path reads `CompiledConfig.decision_audit`, so a config
+    /// that parses and validates but never reaches the snapshot is a
+    /// feed the operator configured and no decision point can see.
     #[test]
     fn decision_audit_reaches_the_compiled_snapshot() {
         let yaml = r#"
