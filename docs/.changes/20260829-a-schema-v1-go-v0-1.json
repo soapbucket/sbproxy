@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "A schema-v1 (Go v0.1.x) flat `sb.yml` now compiles into a real origin instead of booting an empty proxy. Files that declare `hostname` and `action` at the document root are rewritten in memory to `origins: { <hostname>: { ... } }` before compile, so `sbproxy validate` and boot install the declared hostname."
-}
