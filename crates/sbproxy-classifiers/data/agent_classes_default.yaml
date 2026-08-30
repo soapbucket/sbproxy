@@ -178,3 +178,78 @@ agent_classes:
     robots_compliance_score: 0.10
     aliases: []
     deprecated: false
+
+  # --- Coding agents (WOR-2707) ---
+  #
+  # User-Agent classification only. These are not verified crawlers:
+  # reverse_dns_suffixes and keyids stay empty. Patterns mirror the
+  # ADRF baseline so `agent_budget` can key on the same agents that
+  # walkthrough documents (Cursor/0.42.0 and the CLI prefixes).
+  # Each pattern carries `(?i)` because the loader warns on a
+  # case-sensitive shipped entry.
+
+  - id: anysphere-cursor
+    vendor: Anysphere
+    purpose: assistant
+    contact_url: https://docs.cursor.com/
+    expected_user_agent_pattern: "(?i)\\bcursor[-/]"
+    expected_reverse_dns_suffixes: []
+    expected_keyids: []
+    robots_compliance_score: 0.50
+    aliases: []
+    deprecated: false
+
+  - id: anthropic-claude-code-cli
+    vendor: Anthropic
+    purpose: assistant
+    contact_url: https://docs.anthropic.com/en/docs/claude-code
+    expected_user_agent_pattern: "(?i)^claude-cli/"
+    expected_reverse_dns_suffixes: []
+    expected_keyids: []
+    robots_compliance_score: 0.50
+    aliases: []
+    deprecated: false
+
+  - id: openai-codex-cli
+    vendor: OpenAI
+    purpose: assistant
+    contact_url: https://github.com/openai/codex
+    expected_user_agent_pattern: "(?i)^codex-cli/"
+    expected_reverse_dns_suffixes: []
+    expected_keyids: []
+    robots_compliance_score: 0.50
+    aliases: []
+    deprecated: false
+
+  - id: github-copilot
+    vendor: GitHub
+    purpose: assistant
+    contact_url: https://docs.github.com/en/copilot
+    expected_user_agent_pattern: "(?i)\\bgithub-copilot"
+    expected_reverse_dns_suffixes: []
+    expected_keyids: []
+    robots_compliance_score: 0.50
+    aliases: []
+    deprecated: false
+
+  - id: jetbrains-junie
+    vendor: JetBrains
+    purpose: assistant
+    contact_url: https://www.jetbrains.com/help/junie/
+    expected_user_agent_pattern: "(?i)^Junie/"
+    expected_reverse_dns_suffixes: []
+    expected_keyids: []
+    robots_compliance_score: 0.50
+    aliases: []
+    deprecated: false
+
+  - id: google-gemini-cli
+    vendor: Google
+    purpose: assistant
+    contact_url: https://github.com/google-gemini/gemini-cli
+    expected_user_agent_pattern: "(?i)^gemini-cli/"
+    expected_reverse_dns_suffixes: []
+    expected_keyids: []
+    robots_compliance_score: 0.50
+    aliases: []
+    deprecated: false

@@ -158,4 +158,93 @@ mod tests {
         assert!(registry.advance_clock(std::time::Duration::from_secs(10)));
         assert_eq!(registry.effective("workspace"), (2, Tier::Throttle));
     }
+
+    /// WOR-2711 repro: AutoSuspend / resume write the module's own
+    /// `AuditRow` ring and a raw `tracing::{warn,info}!(target:
+    /// "security_audit")`, but never `SecurityAuditEntry::emit`, the
+    /// only path that reaches `audit_chain::append_security_audit` and
+    /// the shared admin audit ring. Desired: suspend lands on the
+    /// shared security channel. Fails on current code.
+    #[test]
+    fn auto_suspend_reaches_shared_security_audit_ring() {
+        let marker = format!("wor2711-{}", std::process::id());
+        let registry = RateLimitBudgetRegistry::new(&RateLimitsConfig {
+            workspace_default: WorkspaceBudgetConfig {
+                http_rps_sustained: 2,
+                http_rps_burst: 3,
+                soft_threshold_rps: Some(2),
+            },
+            escalation: RateLimitEscalationConfig {
+                abuse_threshold_throttle_to_suspend: 2,
+                auto_suspend_cooldown_secs: 10,
+            },
+            clock: RateLimitClockMode::Manual,
+        });
+
+        for _ in 0..4 {
+            let _ = registry.check(&marker);
+        }
+        let suspended = registry.check(&marker);
+        assert_eq!(suspended.tier, Tier::AutoSuspend);
+        assert!(
+            registry
+                .recent_audit(8)
+                .iter()
+                .any(|row| row.action == "rate_limit_suspend" && row.target_id == marker),
+            "module ring must still record the suspend"
+        );
+
+        let shared =
+            sbproxy_observe::audit_ring::recent_audit_events(64, Some("security"), None, None);
+        assert!(
+            shared
+                .iter()
+                .any(|event| event.kind == "rate_limit_auto_suspend"),
+            "WOR-2711: AutoSuspend never reached SecurityAuditEntry::emit \
+             (shared security audit ring empty for this transition)"
+        );
+    }
+
+    /// WOR-2711: manual resume must take the same `SecurityAuditEntry::emit`
+    /// path as AutoSuspend so chain mode records both transitions.
+    #[test]
+    fn resume_reaches_shared_security_audit_ring() {
+        let marker = format!("wor2711-resume-{}", std::process::id());
+        let registry = RateLimitBudgetRegistry::new(&RateLimitsConfig {
+            workspace_default: WorkspaceBudgetConfig {
+                http_rps_sustained: 2,
+                http_rps_burst: 3,
+                soft_threshold_rps: Some(2),
+            },
+            escalation: RateLimitEscalationConfig {
+                abuse_threshold_throttle_to_suspend: 2,
+                auto_suspend_cooldown_secs: 10,
+            },
+            clock: RateLimitClockMode::Manual,
+        });
+
+        for _ in 0..5 {
+            let _ = registry.check(&marker);
+        }
+        assert!(registry.resume(&marker));
+        assert!(
+            registry
+                .recent_audit(8)
+                .iter()
+                .any(|row| row.action == "rate_limit_resume" && row.target_id == marker),
+            "module ring must still record the resume"
+        );
+
+        let shared = sbproxy_observe::audit_ring::recent_audit_events(
+            64,
+            Some("security"),
+            Some("rate_limit_resume"),
+            None,
+        );
+        assert!(
+            shared.iter().any(|event| event.kind == "rate_limit_resume"),
+            "WOR-2711: resume never reached SecurityAuditEntry::emit \
+             (shared security audit ring empty for this transition)"
+        );
+    }
 }

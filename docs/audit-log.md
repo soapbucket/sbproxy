@@ -1,5 +1,5 @@
 # Audit log
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-30*
 
 SBproxy's audit surface is a set of narrow, structured channels rather than one audit framework. This page documents what actually ships: the admin-action audit rows served at `/api/audit/recent`, the `config_audit` / `security_audit` / `key_audit` / `sbproxy::admin::audit` tracing channels, the tamper-evident chains each of those four can be written to, the `AdminAuditEmitter` plugin seam, and the emission metric. There is no `sbproxy_audit` crate and no envelope middleware.
 
@@ -19,7 +19,7 @@ module-owned state machine in
 | `target_id` | string | The identifier of the targeted entity. |
 | `reason` | string | Human-readable explanation of why the action fired. |
 
-The workspace rate-limit budget's auto-suspend and resume transitions are the emitters today. Each row is mirrored to the structured `security_audit` tracing target for external sinks and retained in an in-memory ring of the most recent 256 rows.
+The workspace rate-limit budget's auto-suspend and resume transitions are the emitters today. Each row is retained in an in-memory ring of the most recent 256 rows and also goes through `SecurityAuditEntry::emit` (`event_type` `rate_limit_auto_suspend` / `rate_limit_resume`) so `audit.sink: chain` records the same transition the admin ring shows.
 
 Query the ring through the admin API:
 

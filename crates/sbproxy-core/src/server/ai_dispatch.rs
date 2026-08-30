@@ -3941,6 +3941,27 @@ fn cascade_credential_lock_providers(error: &anyhow::Error) -> Option<String> {
         .map(|exhausted| exhausted.locked_providers().join(", "))
 }
 
+/// Drop the pre-cascade load-balancer seed so a routing-decisions row
+/// cannot report a `selected_provider` that never dispatched (WOR-2709).
+///
+/// Both cascade `Err` arms call this: the credential-lock arm through
+/// [`record_cascade_credential_lock`], and the generic 502 arm
+/// directly. `ai_provider` is left unset; it is only written on a
+/// served attempt.
+fn clear_unserved_cascade_selection(ctx: &mut crate::context::RequestContext) {
+    ctx.admin_load_balancer_target = None;
+}
+
+/// Stamp the generic cascade connect-error arm (WOR-2709).
+///
+/// Same seed-clear as [`record_cascade_credential_lock`], without the
+/// lock stamps. The production generic `Err` arm must call this; the
+/// zero-attempt test asserts that call site by source so deleting it
+/// fails the test.
+fn record_cascade_connect_failure(ctx: &mut crate::context::RequestContext) {
+    clear_unserved_cascade_selection(ctx);
+}
+
 /// Stamp every operator-facing surface for a cascade that dispatched
 /// no tier because the credential's provider policy excluded all of
 /// them (WOR-2685).
@@ -3962,6 +3983,7 @@ fn record_cascade_credential_lock(
     method: &str,
     ctx: &mut crate::context::RequestContext,
 ) {
+    clear_unserved_cascade_selection(ctx);
     let detail = format!("credential_provider_lock: {locked}");
     ctx.ai_outcome = Some("credential_provider_lock".to_string());
     ctx.record_policy_decision("credential_provider_policy", "deny");
@@ -4020,6 +4042,14 @@ mod cascade_credential_lock_tests {
         allowed_providers: &[String],
     ) -> anyhow::Error {
         let cascade = config.router().cascade_config().cloned().expect("cascade");
+        exhaust_named_cascade(config, &cascade, allowed_providers).await
+    }
+
+    async fn exhaust_named_cascade(
+        config: &sbproxy_ai::AiHandlerConfig,
+        cascade: &sbproxy_ai::routing::CascadeConfig,
+        allowed_providers: &[String],
+    ) -> anyhow::Error {
         let body = serde_json::json!({
             "model": "claude-3-5-sonnet",
             "messages": [{"role": "user", "content": "ping"}]
@@ -4032,7 +4062,7 @@ mod cascade_credential_lock_tests {
         sbproxy_ai::AiClient::new()
             .forward_cascade_with_policy_and_quota_with_reasoning_eligibility(
                 config,
-                &cascade,
+                cascade,
                 allowed_providers,
                 sbproxy_ai::CascadeBlockLists::credential_only(&[]),
                 "/v1/messages",
@@ -4045,6 +4075,16 @@ mod cascade_credential_lock_tests {
             )
             .await
             .expect_err("this cascade cannot dispatch")
+    }
+
+    /// Mirror of the routing-decisions assembly in `proxy_http.rs`:
+    /// `selected_provider` is `ai_provider` or, if that is unset, the
+    /// load-balancer seed. A cascade that never dispatched must leave
+    /// both unset so the row cannot report a provider that never ran.
+    fn routing_decision_selected_provider(ctx: &crate::context::RequestContext) -> Option<&str> {
+        ctx.ai_provider
+            .as_deref()
+            .or(ctx.admin_load_balancer_target.as_deref())
     }
 
     /// WOR-2685: the disposition seam. The cascade `Err` arm treats a
@@ -4094,8 +4134,24 @@ mod cascade_credential_lock_tests {
         ctx.tenant_id = "cascade-lock-test-tenant".into();
         ctx.request_id = "cascade-lock-test-rid".into();
         ctx.ai_route_reason = Some("price_ceiling: 0.02".to_string());
+        // WOR-2709: dispatch seeds this to the credential's pin before
+        // the cascade runs. A lock that never dispatched must not leave
+        // that seed in place for the routing-decisions row.
+        ctx.admin_load_balancer_target = Some("openai".to_string());
 
         record_cascade_credential_lock("anthropic", "POST", &mut ctx);
+
+        assert!(
+            ctx.admin_load_balancer_target.is_none(),
+            "a lock that dispatched nothing must clear the pre-cascade seed, or \
+             selected_provider reports a provider that never ran: {:?}",
+            ctx.admin_load_balancer_target
+        );
+        assert!(
+            ctx.ai_provider.is_none(),
+            "ai_provider stays unset on a zero-attempt refusal so the row cannot \
+             fall back to a served name that does not exist"
+        );
 
         assert_eq!(
             ctx.ai_outcome.as_deref(),
@@ -4140,6 +4196,73 @@ mod cascade_credential_lock_tests {
              `events:` sink as policy_denied"
         );
     }
+
+    /// WOR-2709: when a cascade Err is recorded with attempts 0, the
+    /// fields `proxy_http.rs` assembles into `selected_provider` must
+    /// both be unset. The seed used to survive both Err arms, so a
+    /// row read `candidates=[anthropic], attempts=0, selected_provider=openai`.
+    #[test]
+    fn a_zero_attempt_cascade_error_clears_selected_provider() {
+        let mut ctx = crate::context::RequestContext::new();
+        ctx.admin_load_balancer_target = Some("openai".to_string());
+        ctx.ai_provider = None;
+        ctx.admin_ai_attempts = 0;
+
+        record_cascade_credential_lock("anthropic", "POST", &mut ctx);
+
+        assert_eq!(
+            routing_decision_selected_provider(&ctx),
+            None,
+            "attempts=0 must not report a provider that never served"
+        );
+        assert_eq!(ctx.admin_ai_attempts, 0);
+
+        // The generic 502 arm calls the same helper without the lock
+        // stamps. Re-seed and prove that path clears the row too.
+        ctx.admin_load_balancer_target = Some("openai".to_string());
+        record_cascade_connect_failure(&mut ctx);
+        assert_eq!(
+            routing_decision_selected_provider(&ctx),
+            None,
+            "the generic Err arm must clear the seed as well"
+        );
+        let src = include_str!("ai_dispatch.rs");
+        let marker = concat!(
+            "Streaming never reaches these arms (`",
+            "cascade_owns_dispatch`"
+        );
+        let arm = src.find(marker).expect("generic cascade 502 arm");
+        assert!(
+            src[arm..arm.saturating_add(400)].contains("record_cascade_connect_failure(ctx);"),
+            "the generic cascade 502 arm must call record_cascade_connect_failure before ConnectError"
+        );
+    }
+
+    /// WOR-2709 open question: a routing-policy plan is a
+    /// [`sbproxy_ai::route_event::RoutePlan`] lowered onto the same
+    /// cascade executor, not a second path. A single-tier plan whose
+    /// provider the credential's pin excludes must still classify as
+    /// a credential lock, so the lock Err arm (not only the generic
+    /// 502 arm) is the one that stamps the refusal.
+    #[tokio::test]
+    async fn a_plan_derived_single_tier_cascade_locked_by_the_credential_is_a_refusal() {
+        let config = locked_cascade_config(true);
+        // RoutePlan is non_exhaustive; from_route_to then overwrite the
+        // candidate the way a routing-policy plan names a provider.
+        let mut plan = sbproxy_ai::route_event::RoutePlan::from_route_to("claude-3-5-sonnet");
+        plan.candidates[0].provider_id = "anthropic".to_string();
+        plan.candidates[0].quality_threshold = Some(0.5);
+        let cascade = plan.to_cascade_config(None);
+
+        let error = exhaust_named_cascade(&config, &cascade, &["openai".to_string()]).await;
+
+        assert_eq!(
+            cascade_credential_lock_providers(&error).as_deref(),
+            Some("anthropic"),
+            "a plan-derived single-tier cascade whose provider is not in \
+             allowed_providers must take the credential_lock arm: {error}"
+        );
+    }
 }
 
 /// WOR-2557: the typed fail-closed refusal for a candidate set the
@@ -4166,6 +4289,7 @@ fn posture_refusal_body(
     }
     let request_id = ctx.request_id.to_string();
     record_posture_refusal(constraint, posture_excluded, method, ctx);
+    clear_unserved_cascade_selection(ctx);
     Some(
         ErrorEnvelope::new(
             "no_posture_eligible_provider",
@@ -4225,6 +4349,7 @@ mod posture_refusal_tests {
         let mut ctx = crate::context::RequestContext::new();
         ctx.tenant_id = "posture-refusal-test-tenant".into();
         ctx.request_id = "posture-refusal-test-rid".into();
+        ctx.admin_load_balancer_target = Some("openai".to_string());
         let excluded = vec!["mistral".to_string(), "groq".to_string()];
         let before = refused_count("require_zdr", "posture-refusal-test-tenant");
 
@@ -4273,6 +4398,10 @@ mod posture_refusal_tests {
                 .any(|event| event.request_id.as_deref() == Some("posture-refusal-test-rid")),
             "the refusal must land on the security-audit channel, which is what \
              reaches an `events:` sink as policy_denied"
+        );
+        assert_eq!(
+            ctx.admin_load_balancer_target, None,
+            "a cascade posture refusal never dispatched, so selected_provider must not keep the pre-cascade seed"
         );
     }
 
@@ -6052,6 +6181,7 @@ async fn refuse_over_price_ceiling(
     method: &str,
 ) -> Result<()> {
     sbproxy_ai::ai_metrics::record_price_ceiling("refused");
+    clear_unserved_cascade_selection(ctx);
     // A bare 402 classifies as `budget_exceeded` on
     // `sbproxy_ai_requests_attributed_total{outcome}`, which is the
     // label an exhausted tenant budget already owns. Stamping the
@@ -12579,6 +12709,7 @@ pub(super) async fn handle_ai_proxy(
                         if let QuotaPoolErrorDisposition::Reject { status, message } =
                             sbproxy_ai::quota_pool::pool_error_disposition(Some(pool), error)
                         {
+                            clear_unserved_cascade_selection(ctx);
                             send_error(session, status, message).await?;
                             return Ok(());
                         }
@@ -12609,6 +12740,11 @@ pub(super) async fn handle_ai_proxy(
                         error = %e,
                         "AI proxy: cascade dispatch failed; returning 502"
                     );
+                    // WOR-2709: the generic arm must clear the seed too.
+                    // Streaming never reaches these arms (`cascade_owns_dispatch`
+                    // is false when `is_stream`), so this bug does not exist
+                    // on that path.
+                    record_cascade_connect_failure(ctx);
                     return Err(Error::because(
                         ErrorType::ConnectError,
                         "AI cascade failed",

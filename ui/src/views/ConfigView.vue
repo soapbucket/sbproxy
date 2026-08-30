@@ -174,6 +174,13 @@ async function loadConfig() {
 
 async function saveConfig() {
   if (saveBusy.value || editorLocked.value || !editorText.value.trim()) return;
+  if (editorText.value.includes("[REDACTED]")) {
+    saveBanner.value = {
+      tone: "err",
+      text: "Replace every [REDACTED] secret before saving. The editor loaded a redacted copy; submitting those markers would corrupt or reject the file.",
+    };
+    return;
+  }
   saveBusy.value = true;
   saveBanner.value = null;
   try {
