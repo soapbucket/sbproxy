@@ -1820,6 +1820,7 @@ export type ModelHostAuthority =
 export type PullPolicy = "on_boot" | "on_demand" | "manual";
 export type EngineChoice = "auto" | EngineKind;
 export type RolloutPolicy = "rolling" | "recreate";
+export type ColdStartPolicy = "wait" | "reject" | "fallback";
 
 export interface ModelDeployment {
   model: string;
@@ -1836,6 +1837,7 @@ export interface ModelDeployment {
   queue_timeout_ms: number;
   engine: EngineChoice;
   rollout: RolloutPolicy;
+  cold_start: ColdStartPolicy;
 }
 
 export interface ModelDeploymentRequest {
@@ -1853,6 +1855,7 @@ export interface ModelDeploymentRequest {
   queue_timeout_ms?: number;
   engine?: EngineChoice;
   rollout?: RolloutPolicy;
+  cold_start?: ColdStartPolicy;
 }
 
 export interface DeploymentDocument {

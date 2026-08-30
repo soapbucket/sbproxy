@@ -1970,9 +1970,38 @@ pub fn parse_source_head(inline_text: &str) -> Result<Option<ConfigSource>, Conf
         #[serde(default)]
         source: Option<ConfigSource>,
     }
-    let head: Option<SourceHead> = serde_yaml::from_str(inline_text)
-        .map_err(|e| ConfigSourceError::Invalid(format!("failed to parse `source:` block: {e}")))?;
-    Ok(match head.and_then(|head| head.source) {
+    // Parse the document as YAML first so a syntax error anywhere is
+    // reported as a document problem, not as a malformed `source:`
+    // block the file may not even contain (WOR-2710). Only deserialize
+    // the `source:` subtree when that key is present.
+    let value: serde_yaml::Value = match serde_yaml::from_str(inline_text) {
+        Ok(value) => value,
+        Err(e) => {
+            if inline_text.trim().is_empty() {
+                return Ok(None);
+            }
+            return Err(ConfigSourceError::Invalid(format!(
+                "failed to parse config: {e}"
+            )));
+        }
+    };
+    if matches!(value, serde_yaml::Value::Null) {
+        return Ok(None);
+    }
+    let Some(mapping) = value.as_mapping() else {
+        return Err(ConfigSourceError::Invalid(
+            "config root must be a mapping".to_string(),
+        ));
+    };
+    let Some(source_value) = mapping.get(serde_yaml::Value::String("source".to_string())) else {
+        return Ok(None);
+    };
+    let head = SourceHead {
+        source: serde_yaml::from_value(source_value.clone()).map_err(|e| {
+            ConfigSourceError::Invalid(format!("failed to parse `source:` block: {e}"))
+        })?,
+    };
+    Ok(match head.source {
         None | Some(ConfigSource::Local) => None,
         Some(source) => Some(source),
     })
@@ -3110,6 +3139,41 @@ mod tests {
         .expect("git source present");
         assert!(matches!(parsed, ConfigSource::Git { .. }));
         assert!(parse_source_head("source:\n  kind: nope\n").is_err());
+    }
+
+    /// WOR-2710 repro: any whole-document YAML syntax error is wrapped as
+    /// a `source:` block failure even when the document has no `source:`
+    /// key. Desired: the message names the real parse problem, not a
+    /// feature the file never uses. Fails on current code.
+    #[test]
+    fn parse_source_head_does_not_blame_source_for_unrelated_yaml_syntax_error() {
+        let yaml = "proxy:\n  http_bind_port: 8080\nclient_secret: [REDACTED\n";
+        assert!(!yaml.contains("source:"), "fixture must be source-free");
+        let err = parse_source_head(yaml).expect_err("unclosed flow sequence is invalid YAML");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("failed to parse `source:` block"),
+            "WOR-2710: syntax error mislabeled as source: block: {msg}"
+        );
+    }
+
+    /// WOR-2710 companion: unquoted `[REDACTED]` (the mask GET /admin/config
+    /// writes for keyed secrets) is valid YAML as a one-element flow
+    /// sequence, so parse_source_head accepts a source-free redacted
+    /// document. The type mismatch surfaces later; the mislabel bug is
+    /// only for syntax failures.
+    #[test]
+    fn unquoted_redacted_marker_parses_as_yaml_flow_sequence() {
+        let yaml = "proxy:\n  http_bind_port: 8080\nclient_secret: [REDACTED]\n";
+        assert!(parse_source_head(yaml)
+            .expect("redacted source-free doc still parses")
+            .is_none());
+        let value: serde_yaml::Value =
+            serde_yaml::from_str(yaml).expect("serde_yaml accepts the marker");
+        assert!(
+            value["client_secret"].is_sequence(),
+            "unquoted [REDACTED] is a flow sequence, not a string"
+        );
     }
 
     #[test]

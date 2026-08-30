@@ -222,8 +222,10 @@ fn now_rfc3339() -> String {
 pub struct SecurityAuditEntry {
     /// RFC 3339 timestamp.
     pub timestamp: String,
-    /// Event class. Today: `"framing_violation"`. New classes
-    /// extend this enum-as-string surface.
+    /// Event class. Request refusals use `"framing_violation"` and the
+    /// policy / auth labels. Workspace budget transitions use
+    /// `"rate_limit_auto_suspend"` and `"rate_limit_resume"` (WOR-2711).
+    /// New classes extend this enum-as-string surface.
     pub event_type: String,
     /// Stable machine-readable reason. For framing violations this
     /// is one of `dual_cl_te`, `duplicate_cl`, `malformed_te`,
@@ -263,6 +265,18 @@ pub struct SecurityAuditEntry {
     /// a denial names the key that was denied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_id: Option<String>,
+    /// Kind of non-request entity this event targeted, when the event is
+    /// a state-machine transition rather than a refused HTTP request.
+    /// `"workspace"` for rate-limit budget AutoSuspend / resume
+    /// (WOR-2711). Omitted on request-shaped records so existing chained
+    /// entries stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_kind: Option<String>,
+    /// Identifier of the targeted entity, when [`Self::target_kind`] is
+    /// set. The workspace name for rate-limit budget transitions
+    /// (WOR-2711). Secret-free: a workspace id, never a credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<String>,
 }
 
 impl SecurityAuditEntry {
@@ -289,6 +303,8 @@ impl SecurityAuditEntry {
             key_provider: None,
             key_mode: None,
             api_key_id: None,
+            target_kind: None,
+            target_id: None,
         }
     }
 
@@ -327,6 +343,8 @@ impl SecurityAuditEntry {
             key_provider: None,
             key_mode: None,
             api_key_id: None,
+            target_kind: None,
+            target_id: None,
         }
     }
 
@@ -357,6 +375,46 @@ impl SecurityAuditEntry {
             key_provider: None,
             key_mode: None,
             api_key_id: None,
+            target_kind: None,
+            target_id: None,
+        }
+    }
+
+    /// Build a workspace rate-limit budget transition (WOR-2711).
+    ///
+    /// `event_type` is `"rate_limit_auto_suspend"` or `"rate_limit_resume"`.
+    /// `target_id` is the workspace the budget keyed on. Request-shaped
+    /// fields stay empty: this is a state-machine transition, not a
+    /// refused HTTP request. Status is 429 on AutoSuspend and 200 on
+    /// resume. `tenant_id` repeats the workspace so existing SIEM
+    /// partitions still see it.
+    pub fn rate_limit_budget_transition(
+        event_type: impl Into<String>,
+        reason: impl Into<String>,
+        target_id: impl Into<String>,
+    ) -> Self {
+        let event_type = event_type.into();
+        let target_id = target_id.into();
+        let status_code = if event_type == "rate_limit_resume" {
+            200
+        } else {
+            429
+        };
+        Self {
+            timestamp: now_rfc3339(),
+            event_type,
+            reason: reason.into(),
+            hostname: None,
+            client_ip: None,
+            request_id: None,
+            method: None,
+            status_code,
+            tenant_id: Some(target_id.clone()),
+            key_provider: None,
+            key_mode: None,
+            api_key_id: None,
+            target_kind: Some("workspace".to_string()),
+            target_id: Some(target_id),
         }
     }
 
@@ -1423,6 +1481,101 @@ mod tests {
         assert!(v.get("method").is_none());
     }
 
+    /// WOR-2711: adding optional workspace target fields must not rewrite
+    /// existing chained framing_violation records. `skip_serializing_if`
+    /// keeps those keys out when they are unset.
+    #[test]
+    fn framing_violation_json_omits_target_kind_and_target_id() {
+        let entry = SecurityAuditEntry::framing_violation("duplicate_cl", None, None, None, None);
+        let json = serde_json::to_string(&entry).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            v.get("target_kind").is_none(),
+            "vanilla framing_violation must not grow target_kind: {json}"
+        );
+        assert!(
+            v.get("target_id").is_none(),
+            "vanilla framing_violation must not grow target_id: {json}"
+        );
+    }
+
+    /// WOR-2711: AutoSuspend and resume are workspace transitions, not
+    /// request refusals. The constructor fills the new target fields and
+    /// leaves the request-shaped ones empty.
+    #[test]
+    fn rate_limit_budget_transition_names_the_workspace_not_a_request() {
+        let suspend = SecurityAuditEntry::rate_limit_budget_transition(
+            "rate_limit_auto_suspend",
+            "auto_suspend_threshold_exceeded: 2 consecutive throttles >= 2",
+            "acme-ws",
+        );
+        assert_eq!(suspend.event_type, "rate_limit_auto_suspend");
+        assert_eq!(
+            suspend.reason,
+            "auto_suspend_threshold_exceeded: 2 consecutive throttles >= 2"
+        );
+        assert_eq!(suspend.status_code, 429);
+        assert_eq!(suspend.hostname, None);
+        assert_eq!(suspend.client_ip, None);
+        assert_eq!(suspend.request_id, None);
+        assert_eq!(suspend.method, None);
+        assert_eq!(suspend.target_kind.as_deref(), Some("workspace"));
+        assert_eq!(suspend.target_id.as_deref(), Some("acme-ws"));
+
+        let json = serde_json::to_string(&suspend).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["target_kind"], "workspace");
+        assert_eq!(v["target_id"], "acme-ws");
+
+        let resume = SecurityAuditEntry::rate_limit_budget_transition(
+            "rate_limit_resume",
+            "manual resume via admin",
+            "acme-ws",
+        );
+        assert_eq!(resume.event_type, "rate_limit_resume");
+        assert_eq!(resume.reason, "manual resume via admin");
+        assert_eq!(resume.status_code, 200);
+        assert_eq!(resume.target_kind.as_deref(), Some("workspace"));
+        assert_eq!(resume.target_id.as_deref(), Some("acme-ws"));
+    }
+
+    /// WOR-2711: `SecurityAuditEntry::emit` is the only path that reaches
+    /// `append_security_audit`. A transition built by the constructor
+    /// must land on an installed security chain.
+    #[test]
+    fn rate_limit_budget_transition_emit_reaches_an_installed_security_chain() {
+        let path =
+            std::env::temp_dir().join(format!("sb-audit-rlb-emit-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let seed = "ab".repeat(32);
+        let chain = crate::audit_chain::SecurityAuditChain::open(&path, &seed, "rlb-emit-test")
+            .expect("chain opens");
+        if crate::audit_chain::install_security_audit_chain(chain).is_err() {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+
+        let entry = SecurityAuditEntry::rate_limit_budget_transition(
+            "rate_limit_auto_suspend",
+            "auto_suspend_threshold_exceeded: 2 consecutive throttles >= 2",
+            "ws-chain",
+        );
+        let emitted = serde_json::to_string(&entry).expect("entry serializes");
+        entry.emit();
+
+        let content = std::fs::read_to_string(&path).expect("chain is readable");
+        assert!(
+            content.contains(&emitted),
+            "emit() reached the chain: {content}"
+        );
+        assert!(
+            content.contains("rate_limit_auto_suspend"),
+            "event_type reached the chain: {content}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn security_audit_records_native_key_context_without_secret_material() {
         let entry = SecurityAuditEntry::auth_failure(
@@ -1653,6 +1806,9 @@ mod tests {
             // refusals on a rule, so both belong on `policy_denied`.
             "body_threat_protection",
             "api_deprecation",
+            // WOR-2711: workspace budget transitions share this feed.
+            "rate_limit_auto_suspend",
+            "rate_limit_resume",
         ] {
             let entry = SecurityAuditEntry::policy_violation(
                 policy, "blocked", 403, None, None, None, None,

@@ -1,9 +1,13 @@
 <script setup lang="ts">
 import { nextTick, onMounted, onUnmounted, ref, useId } from "vue";
 import { focusTargetForTab } from "../lib/dialog-focus";
+import { createScrimDismiss } from "../lib/dialog-scrim";
 
 const props = defineProps<{ title: string; wide?: boolean }>();
 const emit = defineEmits<{ (e: "close"): void }>();
+const { onScrimMouseDown, onScrimClick } = createScrimDismiss(() => {
+  emit("close");
+});
 const dialog = ref<HTMLElement | null>(null);
 const titleId = useId();
 let previouslyFocused: HTMLElement | null = null;
@@ -67,7 +71,7 @@ void props;
 </script>
 
 <template>
-  <div class="scrim" @click.self="$emit('close')">
+  <div class="scrim" @mousedown="onScrimMouseDown" @click="onScrimClick">
     <div
       ref="dialog"
       class="dialog"

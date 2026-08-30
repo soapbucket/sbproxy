@@ -382,16 +382,15 @@ impl RateLimitBudgetRegistry {
                 self.abuse_threshold, self.abuse_threshold
             ),
         };
-        // Mirror to the structured security_audit target for external
-        // sinks, then retain in the in-memory ring for /api/audit/recent.
-        tracing::warn!(
-            target: "security_audit",
-            action = %row.action,
-            target_kind = %row.target_kind,
-            target_id = %row.target_id,
-            reason = %row.reason,
-            "rate-limit auto-suspend"
-        );
+        // WOR-2711: SecurityAuditEntry::emit is the only path that
+        // reaches audit.sink: chain. Keep the local ring for
+        // /api/audit/recent.
+        sbproxy_observe::SecurityAuditEntry::rate_limit_budget_transition(
+            "rate_limit_auto_suspend",
+            row.reason.clone(),
+            workspace,
+        )
+        .emit();
         let mut ring = self.audit.lock();
         if ring.len() == AUDIT_RING_CAP {
             ring.pop_front();
@@ -479,14 +478,14 @@ impl RateLimitBudgetRegistry {
                 target_id: workspace.to_string(),
                 reason: "manual resume via admin".to_string(),
             };
-            tracing::info!(
-                target: "security_audit",
-                action = %row.action,
-                target_kind = %row.target_kind,
-                target_id = %row.target_id,
-                reason = %row.reason,
-                "rate-limit manual resume"
-            );
+            // WOR-2711: same emit path as AutoSuspend so chain mode
+            // records the resume too.
+            sbproxy_observe::SecurityAuditEntry::rate_limit_budget_transition(
+                "rate_limit_resume",
+                row.reason.clone(),
+                workspace,
+            )
+            .emit();
             let mut ring = self.audit.lock();
             if ring.len() == AUDIT_RING_CAP {
                 ring.pop_front();

@@ -36,4 +36,9 @@ describe("ConfigView config history panel", () => {
     // selected, which is exactly the state a failed detail row is in.
     expect(configView).toContain('@retry="loadHistoryDetail(entry)"');
   });
+
+  it("refuses to submit a buffer that still contains a redaction marker", () => {
+    expect(configView).toContain('editorText.value.includes("[REDACTED]")');
+    expect(configView).toContain("Replace every [REDACTED] secret before saving");
+  });
 });

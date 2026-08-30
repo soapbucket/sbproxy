@@ -1,6 +1,6 @@
 # Migrating from v0.1.x (Go) to v1.0 (Rust)
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-29*
 
 SBproxy v1.0 replaces the Go implementation with a Rust rewrite built on Cloudflare's Pingora. This document covers what changes for operators upgrading from a v0.1.x Go binary to a v1.0 Rust binary.
 
@@ -45,7 +45,7 @@ These are additive and do not require config changes:
 
 ### Renamed
 
-- No `sb.yml` field renames between the v0.1.x Go config schema and the v1.0 Rust config schema. (The internal config schema is also referred to as `schema-v1`; that label has not changed.) The compatibility promise is pinned by the `v1_compat::v1_fixtures_compile_unmodified` test in `crates/sbproxy-config/`. If a real-world v0.1.x config fails to compile under v1.0, that is a bug; file an issue tagged `migration`.
+- No `sb.yml` field renames between the v0.1.x Go config schema and the v1.0 Rust config schema. (The internal config schema is also referred to as `schema-v1`; that label has not changed.) A flat Go-era file (`hostname` and `action` at the document root, no `origins:` map) is rewritten in memory into `origins: { <hostname>: { ... } }` before compile, so `sbproxy validate` and boot actually install that origin. The compatibility promise is pinned by the `v1_compat::v1_fixtures_compile_unmodified` test in `crates/sbproxy-config/`. If a real-world v0.1.x config fails to compile under v1.0, that is a bug; file an issue tagged `migration`.
 
 ### Default changes
 

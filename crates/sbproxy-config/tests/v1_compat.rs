@@ -5,7 +5,8 @@
 //! The source fixtures came from
 //! <https://github.com/soapbucket/sbproxy-go/tree/v0.1.2/tests/config-compat>.
 //! Every fixture in `tests/v1-compat-fixtures/` must compile against the
-//! current schema.
+//! current schema **and** produce at least one origin for the hostname
+//! the file declares. Compiling to an empty proxy is not compatibility.
 //!
 //! When a v1-style field is intentionally removed, this test fails
 //! and the breaking change has to be called out in MIGRATION.md
@@ -51,8 +52,31 @@ fn v1_fixtures_compile_unmodified() {
         if yaml.is_empty() {
             continue;
         }
-        if let Err(e) = sbproxy_config::compile_config(&yaml) {
-            failures.push(format!("{}: compile_config: {}", file.display(), e));
+        match sbproxy_config::compile_config(&yaml) {
+            Err(e) => {
+                failures.push(format!("{}: compile_config: {}", file.display(), e));
+            }
+            Ok(compiled) => {
+                if compiled.origins.is_empty() {
+                    failures.push(format!(
+                        "{}: compiled with zero origins (schema-v1 flat file was dropped)",
+                        file.display()
+                    ));
+                    continue;
+                }
+                if let Some(hostname) = yaml_hostname(&yaml) {
+                    let present = compiled
+                        .host_map
+                        .keys()
+                        .any(|host| host.as_str() == hostname);
+                    if !present {
+                        failures.push(format!(
+                            "{}: compiled origins do not include hostname `{hostname}`",
+                            file.display()
+                        ));
+                    }
+                }
+            }
         }
     }
     if !failures.is_empty() {
@@ -63,4 +87,17 @@ fn v1_fixtures_compile_unmodified() {
             failures.join("\n  ")
         );
     }
+}
+
+fn yaml_hostname(yaml: &str) -> Option<&str> {
+    for line in yaml.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("hostname:") {
+            let value = rest.trim().trim_matches('"').trim_matches('\'');
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    None
 }
