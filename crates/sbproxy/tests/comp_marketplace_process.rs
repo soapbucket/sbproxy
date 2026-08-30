@@ -389,8 +389,7 @@ fn serves_public_plane(port: u16) -> bool {
     request(port, "GET", "/", None).is_ok_and(|raw| raw.starts_with(b"HTTP/1.1"))
 }
 
-/// True once the admin listener answers `/admin/licensing` with the
-/// bridge this config declares.
+/// True once the admin listener answers `/admin/licensing` at all.
 ///
 /// This is the check the old readiness loop did not have, and its
 /// absence is the whole flake. The two listeners come up independently:
@@ -403,23 +402,45 @@ fn serves_public_plane(port: u16) -> bool {
 /// always surfaced there, and why a nextest retry did not absorb it:
 /// the retry runs on the same loaded machine and loses the same race.
 ///
-/// The route step 8 needs, and its populated answer rather than any
-/// answer. `status()` reads the process-global pipeline and returns 200
-/// either way, so "the socket accepted" and "the bridge is published"
-/// are different facts and only the second is what step 8 asserts. The
-/// pipeline is published before either listener binds, so in a healthy
-/// boot this is true the first time the listener answers and costs one
-/// request against the admin rate limit.
-fn serves_admin_plane(port: u16) -> bool {
-    let Ok(raw) = admin_get(port, "/admin/licensing") else {
-        return false;
-    };
-    let (head, body) = split(&raw);
-    if !head.starts_with("HTTP/1.1 200") {
-        return false;
+/// The status line and nothing else. An earlier version of this also
+/// required `enabled: true` from the parsed body, which is exactly what
+/// step 8 asserts, and that made step 8's assertions unreachable: any
+/// state where they would fail is a state where this never returns
+/// true, so a bridge reporting `enabled: false` came out as a 45 second
+/// "did not serve" with neither the status nor the body in the message,
+/// instead of `enabled was false`. Waiting on the answer is also a
+/// retry wrapped around an assertion, spelled as readiness.
+///
+/// A 200 is the whole of what readiness needs here, because the defect
+/// this closes is a refused connection. The route's own contents are
+/// step 8's to judge, once.
+fn serves_admin_plane(port: u16) -> AdminProbe {
+    match admin_get(port, "/admin/licensing") {
+        Ok(raw) if raw.starts_with(b"HTTP/1.1 200") => AdminProbe::Serving,
+        Ok(_) => AdminProbe::Answered,
+        Err(_) => AdminProbe::Unreachable,
     }
-    serde_json::from_str::<serde_json::Value>(&body)
-        .is_ok_and(|admin| admin["enabled"] == serde_json::Value::Bool(true))
+}
+
+/// What one probe of the admin plane cost and learned.
+///
+/// Split three ways because only one of the three spends anything. The
+/// admin rate limiter is always on and defaults to 240 requests per
+/// minute per IP, and `/admin/licensing` is not on its exemption list,
+/// which covers only static console assets. A probe that is refused at
+/// connect never reaches the limiter, so polling a port that is not yet
+/// bound is free and can stay fast. A probe that gets an answer has
+/// spent one, so a plane that answers something other than 200 has to
+/// be asked slowly or the readiness loop exhausts in twelve seconds the
+/// budget it is waiting on, and every later probe gets a 429 it can
+/// never recover from.
+enum AdminProbe {
+    /// A 200. Readiness is satisfied.
+    Serving,
+    /// An answer, but not a 200. Cost one request against the limiter.
+    Answered,
+    /// Refused, reset, or timed out. Cost nothing.
+    Unreachable,
 }
 
 /// Boot the shipped binary on a fresh pair of loopback ports and wait
@@ -581,13 +602,26 @@ fn wait_until_serving(
         if child.try_wait().expect("poll sbproxy").is_some() {
             return Startup::Exited;
         }
-        if serves_public_plane(port) && serves_admin_plane(admin_port) {
-            return Startup::Serving;
+        let mut answered_without_serving = false;
+        if serves_public_plane(port) {
+            match serves_admin_plane(admin_port) {
+                AdminProbe::Serving => return Startup::Serving,
+                AdminProbe::Answered => answered_without_serving = true,
+                AdminProbe::Unreachable => {}
+            }
         }
         if Instant::now() >= deadline {
             return Startup::TimedOut;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        // A probe that was answered spent one of the 240 the admin
+        // limiter allows per minute, so it is asked once a second rather
+        // than twenty times. A refused one spent nothing and keeps the
+        // fast cadence, which is the case this loop exists for.
+        std::thread::sleep(if answered_without_serving {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_millis(50)
+        });
     }
 }
 
