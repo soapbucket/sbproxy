@@ -630,7 +630,19 @@ mod tests {
                 let mut payload = vec![0u8; length];
                 let _ = reader.read_exact(&mut payload);
                 let _ = tx.send(request_line.trim().to_string());
-                let reason = if status == 200 { "OK" } else { "Forbidden" };
+                // Only the statuses this file scripts. An unmapped one
+                // is named rather than silently answered "Forbidden",
+                // which would make the first 500 or 429 anybody scripts
+                // read as a revoked grant.
+                let reason = match status {
+                    200 => "OK",
+                    401 => "Unauthorized",
+                    403 => "Forbidden",
+                    404 => "Not Found",
+                    429 => "Too Many Requests",
+                    500 => "Internal Server Error",
+                    other => panic!("scripted_vault has no reason phrase for status {other}"),
+                };
                 let response = format!(
                     "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),

@@ -370,6 +370,15 @@ const NOTE_TRUNCATED_MARKER: &str = "... [truncated]";
 #[derive(Default)]
 struct Registry {
     grants: parking_lot::Mutex<Vec<Grant>>,
+    /// Whether the "registry is full" refusal has already been recorded.
+    ///
+    /// The refusal is repeatable by an authenticated admin and its record
+    /// is a keyed-HMAC append to the audit chain on disk, so recording
+    /// every attempt turns a refused request into an unbounded write. The
+    /// finding is that the registry filled, not that this request arrived.
+    /// Cleared when a listing evicts a terminal grant and the registry
+    /// drops back under the ceiling, so a second episode records again.
+    registry_full_recorded: std::sync::atomic::AtomicBool,
 }
 
 fn registry() -> &'static Registry {
@@ -479,8 +488,27 @@ pub(crate) fn request(
                     GrantState::Reviewed | GrantState::Denied
                 )
             });
+            if grants.len() < MAX_TRACKED_GRANTS {
+                registry()
+                    .registry_full_recorded
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+            }
             if grants.len() >= MAX_TRACKED_GRANTS {
                 drop(grants);
+                // Once, not once per attempt. The refusal is repeatable by
+                // an authenticated admin and each record is a keyed-HMAC
+                // append to the audit chain on disk, so recording every
+                // one turns a refusal into an unbounded write loop. The
+                // finding is that the registry filled, which is a fact
+                // about the registry rather than about this request; the
+                // latch resets when a listing evicts a terminal grant and
+                // the registry drops back under the ceiling.
+                if registry()
+                    .registry_full_recorded
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(BreakGlassError::RegistryFull(MAX_TRACKED_GRANTS));
+                }
                 // The one refusal whose own error text says "a registry
                 // this full is itself the finding", which is worth
                 // nothing if the finding reaches no record. The others
@@ -666,20 +694,19 @@ pub(crate) fn review(id: &str, reviewer: &str, note: &str) -> Result<Grant, Brea
     });
     let snapshot = grant.clone();
     drop(grants);
-    sbproxy_observe::metrics::record_break_glass("reviewed");
-    audit_with_note(
-        &snapshot,
-        "break_glass_review",
-        if roster_was_empty {
-            // A distinct outcome rather than a flag inside the context
-            // string, so a SIEM rule can select these without parsing
-            // free text. It says the roster was gone when this closed.
-            "reviewed_without_roster"
-        } else {
-            "reviewed"
-        },
-        note,
-    );
+    // A distinct outcome rather than a flag inside the context string, so
+    // a SIEM rule can select these without parsing free text, and the same
+    // value on the counter so the two agree. Recording `reviewed`
+    // unconditionally here while four operator-facing surfaces, one of
+    // them `docs/metrics-stability.md`, advertised the second value made
+    // the label a promise nothing kept.
+    let outcome = if roster_was_empty {
+        "reviewed_without_roster"
+    } else {
+        "reviewed"
+    };
+    sbproxy_observe::metrics::record_break_glass(outcome);
+    audit_with_note(&snapshot, "break_glass_review", outcome, note);
     refresh_gauges();
     Ok(snapshot)
 }
@@ -710,6 +737,18 @@ pub(crate) fn tag_action(actor: &str) -> Option<String> {
 /// Every grant, newest first, as JSON views.
 pub(crate) fn list(now: DateTime<Utc>) -> serde_json::Value {
     let Some(cfg) = config() else {
+        // Publish before returning, not after: this early return is the
+        // only path that runs when the block is gone, and `refresh_gauges`
+        // reads `config()` itself, so leaving the call below the return
+        // made its zero-publish arm unreachable from every caller.
+        //
+        // Without this, removing `key_management` from the config left
+        // `sbproxy_break_glass_open{state="awaiting_review"}` frozen at
+        // whatever the last transition wrote, for the life of the process,
+        // with the queue hidden from the route and no path able to move
+        // the number. That is worse than the strand this branch removed:
+        // unclosable *and* invisible.
+        refresh_gauges();
         return json!({ "enabled": false, "grants": [] });
     };
     // The review queue is time-driven and every other transition is not, so
@@ -932,6 +971,9 @@ impl RefusedGrant {
 #[cfg(test)]
 pub(crate) fn reset_for_test() {
     registry().grants.lock().clear();
+    registry()
+        .registry_full_recorded
+        .store(false, std::sync::atomic::Ordering::SeqCst);
 }
 
 #[cfg(test)]

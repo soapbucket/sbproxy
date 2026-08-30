@@ -5933,15 +5933,6 @@ mod tests {
         assert_eq!(parse(&reviewed)["grant"]["state"], "reviewed");
     }
 
-    /// The reviewer's note reaches the audit record whole, whatever the
-    /// scope carried.
-    ///
-    /// The note and the scope shared one 256-byte context string, and
-    /// scope was bounded at 64 entries of 256 bytes, which is sixty-four
-    /// times the context cap. A grant with a large scope silently dropped
-    /// `approvals=`, `ttl_secs=` and the note, so the sign-off the whole
-    /// feature exists to produce vanished on exactly the grants most
-    /// likely to want it.
     /// A grant awaiting review must still be closeable after the kill
     /// switch is thrown, and after the block is deleted outright.
     ///
@@ -6017,6 +6008,33 @@ mod tests {
                 reviewed.2
             );
             assert_eq!(parse(&reviewed)["grant"]["state"], "reviewed", "{label}");
+
+            // The empty-roster case closes out through the fallback, and
+            // that has to be distinguishable in the record: four
+            // operator-facing surfaces advertise the label, one of them
+            // `docs/metrics-stability.md`, which is a compatibility
+            // contract. The audit outcome and the counter take the same
+            // value from one variable, so this pins both.
+            let expected = if approvers.is_empty() {
+                "reviewed_without_roster"
+            } else {
+                "reviewed"
+            };
+            let events = sbproxy_observe::audit_ring::recent_audit_events(
+                10,
+                Some("key"),
+                Some("break_glass_review"),
+                None,
+            );
+            let closed = events
+                .iter()
+                .find(|e| e.detail.as_deref().is_some_and(|d| d.contains(expected)))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{label}: no break_glass_review record with outcome {expected}: {events:?}"
+                    )
+                });
+            assert_eq!(closed.actor.as_deref(), Some("alice"), "{label}");
         }
     }
 
@@ -6118,6 +6136,15 @@ mod tests {
         }
     }
 
+    /// The reviewer's note reaches the audit record whole, whatever the
+    /// scope carried.
+    ///
+    /// The note and the scope shared one 256-byte context string, and
+    /// scope was bounded at 64 entries of 256 bytes, which is sixty-four
+    /// times the context cap. A grant with a large scope silently dropped
+    /// `approvals=`, `ttl_secs=` and the note, so the sign-off the whole
+    /// feature exists to produce vanished on exactly the grants most
+    /// likely to want it.
     #[test]
     fn a_reviewers_note_survives_a_large_scope() {
         let _g = crate::key_plane::test_plane_guard();

@@ -9299,6 +9299,38 @@ fn parse_cluster_labels(labels: &[String]) -> anyhow::Result<BTreeMap<String, St
     Ok(parsed)
 }
 
+/// Render one config for `sbproxy config print`, through both masks.
+///
+/// A free function rather than the body of [`handle_config_print`],
+/// because the property worth testing is what comes *out* and the handler
+/// reads a path and writes to stdout. Nothing outside the dispatch called
+/// the handler, so a test on the two masks had to reimplement the pipeline
+/// and then claim it was pinning the real one.
+///
+/// Two passes, and they are complementary rather than redundant.
+/// [`mask_secrets`] is a key-name allowlist, which cannot cover
+/// `key_management.crypto.root_of_trust.address`: `address` is a
+/// non-secret key name almost everywhere else in the schema, so listing it
+/// would mask a dozen fields that are not secrets to hide one that is.
+/// `redact_config_document` masks that one by position, leaving the host
+/// readable, and it is the config-document form deliberately: a URL's
+/// userinfo here is a whole scalar an operator wrote, so it may carry
+/// base64 padding and sub-delims that the narrower log-line form stops at.
+/// Both preserve key separators, so the printed document still parses.
+fn render_config_for_print(
+    config: &sbproxy_config::ConfigFile,
+    as_json: bool,
+) -> anyhow::Result<String> {
+    let mut value = serde_json::to_value(config)?;
+    mask_secrets(&mut value);
+    let rendered = if as_json {
+        serde_json::to_string_pretty(&value)?
+    } else {
+        serde_yaml::to_string(&value)?
+    };
+    Ok(sbproxy_observe::redact::redact_config_document(&rendered))
+}
+
 /// `sbproxy config print`: the effective config after built-in defaults +
 /// the file + `${ENV}` interpolation, with secret values masked. Makes
 /// it obvious what a box will actually do (WOR-1805).
@@ -9316,24 +9348,7 @@ fn handle_config_print(
     // then re-serialize so defaults show explicitly.
     let config: sbproxy_config::ConfigFile = serde_yaml::from_str(&interpolated)
         .map_err(|e| anyhow::anyhow!("parse config '{}': {e}", path.display()))?;
-    let mut value = serde_json::to_value(&config)?;
-    mask_secrets(&mut value);
-    // Then the same pattern pass `GET /admin/config` runs
-    // (`admin.rs:2990`). `mask_secrets` is a key-name allowlist and there
-    // are fields it cannot cover by name: `root_of_trust.address` is an
-    // unparsed URL that may carry userinfo, and `address` is a
-    // non-secret key name almost everywhere else in the schema, so
-    // adding it to the allowlist would mask a dozen fields that are not
-    // secrets to hide one that is. The pattern pass masks the userinfo
-    // by position instead, and leaves the host readable. It preserves
-    // key separators by construction, so the printed document still
-    // parses either way.
-    let rendered = if args.json {
-        serde_json::to_string_pretty(&value)?
-    } else {
-        serde_yaml::to_string(&value)?
-    };
-    let rendered = sbproxy_observe::redact::redact_secrets(&rendered);
+    let rendered = render_config_for_print(&config, args.json)?;
     if args.json {
         println!("{rendered}");
     } else {
@@ -11389,6 +11404,16 @@ fn is_secret_key(key: &str) -> bool {
             | "secret_access_key"
             | "aws_secret_access_key"
             | "private_key"
+            // Both halves of `key_management.crypto`. `pepper` was on
+            // neither this list nor any pattern, so an inline
+            // `pepper: a-long-random-server-pepper` came back verbatim on
+            // every config surface: it is the salt inbound key hashes are
+            // built with, and leaking it is what makes a stolen hash table
+            // worth brute-forcing. `master_key` is in the pattern pass's
+            // alternation, so it was single-covered; naming it here makes
+            // both double-covered, which is what the rest of this list is.
+            | "pepper"
+            | "master_key"
     )
 }
 
@@ -14906,37 +14931,43 @@ hooks:
         assert_eq!(arr[4]["base_url"], "https://api.example.com");
     }
 
-    /// The second pass `sbproxy config print` runs, and the reason it
-    /// exists: a key-name allowlist cannot cover
-    /// `root_of_trust.address`, because `address` is a non-secret key name
-    /// almost everywhere else in the schema. The userinfo is masked by
-    /// position instead, and the host survives so the operator can still
-    /// read which key service is configured.
+    /// The masks `sbproxy config print` actually runs, through the
+    /// function the handler calls rather than a reimplementation of it.
     ///
-    /// Deleting the `redact_secrets` call from `handle_config_print`
-    /// reddens the first two assertions. The third is the marker
-    /// consistency: `mask_secrets` stamps `***MASKED***` and this pass
-    /// must not restamp the same value as `[REDACTED]`, or one surface
-    /// shows two markers for the same thing.
+    /// The earlier version of this test built its own `serde_json::Value`
+    /// and called the two passes by hand, so its doc claimed a revert it
+    /// could not observe: nothing outside the dispatch called
+    /// `handle_config_print`, and deleting the `redact_config_document`
+    /// line from it left the test green. `render_config_for_print` is the
+    /// seam now, and both reverts redden this.
+    ///
+    /// The fixture is a real `ConfigFile`, parsed from YAML, so a field
+    /// that stops serializing under that name reddens it too.
     #[test]
     fn config_print_masks_a_url_userinfo_and_keeps_one_marker() {
-        let mut v = serde_json::json!({
-            "key_management": {
-                "crypto": {
-                    "master_key": "literal-master-secret",
-                    "root_of_trust": {
-                        "address": "https://sbproxy:hvs.PRINTMUSTNOTAPPEAR@vault.internal:8200",
-                        "token": "literal-transit-token",
-                    }
-                }
-            }
-        });
-        mask_secrets(&mut v);
-        let rendered =
-            sbproxy_observe::redact::redact_secrets(&serde_yaml::to_string(&v).expect("renders"));
+        let config: sbproxy_config::ConfigFile = serde_yaml::from_str(
+            r#"
+proxy:
+  key_management:
+    enabled: true
+    crypto:
+      pepper: literal-inline-pepper
+      master_key: literal-master-secret
+      root_of_trust:
+        provider: vault_transit
+        address: https://sbproxy:hvs.CAESIQpAbCdEf=@vault.internal:8200
+        mount: transit
+        key_name: sbproxy-root
+        token: literal-transit-token
+"#,
+        )
+        .expect("fixture parses");
+        let rendered = render_config_for_print(&config, false).expect("renders");
 
+        // The positional mask, on the field no key-name rule can cover,
+        // with the base64 padding a Vault token actually carries.
         assert!(
-            !rendered.contains("hvs.PRINTMUSTNOTAPPEAR"),
+            !rendered.contains("hvs.CAESIQpAbCdEf="),
             "the address carries userinfo and no key-name rule covers it: {rendered}"
         );
         assert!(
@@ -14944,34 +14975,38 @@ hooks:
             "the host has to survive, or the operator cannot tell which Vault this is: \
              {rendered}"
         );
-        for masked in ["literal-master-secret", "literal-transit-token"] {
+
+        // And the three key-name secrets in the same block.
+        for masked in [
+            "literal-inline-pepper",
+            "literal-master-secret",
+            "literal-transit-token",
+        ] {
             assert!(!rendered.contains(masked), "{masked} leaked: {rendered}");
         }
 
-        // One surface, one marker, said as two counts rather than as a
-        // disjunction that can be true for the wrong reason.
-        //
-        // The two passes are complementary and this fixture shows all
-        // three cases. `token` is on `is_secret_key`, so `mask_secrets`
-        // stamps it `***MASKED***` and the pattern pass must leave that
-        // alone. `master_key` is **not** on `is_secret_key`, and is
-        // covered only by `RE_CREDENTIAL_KEY` in the pattern pass, so it
-        // comes out `[REDACTED]`. The address is under a key name neither
-        // rule knows and is masked by position.
-        //
-        // Dropping the `***MASKED***` arm from `masks_value` restamps the
-        // token and reddens both counts.
-        assert_eq!(
-            rendered.matches("***MASKED***").count(),
-            1,
-            "the key-name mask keeps its own marker rather than being restamped: {rendered}"
+        // One surface, one marker. `mask_secrets` stamps `***MASKED***`
+        // and the pattern pass must not restamp what it already did.
+        assert!(
+            !rendered.contains("[REDACTED]\n"),
+            "a whole value masked as [REDACTED] means the pattern pass restamped a key-name \
+             mask: {rendered}"
         );
         assert_eq!(
             rendered.matches("[REDACTED]").count(),
-            2,
-            "the pattern pass covers master_key by name and the address by position, and \
-             nothing else on this document: {rendered}"
+            1,
+            "the only positional mask on this document is the address userinfo: {rendered}"
         );
+        assert_eq!(
+            rendered.matches("***MASKED***").count(),
+            3,
+            "pepper, master_key and token keep their own marker: {rendered}"
+        );
+
+        // The document still parses, which is the invariant both passes
+        // are built around.
+        serde_yaml::from_str::<serde_yaml::Value>(&rendered)
+            .unwrap_or_else(|e| panic!("masked document no longer parses ({e}): {rendered}"));
     }
 
     #[test]

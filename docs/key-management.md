@@ -2151,7 +2151,8 @@ Rules the endpoints enforce rather than document:
   grants live in process memory and survive a config reload, so nothing could
   ever reach `reviewed`, and the `awaiting_review` gauge below would stay
   pinned above zero for the life of the process.
-* **An empty roster falls back to "any admin who is not the requester".**
+* **An empty roster falls back to "any admin who is not the requester",
+  and that is the only strand this closes.**
   Deleting the `break_glass:` block entirely reaches the same strand by a
   different route, because the block's default is `enabled: false,
   approvers: []` and the config compiler validates the roster only while
@@ -2160,8 +2161,17 @@ Rules the endpoints enforce rather than document:
   operator. The two-person property survives the fallback, since the
   requester is still refused; what is given up is "and that person was
   pre-named". Those sign-offs are recorded with
-  `outcome: reviewed_without_roster` so they are distinguishable in the
-  chain.
+  `outcome: reviewed_without_roster`, on the audit record and on
+  `sbproxy_break_glass_grants_total`, so they are distinguishable in the
+  chain and on the dashboard.
+
+  **A roster that is non-empty but has no eligible reviewer left still
+  strands.** With `enabled: true` and a roster whose last non-requester
+  approver has been removed, every other operator is `NotAnApprover` and
+  the requester is refused as the subject, so the grant cannot reach
+  `reviewed`. There is no force-close and no admin override. Keep at least
+  two people on `approvers` for as long as any grant is open, or empty the
+  list, which is the case the fallback covers.
 * **Removing `key_management.enabled` hides the queue.** With the whole
   block gone, `GET /admin/break-glass` reports `{"enabled": false,
   "grants": []}` and `review` answers `409 disabled`, while the grants stay

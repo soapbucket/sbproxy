@@ -2987,7 +2987,7 @@ fn handle_config_read(state: &AdminState) -> (u16, &'static str, String) {
     // read-only operator. Same pass the log pipeline runs, so the same token
     // shapes are caught; everything the patterns do not match, comments and
     // formatting included, is returned byte-for-byte.
-    let yaml = sbproxy_observe::redact::redact_secrets(&yaml);
+    let yaml = sbproxy_observe::redact::redact_config_document(&yaml);
     let revision = state
         .loaded_config_content_hash
         .lock()
@@ -3509,7 +3509,7 @@ fn handle_config_effective(state: &AdminState) -> (u16, &'static str, String) {
     // WOR-2316: same pass as `GET /admin/config`, for the same reason. The
     // provenance map holds leaf paths, never values, so only the document
     // itself needs it.
-    let yaml = sbproxy_observe::redact::redact_secrets(&effective.yaml);
+    let yaml = sbproxy_observe::redact::redact_config_document(&effective.yaml);
     (
         200,
         "application/json",
@@ -4483,7 +4483,7 @@ fn config_rejected_entry_json(entry: &sbproxy_config::RejectedCandidate) -> serd
         "first_seen_at": config_history_rfc3339(entry.first_seen_at),
         "last_seen_at": config_history_rfc3339(entry.last_seen_at),
         "count": entry.count,
-        "document": sbproxy_observe::redact::redact_secrets(&entry.document),
+        "document": sbproxy_observe::redact::redact_config_document(&entry.document),
     })
 }
 
@@ -4584,7 +4584,7 @@ fn handle_config_history_detail(state: &AdminState, digest: &str) -> (u16, &'sta
     let plan_text = config_history_plan_text(state, &document);
     // Redact for display only, after both are computed from the
     // original bytes above. See the handler doc comment for why.
-    let document = sbproxy_observe::redact::redact_secrets(&document);
+    let document = sbproxy_observe::redact::redact_config_document(&document);
     let plan_text = sbproxy_observe::redact::redact_secrets(&plan_text);
     let body = serde_json::json!({
         "entry": config_history_entry_json(&entry),

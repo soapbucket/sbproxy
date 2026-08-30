@@ -99,25 +99,44 @@ use std::sync::LazyLock;
 /// subset of what RFC 3986 permits in an authority, chosen so the run
 /// cannot walk out of the field it started in.
 ///
-/// # Why this set and not the wider legal one
+/// # Two surfaces, two sets, and why one cannot serve both
 ///
-/// The first allowlist also kept `!$&*+=` and `[]`, on the reasoning that
-/// they are legal in an authority and are not structure. Two of them were:
-/// `&` and `=` are the structural bytes of a query string and of
-/// `application/x-www-form-urlencoded`, a fourth serialization this rule
-/// meets that the reasoning did not name. The access log stores the
-/// client's raw query string with the leading `?` already stripped
-/// (`sbproxy-core`'s `access_log.rs`), so
+/// The narrow set is `[A-Za-z0-9]` plus `-._~%:@`. The wide set adds the
+/// RFC 3986 userinfo sub-delims that are not structure anywhere this runs,
+/// `!$&*+=`. [`redact_secrets`] takes the narrow one, and
+/// [`redact_config_document`] the wide one. Each got its set from a
+/// finding, so both are worth stating.
+///
+/// **Why the log pass is narrow.** The first allowlist kept `&` and `=`
+/// on the reasoning that they are legal in an authority and are not
+/// structure. They are the structural bytes of a query string and of
+/// `application/x-www-form-urlencoded`, a serialization that reasoning
+/// did not name. The access log stores the client's raw query string with
+/// the leading `?` already stripped, so
 /// `u=https://a.example&op=drop_all&next=b@c.example` had no `?` left to
 /// stop on and masked to `u=https://[REDACTED]@c.example`. Nothing leaked,
-/// because the line still parsed and the field-key denylist still ran, but
-/// the caller chose the ordering of their own parameters and therefore
-/// chose which of them survived into their own audit record.
+/// because the line still parsed, but the caller chose the ordering of
+/// their own parameters and therefore chose which of them survived into
+/// their own audit record.
 ///
-/// `[` and `]` went with them because they buy nothing: an IPv6 host sits
-/// *after* the `@`, so the run only needs them to keep scanning for a
-/// later `@` that a well-formed URL cannot have.
-/// `https://u:pw@[2001:db8::1]:8200` masks identically either way.
+/// **Why the config pass is wide.** Narrowing the set then created the
+/// opposite defect on the three routes this mask was written for.
+/// `https://sbproxy:hvs.CAESIQpAbCdEf=@vault.internal:8200` is an ordinary
+/// value of `key_management.crypto.root_of_trust.address`, because a Vault
+/// token is `hvs.` plus base64 and `=` is its padding; stopping at `=`
+/// returned it verbatim. `p&w0rd` is the same story for `&`.
+///
+/// The difference between the surfaces is not a preference, it is who
+/// chose the delimiter. In a log line the run can be inside a field whose
+/// own delimiters an attacker supplied. In a rendered config document
+/// there is no such field: the value is a whole scalar and the delimiter
+/// around it was chosen by the renderer, a newline in block YAML or a `"`
+/// in pretty JSON, neither of which is in either set.
+///
+/// `[` and `]` are in neither set. RFC 3986 forbids them in userinfo, and
+/// an IPv6 host sits *after* the `@`, so the run would only need them to
+/// keep scanning for a later `@` that a well-formed URL cannot have.
+/// `https://u:pw@[2001:db8::1]:8200` masks identically without them.
 ///
 /// # Why a line still parses, which is not the byte-class argument
 ///
@@ -138,21 +157,34 @@ use std::sync::LazyLock;
 /// about the class of every byte in the set, and it is what
 /// `a_url_in_a_json_field_keeps_the_line_parseable` pins.
 ///
-/// The other serializations get the same treatment from their own
-/// delimiters rather than from a claim about byte classes: whitespace and
-/// `,` end a YAML flow scalar and a logfmt pair, `&` and `=` end a query
-/// parameter, and none of the five is in the set.
+/// The other serializations are held by their own delimiters rather than
+/// by a claim about byte classes. Whitespace ends a logfmt pair and an
+/// unquoted YAML scalar; `,` ends a YAML flow scalar, though not a logfmt
+/// value, where a comma is legal unquoted; `&` and `=` end a query
+/// parameter. None of those four bytes is in the log-line set.
 ///
 /// # What it therefore does not mask, stated rather than discovered
 ///
-/// Userinfo containing any byte outside the set is not masked at all,
-/// rather than masked halfway. That covers `'`, `(`, `)`, `,`, `;`, `!`,
-/// `$`, `&`, `*`, `+`, `=`, which RFC 3986 permits in userinfo, and **every
+/// Userinfo containing any byte outside the surface's set is not masked at
+/// all, rather than masked halfway. For both surfaces that covers `'`,
+/// `(`, `)`, `,`, `;`, which RFC 3986 permits in userinfo, and **every
 /// non-ASCII byte**, so `https://usér:pw@vault.internal:8200` comes back
-/// verbatim. Failing to mask is the safe direction here and deleting a
-/// delimiter is not, which is the same trade [`RE_PASSWORD`] documents for
-/// its own stop set. The control for what this misses is the field-name
-/// denylist in [`crate::logging`], which never reads a value.
+/// verbatim. For the log surface it also covers `!$&*+=`. Failing to mask
+/// is the safe direction here and deleting a delimiter is not, which is
+/// the same trade [`RE_PASSWORD`] documents for its own stop set.
+///
+/// **The control differs by surface, and naming the wrong one is how this
+/// went wrong once already.** On a log line it is the field-name denylist
+/// in [`crate::logging`], which keys on the name and never reads a value.
+/// That denylist runs inside `redact_json_line` and **does not run on the
+/// config routes**: there `redact_config_document` is the whole pass. The
+/// control there is the one [`RE_CREDENTIAL_KEY`] already names for the
+/// two field names it deliberately leaves out: put a `${VAR}` or
+/// `vault://` reference in the field, which [`is_secret_reference`]
+/// preserves verbatim and which never holds the value in the first place,
+/// and rely on the config file's own `0600` permissions. Percent-encoding
+/// the userinfo also restores the mask on either surface, since `%` is in
+/// both sets.
 ///
 /// # The last `@`, not the first
 ///
@@ -176,12 +208,15 @@ use std::sync::LazyLock;
 /// mask, because the walk-back continues through `.` and `-` to a letter.
 /// Over-masking is the safe direction, so the difference is documented
 /// rather than removed.
-fn mask_url_userinfo(input: &str) -> std::borrow::Cow<'_, str> {
-    // Unreserved, percent-encoding, `:` and `@`. A strict subset of the
-    // RFC 3986 authority charset; see the allowlist section above for why
-    // `&`, `=`, `[` and `]` are not in it.
-    fn continues_authority(c: u8) -> bool {
-        c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'_' | b'~' | b'%' | b':' | b'@')
+fn mask_url_userinfo(input: &str, sub_delims: bool) -> std::borrow::Cow<'_, str> {
+    // Unreserved, percent-encoding, `:` and `@`, plus the userinfo
+    // sub-delims when the caller is a whole config document. See the
+    // allowlist section above for why the two surfaces differ and why
+    // `[` and `]` are in neither.
+    fn continues_authority(c: u8, sub_delims: bool) -> bool {
+        c.is_ascii_alphanumeric()
+            || matches!(c, b'-' | b'.' | b'_' | b'~' | b'%' | b':' | b'@')
+            || (sub_delims && matches!(c, b'!' | b'$' | b'&' | b'*' | b'+' | b'='))
     }
 
     let bytes = input.as_bytes();
@@ -215,7 +250,7 @@ fn mask_url_userinfo(input: &str) -> std::borrow::Cow<'_, str> {
         // Walk the whole authority and keep the LAST `@`, not the first.
         let mut at = None;
         let mut i = authority;
-        while i < bytes.len() && continues_authority(bytes[i]) {
+        while i < bytes.len() && continues_authority(bytes[i], sub_delims) {
             if bytes[i] == b'@' {
                 at = Some(i);
             }
@@ -361,7 +396,7 @@ static RE_API_KEY: LazyLock<Regex> = LazyLock::new(|| {
 /// name and that an unrecognized name comes back as written.
 static RE_CREDENTIAL_KEY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?i)\b(session[_-]?token|master[_-]?key|signing[_-]?key|shared[_-]?key|virtual[_-]?key|challenge[_-]?binding[_-]?key|signing[_-]?secret|client[_-]?secret)(["'\s]*[:=]["'\s]*)([^\s"',;]{4,})"#,
+        r#"(?i)\b(session[_-]?token|master[_-]?key|signing[_-]?key|shared[_-]?key|virtual[_-]?key|challenge[_-]?binding[_-]?key|signing[_-]?secret|client[_-]?secret|pepper)(["'\s]*[:=]["'\s]*)([^\s"',;]{4,})"#,
     )
     .expect("valid regex")
 });
@@ -522,11 +557,19 @@ fn keyed_credential_replacement(caps: &regex::Captures<'_>) -> String {
 
 // --- Public API ---
 
-/// Redact secrets from a string. Returns a new string with secrets replaced.
+/// Redact secrets from a **log line, an error, or any other free text**.
+///
+/// This is the pass for input that may embed a URL inside a
+/// caller-controlled field, and the access log is the case that matters:
+/// its `query` field holds the client's raw query string with the leading
+/// `?` already stripped, so `&` and `=` are live delimiters inside it and
+/// the userinfo run must stop at them. See
+/// [`redact_config_document`] for the other surface, and the
+/// `mask_url_userinfo` doc for why one byte set cannot serve both.
 ///
 /// Applies the userinfo rule and then all twelve patterns, in priority
-/// order. The result is
-/// suitable for safe emission in log lines or error messages.
+/// order. The result is suitable for safe emission in log lines or error
+/// messages.
 ///
 /// Two properties callers depend on, both pinned by tests:
 ///
@@ -540,6 +583,44 @@ fn keyed_credential_replacement(caps: &regex::Captures<'_>) -> String {
 ///   lets `logging::redact_json_line` run the field-key denylist on
 ///   the result.
 pub fn redact_secrets(input: &str) -> String {
+    redact_with(input, false)
+}
+
+/// Redact secrets from a **rendered config document**: the YAML
+/// `GET /admin/config` and `/admin/config/effective` return, the stored
+/// documents `GET /admin/config/history/{digest}` hands back, and the
+/// output of `sbproxy config print`.
+///
+/// Identical to [`redact_secrets`] except that a URL's userinfo may also
+/// contain the RFC 3986 sub-delims `!$&*+=`, and the difference is the
+/// whole point of there being two functions.
+///
+/// On these surfaces a URL is a complete scalar value written by the
+/// operator, and `=` is base64 padding: a Vault token is `hvs.` plus
+/// base64, so `https://sbproxy:hvs.CAESIQpAbCdEf=@vault.internal:8200`
+/// is an ordinary value of `key_management.crypto.root_of_trust.address`.
+/// Stopping the run at `=` leaves that credential in the clear on the
+/// three routes this mask was written for. There is no caller-supplied
+/// query field in a rendered config document, so the delimiter that
+/// bounds the run is the one the *renderer* chose, not one an attacker
+/// picked: a newline in block YAML, a `"` in pretty JSON. Neither is in
+/// either set, so the same "cannot leave the token it started in"
+/// argument holds here.
+///
+/// The narrower [`redact_secrets`] must not be widened to match. Its
+/// input includes a field whose own delimiters are `&` and `=`, and
+/// admitting them there let a caller delete their own query parameters
+/// from their own audit record.
+pub fn redact_config_document(input: &str) -> String {
+    redact_with(input, true)
+}
+
+/// The shared body of [`redact_secrets`] and [`redact_config_document`].
+///
+/// `sub_delims` selects the authority set; every pattern after the
+/// userinfo rule is identical, because those match by shape or by an
+/// adjacent key name and neither depends on the surface.
+fn redact_with(input: &str, sub_delims: bool) -> String {
     // Work through a scratch buffer so each replacement sees the previous output.
     // Ordering matters: more-specific patterns (Anthropic) come before more-general
     // ones (OpenAI `sk-`) to avoid double-redaction artifacts.
@@ -547,7 +628,7 @@ pub fn redact_secrets(input: &str) -> String {
     // masking it whole avoids a shape pattern hitting the embedded
     // credential first and leaving `https://user:sk-ant-[REDACTED]@host`,
     // which still names the user.
-    let s = mask_url_userinfo(input);
+    let s = mask_url_userinfo(input, sub_delims);
     let s = RE_ANTHROPIC.replace_all(&s, "sk-ant-[REDACTED]");
     let s = RE_STRIPE.replace_all(&s, "stripe_[REDACTED]");
     let s = RE_OPENAI.replace_all(&s, "sk-[REDACTED]");
@@ -569,7 +650,7 @@ pub fn redact_secrets(input: &str) -> String {
 /// Cheaper than a full `redact_secrets` call when you only need a boolean
 /// answer (e.g. for metrics or alerting).
 pub fn contains_secret(input: &str) -> bool {
-    matches!(mask_url_userinfo(input), std::borrow::Cow::Owned(_))
+    matches!(mask_url_userinfo(input, false), std::borrow::Cow::Owned(_))
         || RE_ANTHROPIC.is_match(input)
         || RE_STRIPE.is_match(input)
         || RE_OPENAI.is_match(input)
@@ -1304,6 +1385,92 @@ mod tests {
         }
     }
 
+    /// The two surfaces want different authority sets, and this is the
+    /// pair of cases that forced that.
+    ///
+    /// A Vault token is `hvs.` plus base64, so `=` is padding and belongs
+    /// in the userinfo of a perfectly ordinary
+    /// `key_management.crypto.root_of_trust.address`. Stopping the run at
+    /// `=` returned it in the clear on the three config routes. But `=`
+    /// and `&` are also the delimiters of the access log's `query` field,
+    /// which holds the client's raw query with the `?` already stripped,
+    /// and admitting them there let a caller delete their own parameters
+    /// from their own record.
+    ///
+    /// Narrowing `redact_config_document` to the log set reddens the first
+    /// two assertions; widening `redact_secrets` to the document set
+    /// reddens the third.
+    #[test]
+    fn the_config_document_pass_masks_a_sub_delim_userinfo_and_the_log_pass_does_not() {
+        // Base64 padding, on the field the epic is sold on.
+        assert_eq!(
+            redact_config_document(
+                "      address: https://sbproxy:hvs.CAESIQpAbCdEf=@vault.internal:8200"
+            ),
+            "      address: https://[REDACTED]@vault.internal:8200",
+            "a base64-padded token is an ordinary value of this field"
+        );
+        // And a sub-delim in a password.
+        assert_eq!(
+            redact_config_document("      address: https://sbproxy:p&w0rd@vault.internal:8200"),
+            "      address: https://[REDACTED]@vault.internal:8200"
+        );
+
+        // The same bytes on the log surface must NOT extend the run: this
+        // is the query-string case, where `&` and `=` belong to the field
+        // rather than to the URL.
+        let line = r#"{"query":"u=https://a.example&op=drop_all&next=b@c.example","status":200}"#;
+        let out = redact_secrets(line);
+        let parsed: serde_json::Value = serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("redacted line is not JSON ({e}): {out}"));
+        assert_eq!(
+            parsed["query"], "u=https://a.example&op=drop_all&next=b@c.example",
+            "the log pass must not admit the query delimiters: {out}"
+        );
+
+        // Percent-encoding restores the mask on the log surface, which is
+        // the documented mitigation and is worth pinning as one.
+        assert_eq!(
+            redact_secrets("address: https://sbproxy:hvs.CAESIQpAbCdEf%3D@vault.internal:8200"),
+            "address: https://[REDACTED]@vault.internal:8200"
+        );
+
+        // A block-YAML document is bounded by newlines, so the wider set
+        // still cannot leave the value it started in.
+        let doc = "crypto:\n  address: https://u:a=b&c@vault.internal:8200\n  other: keep@me\n";
+        assert_eq!(
+            redact_config_document(doc),
+            "crypto:\n  address: https://[REDACTED]@vault.internal:8200\n  other: keep@me\n"
+        );
+    }
+
+    /// `key_management.crypto`'s two locally-held secrets are both
+    /// covered, on both surfaces.
+    ///
+    /// `pepper` was on no key-name list and no shape pattern, so an
+    /// inline one came back verbatim from `GET /admin/config`. It is the
+    /// salt inbound key hashes are built with: leaking it is what makes a
+    /// stolen hash table worth brute-forcing.
+    #[test]
+    fn the_locally_held_crypto_secrets_are_masked_by_name() {
+        for surface in [
+            redact_secrets as fn(&str) -> String,
+            redact_config_document as fn(&str) -> String,
+        ] {
+            let out = surface(
+                "  pepper: a-long-random-server-pepper\n  master_key: a-long-random-master-key\n",
+            );
+            assert!(!out.contains("a-long-random-server-pepper"), "{out}");
+            assert!(!out.contains("a-long-random-master-key"), "{out}");
+            assert_eq!(out.matches("[REDACTED]").count(), 2, "{out}");
+        }
+        // A reference names a secret rather than being one, so it shows.
+        assert_eq!(
+            redact_secrets("pepper: vault://primary/cluster?key=pepper"),
+            "pepper: vault://primary/cluster?key=pepper"
+        );
+    }
+
     /// The invariant the whole module is built on, for the one rule that
     /// matches by position: **a redacted line still parses, and no field
     /// but the one the URL sits in changes at all.**
@@ -1388,18 +1555,35 @@ mod tests {
         assert!(!out.contains("tok3n"), "{out}");
 
         // 5. The same invariant in the other two serializations the stop
-        //    set names. Both use `,` rather than a space before the later
-        //    `@`, because the old rule stopped at whitespace and a
-        //    space-separated fixture passes on both sides of the revert.
-        assert_eq!(
-            redact_secrets("[https://ref.example,b@c.example]"),
-            "[https://ref.example,b@c.example]",
-            "YAML flow sequence"
-        );
-        assert_eq!(
-            redact_secrets("url=https://ref.example,next=b@c.example"),
-            "url=https://ref.example,next=b@c.example",
-            "logfmt"
-        );
+        //    set names, twice over.
+        //
+        //    The `,` forms are the ones that can fail under the named
+        //    revert, because the old rule stopped at whitespace and a
+        //    space-separated fixture passes on both sides of it. The
+        //    space forms cannot fail under *that* revert and are kept
+        //    anyway: they are the only thing pinning "whitespace ends the
+        //    run", which an earlier version of this test dropped when it
+        //    rewrote both blocks to commas. They redden if whitespace is
+        //    ever admitted to the set.
+        for (fixture, label) in [
+            (
+                "[https://ref.example,b@c.example]",
+                "YAML flow sequence, comma",
+            ),
+            (
+                "{url: https://ref.example, user: ops@corp.com}",
+                "YAML flow mapping, space",
+            ),
+            (
+                "url=https://ref.example,next=b@c.example",
+                "logfmt, comma inside an unquoted value",
+            ),
+            (
+                "url=https://ref.example next=b@c.example",
+                "logfmt, space between pairs",
+            ),
+        ] {
+            assert_eq!(redact_secrets(fixture), fixture, "{label}");
+        }
     }
 }
