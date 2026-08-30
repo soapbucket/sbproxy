@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-08-29*
+*Last modified: 2026-08-30*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -99,9 +99,19 @@ a `credentials` policy) fails `serve`, `validate`, and hot reload with an
 error naming the key and the accepted alternatives, instead of being silently
 dropped while the setting takes its default. Two escape hatches stay open:
 out-of-tree blocks belong under `proxy.extensions:` (or an origin's
-`extensions:`), which accept arbitrary keys, and unknown keys at the very top
-level of the file only log a warning so flat schema-v1 configs from the
-archived Go line keep loading.
+`extensions:`), which accept arbitrary keys, and a descriptive unknown key at
+the very top level of the file only logs a warning, since dropping `id`,
+`config_version`, or `workspace_id` changes nothing about how the proxy
+behaves.
+
+The flat schema-v1 keys that carry origin behavior are the exception.
+`hostname`, `action`, `authentication`, `policies`, `forward_rules`, `cors`,
+`request_modifiers`, `response_modifiers`, `session`, `variables`,
+`allowed_methods`, `force_ssl`, and `ai_proxy` at the top level are refused
+rather than dropped. Go compatibility is deprecated and those keys are not
+translated into `origins:`, so warning about them would boot a proxy with no
+origin configured. See [MIGRATION.md](../MIGRATION.md) for the rewrite and for
+the archived Go binary.
 
 The smallest runnable file is synced from
 [`examples/basic-proxy/sb.yml`](../examples/basic-proxy/sb.yml). CI compiles

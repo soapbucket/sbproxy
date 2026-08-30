@@ -2314,8 +2314,7 @@ fn nothing_in_the_resolver_opens_a_file_or_a_socket() {
 }
 
 /// A config with neither block behaves exactly as it did before they
-/// existed. The v1-compat fixture sweep covers the wider claim; this
-/// pins the narrow one next to the code that could break it.
+/// existed. This pins the claim next to the code that could break it.
 #[test]
 fn a_config_with_neither_block_is_unchanged() {
     let yaml = "origins:\n  \"api.test\":\n    action:\n      type: static\n      \

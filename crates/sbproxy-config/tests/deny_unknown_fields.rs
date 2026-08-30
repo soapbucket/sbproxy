@@ -11,8 +11,12 @@
 //!   parses into a typed struct (`origins.<host>.response_cache`);
 //! - the quality of the error itself (serde names the field and lists
 //!   the accepted ones);
-//! - and the schema-v1 escape hatch: unknown TOP-level keys still only
-//!   warn, so archived flat v0.1.x configs keep compiling.
+//! - and the top-level escape hatch: a descriptive unknown key at the
+//!   root still only warns, because dropping it changes nothing.
+//!
+//! The escape hatch is not open to everything. The flat schema-v1 keys
+//! that carry origin behavior are refused rather than warned about, and
+//! that split is pinned in `compiler.rs` and `v1_compat.rs`.
 
 use sbproxy_config::compile_config;
 
@@ -122,24 +126,53 @@ origins:
     assert!(format!("{err:#}").contains("native_polices"));
 }
 
-/// The schema-v1 promise survives the deny layer: a flat v0.1.x-style
-/// file, including a key no schema version ever had, still compiles
-/// because the root `ConfigFile` stays permissive and top-level
-/// unknowns only warn.
+/// The escape hatch survives the deny layer: a descriptive top-level
+/// key, including one no schema version ever had, still only warns,
+/// because the root `ConfigFile` stays permissive.
+///
+/// This used to carry `hostname:` and `action:` as well and called
+/// itself a flat v0.1.x file. It was not one: it had no `origins:` map,
+/// so what it actually pinned was a config that compiled into a proxy
+/// with no origin at all. Those two keys moved to the refusal tests
+/// (WOR-2706); what is left here is the WOR-1140 behavior this file is
+/// about.
 #[test]
-fn v1_flat_file_with_unknown_top_level_keys_still_compiles() {
+fn descriptive_unknown_top_level_keys_still_compile() {
     let yaml = r#"
 config_version: 2
 id: "legacy-1"
-hostname: "api.example.com"
 workspace_id: "ws-legacy"
 version: "1.0"
 some_key_no_schema_ever_had: true
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+    compile_config(yaml).expect("a descriptive top-level leftover must only warn");
+}
+
+/// The other side of the same hatch. A top-level key that carries origin
+/// behavior is refused, so the deny layer's permissive root cannot be
+/// read as "anything at the root is fine".
+#[test]
+fn a_behavior_carrying_top_level_key_is_refused() {
+    let yaml = r#"
+config_version: 2
+hostname: "api.example.com"
 action:
   type: proxy
   url: https://test.sbproxy.dev
 "#;
-    compile_config(yaml).expect("v1 flat files must keep compiling under deny_unknown_fields");
+    let err = compile_config(yaml)
+        .err()
+        .expect("a flat Go v0.1.x file must be refused, not compiled into an empty proxy");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("sbproxy-go"),
+        "the refusal names the archived Go project: {message}"
+    );
 }
 
 /// The deliberate pass-through blocks stay open: `extensions` maps and

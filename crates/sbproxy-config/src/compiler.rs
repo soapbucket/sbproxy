@@ -1712,6 +1712,44 @@ fn validate_compression_state_local_path(path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Flat schema-v1 top-level keys that carry a single origin's behavior.
+///
+/// The Go `v0.1.x` line wrote one origin's behavior at the top level of
+/// the file. This line reads origin behavior only from
+/// `origins.<hostname>:` and never translated the flat shape into it,
+/// so each of these used to be dropped with a warning while the proxy
+/// booted with no origin at all.
+///
+/// The evidence is the three archived fixtures under
+/// `crates/sbproxy-config/tests/v1-compat-fixtures/`, which came from
+/// `sbproxy-go`'s own `v0.1.2` `tests/config-compat` suite. Twelve of
+/// the thirteen appear there. `ai_proxy` is the exception and no fixture
+/// exercises it; it is listed because it names an AI gateway origin the
+/// same way the others name a proxy one, so a flat file carrying it
+/// would fail open identically, and a list narrower than the failure it
+/// exists to stop is worse than no list.
+///
+/// The descriptive metadata those same files carry (`config_version`,
+/// `id`, `workspace_id`, `version`, `environment`, `tags`, `debug`) is
+/// deliberately absent: dropping it changes nothing, so it stays on
+/// WOR-1140's warn-on-unknown-top-level-key path, which is unrelated to
+/// the Go deprecation and has to survive it.
+const FLAT_SCHEMA_V1_BEHAVIOR_KEYS: &[&str] = &[
+    "action",
+    "ai_proxy",
+    "allowed_methods",
+    "authentication",
+    "cors",
+    "force_ssl",
+    "forward_rules",
+    "hostname",
+    "policies",
+    "request_modifiers",
+    "response_modifiers",
+    "session",
+    "variables",
+];
+
 /// Compile a raw YAML config string into a `CompiledConfig`.
 ///
 /// # Errors
@@ -1879,19 +1917,20 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
     // fails the typed parse itself, including inside tagged enums
     // (`credentials[].policies[]`, `secrets.backends[]`, ...) whose
     // buffered content `serde_ignored` cannot see into. The root
-    // `ConfigFile` deliberately stays permissive because the archived
-    // Go v0.1.x schema was a flat single-origin file whose keys all sit
-    // at the top level; those fall through to the second layer.
+    // `ConfigFile` stays permissive so that a leftover top-level key is
+    // a diagnosable condition here rather than a serde parse error with
+    // no room for one; those fall through to the second layer.
     //
     // The second layer is this `serde_ignored` pass, which reports the
-    // top-level leftovers so they can warn (v1 compat) below. The
-    // schema's deliberate arbitrary-key blocks (`proxy.extensions` /
-    // origin `extensions` are `HashMap<String, Value>`, and `action` /
-    // `policies` / `transforms` / `authentication` / `variables` are
-    // opaque `serde_json::Value` handed to the module layer) accept any
-    // key under either layer. The `sbproxy serve` boot path runs
-    // `compile_config`, so both gates fire on boot and reload, not just
-    // the `validate` subcommand.
+    // top-level leftovers so the split below can decide between a
+    // warning and a refusal. The schema's deliberate arbitrary-key
+    // blocks (`proxy.extensions` / origin `extensions` are
+    // `HashMap<String, Value>`, and `action` / `policies` /
+    // `transforms` / `authentication` / `variables` are opaque
+    // `serde_json::Value` handed to the module layer) accept any key
+    // under either layer. The `sbproxy serve` boot path runs
+    // `compile_config`, so every gate below fires on boot and reload,
+    // not just under the `validate` subcommand.
     let mut unknown_keys: Vec<String> = Vec::new();
     let mut config_file: ConfigFile = {
         let de = serde_yaml::Deserializer::from_str(&yaml);
@@ -1900,23 +1939,56 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         })
         .context("failed to parse config YAML")?
     };
-    // Split unknown keys by nesting. The archived Go `v0.1.x` schema was
-    // a flat single-origin file (`config_version`, `id`, `hostname`,
-    // `action`, ...) whose keys all sit at the TOP level; the
-    // schema-v1 compatibility promise tolerates those, so a top-level
-    // unknown only warns. A NESTED unknown (`proxy.*`, `origins.*.*`) in
+    // Split unknown keys twice, on two different questions.
+    //
+    // First by nesting. A NESTED unknown (`proxy.*`, `origins.*.*`) in
     // the schema-v2 shape is a real typo in a server / security / origin
     // block - e.g. `mtls`->`mtsl`, `trusted_proxies`->`trusted_proxy`,
     // `force_ssl`->`forced_ssl` - which silently disables the intended
     // protection, so that fails the compile (and thus boot / reload).
+    //
+    // Then the top-level remainder by whether dropping the key changes
+    // behavior (WOR-2706). The archived Go `v0.1.x` schema was a flat
+    // single-origin file whose keys all sit at the TOP level, and it is
+    // two different kinds of key at once. `hostname`, `action`,
+    // `authentication`, `policies` and their siblings ARE the origin;
+    // dropping them boots a proxy with nothing configured that answers
+    // 404 for the hostname the file declares, which is why they are
+    // refused rather than warned about. `config_version`, `id`,
+    // `workspace_id` and the rest are descriptive, so they keep WOR-1140's
+    // warning: that behavior predates the Go deprecation, is what catches
+    // an ordinary top-level typo, and is unrelated to this split.
     let (nested_unknowns, top_unknowns): (Vec<String>, Vec<String>) =
         unknown_keys.into_iter().partition(|k| k.contains('.'));
+    let (mut flat_v1_behavior, top_unknowns): (Vec<String>, Vec<String>) = top_unknowns
+        .into_iter()
+        .partition(|k| FLAT_SCHEMA_V1_BEHAVIOR_KEYS.contains(&k.as_str()));
     if !top_unknowns.is_empty() {
         tracing::warn!(
             keys = %top_unknowns.join(", "),
             "config: ignored unknown/misspelled top-level key(s); each is dropped and \
              takes its default. Check for typos, or move an out-of-tree block under \
              `proxy.extensions:`."
+        );
+    }
+    if !flat_v1_behavior.is_empty() {
+        // Sorted so the message is a function of the keys rather than of
+        // the order they happened to appear in the document.
+        flat_v1_behavior.sort();
+        anyhow::bail!(
+            "config compile: deprecated flat schema-v1 top-level key(s) that carry origin \
+             behavior: {}. The archived Go `v0.1.x` line wrote one origin's behavior at the top \
+             level of the file. That shape is deprecated and is not translated: this binary \
+             reads origin behavior only from `origins.<hostname>:`, so every key above would be \
+             dropped and the proxy would boot with no origin configured, answering 404 for the \
+             hostname the file declares while `sbproxy validate` called the same file valid. An \
+             `authentication:` or IP allow-list block lost that way leaves the proxy open, so \
+             boot is rejected instead. Move the block under `origins:` as described in \
+             `MIGRATION.md`, or keep running the Go binary from the archived \
+             https://github.com/soapbucket/sbproxy-go repository, which is maintenance only. \
+             Descriptive top-level leftovers such as `id` and `config_version` are unaffected \
+             and still only warn.",
+            flat_v1_behavior.join(", ")
         );
     }
     if !nested_unknowns.is_empty() {
@@ -4234,8 +4306,8 @@ fn refuse_inert_origin_keys(hostname: &str, config: &RawOriginConfig) -> Result<
     // entry points gate on the PRESENCE of the `cors:` block and neither
     // one looks at the boolean, so an operator who wrote `false` to turn
     // CORS off ran with CORS fully on. `true` is left accepted because it
-    // agrees with what the block already does, which also keeps the
-    // archived schema-v1 fixtures compiling unmodified. The alias spelling
+    // agrees with what the block already does, so the operator who wrote
+    // it was not misled and has nothing to fix. The alias spelling
     // `enabled` deserializes into this same field, so both spellings are
     // covered by the one check.
     if config
@@ -6637,16 +6709,81 @@ origins:
         assert!(format!("{err:#}").contains("forced_ssl"));
     }
 
+    /// A genuinely flat Go `v0.1.x` document: one origin's behavior at
+    /// the top level and no `origins:` map at all. This is the shape the
+    /// archived fixtures have, and the shape that used to warn once and
+    /// then boot an empty proxy that answered 404 for the hostname it
+    /// declared.
+    ///
+    /// The predecessor of this test stapled flat keys onto a real modern
+    /// `origins:` map, which no legacy file has. That document had a
+    /// working origin whatever happened to the flat keys, so the test
+    /// passed for years while the case it was named for was broken.
     #[test]
-    fn top_level_unknown_key_compiles_for_v1_compat() {
-        // The archived Go v0.1.x flat schema puts metadata at the top
-        // level; schema-v1 compat tolerates those (they only warn), so
-        // the config still compiles.
+    fn flat_schema_v1_document_is_refused_with_the_go_deprecation() {
         let yaml = r#"
 config_version: 2
 id: "legacy-1"
 hostname: "api.example.com"
+workspace_id: "ws-1"
 version: "1.0"
+action:
+  type: proxy
+  url: https://test.sbproxy.dev
+authentication:
+  type: api_key
+  api_keys:
+    - legacy-key-001
+"#;
+        let err = compile_config(yaml)
+            .err()
+            .expect("a flat Go v0.1.x document must not compile into an empty proxy");
+        let message = format!("{err:#}");
+
+        // Read the refused keys out of the message rather than asking
+        // whether each name appears somewhere in it. The prose that
+        // follows the list mentions `hostname` on its own account, so a
+        // whole-message `contains` would report a pass for a key the
+        // refusal never named.
+        let (_, tail) = message
+            .split_once("carry origin behavior: ")
+            .expect("refusal carries its key list");
+        let (list, _) = tail.split_once('.').expect("key list is terminated");
+        let refused: Vec<&str> = list.split(',').map(str::trim).collect();
+
+        assert_eq!(
+            refused,
+            ["action", "authentication", "hostname"],
+            "refusal must name every dropped behavior key and nothing else: {message}"
+        );
+        for metadata in ["config_version", "id", "workspace_id", "version"] {
+            assert!(
+                !refused.contains(&metadata),
+                "`{metadata}` is descriptive and must not be refused: {message}"
+            );
+        }
+        assert!(
+            message.contains("sbproxy-go"),
+            "refusal must point at the Go binary for operators staying on the old config: \
+             {message}"
+        );
+        assert!(
+            message.contains("MIGRATION.md"),
+            "refusal must point at MIGRATION.md for the current shape: {message}"
+        );
+    }
+
+    /// The other side of the split, and the reason it is a split rather
+    /// than a blanket refusal: WOR-1140's warn-on-unknown-top-level-key
+    /// behavior is unrelated to the Go deprecation and has to survive it.
+    /// A modern config that still carries the descriptive leftovers from
+    /// a Go-era file boots, because dropping them changes nothing.
+    #[test]
+    fn modern_document_with_leftover_go_metadata_still_compiles() {
+        let yaml = r#"
+config_version: 2
+id: "legacy-1"
+workspace_id: "ws-1"
 proxy:
   http_bind_port: 8080
 origins:
@@ -6655,9 +6792,11 @@ origins:
       type: proxy
       url: https://test.sbproxy.dev
 "#;
+        let compiled = compile_config(yaml)
+            .expect("descriptive top-level leftovers only warn; they must not fail the compile");
         assert!(
-            compile_config(yaml).is_ok(),
-            "top-level v1-compat metadata keys must still compile"
+            compiled.resolve_origin("api.example.com").is_some(),
+            "the origin declared under `origins:` still resolves"
         );
     }
 
@@ -10486,8 +10625,7 @@ origins:
 
     /// The asymmetry is deliberate. `true` describes what the block
     /// already does, so the operator who wrote it was not misled and has
-    /// nothing to fix, and the archived schema-v1 fixtures that carry it
-    /// must keep compiling unmodified.
+    /// nothing to fix.
     #[test]
     fn cors_enable_true_still_compiles_because_it_describes_the_build() {
         let yaml = origin_doc(

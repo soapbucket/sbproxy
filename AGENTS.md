@@ -161,7 +161,7 @@ you're working in:
 - `cargo check -p <crate>` - single-crate type check, ~1-5s
 - `cargo test -p <crate> --lib <prefix>` - unit tests by name prefix
 - `cargo test -p sbproxy-config --tests` - config tests + example +
-  v1-compat sweep, ~3s
+  v1-compat refusal sweep, ~3s
 - `cargo test -p sbproxy-modules --lib <policy_name>` - per-policy
   unit tests
 - `cargo test -p sbproxy-e2e --release --test <name>` - one e2e test
@@ -620,12 +620,17 @@ and is archived at [`soapbucket/sbproxy-go`](https://github.com/soapbucket/sbpro
 See `MIGRATION.md` for upgrade guidance.
 
 The internal config schema is independently versioned and is referred
-to as `schema-v1`; the same schema is supported by both the Go
-`v0.1.x` line and the Rust `v1.x` line. The compatibility promise is
-pinned by the `v1_compat::v1_fixtures_compile_unmodified` test in
-`crates/sbproxy-config/`. Do not conflate `schema-v1` with binary
-`v1.0`; the schema label predates this rename and is intentionally
-unchanged.
+to as `schema-v1`. Key names and their meanings carry over from the Go
+`v0.1.x` line; the file's shape does not. Go compatibility is
+deprecated (WOR-2706): the Rust line reads origin behavior only from
+`origins.<hostname>:` and never translated the Go line's flat
+single-origin file into it, so a flat file is refused with a message
+naming `sbproxy-go` rather than compiled into a proxy with no origin
+at all. `crates/sbproxy-config/tests/v1_compat.rs` pins that refusal
+against the archived fixtures. Descriptive top-level leftovers (`id`,
+`config_version`, `workspace_id`) still only warn. Do not conflate
+`schema-v1` with binary `v1.0`; the schema label predates this rename
+and is intentionally unchanged.
 
 ## Cutting a new version
 
