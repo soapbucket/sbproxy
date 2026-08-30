@@ -77,18 +77,27 @@ DISTROLESS_FILES=(
   .github/workflows/release.yml
 )
 
-# A COPY instruction whose last path is /var/lib/sbproxy. Comments are
-# ignored. Matches both `COPY --from=builder --chown=65532:65532
-# /var/lib/sbproxy /var/lib/sbproxy` and the release.yml form
+# A COPY in the runtime stage (after the last FROM) whose destination
+# is /var/lib/sbproxy and that names --chown=65532:65532. Comments are
+# ignored. The chown is the WOR-2087 property: uid 65532 cannot write
+# a root-owned directory. Matches both
+# `COPY --from=builder --chown=65532:65532 /var/lib/sbproxy /var/lib/sbproxy`
+# and the release.yml form
 # `COPY --chown=65532:65532 var/lib/sbproxy /var/lib/sbproxy`.
-VARLIB_COPY_RE='^[[:space:]]*COPY[[:space:]].+[[:space:]]/var/lib/sbproxy[[:space:]]*$'
+VARLIB_COPY_RE='^[[:space:]]*COPY[[:space:]].*--chown=65532:65532[[:space:]].+[[:space:]]/var/lib/sbproxy[[:space:]]*$'
 
 # A FROM line that still names the debian12 distroless tag. Comments
 # that mention the old tag do not match.
 DEBIAN12_FROM_RE='^[[:space:]]*FROM[[:space:]].*cc-debian12'
 
+# Lines from the last FROM through EOF: the runtime stage. A COPY only
+# in the builder stage does not provision the image that runs.
+runtime_stage() {
+  awk '/^[[:space:]]*FROM/{buf=""} {buf=buf $0 ORS} END{printf "%s", buf}' "$1"
+}
+
 has_varlib_copy() {
-  grep -E "$VARLIB_COPY_RE" "$1" >/dev/null
+  runtime_stage "$1" | grep -E "$VARLIB_COPY_RE" >/dev/null
 }
 
 has_debian12_from() {
@@ -223,6 +232,45 @@ EOF
 EOF
   expect "worker without the COPY is refused" 1 scan_tree "$scratch/worker-gap"
 
+  # A runtime COPY without --chown=65532:65532 is WOR-2087 again:
+  # nonroot uid 65532 cannot write a root-owned /var/lib/sbproxy.
+  mkdir -p "$scratch/no-chown/.github/workflows"
+  cat >"$scratch/no-chown/Dockerfile.ci" <<'EOF'
+FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
+COPY --from=builder /var/lib/sbproxy /var/lib/sbproxy
+EOF
+  cp "$scratch/no-chown/Dockerfile.ci" "$scratch/no-chown/Dockerfile.gateway"
+  cp "$scratch/no-chown/Dockerfile.ci" "$scratch/no-chown/Dockerfile.cloudbuild"
+  cat >"$scratch/no-chown/Dockerfile.worker" <<'EOF'
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04 AS runtime
+COPY --from=builder --chown=65532:65532 /var/lib/sbproxy /var/lib/sbproxy
+EOF
+  cat >"$scratch/no-chown/.github/workflows/release.yml" <<'EOF'
+          FROM gcr.io/distroless/cc-debian13:nonroot
+          COPY --chown=65532:65532 var/lib/sbproxy /var/lib/sbproxy
+EOF
+  expect "a runtime COPY without chown is refused" 1 scan_tree "$scratch/no-chown"
+
+  # A builder-only COPY does not provision the runtime image.
+  mkdir -p "$scratch/builder-only/.github/workflows"
+  cat >"$scratch/builder-only/Dockerfile.ci" <<'EOF'
+FROM rust:1.95-bookworm AS builder
+COPY --from=elsewhere --chown=65532:65532 /var/lib/sbproxy /var/lib/sbproxy
+FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
+COPY --from=builder /usr/local/bin/sbproxy /usr/local/bin/sbproxy
+EOF
+  cp "$scratch/builder-only/Dockerfile.ci" "$scratch/builder-only/Dockerfile.gateway"
+  cp "$scratch/builder-only/Dockerfile.ci" "$scratch/builder-only/Dockerfile.cloudbuild"
+  cat >"$scratch/builder-only/Dockerfile.worker" <<'EOF'
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04 AS runtime
+COPY --from=builder --chown=65532:65532 /var/lib/sbproxy /var/lib/sbproxy
+EOF
+  cat >"$scratch/builder-only/.github/workflows/release.yml" <<'EOF'
+          FROM gcr.io/distroless/cc-debian13:nonroot
+          COPY --chown=65532:65532 var/lib/sbproxy /var/lib/sbproxy
+EOF
+  expect "a builder-only COPY is refused" 1 scan_tree "$scratch/builder-only"
+
   # The tree this change lands: COPY everywhere, debian13 on distroless,
   # worker still on CUDA.
   mkdir -p "$scratch/good/.github/workflows"
@@ -250,7 +298,7 @@ EOF
     echo "self-test failed: the detector is narrower than the gap" >&2
     return 1
   fi
-  echo "self-test passed: pre-fix tree refused, comment ignored, worker COPY required, fixed tree passes"
+  echo "self-test passed: pre-fix tree refused, comment ignored, worker COPY required, no-chown refused, builder-only refused, fixed tree passes"
   return 0
 }
 
