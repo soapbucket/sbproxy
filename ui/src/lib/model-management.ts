@@ -31,17 +31,18 @@ export interface DeploymentFormDraft {
   model: string;
   variant: string;
   heterogeneousVariants: boolean;
-  replicas: string;
+  replicas: string | number;
   requiredLabels: string;
   spreadBy: string;
   pull: ModelDeployment["pull"];
   warm: boolean;
-  keepAliveSecs: string;
-  maxConcurrency: string;
-  maxQueueDepth: string;
-  queueTimeoutMs: string;
+  keepAliveSecs: string | number;
+  maxConcurrency: string | number;
+  maxQueueDepth: string | number;
+  queueTimeoutMs: string | number;
   engine: ModelDeployment["engine"];
   rollout: ModelDeployment["rollout"];
+  coldStart: ModelDeployment["cold_start"];
   licenseAcknowledged: boolean;
 }
 
@@ -268,6 +269,7 @@ export function deploymentDefaults(
     queue_timeout_ms: 30_000,
     engine: "auto",
     rollout: "rolling",
+    cold_start: "wait",
   };
 }
 
@@ -300,6 +302,7 @@ function deploymentToFormDraft(
     queueTimeoutMs: String(deployment.queue_timeout_ms),
     engine: deployment.engine,
     rollout: deployment.rollout,
+    coldStart: deployment.cold_start,
     licenseAcknowledged: false,
   };
 }
@@ -326,12 +329,12 @@ const DEPLOYMENT_ID_PATTERN = /^[A-Za-z0-9._-]+$/;
 const LABEL_KEY_PATTERN = /^[A-Za-z0-9._/-]+$/;
 
 function parseBoundedInteger(
-  raw: string,
+  raw: string | number,
   field: DeploymentFormField,
   errors: Partial<Record<DeploymentFormField, string>>,
   bounds: { minimum: number; maximum: number; optional?: boolean },
 ): number | null {
-  const value = raw.trim();
+  const value = String(raw ?? "").trim();
   if (!value && bounds.optional) return null;
   if (!/^\d+$/.test(value)) {
     errors[field] = "Enter a whole number.";
@@ -546,6 +549,7 @@ export function parseDeploymentForm(
         queue_timeout_ms: queueTimeoutMs as number,
         engine: draft.engine,
         rollout: draft.rollout,
+        cold_start: draft.coldStart,
       },
     },
   };

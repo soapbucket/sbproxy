@@ -200,6 +200,7 @@ const ERROR_ORDER: DeploymentFormField[] = [
   "maxConcurrency",
   "maxQueueDepth",
   "queueTimeoutMs",
+  "coldStart",
   "licenseAcknowledged",
 ];
 
@@ -214,6 +215,7 @@ const CONTROL_IDS: Partial<Record<DeploymentFormField, string>> = {
   maxConcurrency: "deployment-max-concurrency",
   maxQueueDepth: "deployment-max-queue-depth",
   queueTimeoutMs: "deployment-queue-timeout",
+  coldStart: "deployment-cold-start",
   licenseAcknowledged: "license-acknowledgement",
 };
 const validationErrors = computed(() =>
@@ -378,7 +380,7 @@ function comparisonCue(conflict: DeploymentConflictState): string {
               <span class="sb-label">Replicas</span>
               <input
                 id="deployment-replicas"
-                v-model="draft.replicas"
+                v-model.number="draft.replicas"
                 class="sb-input"
                 type="number"
                 min="1"
@@ -468,6 +470,18 @@ function comparisonCue(conflict: DeploymentConflictState): string {
                 <option value="recreate">Recreate</option>
               </select>
             </label>
+            <label class="sb-field">
+              <span class="sb-label">Cold start</span>
+              <select
+                id="deployment-cold-start"
+                v-model="draft.coldStart"
+                class="sb-select"
+              >
+                <option value="wait">Wait</option>
+                <option value="reject">Reject</option>
+                <option value="fallback">Fallback</option>
+              </select>
+            </label>
           </div>
 
           <label class="check-row">
@@ -483,7 +497,7 @@ function comparisonCue(conflict: DeploymentConflictState): string {
               <span class="sb-label">Keep-alive seconds</span>
               <input
                 id="deployment-keep-alive"
-                v-model="draft.keepAliveSecs"
+                v-model.number="draft.keepAliveSecs"
                 class="sb-input"
                 type="number"
                 min="0"
@@ -500,7 +514,7 @@ function comparisonCue(conflict: DeploymentConflictState): string {
               <span class="sb-label">Max concurrency</span>
               <input
                 id="deployment-max-concurrency"
-                v-model="draft.maxConcurrency"
+                v-model.number="draft.maxConcurrency"
                 class="sb-input"
                 type="number"
                 min="1"
@@ -517,7 +531,7 @@ function comparisonCue(conflict: DeploymentConflictState): string {
               <span class="sb-label">Max queue depth</span>
               <input
                 id="deployment-max-queue-depth"
-                v-model="draft.maxQueueDepth"
+                v-model.number="draft.maxQueueDepth"
                 class="sb-input"
                 type="number"
                 min="0"
@@ -533,7 +547,7 @@ function comparisonCue(conflict: DeploymentConflictState): string {
               <span class="sb-label">Queue timeout milliseconds</span>
               <input
                 id="deployment-queue-timeout"
-                v-model="draft.queueTimeoutMs"
+                v-model.number="draft.queueTimeoutMs"
                 class="sb-input"
                 type="number"
                 min="1"

@@ -348,6 +348,7 @@ describe("model management presentation", () => {
       queue_timeout_ms: 30_000,
       engine: "auto",
       rollout: "rolling",
+      cold_start: "wait",
     });
     expect(Object.getPrototypeOf(deployment.required_labels)).toBeNull();
   });
@@ -375,6 +376,7 @@ describe("model management presentation", () => {
       queueTimeoutMs: "30000",
       engine: "auto",
       rollout: "rolling",
+      coldStart: "wait",
       licenseAcknowledged: false,
     });
   });
@@ -394,6 +396,7 @@ describe("model management presentation", () => {
       queue_timeout_ms: 5000,
       engine: "vllm" as const,
       rollout: "recreate" as const,
+      cold_start: "fallback" as const,
     };
 
     expect(deploymentFormFromDeployment("cluster-qwen", deployment)).toEqual(
@@ -408,6 +411,7 @@ describe("model management presentation", () => {
         maxConcurrency: "4",
         maxQueueDepth: "64",
         queueTimeoutMs: "5000",
+        coldStart: "fallback",
         licenseAcknowledged: false,
       }),
     );
@@ -456,6 +460,72 @@ describe("model management presentation", () => {
         },
       },
     });
+  });
+
+  // WOR-2702: admin PUT StrictModelDeployment requires cold_start; the form
+  // payload must always emit it (seeded default + parse path).
+  it("always emits cold_start on a fresh Add-deployment parse payload", () => {
+    const draft = deploymentFormDefaults("fresh", "model", "q4_k_m");
+    const result = parseDeploymentForm(draft, {
+      requireLicenseAcknowledgement: false,
+      existingDeploymentIds: [],
+      catalog: {
+        schema_version: 1,
+        catalog_revision: "catalog-v2",
+        models: { model: catalogEntry() },
+      },
+    });
+
+    expect(result.value).not.toBeNull();
+    expect(result.value?.deployment).toHaveProperty("cold_start");
+    expect(
+      (result.value?.deployment as { cold_start?: string }).cold_start,
+    ).toBe("wait");
+    expect(draft).toHaveProperty("coldStart");
+  });
+
+  // WOR-2703: Vue casts type=number v-model values to number on input; the
+  // parser must accept those without calling .trim on a non-string.
+  it("accepts number-typed admission fields that Vue number inputs assign", () => {
+    const draft = deploymentFormDefaults("numeric", "model", "q4_k_m");
+    Object.assign(draft, {
+      replicas: 2 as unknown as string,
+      keepAliveSecs: 600 as unknown as string,
+      maxConcurrency: 4 as unknown as string,
+      maxQueueDepth: 64 as unknown as string,
+      queueTimeoutMs: 5000 as unknown as string,
+    });
+
+    expect(() =>
+      parseDeploymentForm(draft, {
+        requireLicenseAcknowledgement: false,
+        existingDeploymentIds: [],
+        catalog: {
+          schema_version: 1,
+          catalog_revision: "catalog-v2",
+          models: { model: catalogEntry() },
+        },
+      }),
+    ).not.toThrow();
+
+    const result = parseDeploymentForm(draft, {
+      requireLicenseAcknowledgement: false,
+      existingDeploymentIds: [],
+      catalog: {
+        schema_version: 1,
+        catalog_revision: "catalog-v2",
+        models: { model: catalogEntry() },
+      },
+    });
+    expect(result.value?.deployment).toEqual(
+      expect.objectContaining({
+        replicas: 2,
+        keep_alive_secs: 600,
+        max_concurrency: 4,
+        max_queue_depth: 64,
+        queue_timeout_ms: 5000,
+      }),
+    );
   });
 
   it("rejects cluster-only placement intent in local admin mode", () => {

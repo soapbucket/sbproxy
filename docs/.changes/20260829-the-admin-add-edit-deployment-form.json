@@ -1,0 +1,4 @@
+{
+  "type": "fixed",
+  "message": "The admin Add/Edit deployment form now sends `cold_start` (default `wait`), numeric fields no longer crash submit after typing, and a text-selection drag that ends on the modal backdrop no longer dismisses the dialog."
+}

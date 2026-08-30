@@ -51,6 +51,17 @@ describe("model management component contracts", () => {
     expect(evidence).toContain('aria-describedby="license-acknowledgement-description license-acknowledgement-error"');
   });
 
+  // WOR-2702: Runtime policy must expose cold_start; without it admin_managed
+  // PUT always 400s with missing field `cold_start`.
+  it("exposes a cold_start Runtime policy control on Add/Edit deployment", () => {
+    const modal = source("ModelDeploymentModal.vue");
+    expect(modal).toMatch(/[Cc]old start/);
+    expect(modal).toContain("draft.coldStart");
+    expect(modal).toMatch(/value=["']wait["']/);
+    expect(modal).toMatch(/value=["']reject["']/);
+    expect(modal).toMatch(/value=["']fallback["']/);
+  });
+
   it("uses row headers and deployment-specific action names", () => {
     const table = source("ModelDeploymentTable.vue");
     expect(table).toContain('<th scope="row">');
