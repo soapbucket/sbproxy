@@ -1,6 +1,6 @@
 # SBproxy events
 
-*Last modified: 2026-08-27*
+*Last modified: 2026-08-29*
 
 SBproxy hands a SIEM three different things, and this page is the map of how they fit together: typed proxy events (the `events:` block, a closed set of twenty-three), decision-audit records (`observability.log.decision_audit`, twenty pipeline decisions normalized to OCSF), and four audit channels that write to their own tracing targets (`security_audit`, `config_audit`, `key_audit`, and the admin action ring). Two of those four, `security_audit` and `config_audit`, can additionally be hash-chained and Ed25519-signed for tamper evidence.
 
@@ -266,7 +266,9 @@ Any 2xx is success. Anything else drops the batch and counts it.
 
 The batch carries an HMAC signature over its own body, so where that body ends up is a security question rather than a routing one. Four rules decide it, and all four are enforced on every batch rather than once at boot.
 
-The URL goes through the SSRF guard at boot and again before every batch, so a collector hostname that starts resolving to a private address stops being posted to rather than becoming an internal probe.
+The URL goes through the SSRF guard at boot and again before every batch, so a collector hostname that starts resolving to a private address stops being posted to rather than becoming an internal probe. `egress.usage_sinks.allow_private: true` plus a host in `egress.usage_sinks.hosts` exempts those hostnames from the private-address block. Without that pair the guard still runs and still refuses private and loopback collectors.
+
+The events webhook destination and that SSRF allowlist are taken at boot. `install_event_egress` is set-once, so a SIGHUP cannot newly permit a private collector that was refused at start. Restart the process after adding `allow_private` or a listed host if the current `events.url` was refused on the previous start.
 
 **The dial is pinned to the addresses that check resolved.** The guard resolves the hostname and the connection goes to that answer, not to a second lookup the HTTP client runs for itself. A DNS answer that changes between the check and the connect cannot steer the batch anywhere, because the connect was never going to ask again.
 
