@@ -61,9 +61,32 @@ impl OnnxCatBoostScorer {
     /// `probability_tensor` output instead.
     pub fn load(model_path: impl AsRef<Path>) -> Result<Self> {
         let model_path = model_path.as_ref();
-        let model = tract_onnx::onnx()
-            .model_for_path(model_path)
-            .with_context(|| format!("failed to parse ONNX model at {model_path:?}"))?
+        // Parse the protobuf, then translate it with no model directory in the
+        // parsing context. `model_for_path` hands tract the model's own
+        // directory, which is what GHSA-h668-6x6g-f8r5 resolves an
+        // attacker-chosen `external_data` `location` against: up to and
+        // including 0.21.16 that resolution was
+        // `PathBuf::from(dir).join(location)` with no
+        // containment check, so an absolute path or a `..` walk read any file
+        // the proxy user can open. `model_for_proto_model` passes no
+        // directory, which is the state ONNX reserves for "external data
+        // cannot be resolved", and tract refuses there. The operator supplies
+        // this model file, so its bytes are not ours to trust.
+        //
+        // Unlike `sbproxy-classifiers`, this crate does not also run the
+        // explicit `reject_external_tensor_data` walk: it is a foundational
+        // crate whose only heavy dependency is the runtime itself, and taking
+        // a dependency on the classifier crate to share one function would
+        // pull tonic, reqwest, and the AI stack into it.
+        // `scripts/check-onnx-model-loaders.sh` is what keeps this call site
+        // in the two-step shape.
+        let onnx = tract_onnx::onnx();
+        let model_proto = onnx
+            .proto_model_for_path(model_path)
+            .with_context(|| format!("failed to parse ONNX model at {model_path:?}"))?;
+        let model = onnx
+            .model_for_proto_model(&model_proto)
+            .context("failed to translate ONNX model")?
             .into_optimized()
             .context("failed to optimise ONNX model")?
             .into_runnable()

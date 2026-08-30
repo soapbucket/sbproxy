@@ -8860,6 +8860,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arc-swap",
+ "prost 0.11.9",
  "regex",
  "sbproxy-tls",
  "serde",

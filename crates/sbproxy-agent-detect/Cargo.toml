@@ -31,8 +31,16 @@ sbproxy-tls = { path = "../sbproxy-tls" }
 sha2 = { workspace = true }
 # Slice 9 (WOR-592): pure-Rust ONNX runtime for the CatBoost JA4
 # scorer. Same engine/version as `sbproxy-classifiers`, avoiding the
-# system ONNX Runtime dependency in proxy binaries.
+# system ONNX Runtime dependency in proxy binaries. Held at 0.21 with
+# `sbproxy-classifiers` and `sbproxy-modules`; the advisories against this
+# line and why the bump is blocked are documented on that crate's
+# declaration and in deny.toml. Keep the three in step.
 tract-onnx = "0.21"
 
 [dev-dependencies]
 tempfile = "3"
+# Builds the malicious ONNX fixture in `tests/external_data_refusal.rs`
+# by encoding a `tract_onnx::pb::ModelProto`. Pinned to the prost major
+# `tract-onnx` 0.21 generates against, so the encoder and the decoder
+# under test share one `Message` trait.
+prost_011 = { package = "prost", version = "0.11" }

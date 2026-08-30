@@ -2944,6 +2944,13 @@ as a no-op.
 | `scope` | enum | `last_user_message` | `last_user_message` or `full_text`. |
 | `max_chars` | int | `2000` | Character cap applied to request subjects and centroid examples before tokenization. Must be above zero. |
 
+Every ONNX path in this document names a file the proxy parses in its own
+address space, and a model is a program rather than data. A model that keeps
+its tensors in a separate file (ONNX `external_data`) is refused before any
+file is opened, because the runtime resolves that reference against a path
+the model itself chooses. See
+[What a model file may not do](model-pinning.md#what-a-model-file-may-not-do).
+
 The root JSON schema keeps each origin's `action` as raw JSON because actions
 are module-registry values, so editor completion cannot enumerate this nested
 table. The guardrail pipeline compiler parses and validates the classifier
@@ -4512,7 +4519,7 @@ policies:
 | `detector_config.model_signature_path` | path | none | Optional detached Ed25519 signature over the model SHA-256 digest. Configure with tokenizer signature and public key. |
 | `detector_config.tokenizer_signature_path` | path | none | Optional detached Ed25519 signature over the tokenizer digest. |
 | `detector_config.signature_public_key` | string | none | Ed25519 key as 64 hex characters or a `PUBLIC KEY` PEM block. All three signature fields are required together. |
-| `detector_config.max_model_bytes` | integer | `209715200` | Model size budget checked before parsing. |
+| `detector_config.max_model_bytes` | integer | `209715200` | Model size budget checked before parsing. The budget measures the `.onnx` file; a model that points at tensors in another file is refused rather than sized. See [What a model file may not do](model-pinning.md#what-a-model-file-may-not-do). |
 | `detector_config.max_tokenizer_bytes` | integer | `209715200` | Tokenizer size budget checked before parsing. |
 | `detector_config.max_concurrent` | integer | `2` | Running in-process evaluations. Must be in `1..=64`. |
 | `detector_config.max_queued` | integer | `16` | Waiting in-process evaluations. Must be in `1..=1024`; later work is refused as `queue_full`. |

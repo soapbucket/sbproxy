@@ -99,53 +99,73 @@ ignore = [
   "RUSTSEC-2024-0384",
 
   # RUSTSEC-2024-0436: paste 1.0.15. Paths: paste -> tract-* -> tract-onnx
-  # (direct dep) and paste -> tokenizers (direct dep), both via
-  # sbproxy-classifiers. Unmaintained, no maintained replacement reachable;
-  # transitive; revisit when tract-onnx and tokenizers update.
+  # (direct dep) and paste -> macro_rules_attribute -> tokenizers (direct
+  # dep). Unmaintained, no maintained replacement reachable; transitive;
+  # revisit when tract-onnx and tokenizers update. The tract path would
+  # disappear on tract 0.22, which uses the maintained `pastey` fork, but
+  # that bump is blocked (see RUSTSEC-2026-0217 below).
   "RUSTSEC-2024-0436",
 
   # RUSTSEC-2026-0217: tract-nnef 0.21.10, integer overflow in the NNEF
-  # tensor parser on attacker-controlled .dat files. Not reachable here:
-  # sbproxy never parses NNEF. tract loads only our digest-pinned ONNX
-  # artifacts (classifier centroids and the in-process embedding model
-  # fail closed on digest mismatch).
+  # .dat tensor parser on attacker-controlled files.
   #
-  # BLOCKER, re-verified 2026-08-07 (WOR-2039). The old note here said this
-  # was blocked by mistralrs 0.9.0's git-pinned `half`, and that mistralrs
-  # is gone from the tree entirely, so the note read as actionable when it
-  # was not. Someone acted on it and burned the investigation; hence this
-  # rewrite.
+  # NOT REACHABLE, and this is a call-site fact rather than a judgement:
+  # there is no NNEF entry point anywhere in this workspace. `grep -rn
+  # 'nnef\|NNEF' crates/ e2e/` returns nothing. tract-nnef is in the graph
+  # only because tract-onnx depends on it, and every model this process
+  # loads goes through the ONNX path.
   #
-  # The real blocker is now a `libm` conflict, and we introduced it
-  # ourselves. Every in-range fix pins libm exactly, one layer below
-  # tract-onnx itself:
+  # BLOCKED, re-verified 2026-08-29 (WOR-2694) by extracting the .crate
+  # tarballs rather than trusting a summary. Two separate blockers, and the
+  # cheapest way out is the first one:
   #
-  #   tract-data 0.21.16 / 0.21.17  ->  libm =0.2.11   (0.21.10 has no
-  #                                                     libm dep at all)
-  #   cranelift-codegen 0.133.2     ->  libm ^0.2.16
-  #     <- wasmtime 46.0.2 (WOR-2105) <- sbproxy-extension
+  # 0.21.17 is the release to want. It carries the containment fix for the
+  # ONNX external_data read AND the NNEF fix (from 0.21.16), and it has
+  # none of the Gather regression below: its Gather is still the checked
+  # `data_view.get(&*icoords).context("Invalid gather")?`. It is blocked by
+  # exactly one character. tract-data 0.21.17 declares
+  # `libm = "=0.2.11"`, an exact pin, while wasmtime-internal-core needs
+  # `^0.2.16` and this lockfile resolves libm 0.2.16. Drop the `=` and it
+  # resolves. That is the upstream ask: a 0.21.18 patch relaxing one
+  # requirement, which is a far smaller request than the alternative below.
   #
-  # Both are 0.2.x, so cargo must unify them on a single version and no
-  # such version exists; it fails with "failed to select a version for
-  # `libm`". Reproduce with:
+  # 0.22 and 0.23 do resolve, because they already write that requirement
+  # as a caret. They are refused for a different reason.
   #
-  #   cargo update -p tract-onnx --precise 0.21.17
+  # The reason now is a panic regression. tract 0.22 added an unchecked
+  # block-copy fast path to the Gather op (tract-core/src/ops/array/
+  # gather.rs, `can_block_copy`) that indexes a slice directly:
   #
-  # Re-verified against the crates.io index 2026-08-08. Note the pin sits
-  # on tract-data, not tract-onnx, so grepping tract-onnx's own manifest
-  # for libm finds nothing and reads as though the conflict were fixed.
+  #     let input_offset = resolved_index * block_len;
+  #     output_slice[..].clone_from_slice(&input_slice[input_offset..][..block_len]);
   #
-  # The advisory's other patched ranges (>= 0.22.2, >= 0.23.1) are outside
-  # our `tract-onnx = "0.21"` caret pins in sbproxy-classifiers,
-  # sbproxy-modules, and sbproxy-agent-detect, so taking them is a
-  # semver-major bump with a real API delta, not a lockfile change.
+  # 0.21 used a checked `data_view.get(&*icoords).context("Invalid
+  # gather")?` and returned an error. An out-of-range index, which is what
+  # a tokenizer and model whose vocabularies disagree produce, therefore
+  # panics on 0.22 where it used to fail cleanly. Two tests catch it:
+  # prompt_injection_v2::body_aware::tests::{configured_composite_failure_
+  # is_retried_and_never_cached, classification_cache_isolates_real_
+  # inprocess_configs_with_different_pins}, which assert a typed
+  # DetectionFailureKind::Inference and get ::Worker instead. 0.23.5 has
+  # the same fast path, so it is not an escape either.
   #
-  # Unblocks when tract relaxes its exact libm pin on the 0.21 line, or when
-  # someone takes the 0.22/0.23 bump deliberately. Do NOT retry a plain
-  # `cargo update -p tract-onnx`: without --precise it silently downgrades
-  # unrelated packages (windows-sys 0.61 -> 0.60, itertools 0.13 -> 0.11)
-  # while leaving tract where it was.
-  "RUSTSEC-2026-0217",
+  # Trading an unreachable integer overflow for a panic on the AI request
+  # path is the wrong direction, so the bump is not taken here.
+  #
+  # What is NOT carried: the ONNX external_data arbitrary file read
+  # (GHSA-h668-6x6g-f8r5, see the prose section below) is closed in our own
+  # code as of WOR-2694 and does not depend on this entry.
+  #
+  # EXPIRES 2026-11-30. This is a carry with a deadline, not a permanent
+  # exemption: if no tract release fixes the Gather panic by then, the
+  # decision is reopened rather than renewed silently. cargo-deny 0.19 has
+  # no `expires` field on an ignore entry, so the date lives here and the
+  # reason travels with the id.
+  #
+  # Owner: whoever next touches the classifier stack. Remove this entry when
+  # a tract release carries both the advisory fix and a bounds-checked
+  # Gather, or when the Gather panic is fixed upstream.
+  { id = "RUSTSEC-2026-0217", reason = "tract-nnef NNEF parser overflow; no NNEF call site in this workspace, and 0.22/0.23 regress Gather to a panic on out-of-range indices (WOR-2694); expires 2026-11-30" },
 
   # RUSTSEC-2025-0134: rustls-pemfile 2.2.0. Paths: rustls-pemfile ->
   # pingora-rustls -> pingora-core (direct dep), -> object_store (direct
@@ -220,27 +240,36 @@ ignore = [
 # the only scanner in this repository that sees them; see SUPPLY-CHAIN.md
 # section 4.3.
 #
-# Both entries below were triaged on 2026-08-08. Re-check whether RustSec
-# has since assigned an id (`ls ~/.cargo/advisory-db/crates/<crate>`); if it
-# has, the finding becomes gateable and moves into the `ignore` list above
-# with the same rationale, or gets fixed.
+# The entries below were triaged on 2026-08-08. Re-check whether RustSec has
+# since assigned an id (`ls ~/.cargo/advisory-db/crates/<crate>`); if it has,
+# the finding becomes gateable and moves into the `ignore` list above with the
+# same rationale, or gets fixed.
 #
 # GHSA-h668-6x6g-f8r5 / CVE-2026-55832 (medium): tract-onnx arbitrary file
 # read via an unsanitized ONNX `external_data` `location` field, i.e. path
 # traversal at model-load time. Vulnerable < 0.21.17; we resolve 0.21.10.
-# Blocked by exactly the libm conflict documented under RUSTSEC-2026-0217
-# above (the fix is tract-onnx 0.21.17, which drags in tract-data's
-# `libm =0.2.11`), so the two tract advisories share one unblock condition.
-# Not reachable today. tract only ever opens artifacts an operator named:
-# `agent_detect.onnx_model_path` and the classifier `model_path` are local
-# filesystem paths from `sb.yml`, and the downloaded model is the
-# sha256-pinned `all-MiniLM-L6-v2` entry in
-# crates/sbproxy-classifiers/src/known_models.rs. The digest-verified path
-# is stronger still: `OnnxEmbedder::load_from_bytes_with_options` calls
-# tract's `model_for_read`, which has no model directory to resolve
-# external tensor files against and rejects such models during parsing
-# rather than reopening a path. An attacker who could substitute the .onnx
-# file already has write access to the operator's model directory.
+#
+# FIXED IN OUR CODE 2026-08-29 (WOR-2694), not carried and not deferred.
+# `sbproxy_classifiers::reject_external_tensor_data` refuses any model that
+# declares external tensor data, and every ONNX loader in the workspace
+# translates the parsed protobuf with no model directory in the parsing
+# context, which is the state tract itself treats as "external data cannot be
+# resolved". `scripts/check-onnx-model-loaders.sh` fails the build if any
+# crate goes back to the one-shot `model_for_path` / `model_for_read`.
+# See crates/sbproxy-classifiers/src/onnx_external_data.rs and
+# docs/model-pinning.md.
+#
+# The reachability note that used to sit here claimed an attacker who could
+# substitute the .onnx file already had write access to the operator's model
+# directory. That was wrong, and it is why this was fixed rather than
+# re-dated: operators point sbproxy at models they did not author, so the
+# bytes of that field are attacker-controlled without any host access at all.
+#
+# This entry stays as a comment rather than moving to the `ignore` list
+# because it has no RUSTSEC id for cargo-deny to match. Dependabot will keep
+# reporting it against the 0.21 line until the version moves, which is
+# blocked on the Gather panic documented under RUSTSEC-2026-0217 above. The
+# vector it describes is closed regardless of that version.
 #
 # GHSA-w9wp-h8wv-79jx / CVE-2026-48504 (medium): opentelemetry_sdk unbounded
 # memory allocation in W3C Baggage propagation. Vulnerable <= 0.32.0; we

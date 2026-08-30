@@ -65,6 +65,7 @@ pub mod agent_class;
 pub mod agent_classifier_types;
 pub mod judge_rpc;
 pub mod known_models;
+pub mod onnx_external_data;
 
 mod default_centroids;
 mod embedder;
@@ -90,6 +91,7 @@ pub use judge_rpc::{
     DEFAULT_BUDGET_TOKENS,
 };
 pub use known_models::{lookup as lookup_known_model, KnownModel, KNOWN_MODELS};
+pub use onnx_external_data::reject_external_tensor_data;
 
 use std::fs;
 use std::io::{Read, Write};
@@ -460,9 +462,20 @@ impl OnnxClassifier {
         // process. `into_optimized()` runs the graph optimiser once at
         // load; `into_runnable()` wraps it in a SimplePlan we can call
         // `run` on.
-        let model = tract_onnx::onnx()
-            .model_for_path(model_path)
-            .with_context(|| format!("failed to parse ONNX model at {model_path:?}"))?
+        // Parse, refuse external tensor data, then translate. `model_for_path`
+        // would do all three in one call and hand tract the model's own
+        // directory, which is the state GHSA-h668-6x6g-f8r5 turns into an
+        // arbitrary file read. `model_for_proto_model` passes no directory, so
+        // tract refuses external data on its own even if the walk above ever
+        // misses a tensor.
+        let onnx = tract_onnx::onnx();
+        let model_proto = onnx
+            .proto_model_for_path(model_path)
+            .with_context(|| format!("failed to parse ONNX model at {model_path:?}"))?;
+        reject_external_tensor_data(&model_proto)?;
+        let model = onnx
+            .model_for_proto_model(&model_proto)
+            .context("failed to translate ONNX model")?
             .into_optimized()
             .context("failed to optimise ONNX model")?
             .into_runnable()

@@ -7,10 +7,7 @@ use tokenizers::normalizers::NormalizerWrapper;
 use tokenizers::pre_tokenizers::metaspace::PrependScheme;
 use tokenizers::pre_tokenizers::PreTokenizerWrapper;
 use tokenizers::{Encoding, PostProcessor, Tokenizer};
-use tract_onnx::pb::{
-    tensor_proto, tensor_shape_proto, type_proto, AttributeProto, GraphProto, ModelProto,
-    NodeProto, SparseTensorProto, TensorProto, ValueInfoProto,
-};
+use tract_onnx::pb::{tensor_proto, tensor_shape_proto, type_proto, ModelProto, ValueInfoProto};
 use tract_onnx::prelude::*;
 
 use crate::{check_size_budget, LoadOptions, RunnableOnnxModel};
@@ -542,91 +539,6 @@ fn keep_probabilities_from_logits(
         .collect()
 }
 
-fn validate_embedded_model_data(model: &ModelProto) -> Result<()> {
-    if let Some(graph) = model.graph.as_ref() {
-        validate_graph_embedded_data(graph)?;
-    }
-    for training in &model.training_info {
-        if let Some(graph) = training.initialization.as_ref() {
-            validate_graph_embedded_data(graph)?;
-        }
-        if let Some(graph) = training.algorithm.as_ref() {
-            validate_graph_embedded_data(graph)?;
-        }
-    }
-    for function in &model.functions {
-        validate_nodes_embedded_data(&function.node)?;
-    }
-    Ok(())
-}
-
-fn validate_graph_embedded_data(graph: &GraphProto) -> Result<()> {
-    for tensor in &graph.initializer {
-        validate_tensor_embedded_data(tensor)?;
-    }
-    for tensor in &graph.sparse_initializer {
-        validate_sparse_tensor_embedded_data(tensor)?;
-    }
-    validate_nodes_embedded_data(&graph.node)
-}
-
-fn validate_nodes_embedded_data(nodes: &[NodeProto]) -> Result<()> {
-    for node in nodes {
-        for attribute in &node.attribute {
-            validate_attribute_embedded_data(attribute)?;
-        }
-    }
-    Ok(())
-}
-
-fn validate_attribute_embedded_data(attribute: &AttributeProto) -> Result<()> {
-    if let Some(tensor) = attribute.t.as_ref() {
-        validate_tensor_embedded_data(tensor)?;
-    }
-    for tensor in &attribute.tensors {
-        validate_tensor_embedded_data(tensor)?;
-    }
-    if let Some(tensor) = attribute.sparse_tensor.as_ref() {
-        validate_sparse_tensor_embedded_data(tensor)?;
-    }
-    for tensor in &attribute.sparse_tensors {
-        validate_sparse_tensor_embedded_data(tensor)?;
-    }
-    if let Some(graph) = attribute.g.as_ref() {
-        validate_graph_embedded_data(graph)?;
-    }
-    for graph in &attribute.graphs {
-        validate_graph_embedded_data(graph)?;
-    }
-    Ok(())
-}
-
-fn validate_sparse_tensor_embedded_data(tensor: &SparseTensorProto) -> Result<()> {
-    if let Some(values) = tensor.values.as_ref() {
-        validate_tensor_embedded_data(values)?;
-    }
-    if let Some(indices) = tensor.indices.as_ref() {
-        validate_tensor_embedded_data(indices)?;
-    }
-    Ok(())
-}
-
-fn validate_tensor_embedded_data(tensor: &TensorProto) -> Result<()> {
-    let external_location =
-        tensor.data_location == Some(tensor_proto::DataLocation::External as i32);
-    if external_location || !tensor.external_data.is_empty() {
-        let name = if tensor.name.is_empty() {
-            "<unnamed>"
-        } else {
-            &tensor.name
-        };
-        return Err(anyhow!(
-            "ONNX external tensor data is unsupported for token model tensor {name:?}"
-        ));
-    }
-    Ok(())
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TokenModelInput {
     InputIds,
@@ -812,7 +724,7 @@ impl OnnxTokenClassifier {
         let model_proto = onnx
             .proto_model_for_path(model_path)
             .with_context(|| format!("failed to parse ONNX model at {model_path:?}"))?;
-        validate_embedded_model_data(&model_proto)?;
+        crate::reject_external_tensor_data(&model_proto)?;
         validate_token_model_signature(&model_proto)?;
         let model = onnx
             .model_for_proto_model(&model_proto)
