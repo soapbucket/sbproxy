@@ -465,7 +465,9 @@ fn wait_until_serving(
         // Checked before the child's own status: an admin bind that lost
         // its port is logged and then survived, so waiting for an exit
         // that never comes would spend the whole deadline on a condition
-        // one line of stderr already settles.
+        // one line of the captured output already settles. That line is
+        // on stdout, not stderr, which is the distinction the first cut
+        // of this fix got wrong.
         if output.lost_a_port() {
             return Startup::LostAPort;
         }
