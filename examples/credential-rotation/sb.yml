@@ -1,0 +1,91 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Rotating an upstream provider credential with a bounded overlap window.
+#
+# Changing an upstream secret used to be a PATCH overwrite: the instant it
+# landed every request presented the new value, and a value the provider had
+# not activated yet took the deployment down with it. POST
+# /admin/credentials/{id}/rotate installs the new material and keeps the old
+# material usable as a fallback for key_management.crypto.rotation.credential_grace_secs.
+#
+# The new material is what every request uses. The previous material is reached
+# only when the new one will not resolve, and only while the window is open, so
+# a rotation that works never presents the retired secret.
+#
+# Setup:
+#   export SBPROXY_KEY_PEPPER=a-long-random-server-pepper
+#   export SBPROXY_KEY_MASTER=a-long-random-master-key
+#   make run CONFIG=examples/credential-rotation/sb.yml
+#
+# 1. Create the credential (the secret is sealed into an envelope at rest):
+#   curl -s -u admin:admin -X POST http://127.0.0.1:9090/admin/credentials \
+#     -H 'Content-Type: application/json' \
+#     -d '{"id":"cred-openai","name":"openai-prod","provider":"openai","secret":"sk-the-old-one"}'
+#
+# 2. Look at its rotation age. A record that has never been rotated reports the
+#    days since it was created, which is the number to compare against
+#    crypto.rotation.credential_days:
+#   curl -s -u admin:admin http://127.0.0.1:9090/admin/credentials/cred-openai
+#   # { "credential": { "rotated_at": null, "rotation_age_days": 0, ... } }
+#
+# 3. Rotate it with a five-minute overlap:
+#   curl -s -u admin:admin -X POST \
+#     http://127.0.0.1:9090/admin/credentials/cred-openai/rotate \
+#     -H 'Content-Type: application/json' \
+#     -d '{"secret":"sk-the-new-one","grace_secs":300}'
+#   # { "credential": { "rotated_at": "...", "rotation_overlap_expires_at": "..." },
+#   #   "overlap": { "grace_secs": 300, ... } }
+#
+#    Neither secret appears anywhere in that response, or in the audit record,
+#    or in the log line.
+#
+# 4. Rotating a compromised secret? Pass grace_secs: 0 and the old material is
+#    retired at once:
+#   curl -s -u admin:admin -X POST \
+#     http://127.0.0.1:9090/admin/credentials/cred-openai/rotate \
+#     -H 'Content-Type: application/json' \
+#     -d '{"secret":"sk-emergency","grace_secs":0}'
+#
+# 5. Watch the fleet-wide rotation age. Listing publishes the gauge:
+#   curl -s -u admin:admin http://127.0.0.1:9090/admin/credentials >/dev/null
+#   curl -s http://127.0.0.1:9090/metrics | grep sbproxy_key_rotation_age_days
+
+proxy:
+  http_bind_port: 8080
+
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    password: admin
+
+  key_management:
+    enabled: true
+    store:
+      backend: embedded
+      path: /tmp/sbproxy-credential-rotation.redb
+    crypto:
+      pepper: env:SBPROXY_KEY_PEPPER
+      master_key: env:SBPROXY_KEY_MASTER
+      # Named crypto periods. Nothing enforces them; they are the numbers
+      # sbproxy_key_rotation_age_days is alerted against.
+      rotation:
+        inbound_key_days: 90
+        credential_days: 90
+        master_key_days: 365
+        # How long a rotated credential keeps its previous material usable
+        # when the new material will not resolve.
+        credential_grace_secs: 300
+    failure_posture: closed
+
+origins:
+  "openai.local":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          base_url: https://test.sbproxy.dev
+          # Resolved through the key plane per request, so a rotation lands
+          # without a config reload.
+          credential_id: cred-openai
+          models:
+            - gpt-4o-mini

@@ -27,7 +27,7 @@ use sbproxy_config::types::{
     KeyCacheTier, KeyGovernanceConfig, KeyManagementConfig, KeyStoreBackend, SeedCredentialConfig,
     SeedKeyConfig,
 };
-use sbproxy_keystore::crypto::KeyCrypto;
+use sbproxy_keystore::crypto::{KeyCrypto, RootOfTrust as _};
 use sbproxy_keystore::record::{
     CredentialMaterial, CredentialRecord, KeyRecord, RecordBudget, RecordSource, RecordStatus,
 };
@@ -45,6 +45,18 @@ pub struct KeyPlane {
     governance_store: Arc<dyn GovernanceStore>,
     approximate_store: Option<Arc<InMemoryGovernanceStore>>,
     inbound: sbproxy_config::types::KeyInboundConfig,
+    /// WOR-2570: read/access audit settings for credential resolution.
+    read_audit: sbproxy_config::types::KeyReadAuditConfig,
+    /// Last time a read-audit detail record was emitted for each
+    /// credential id, so the detail cadence is bounded per credential
+    /// rather than per request. Holds one `Instant` per credential the
+    /// plane has resolved, which is bounded by credential count.
+    read_audit_last: parking_lot::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    /// WOR-2567: named crypto periods and the credential rotation grace
+    /// window.
+    rotation: sbproxy_config::types::KeyRotationCadenceConfig,
+    /// WOR-2573: break-glass emergency access settings.
+    break_glass: sbproxy_config::types::BreakGlassConfig,
 }
 
 impl KeyPlane {
@@ -114,6 +126,10 @@ impl KeyPlane {
             governance_store,
             approximate_store,
             inbound: sbproxy_config::types::KeyInboundConfig::default(),
+            read_audit: sbproxy_config::types::KeyReadAuditConfig::default(),
+            read_audit_last: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            rotation: sbproxy_config::types::KeyRotationCadenceConfig::default(),
+            break_glass: sbproxy_config::types::BreakGlassConfig::default(),
         }
     }
 
@@ -131,6 +147,72 @@ impl KeyPlane {
     pub(crate) fn with_inbound(mut self, inbound: sbproxy_config::types::KeyInboundConfig) -> Self {
         self.inbound = inbound;
         self
+    }
+
+    /// Attach the read/access audit settings (WOR-2570).
+    pub(crate) fn with_read_audit(
+        mut self,
+        read_audit: sbproxy_config::types::KeyReadAuditConfig,
+    ) -> Self {
+        self.read_audit = read_audit;
+        self
+    }
+
+    /// Attach the break-glass settings (WOR-2573).
+    pub(crate) fn with_break_glass(
+        mut self,
+        break_glass: sbproxy_config::types::BreakGlassConfig,
+    ) -> Self {
+        self.break_glass = break_glass;
+        self
+    }
+
+    /// Attach the named crypto periods and the credential rotation grace
+    /// window (WOR-2567).
+    pub(crate) fn with_rotation(
+        mut self,
+        rotation: sbproxy_config::types::KeyRotationCadenceConfig,
+    ) -> Self {
+        self.rotation = rotation;
+        self
+    }
+
+    /// The default overlap window a credential rotation opens, in seconds
+    /// (WOR-2567).
+    ///
+    /// One accessor per field rather than one that hands out the whole
+    /// block. The config-reader guard proves a key is read by finding a
+    /// typed field access, and a `&KeyRotationCadenceConfig` handed across
+    /// a crate boundary hides every read behind it. Reading each field
+    /// here, where the type is nameable, is what makes "this key is wired"
+    /// checkable rather than asserted.
+    pub fn credential_rotation_grace_secs(&self) -> u64 {
+        self.rotation.credential_grace_secs
+    }
+
+    /// The named crypto period for upstream provider credentials, in days.
+    pub fn credential_crypto_period_days(&self) -> u32 {
+        self.rotation.credential_days
+    }
+
+    /// The named crypto period for inbound virtual keys, in days.
+    pub fn inbound_key_crypto_period_days(&self) -> u32 {
+        self.rotation.inbound_key_days
+    }
+
+    /// The named crypto period for the envelope master key, in days.
+    pub fn master_key_crypto_period_days(&self) -> u32 {
+        self.rotation.master_key_days
+    }
+
+    /// The configured read/access audit settings.
+    pub fn read_audit(&self) -> &sbproxy_config::types::KeyReadAuditConfig {
+        &self.read_audit
+    }
+
+    /// The configured break-glass settings (WOR-2573).
+    pub fn break_glass(&self) -> &sbproxy_config::types::BreakGlassConfig {
+        &self.break_glass
     }
 
     /// Which inbound headers carry a minted key, and whether one is required.
@@ -262,7 +344,17 @@ pub(crate) fn note_key_store_outage(plane: &KeyPlane, entrypoint: &'static str) 
 }
 
 /// An upstream credential resolved into the exact header the proxy writes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is hand-written and redacts, because `value` is the full header
+/// value and `material` is the bare decrypted upstream secret: this type is
+/// the plaintext, not a reference to it. Nothing formats it today, which is
+/// exactly the state every one of this workspace's `Debug` leaks was in the
+/// day before it was formatted. It is the type at the centre of the
+/// customer-managed claim, since `resolved_credentials` is the cache a
+/// failed liveness probe exists to purge, so it gets the same treatment as
+/// the five types in `scripts/secret-debug-registry.txt` and a line of its
+/// own there.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ResolvedCredential {
     /// Lowercase header name to set on the upstream request.
     pub header: String,
@@ -279,6 +371,22 @@ pub struct ResolvedCredential {
     /// site would make every such caller re-derive a fact this
     /// resolution already had.
     pub material: String,
+}
+
+impl std::fmt::Debug for ResolvedCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedCredential")
+            .field("header", &self.header)
+            .field(
+                "value",
+                &format_args!("[REDACTED] ({} bytes)", self.value.len()),
+            )
+            .field(
+                "material",
+                &format_args!("[REDACTED] ({} bytes)", self.material.len()),
+            )
+            .finish()
+    }
 }
 
 /// Why a key's bound credential could not be presented.
@@ -329,6 +437,15 @@ fn rotation_policy() -> sbproxy_vault::RotationPolicy {
     sbproxy_vault::process_rotation()
 }
 
+/// How many credentials the read audit tracks a detail-record window for
+/// (WOR-2570).
+///
+/// A deployment with more distinct credentials than this in one window gets
+/// detail records more often than the configured cadence for the excess,
+/// never fewer. Sized well above what a key plane realistically holds; it
+/// is a bound on a process-lifetime map, not a tuning knob.
+const READ_AUDIT_TRACKED_CREDENTIALS: usize = 4096;
+
 /// One entry in a plane generation's resolved-secret cache: when the value
 /// was resolved, the value itself, and whether the stale-serving episode
 /// this entry is currently in has already been announced.
@@ -351,6 +468,23 @@ fn rotation_policy() -> sbproxy_vault::RotationPolicy {
 struct ResolvedCredentialEntry {
     at: std::time::Instant,
     value: ResolvedCredential,
+    /// Hard ceiling on how long this entry may be served, whatever
+    /// `proxy.secrets.rotation` says (WOR-2568, WOR-2569).
+    ///
+    /// `None` is the ordinary case and means the rotation policy alone
+    /// decides. `Some` is set where holding the material longer would
+    /// break a promise made elsewhere: a customer-managed envelope may
+    /// not be served past the root of trust's stated revocation window,
+    /// and a leased credential may not be served past its lease.
+    ///
+    /// One field rather than two because both are the same statement -
+    /// this plaintext has an expiry the cache did not choose - and
+    /// because a second field is a second thing for the next return path
+    /// to forget. It is applied on both serving paths, the fresh hit and
+    /// the grace-window stale serve, since the stale path is the one that
+    /// would otherwise extend a revocation window by the whole grace
+    /// period.
+    max_hold: Option<std::time::Duration>,
     stale_announced: bool,
     /// The tenant the underlying record was bound to when it resolved,
     /// `None` for a shared credential.
@@ -365,6 +499,44 @@ struct ResolvedCredentialEntry {
 
 type ResolvedCredentialCache =
     parking_lot::Mutex<std::collections::HashMap<String, ResolvedCredentialEntry>>;
+
+/// Why one attempt to open a credential's material failed, and whether the
+/// grace window in `proxy.secrets.rotation` applies to it.
+///
+/// The distinction was previously spelled out at each `return` in
+/// [`KeyPlane::resolve_credential_secret_inner`]; naming it makes the two
+/// classes checkable in one place, which matters now that the rotation
+/// fallback (WOR-2567) is a second consumer of the same classification.
+#[derive(Debug)]
+enum MaterialError {
+    /// A backend blip. The last known-good cached value may still be
+    /// served inside the grace window.
+    Transient(String),
+    /// A fault that will not fix itself while a grace window runs down: a
+    /// master key that no longer opens the envelope, a revoked root of
+    /// trust, material that is not utf-8, a vault-referenced credential
+    /// with no resolver installed. Serving a stale value here would hide a
+    /// rotation or config error behind an availability feature.
+    Permanent(String),
+}
+
+/// How long an entry may actually be served: the rotation policy's own
+/// interval, or the entry's hard ceiling when it has one and that ceiling
+/// is shorter (WOR-2568, WOR-2569).
+///
+/// `min` rather than "the ceiling wins": a deployment that configures a
+/// shorter `re_resolve_interval_secs` than the root of trust's revocation
+/// window should get the shorter one, and a ceiling that lengthened the
+/// hold would be a ceiling in name only.
+fn effective_hold(
+    policy_window: std::time::Duration,
+    max_hold: Option<std::time::Duration>,
+) -> std::time::Duration {
+    match max_hold {
+        Some(ceiling) => policy_window.min(ceiling),
+        None => policy_window,
+    }
+}
 
 /// Whether a credential bound to `record_tenant` may be presented for a
 /// request scoped to `request_tenant`.
@@ -393,10 +565,52 @@ pub fn invalidate_resolved_credential(id: &str) {
     }
 }
 
-/// Drop every cached resolved secret.
-pub fn invalidate_all_resolved_credentials() {
+/// Drop every cached resolved secret. **Test-only.**
+///
+/// It has no production caller and is `#[cfg(test)]` so it cannot acquire
+/// one by accident. Its survival as a `pub` "drop everything" hammer is
+/// exactly what made the liveness-probe test vacuous for a whole round:
+/// the test called this by hand, so it asserted a function that already
+/// worked rather than the arm the round existed to add. The production
+/// purge is [`invalidate_root_backed_resolved_credentials`], which is
+/// scoped, and the arm that calls it is `key_root_of_trust::probe_once`.
+#[cfg(test)]
+pub(crate) fn invalidate_all_resolved_credentials() {
     if let Some(plane) = current_key_plane() {
         plane.invalidate_all_resolved_credentials();
+    }
+}
+
+/// Drop every cached resolved secret that carries an externally imposed
+/// deadline, and leave the rest alone.
+///
+/// This is what a failed root-of-trust liveness probe calls. The
+/// distinction is the whole point, and getting it wrong costs an outage.
+///
+/// An entry's `max_hold` is `Some` exactly when something outside this
+/// cache set its expiry: a customer-managed envelope carrying the time left
+/// on the data key that opened it, or a leased credential carrying its
+/// lease. Every credential the customer's root ever opened is in that set,
+/// so purging it keeps the published clause "or at the next failed liveness
+/// probe" true.
+///
+/// `None` covers plaintext, `vault_ref`, and locally-sealed credentials, and
+/// those are also the entries `proxy.secrets.rotation`'s grace window serves
+/// stale from. Dropping them on a Transit failure would discard the
+/// stale-serve safety net for credentials the customer's root never touched,
+/// and the two outages coincide: a Vault outage usually takes the Transit
+/// mount and the KV backend down together, which is precisely the outage the
+/// grace window exists for. A global purge turns "serve stale inside the
+/// grace window" into a hard fail for the whole process, on the tick of a
+/// probe that has nothing to say about those credentials.
+///
+/// The set is a superset of "root-backed" rather than exactly it, because a
+/// lease has a `Some` too. Over-purging a leased entry costs one re-lease;
+/// under-purging a root-backed one costs the product claim. The superset is
+/// the safe side of that.
+pub fn invalidate_root_backed_resolved_credentials() {
+    if let Some(plane) = current_key_plane() {
+        plane.invalidate_root_backed_resolved_credentials();
     }
 }
 
@@ -406,9 +620,44 @@ impl KeyPlane {
         self.resolved_credentials.lock().remove(id);
     }
 
+    /// How many decrypted upstream credentials this generation is holding.
+    ///
+    /// Exists for the tests that assert a purge actually emptied the cache
+    /// rather than that a function was called: the difference is what
+    /// makes the revocation clause checkable.
+    #[cfg(test)]
+    pub(crate) fn resolved_credential_count(&self) -> usize {
+        self.resolved_credentials.lock().len()
+    }
+
+    /// Whether `id` is currently in the resolved-credential cache.
+    ///
+    /// A count is not enough and that is not a hypothetical. The purge
+    /// test warmed one root-backed entry and one plaintext entry and
+    /// asserted the survivor count was 1, which is equally true when the
+    /// predicate is inverted and exactly the wrong one survives. Nor does
+    /// re-resolving the survivor prove anything: a miss falls through to
+    /// the store, re-opens the material, and re-inserts, so the call
+    /// returns `Ok` whether the entry survived or was rebuilt. Survival
+    /// has to be read off the map by name.
+    #[cfg(test)]
+    pub(crate) fn resolved_credential_is_cached(&self, id: &str) -> bool {
+        self.resolved_credentials.lock().contains_key(id)
+    }
+
     /// Drop every resolved upstream secret from this plane generation.
+    /// Test-only; see the free function of the same name.
+    #[cfg(test)]
     pub(crate) fn invalidate_all_resolved_credentials(&self) {
         self.resolved_credentials.lock().clear();
+    }
+
+    /// Drop the resolved secrets whose expiry was set outside this cache.
+    /// See [`invalidate_root_backed_resolved_credentials`].
+    pub(crate) fn invalidate_root_backed_resolved_credentials(&self) {
+        self.resolved_credentials
+            .lock()
+            .retain(|_, entry| entry.max_hold.is_none());
     }
 
     /// Claim the right to announce one stale-serving episode for `id`.
@@ -486,6 +735,13 @@ impl KeyPlane {
             outcome,
             started.elapsed().as_secs_f64(),
         );
+        // WOR-2570: the read/access audit rides the wrapper rather than
+        // the inner function on purpose. `audit.key_path` answers who
+        // *changed* a credential; this answers who *read* one, and a read
+        // that was served from cache is still a use of the material. So
+        // the counter is as wide as the histogram, every return path
+        // included, and only the chained detail record is rate limited.
+        self.record_credential_read(id, tenant_id, outcome, cache_layer);
         result
     }
 
@@ -521,6 +777,282 @@ impl KeyPlane {
             .map(|resolved| resolved.material)
     }
 
+    /// Open the previous material of a credential that was rotated inside
+    /// the overlap window (WOR-2567).
+    ///
+    /// Returns `None` when the record was never rotated, when the window
+    /// has closed, or when the previous material will not open either.
+    /// Never called before the current material has already failed, so a
+    /// successful rotation never presents the retired secret.
+    ///
+    /// The overlap is announced once per resolution rather than counted
+    /// silently: presenting a retired provider key is a fact an operator
+    /// wants in front of them while the rotation is still reversible, and
+    /// a rotation that stays in overlap is one where the new key never
+    /// went live at the provider.
+    async fn open_rotation_grace_material(
+        &self,
+        record: &CredentialRecord,
+    ) -> Option<(String, &'static str, Option<std::time::Duration>)> {
+        let now = Utc::now();
+        let previous = record.usable_prev_material(now)?;
+        let (secret, _, ceiling) = self.open_material(&record.id, previous).await.ok()?;
+        let expires_in = record
+            .prev_material_expires_at
+            .map(|at| (at - now).num_seconds().max(0))
+            .unwrap_or_default();
+        tracing::warn!(
+            credential_id = %record.id,
+            overlap_expires_in_secs = expires_in,
+            "an upstream credential's current material could not be presented, so the material it \
+             carried before its last rotation is being used for the remainder of \
+             key_management.crypto.rotation.credential_grace_secs. Confirm the new secret is live \
+             at the provider before the window closes."
+        );
+        sbproxy_observe::publish_proxy_event(
+            sbproxy_observe::EventType::CredentialResolved,
+            || {
+                credential_resolved_event(
+                    &record.id,
+                    record.tenant_id.as_deref(),
+                    "rotation_overlap",
+                    Some("prev_material"),
+                )
+            },
+        );
+        // The overlap secret is held no longer than the window itself, so
+        // the retired key stops being presented when the window closes
+        // rather than at the end of whatever cache entry it landed in.
+        let overlap_ceiling = std::time::Duration::from_secs(expires_in.max(0) as u64);
+        let ceiling = Some(match ceiling {
+            Some(existing) => existing.min(overlap_ceiling),
+            None => overlap_ceiling,
+        });
+        Some((secret, "prev_material", ceiling))
+    }
+
+    /// Record one credential read for the read/access audit (WOR-2570).
+    ///
+    /// Two instrumentations with deliberately different widths, the same
+    /// split HashiCorp Vault's audit devices make between an unconditional
+    /// request record and what a deployment can afford to keep:
+    ///
+    /// * the counter moves on every call, including the ones that ride the
+    ///   per-request cache, because "how often was this credential used" is
+    ///   a question about traffic;
+    /// * the chained detail record fires at most once per credential per
+    ///   `key_management.read_audit.detail_window_secs`, because a record
+    ///   per request at gateway volume is a tax on the hot path and a
+    ///   chain nobody can read.
+    ///
+    /// The two diverging under load is the design. `docs/key-management.md`
+    /// states it in those words rather than claiming every read is
+    /// recorded, because the honest claim is "volume unconditionally,
+    /// detail on a bounded cadence".
+    ///
+    /// Field posture follows Vault's selective hash: the credential id is
+    /// HMAC'd under the key-audit fingerprint key when
+    /// `hash_identifiers` is on, and the timestamp, outcome, tenant, and
+    /// cache layer pass through readable. Nothing here is the secret, the
+    /// header value, or the vault reference.
+    fn record_credential_read(
+        &self,
+        id: &str,
+        tenant_id: Option<&str>,
+        outcome: &'static str,
+        cache_layer: &'static str,
+    ) {
+        sbproxy_observe::metrics::record_credential_read(outcome);
+        if !self.read_audit.enabled {
+            return;
+        }
+        if !self.claim_read_audit_window(id) {
+            sbproxy_observe::metrics::record_credential_read_audit("suppressed");
+            return;
+        }
+        let recorded_id = if self.read_audit.hash_identifiers {
+            match sbproxy_observe::audit_chain::fingerprint_key_audit_value("id", id) {
+                Some(hashed) => hashed,
+                None => {
+                    // No fingerprint key means no way to hash, and
+                    // falling back to the clear id would quietly turn
+                    // `hash_identifiers: true` into a lie. Refusing to
+                    // emit is the fail-closed direction: the volume
+                    // counter still moved, so the read is not lost.
+                    sbproxy_observe::metrics::record_credential_read_audit("failed");
+                    return;
+                }
+            }
+        } else {
+            id.to_string()
+        };
+        let mut entry =
+            sbproxy_observe::audit::KeyAuditEntry::new("resolve", "credential", recorded_id)
+                .with_outcome(outcome)
+                .with_context(format!(
+                    "cache={cache_layer} epoch={}",
+                    sbproxy_observe::audit_chain::fingerprint_epoch()
+                ));
+        if let Some(tenant) = tenant_id {
+            entry = entry.with_tenant_id(tenant);
+        }
+        entry.emit();
+        sbproxy_observe::metrics::record_credential_read_audit("emitted");
+    }
+
+    /// Claim the right to emit one read-audit detail record for `id`.
+    ///
+    /// Returns `true` for the first read of each credential in each
+    /// window and `false` for the rest. Read and set under one lock
+    /// acquisition, so two concurrent resolutions cannot both claim the
+    /// same window, which is the same construction
+    /// [`Self::claim_stale_announcement`] already uses one field over.
+    fn claim_read_audit_window(&self, id: &str) -> bool {
+        let window = std::time::Duration::from_secs(self.read_audit.detail_window_secs);
+        let now = std::time::Instant::now();
+        let mut last = self.read_audit_last.lock();
+        if let Some(at) = last.get(id) {
+            if now.duration_since(*at) < window {
+                return false;
+            }
+        }
+        // Bounded, and the bound is why this drops lapsed entries before
+        // inserting rather than growing. The key is a credential id, which
+        // is operator-set today and reaches here from a key record's
+        // binding, so it is not caller-controlled. That is a fact about
+        // today's call sites rather than a property of this map, and a
+        // process-lifetime map whose safety rests on "no future caller
+        // passes an id from a header" is a map that grows the day one
+        // does. Sweeping the lapsed entries at the cap costs one pass over
+        // a map that only reaches this size on a deployment with that many
+        // credentials.
+        if last.len() >= READ_AUDIT_TRACKED_CREDENTIALS {
+            last.retain(|_, at| now.duration_since(*at) < window);
+            if last.len() >= READ_AUDIT_TRACKED_CREDENTIALS {
+                // Every entry is still inside its window, so nothing can be
+                // dropped without losing a claim somebody already made.
+                // Emit rather than suppress: the detail record is the
+                // investigative half, and a deployment past this bound has
+                // more credentials than the cadence was sized for, which is
+                // a thing to see in the record rather than to hide by
+                // silently suppressing.
+                return true;
+            }
+        }
+        last.insert(id.to_string(), now);
+        true
+    }
+
+    /// Open one credential material into its bare secret, naming where the
+    /// material came from and any hard ceiling on how long the result may
+    /// be cached.
+    ///
+    /// Split out of [`Self::resolve_credential_secret_inner`] because two
+    /// callers now need it: the record's current material, and its
+    /// previous material inside a rotation grace window (WOR-2567). A
+    /// second copy of this body at the fallback site is how the two would
+    /// drift, and the fallback is the path nobody exercises daily.
+    ///
+    /// # Errors
+    ///
+    /// [`MaterialError::Transient`] when the secret backend could not
+    /// answer, [`MaterialError::Permanent`] for everything that will not
+    /// fix itself.
+    async fn open_material(
+        &self,
+        record_id: &str,
+        material: &CredentialMaterial,
+    ) -> std::result::Result<(String, &'static str, Option<std::time::Duration>), MaterialError>
+    {
+        match material {
+            CredentialMaterial::Plaintext { value } => Ok((value.clone(), "plaintext", None)),
+            CredentialMaterial::Envelope { envelope } => {
+                // WOR-2568: `open_async`, not `open`. A customer-managed
+                // envelope names its root of trust and needs the external
+                // key service; a locally-wrapped one still opens locally,
+                // and the envelope decides which, not the config.
+                let opened: sbproxy_keystore::crypto::OpenedEnvelope = self
+                    .crypto()
+                    .open_async(record_id, envelope)
+                    .await
+                    .map_err(|e| {
+                        // Distinct message: after a master-key rotation
+                        // every existing envelope stops opening, and that
+                        // is otherwise very hard to tell apart from a
+                        // corrupt store.
+                        MaterialError::Permanent(format!(
+                            "envelope did not open under the configured root of trust: {e:#}"
+                        ))
+                    })?;
+                let secret = String::from_utf8(opened.plaintext)
+                    .map_err(|_| MaterialError::Permanent("secret is not utf-8".to_string()))?;
+                // WOR-2568: the ceiling is the time *left* on the data key
+                // that opened this envelope, handed back by the root of
+                // trust, not a fresh copy of the configured window.
+                //
+                // Reading `root.revocation_window()` here instead is the
+                // bug this shipped with once. The unwrap cache's clock
+                // starts at the Vault round trip and this cache's clock
+                // starts at the resolution, so two caches each clamped to
+                // W hold the secret for up to 2W and the published number
+                // is half the truth. Inheriting the remaining window makes
+                // the total exposure one W by construction, with no second
+                // site to keep in step.
+                Ok((secret, "envelope", opened.hold_for))
+            }
+            CredentialMaterial::VaultRef { reference } => {
+                let Some(resolver) = sbproxy_vault::process_resolver() else {
+                    // A missing resolver is a config fault, not an
+                    // outage, so grace does not apply: it will not fix
+                    // itself and serving a stale value would hide it.
+                    return Err(MaterialError::Permanent(
+                        "no secret resolver is installed for a vault-referenced credential"
+                            .to_string(),
+                    ));
+                };
+                // The case grace exists for. Everything above this point
+                // reads local state; this is the network round-trip to the
+                // secret backend, so this is where a vault blip turns a
+                // working deployment into 503s.
+                match resolver.resolve_async(reference.clone()).await {
+                    Ok(secret) => Ok((secret, "vault_ref", None)),
+                    Err(e) => Err(MaterialError::Transient(e.to_string())),
+                }
+            }
+            // WOR-2569. Read like a `VaultRef`, because on the wire it is
+            // one: a dynamic-secrets mount answers a read by minting. The
+            // difference is entirely in the ceiling, which is what makes
+            // the credential leased rather than merely fetched.
+            CredentialMaterial::Leased {
+                reference,
+                platform,
+                lease_duration_secs,
+            } => {
+                let Some(resolver) = sbproxy_vault::process_resolver() else {
+                    return Err(MaterialError::Permanent(format!(
+                        "no secret resolver is installed to lease a {} credential; declare the \
+                         dynamic-secrets mount under proxy.secrets.backends",
+                        platform.label()
+                    )));
+                };
+                match resolver.resolve_async(reference.clone()).await {
+                    Ok(secret) => Ok((
+                        secret,
+                        "leased",
+                        // The whole point. A leased credential is not
+                        // cached past its lease, whatever
+                        // `proxy.secrets.rotation.re_resolve_interval_secs`
+                        // says, so the material stops being presented when
+                        // the platform stops honouring it rather than at
+                        // whatever the cache felt like.
+                        Some(std::time::Duration::from_secs(*lease_duration_secs)),
+                    )),
+                    Err(e) => Err(MaterialError::Transient(e.to_string())),
+                }
+            }
+        }
+    }
+
     /// [`Self::resolve_credential_secret`] minus the metrics wrapper.
     /// `cache_layer` starts at `miss` and is overwritten by the two
     /// early-return paths that did not run the full resolution.
@@ -541,8 +1073,10 @@ impl KeyPlane {
     /// | resolved material is not utf-8 | `miss` / `error` | none |
     /// | vault-referenced credential with no resolver installed | `miss` / `error` | none |
     /// | full resolution succeeds | `miss` / `ok` | `credential_resolved`, `outcome: resolved` |
+    /// | current material fails, rotation overlap serves | `miss` / `ok` | `credential_resolved`, `outcome: rotation_overlap`, once per serve |
+    /// | leased credential minted from its mount | `miss` / `ok` | `credential_resolved`, `outcome: resolved`, `source: leased` |
     ///
-    /// Ten rows for ten returns, and the last three of the `error` rows
+    /// Twelve rows for twelve returns, and the last three of the `error` rows
     /// are the ones worth naming rather than folding into "the backend is
     /// down". None of them reaches `serve_stale_on_failure` at all, and
     /// that is a ruling, not an oversight: a master key that no longer
@@ -580,7 +1114,7 @@ impl KeyPlane {
         let cached =
             cached.filter(|entry| tenant_binding_permits(entry.tenant_id.as_deref(), tenant_id));
         if let Some(entry) = &cached {
-            if entry.at.elapsed() < policy.re_resolve_interval() {
+            if entry.at.elapsed() < effective_hold(policy.re_resolve_interval(), entry.max_hold) {
                 *cache_layer = "hit";
                 return Ok(entry.value.clone());
             }
@@ -599,7 +1133,10 @@ impl KeyPlane {
         // never reached by a config that did not ask for it.
         let serve_stale_on_failure =
             |cache_layer: &mut &'static str, err: CredentialResolveError| match &cached {
-                Some(entry) if entry.at.elapsed() < policy.stale_serve_deadline() => {
+                Some(entry)
+                    if entry.at.elapsed()
+                        < effective_hold(policy.stale_serve_deadline(), entry.max_hold) =>
+                {
                     *cache_layer = "stale";
                     // The two instrumentations part company here, on
                     // purpose. `cache_layer = "stale"` is per serve,
@@ -666,54 +1203,30 @@ impl KeyPlane {
             return Err(CredentialResolveError::TenantMismatch);
         }
 
-        // WOR-2571: named before the material is opened so the typed
-        // event below can say where fresh material came from without
-        // holding anything secret.
-        let source = match &record.material {
-            CredentialMaterial::Plaintext { .. } => "plaintext",
-            CredentialMaterial::Envelope { .. } => "envelope",
-            CredentialMaterial::VaultRef { .. } => "vault_ref",
-        };
-        let secret = match &record.material {
-            CredentialMaterial::Plaintext { value } => value.clone(),
-            CredentialMaterial::Envelope { envelope } => {
-                let bytes = self.crypto().open(&record.id, envelope).map_err(|e| {
-                    // Distinct message: after a master-key rotation every
-                    // existing envelope stops opening, and that is otherwise
-                    // very hard to tell apart from a corrupt store.
-                    CredentialResolveError::Unresolvable(format!(
-                        "envelope did not open under the configured master key: {e}"
-                    ))
-                })?;
-                String::from_utf8(bytes).map_err(|_| {
-                    CredentialResolveError::Unresolvable("secret is not utf-8".to_string())
-                })?
-            }
-            CredentialMaterial::VaultRef { reference } => {
-                let Some(resolver) = sbproxy_vault::process_resolver() else {
-                    // A missing resolver is a config fault, not an
-                    // outage, so grace does not apply: it will not fix
-                    // itself and serving a stale value would hide it.
-                    return Err(CredentialResolveError::Unresolvable(
-                        "no secret resolver is installed for a vault-referenced credential"
-                            .to_string(),
-                    ));
-                };
-                // The case grace exists for. Everything above this point
-                // reads local state; this is the network round-trip to the
-                // secret backend, so this is where a vault blip turns a
-                // working deployment into 503s.
-                match resolver.resolve_async(reference.clone()).await {
-                    Ok(secret) => secret,
-                    Err(e) => {
-                        return serve_stale_on_failure(
-                            cache_layer,
-                            CredentialResolveError::Unresolvable(e.to_string()),
-                        )
+        // WOR-2567: the rotation overlap. The current material is tried
+        // first; only when it will not open does the previous material
+        // get a turn, and only while its window is open. That ordering is
+        // the whole safety property: a rotation that worked never
+        // presents the retired secret, and one that has not taken effect
+        // at the provider yet does not take the deployment down.
+        let (secret, source, max_hold) =
+            match self.open_material(&record.id, &record.material).await {
+                Ok(opened) => opened,
+                Err(primary) => match self.open_rotation_grace_material(&record).await {
+                    Some(opened) => opened,
+                    None => {
+                        return match primary {
+                            MaterialError::Permanent(message) => {
+                                Err(CredentialResolveError::Unresolvable(message))
+                            }
+                            MaterialError::Transient(message) => serve_stale_on_failure(
+                                cache_layer,
+                                CredentialResolveError::Unresolvable(message),
+                            ),
+                        }
                     }
-                }
-            }
-        };
+                },
+            };
 
         let resolved = ResolvedCredential {
             header: record.header.trim().to_ascii_lowercase(),
@@ -725,6 +1238,7 @@ impl KeyPlane {
             ResolvedCredentialEntry {
                 at: std::time::Instant::now(),
                 value: resolved.clone(),
+                max_hold,
                 // A fresh resolution ends whatever stale-serving episode
                 // was running, so the next outage announces again.
                 stale_announced: false,
@@ -735,10 +1249,20 @@ impl KeyPlane {
         // fast path above returns before this point, so a request that
         // rode the cache publishes nothing; see
         // [`credential_resolved_event`] for the cardinality ruling.
-        sbproxy_observe::publish_proxy_event(
-            sbproxy_observe::EventType::CredentialResolved,
-            || credential_resolved_event(id, tenant_id, "resolved", Some(source)),
-        );
+        //
+        // The overlap path is the one exception and publishes its own
+        // `rotation_overlap` event inside `open_rotation_grace_material`,
+        // because what a SIEM wants to see there is that a retired secret
+        // was presented, not that a resolution happened. Publishing here
+        // too would put two events on the wire for one read and describe
+        // the same serve twice, once as `resolved` and once as
+        // `rotation_overlap`.
+        if source != "prev_material" {
+            sbproxy_observe::publish_proxy_event(
+                sbproxy_observe::EventType::CredentialResolved,
+                || credential_resolved_event(id, tenant_id, "resolved", Some(source)),
+            );
+        }
         Ok(resolved)
     }
 }
@@ -759,9 +1283,9 @@ impl KeyPlane {
 /// `outcome` is `resolved` for a fresh resolution and `stale_served`
 /// when the backend failed and the last known-good value was served
 /// inside `proxy.secrets.rotation.grace_period_secs`. `source` names
-/// where fresh material came from (`plaintext`, `envelope`,
-/// `vault_ref`) and is absent on the stale path, where nothing was
-/// freshly read. The per-request cache hit publishes nothing: this
+/// where fresh material came from (`plaintext`, `envelope`, `vault_ref`,
+/// `leased`, or `prev_material` for a rotation overlap) and is absent on
+/// the stale path, where nothing was freshly read. The per-request cache hit publishes nothing: this
 /// event marks material actually being read, not every request that
 /// rode the cached value, the same cardinality ruling that keeps
 /// `cache_hit` unwired on the typed feed. Resolution refusals publish
@@ -1003,30 +1527,85 @@ fn warn_on_ungoverned_provider_hints(cfg: &KeyManagementConfig) {
     );
 }
 
-/// Build the `KeyCrypto` handle from config, generating ephemeral secrets
-/// with a warning when the operator did not pin them.
+/// Resolve one crypto-sensitive field, refusing a resolution that gave back
+/// the reference it was asked about (WOR-2567).
+///
+/// The incident this closes: an operator set `pepper: awssm://prod/pepper`,
+/// nothing dereferenced it, and the pepper became the 19-character ASCII
+/// string `awssm://prod/pepper`, identical on every deployment that copied
+/// the config example and offline-crackable by anyone who had read the
+/// docs. [`resolve_secret_material`] closed the one instance by refusing a
+/// provider URI it cannot resolve. This closes the *class*: whatever the
+/// resolver is, whatever the scheme is, a resolved value byte-identical to
+/// the reference that named it is not a secret, and a crypto-sensitive
+/// field must not accept one.
+///
+/// It is a separate check rather than a rule inside the resolver because
+/// the resolver is shared with fields where a value equal to its own
+/// reference is merely odd. On a pepper or a master key it is fatal, and
+/// this is the only place that knows that.
+///
+/// Inline literals are exempt and have to be: `pepper: a-literal-pepper` is
+/// the documented way to pin one in a test or a single-node deployment, and
+/// there the value *is* the reference. The exemption is narrow on purpose:
+/// it applies only when the reference carries no scheme at all, so
+/// `env:PEPPER` resolving to the string `env:PEPPER` is still refused.
+///
+/// # Errors
+///
+/// Propagates the resolver's own failure, or reports a resolution that
+/// returned its own reference.
+fn resolve_crypto_field(field: &str, reference: &str) -> Result<Vec<u8>> {
+    let resolved = resolve_secret_material(reference)
+        .with_context(|| format!("resolve key_management.crypto.{field}"))?;
+    let looks_like_a_reference = sbproxy_vault::looks_like_secret_reference_uri(reference)
+        || reference.starts_with("env:")
+        || reference.starts_with("file:")
+        || reference.starts_with("${");
+    if looks_like_a_reference && resolved == reference.as_bytes() {
+        anyhow::bail!(
+            "key_management.crypto.{field} resolved to the literal text of its own reference \
+             rather than to a secret. That is not a secret: it is source-visible, identical on \
+             every deployment that copied the same config, and defeats the whole purpose of the \
+             field. Check that the backend named by the reference is declared under \
+             proxy.secrets.backends and actually holds a value."
+        );
+    }
+    Ok(resolved)
+}
+
+/// Build the `KeyCrypto` handle from config.
+///
+/// # What changed, and why the default is now a refusal (WOR-2567)
+///
+/// This used to mint an ephemeral pepper and master key with a `warn!` when
+/// the operator pinned neither. A restart then silently invalidated every
+/// stored key hash and every stored envelope, and the deployment found out
+/// through a flood of 401s and unopenable credentials rather than through a
+/// boot that refused to come up. A warning at boot is read once, by
+/// whoever was watching; a refusal is read by whoever caused it.
+///
+/// Vault and comparable key-management products refuse to start without a
+/// resolvable root key rather than minting one, and NIST SP 800-57 Part 1
+/// Rev 5 treats key generation and activation as steps an operator owns
+/// rather than side effects of a process starting. So: an enabled key plane
+/// with no pinned `pepper` or `master_key` fails the boot, naming the
+/// missing key, unless `key_management.crypto.allow_ephemeral_secrets` is
+/// explicitly true.
+///
+/// # Errors
+///
+/// A missing pepper or master key with no explicit opt-in; a resolution
+/// failure on either; a resolution that returned its own reference; or an
+/// unbuildable customer-managed root of trust.
 fn build_crypto(cfg: &KeyManagementConfig) -> Result<KeyCrypto> {
     let pepper = match &cfg.crypto.pepper {
-        Some(r) => resolve_secret_material(r)?,
-        None => {
-            tracing::warn!(
-                "key_management.crypto.pepper is unset; generating an ephemeral pepper. \
-                 Stored key hashes will not survive a restart or successful config reload. \
-                 Set a stable pepper in production."
-            );
-            sbproxy_security::random_aes256_key().to_vec()
-        }
+        Some(r) => resolve_crypto_field("pepper", r)?,
+        None => ephemeral_or_refuse(cfg, "pepper")?,
     };
     let master = match &cfg.crypto.master_key {
-        Some(r) => resolve_secret_material(r)?,
-        None => {
-            tracing::warn!(
-                "key_management.crypto.master_key is unset; generating an ephemeral master key. \
-                 Encrypted upstream credentials will not be decryptable after a restart or \
-                 successful config reload."
-            );
-            sbproxy_security::random_aes256_key().to_vec()
-        }
+        Some(r) => resolve_crypto_field("master_key", r)?,
+        None => ephemeral_or_refuse(cfg, "master_key")?,
     };
     // WOR-2478: derive the key-audit chain's fingerprint key from this same
     // master secret, under a dedicated HKDF purpose, before `master` moves
@@ -1035,7 +1614,55 @@ fn build_crypto(cfg: &KeyManagementConfig) -> Result<KeyCrypto> {
     // retains; see that function's docs for why a later call (a hot
     // reload) does not replace an already-installed key.
     sbproxy_observe::audit_chain::install_key_audit_fingerprint_key(&master);
-    Ok(KeyCrypto::new(pepper, master))
+    let crypto = KeyCrypto::new(pepper, master);
+    // WOR-2568. Built last so a broken root of trust reports after the two
+    // locally-held secrets have already been validated, which keeps the
+    // three failure messages from arriving in an order that depends on
+    // which one an operator happened to get wrong.
+    let Some(root_cfg) = &cfg.crypto.root_of_trust else {
+        return Ok(crypto);
+    };
+    let token = String::from_utf8(
+        resolve_crypto_field("root_of_trust.token", &root_cfg.token)
+            .context("resolve the customer-managed root-of-trust token")?,
+    )
+    .context("the customer-managed root-of-trust token is not utf-8")?;
+    let root = Arc::new(crate::key_root_of_trust::CustomerManagedRoot::new(
+        root_cfg, token,
+    )?);
+    tracing::info!(
+        kek = %root.kek_name(),
+        revocation_window_secs = root.revocation_window().as_secs(),
+        "customer-managed root of trust installed; upstream-credential envelopes sealed from now \
+         on are unreadable without the external key service"
+    );
+    Ok(crypto.with_root_of_trust(root))
+}
+
+/// The old ephemeral-secret behavior, now behind an explicit opt-in.
+///
+/// # Errors
+///
+/// When `allow_ephemeral_secrets` is false, which is the default.
+fn ephemeral_or_refuse(cfg: &KeyManagementConfig, field: &str) -> Result<Vec<u8>> {
+    if !cfg.crypto.allow_ephemeral_secrets {
+        anyhow::bail!(
+            "key_management is enabled but key_management.crypto.{field} is unset. A process that \
+             mints its own {field} loses it on restart: stored key hashes stop verifying and \
+             stored credential envelopes stop opening, and the first sign of it is a flood of \
+             401s rather than a failed boot. Pin it to a secret reference (env:, file:, vault://, \
+             awssm://, ...), or set key_management.crypto.allow_ephemeral_secrets: true for a \
+             local development run where a key plane that does not outlive the process is what \
+             you want."
+        );
+    }
+    tracing::warn!(
+        field,
+        "key_management.crypto.{field} is unset and allow_ephemeral_secrets is on; generating an \
+         ephemeral value. Stored key hashes and credential envelopes will not survive a restart \
+         or a successful config reload.",
+    );
+    Ok(sbproxy_security::random_aes256_key().to_vec())
 }
 
 /// Build the configured store backend: embedded (redb), Redis, or
@@ -1337,8 +1964,18 @@ fn lower_seed_key(
 }
 
 /// Lower a seed credential into a [`CredentialRecord`], envelope-encrypting an
-/// inline secret under the master key.
-fn lower_seed_credential(
+/// inline secret under whichever root of trust is configured.
+///
+/// `async` because the seal may be a network call. WOR-2568 made the
+/// synchronous `KeyCrypto::seal` refuse outright under a customer-managed
+/// root, deliberately, so that no call site can quietly produce a
+/// locally-wrapped envelope while the config claims a customer-held root.
+/// This site was left on the synchronous path when the admin path moved,
+/// which turned that refusal into "every config-seeded `secret:` credential
+/// is logged and skipped at boot" the moment an operator enabled
+/// `root_of_trust`. Boot still succeeded and the records were simply
+/// absent, so the first symptom was a `NotFound` at request time.
+async fn lower_seed_credential(
     seed: &SeedCredentialConfig,
     crypto: &KeyCrypto,
     now: DateTime<Utc>,
@@ -1348,7 +1985,7 @@ fn lower_seed_credential(
             reference: reference.clone(),
         }
     } else if let Some(secret) = &seed.secret {
-        match crypto.seal(&seed.id, secret.as_bytes()) {
+        match crypto.seal_async(&seed.id, secret.as_bytes()).await {
             Ok(envelope) => CredentialMaterial::Envelope { envelope },
             Err(e) => {
                 tracing::error!(id = %seed.id, error = %e, "failed to seal seed credential; skipping");
@@ -1376,6 +2013,9 @@ fn lower_seed_credential(
         created_at: now,
         updated_at: now,
         source: RecordSource::Config,
+        rotated_at: None,
+        prev_material: None,
+        prev_material_expires_at: None,
     })
 }
 
@@ -1400,7 +2040,7 @@ async fn seed_records(
         if cfg.allow_api_override && store.get_credential(&seed.id).await?.is_some() {
             continue;
         }
-        if let Some(rec) = lower_seed_credential(seed, crypto, now) {
+        if let Some(rec) = lower_seed_credential(seed, crypto, now).await {
             store.put_credential(rec).await?;
         }
     }
@@ -1440,7 +2080,10 @@ pub(crate) fn prepare_key_plane(
             approximate_store,
         )
         .with_failure_posture(cfg.failure_posture())
-        .with_inbound(cfg.inbound.clone()),
+        .with_inbound(cfg.inbound.clone())
+        .with_read_audit(cfg.read_audit.clone())
+        .with_rotation(cfg.crypto.rotation.clone())
+        .with_break_glass(cfg.break_glass.clone()),
     );
     Ok(Some(plane))
 }
@@ -1531,6 +2174,17 @@ pub(crate) fn activate_key_plane(plane: Option<Arc<KeyPlane>>, cfg: Option<&KeyM
                 }
             }
         });
+    }
+
+    // WOR-2568: the customer-managed root's liveness probe. Driven on the
+    // key plane's own runtime, the same one the invalidation subscriber
+    // above uses, so it outlives whichever request thread happened to
+    // install the plane.
+    if let Some(root_cfg) = cfg.crypto.root_of_trust.as_ref() {
+        if let Some(root) = plane.crypto().root_of_trust().cloned() {
+            let interval = crate::key_root_of_trust::liveness_interval(root_cfg);
+            key_runtime().spawn(crate::key_root_of_trust::run_liveness_probe(root, interval));
+        }
     }
 
     tracing::info!(
@@ -1693,6 +2347,9 @@ mod tests {
             crypto: KeyCryptoConfig {
                 pepper: Some("test-pepper".to_string()),
                 master_key: Some("test-master".to_string()),
+                allow_ephemeral_secrets: false,
+                root_of_trust: None,
+                rotation: Default::default(),
             },
             ..Default::default()
         }
@@ -2232,6 +2889,9 @@ mod tests {
             crypto: KeyCryptoConfig {
                 pepper: Some("test-pepper".to_string()),
                 master_key: Some("test-master".to_string()),
+                allow_ephemeral_secrets: false,
+                root_of_trust: None,
+                rotation: Default::default(),
             },
             ..Default::default()
         };
@@ -2299,6 +2959,9 @@ mod tests {
             crypto: KeyCryptoConfig {
                 pepper: Some("pinned-pepper".to_string()),
                 master_key: None,
+                allow_ephemeral_secrets: false,
+                root_of_trust: None,
+                rotation: Default::default(),
             },
             ..Default::default()
         };
@@ -2314,6 +2977,9 @@ mod tests {
             crypto: KeyCryptoConfig {
                 pepper: Some("env:SBPROXY_TEST_ADMIN_PEPPER_DOES_NOT_EXIST".to_string()),
                 master_key: None,
+                allow_ephemeral_secrets: false,
+                root_of_trust: None,
+                rotation: Default::default(),
             },
             ..Default::default()
         };
@@ -2463,6 +3129,236 @@ mod tests {
 
         std::fs::remove_file(&path).ok();
     }
+
+    // --- WOR-2567: boot refuses to mint its own crypto material ---
+
+    /// The seam: an enabled key plane with no pinned pepper does not boot.
+    ///
+    /// Before this, `build_crypto` minted a random pepper and logged a
+    /// warning. Every stored key hash then stopped verifying at the next
+    /// restart, and the deployment learned about it through a flood of
+    /// 401s. The refusal has to name the field, because the operator
+    /// reading it is looking at a config with two crypto keys in it and
+    /// needs to know which one is missing.
+    #[test]
+    fn boot_refuses_when_no_pepper_is_pinned() {
+        let mut cfg = base_cfg(&temp_db());
+        cfg.crypto.pepper = None;
+        let error = match prepare_key_plane(Some(&cfg)) {
+            Err(error) => error,
+            Ok(_) => panic!("an enabled key plane with no pinned pepper must not boot"),
+        };
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("key_management.crypto.pepper"),
+            "the refusal must name the missing key: {text}"
+        );
+        assert!(
+            text.contains("allow_ephemeral_secrets"),
+            "the refusal must name the opt-out a developer needs: {text}"
+        );
+
+        // Same for the master key, named separately.
+        let mut cfg = base_cfg(&temp_db());
+        cfg.crypto.master_key = None;
+        let error = match prepare_key_plane(Some(&cfg)) {
+            Err(error) => error,
+            Ok(_) => panic!("no master key, no boot"),
+        };
+        assert!(
+            format!("{error:#}").contains("key_management.crypto.master_key"),
+            "{error:#}"
+        );
+    }
+
+    /// The explicit opt-out still works, because a local development run
+    /// with a key plane that does not outlive the process is a real thing
+    /// to want. It is just not the default any more.
+    #[test]
+    fn the_ephemeral_opt_in_still_boots() {
+        let _guard = test_plane_guard();
+        let mut cfg = base_cfg(&temp_db());
+        cfg.crypto.pepper = None;
+        cfg.crypto.master_key = None;
+        cfg.crypto.allow_ephemeral_secrets = true;
+        assert!(
+            prepare_key_plane(Some(&cfg))
+                .expect("the explicit opt-in boots")
+                .is_some(),
+            "an enabled config with the opt-in must still yield a plane"
+        );
+    }
+
+    /// A resolution that hands back the text of its own reference is not a
+    /// secret, and a crypto-sensitive field must refuse it whatever the
+    /// resolver was.
+    ///
+    /// [`resolve_secret_material`] already refuses a provider URI it
+    /// cannot resolve, which closed the one instance of this bug. This
+    /// closes the class: a backend that echoes, a file whose contents are
+    /// the reference that named it, a `${VAR}` whose value is the literal
+    /// `${VAR}`. Each of those produces a source-visible pepper identical
+    /// on every deployment that copied the same config, which is exactly
+    /// the failure the original incident had.
+    #[test]
+    fn a_crypto_field_refuses_a_resolution_that_echoes_its_own_reference() {
+        // A `file:` reference whose contents are the reference text is
+        // the cheapest reproduction of the class and needs no resolver
+        // and no environment mutation. The same check covers every other
+        // scheme, because it compares the resolved bytes to the reference
+        // rather than inspecting the scheme.
+        let path = format!(
+            "{}/sbproxy_echoing_pepper_{}.txt",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let reference = format!("file:{path}");
+        std::fs::write(&path, reference.as_bytes()).expect("write fixture");
+        let error = resolve_crypto_field("pepper", &reference)
+            .expect_err("a resolution that returns its own reference is not a secret");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("literal text of its own reference"),
+            "the refusal must say what went wrong: {text}"
+        );
+        assert!(
+            text.contains("key_management.crypto.pepper"),
+            "the refusal must name the field: {text}"
+        );
+
+        // A real value through the same path still resolves, so the guard
+        // is not simply refusing every `file:` reference.
+        std::fs::write(&path, b"a-real-pepper-value").expect("write fixture");
+        assert_eq!(
+            resolve_crypto_field("pepper", &reference).expect("a real value resolves"),
+            b"a-real-pepper-value".to_vec()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- WOR-2568: the revocation window bounds the credential cache ---
+
+    /// The seam: a customer-managed envelope's plaintext may not be
+    /// served past the root of trust's stated revocation window, whatever
+    /// `proxy.secrets.rotation` says.
+    ///
+    /// Without the ceiling the honest revocation bound would be the
+    /// unwrap-cache TTL *plus* `re_resolve_interval_secs` on the fresh
+    /// path, plus `grace_period_secs` again on the stale path. The admin
+    /// surface prints one number, so one number has to be true.
+    #[test]
+    fn a_ceiling_shortens_the_hold_and_never_lengthens_it() {
+        use std::time::Duration;
+        // No ceiling: the policy window is the answer.
+        assert_eq!(
+            effective_hold(Duration::from_secs(60), None),
+            Duration::from_secs(60)
+        );
+        // A shorter ceiling wins, which is the revocation bound doing its
+        // job.
+        assert_eq!(
+            effective_hold(Duration::from_secs(60), Some(Duration::from_secs(5))),
+            Duration::from_secs(5)
+        );
+        // A longer ceiling does not extend the hold. A ceiling that could
+        // lengthen a window is not a ceiling.
+        assert_eq!(
+            effective_hold(Duration::from_secs(10), Some(Duration::from_secs(600))),
+            Duration::from_secs(10)
+        );
+    }
+
+    // --- WOR-2570: the read/access audit ---
+
+    /// The seam: the volume counter moves on every credential read
+    /// including the cached ones, while the chained detail record fires
+    /// at most once per credential per window. The two diverging under
+    /// load is the whole design, and this is the test that says so.
+    #[tokio::test]
+    async fn credential_reads_count_unconditionally_and_detail_on_a_bounded_cadence() {
+        let _guard = test_plane_guard();
+        let mut cfg = base_cfg(&temp_db());
+        cfg.read_audit.enabled = true;
+        // Wide enough that the second and third reads in this test land
+        // inside the same window as the first.
+        cfg.read_audit.detail_window_secs = 3600;
+        cfg.read_audit.hash_identifiers = false;
+        let plane = prepare_key_plane(Some(&cfg))
+            .expect("plane builds")
+            .expect("an enabled config yields a plane");
+
+        fn reads() -> f64 {
+            gathered("sbproxy_credential_read_total")
+                .into_iter()
+                .map(|(_, value)| value)
+                .sum()
+        }
+        fn details(outcome: &str) -> f64 {
+            gathered("sbproxy_credential_read_audit_records_total")
+                .into_iter()
+                .filter(|(labels, _)| labels.contains(&format!("outcome={outcome}")))
+                .map(|(_, value)| value)
+                .sum()
+        }
+
+        let envelope = plane
+            .crypto()
+            .seal("cred-read-audit", b"upstream-secret")
+            .expect("seal");
+        let now = Utc::now();
+        let record = CredentialRecord {
+            id: "cred-read-audit".to_string(),
+            name: "cred-read-audit".to_string(),
+            provider: None,
+            kind: "api_key".to_string(),
+            header: sbproxy_keystore::record::default_cred_header(),
+            scheme: sbproxy_keystore::record::default_cred_scheme(),
+            material: CredentialMaterial::Envelope { envelope },
+            status: RecordStatus::Active,
+            tenant_id: None,
+            metadata: Default::default(),
+            created_at: now,
+            updated_at: now,
+            source: RecordSource::Api,
+            rotated_at: None,
+            prev_material: None,
+            prev_material_expires_at: None,
+        };
+        plane
+            .cache()
+            .store()
+            .put_credential(record)
+            .await
+            .expect("seed the credential");
+
+        let reads_before = reads();
+        let emitted_before = details("emitted");
+        let suppressed_before = details("suppressed");
+
+        for _ in 0..3 {
+            plane
+                .resolve_credential_secret("cred-read-audit", None)
+                .await
+                .expect("resolves");
+        }
+
+        assert_eq!(
+            reads() - reads_before,
+            3.0,
+            "every read moves the volume counter, including the two that rode the cache"
+        );
+        assert_eq!(
+            details("emitted") - emitted_before,
+            1.0,
+            "exactly one detail record per credential per window"
+        );
+        assert_eq!(
+            details("suppressed") - suppressed_before,
+            2.0,
+            "the reads that did not get a detail record are counted as suppressed, so the \
+             divergence is visible rather than silent"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2496,6 +3392,9 @@ mod resolve_credential_secret_tests {
             created_at: now,
             updated_at: now,
             source: RecordSource::Api,
+            rotated_at: None,
+            prev_material: None,
+            prev_material_expires_at: None,
         }
     }
 
@@ -2715,7 +3614,11 @@ mod resolve_credential_secret_tests {
 
         match p.resolve_credential_secret("c5", None).await {
             Err(CredentialResolveError::Unresolvable(reason)) => {
-                assert!(reason.contains("master key"), "{reason}");
+                // WOR-2568 widened this message from "master key" to
+                // "root of trust", because the envelope may now be
+                // wrapped by an external key service and "the configured
+                // master key" would be the wrong thing to go and check.
+                assert!(reason.contains("root of trust"), "{reason}");
             }
             other => panic!("expected Unresolvable, got {other:?}"),
         }
@@ -3552,5 +4455,542 @@ mod resolve_credential_secret_tests {
             !content.contains("seam-marker-value"),
             "resolved material must never reach the typed feed: {content}"
         );
+    }
+
+    // --- WOR-2567: the rotation overlap on the resolution path ---
+
+    /// The seam: when the material a rotation installed will not open,
+    /// the material it replaced is presented instead, but only while the
+    /// overlap window is open.
+    ///
+    /// The ordering is the safety property. A rotation that worked never
+    /// reaches the previous material at all, which this test pins by
+    /// resolving a record whose *current* material is good and asserting
+    /// the current value comes back even though a usable previous one is
+    /// sitting right there.
+    #[tokio::test]
+    async fn a_rotation_overlap_serves_the_previous_material_only_when_the_new_one_fails() {
+        invalidate_all_resolved_credentials();
+        let p = plane();
+
+        // A working rotation: current material opens, so the overlap is
+        // never consulted.
+        let mut healthy = credential(
+            "c-rot-ok",
+            CredentialMaterial::Plaintext {
+                value: "new-secret".into(),
+            },
+        );
+        healthy.prev_material = Some(CredentialMaterial::Plaintext {
+            value: "old-secret".into(),
+        });
+        healthy.prev_material_expires_at = Some(Utc::now() + chrono::Duration::seconds(300));
+        put(&p, healthy).await;
+        let resolved = p
+            .resolve_credential_secret("c-rot-ok", None)
+            .await
+            .expect("the current material resolves");
+        assert_eq!(
+            resolved.material, "new-secret",
+            "a rotation whose new material works must never present the retired one"
+        );
+
+        // A rotation whose new material will not open: the overlap
+        // carries the request.
+        invalidate_all_resolved_credentials();
+        let mut broken = credential(
+            "c-rot-fallback",
+            // Sealed under a master this plane does not hold, which is
+            // the shape of "the new material is not usable here".
+            CredentialMaterial::Envelope {
+                envelope: KeyCrypto::new(b"pep".to_vec(), b"another-master".to_vec())
+                    .seal("c-rot-fallback", b"unopenable")
+                    .expect("seal"),
+            },
+        );
+        broken.prev_material = Some(CredentialMaterial::Plaintext {
+            value: "still-good".into(),
+        });
+        broken.prev_material_expires_at = Some(Utc::now() + chrono::Duration::seconds(300));
+        put(&p, broken.clone()).await;
+        let resolved = p
+            .resolve_credential_secret("c-rot-fallback", None)
+            .await
+            .expect("the overlap carries the request");
+        assert_eq!(resolved.material, "still-good");
+
+        // Once the window has closed, the same record fails rather than
+        // presenting a retired secret indefinitely.
+        invalidate_all_resolved_credentials();
+        let mut expired = broken;
+        expired.id = "c-rot-expired".to_string();
+        expired.material = CredentialMaterial::Envelope {
+            envelope: KeyCrypto::new(b"pep".to_vec(), b"another-master".to_vec())
+                .seal("c-rot-expired", b"unopenable")
+                .expect("seal"),
+        };
+        expired.prev_material_expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
+        put(&p, expired).await;
+        match p.resolve_credential_secret("c-rot-expired", None).await {
+            Err(CredentialResolveError::Unresolvable(reason)) => {
+                assert!(reason.contains("root of trust"), "{reason}");
+            }
+            other => panic!("a closed overlap window must not serve the old material: {other:?}"),
+        }
+    }
+
+    /// A root of trust whose data keys carry a deliberately short remaining
+    /// window, so a test can tell "inherited the deadline" from "started a
+    /// fresh one" without waiting.
+    #[derive(Debug)]
+    struct ShortWindowRoot {
+        window: std::time::Duration,
+        remaining: std::time::Duration,
+        unwraps: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl sbproxy_keystore::crypto::RootOfTrust for ShortWindowRoot {
+        fn kek_name(&self) -> &str {
+            "stub/short-window"
+        }
+        async fn wrap_dek(&self, dek: &[u8]) -> anyhow::Result<String> {
+            Ok(format!("stub:v1:{}", hex::encode(dek)))
+        }
+        async fn unwrap_dek(
+            &self,
+            wrapped: &str,
+        ) -> anyhow::Result<sbproxy_keystore::crypto::UnwrappedDek> {
+            self.unwraps
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = wrapped
+                .strip_prefix("stub:v1:")
+                .ok_or_else(|| anyhow::anyhow!("not a stub ciphertext"))?;
+            Ok(sbproxy_keystore::crypto::UnwrappedDek {
+                dek: hex::decode(body)?,
+                // The point: a data key most of whose window has already
+                // been spent in the root's own cache.
+                valid_for: self.remaining,
+            })
+        }
+        fn revocation_window(&self) -> std::time::Duration {
+            self.window
+        }
+        // The liveness five are required on the trait, so this double
+        // states its trivial answers instead of inheriting them. It runs
+        // no probe and holds no cache of its own, and it says the first
+        // half out loud: `Ok(())` beside `last_liveness_ok() == false` is
+        // a probe that succeeded and recorded nothing, which is the exact
+        // wrong-trivial-answer shape whose removal from the trait was the
+        // point of the round.
+        async fn probe_liveness(&self) -> anyhow::Result<()> {
+            Err(anyhow::anyhow!("this double runs no probe"))
+        }
+        fn last_liveness_unix(&self) -> Option<u64> {
+            None
+        }
+        fn last_liveness_ok(&self) -> bool {
+            false
+        }
+        fn cached_dek_count(&self) -> usize {
+            0
+        }
+        fn purge_cache(&self) {}
+    }
+
+    /// Seam G, replaced. The old test asserted `effective_hold(60, Some(5))
+    /// == 5`, which proves `min` and nothing about the wiring, and the
+    /// revocation bound is exactly what lived in that gap: two caches each
+    /// clamped to the same window hold a secret for up to twice it.
+    ///
+    /// This drives the real `open_material` and asserts the ceiling it
+    /// returns is the time *left* on the data key, not a fresh copy of the
+    /// configured window. Reverting that line to
+    /// `root.revocation_window()` reddens this and leaves the `min` unit
+    /// test green, which is the difference between the two tests.
+    #[tokio::test]
+    async fn a_customer_managed_open_inherits_the_data_keys_remaining_window() {
+        let root = Arc::new(ShortWindowRoot {
+            window: std::time::Duration::from_secs(600),
+            remaining: std::time::Duration::from_secs(7),
+            unwraps: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let crypto =
+            KeyCrypto::new(b"pep".to_vec(), b"master".to_vec()).with_root_of_trust(root.clone());
+        let store = Arc::new(MemoryKeyStore::new());
+        let cache = Arc::new(TtlCache::new(
+            store as Arc<dyn KeyStore>,
+            TtlCacheConfig::default(),
+        ));
+        let plane = KeyPlane::from_parts(crypto, cache, false, false, None);
+
+        let envelope = plane
+            .crypto()
+            .seal_async("cred-cmk-ceiling", b"upstream-secret")
+            .await
+            .expect("seal under the customer-managed root");
+        assert!(
+            envelope.kek.is_some(),
+            "the envelope must name its root, or this test is not exercising the CMK path"
+        );
+
+        let (secret, source, ceiling) = plane
+            .open_material(
+                "cred-cmk-ceiling",
+                &CredentialMaterial::Envelope { envelope },
+            )
+            .await
+            .expect("opens through the external root");
+        assert_eq!(secret, "upstream-secret");
+        assert_eq!(source, "envelope");
+        assert_eq!(
+            ceiling,
+            Some(std::time::Duration::from_secs(7)),
+            "the ceiling must be the time left on the data key. Taking the configured window \
+             here instead is how two caches clamped to W end up holding a secret for 2W, which \
+             is the number the admin surface prints"
+        );
+        assert_ne!(
+            ceiling,
+            Some(std::time::Duration::from_secs(600)),
+            "a fresh copy of the configured window is exactly the bug"
+        );
+    }
+
+    /// The other half of the same seam: a locally-wrapped envelope is
+    /// bounded by no external service, so it must carry no ceiling at all.
+    /// Returning one would clamp a local deployment's cache to a window it
+    /// never opted into.
+    #[tokio::test]
+    async fn a_locally_wrapped_envelope_carries_no_ceiling() {
+        let plane = plane();
+        let envelope = plane
+            .crypto()
+            .seal("cred-local-ceiling", b"local-secret")
+            .expect("local seal");
+        assert!(envelope.kek.is_none());
+        let (secret, source, ceiling) = plane
+            .open_material(
+                "cred-local-ceiling",
+                &CredentialMaterial::Envelope { envelope },
+            )
+            .await
+            .expect("opens locally");
+        assert_eq!(secret, "local-secret");
+        assert_eq!(source, "envelope");
+        assert_eq!(ceiling, None);
+    }
+
+    /// `ResolvedCredential` is the plaintext, not a handle to it: `value`
+    /// is the whole header and `material` is the bare upstream secret.
+    /// Nothing formats it today, which is the state every `Debug` leak in
+    /// `scripts/secret-debug-registry.txt` was in the day before something
+    /// did, and it is the type the customer-managed claim is about.
+    ///
+    /// Restoring `#[derive(Debug)]` reddens this on both fields.
+    #[test]
+    fn debug_never_renders_a_resolved_credential() {
+        let rendered = format!(
+            "{:?}",
+            ResolvedCredential {
+                header: "authorization".to_string(),
+                value: "Bearer RESOLVEDMUSTNOTAPPEAR".to_string(),
+                material: "RESOLVEDMUSTNOTAPPEAR".to_string(),
+            }
+        );
+        assert!(
+            !rendered.contains("RESOLVEDMUSTNOTAPPEAR"),
+            "a resolved credential leaked its secret: {rendered}"
+        );
+        assert!(
+            rendered.contains("ResolvedCredential") && rendered.contains("[REDACTED]"),
+            "the identifier and the mask both have to survive, or a log line stops naming \
+             what failed: {rendered}"
+        );
+        assert!(
+            rendered.contains("authorization"),
+            "the header name is not a secret and is what makes the line useful: {rendered}"
+        );
+    }
+
+    /// A root of trust whose probe always fails, and which counts its own
+    /// purges, so a test can assert the probe's failure arm rather than
+    /// assert that a function it called by hand exists.
+    #[derive(Debug)]
+    struct FailingProbeRoot {
+        window: std::time::Duration,
+        purged: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl sbproxy_keystore::crypto::RootOfTrust for FailingProbeRoot {
+        fn kek_name(&self) -> &str {
+            "stub/failing-probe"
+        }
+        async fn wrap_dek(&self, dek: &[u8]) -> anyhow::Result<String> {
+            Ok(format!("stub:v1:{}", hex::encode(dek)))
+        }
+        async fn unwrap_dek(
+            &self,
+            wrapped: &str,
+        ) -> anyhow::Result<sbproxy_keystore::crypto::UnwrappedDek> {
+            let body = wrapped
+                .strip_prefix("stub:v1:")
+                .ok_or_else(|| anyhow::anyhow!("not a stub ciphertext"))?;
+            Ok(sbproxy_keystore::crypto::UnwrappedDek {
+                dek: hex::decode(body)?,
+                valid_for: self.window,
+            })
+        }
+        fn revocation_window(&self) -> std::time::Duration {
+            self.window
+        }
+        // The point of the double: the customer revoked, so the probe
+        // fails. Everything else answers honestly.
+        async fn probe_liveness(&self) -> anyhow::Result<()> {
+            Err(anyhow::anyhow!("grant revoked"))
+        }
+        fn last_liveness_unix(&self) -> Option<u64> {
+            None
+        }
+        fn last_liveness_ok(&self) -> bool {
+            false
+        }
+        fn cached_dek_count(&self) -> usize {
+            0
+        }
+        fn purge_cache(&self) {
+            self.purged
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// The published clause "or at the next failed liveness probe,
+    /// whichever comes first" has to be true of the cache the customer is
+    /// actually testing, and false of the credentials that root never
+    /// opened.
+    ///
+    /// `purge_cache` drops wrapped data keys. The resolved-credential
+    /// cache holds credentials this process already decrypted and serves
+    /// them upstream without consulting the root of trust at all, so
+    /// purging only the first leaves a revoked deployment serving
+    /// plaintext for its full inherited deadline while
+    /// `GET /admin/crypto/root-of-trust` reports `cached_data_keys: 0`.
+    /// Three published sentences and a runnable walkthrough are built on
+    /// that clause.
+    ///
+    /// This test drives `key_root_of_trust::probe_once`, which is the
+    /// real failure arm, with a root whose probe returns `Err`. The
+    /// version it replaces called `invalidate_all_resolved_credentials()`
+    /// by hand: that function was `pub` and pre-existing, so the test
+    /// asserted something that already worked and deleting the line the
+    /// whole round exists to add left it green.
+    ///
+    /// Two assertions, and the second is not decoration. A customer-managed
+    /// entry must go, and a plaintext entry must **stay**: it is what
+    /// `proxy.secrets.rotation`'s grace window serves stale from, the
+    /// customer's root never opened it, and a Vault outage takes the
+    /// Transit mount and the KV backend down together, so a global purge
+    /// cancels the grace window at exactly the moment it is needed.
+    #[tokio::test]
+    async fn a_failed_liveness_probe_drops_the_credentials_the_root_opened() {
+        let _guard = crate::key_plane::test_plane_guard();
+        let root = Arc::new(FailingProbeRoot {
+            window: std::time::Duration::from_secs(600),
+            purged: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let crypto =
+            KeyCrypto::new(b"pep".to_vec(), b"master".to_vec()).with_root_of_trust(root.clone());
+        let store = Arc::new(MemoryKeyStore::new());
+        let cache = Arc::new(TtlCache::new(
+            store as Arc<dyn KeyStore>,
+            TtlCacheConfig::default(),
+        ));
+        let plane = Arc::new(KeyPlane::from_parts(crypto, cache, false, false, None));
+        crate::key_plane::install_key_plane_for_test(plane.clone());
+
+        // One credential the customer's root opened, and one it never
+        // touched.
+        let envelope = plane
+            .crypto()
+            .seal_async("cred-cmk", b"cmk-secret")
+            .await
+            .expect("seal under the customer-managed root");
+        assert!(
+            envelope.kek.is_some(),
+            "the envelope must name its root, or this test is not exercising the CMK path"
+        );
+        put(
+            &plane,
+            credential("cred-cmk", CredentialMaterial::Envelope { envelope }),
+        )
+        .await;
+        put(
+            &plane,
+            credential(
+                "cred-plain",
+                CredentialMaterial::Plaintext {
+                    value: "local-secret".into(),
+                },
+            ),
+        )
+        .await;
+
+        // Warm both through the real resolution path.
+        assert_eq!(
+            plane
+                .resolve_credential_secret("cred-cmk", None)
+                .await
+                .expect("resolves through the root")
+                .material,
+            "cmk-secret"
+        );
+        assert_eq!(
+            plane
+                .resolve_credential_secret("cred-plain", None)
+                .await
+                .expect("resolves locally")
+                .material,
+            "local-secret"
+        );
+        assert_eq!(
+            plane.resolved_credential_count(),
+            2,
+            "both entries must be warm, or this test proves nothing"
+        );
+
+        // The real arm, with a real failing probe behind it.
+        let dyn_root: Arc<dyn sbproxy_keystore::crypto::RootOfTrust> = root.clone();
+        crate::key_root_of_trust::probe_once(&dyn_root).await;
+
+        assert_eq!(
+            root.purged.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the failure arm must purge the wrapped data keys"
+        );
+        // By name, not by count, and not by re-resolving. A count of 1 is
+        // equally true when the predicate is inverted and exactly the
+        // wrong entry survives, and a re-resolve returns `Ok` either way
+        // because a miss falls through to the store and rebuilds.
+        assert!(
+            !plane.resolved_credential_is_cached("cred-cmk"),
+            "a failed probe must drop every credential the root opened. Purging only the \
+             wrapped data keys leaves the credential the customer is testing being served from \
+             a cache the probe never touched, which is the published clause being false"
+        );
+        assert!(
+            plane.resolved_credential_is_cached("cred-plain"),
+            "the plaintext entry must survive: the customer's root never opened it, it is what \
+             the stale-serve grace window serves from during the same outage, and a Vault \
+             outage takes the Transit mount and the KV backend down together"
+        );
+        assert_eq!(plane.resolved_credential_count(), 1);
+    }
+
+    /// Blocker 3's seam: a config-seeded `secret:` credential must still
+    /// be created when a customer-managed root of trust is configured.
+    ///
+    /// `KeyCrypto::seal` refuses outright under a customer-managed root,
+    /// deliberately, so that no call site can quietly produce a
+    /// locally-wrapped envelope while the config claims a customer-held
+    /// root. `lower_seed_credential` was left on that synchronous path
+    /// when the admin path moved to `seal_async`, which turned the
+    /// refusal into "every seeded credential is logged and skipped at
+    /// boot": the boot succeeded, the records were simply absent, and the
+    /// first symptom was a `NotFound` at request time.
+    ///
+    /// The existing seeding test cannot see this, because it runs with no
+    /// root of trust, where `seal_async` falls through to the local seal
+    /// and reverting it to `seal` is invisible. This one installs a root,
+    /// so reverting `key_plane.rs`'s `seal_async` back to `seal` reddens
+    /// it.
+    #[tokio::test]
+    async fn a_seeded_credential_survives_a_customer_managed_root() {
+        let crypto = KeyCrypto::new(b"pep".to_vec(), b"master".to_vec())
+            .with_root_of_trust(Arc::new(SeedStubRoot));
+        let store: Arc<dyn KeyStore> = Arc::new(MemoryKeyStore::new());
+
+        let mut cfg = sbproxy_config::types::KeyManagementConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        cfg.seed.credentials = vec![sbproxy_config::types::SeedCredentialConfig {
+            id: "seed-cred".into(),
+            name: None,
+            provider: None,
+            kind: None,
+            vault_ref: None,
+            secret: Some("sk-seeded".into()),
+            tenant: None,
+        }];
+
+        seed_records(&store, &crypto, &cfg, Utc::now())
+            .await
+            .expect("seeding succeeds under a customer-managed root");
+
+        let stored = store
+            .get_credential("seed-cred")
+            .await
+            .expect("store read")
+            .expect(
+                "the seeded credential must exist. Under a customer-managed root the synchronous \
+                 seal refuses, so a seed path still on it logs and skips every credential and the \
+                 boot succeeds with the records simply absent",
+            );
+        match &stored.material {
+            CredentialMaterial::Envelope { envelope } => assert_eq!(
+                envelope.kek.as_deref(),
+                Some("stub/seed-root"),
+                "the seeded envelope must name the customer-managed root that wrapped it, not be \
+                 locally wrapped behind its back"
+            ),
+            other => panic!("expected an envelope, got {other:?}"),
+        }
+    }
+
+    /// A root of trust for the seeding test. Wrapping is reversible so the
+    /// envelope is well formed; what matters is that it is reached at all.
+    #[derive(Debug)]
+    struct SeedStubRoot;
+
+    #[async_trait::async_trait]
+    impl sbproxy_keystore::crypto::RootOfTrust for SeedStubRoot {
+        fn kek_name(&self) -> &str {
+            "stub/seed-root"
+        }
+        async fn wrap_dek(&self, dek: &[u8]) -> anyhow::Result<String> {
+            Ok(format!("stub:v1:{}", hex::encode(dek)))
+        }
+        async fn unwrap_dek(
+            &self,
+            wrapped: &str,
+        ) -> anyhow::Result<sbproxy_keystore::crypto::UnwrappedDek> {
+            let body = wrapped
+                .strip_prefix("stub:v1:")
+                .ok_or_else(|| anyhow::anyhow!("not a stub ciphertext"))?;
+            Ok(sbproxy_keystore::crypto::UnwrappedDek {
+                dek: hex::decode(body)?,
+                valid_for: std::time::Duration::from_secs(60),
+            })
+        }
+        fn revocation_window(&self) -> std::time::Duration {
+            std::time::Duration::from_secs(60)
+        }
+        // Same reason as `ShortWindowRoot`: no defaults to inherit, so the
+        // double writes down that it neither probes nor caches, and says
+        // so with an `Err` that matches the `false` below it.
+        async fn probe_liveness(&self) -> anyhow::Result<()> {
+            Err(anyhow::anyhow!("this double runs no probe"))
+        }
+        fn last_liveness_unix(&self) -> Option<u64> {
+            None
+        }
+        fn last_liveness_ok(&self) -> bool {
+            false
+        }
+        fn cached_dek_count(&self) -> usize {
+            0
+        }
+        fn purge_cache(&self) {}
     }
 }

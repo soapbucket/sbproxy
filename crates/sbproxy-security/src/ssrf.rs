@@ -977,6 +977,69 @@ mod caller_status_guard {
         "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen",
     ];
 
+    /// The source of `text` with every `#[cfg(test)]` module blanked
+    /// out, line count preserved.
+    ///
+    /// The block this guard checks is a list of production paths that
+    /// need dial-time re-validation. A validator call in a unit test is
+    /// not one of those: it is a test asserting the validator refuses
+    /// something, and naming it in the block would tell a reviewer to
+    /// audit a `#[test]` for pinning behavior it does not have. Counting
+    /// them also made the count move whenever anyone added a test, which
+    /// is how this guard first went red.
+    ///
+    /// Deliberately blanks rather than deletes, so a future finding that
+    /// wants line numbers still gets true ones.
+    ///
+    /// The narrowing is the part to be careful about, because a guard
+    /// that skips too much is worse than none: this only skips a module
+    /// introduced by a literal `#[cfg(test)]` attribute, tracked to its
+    /// matching brace, so production code after a test module is still
+    /// read. It does not understand `cfg(all(test, ...))`, string
+    /// literals or comments containing braces, which is why the count
+    /// assertion stays: if this ever blanks the wrong span, the number
+    /// moves and the guard says so.
+    fn without_test_modules(text: &str) -> String {
+        let mut out: Vec<String> = Vec::new();
+        let mut depth: Option<i32> = None;
+        let mut pending = false;
+        for line in text.lines() {
+            let trimmed = line.trim_start();
+            match depth {
+                Some(ref mut open) => {
+                    *open += line.matches('{').count() as i32;
+                    *open -= line.matches('}').count() as i32;
+                    out.push(String::new());
+                    if *open <= 0 {
+                        depth = None;
+                    }
+                }
+                None if pending && trimmed.contains('{') => {
+                    let open = line.matches('{').count() as i32 - line.matches('}').count() as i32;
+                    pending = false;
+                    out.push(String::new());
+                    if open > 0 {
+                        depth = Some(open);
+                    }
+                }
+                None => {
+                    if trimmed.starts_with("#[cfg(test)]") {
+                        pending = true;
+                        out.push(String::new());
+                    } else {
+                        if pending && !trimmed.is_empty() && !trimmed.starts_with("//") {
+                            // An attribute on something that is not a
+                            // block: a `#[cfg(test)] use ...`, say.
+                            pending = false;
+                        }
+                        out.push(line.to_string());
+                    }
+                }
+            }
+        }
+        out.join("\n")
+    }
+
     fn rust_files(root: &Path) -> Vec<PathBuf> {
         let mut out = Vec::new();
         let mut stack = vec![root.to_path_buf()];
@@ -1049,9 +1112,10 @@ mod caller_status_guard {
             if file == this_file {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(&file) else {
+            let Ok(raw) = std::fs::read_to_string(&file) else {
                 continue;
             };
+            let text = without_test_modules(&raw);
             let calls = text
                 .lines()
                 .filter(|line| {

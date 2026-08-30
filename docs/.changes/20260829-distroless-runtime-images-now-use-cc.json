@@ -1,0 +1,4 @@
+{
+  "type": "fixed",
+  "message": "**Distroless runtime images now use `cc-debian13`.** Fetched mistral.rs prebuilts that need GLIBC_2.38 or newer can start."
+}

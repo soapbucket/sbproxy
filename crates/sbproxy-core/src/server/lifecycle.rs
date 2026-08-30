@@ -6036,6 +6036,18 @@ fn arm_egress_gates_from_config(compiled: &sbproxy_config::CompiledConfig) {
         &[EgressPurpose::UsageSink, EgressPurpose::Webhook],
         compiled.egress.usage_sinks.clone(),
     );
+    // WOR-2712: the events webhook SSRF guard runs before the
+    // governed-egress authorizer, so `allow_private` on this
+    // sub-block has to reach that earlier check too. Empty when
+    // the block is absent or `allow_private` is false: deny-by-default.
+    sbproxy_observe::arm_webhook_ssrf_allowlist(
+        compiled
+            .egress
+            .usage_sinks
+            .as_ref()
+            .map(|authorizer| authorizer.ssrf_private_hosts(EgressPurpose::Webhook))
+            .unwrap_or_default(),
+    );
     arm(
         &[EgressPurpose::ModelArtifact],
         compiled.egress.model_artifacts.clone(),
@@ -7415,6 +7427,9 @@ origins:
                     "env:SBPROXY_TEST_LIFECYCLE_PEPPER_DOES_NOT_EXIST_ANYWHERE".to_string(),
                 ),
                 master_key: None,
+                allow_ephemeral_secrets: false,
+                root_of_trust: None,
+                rotation: Default::default(),
             },
             ..Default::default()
         }
@@ -7457,6 +7472,9 @@ origins:
             crypto: sbproxy_config::types::KeyCryptoConfig {
                 pepper: Some("pinned-pepper".to_string()),
                 master_key: None,
+                allow_ephemeral_secrets: false,
+                root_of_trust: None,
+                rotation: Default::default(),
             },
             ..Default::default()
         };
@@ -8342,6 +8360,77 @@ mod event_egress_tests {
         assert!(
             error.to_string().contains("events.signing_secret"),
             "the failure names the key: {error}"
+        );
+    }
+
+    fn webhook_config(url: &str) -> EventsConfig {
+        EventsConfig {
+            sink: EventSinkKind::Webhook,
+            url: Some(url.to_string()),
+            path: None,
+            signing_secret: None,
+            types: Vec::new(),
+            fail_closed: Vec::new(),
+            queue_capacity: None,
+        }
+    }
+
+    fn restore_usage_sinks_gates() {
+        sbproxy_security::egress::install_configured_gate(
+            sbproxy_security::egress::EgressPurpose::UsageSink,
+            None,
+        );
+        sbproxy_security::egress::install_configured_gate(
+            sbproxy_security::egress::EgressPurpose::Webhook,
+            None,
+        );
+        sbproxy_observe::arm_webhook_ssrf_allowlist(Vec::new());
+    }
+
+    #[test]
+    fn usage_sinks_allow_private_lets_a_loopback_events_webhook_start() {
+        // WOR-2712: production `ssrf_allowlist()` used to return an empty
+        // vec at boot, so `egress.usage_sinks.allow_private: true` plus a
+        // listed host never reached the SSRF check. Arm the compiled
+        // usage_sinks block the same way `run` does, then start a
+        // webhook at loopback the way `install_event_egress` does.
+        let yaml = r#"
+proxy: {}
+egress:
+  usage_sinks:
+    mode: deny_by_default
+    hosts: ["127.0.0.1"]
+    allow_private: true
+"#;
+        let compiled = sbproxy_config::compile_config(yaml).expect("config compiles");
+        arm_egress_gates_from_config(&compiled);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind collector");
+        let addr = listener.local_addr().expect("collector addr");
+        let built = build_event_egress(&webhook_config(&format!("http://{addr}/ingest")));
+        restore_usage_sinks_gates();
+        let (egress, sink) = built
+            .expect("loopback collector on an allow_private usage_sinks host must start")
+            .expect("webhook egress is started");
+        assert_eq!(sink, "webhook");
+        drop(egress);
+    }
+
+    #[test]
+    fn a_loopback_events_webhook_is_refused_without_usage_sinks_allow_private() {
+        // Inverse of the test above: no usage_sinks arming, so the SSRF
+        // guard still runs with an empty host list and must refuse the
+        // same loopback URL at boot.
+        let compiled = sbproxy_config::compile_config("proxy: {}\n").expect("bare config compiles");
+        arm_egress_gates_from_config(&compiled);
+
+        let error = build_event_egress(&webhook_config("http://127.0.0.1:9/ingest"))
+            .expect_err("a private collector must not boot without allow_private");
+        restore_usage_sinks_gates();
+        let message = error.to_string();
+        assert!(
+            message.contains("SSRF guard"),
+            "the refusal must name the SSRF guard: {message}"
         );
     }
 

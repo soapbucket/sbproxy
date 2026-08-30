@@ -1,0 +1,125 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Break-glass emergency access to the key and credential admin API.
+#
+# A grant is a time-boxed, scoped, quorum-approved marker on an admin session.
+# It is not a new authorization model: authorization is still the admin RBAC
+# roles. What it adds is that the access was asked for, agreed to by other
+# people, bounded, and attributable afterwards to one id.
+#
+# Setup:
+#   export SBPROXY_KEY_PEPPER=a-long-random-server-pepper
+#   export SBPROXY_KEY_MASTER=a-long-random-master-key
+#   make run CONFIG=examples/break-glass/sb.yml
+#
+# 1. Alice requests a grant. Scope and justification are both required, and a
+#    ttl_secs above max_ttl_secs is refused rather than clamped:
+#   curl -s -u alice:alice-password -X POST http://127.0.0.1:9090/admin/break-glass \
+#     -H 'Content-Type: application/json' \
+#     -d '{"justification":"incident 4412, provider key rotated out from under us",
+#          "scope":["cred-openai"],"ttl_secs":900}'
+#   # 201 { "grant": { "id": "bg_...", "state": "pending_approval", "approvals_needed": 2 } }
+#
+# 2. Alice cannot approve her own request, even though she is on the roster:
+#   curl -s -u alice:alice-password -X POST \
+#     http://127.0.0.1:9090/admin/break-glass/bg_.../approve
+#   # 403 { "error": "a break-glass grant cannot be approved by the operator who requested it" }
+#
+# 3. Two other roster operators approve. The second one activates it:
+#   curl -s -u bob:bob-password -X POST \
+#     http://127.0.0.1:9090/admin/break-glass/bg_.../approve
+#   # 200 { "grant": { "state": "pending_approval", "approvals_needed": 1 } }
+#   curl -s -u carol:carol-password -X POST \
+#     http://127.0.0.1:9090/admin/break-glass/bg_.../approve
+#   # 200 { "grant": { "state": "active", "expires_at": "..." } }
+#
+# 4. Anything alice does now is tagged with the grant id in the key audit
+#    chain, and counted against the grant:
+#   curl -s -u alice:alice-password -X POST http://127.0.0.1:9090/admin/keys \
+#     -H 'Content-Type: application/json' -d '{"name":"incident-4412"}'
+#   curl -s -u admin:admin http://127.0.0.1:9090/admin/break-glass
+#   # { "grants": [ { "id": "bg_...", "actions_taken": 1, ... } ] }
+#
+# 5. After the TTL passes the grant does not close. It moves to
+#    awaiting_review and stays on the queue until somebody signs off:
+#   curl -s -u dave:dave-password -X POST \
+#     http://127.0.0.1:9090/admin/break-glass/bg_.../review \
+#     -H 'Content-Type: application/json' \
+#     -d '{"note":"rotation confirmed, no other credential touched"}'
+#
+# 6. What a reviewer alerts on: grants that expired and nobody signed off.
+#   curl -s http://127.0.0.1:9090/metrics | grep sbproxy_break_glass
+#
+# Grants live in process memory. A restart voids every active grant, which
+# fails safe, and a fleet does not share them: each node counts its own quorum.
+
+proxy:
+  http_bind_port: 8080
+
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    password: admin
+
+  key_management:
+    enabled: true
+    store:
+      backend: embedded
+      path: /tmp/sbproxy-break-glass.redb
+    crypto:
+      pepper: env:SBPROXY_KEY_PEPPER
+      master_key: env:SBPROXY_KEY_MASTER
+    break_glass:
+      enabled: true
+      # Who may approve. A requester is never counted among their own
+      # approvers even when listed here.
+      approvers:
+        - alice
+        - bob
+        - carol
+        - dave
+      # How many distinct approvers a grant needs before it activates.
+      quorum: 2
+      # Hard cap on a requested TTL. A request naming more is refused.
+      max_ttl_secs: 3600
+      # How long after expiry an unreviewed grant is merely open rather
+      # than overdue.
+      review_window_secs: 86400
+    # Credential-read auditing. Independent of break-glass grant tagging,
+    # which happens unconditionally in the admin audit seam and needs no
+    # opt-in; what this block turns on is the chained detail record for
+    # credential *resolutions*.
+    read_audit:
+      enabled: true
+      detail_window_secs: 300
+      hash_identifiers: true
+    failure_posture: closed
+
+  # The signing identity the audit chain is cut with. Demo key only: this
+  # is the published RFC 8032 test vector, the same pair
+  # docs/web-bot-auth.md uses, so the walkthrough runs without generating
+  # keys. Generate your own before running this anywhere real.
+  web_bot_auth:
+    key_id: break-glass-demo-2026
+    ed25519_seed_hex: "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
+
+# Every key or credential mutation made while a grant is active carries
+# break_glass_grant=<id> in its context field. That tagging is
+# unconditional; this block is what makes it durable, so a reviewer can pull
+# the whole session by one key after the fact.
+audit:
+  sink: chain
+  path: /tmp/sbproxy-break-glass-security.chain
+  sign_with: proxy.web_bot_auth
+  # Where the tagged records land. Every key or credential mutation made
+  # while a grant is active carries break_glass_grant=<id> in its context
+  # field, so `sbproxy audit verify --channel key` plus a grep for the
+  # grant id reconstructs the whole session.
+  key_path: /tmp/sbproxy-break-glass-key.chain
+
+origins:
+  "openai.local":
+    action:
+      type: static
+      status: 200
+      body: "break-glass example origin"

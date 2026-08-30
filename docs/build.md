@@ -1,5 +1,5 @@
 # Build pipeline
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-29*
 
 How the proxy container images are built, what stays warm between
 runs, and what the expected wall-clock numbers are. Companion to
@@ -93,9 +93,12 @@ through `builder` (see above) rather than repeating it here:
 6. **cert-gen** (cloudbuild only): self-signed loadtest cert.
    Production deploys mount real certs over `/etc/sbproxy/` at
    runtime.
-7. **runtime**: `gcr.io/distroless/cc-debian12` (the `:nonroot`
-   variant in `Dockerfile.ci`). Carries the binary and (cloudbuild)
-   the loadtest cert pair.
+7. **runtime**: `gcr.io/distroless/cc-debian13` (the `:nonroot`
+   variant in `Dockerfile.ci`). Debian 13 ships glibc 2.41, so fetched
+   engine binaries that need GLIBC_2.38 or newer (mistral.rs) can start.
+   The sbproxy binary itself is still built on bookworm and must require
+   glibc 2.36 or older so Linux tarballs run on Debian 12. Carries the
+   binary and (cloudbuild) the loadtest cert pair.
 
 ## Build-time numbers
 

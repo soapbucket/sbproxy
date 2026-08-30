@@ -473,6 +473,14 @@ jobs:
       - name: durable sinks create files owner-only (WOR-2626)
         run: bash scripts/check-durable-file-modes.sh
 
+      # Fleet and Cloud Build images must COPY /var/lib/sbproxy into the
+      # runtime stage (WOR-2705), and every distroless runtime FROM must
+      # not still name cc-debian12 (WOR-2713). Dockerfile.worker is CUDA
+      # / Ubuntu: it needs the COPY and is not required to name debian13.
+      # Shares one script with scripts/check.sh and check-fast.sh.
+      - name: runtime images keep /var/lib/sbproxy and debian13
+        run: bash scripts/check-runtime-image-lockstep.sh
+
       # Every type in scripts/secret-debug-registry.txt keeps its
       # redacting Debug (WOR-2640). Pure grep plus its own fixtures.
       # A runtime test can prove one type redacts; only a registry can

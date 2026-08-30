@@ -107,9 +107,9 @@ pub use clock_skew::{
     DEFAULT_NTP_SOURCE, DEFAULT_POLL_INTERVAL_SECS, SNTP_TIMEOUT, TOLERANCE_SECS,
 };
 pub use event_sink::{
-    install_event_egress, publish_proxy_event, publish_proxy_event_checked, wants_event,
-    EventEgress, EventPublishError, EventSinkTarget, EventTypeMask,
-    DEFAULT_QUEUE_CAPACITY as DEFAULT_EVENT_QUEUE_CAPACITY,
+    arm_webhook_ssrf_allowlist, install_event_egress, publish_proxy_event,
+    publish_proxy_event_checked, wants_event, EventEgress, EventPublishError, EventSinkTarget,
+    EventTypeMask, DEFAULT_QUEUE_CAPACITY as DEFAULT_EVENT_QUEUE_CAPACITY,
 };
 pub use events::{
     EventBus, EventType, PolicySurface, PolicyVerdictEvent, ProxyEvent, VerdictTag, ALL_EVENT_TYPES,

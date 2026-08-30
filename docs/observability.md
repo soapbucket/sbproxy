@@ -1,5 +1,5 @@
 # Observability
-*Last modified: 2026-08-27*
+*Last modified: 2026-08-28*
 
 SBproxy ships metrics, logs, and traces from one process. This guide covers the Wave 1 substrate: the SLO catalog, the metric label budget, the log schema and redaction policy, the trace propagation contract, the health endpoints, the dashboards, and the reference Compose stack you can boot in one command.
 
@@ -1004,7 +1004,7 @@ The proxy also makes HTTP calls of its own while handling a request, and those a
 
 Not every outbound call has a trace to join, and the ones that do not are named rather than left quiet. A release download at boot, a CLI subcommand, a config-authority poll, a certificate renewal, and a provider health probe are all scheduled by a timer or an operator, not by a request. Those leave without the header on purpose: a synthesized root per call would put an orphan single-span trace in your backend for each one, indistinguishable from a real trace and attached to nothing, which is worse than an absent header. An absent header at least reads as "this hop was not traced".
 
-Both halves are enforced rather than described. Every file in the workspace that builds or drives an outbound HTTP client is classified: 10 outbound files attach the trace context, and 57 carry a reviewed line saying why the call they make has none. The `outbound_trace_drift` guard fails the build when a new outbound client appears in a file that is on neither list, when a file that was injecting stops, and when a file listed as having no trace to join starts injecting anyway. The uninjected list is where the remaining work is visible, and the largest entries on it are the AI provider call, the RAG embedding and vector calls, and the settlement transport.
+Both halves are enforced rather than described. Every file in the workspace that builds or drives an outbound HTTP client is classified: 11 outbound files attach the trace context, and 57 carry a reviewed line saying why the call they make has none. The `outbound_trace_drift` guard fails the build when a new outbound client appears in a file that is on neither list, when a file that was injecting stops, and when a file listed as having no trace to join starts injecting anyway. The uninjected list is where the remaining work is visible, and the largest entries on it are the AI provider call, the RAG embedding and vector calls, and the settlement transport.
 
 One behavior worth knowing before you read a trace: the proxied upstream request carries `traceparent` whether or not you have configured an OTLP exporter, because it is built from the request's own parsed context. The helper calls that read the ambient span instead carry it only when tracing is enabled, since with no tracer installed there is no span to read.
 

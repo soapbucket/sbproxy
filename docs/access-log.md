@@ -425,6 +425,57 @@ written under a recognized name: `api_key`, `password`, `master_key`,
 `signing_key`, `shared_key`, `virtual_key`, `challenge_binding_key`,
 `signing_secret`, `client_secret`, `session_token`, or a bare `token`.
 
+It also masks a credential carried in a URL's userinfo, which is the one
+thing it recognizes by position rather than by shape or by name:
+`https://sbproxy:hvs.MUSTNOTAPPEAR...@vault.internal:8200` comes out as
+`https://[REDACTED]@vault.internal:8200`. The scheme and everything from
+the last `@` of the authority on survive, so the host stays readable, and
+a password containing its own `@` does not leak its tail. The user is
+masked along with the password.
+
+The authority is matched by an allowlist rather than by scanning to the
+next delimiter. A byte continues it only if it is one of `[A-Za-z0-9]`,
+`-`, `.`, `_`, `~`, `%`, `:`, or `@`, which is a strict subset of what RFC
+3986 permits there. Everything else ends the run.
+
+That set is this surface's. The config routes take a wider one, described
+in [configuration.md](configuration.md#config_history), because a rendered
+config document has no field whose delimiters a caller chose: the value is
+a whole scalar and the renderer picked what surrounds it. Here the `query`
+field holds the client's raw query string, so `&` and `=` are live bytes an
+attacker supplies, and admitting them would let a mask delete a caller's
+own parameters out of their own log record.
+
+The set is *not* "every byte that is not structure", and that distinction
+matters: `:` is JSON structure and is in the set, because a URL needs it.
+What holds the line is narrower and stronger. Neither `"` nor `\` is in
+the set, a JSON string ends only at an unescaped `"`, and every escape
+begins with `\`, so a deleted span cannot leave the string token it
+started in. The other serializations are held by their own delimiters
+being absent from the set: whitespace and `,` end a YAML flow scalar and
+a logfmt pair, and `&` and `=` end a query parameter. Three consequences
+worth knowing:
+
+* An `@` outside the authority is never reached, so
+  `https://api.example.com?notify=ops@example.com` and the same URL with a
+  path or a `#fragment` come back untouched.
+* The closing `"` of a JSON string always ends the run, so this pass
+  cannot reach the next field of a record. That is not incidental: the
+  field pass below only runs on a line that still parses, so a value pass
+  that ran past a key separator would drop the whole record's field
+  denylist, and this rule is the only one here with no key name to anchor
+  on.
+* `&` and `=` end the run, which matters because the `query` field holds
+  the client's raw query string with the leading `?` already stripped.
+  With those two in the set, `u=https://a.example&op=drop_all&next=b@c`
+  masked to `u=https://[REDACTED]@c` and a caller could delete their own
+  query parameters from their own record by choosing their order.
+
+The stated cost, the same one the `password` pattern carries: userinfo that
+literally contains one of the excluded bytes ends the run there, so the URL
+is emitted unmasked rather than masked halfway. That includes every
+non-ASCII byte, so `https://usér:pw@host` is not masked at all.
+
 The **field pass** then parses the line as JSON and masks whole values
 by field name. That is the layer covering `prompt`, `messages`,
 `cookie`, `authorization`, a captured `x-api-key` header, and

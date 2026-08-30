@@ -324,6 +324,9 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             source: Default::default(),
+            rotated_at: None,
+            prev_material: None,
+            prev_material_expires_at: None,
         };
         tier.put_credential(&cred, Duration::from_secs(60)).await;
         assert!(tier.get_credential("c1").await.is_some());

@@ -1,0 +1,96 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Leased upstream credentials for cloud IAM.
+#
+# Read the scope first. Leasing works where the platform underneath can mint
+# short-lived credentials: an enterprise buyer's own AWS, GCP, or Azure IAM, or
+# a Vault-fronted database mount. Most AI provider API keys cannot. OpenAI and
+# Anthropic have no STS equivalent and no short-TTL issuance, so there is
+# nothing to lease against, and `lease` on such a provider is refused with that
+# limitation named rather than accepted and quietly turned into a static read.
+#
+# A leased credential stores the mount, not a credential. Each resolution that
+# cannot be served from cache reads the mount, which mints; the material is
+# then cached for at most lease_duration_secs and never longer.
+#
+# Setup against a dev Vault with the AWS secrets engine:
+#   vault server -dev -dev-root-token-id=root &
+#   export VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root
+#   vault secrets enable aws
+#   vault write aws/config/root access_key=... secret_key=... region=us-east-1
+#   vault write aws/roles/sbproxy-bedrock credential_type=iam_user \
+#     policy_document=@bedrock-invoke.json default_sts_ttl=900s
+#   export SBPROXY_KEY_PEPPER=a-long-random-server-pepper
+#   export SBPROXY_KEY_MASTER=a-long-random-master-key
+#   make run CONFIG=examples/leased-credentials/sb.yml
+#
+# 1. Create the leased credential. Nothing static is stored:
+#   curl -s -u admin:admin -X POST http://127.0.0.1:9090/admin/credentials \
+#     -H 'Content-Type: application/json' \
+#     -d '{"id":"cred-bedrock","name":"bedrock-prod","provider":"bedrock",
+#          "lease":{"reference":"vault://aws-dynamic/aws/creds/sbproxy-bedrock",
+#                   "platform":"aws","lease_duration_secs":900}}'
+#   # 201 { "credential": { "storage": "leased",
+#   #        "lease": { "platform": "aws", "lease_duration_secs": 900 } } }
+#
+# 2. Try the same for an AI provider key and watch it be refused with the
+#    reason, rather than accepted and silently degraded to a static read:
+#   curl -s -u admin:admin -X POST http://127.0.0.1:9090/admin/credentials \
+#     -H 'Content-Type: application/json' \
+#     -d '{"id":"cred-openai","provider":"openai",
+#          "lease":{"reference":"vault://aws/creds/x","platform":"aws",
+#                   "lease_duration_secs":900}}'
+#   # 400 { "error": "provider 'openai' cannot be leased against platform 'aws'. ..." }
+#
+# 3. Confirm the cache ceiling. Resolve once, wait past the lease, resolve
+#    again, and the mount is read a second time rather than the first
+#    credential being replayed:
+#   curl -s http://127.0.0.1:9090/metrics | grep sbproxy_credential_resolution
+#
+# What this does not do: there is no background renewal loop (sbproxy
+# re-leases lazily at the next resolution), and it does not revoke a lease it
+# stops using (the mount's own TTL reaps it). Keep the vault backend's read
+# cache TTL below lease_duration_secs, or the effective re-mint interval is the
+# backend's rather than the lease's.
+
+proxy:
+  http_bind_port: 8080
+
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    password: admin
+
+  secrets:
+    backends:
+      - type: hashicorp
+        name: aws-dynamic
+        addr: http://127.0.0.1:8200/v1
+        mount: aws
+        auth:
+          type: token
+          token: ${VAULT_TOKEN}
+        # Below lease_duration_secs, or this cache decides the re-mint
+        # interval instead of the lease.
+        cache_ttl_secs: 300
+
+  key_management:
+    enabled: true
+    store:
+      backend: embedded
+      path: /tmp/sbproxy-leased-credentials.redb
+    crypto:
+      pepper: env:SBPROXY_KEY_PEPPER
+      master_key: env:SBPROXY_KEY_MASTER
+    failure_posture: closed
+
+origins:
+  "bedrock.local":
+    action:
+      type: ai_proxy
+      providers:
+        - name: bedrock
+          base_url: https://test.sbproxy.dev
+          credential_id: cred-bedrock
+          models:
+            - anthropic.claude-3-5-sonnet

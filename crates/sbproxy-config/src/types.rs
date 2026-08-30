@@ -5706,6 +5706,13 @@ pub struct KeyManagementConfig {
     /// Optional declarative seed of keys and credentials.
     #[serde(default)]
     pub seed: KeySeedConfig,
+    /// Read and access audit for key and credential resolution (WOR-2570).
+    #[serde(default)]
+    pub read_audit: KeyReadAuditConfig,
+    /// Break-glass emergency access to the key and credential admin API
+    /// (WOR-2573).
+    #[serde(default)]
+    pub break_glass: BreakGlassConfig,
 }
 
 impl KeyManagementConfig {
@@ -6063,6 +6070,273 @@ impl Default for KeyCacheConfig {
     }
 }
 
+/// `key_management.crypto.root_of_trust:` block (WOR-2568). Present means
+/// the customer holds the root of trust for the upstream-credential
+/// envelope; absent means sbproxy's own `master_key` does.
+///
+/// One field answers "is our root of trust customer-held right now", which
+/// is deliberate: before this block existed the only way to answer it was
+/// to audit which reference `master_key` happened to carry, and every
+/// answer that audit could give was "no", because a resolved reference is
+/// a copy.
+#[derive(Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RootOfTrustConfig {
+    /// Which external key service performs the wrap and unwrap.
+    pub provider: RootOfTrustProvider,
+    /// Base address of the key service, for example
+    /// `https://vault.internal:8200`.
+    pub address: String,
+    /// Transit mount path. Defaults to `transit`, matching Vault's own
+    /// default mount.
+    #[serde(default = "default_transit_mount")]
+    pub mount: String,
+    /// Name of the Transit key that wraps sbproxy's data keys. Created and
+    /// owned by the customer; sbproxy never creates it.
+    pub key_name: String,
+    /// Secret reference for the token sbproxy authenticates with
+    /// (`env:`, `file:`, `vault://`, ...). Resolved once at boot. Losing
+    /// this token is a second, independent way for the customer to cut
+    /// sbproxy off.
+    pub token: String,
+    /// Optional Vault Enterprise namespace header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    /// How long an unwrapped data key may be reused before the external
+    /// service is consulted again.
+    ///
+    /// This number *is* the deployment's revocation-latency bound and is
+    /// reported verbatim on `GET /admin/crypto/root-of-trust`. Larger
+    /// trades a longer window in which a revoked grant still works for
+    /// fewer calls to the key service. The resolved-credential cache is
+    /// clamped to this value for customer-managed envelopes, so raising
+    /// `proxy.secrets.rotation.re_resolve_interval_secs` cannot quietly
+    /// extend it.
+    #[serde(default = "default_unwrap_cache_ttl_secs")]
+    pub unwrap_cache_ttl_secs: u64,
+    /// How often to probe the key service for reachability and continued
+    /// authorization, in seconds. Feeds the admin surface's
+    /// last-successful-check timestamp and the liveness metric. Zero
+    /// disables the background probe; the on-demand path still fails
+    /// closed.
+    #[serde(default = "default_root_liveness_interval_secs")]
+    pub liveness_interval_secs: u64,
+}
+
+/// Redacting `Debug` (the rule `HashiCorpBackendAuth` and
+/// `HashiCorpSecretsConfig` already carry in this file). `token` is a secret
+/// reference and `resolve_crypto_field` deliberately exempts inline
+/// literals, so an operator may legitimately write the token itself here;
+/// `address` is unparsed and may carry userinfo. `finish_non_exhaustive`
+/// so a later credential-shaped field is omitted by default.
+impl std::fmt::Debug for RootOfTrustConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RootOfTrustConfig")
+            .field("provider", &self.provider)
+            .field("mount", &self.mount)
+            .field("key_name", &self.key_name)
+            .field("address", &"[REDACTED]")
+            .field("token", &"[REDACTED]")
+            .field("unwrap_cache_ttl_secs", &self.unwrap_cache_ttl_secs)
+            .field("liveness_interval_secs", &self.liveness_interval_secs)
+            .finish_non_exhaustive()
+    }
+}
+
+/// External key services that can hold the root of trust.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RootOfTrustProvider {
+    /// HashiCorp Vault's Transit secrets engine (encryption as a service).
+    /// The caller never receives the key, only ciphertext or plaintext.
+    #[default]
+    VaultTransit,
+}
+
+fn default_transit_mount() -> String {
+    "transit".to_string()
+}
+
+fn default_unwrap_cache_ttl_secs() -> u64 {
+    60
+}
+
+fn default_root_liveness_interval_secs() -> u64 {
+    30
+}
+
+/// `key_management.crypto.rotation:` block (WOR-2567): the named crypto
+/// period for each class of key material, and the grace window a rotated
+/// upstream credential keeps its previous material usable for.
+///
+/// NIST SP 800-57 Part 1 Rev 5 frames a key's life as generation,
+/// activation, active use, rotation, destruction, and expects a deployment
+/// to *state* its crypto period rather than leave "rotate periodically" as
+/// the whole policy. These defaults are that statement; the runtime reads
+/// them to compute rotation age and to warn when a record is past due.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct KeyRotationCadenceConfig {
+    /// Crypto period for inbound virtual keys, in days. Default 90.
+    #[serde(default = "default_inbound_key_period_days")]
+    pub inbound_key_days: u32,
+    /// Crypto period for upstream provider credentials, in days.
+    /// Default 90: a provider API key is a bearer credential with no
+    /// binding to the caller, so it sits at the short end of NIST's range
+    /// rather than the one to two years a TLS key gets.
+    #[serde(default = "default_credential_period_days")]
+    pub credential_days: u32,
+    /// Crypto period for the envelope master key, in days. Default 365,
+    /// the symmetric data-encryption-key end of NIST's range. Under a
+    /// customer-managed root this is the customer's Transit key rotation
+    /// cadence, not sbproxy's.
+    #[serde(default = "default_master_period_days")]
+    pub master_key_days: u32,
+    /// How long a rotated upstream credential keeps serving its previous
+    /// material when the new material cannot be resolved, in seconds.
+    /// Default 300. Mirrors the dual-validity window `rotate_key` already
+    /// gives inbound keys; zero disables the overlap.
+    #[serde(default = "default_credential_rotation_grace_secs")]
+    pub credential_grace_secs: u64,
+}
+
+impl Default for KeyRotationCadenceConfig {
+    fn default() -> Self {
+        Self {
+            inbound_key_days: default_inbound_key_period_days(),
+            credential_days: default_credential_period_days(),
+            master_key_days: default_master_period_days(),
+            credential_grace_secs: default_credential_rotation_grace_secs(),
+        }
+    }
+}
+
+fn default_inbound_key_period_days() -> u32 {
+    90
+}
+
+fn default_credential_period_days() -> u32 {
+    90
+}
+
+fn default_master_period_days() -> u32 {
+    365
+}
+
+fn default_credential_rotation_grace_secs() -> u64 {
+    300
+}
+
+/// `key_management.read_audit:` block (WOR-2570): the read half of the key
+/// audit trail.
+///
+/// `audit.key_path` records who *changed* a key or credential. This records
+/// who *resolved* one for use, which is the question a breach investigation
+/// actually asks and a different question from the first.
+///
+/// Cost-bounded on purpose, following the shape Vault's audit devices take
+/// for volume versus detail: the counter moves on every resolution, and the
+/// chained detail record fires at most once per credential per window.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct KeyReadAuditConfig {
+    /// Emit chained detail records for credential resolutions. The volume
+    /// counter is unconditional and is not gated by this.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Minimum seconds between detail records for the same credential.
+    /// Default 300. The first resolution in each window emits; the rest
+    /// are counted and not recorded, so cost scales with credential count
+    /// rather than with request rate.
+    #[serde(default = "default_read_audit_window_secs")]
+    pub detail_window_secs: u64,
+    /// HMAC the credential id in the detail record, so a chain handed to
+    /// an auditor does not enumerate which credentials exist while still
+    /// letting an investigator confirm a specific id with
+    /// `sbproxy audit hash`. Default true, matching Vault's audit-device
+    /// posture of hashing sensitive string fields and passing timestamps,
+    /// outcomes, and other non-identifying fields through in the clear.
+    #[serde(default = "default_true")]
+    pub hash_identifiers: bool,
+}
+
+impl Default for KeyReadAuditConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            detail_window_secs: default_read_audit_window_secs(),
+            hash_identifiers: true,
+        }
+    }
+}
+
+fn default_read_audit_window_secs() -> u64 {
+    300
+}
+
+/// `key_management.break_glass:` block (WOR-2573): the pre-staged,
+/// time-boxed, quorum-approved emergency path into the key and credential
+/// admin API.
+///
+/// Every vault product surveyed converges on the same shape, and the shape
+/// is the point: a break-glass grant should be expensive to use quietly and
+/// cheap to review afterwards.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BreakGlassConfig {
+    /// Turn the break-glass endpoints on. Off by default: an emergency
+    /// path nobody configured is an emergency path nobody reviews.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Operators who may approve a grant, by admin username. A requester
+    /// is never counted among their own approvers even when listed here.
+    #[serde(default)]
+    pub approvers: Vec<String>,
+    /// How many distinct approvers a grant needs before it activates.
+    /// Default 2. Must be at least 1 and no greater than the number of
+    /// configured approvers, or config compile refuses the block.
+    #[serde(default = "default_break_glass_quorum")]
+    pub quorum: usize,
+    /// Hard cap on a grant's requested TTL, in seconds. Default 3600.
+    /// A request naming more is refused rather than silently clamped, so
+    /// the requester finds out at request time instead of at expiry.
+    #[serde(default = "default_break_glass_max_ttl_secs")]
+    pub max_ttl_secs: u64,
+    /// How long after expiry a grant with no reviewer sign-off stays on
+    /// the review queue, in seconds. Default 86400, the 24-hour
+    /// post-access review window the surveyed products converge on.
+    /// Grants past this are still listed and still flagged; the number
+    /// drives the overdue marker, not deletion.
+    #[serde(default = "default_break_glass_review_window_secs")]
+    pub review_window_secs: u64,
+}
+
+impl Default for BreakGlassConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            approvers: Vec::new(),
+            quorum: default_break_glass_quorum(),
+            max_ttl_secs: default_break_glass_max_ttl_secs(),
+            review_window_secs: default_break_glass_review_window_secs(),
+        }
+    }
+}
+
+fn default_break_glass_quorum() -> usize {
+    2
+}
+
+fn default_break_glass_max_ttl_secs() -> u64 {
+    3600
+}
+
+fn default_break_glass_review_window_secs() -> u64 {
+    86_400
+}
+
 /// `key_management.crypto:` block. Both values accept a secret reference
 /// (`vault://`, `env:`, `file:`, ...) resolved at boot, or an inline value
 /// (discouraged outside tests).
@@ -6078,6 +6352,27 @@ pub struct KeyCryptoConfig {
     /// encrypted upstream credentials; vault-ref credentials do not need it.
     #[serde(default)]
     pub master_key: Option<String>,
+    /// Let the process mint an ephemeral `pepper` or `master_key` when the
+    /// operator pinned neither (WOR-2567).
+    ///
+    /// Default false, and the default is the change: a restart with no
+    /// pinned pepper silently invalidates every stored key hash, and the
+    /// failure surfaces as a flood of 401s rather than as a boot refusal.
+    /// Vault and comparable products refuse to start without a resolvable
+    /// root key rather than minting one, and that is now the behavior here.
+    /// Set true for a single-process local development run, where a key
+    /// plane whose hashes do not outlive the process is exactly what is
+    /// wanted.
+    #[serde(default)]
+    pub allow_ephemeral_secrets: bool,
+    /// Customer-managed root of trust for the upstream-credential envelope
+    /// (WOR-2568). Absent means sbproxy's own `master_key` is the root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_of_trust: Option<RootOfTrustConfig>,
+    /// Named crypto periods and the credential rotation grace window
+    /// (WOR-2567).
+    #[serde(default)]
+    pub rotation: KeyRotationCadenceConfig,
 }
 
 /// `key_management.oidc_claim_map:` block.
@@ -16431,5 +16726,44 @@ mod host_backed_secret_reference_tests {
             assert!(!is_secret_reference(value), "`{value}`");
             assert!(host_backed_secret_reference(value).is_none(), "`{value}`");
         }
+    }
+
+    /// Registry sentinel for `RootOfTrustConfig`
+    /// (`scripts/secret-debug-registry.txt`).
+    ///
+    /// The config-side twin of `TransitConfig`. `token` is a secret
+    /// reference and `resolve_crypto_field` deliberately exempts inline
+    /// literals, so an operator may legitimately write the token itself
+    /// here; `address` is unparsed and may carry userinfo.
+    #[test]
+    fn debug_never_renders_the_root_of_trust_token_or_address() {
+        const SENTINEL: &str = "SENTINEL-ROT-9c4a";
+
+        let root = RootOfTrustConfig {
+            provider: RootOfTrustProvider::VaultTransit,
+            address: format!("https://sbproxy:{SENTINEL}@vault.internal:8200"),
+            mount: "transit".to_string(),
+            key_name: "sbproxy-root".to_string(),
+            token: format!("hvs.{SENTINEL}"),
+            namespace: None,
+            unwrap_cache_ttl_secs: 60,
+            liveness_interval_secs: 30,
+        };
+        let rendered = format!("{root:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the root-of-trust token or address reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("RootOfTrustConfig")
+                && rendered.contains("transit")
+                && rendered.contains("sbproxy-root"),
+            "the identifier, mount, and key name must survive so a misconfiguration is \
+             diagnosable: {rendered}"
+        );
+        assert!(
+            rendered.contains("[REDACTED]"),
+            "the redaction must be visible rather than the field simply vanishing: {rendered}"
+        );
     }
 }

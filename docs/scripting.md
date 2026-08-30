@@ -1,6 +1,6 @@
 # SBproxy scripting reference: CEL, Rego, Lua, JavaScript, and WASM
 
-*Last modified: 2026-08-27*
+*Last modified: 2026-08-29*
 
 SBproxy includes five scripting engines for custom logic: CEL (Common Expression Language), Rego (via Regorus), Lua, JavaScript, and WASM. All run in sandboxed environments with access to request context.
 
@@ -635,6 +635,7 @@ Everything fails closed, at the earliest point it can be detected:
 |---|---|---|
 | Module does not parse | config load | config refused, boot and reload both name the error |
 | Module parses but is semantically invalid (unsafe variable, `query` naming no rule) | config load | config refused; the engine runs one trial evaluation so deferred analysis cannot push an authoring mistake to request time |
+| Load-time trial exceeds `budget_ms` | config load | compile proceeds; the trial is inconclusive, not a semantic fault. The same budget still denies at request time |
 | Rule errors, returns a non-boolean, or exceeds `budget_ms` at request time | per request | request denied with `deny_status`, one warning logged |
 
 `budget_ms` bounds one evaluation's wall clock and defaults to 50ms, matching the extension-bundle sandbox. It cannot be zero.
@@ -1371,7 +1372,7 @@ The four bullets below describe `policies[] type: rego` and `ai_routing_policy` 
 
 - One evaluation runs under `budget_ms` (default 50 ms, matching the extension-bundle sandbox default), enforced by the Regorus execution timer, which checks the deadline every thousand work units. `budget_ms: 0` is refused at config load.
 - Deliberately has no memory or stack cap and no fuel: the execution timer bounds total work, and a policy is one bounded evaluation over an already-bounded input document rather than a body-sized stream.
-- Configured per policy (`policies[] type: rego`, field `budget_ms`), not under `proxy.scripting`. Modules are compiled and semantically checked at config load, including one trial evaluation, so authoring mistakes cannot defer to request time.
+- Configured per policy (`policies[] type: rego`, field `budget_ms`), not under `proxy.scripting`. Modules are compiled and semantically checked at config load, including one trial evaluation, so authoring mistakes cannot defer to request time. A trial that only exceeds `budget_ms` is inconclusive: compile proceeds, and the request path still denies when the same budget is exceeded for real.
 - Every fault denies the request; there is no `failure_posture` knob on this surface. See [§3a](#failure-posture).
 - A [request/response modifier's](#rego-modifiers) `rego_module` compiles fresh per invocation instead, under its own `rego_budget_ms` (same 50 ms default), and a fault is logged and the modifier skipped rather than denying, matching the Lua/JS modifier posture. A signed extension bundle's [`runtime: rego`](extension-bundles.md#rego) policy hook compiles once at candidate load like `policies[] type: rego`, but a request-time fault propagates to the bundle manifest's `failure_posture` (`open` admits, `closed` refuses) instead of always denying, the same fault path every other bundle policy hook shares.
 
@@ -1462,7 +1463,7 @@ With debug logging on, script failures are logged with the engine, the error mes
 | rate-limit `key:` | A CEL parse error rejects the config at compile time; an empty or null result falls back to the default client key; an evaluation error buckets the request under the `__cel_key_error__:` namespace and logs |
 | WAF `persistent_block.key` | A CEL parse error, or `track_by: cel` with no `key:`, rejects the config at compile time; an evaluation error leaves the request untracked (no strike, no block) |
 | `engine: cel` custom log field | A CEL parse error rejects the config at compile time; an evaluation error is logged at debug and the field is omitted from the line |
-| `rego` policy | A module that fails to parse or a semantic fault (unsafe variable, `query` naming no rule) rejects the config at compile time; a rule error, non-boolean result, or exceeded `budget_ms` denies the request with `deny_status` |
+| `rego` policy | A module that fails to parse or a semantic fault (unsafe variable, `query` naming no rule) rejects the config at compile time; a load-time trial that only exceeds `budget_ms` is inconclusive and does not refuse compile; a rule error, non-boolean result, or exceeded `budget_ms` at request time denies the request with `deny_status` |
 | forward-rule `when:` | A CEL parse error rejects the config at compile time; an evaluation error means the rule does not match, logged per request |
 | WAF custom rule (Lua / JS) | A rule whose script errors is skipped and counted; if no rule blocked but at least one went unevaluated, the pass reports a WAF failure and the policy's `failure_posture` decides (default closed) |
 | Lua / JS / Rego modifiers | Error logged per request; the modifier's headers are not applied; the request proceeds. Unlike `policy: rego`, a Rego modifier module that fails to parse follows this row, not the `rego` policy row above: the module is not compiled at config load |

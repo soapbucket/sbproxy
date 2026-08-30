@@ -246,6 +246,27 @@ impl EgressAuthorizer {
         purposes
     }
 
+    /// Hosts the events webhook SSRF guard should exempt from its
+    /// private-address block for `purpose`.
+    ///
+    /// Empty when the purpose is unlisted or `allow_private` is false:
+    /// the guard still runs, and no host is exempt. When `allow_private`
+    /// is true, the purpose's configured hosts are returned so
+    /// [`crate::ssrf::validate_url_with_allowlist`] /
+    /// [`crate::ssrf::validate_url_resolved`] skip the private-IP block
+    /// for those names (WOR-2712). Sorted so the order does not depend
+    /// on a `HashSet`'s iteration.
+    pub fn ssrf_private_hosts(&self, purpose: EgressPurpose) -> Vec<String> {
+        match self.config.purposes.get(&purpose) {
+            Some(allow) if allow.allow_private => {
+                let mut hosts: Vec<String> = allow.hosts.iter().cloned().collect();
+                hosts.sort();
+                hosts
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// Authorize `url` for `purpose`, pinning resolved addresses via `resolver`.
     ///
     /// Default deny: unlisted purpose or host is rejected.
@@ -1694,6 +1715,34 @@ mod tests {
             )
             .expect_err("private IP must be denied unless allow_private");
         assert_eq!(err, EgressDenied::PrivateAddress);
+    }
+
+    #[test]
+    fn ssrf_private_hosts_follow_allow_private() {
+        let mut cfg = ai_provider_https_443(&["127.0.0.1"]);
+        cfg.purposes
+            .get_mut(&EgressPurpose::AiProvider)
+            .expect("fixture arms AiProvider")
+            .allow_private = true;
+        let with_private = EgressAuthorizer::new(cfg);
+        assert_eq!(
+            with_private.ssrf_private_hosts(EgressPurpose::AiProvider),
+            vec!["127.0.0.1".to_string()]
+        );
+        assert!(
+            with_private
+                .ssrf_private_hosts(EgressPurpose::Webhook)
+                .is_empty(),
+            "a purpose the authorizer does not carry must not exempt hosts"
+        );
+
+        let denied = EgressAuthorizer::new(ai_provider_https_443(&["127.0.0.1"]));
+        assert!(
+            denied
+                .ssrf_private_hosts(EgressPurpose::AiProvider)
+                .is_empty(),
+            "allow_private false must keep the SSRF allowlist empty"
+        );
     }
 
     #[test]

@@ -5043,7 +5043,14 @@
           "description": "At-rest crypto material.",
           "default": {
             "pepper": null,
-            "master_key": null
+            "master_key": null,
+            "allow_ephemeral_secrets": false,
+            "rotation": {
+              "inbound_key_days": 90,
+              "credential_days": 90,
+              "master_key_days": 365,
+              "credential_grace_secs": 300
+            }
           },
           "allOf": [
             {
@@ -5170,6 +5177,34 @@
           "allOf": [
             {
               "$ref": "#/definitions/KeySeedConfig"
+            }
+          ]
+        },
+        "read_audit": {
+          "description": "Read and access audit for key and credential resolution (WOR-2570).",
+          "default": {
+            "enabled": false,
+            "detail_window_secs": 300,
+            "hash_identifiers": true
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeyReadAuditConfig"
+            }
+          ]
+        },
+        "break_glass": {
+          "description": "Break-glass emergency access to the key and credential admin API (WOR-2573).",
+          "default": {
+            "enabled": false,
+            "approvers": [],
+            "quorum": 2,
+            "max_ttl_secs": 3600,
+            "review_window_secs": 86400
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/BreakGlassConfig"
             }
           ]
         }
@@ -5759,6 +5794,142 @@
             "string",
             "null"
           ]
+        },
+        "allow_ephemeral_secrets": {
+          "description": "Let the process mint an ephemeral `pepper` or `master_key` when the operator pinned neither (WOR-2567).\n\nDefault false, and the default is the change: a restart with no pinned pepper silently invalidates every stored key hash, and the failure surfaces as a flood of 401s rather than as a boot refusal. Vault and comparable products refuse to start without a resolvable root key rather than minting one, and that is now the behavior here. Set true for a single-process local development run, where a key plane whose hashes do not outlive the process is exactly what is wanted.",
+          "default": false,
+          "type": "boolean"
+        },
+        "root_of_trust": {
+          "description": "Customer-managed root of trust for the upstream-credential envelope (WOR-2568). Absent means sbproxy's own `master_key` is the root.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RootOfTrustConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rotation": {
+          "description": "Named crypto periods and the credential rotation grace window (WOR-2567).",
+          "default": {
+            "inbound_key_days": 90,
+            "credential_days": 90,
+            "master_key_days": 365,
+            "credential_grace_secs": 300
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeyRotationCadenceConfig"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "RootOfTrustConfig": {
+      "description": "`key_management.crypto.root_of_trust:` block (WOR-2568). Present means the customer holds the root of trust for the upstream-credential envelope; absent means sbproxy's own `master_key` does.\n\nOne field answers \"is our root of trust customer-held right now\", which is deliberate: before this block existed the only way to answer it was to audit which reference `master_key` happened to carry, and every answer that audit could give was \"no\", because a resolved reference is a copy.",
+      "type": "object",
+      "required": [
+        "address",
+        "key_name",
+        "provider",
+        "token"
+      ],
+      "properties": {
+        "provider": {
+          "description": "Which external key service performs the wrap and unwrap.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/RootOfTrustProvider"
+            }
+          ]
+        },
+        "address": {
+          "description": "Base address of the key service, for example `https://vault.internal:8200`.",
+          "type": "string"
+        },
+        "mount": {
+          "description": "Transit mount path. Defaults to `transit`, matching Vault's own default mount.",
+          "default": "transit",
+          "type": "string"
+        },
+        "key_name": {
+          "description": "Name of the Transit key that wraps sbproxy's data keys. Created and owned by the customer; sbproxy never creates it.",
+          "type": "string"
+        },
+        "token": {
+          "description": "Secret reference for the token sbproxy authenticates with (`env:`, `file:`, `vault://`, ...). Resolved once at boot. Losing this token is a second, independent way for the customer to cut sbproxy off.",
+          "type": "string"
+        },
+        "namespace": {
+          "description": "Optional Vault Enterprise namespace header.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "unwrap_cache_ttl_secs": {
+          "description": "How long an unwrapped data key may be reused before the external service is consulted again.\n\nThis number *is* the deployment's revocation-latency bound and is reported verbatim on `GET /admin/crypto/root-of-trust`. Larger trades a longer window in which a revoked grant still works for fewer calls to the key service. The resolved-credential cache is clamped to this value for customer-managed envelopes, so raising `proxy.secrets.rotation.re_resolve_interval_secs` cannot quietly extend it.",
+          "default": 60,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "liveness_interval_secs": {
+          "description": "How often to probe the key service for reachability and continued authorization, in seconds. Feeds the admin surface's last-successful-check timestamp and the liveness metric. Zero disables the background probe; the on-demand path still fails closed.",
+          "default": 30,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "RootOfTrustProvider": {
+      "description": "External key services that can hold the root of trust.",
+      "oneOf": [
+        {
+          "description": "HashiCorp Vault's Transit secrets engine (encryption as a service). The caller never receives the key, only ciphertext or plaintext.",
+          "type": "string",
+          "enum": [
+            "vault_transit"
+          ]
+        }
+      ]
+    },
+    "KeyRotationCadenceConfig": {
+      "description": "`key_management.crypto.rotation:` block (WOR-2567): the named crypto period for each class of key material, and the grace window a rotated upstream credential keeps its previous material usable for.\n\nNIST SP 800-57 Part 1 Rev 5 frames a key's life as generation, activation, active use, rotation, destruction, and expects a deployment to *state* its crypto period rather than leave \"rotate periodically\" as the whole policy. These defaults are that statement; the runtime reads them to compute rotation age and to warn when a record is past due.",
+      "type": "object",
+      "properties": {
+        "inbound_key_days": {
+          "description": "Crypto period for inbound virtual keys, in days. Default 90.",
+          "default": 90,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "credential_days": {
+          "description": "Crypto period for upstream provider credentials, in days. Default 90: a provider API key is a bearer credential with no binding to the caller, so it sits at the short end of NIST's range rather than the one to two years a TLS key gets.",
+          "default": 90,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "master_key_days": {
+          "description": "Crypto period for the envelope master key, in days. Default 365, the symmetric data-encryption-key end of NIST's range. Under a customer-managed root this is the customer's Transit key rotation cadence, not sbproxy's.",
+          "default": 365,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "credential_grace_secs": {
+          "description": "How long a rotated upstream credential keeps serving its previous material when the new material cannot be resolved, in seconds. Default 300. Mirrors the dual-validity window `rotate_key` already gives inbound keys; zero disables the overlap.",
+          "default": 300,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
         }
       },
       "additionalProperties": false
@@ -6323,6 +6494,71 @@
             "string",
             "null"
           ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "KeyReadAuditConfig": {
+      "description": "`key_management.read_audit:` block (WOR-2570): the read half of the key audit trail.\n\n`audit.key_path` records who *changed* a key or credential. This records who *resolved* one for use, which is the question a breach investigation actually asks and a different question from the first.\n\nCost-bounded on purpose, following the shape Vault's audit devices take for volume versus detail: the counter moves on every resolution, and the chained detail record fires at most once per credential per window.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Emit chained detail records for credential resolutions. The volume counter is unconditional and is not gated by this.",
+          "default": false,
+          "type": "boolean"
+        },
+        "detail_window_secs": {
+          "description": "Minimum seconds between detail records for the same credential. Default 300. The first resolution in each window emits; the rest are counted and not recorded, so cost scales with credential count rather than with request rate.",
+          "default": 300,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "hash_identifiers": {
+          "description": "HMAC the credential id in the detail record, so a chain handed to an auditor does not enumerate which credentials exist while still letting an investigator confirm a specific id with `sbproxy audit hash`. Default true, matching Vault's audit-device posture of hashing sensitive string fields and passing timestamps, outcomes, and other non-identifying fields through in the clear.",
+          "default": true,
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "BreakGlassConfig": {
+      "description": "`key_management.break_glass:` block (WOR-2573): the pre-staged, time-boxed, quorum-approved emergency path into the key and credential admin API.\n\nEvery vault product surveyed converges on the same shape, and the shape is the point: a break-glass grant should be expensive to use quietly and cheap to review afterwards.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Turn the break-glass endpoints on. Off by default: an emergency path nobody configured is an emergency path nobody reviews.",
+          "default": false,
+          "type": "boolean"
+        },
+        "approvers": {
+          "description": "Operators who may approve a grant, by admin username. A requester is never counted among their own approvers even when listed here.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "quorum": {
+          "description": "How many distinct approvers a grant needs before it activates. Default 2. Must be at least 1 and no greater than the number of configured approvers, or config compile refuses the block.",
+          "default": 2,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "max_ttl_secs": {
+          "description": "Hard cap on a grant's requested TTL, in seconds. Default 3600. A request naming more is refused rather than silently clamped, so the requester finds out at request time instead of at expiry.",
+          "default": 3600,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "review_window_secs": {
+          "description": "How long after expiry a grant with no reviewer sign-off stays on the review queue, in seconds. Default 86400, the 24-hour post-access review window the surveyed products converge on. Grants past this are still listed and still flagged; the number drives the overdue marker, not deletion.",
+          "default": 86400,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
         }
       },
       "additionalProperties": false

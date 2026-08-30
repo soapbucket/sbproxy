@@ -1,0 +1,143 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Customer-managed root of trust for the upstream-credential envelope.
+#
+# By default the envelope's data key is wrapped by a key derived from
+# key_management.crypto.master_key, which this process holds for its whole
+# life. Pointing master_key at a vault reference does not change that: the read
+# happens once, at boot, and the copy is sbproxy's.
+#
+# key_management.crypto.root_of_trust changes the shape. The data key is
+# wrapped and unwrapped by HashiCorp Vault's Transit engine, and sbproxy never
+# receives the key that did it. Revoking sbproxy's Transit policy stops
+# decryption within unwrap_cache_ttl_secs, or at the next failed liveness
+# probe, whichever comes first.
+#
+# Setup against a dev Vault. Run every line: the walkthrough is written to
+# run under the scoped token a customer would actually hand you, because
+# step 4's narrowest revocation is a no-op under a root token.
+#
+#   vault server -dev -dev-root-token-id=root &
+#   export VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root
+#   vault secrets enable transit
+#   vault write -f transit/keys/sbproxy-root
+#
+#   deletion_allowed is a parameter of the key's config endpoint, not of
+#   key creation. Passing it to the create above returns a response warning
+#   rather than an error, so the key looks created and step 4's delete then
+#   fails with "deletion is not allowed for this key":
+#   vault write transit/keys/sbproxy-root/config deletion_allowed=true
+#
+#   The grant is two capabilities and nothing else, which is exactly what
+#   the liveness probe needs. It does not include read on the key:
+#   cat <<'POLICY' | vault policy write sbproxy-transit -
+#   path "transit/encrypt/sbproxy-root" { capabilities = ["update"] }
+#   path "transit/decrypt/sbproxy-root" { capabilities = ["update"] }
+#   POLICY
+#
+#   export SBPROXY_KEY_PEPPER=a-long-random-server-pepper
+#   export SBPROXY_KEY_MASTER=a-long-random-master-key
+#   export SBPROXY_TRANSIT_TOKEN=$(vault token create -policy=sbproxy-transit -field=token)
+#   make run CONFIG=examples/cmk-envelope/sb.yml
+#
+# 1. Confirm the mode. This is the page a security reviewer opens first:
+#   curl -s -u admin:admin http://127.0.0.1:9090/admin/crypto/root-of-trust
+#   # { "mode": "customer_managed", "kek": "transit/sbproxy-root",
+#   #   "revocation_window_secs": 30,
+#   #   "liveness": { "probe": "ok", "last_success_unix": ..., "cached_data_keys": 0 } }
+#   #
+#   # cached_data_keys rises as credentials are resolved. It is how much
+#   # decrypt capability a revocation still has to age out, so watching it
+#   # fall to zero is watching the revocation take effect.
+#
+# 2. Store a credential. Its data key is wrapped by Vault, not by this process:
+#   curl -s -u admin:admin -X POST http://127.0.0.1:9090/admin/credentials \
+#     -H 'Content-Type: application/json' \
+#     -d '{"id":"cred-openai","name":"openai-prod","secret":"sk-customer-owned"}'
+#   curl -s -u admin:admin http://127.0.0.1:9090/admin/credentials/cred-openai
+#   # { "credential": { "storage": "encrypted", "root_of_trust": "transit/sbproxy-root" } }
+#
+# 3. Prove the credential works first. This is the step that matters, and
+#    the one an operator does naturally: a request here warms the
+#    resolved-credential cache, which is what a revocation has to reach.
+#   curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Host: openai.local' \
+#     -H 'Content-Type: application/json' \
+#     -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+#
+# 4. Revoke the grant the way a customer would, then watch decryption stop.
+#    The narrowest form first, because it is the one the probe change
+#    exists for: drop decrypt from the policy and leave everything else
+#    standing. A probe that read the key instead of using it would stay
+#    green through this.
+#   cat <<'POLICY' | vault policy write sbproxy-transit -
+#   path "transit/encrypt/sbproxy-root" { capabilities = ["update"] }
+#   POLICY
+#
+#    Any of these does the same job:
+#      vault token revoke $SBPROXY_TRANSIT_TOKEN
+#      vault policy delete sbproxy-transit
+#      vault delete transit/keys/sbproxy-root   # needs the config step above
+#
+#    The background probe runs every liveness_interval_secs (15 below). Its
+#    first failure drops every cached data key and every already-decrypted
+#    credential, so the wait is bounded by the probe interval rather than by
+#    the cache TTL:
+#   sleep 20
+#   curl -s -u admin:admin http://127.0.0.1:9090/admin/crypto/root-of-trust
+#   # { "liveness": { "probe": "failed_or_never_run", "cached_data_keys": 0 } }
+#
+#    Repeat the request from step 3. It now fails to resolve rather than
+#    being served from a copy sbproxy kept: the failed probe drops the
+#    wrapped data keys *and* every already-decrypted credential, which is
+#    what makes the "or at the next failed liveness probe" clause true of
+#    the cache you actually warmed. Worst case without the probe is
+#    unwrap_cache_ttl_secs (30 below), and that is the whole exposure: a
+#    decrypted credential inherits the time left on the data key that opened
+#    it rather than starting a second window of its own.
+#
+# What this covers: the upstream-credential envelope, for credentials sealed
+# after the root of trust was configured. It does not cover the pepper (inbound
+# key hashes are still hashed locally), vault_ref credentials (their secret
+# never was an envelope), or envelopes sealed before the switch. Rotate a
+# credential to re-seal it under the current root.
+
+proxy:
+  http_bind_port: 8080
+
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    password: admin
+
+  key_management:
+    enabled: true
+    store:
+      backend: embedded
+      path: /tmp/sbproxy-cmk-envelope.redb
+    crypto:
+      pepper: env:SBPROXY_KEY_PEPPER
+      # Still required: it opens envelopes sealed before the switch and
+      # derives the key-audit chain's fingerprint key.
+      master_key: env:SBPROXY_KEY_MASTER
+      root_of_trust:
+        provider: vault_transit
+        address: http://127.0.0.1:8200
+        mount: transit
+        key_name: sbproxy-root
+        token: env:SBPROXY_TRANSIT_TOKEN
+        # This number is the revocation-latency bound and is printed
+        # verbatim on /admin/crypto/root-of-trust.
+        unwrap_cache_ttl_secs: 30
+        liveness_interval_secs: 15
+    failure_posture: closed
+
+origins:
+  "openai.local":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          base_url: https://test.sbproxy.dev
+          credential_id: cred-openai
+          models:
+            - gpt-4o-mini

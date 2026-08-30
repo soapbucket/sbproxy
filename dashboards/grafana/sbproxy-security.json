@@ -1349,13 +1349,256 @@
     },
     {
       "id": 22,
-      "title": "GeoIP Lookups",
+      "title": "Credential Read Audit (WOR-2570)",
       "type": "timeseries",
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 0,
         "y": 96
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(sbproxy_credential_read_total[5m]))",
+          "legendFormat": "read {{outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (outcome) (rate(sbproxy_credential_read_audit_records_total[5m]))",
+          "legendFormat": "detail {{outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Volume against detail. `sbproxy_credential_read_total` moves on every credential resolution including cached ones; the chained detail record fires at most once per credential per `key_management.read_audit.detail_window_secs`, and the reads that did not get one are counted `suppressed`. The two series diverging is the design, not a fault: cost scales with credential count, not request rate. A detail rate of zero while reads climb means `read_audit.enabled` is off, or (if it is on) the fingerprint key is missing and records are being refused rather than emitted in the clear, which shows as `failed`. Runbook: docs/key-management.md#read-and-access-audit."
+    },
+    {
+      "id": 23,
+      "title": "Root of Trust Liveness (WOR-2568)",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 96
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sbproxy_root_of_trust_liveness",
+          "legendFormat": "authorized",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (operation) (rate(sbproxy_root_of_trust_operations_total[5m]))",
+          "legendFormat": "{{operation}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Whether the customer's key service still answers and still authorizes this proxy. A zero on `sbproxy_root_of_trust_liveness` stops credential decryption immediately: the failed probe drops the cached data keys and every credential this root had opened, so the wait is the probe interval rather than `key_management.crypto.root_of_trust.unwrap_cache_ttl_secs`, which is the worst case with no probe running. Note that the series is only written by the probe itself, so `liveness_interval_secs: 0` leaves it absent and this panel cannot alert. That is the intended outcome after a customer revokes their grant, and an incident otherwise; check `GET /admin/crypto/root-of-trust` to tell them apart. The `unwrap` to `unwrap_cached` ratio is what the cache is actually buying, and the absolute `unwrap` rate is what the key service's own rate limit is sized against. Runbook: docs/key-management.md#customer-managed-root-of-trust."
+    },
+    {
+      "id": 24,
+      "title": "Break-Glass Grants (WOR-2573)",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 104
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (state) (sbproxy_break_glass_open)",
+          "legendFormat": "open {{state}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (event) (increase(sbproxy_break_glass_grants_total[1h]))",
+          "legendFormat": "{{event}} / 1h",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "The emergency path, and whether anyone is reviewing it. `awaiting_review` is the number a security reviewer opens this dashboard for: a grant that expired with nobody signing off on what was done under it. Alert when `sbproxy_break_glass_open{state=\"awaiting_review\"}` stays above zero for longer than `key_management.break_glass.review_window_secs`. A `used` rate that outruns `reviewed` over any window is the same finding stated as a rate. Runbook: docs/key-management.md#break-glass-emergency-access."
+    },
+    {
+      "id": 25,
+      "title": "Rotation Age (WOR-2567)",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 104
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "d",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sbproxy_key_rotation_age_days",
+          "legendFormat": "{{kind}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Days since the oldest record of each kind was minted or rotated, published when `GET /admin/credentials` is listed. Compare against the crypto period named in `key_management.crypto.rotation`: 90 days for credentials and inbound keys by default, following NIST SP 800-57 Part 1 Rev 5. This is what turns \"rotate periodically\" into a page. A flat line means nothing is listing the admin API, not that nothing is ageing. Runbook: docs/key-management.md#rotation-cadence."
+    },
+    {
+      "id": 26,
+      "title": "GeoIP Lookups",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 112
       },
       "datasource": {
         "type": "prometheus",
@@ -1402,14 +1645,14 @@
       "description": "Measures geoip policy lookups by outcome (hit, miss, no_database, no_client_ip). Runbook: docs/request-enrichment.md. A rising no_database share means the origin has geoip configured with no reachable MMDB."
     },
     {
-      "id": 23,
+      "id": 27,
       "title": "User-Agent Headless Detections",
       "type": "timeseries",
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 96
+        "y": 112
       },
       "datasource": {
         "type": "prometheus",

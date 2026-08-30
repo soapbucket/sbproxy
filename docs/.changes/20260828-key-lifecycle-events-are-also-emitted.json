@@ -1,0 +1,4 @@
+{
+  "type": "added",
+  "message": "Key-lifecycle events are also emitted as ArcSight CEF on the `key_audit_cef` tracing target, and every record on the feed now carries `sbproxy.evidence.seq` and `sbproxy.evidence.instance` so a SIEM can detect a dropped record."
+}

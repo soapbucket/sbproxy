@@ -610,6 +610,19 @@ pub struct KeyAuditEntry {
     /// Redacted snapshot of the record after the mutation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after: Option<serde_json::Value>,
+    /// What happened: `applied` for a mutation, or for a `resolve` record
+    /// `ok`, `refused`, or `error` (WOR-2570). Passed through in the clear,
+    /// never fingerprinted: an outcome is not an identifier, and a trail
+    /// whose outcomes are all opaque hashes tells an investigator nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    /// Bounded, non-secret context for the record: which cache layer
+    /// answered a resolution, which fingerprint epoch an HMAC'd `id` was
+    /// computed under, or the break-glass grant an admin action ran under
+    /// (WOR-2570, WOR-2573). Truncated to 256 bytes. Never a secret, a
+    /// header value, a payload, or a URL with userinfo.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
 }
 
 /// The durable half of a key/credential mutation (WOR-2478).
@@ -669,6 +682,13 @@ pub struct KeyAuditChainEntry {
     /// The same, for the value after the mutation.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub after_fingerprint: BTreeMap<String, String>,
+    /// The outcome, in the clear. See [`KeyAuditEntry::outcome`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    /// Bounded non-secret context, in the clear. See
+    /// [`KeyAuditEntry::context`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
 }
 
 // --- Admin-action audit channel (WOR-2478) ---
@@ -797,12 +817,29 @@ impl KeyAuditEntry {
             tenant_id: None,
             before: None,
             after: None,
+            outcome: None,
+            context: None,
         }
     }
 
     /// Attach the acting principal.
     pub fn with_actor(mut self, actor: impl Into<String>) -> Self {
         self.actor = Some(actor.into());
+        self
+    }
+
+    /// Attach the outcome, in the clear (WOR-2570).
+    pub fn with_outcome(mut self, outcome: impl Into<String>) -> Self {
+        self.outcome = Some(outcome.into());
+        self
+    }
+
+    /// Attach bounded, non-secret context, in the clear (WOR-2570).
+    ///
+    /// Truncated to 256 bytes here rather than at each call site, so a
+    /// later caller cannot widen it by forgetting to.
+    pub fn with_context(mut self, context: impl AsRef<str>) -> Self {
+        self.context = Some(sbproxy_util::truncate_utf8(context.as_ref(), 256).to_owned());
         self
     }
 
@@ -863,10 +900,14 @@ impl KeyAuditEntry {
             self.tenant_id.clone(),
             Some(self.id.clone()),
             None,
-            Some(match (&self.before, &self.after) {
-                (Some(before), Some(after)) => {
+            Some(match (&self.before, &self.after, &self.outcome) {
+                (Some(before), Some(after), _) => {
                     format!("{}: {before} -> {after}", self.resource)
                 }
+                // WOR-2570: a `resolve` record carries no diff, so the
+                // outcome is what the console has to show instead of a
+                // bare resource name.
+                (_, _, Some(outcome)) => format!("{}: {outcome}", self.resource),
                 _ => self.resource.clone(),
             }),
         ));
@@ -888,6 +929,8 @@ impl KeyAuditEntry {
                 after_fingerprint: crate::audit_chain::fingerprint_key_audit_snapshot(
                     self.after.as_ref(),
                 ),
+                outcome: self.outcome.clone(),
+                context: self.context.clone(),
             };
             crate::audit_chain::append_key_audit(&chain_entry)
         } else {
@@ -915,9 +958,36 @@ impl KeyAuditEntry {
         // when the SIEM copy matters most. The counter reports the
         // durability hole, the feed still carries the mutation.
         if let Some(event_type) = key_lifecycle_event_type(&self.op) {
-            crate::event_sink::publish_proxy_event(event_type, || {
-                key_lifecycle_event(self, event_type)
-            });
+            // WOR-2596: the same allowlisted payload, once, feeding two
+            // consumers. Built here rather than inside the publish
+            // closure because the CEF line needs the sequence number the
+            // JSON payload carries, and building it twice would hand the
+            // two copies different sequence numbers, which is worse than
+            // having no sequence at all: a receiver correlating them
+            // would see a hole in each.
+            // Neither consumer configured means neither pays. The
+            // sequence number is drawn inside `key_lifecycle_event`, so
+            // building it for nobody would also burn sequence numbers a
+            // receiver would then read as holes.
+            let cef_wanted = tracing::event_enabled!(target: "key_audit_cef", tracing::Level::INFO);
+            if cef_wanted || crate::event_sink::wants_event(event_type) {
+                let event = key_lifecycle_event(self, event_type);
+                if cef_wanted {
+                    // A flattened copy for a SIEM that cannot take JSON.
+                    // ArcSight CEF, the form Vault's own audit device
+                    // emits, on its own tracing target so a deployment
+                    // routes it (or does not) with the logging config it
+                    // already has.
+                    tracing::info!(target: "key_audit_cef", "{}", key_event_to_cef(&event));
+                }
+                crate::event_sink::publish_proxy_event(event_type, move || event);
+            } else {
+                crate::notify::wants(event_type.as_str()).then(|| {
+                    crate::event_sink::publish_proxy_event(event_type, || {
+                        key_lifecycle_event(self, event_type)
+                    })
+                });
+            }
         }
         crate::metrics::record_audit_emit_duration("key", outcome, started.elapsed().as_secs_f64());
     }
@@ -1012,12 +1082,153 @@ fn key_lifecycle_event(
     if let Some(new) = status_of(entry.after.as_ref()) {
         data["new_status"] = serde_json::json!(new);
     }
-    crate::events::ProxyEvent::new(
-        event_type,
-        String::new(),
-        entry.tenant_id.clone().unwrap_or_default(),
-        data,
+    // WOR-2596: the per-(instance, tenant) gapless sequence WOR-2384
+    // already built for `mcp_governance_decision`, applied to this
+    // family. The argument for it is the same one and worth restating:
+    // the local Ed25519 audit chain's signing key sits in the same
+    // process that writes the rows, so a consumer that only has the
+    // chain is trusting this process about this process. A sequence hole
+    // is detectable by the receiver with no help from here, which is a
+    // different and weaker-but-independent check.
+    //
+    // The feed is still a lossy real-time copy and `docs/events.md` still
+    // says so. What changes is that a loss is now *visible* rather than
+    // indistinguishable from quiet.
+    let tenant = entry.tenant_id.clone().unwrap_or_default();
+    // Namespaced, not the bare tenant. `evidence_seq` keys its counters by
+    // the string it is given, and `mcp_governance_decision` already draws
+    // on the bare tenant id. Sharing one counter between two event
+    // families would give neither family a gapless sequence of its own: a
+    // SIEM rule filtered to `key_revoked` would see 3, 7, 12 and read two
+    // holes that are not holes, which is worse than carrying no sequence
+    // at all. The prefix costs one map entry per (family, tenant) against
+    // `MAX_TRACKED_TENANTS` and buys the property the field claims.
+    data["sbproxy.evidence.seq"] = serde_json::json!(crate::evidence_seq::next_seq(&format!(
+        "key_lifecycle/{tenant}"
+    )));
+    data["sbproxy.evidence.instance"] = serde_json::json!(crate::instance::instance_id());
+    crate::events::ProxyEvent::new(event_type, String::new(), tenant, data)
+}
+
+/// Render one key-lifecycle event as an ArcSight Common Event Format
+/// line (WOR-2596).
+///
+/// # Why CEF, and why not LEEF
+///
+/// The ticket asked for both. CEF ships here and LEEF does not, and that
+/// is a decision rather than an omission. CEF is what HashiCorp Vault's
+/// own audit device emits natively, and it is the flattened form
+/// ArcSight, Splunk, and QRadar all have a supported ingest path for.
+/// LEEF is IBM QRadar's own format, and QRadar reads CEF; shipping both
+/// would double the field-mapping surface, and every mapping is a place
+/// where a later field addition can silently stop crossing, in exchange
+/// for a second path to one vendor that already has one. If a deployment
+/// turns up that genuinely cannot read CEF, LEEF is a small addition on
+/// top of this function's extension map.
+///
+/// # Shape
+///
+/// `CEF:0|Soap Bucket|sbproxy|<version>|<signature>|<name>|<severity>|<extensions>`
+///
+/// The seven pipe-delimited header fields are fixed by the format. The
+/// extension map carries `rt` (event time), `suser` (the acting
+/// principal), `outcome`, `duid` (the record id), and `cs1`/`cs2` with
+/// their required `cs1Label`/`cs2Label` partners, which is CEF's only
+/// sanctioned way to carry a field the standard does not name.
+///
+/// Severity follows the operation's meaning rather than a constant:
+/// revocation and blocking are the two an analyst wants surfacing above
+/// a mint, because they are what a compromise response looks like.
+///
+/// # Escaping
+///
+/// CEF escapes `\` and `|` in header fields, and `\` and `=` in extension
+/// values. Getting this wrong does not merely garble a line: an
+/// unescaped `=` inside a value splits one extension into two, which is
+/// how a field an attacker controls becomes a field an attacker
+/// *injects*. Every value here is either a closed vocabulary or an
+/// operator-supplied id, and the ids are escaped rather than trusted.
+pub(crate) fn key_event_to_cef(event: &crate::events::ProxyEvent) -> String {
+    let data = &event.data;
+    let field = |name: &str| -> Option<String> {
+        data.get(name)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
+    let op = field("op").unwrap_or_default();
+    let resource = field("resource").unwrap_or_default();
+    let signature = format!("sbproxy.key.{op}");
+    let name = format!("{resource} {op}");
+    let severity = match op.as_str() {
+        "revoke" => 7,
+        "block" => 6,
+        "rotate" => 4,
+        _ => 3,
+    };
+    let mut extensions = vec![
+        format!("rt={}", event.timestamp),
+        format!(
+            "outcome={}",
+            cef_extension_escape(&field("outcome").unwrap_or_default())
+        ),
+        format!(
+            "duid={}",
+            cef_extension_escape(&field("id").unwrap_or_default())
+        ),
+        "cs1Label=resource".to_string(),
+        format!("cs1={}", cef_extension_escape(&resource)),
+    ];
+    if let Some(actor) = field("actor") {
+        extensions.push(format!("suser={}", cef_extension_escape(&actor)));
+    }
+    if !event.tenant_id.is_empty() {
+        extensions.push("cs2Label=tenant".to_string());
+        extensions.push(format!("cs2={}", cef_extension_escape(&event.tenant_id)));
+    }
+    if let Some(seq) = data.get("sbproxy.evidence.seq").and_then(|v| v.as_u64()) {
+        extensions.push("cn1Label=evidenceSeq".to_string());
+        extensions.push(format!("cn1={seq}"));
+    }
+    if let Some(instance) = field("sbproxy.evidence.instance") {
+        extensions.push("cs3Label=evidenceInstance".to_string());
+        extensions.push(format!("cs3={}", cef_extension_escape(&instance)));
+    }
+    format!(
+        "CEF:0|Soap Bucket|sbproxy|{}|{}|{}|{}|{}",
+        cef_header_escape(env!("CARGO_PKG_VERSION")),
+        cef_header_escape(&signature),
+        cef_header_escape(&name),
+        severity,
+        extensions.join(" ")
     )
+}
+
+/// Escape a CEF header field: backslash, the pipe delimiter, and the
+/// newlines that would end the record early.
+///
+/// The newline arms are unreachable today, because every header input is a
+/// closed vocabulary (`key_lifecycle_event_type` maps four literals) and
+/// the version comes from `CARGO_PKG_VERSION`. They are here because the
+/// module doc presents the escaping as the defense, and a defense that
+/// holds only because of a property two functions away is one refactor
+/// from being wrong. Its sibling `cef_extension_escape` already covers all
+/// four; the asymmetry was the accident.
+fn cef_header_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('|', "\\|")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
+/// Escape a CEF extension value: backslash, the `=` that separates a key
+/// from its value, and the newlines that would end the record early.
+fn cef_extension_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('=', "\\=")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 #[cfg(test)]
@@ -1901,6 +2112,108 @@ mod tests {
         assert!(
             !content.contains("key_blocked"),
             "a masked-out kind was delivered anyway: {content}"
+        );
+    }
+
+    // --- WOR-2596: CEF, and the gapless sequence ---
+
+    /// The seam: a key-lifecycle event renders as a well-formed CEF line
+    /// with the seven header fields the format fixes and the extension
+    /// keys a SIEM rule reads.
+    #[test]
+    fn a_key_lifecycle_event_renders_as_cef() {
+        let entry = KeyAuditEntry::new("revoke", "key", "sbp_cef_key")
+            .with_actor("operator-jo")
+            .with_tenant_id("acme")
+            .with_diff(
+                Some(serde_json::json!({ "status": "active" })),
+                Some(serde_json::json!({ "status": "revoked" })),
+            );
+        let event = key_lifecycle_event(&entry, crate::events::EventType::KeyRevoked);
+        let line = key_event_to_cef(&event);
+
+        assert!(line.starts_with("CEF:0|Soap Bucket|sbproxy|"), "{line}");
+        let header: Vec<&str> = line.splitn(8, '|').collect();
+        assert_eq!(header.len(), 8, "CEF fixes seven header fields: {line}");
+        assert_eq!(header[4], "sbproxy.key.revoke", "{line}");
+        assert_eq!(header[5], "key revoke", "{line}");
+        assert_eq!(
+            header[6], "7",
+            "a revocation outranks a mint on the analyst's queue: {line}"
+        );
+        let extensions = header[7];
+        assert!(extensions.contains("duid=sbp_cef_key"), "{extensions}");
+        assert!(extensions.contains("suser=operator-jo"), "{extensions}");
+        assert!(extensions.contains("outcome=applied"), "{extensions}");
+        assert!(
+            extensions.contains("cs2Label=tenant") && extensions.contains("cs2=acme"),
+            "a custom string field needs its label, or the receiver cannot name it: {extensions}"
+        );
+        assert!(
+            extensions.contains("cn1Label=evidenceSeq") && extensions.contains("cn1="),
+            "the gapless sequence has to survive the flattening: {extensions}"
+        );
+    }
+
+    /// An `=` inside a value splits one extension into two, which is how
+    /// a field an operator controls becomes a field an operator
+    /// *injects*. Ids are operator-chosen, so they are escaped rather
+    /// than trusted.
+    #[test]
+    fn cef_escapes_the_characters_that_would_split_a_record() {
+        let entry = KeyAuditEntry::new("create", "credential", "id=with|pipe\\and-backslash");
+        let event = key_lifecycle_event(&entry, crate::events::EventType::KeyMinted);
+        let line = key_event_to_cef(&event);
+        assert!(
+            line.contains("duid=id\\=with|pipe\\\\and-backslash"),
+            "the `=` must be escaped and the `\\` doubled: {line}"
+        );
+        // Header fields escape the pipe; extension values do not have to,
+        // because the extension section is not pipe-delimited.
+        assert_eq!(
+            line.matches("CEF:0|Soap Bucket|sbproxy|").count(),
+            1,
+            "{line}"
+        );
+    }
+
+    /// The feed carries a per-(instance, tenant) sequence so a SIEM can
+    /// see a hole where a lossy transport dropped a record. The chain's
+    /// signing key lives in this process, so a check the receiver can run
+    /// without trusting this process is worth its two fields.
+    #[test]
+    fn the_key_lifecycle_feed_numbers_its_records_per_tenant() {
+        let tenant = "wor2596-seq-tenant";
+        let seq_of = |op: &str| {
+            let entry = KeyAuditEntry::new(op, "key", "sbp_seq").with_tenant_id(tenant);
+            let event = key_lifecycle_event(&entry, crate::events::EventType::KeyMinted);
+            (
+                event.data["sbproxy.evidence.seq"].as_u64().expect("a seq"),
+                event.data["sbproxy.evidence.instance"]
+                    .as_str()
+                    .expect("an instance")
+                    .to_string(),
+            )
+        };
+        let (first, instance) = seq_of("create");
+        // A governance record for the same tenant, drawing on the bare
+        // tenant id the way `action_dispatch` does. It must not move this
+        // family's counter: two families sharing one counter would give
+        // neither a gapless sequence, and a SIEM rule filtered to
+        // `key_revoked` would read the other family's draws as holes.
+        let _ = crate::evidence_seq::next_seq(tenant);
+        let (second, again) = seq_of("revoke");
+        let (third, _) = seq_of("rotate");
+        assert_eq!(
+            second,
+            first + 1,
+            "strictly monotonic with no gaps, even across an interleaved governance record"
+        );
+        assert_eq!(third, second + 1);
+        assert_eq!(
+            instance, again,
+            "the sequence's identity is (instance, tenant), so the instance must be stable \
+             within a process"
         );
     }
 }

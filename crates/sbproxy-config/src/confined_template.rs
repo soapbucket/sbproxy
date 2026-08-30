@@ -3402,6 +3402,19 @@ mod tests {
             "origins.*.forward_rules[].parameters[].name",
             "the parameter name; its description mentions path params",
         ),
+        // --- key-service coordinates that are not host paths ---------
+        (
+            "proxy.key_management.crypto.root_of_trust.mount",
+            "the Transit mount path *inside the key service*, for example `transit`. It is a \
+             segment of a URL this proxy dials, never a file on this host, and the confined \
+             template has nothing to confine it to",
+        ),
+        (
+            "proxy.key_management.crypto.root_of_trust.token",
+            "a secret reference for the key-service token (`env:`, `file:`, `vault://`). The \
+             `file:` form names a host file and is resolved by the shared secret resolver, \
+             which applies its own confinement; the field itself is a reference, not a path",
+        ),
         // --- URLs and network endpoints ------------------------------
         (
             "origins.*.action.semantic_cache.openai.base_url",
