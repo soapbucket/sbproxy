@@ -13,13 +13,23 @@ use std::time::Duration;
 /// Top-level config file structure (sb.yml).
 ///
 /// This is the one container in the schema without
-/// `#[serde(deny_unknown_fields)]` (WOR-1140). The archived Go v0.1.x
-/// schema was a flat single-origin file whose keys all sit at the top
-/// level, and the schema-v1 compatibility promise
-/// (`v1_compat::v1_fixtures_compile_unmodified`) keeps those files
-/// compiling. Unknown top-level keys therefore warn via the
-/// `serde_ignored` pass in [`crate::compile_config`] instead of failing
-/// the parse; every nested container rejects unknown keys outright.
+/// `#[serde(deny_unknown_fields)]` (WOR-1140). Every nested container
+/// rejects an unknown key outright, which turns a typo in a server,
+/// security, or origin block into a boot error rather than a silent drop
+/// to the field's default. The root stays permissive so that an unknown
+/// top-level key reaches the `serde_ignored` pass in
+/// [`crate::compile_config`] as a diagnosable condition instead of dying
+/// as an untyped parse error, and that pass then decides what it is
+/// worth.
+///
+/// It decides on one question: does dropping the key change behavior?
+/// A descriptive leftover (`id`, `config_version`, `workspace_id`) warns
+/// and compiles. A flat schema-v1 key that carries origin behavior
+/// (`hostname`, `action`, `authentication`, `policies`, ...) is refused,
+/// because this type has no field for any of them and never translated
+/// them into `origins`: a file in that shape used to compile into a
+/// proxy with no origin at all. Go compatibility is deprecated; see
+/// `MIGRATION.md` and `tests/v1_compat.rs`.
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ConfigFile {
     /// Optional source descriptor.
