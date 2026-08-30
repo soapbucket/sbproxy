@@ -1,10 +1,10 @@
 # agent_budget: per-agent semantic rate limit
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-29*
 
 ![agent_budget: per-agent semantic rate limit](../../docs/assets/agent-budget.gif)
 
-Demonstrates the `agent_budget` policy. Per-agent rate-limit primitive keyed on the resolved `agent_id` (from the agent-class resolver). One bucket per named agent collapses "every request from the Cursor instance" or "every request from the same Assistant" into a single budget operators can actually size, while still letting an attacker get blocked cleanly because they cannot mint a fresh `agent_id` per request.
+Demonstrates the `agent_budget` policy. Per-agent rate-limit primitive keyed on the resolved `agent_id` from the built-in agent-class catalog (User-Agent regex). That catalog includes coding agents such as Cursor, so `User-Agent: Cursor/0.42.0` resolves to a named id rather than the human sentinel. One bucket per named agent collapses "every request from the Cursor instance" or "every request from the same Assistant" into a single budget operators can actually size, while still letting an attacker get blocked cleanly because they cannot mint a fresh `agent_id` per request. This example does not enable `agent_detect`; the catalog match is enough.
 
 Standard per-IP or per-key limits assume humans pause between requests; LLM loops do not. Per-agent limits are what catch the runaway loop without breaking legitimate background traffic.
 

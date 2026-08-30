@@ -519,9 +519,9 @@ mod tests {
     #[test]
     fn defaults_load_eight_or_more_entries() {
         let cat = AgentClassCatalog::defaults();
-        // Wave 1 ADR locks the floor at the eight well-known vendors;
-        // we ship ten today (GPTBot + ChatGPT-User both for OpenAI,
-        // Googlebot + Google-Extended both for Google).
+        // Wave 1 ADR locks the floor at the eight well-known vendors.
+        // The catalog also ships dual entries for OpenAI and Google,
+        // three headless sentinels, and the WOR-2707 coding agents.
         assert!(
             cat.len() >= 8,
             "expected at least 8 agent classes in defaults, got {}",
@@ -547,6 +547,32 @@ mod tests {
             )
             .expect("Googlebot should match google-googlebot");
         assert_eq!(m.id, "google-googlebot");
+    }
+
+    /// WOR-2707: coding-agent User-Agents the ADRF baseline already
+    /// names must resolve in the default catalog, or `agent_budget`
+    /// keys them as the human sentinel and the documented Cursor
+    /// walkthrough shares a bucket with every browser.
+    #[test]
+    fn default_catalog_matches_cursor_and_not_a_generic_mozilla_ua() {
+        let cat = AgentClassCatalog::defaults();
+        let cursor = cat
+            .lookup_by_user_agent("Cursor/0.42.0")
+            .expect("Cursor/0.42.0 should match the coding-agent catalog entry");
+        assert_eq!(cursor.id, "anysphere-cursor");
+        assert_eq!(cursor.purpose, AgentPurpose::Assistant);
+        let agent_build = cat
+            .lookup_by_user_agent("cursor-agent/0.41.5 (darwin; arm64)")
+            .expect("cursor-agent/ must match the same cursor entry");
+        assert_eq!(agent_build.id, "anysphere-cursor");
+        let mozilla = cat.lookup_by_user_agent(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
+        );
+        assert!(
+            mozilla.is_none(),
+            "a generic Mozilla UA must not classify as a coding agent: {:?}",
+            mozilla.map(|entry| entry.id.as_str())
+        );
     }
 
     #[test]
