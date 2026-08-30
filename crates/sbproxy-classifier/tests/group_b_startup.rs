@@ -594,43 +594,6 @@ async fn wait_for_http_ready(child: &mut ChildGuard, address: SocketAddr) -> Vec
     }
 }
 
-/// Wait until every other listener the shipped child was told to open
-/// accepts a connection.
-///
-/// [`wait_for_http_ready`] proves one of the four, and both tests then
-/// drive the other three straight away. Those three are reached through
-/// [`wire_exchange`] and the generated gRPC client, and both take a
-/// refused connection as a failure rather than as "not yet": the child
-/// publishes `/readyz` from its metrics listener, which is bound by a
-/// different task from the wire and gRPC ones, so a loaded machine can
-/// answer `/readyz` while the listener the next line dials is still
-/// binding. That is the same shape as the CoMP marketplace process
-/// test's admin plane, and it fails the same way, on a connection
-/// refused that says nothing about what the test covers.
-///
-/// What this proves is a connection, which is exactly what a refused
-/// connect reports on. It does not prove the accept loop behind the
-/// listener has begun reading, and nothing here can: the wire protocol
-/// is length-prefixed msgpack with no readiness message in it.
-async fn wait_for_listeners(child: &mut ChildGuard, addresses: &[SocketAddr]) {
-    let deadline = tokio::time::Instant::now() + EXTERNAL_WAIT;
-    for address in addresses {
-        loop {
-            if let Some(status) = child.try_wait().expect("child status remains observable") {
-                panic!("shipped classifier exited before {address} accepted: {status}");
-            }
-            if TcpStream::connect(*address).await.is_ok() {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "shipped classifier did not open {address} before its deadline"
-            );
-            tokio::task::yield_now().await;
-        }
-    }
-}
-
 #[derive(Serialize)]
 struct WireRequest<'a> {
     cmd: &'a str,
@@ -842,7 +805,6 @@ async fn shipped_binary_uses_production_http_tcp_and_grpc_startup_owners() {
 
     let ready = wait_for_http_ready(&mut child, http).await;
     assert!(ready.starts_with(b"HTTP/1.1 200 "));
-    wait_for_listeners(&mut child, &[public, admin, grpc]).await;
     assert!(http_get(http, "/healthz")
         .await
         .unwrap()
@@ -940,7 +902,6 @@ async fn shipped_binary_bounds_public_classify_with_its_configured_inference_dea
     ]);
     let mut child = ChildGuard::spawn(command);
     wait_for_http_ready(&mut child, http).await;
-    wait_for_listeners(&mut child, &[public, admin, grpc]).await;
 
     let register: AdminResponse = wire_exchange(
         admin,
