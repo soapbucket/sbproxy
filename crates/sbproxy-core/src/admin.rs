@@ -4584,6 +4584,15 @@ fn handle_config_history_detail(state: &AdminState, digest: &str) -> (u16, &'sta
     let plan_text = config_history_plan_text(state, &document);
     // Redact for display only, after both are computed from the
     // original bytes above. See the handler doc comment for why.
+    //
+    // Two passes in one response, on purpose. `document` is a rendered
+    // config document, so it takes the wide set. `plan_text` is free
+    // text: config paths and `&'static str` reasons, not a document
+    // whose delimiters the renderer chose. It still gets the narrow
+    // pass because a `PlanFinding::message` can carry a config-derived
+    // string (`sbproxy-config/src/validate.rs` builds one with
+    // `format!("{error:#}")`), and free text is the surface the narrow
+    // set was written for.
     let document = sbproxy_observe::redact::redact_config_document(&document);
     let plan_text = sbproxy_observe::redact::redact_secrets(&plan_text);
     let body = serde_json::json!({

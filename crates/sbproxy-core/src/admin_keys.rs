@@ -5995,6 +5995,15 @@ mod tests {
             // Now the operator turns it off, or deletes the block.
             install_break_glass_plane_with(1, approvers, enabled);
 
+            // Read before the review, because the counter assertion
+            // below is a strict increase against a process-global
+            // registry.
+            let grants_before_review = break_glass_grants_total(if approvers.is_empty() {
+                "reviewed_without_roster"
+            } else {
+                "reviewed"
+            });
+
             let reviewed = dispatch(
                 "POST",
                 &format!("/admin/break-glass/{grant_id}/review"),
@@ -6010,11 +6019,22 @@ mod tests {
             assert_eq!(parse(&reviewed)["grant"]["state"], "reviewed", "{label}");
 
             // The empty-roster case closes out through the fallback, and
-            // that has to be distinguishable in the record: four
+            // that has to be distinguishable in *both* records: four
             // operator-facing surfaces advertise the label, one of them
             // `docs/metrics-stability.md`, which is a compatibility
-            // contract. The audit outcome and the counter take the same
-            // value from one variable, so this pins both.
+            // contract.
+            //
+            // Both are asserted, separately, because one variable
+            // feeding two calls makes a metric-only regression unlikely
+            // and not detected, and an earlier round of this test said
+            // it pinned the counter when it read only the audit ring.
+            // The counter assertion is a strict increase rather than an
+            // exact value: `prometheus::gather()` reads a process-global
+            // registry and sibling tests move the same family
+            // concurrently, so "it moved" is the whole claim the
+            // regression needs and the only one that cannot go flaky.
+            // Same reasoning, and the same shape, as
+            // `settlement_gate.rs:3329`.
             let expected = if approvers.is_empty() {
                 "reviewed_without_roster"
             } else {
@@ -6035,7 +6055,39 @@ mod tests {
                     )
                 });
             assert_eq!(closed.actor.as_deref(), Some("alice"), "{label}");
+            assert!(
+                break_glass_grants_total(expected) > grants_before_review,
+                "{label}: sbproxy_break_glass_grants_total{{event={expected}}} did not \
+                 move; the audit record carries the outcome but the counter that \
+                 `docs/metrics-stability.md` promises does not"
+            );
         }
+    }
+
+    /// One `sbproxy_break_glass_grants_total` series, or 0 before
+    /// anything has created it.
+    ///
+    /// Reads the process-global registry, so callers compare a before
+    /// and after rather than an absolute: a sibling test on another
+    /// thread may move the same series in between.
+    fn break_glass_grants_total(event: &str) -> f64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.name() == "sbproxy_break_glass_grants_total")
+            .map(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .filter(|metric| {
+                        metric
+                            .get_label()
+                            .iter()
+                            .any(|label| label.name() == "event" && label.value() == event)
+                    })
+                    .map(|metric| metric.get_counter().value())
+                    .sum()
+            })
+            .unwrap_or(0.0)
     }
 
     /// A refused approval or review reaches the audit channel.

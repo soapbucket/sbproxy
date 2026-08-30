@@ -376,8 +376,10 @@ struct Registry {
     /// is a keyed-HMAC append to the audit chain on disk, so recording
     /// every attempt turns a refused request into an unbounded write. The
     /// finding is that the registry filled, not that this request arrived.
-    /// Cleared when a listing evicts a terminal grant and the registry
-    /// drops back under the ceiling, so a second episode records again.
+    /// Cleared in [`request`], which is the only caller that evicts:
+    /// its `retain` drops terminal grants and then clears this latch, so
+    /// a second episode records again. A listing does not evict, so
+    /// polling `GET /admin/break-glass` never re-arms it.
     registry_full_recorded: std::sync::atomic::AtomicBool,
 }
 
@@ -500,9 +502,12 @@ pub(crate) fn request(
                 // append to the audit chain on disk, so recording every
                 // one turns a refusal into an unbounded write loop. The
                 // finding is that the registry filled, which is a fact
-                // about the registry rather than about this request; the
-                // latch resets when a listing evicts a terminal grant and
-                // the registry drops back under the ceiling.
+                // about the registry rather than about this request. The
+                // latch resets above in this same function, where the
+                // `retain` evicts terminal grants and drops the registry
+                // back under the ceiling. Only a later `request` can
+                // re-arm it: a listing reads the vector and never
+                // evicts, so polling the admin route does not.
                 if registry()
                     .registry_full_recorded
                     .swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -995,6 +1000,64 @@ mod tests {
     /// (`admin_keys::tests::a_reviewers_note_survives_a_large_scope`)
     /// reads `grant.reviewed_note` off the JSON response and stays green
     /// through that revert, which is why this test exists beside it.
+    /// The zero-publish arm of `refresh_gauges`, which no test reached.
+    ///
+    /// `list()` returns early when the block is gone, and the call to
+    /// `refresh_gauges` sits *above* that return precisely so the arm is
+    /// reachable. Move it below and the gauge freezes at whatever the
+    /// last transition wrote, for the life of the process, with the
+    /// queue hidden from the route and nothing able to move the number.
+    /// A frozen alert reads as an open grant nobody is closing, which is
+    /// worse than a silent one.
+    ///
+    /// Seeds a non-zero reading rather than depending on grant state, so
+    /// the revert this names is the only thing that can redden it:
+    /// delete `refresh_gauges()` from the early return and the assertion
+    /// below reads 3, not 0. Holds the plane guard, whose mutex
+    /// serializes every test that touches the global slot.
+    #[test]
+    fn a_listing_with_the_block_gone_publishes_zero_rather_than_freezing() {
+        let _guard = crate::key_plane::test_plane_guard();
+        crate::key_plane::activate_key_plane(None, None);
+
+        sbproxy_observe::metrics::record_break_glass_open("awaiting_review", 3.0);
+        assert_eq!(
+            break_glass_open_gauge("awaiting_review"),
+            3.0,
+            "the seed did not land, so the assertion below would pass vacuously"
+        );
+
+        let listed = list(Utc::now());
+        assert_eq!(listed["enabled"], false, "the block is gone: {listed}");
+        assert_eq!(
+            break_glass_open_gauge("awaiting_review"),
+            0.0,
+            "a listing with no block left the gauge frozen: {listed}"
+        );
+    }
+
+    /// One `sbproxy_break_glass_open` series, or 0 before anything has
+    /// created it.
+    fn break_glass_open_gauge(state: &str) -> f64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.name() == "sbproxy_break_glass_open")
+            .map(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .filter(|metric| {
+                        metric
+                            .get_label()
+                            .iter()
+                            .any(|label| label.name() == "state" && label.value() == state)
+                    })
+                    .map(|metric| metric.get_gauge().value())
+                    .sum()
+            })
+            .unwrap_or(0.0)
+    }
+
     #[test]
     fn the_context_string_carries_counters_and_the_note_rides_the_diff() {
         let mut grant = grant_at("alice", 900);

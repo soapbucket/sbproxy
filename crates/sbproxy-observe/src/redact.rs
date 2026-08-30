@@ -18,10 +18,15 @@
 //!   in a URL's userinfo has neither a recognizable shape nor a key
 //!   name in front of it; what identifies it is where it sits, between
 //!   `://` and the last `@` of the authority. The authority is matched
-//!   by an allowlist, `[A-Za-z0-9]` plus `-._~%:@`, which is a strict
-//!   subset of the RFC 3986 authority charset. Neither `"` nor `\` is
-//!   in it, and that is what keeps a rule with no key name to anchor on
-//!   inside the JSON string token it started in.
+//!   by an allowlist, and there are two of them, because one set could
+//!   not serve both surfaces. The log-line set is `[A-Za-z0-9]` plus
+//!   `-._~%:@`; the config-document set adds the userinfo sub-delims
+//!   `!$&*+=`. Both are strict subsets of the RFC 3986 authority
+//!   charset, and neither contains `"` or `\`, which is what keeps a
+//!   rule with no key name to anchor on inside the JSON string token it
+//!   started in. See [`redact_secrets`] and [`redact_config_document`]
+//!   for which surface takes which, and why a value's delimiters are
+//!   attacker-chosen on one and renderer-chosen on the other.
 //!
 //! A credential that is neither a known shape nor under a known name
 //! is returned as written. In particular there is no JWT pattern: a
@@ -33,10 +38,10 @@
 //!
 //! # Structure survives redaction
 //!
-//! `redact_secrets` runs over already-rendered JSON log lines and over
-//! the YAML `GET /admin/config` hands back, so every keyed pattern
-//! captures (key, separator, value) and returns groups 1 and 2 byte
-//! for byte. A mask that eats the `":"` between a key and its value
+//! `redact_secrets` runs over already-rendered JSON log lines, and
+//! `redact_config_document` over the YAML and JSON the config routes
+//! hand back. Both need this property, so every keyed pattern captures
+//! (key, separator, value) and returns groups 1 and 2 byte for byte. A mask that eats the `":"` between a key and its value
 //! does not merely read wrong: the line stops being JSON,
 //! [`crate::logging::redact_json_line`] fails its `serde_json::from_str`
 //! and silently skips the whole field-key denylist for that line, so a
@@ -101,9 +106,16 @@ use std::sync::LazyLock;
 ///
 /// # Two surfaces, two sets, and why one cannot serve both
 ///
-/// The narrow set is `[A-Za-z0-9]` plus `-._~%:@`. The wide set adds the
-/// RFC 3986 userinfo sub-delims that are not structure anywhere this runs,
-/// `!$&*+=`. [`redact_secrets`] takes the narrow one, and
+/// The narrow set is `[A-Za-z0-9]` plus `-._~%:@`. The wide set adds
+/// `!$&*+=`. Those are RFC 3986 userinfo sub-delims, but the set is not
+/// "the sub-delims": `(`, `)`, `,`, `;` and `'` are sub-delims too and
+/// are deliberately left out, `'` because it closes a single-quoted YAML
+/// scalar and the rest because leaving them out costs nothing this
+/// finding needed. What earned the five is base64: a Vault token is
+/// `hvs.` plus base64, `=` is its padding, and `+` and `/` are its other
+/// two non-alphanumeric bytes. `/` stays out because RFC 3986 forbids it
+/// in userinfo outright, so an address carrying one does not resolve and
+/// `%2F` is the form that does. [`redact_secrets`] takes the narrow one, and
 /// [`redact_config_document`] the wide one. Each got its set from a
 /// finding, so both are worth stating.
 ///
@@ -167,9 +179,11 @@ use std::sync::LazyLock;
 ///
 /// Userinfo containing any byte outside the surface's set is not masked at
 /// all, rather than masked halfway. For both surfaces that covers `'`,
-/// `(`, `)`, `,`, `;`, which RFC 3986 permits in userinfo, and **every
-/// non-ASCII byte**, so `https://usér:pw@vault.internal:8200` comes back
-/// verbatim. For the log surface it also covers `!$&*+=`. Failing to mask
+/// `(`, `)`, `,`, `;`, which RFC 3986 permits in userinfo; `/`, which it
+/// does not, and which is in base64's alphabet, so a standard-base64
+/// token carrying one returns verbatim from every config route; and
+/// **every non-ASCII byte**, so `https://usér:pw@vault.internal:8200`
+/// comes back verbatim. For the log surface it also covers `!$&*+=`. Failing to mask
 /// is the safe direction here and deleting a delimiter is not, which is
 /// the same trade [`RE_PASSWORD`] documents for its own stop set.
 ///
@@ -649,6 +663,18 @@ fn redact_with(input: &str, sub_delims: bool) -> String {
 ///
 /// Cheaper than a full `redact_secrets` call when you only need a boolean
 /// answer (e.g. for metrics or alerting).
+///
+/// # Answers for the log surface, not the config one
+///
+/// The positional rule below runs on the narrow byte set, the one
+/// [`redact_secrets`] uses. [`redact_config_document`] takes the wider
+/// set, so there are inputs it masks that this reports `false` for:
+/// `address: https://u:p=w@vault.internal:8200` is one, because `=` is
+/// in the wide set and not the narrow one. A caller asking "would the
+/// config routes change this?" needs its own detector, calling
+/// `mask_url_userinfo` with sub-delims admitted; this one answers for
+/// the access log.
+/// The keyed patterns are shared and do not have this split.
 pub fn contains_secret(input: &str) -> bool {
     matches!(mask_url_userinfo(input, false), std::borrow::Cow::Owned(_))
         || RE_ANTHROPIC.is_match(input)
@@ -1557,30 +1583,37 @@ mod tests {
         // 5. The same invariant in the other two serializations the stop
         //    set names, twice over.
         //
-        //    The `,` forms are the ones that can fail under the named
-        //    revert, because the old rule stopped at whitespace and a
-        //    space-separated fixture passes on both sides of it. The
-        //    space forms cannot fail under *that* revert and are kept
-        //    anyway: they are the only thing pinning "whitespace ends the
-        //    run", which an earlier version of this test dropped when it
-        //    rewrote both blocks to commas. They redden if whitespace is
-        //    ever admitted to the set.
+        //    The `,` forms redden under the named revert, because the
+        //    old rule stopped at whitespace and a space-separated
+        //    fixture passes on both sides of it.
+        //
+        //    The space forms are here to pin "whitespace ends the run",
+        //    a separate revert, and getting that pin right took three
+        //    goes. The first two carried a space *after* a `,` or an
+        //    `=`, so the run stopped at that byte before whitespace was
+        //    ever reached and the fixture was byte-identical whether or
+        //    not whitespace was in the set: a case that cannot fail,
+        //    asserting in its own comment that it can, which is the
+        //    exact shape this test's doc block sets as its bar. The two
+        //    below carry no other stop byte between the `://` and the
+        //    `@`, so whitespace is the only thing ending the run, and
+        //    admitting `b' '` to `continues_authority` masks them.
         for (fixture, label) in [
             (
                 "[https://ref.example,b@c.example]",
                 "YAML flow sequence, comma",
             ),
             (
-                "{url: https://ref.example, user: ops@corp.com}",
-                "YAML flow mapping, space",
+                "{url: https://ref.example user: ops@corp.com}",
+                "YAML flow mapping, whitespace is the only stop",
             ),
             (
                 "url=https://ref.example,next=b@c.example",
                 "logfmt, comma inside an unquoted value",
             ),
             (
-                "url=https://ref.example next=b@c.example",
-                "logfmt, space between pairs",
+                "url=https://ref.example next@b.example",
+                "logfmt, whitespace is the only stop",
             ),
         ] {
             assert_eq!(redact_secrets(fixture), fixture, "{label}");

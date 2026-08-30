@@ -1748,11 +1748,22 @@ prefixes, `Authorization` values, and the schema's own key / secret /
 token / password fields), plus a URL's userinfo, which is masked by
 position: `https://user:token@vault.internal:8200` comes back as
 `https://[REDACTED]@vault.internal:8200`, host intact. The authority is
-matched by an allowlist, `[A-Za-z0-9]` plus `-._~%:@`, which excludes both
-`"` and `\` and so cannot leave the JSON string it started in, and
-excludes `&`, `=`, `,`, `;` and whitespace and so cannot cross a query
-parameter, a logfmt pair or a YAML flow scalar either. `docs/access-log.md`
-carries the full reasoning. A secret under a
+matched by an allowlist, and these routes take the wider of the two the
+redactor carries: `[A-Za-z0-9]`, plus `-._~%:@`, plus the userinfo
+sub-delims `!$&*+=`. It excludes both `"` and `\`, so a mask can never
+leave the JSON string or the YAML scalar it started in. It does include
+`&` and `=`, which is what lets it reach a base64-padded token such as
+`https://sbproxy:hvs.CAESIQpAbCdEf=@vault.internal:8200`; the cost is
+that a `&`- or `=`-separated value in a config field can be crossed, so
+`extra: u=https://a.example&op=x&next=b@c.example` comes back as
+`extra: u=https://[REDACTED]@c.example`. Still returned verbatim, because
+they are structure in YAML or a quoted scalar: `,`, `;`, `'`, `(`, `)`,
+`/`, and whitespace.
+
+The access log takes the narrower set, without `!$&*+=`, because a log
+line carries a caller's raw query string, where those bytes are chosen by
+whoever sent the request rather than by the renderer. `docs/access-log.md`
+carries the full reasoning for that surface. A secret under a
 name or shape the redactor does not recognize is returned as written,
 which is one more reason the permission boundary above is the real
 control. And it is display

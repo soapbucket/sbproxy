@@ -438,6 +438,14 @@ next delimiter. A byte continues it only if it is one of `[A-Za-z0-9]`,
 `-`, `.`, `_`, `~`, `%`, `:`, or `@`, which is a strict subset of what RFC
 3986 permits there. Everything else ends the run.
 
+That set is this surface's. The config routes take a wider one, described
+in [configuration.md](configuration.md#config_history), because a rendered
+config document has no field whose delimiters a caller chose: the value is
+a whole scalar and the renderer picked what surrounds it. Here the `query`
+field holds the client's raw query string, so `&` and `=` are live bytes an
+attacker supplies, and admitting them would let a mask delete a caller's
+own parameters out of their own log record.
+
 The set is *not* "every byte that is not structure", and that distinction
 matters: `:` is JSON structure and is in the set, because a URL needs it.
 What holds the line is narrower and stronger. Neither `"` nor `\` is in
