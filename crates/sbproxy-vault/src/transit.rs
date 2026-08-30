@@ -566,11 +566,22 @@ mod tests {
     }
 
     /// A one-shot HTTP server that records each request line and answers
-    /// from a canned script.
+    /// from a canned script of `(status, body)` pairs.
+    ///
+    /// The status is part of the script rather than a separate "how many
+    /// succeed before the failure" count, and that is deliberate. The
+    /// count form needs `for i in 0..=ok_count` with `responses[i]` in the
+    /// body, which is an inclusive range indexing a shorter slice: clippy
+    /// refuses it, and the obvious `.iter().enumerate()` rewrite silently
+    /// drops the extra iteration the `..=` existed for. Putting the
+    /// failing response in the script removes the index and the trap
+    /// together.
     ///
     /// `Connection: close` on every response so `ureq` opens a fresh
     /// connection per call and the accept loop stays one-request-per-accept.
-    fn scripted_vault(responses: Vec<String>) -> (String, std::sync::mpsc::Receiver<String>) {
+    fn scripted_vault(
+        responses: Vec<(u16, String)>,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -584,7 +595,7 @@ mod tests {
         std::thread::spawn(move || {
             use std::io::{BufRead, BufReader, Read, Write};
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            for body in responses {
+            for (status, body) in responses {
                 let mut stream = loop {
                     match listener.accept() {
                         Ok((stream, _)) => break stream,
@@ -619,8 +630,9 @@ mod tests {
                 let mut payload = vec![0u8; length];
                 let _ = reader.read_exact(&mut payload);
                 let _ = tx.send(request_line.trim().to_string());
+                let reason = if status == 200 { "OK" } else { "Forbidden" };
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
                     body
                 );
@@ -651,8 +663,11 @@ mod tests {
         let ciphertext = "vault:v1:c2Jwcm94eQ==";
         let plaintext = base64::engine::general_purpose::STANDARD.encode(LIVENESS_PROBE_VALUE);
         let (address, requests) = scripted_vault(vec![
-            format!(r#"{{"data":{{"ciphertext":"{ciphertext}"}}}}"#),
-            format!(r#"{{"data":{{"plaintext":"{plaintext}"}}}}"#),
+            (
+                200,
+                format!(r#"{{"data":{{"ciphertext":"{ciphertext}"}}}}"#),
+            ),
+            (200, format!(r#"{{"data":{{"plaintext":"{plaintext}"}}}}"#)),
         ]);
 
         let client = TransitClient::new(TransitConfig {
@@ -691,63 +706,27 @@ mod tests {
     /// reach the caller as one so the purge arm runs.
     #[test]
     fn a_revoked_grant_on_either_leg_is_reported_as_unauthorized() {
-        for (label, responses) in [
-            ("encrypt", vec![]),
+        // The whole script per case, failing response included, so the
+        // server helper needs no index and no "how many succeed first"
+        // count. `encrypt` is refused on the first call; `decrypt` is
+        // refused on the second, after a successful encrypt.
+        let denied = r#"{"errors":["permission denied"]}"#.to_string();
+        for (label, script) in [
+            ("encrypt", vec![(403, denied.clone())]),
             (
                 "decrypt",
-                vec![r#"{"data":{"ciphertext":"vault:v1:c2Jwcm94eQ=="}}"#.to_string()],
+                vec![
+                    (
+                        200,
+                        r#"{"data":{"ciphertext":"vault:v1:c2Jwcm94eQ=="}}"#.to_string(),
+                    ),
+                    (403, denied.clone()),
+                ],
             ),
         ] {
-            // An empty script means the first request gets no response and
-            // the connection closes, so build the 403 case explicitly.
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-            let port = listener.local_addr().expect("addr").port();
-            let ok_count = responses.len();
-            listener
-                .set_nonblocking(true)
-                .expect("nonblocking listener");
-            std::thread::spawn(move || {
-                use std::io::{Read, Write};
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-                for i in 0..=ok_count {
-                    let mut stream = loop {
-                        match listener.accept() {
-                            Ok((stream, _)) => break stream,
-                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                if std::time::Instant::now() >= deadline {
-                                    return;
-                                }
-                                std::thread::sleep(std::time::Duration::from_millis(5));
-                            }
-                            Err(_) => return,
-                        }
-                    };
-                    stream.set_nonblocking(false).expect("blocking stream");
-                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
-                    let mut buf = [0u8; 4096];
-                    let _ = stream.read(&mut buf);
-                    let body = if i < ok_count {
-                        responses[i].clone()
-                    } else {
-                        r#"{"errors":["permission denied"]}"#.to_string()
-                    };
-                    let status = if i < ok_count {
-                        "200 OK"
-                    } else {
-                        "403 Forbidden"
-                    };
-                    let response = format!(
-                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = stream.write_all(response.as_bytes());
-                    let _ = stream.flush();
-                }
-            });
-
+            let (address, _requests) = scripted_vault(script);
             let client = TransitClient::new(TransitConfig {
-                address: format!("http://127.0.0.1:{port}"),
+                address,
                 mount: "transit".to_string(),
                 key_name: "sbproxy-root".to_string(),
                 token: "hvs.PROBE".to_string(),
