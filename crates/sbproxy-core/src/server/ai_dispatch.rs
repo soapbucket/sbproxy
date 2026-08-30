@@ -3955,9 +3955,9 @@ fn clear_unserved_cascade_selection(ctx: &mut crate::context::RequestContext) {
 /// Stamp the generic cascade connect-error arm (WOR-2709).
 ///
 /// Same seed-clear as [`record_cascade_credential_lock`], without the
-/// lock stamps. The production `Err` arm calls this rather than the
-/// helper, so a later edit that drops the call site fails this module's
-/// zero-attempt test.
+/// lock stamps. The production generic `Err` arm must call this; the
+/// zero-attempt test asserts that call site by source so deleting it
+/// fails the test.
 fn record_cascade_connect_failure(ctx: &mut crate::context::RequestContext) {
     clear_unserved_cascade_selection(ctx);
 }
@@ -4225,6 +4225,16 @@ mod cascade_credential_lock_tests {
             routing_decision_selected_provider(&ctx),
             None,
             "the generic Err arm must clear the seed as well"
+        );
+        let src = include_str!("ai_dispatch.rs");
+        let marker = concat!(
+            "Streaming never reaches these arms (`",
+            "cascade_owns_dispatch`"
+        );
+        let arm = src.find(marker).expect("generic cascade 502 arm");
+        assert!(
+            src[arm..arm.saturating_add(400)].contains("record_cascade_connect_failure(ctx);"),
+            "the generic cascade 502 arm must call record_cascade_connect_failure before ConnectError"
         );
     }
 

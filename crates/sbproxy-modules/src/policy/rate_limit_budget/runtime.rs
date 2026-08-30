@@ -315,7 +315,8 @@ impl RateLimitBudgetRegistry {
         let reset_secs = st.bucket.reset_secs();
         let remaining = st.bucket.tokens.floor().max(0.0) as u64;
 
-        if admitted {
+        let mut emit_suspend = false;
+        let decision = if admitted {
             st.consecutive_throttles = 0;
             // Soft tier: rate has reached the soft threshold (in rps,
             // counted over the 1-second window) but is still admitted.
@@ -353,7 +354,7 @@ impl RateLimitBudgetRegistry {
                 st.suspend_until = Some(now + self.cooldown);
                 // Drop the effective ceiling to 1 rps.
                 st.bucket = TokenBucket::new(1, 1, now);
-                self.emit_suspend(workspace);
+                emit_suspend = true;
             }
             BudgetDecision {
                 allowed: false,
@@ -367,7 +368,12 @@ impl RateLimitBudgetRegistry {
                 reset_secs: reset_secs.max(1),
                 window_secs: 1,
             }
+        };
+        drop(map);
+        if emit_suspend {
+            self.emit_suspend(workspace);
         }
+        decision
     }
 
     fn emit_suspend(&self, workspace: &str) {
