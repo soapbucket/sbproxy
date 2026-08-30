@@ -14612,6 +14612,47 @@ mod mcp_catalog_snapshot_tests {
         found
     }
 
+    /// Every `mcp_governance_decision` record the file carries for one
+    /// tool, read once rather than polled.
+    ///
+    /// Exists to explain a poll that found nothing. "No record arrived"
+    /// and "a record arrived carrying something else" are different
+    /// failures with different fixes, and a bare deadline message claims
+    /// the first when it may be the second.
+    fn governance_events_for_tool(
+        events_path: &std::path::Path,
+        tool_name: &str,
+    ) -> Vec<serde_json::Value> {
+        let Ok(contents) = std::fs::read_to_string(events_path) else {
+            return Vec::new();
+        };
+        contents
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| event["data"]["gen_ai.tool.name"] == tool_name)
+            .collect()
+    }
+
+    /// Those records as one `verdict/rule_id/reason` triple each, for a
+    /// panic message that names what was found instead of what was not.
+    fn describe_governance_events(events: &[serde_json::Value]) -> String {
+        if events.is_empty() {
+            return "no mcp_governance_decision record for this tool at all".to_string();
+        }
+        events
+            .iter()
+            .map(|event| {
+                format!(
+                    "verdict={} rule_id={} reason={}",
+                    event["data"]["sbproxy.decision.verdict"],
+                    event["data"]["sbproxy.decision.rule_id"],
+                    event["data"]["sbproxy.decision.reason"],
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
     #[test]
     fn task_5b_synthesized_rollout_visibility_authorizes_the_resolved_call_target() {
         let cases = [
@@ -16095,40 +16136,72 @@ mod mcp_catalog_snapshot_tests {
                 "Cedar denial must answer INVALID_PARAMS, got: {call:?}"
             );
 
-            // The verdict this scenario means, not merely its tool.
+            // Select this refusal's own record, and work around a
+            // product defect while doing it.
             //
-            // A policy-hook denial is raised inside the federation
-            // dispatch, so unlike the RBAC and flow refusals above, this
-            // call does reach dispatch, and its failure there emits a
-            // second event for the same tool through
-            // `emit_mcp_tool_attribution`. That funnel records the
-            // dispatch outcome rather than the policy one, so it carries
-            // verdict "allow" with no rule_id, and the egress writes it
-            // first:
+            // WOR-2715 (Urgent): this call is refused, and the
+            // `mcp_governance_decision` stream records an `allow` for it
+            // anyway. `emit_mcp_tool_attribution` is called
+            // unconditionally on the dispatch path at `:8346`, before
+            // the response match at `:8404`, and it derives its verdict
+            // from `governance_denial_reason`, which `:8163` computes
+            // from only `modern_output_invalid` and `quarantine_deny`. A
+            // policy-hook denial arrives later, as
+            // `Err(McpPolicyDeniedError)` handled at `:8717`, so the
+            // funnel has already emitted:
             //
-            //     verdict="allow" rule_id=null       reason=null
+            //     verdict="allow" rule_id=null               reason=null
             //     verdict="deny"  rule_id="policy_hook_deny" reason="policy_hook"
             //
-            // `poll_for_governance_event` stops at the first read that
-            // matches, so a predicate naming only the tool returned
-            // whichever of the two had landed when it looked. It usually
-            // saw both and took the last, and on a loaded runner it saw
-            // only the allow and failed the assertion below with
-            // `left: "allow", right: "deny"`. The refusal itself is
-            // asserted above and always held, so the gateway was right
-            // and the test was reading the wrong record. Scenario 4
-            // documents this same two-event shape and pins its verdict
-            // for exactly this reason.
+            // Two records for one call, opposite verdicts, allow first.
+            // An analyst running the query `docs/mcp-security.md:584`
+            // documents gets a hit on "this tool was allowed" for a call
+            // Cedar refused. The result-policy denial at `:8575` is
+            // worse: its `result_label` is `"ok"`, which
+            // `record_mcp_tool_decision:9540` maps to
+            // `DecisionOutcome::Allow`, so on the OCSF decision bus that
+            // refusal is recorded as an allow and there is no trailing
+            // deny to find at all.
+            //
+            // None of that is this test's to fix, and the shape below is
+            // not an endorsement of it. Selecting on `rule_id`, which is
+            // unique to this refusal, is a workaround that lets the test
+            // read its own record until WOR-2715 makes the funnel emit
+            // one `Deny` instead of an allow followed by a deny. When it
+            // does, this predicate still matches and the assertions
+            // below still hold.
+            //
+            // The flake this replaced: the predicate named only the
+            // tool, so it returned whichever of the two records had
+            // landed. Usually both, and it took the last; on a loaded
+            // runner only the allow, and the verdict assertion failed
+            // with `left: "allow", right: "deny"`. The refusal itself is
+            // asserted above and always held, so the gateway refused
+            // correctly and the test was reading the wrong record.
+            //
+            // `rule_id` rather than the verdict, so the verdict stays a
+            // real assertion rather than a restatement of the question.
             let event = poll_for_governance_event(&events_path, |event| {
                 event["data"]["gen_ai.tool.name"] == TOOL_NAME
-                    && event["data"]["sbproxy.decision.verdict"] == "deny"
+                    && event["data"]["sbproxy.decision.rule_id"]
+                        == sbproxy_modules::action::mcp::MCP_POLICY_HOOK_DENY_RULE_ID
             })
             .await
-            .expect(
-                "an mcp_governance_decision event for the Cedar-denied call \
-                 was not observed within 5s",
+            .unwrap_or_else(|| {
+                panic!(
+                    "no mcp_governance_decision record for the Cedar-denied call carried \
+                     rule_id={}. What this tool did produce: {}",
+                    sbproxy_modules::action::mcp::MCP_POLICY_HOOK_DENY_RULE_ID,
+                    describe_governance_events(&governance_events_for_tool(
+                        &events_path,
+                        TOOL_NAME
+                    )),
+                )
+            });
+            assert_eq!(
+                event["data"]["sbproxy.decision.verdict"], "deny",
+                "{event:?}"
             );
-            assert_eq!(event["data"]["sbproxy.decision.verdict"], "deny");
             assert_eq!(
                 event["data"]["sbproxy.decision.rule_id"],
                 sbproxy_modules::action::mcp::MCP_POLICY_HOOK_DENY_RULE_ID
