@@ -409,6 +409,29 @@ fn start_proxy(root: &Path, config_for: impl Fn(u16, u16) -> String) -> Proxy {
     );
 }
 
+impl Drop for Proxy {
+    /// Kill and reap the child, whatever ended the test.
+    ///
+    /// Without this a panicking assertion leaves the proxy running after
+    /// the test process is gone, and an orphan holds its two loopback
+    /// ports for as long as it lives. That is not hypothetical or
+    /// harmless: an orphan from this very test, started by another
+    /// worktree, was found still running after a day and a half, still
+    /// holding its ports. Every one of those is a port the next run can
+    /// lose, so a leaked child on one failure quietly raises the odds of
+    /// the collision that causes the next.
+    ///
+    /// The teardown at the end of the test is now this, and only this,
+    /// so there is one owner rather than a happy path that cleans up and
+    /// a failure path that does not.
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
+}
+
 /// Why a startup stopped.
 enum Startup {
     /// Both planes answer.
@@ -952,7 +975,8 @@ origins:
         "a 429 a client should back off from carries Retry-After: {head}"
     );
 
-    let _ = proxy.child.kill();
-    let _ = proxy.child.wait();
+    // Dropped before the directory is removed, so the proxy is gone
+    // before its configuration and ownership directory go with it.
+    drop(proxy);
     let _ = std::fs::remove_dir_all(root);
 }
