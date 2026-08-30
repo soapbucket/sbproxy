@@ -478,7 +478,8 @@ fn start_proxy(root: &Path, config_for: impl Fn(u16, u16) -> String) -> Proxy {
         // as narrow as it can be and a lost draw is redrawn below.
         drop(public_reservation);
         drop(admin_reservation);
-        let mut child = Command::new(binary())
+        let mut command = Command::new(binary());
+        command
             .arg("serve")
             .arg(&config)
             .env_remove("SB_CONFIG_FILE")
@@ -487,9 +488,17 @@ fn start_proxy(root: &Path, config_for: impl Fn(u16, u16) -> String) -> Proxy {
                 root.join(format!("ownership-{attempt}")),
             )
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("start sbproxy");
+            .stderr(Stdio::piped());
+        // Its own process group, so the teardown can take down whatever
+        // the proxy spawned rather than only the proxy itself. The same
+        // move `sbproxy-config/src/source.rs:522` makes for its `git`
+        // children, and for the same reason.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.process_group(0);
+        }
+        let mut child = command.spawn().expect("start sbproxy");
         let output = ChildOutput::drain(
             child.stdout.take().expect("sbproxy stdout is piped"),
             child.stderr.take().expect("sbproxy stderr is piped"),
@@ -547,23 +556,47 @@ fn start_proxy(root: &Path, config_for: impl Fn(u16, u16) -> String) -> Proxy {
 }
 
 impl Drop for Proxy {
-    /// Kill and reap the child, whatever ended the test.
+    /// Kill and reap the child on every path that unwinds or returns.
     ///
-    /// Without this a panicking assertion leaves the proxy running after
-    /// the test process is gone, and an orphan holds its two loopback
-    /// ports for as long as it lives. That is not hypothetical or
-    /// harmless: an orphan from this very test, started by another
-    /// worktree, was found still running after a day and a half, still
-    /// holding its ports. Every one of those is a port the next run can
-    /// lose, so a leaked child on one failure quietly raises the odds of
-    /// the collision that causes the next.
+    /// Not "whatever ended the test", which is what this said and could
+    /// not deliver. `Drop` runs on a normal return and on a panic
+    /// unwind, and both of those are now covered where before only the
+    /// happy path was. It cannot run when the harness itself is killed
+    /// outright, and no amount of care here changes that: a SIGKILL to
+    /// this process leaves the proxy reparented to init, which is the
+    /// likeliest explanation for the orphan from this test found alive
+    /// in another worktree after a day and a half. That orphan is
+    /// evidence for the cost of leaking, not for what this `Drop` can
+    /// prevent.
+    ///
+    /// What leaking costs is the reason to close the paths that can be
+    /// closed: an orphan holds both its loopback ports for as long as it
+    /// lives, so a leak on one failure raises the odds of the port
+    /// collision that fails the next run.
     ///
     /// The teardown at the end of the test is now this, and only this,
     /// so there is one owner rather than a happy path that cleans up and
     /// a failure path that does not.
     fn drop(&mut self) {
+        // Read before reaping: once `wait` returns, the pid is free to
+        // be recycled, and signalling a recycled pid's group would hit
+        // an unrelated process.
+        let pid = self.child.id();
         if matches!(self.child.try_wait(), Ok(None)) {
             let _ = self.child.kill();
+        }
+        // The whole group, while the child is still unreaped and so
+        // still holds the pid this group is named by. `kill` above ends
+        // the proxy; this ends anything the proxy started that would
+        // otherwise keep a port.
+        #[cfg(unix)]
+        {
+            let _ = Command::new("/bin/kill")
+                .arg("-KILL")
+                .arg(format!("-{pid}"))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
         }
         let _ = self.child.wait();
     }
