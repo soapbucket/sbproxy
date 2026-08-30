@@ -414,6 +414,15 @@ fn serves_public_plane(port: u16) -> bool {
 /// A 200 is the whole of what readiness needs here, because the defect
 /// this closes is a refused connection. The route's own contents are
 /// step 8's to judge, once.
+///
+/// Narrowing it is safe rather than merely cheaper, and the ordering is
+/// why: `reload::load_pipeline` runs at `server/lifecycle.rs:3555`,
+/// before `prepare_listeners` at `:3964` and long before the admin
+/// thread is spawned at `:4358`. The pipeline is therefore published
+/// before the admin port can bind, so an answer from this route already
+/// carries the bridge. Waiting on `enabled: true` never proved anything
+/// a 200 did not; it only moved step 8's failure into this loop's
+/// timeout.
 fn serves_admin_plane(port: u16) -> AdminProbe {
     match admin_get(port, "/admin/licensing") {
         Ok(raw) if raw.starts_with(b"HTTP/1.1 200") => AdminProbe::Serving,
