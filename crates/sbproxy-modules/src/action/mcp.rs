@@ -387,9 +387,10 @@ pub(crate) struct McpGrantLedgerConfig {
 /// Gateway-originated approval gate (WOR-2454).
 ///
 /// Approvals are surfaced on the admin API (`GET`/`POST /api/mcp/approvals`)
-/// and, optionally, a webhook. A console page is deferred: the JSON
-/// routes are the operator surface. The caller's HTTP connection is
-/// never held open; an unanswered hold expires rather than stalling
+/// and the admin console at `/admin/ui/mcp-approvals`. An optional
+/// webhook and `proxy.alerting` (rule `mcp_confirm` on a fresh Confirm
+/// park) notify operators. The caller's HTTP connection is never held
+/// open; an unanswered hold expires fail-closed rather than stalling
 /// the route.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct McpApprovalConfig {

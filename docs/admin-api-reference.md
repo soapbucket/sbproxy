@@ -1,6 +1,6 @@
 # Admin API reference
 
-*Last modified: 2026-08-28*
+*Last modified: 2026-08-29*
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
@@ -3685,7 +3685,7 @@ model-host artifact cache above:
 | GET | `/admin/mcp-runtime` | Federated MCP server runtime state and in-flight tool-call auth challenges. |
 | GET | `/api/mcp/grants` | Time-boxed MCP RBAC grants. A console page is deferred. |
 | POST | `/api/mcp/grants/renew` | Reset `renewed_at` for a grant. Body: `{origin, policy, tool, principal?, tenant?}`. |
-| GET | `/api/mcp/approvals` | Pending and decided MCP approval holds. A console page is deferred. |
+| GET | `/api/mcp/approvals` | Pending and decided MCP approval holds. Console: `/admin/ui/mcp-approvals`. |
 | POST | `/api/mcp/approvals/{id}/approve` | Approve a hold. Body: `{approved_by}`. The next matching retry consumes it once. |
 | POST | `/api/mcp/approvals/{id}/deny` | Deny a hold. Body: `{approved_by}`. |
 
@@ -4022,9 +4022,11 @@ rules beat a `*` catch-all.
 
 ### `GET /api/mcp/approvals`
 
-Gateway-originated MCP approval holds. A console page is deferred. Both
+Gateway-originated MCP approval holds, including Cedar Confirm parks
+when `approval:` is set. Console page `/admin/ui/mcp-approvals`. Both
 `admin` and `read_only` operators may call it. Arguments and secrets are
-never listed.
+never listed. The JSON `console_page` field is
+`/admin/ui/mcp-approvals`.
 
 ### `POST /api/mcp/approvals/{id}/approve`
 

@@ -1,0 +1,6 @@
+# MCP tools/call samples for sbproxy cedar replay.
+# Same principal / action / resource triple the live hook builds.
+# Action defaults to Action::"MCP::CallTool". No arguments: live context is empty.
+{"id":"search","principal":"Agent::\"anonymous\"","resource":"ToolInvocation::\"demo/search_repos\""}
+{"id":"delete","principal":"Agent::\"anonymous\"","resource":"ToolInvocation::\"demo/delete_repo\""}
+{"id":"deploy","principal":"Agent::\"anonymous\"","resource":"ToolInvocation::\"demo/approve_deploy\""}

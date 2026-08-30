@@ -1,0 +1,94 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Proposed Cedar set for the replay-diff demo (WOR-2590).
+#
+# Same origin as baseline.yml, plus a forbid on demo/search_repos.
+# Replay against traffic.jsonl with --baseline baseline.yml: search
+# changes allow -> deny; delete and deploy stay put.
+#
+# Offline (no serve):
+#   sbproxy cedar replay -f examples/cedar-replay/sb.yml \
+#     --against examples/cedar-replay/traffic.jsonl \
+#     --baseline examples/cedar-replay/baseline.yml
+#
+# Plan the same edit (Reload, reason names Cedar):
+#   sbproxy plan -f examples/cedar-replay/sb.yml \
+#     --against examples/cedar-replay/baseline.yml
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "mcp.example.com":
+    action:
+      type: mcp
+      mode: gateway
+      server_info:
+        name: cedar-demo
+        version: "1.0.0"
+      rbac_policies:
+        all_tools:
+          default_allow: false
+          tool_access:
+            - principals: []
+              allowed:
+                - search_repos
+                - delete_repo
+                - approve_deploy
+      cedar_policies:
+        policies: |
+          permit(principal, action, resource);
+
+          forbid(
+            principal,
+            action,
+            resource == ToolInvocation::"demo/delete_repo"
+          );
+
+          forbid(
+            principal,
+            action,
+            resource == ToolInvocation::"demo/search_repos"
+          );
+
+          @confirm("deploy needs a human")
+          forbid(
+            principal,
+            action,
+            resource == ToolInvocation::"demo/approve_deploy"
+          );
+      federated_servers:
+        - type: openapi
+          origin: http://127.0.0.1:8091
+          prefix: demo
+          rbac: all_tools
+          timeout: 10s
+          spec:
+            openapi: "3.0.0"
+            info:
+              title: Cedar demo tools
+              version: "1.0"
+            paths:
+              "/search/repositories":
+                get:
+                  operationId: search_repos
+                  summary: Search repositories by query.
+                  parameters:
+                    - name: q
+                      in: query
+                      required: true
+                      schema:
+                        type: string
+              "/repos/delete":
+                post:
+                  operationId: delete_repo
+                  summary: Delete a repository (Cedar forbids this).
+              "/deploy/approve":
+                post:
+                  operationId: approve_deploy
+                  summary: Approve a deploy (Cedar Confirm-refuses this).
+      guardrails:
+        - type: tool_allowlist
+          allow:
+            - search_repos
+            - delete_repo
+            - approve_deploy

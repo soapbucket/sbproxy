@@ -1,6 +1,6 @@
 # SBproxy Runtime Manual
 
-*Last modified: 2026-08-28*
+*Last modified: 2026-08-29*
 
 Vendor: Soap Bucket LLC - [www.soapbucket.com](https://www.soapbucket.com)
 
@@ -194,6 +194,8 @@ sbproxy run <catalog-id> [--name <alias>] [--variant <id>]
 sbproxy models [list|show <id>|pull [<id>...]|remove <id>|ps|stop <deployment>|
                 lock|verify-lock|prune]
 sbproxy mcp {lock|verify-lock} [--out <path> | --lockfile <path>] [--format text|json]
+sbproxy cedar replay -f <yaml> --against <traffic.jsonl> [--baseline <yaml>]
+                        [--origin <host>] [--format text|json]
 sbproxy rego test <path> [--min-coverage <pct>] [--format text|json]
 sbproxy cluster {init|token create|enroll|status}
 sbproxy update [--self] [--engines] [--models] [--check] [--yes]
@@ -235,6 +237,7 @@ The full subcommand set, one line each:
 | `run` | Resolve a certified artifact, generate local admin auth, warm a canonical managed deployment, then print an OpenAI-compatible endpoint. |
 | `models` | List and show catalog entries, pull or remove exact artifacts, inspect running deployments, drain and stop one, write or check a lockfile (`lock`, `verify-lock`), or reclaim unreferenced cache blobs (`prune`). |
 | `mcp` | Federated MCP tool-catalog lockfile: `lock` discovers the configured servers and pins every advertised tool at its current contract digest; `verify-lock` re-discovers and diffs against the committed baseline without starting a listener, exiting 2 on drift, for CI. |
+| `cedar` | Cedar policy tools: `cedar replay -f <yaml> --against <traffic.jsonl>` evaluates recorded MCP tool-call samples against `cedar_policies` in the YAML. Optional `--baseline` diffs each verdict. Exit 0 when every `expected` label holds and no baseline verdict moved; 1 when a sample missed or a verdict changed; 2 when the sample, the YAML, or the Cedar source could not be compiled. See [cedar-policy.md](cedar-policy.md). |
 | `rego` | `rego test <path>` is the offline `opa test` analogue: runs one or more YAML fixture files against the Rego module(s) they name and prints a per-module line-coverage summary, without touching `sb.yml` or a running proxy. See [scripting.md §3a](scripting.md#3a-rego-policies). |
 | `cluster` | Initialize cluster identity, create one-time enrollment tokens, enroll nodes, or inspect the complete roster, placement, and unhealthy-node alerts. |
 | `update` | Update the engines and cached models (add `--self` for the binary): check the engine release feed and cached models, then fetch, verify, and swap what is out of date, with confirmation. `--check` reports only. Pinned or `path`/`brew`/`apt`-managed artifacts are reported, never replaced, unless the run targets them. |
@@ -358,6 +361,46 @@ Exit codes:
 When `--against` is omitted, the baseline is empty, so every origin in
 the proposed config surfaces as `added`. The `--running` baseline
 (pulled from a live admin socket) is deferred.
+
+A Cedar-only edit on `origins.*.action.cedar_policies` is classified
+**Reload** (`Cedar MCP policies recompile on reload`) and named as
+Cedar, not an opaque action-body tweak. Preview the same source
+against recorded tool calls with `sbproxy cedar replay` (see below).
+
+### `cedar replay` - evaluate recorded MCP tool calls against Cedar
+
+Reads `origins.*.action.cedar_policies.policies` from `-f` / `--config`
+and evaluates a JSONL traffic sample. Each line is
+`{principal, resource, expected?, action?, id?}`. `principal` and
+`resource` are Cedar UIDs (`Agent::"anonymous"`,
+`ToolInvocation::"demo/search_repos"`). `action` defaults to
+`Action::"MCP::CallTool"`. Samples do not carry arguments: the live
+hook evaluates against an empty Cedar context.
+
+```bash
+sbproxy cedar replay -f proposed.yml --against traffic.jsonl
+sbproxy cedar replay -f proposed.yml --against traffic.jsonl \
+  --baseline live.yml --format json
+sbproxy cedar replay -f proposed.yml --against traffic.jsonl \
+  --origin mcp.example.com
+```
+
+`--baseline` diffs each sample's verdict against that file's Cedar
+source. A moved verdict is a policy-change preview (exit 1), the
+analogue of a traffic replay before `apply`. `--origin` restricts extraction to one hostname when several origins
+carry Cedar. When more than one origin has `cedar_policies`,
+`--origin` is required: replay compiles one live hook, not a merged
+PolicySet of every origin.
+
+Exit codes:
+
+| Code | Meaning |
+|------|---------|
+| 0 | Every `expected` label held, and (with `--baseline`) no verdict moved. |
+| 1 | A sample missed its `expected` label, or a baseline verdict changed. |
+| 2 | The sample, the YAML, or the Cedar source could not be parsed or compiled. |
+
+Runnable: [`examples/cedar-replay/`](../examples/cedar-replay/). Dedicated page: [cedar-policy.md](cedar-policy.md).
 
 ### `aggregate` - compose project-owned origin profiles
 
