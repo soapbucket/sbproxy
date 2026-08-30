@@ -320,6 +320,27 @@ describe("api.routingDecisions (WOR-2575)", () => {
   });
 });
 
+describe("api.mcpApprovals (WOR-2588)", () => {
+  it("lists holds and posts approve/deny on the hold id", async () => {
+    const fetchMock = stubFetch('{"enabled":true,"holds":[]}');
+    await api.mcpApprovals();
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/mcp/approvals",
+      expect.objectContaining({ method: "GET" }),
+    );
+    await api.approveMcpHold("hold_abc", "alice");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/mcp/approvals/hold_abc/approve",
+      expect.objectContaining({ method: "POST" }),
+    );
+    await api.denyMcpHold("hold_abc", "alice");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/mcp/approvals/hold_abc/deny",
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+});
+
 describe("extension inventory contract", () => {
   it("loads the authoritative running snapshot from the authenticated API", async () => {
     const snapshot: ExtensionInventorySnapshot = {

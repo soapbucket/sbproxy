@@ -1,0 +1,102 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Cedar Confirm parks for a human (WOR-2588).
+#
+# Same three OpenAPI tools as examples/cedar-mcp-full, plus approval:
+# so a @confirm forbid parks (JSON-RPC -32097) instead of refusing
+# with "confirmation required:". Do not list approve_deploy under
+# approval.tools[]: that selector parks before Cedar runs. The store
+# and hold_ttl are enough for a Confirm verdict to park.
+#
+# alerting.channels type: log is enough to see mcp_confirm fire on a
+# fresh hold. Point webhook / slack / pagerduty at a real receiver
+# the same way any other proxy.alerting channel works. Per-origin
+# approval.webhook still fires even when proxy.alerting is unset.
+#
+# Run (two processes; reuse the cedar-mcp-full mock):
+#   sbproxy serve -f examples/cedar-mcp-full/upstream.yml &
+#   sbproxy serve -f examples/cedar-confirm-flow/sb.yml
+#
+# Without approval:, Confirm stays a refusal. That path is
+# examples/cedar-mcp-full/.
+
+proxy:
+  http_bind_port: 8080
+  admin:
+    enabled: true
+    port: 9900
+  alerting:
+    channels:
+      - type: log
+
+origins:
+  "mcp.example.com":
+    action:
+      type: mcp
+      mode: gateway
+      server_info:
+        name: cedar-confirm-demo
+        version: "1.0.0"
+      approval:
+        store: /tmp/sbproxy-cedar-confirm-approvals.json
+        hold_ttl: 15m
+      rbac_policies:
+        all_tools:
+          default_allow: false
+          tool_access:
+            - principals: []
+              allowed:
+                - search_repos
+                - delete_repo
+                - approve_deploy
+      cedar_policies:
+        policies: |
+          permit(principal, action, resource);
+
+          forbid(
+            principal,
+            action,
+            resource == ToolInvocation::"demo/delete_repo"
+          );
+
+          @confirm("deploy needs a human")
+          forbid(
+            principal,
+            action,
+            resource == ToolInvocation::"demo/approve_deploy"
+          );
+      federated_servers:
+        - type: openapi
+          origin: http://127.0.0.1:8091
+          prefix: demo
+          rbac: all_tools
+          timeout: 10s
+          spec:
+            openapi: "3.0.0"
+            info:
+              title: Cedar demo tools
+              version: "1.0"
+            paths:
+              "/search/repositories":
+                get:
+                  operationId: search_repos
+                  summary: Search repositories by query.
+                  parameters:
+                    - name: q
+                      in: query
+                      required: true
+                      schema:
+                        type: string
+              "/repos/delete":
+                post:
+                  operationId: delete_repo
+                  summary: Delete a repository (Cedar forbids this).
+              "/deploy/approve":
+                post:
+                  operationId: approve_deploy
+                  summary: Approve a deploy (Cedar Confirm parks this).
+      guardrails:
+        - type: tool_allowlist
+          allow:
+            - search_repos
+            - delete_repo
+            - approve_deploy

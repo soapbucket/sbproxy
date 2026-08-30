@@ -38,6 +38,7 @@ const ALERT_COMMAND_CAPACITY: usize = 32;
 #[derive(Debug)]
 enum AlertCommand {
     TestChannel(usize),
+    Fire(Alert),
 }
 
 #[derive(Clone)]
@@ -129,6 +130,17 @@ pub(crate) fn alert_snapshot() -> Option<AlertRuntimeSnapshot> {
 pub(crate) fn queue_channel_test(channel_index: usize) -> Result<(), AlertControlError> {
     let control = ALERT_CONTROL.get().ok_or(AlertControlError::Unavailable)?;
     control.queue_channel_test(channel_index)
+}
+
+/// Fire an ad-hoc alert on every configured channel (Slack, webhook,
+/// PagerDuty). Used for MCP Confirm holds so a parked call pages the
+/// same destinations as a metric rule. A no-op when alerting was not
+/// installed at boot.
+pub(crate) fn fire_event_alert(alert: Alert) {
+    let Some(control) = ALERT_CONTROL.get() else {
+        return;
+    };
+    let _ = control.command_tx.try_send(AlertCommand::Fire(alert));
 }
 
 impl AlertControl {
@@ -246,6 +258,10 @@ async fn run(
                             runtime.record_test_alert(channel_index, &alert);
                             let _ = dispatcher.fire_channel(channel_index, alert);
                         }
+                    }
+                    Some(AlertCommand::Fire(alert)) => {
+                        runtime.record_alert(&alert);
+                        dispatcher.fire(alert);
                     }
                     None => commands_open = false,
                 }

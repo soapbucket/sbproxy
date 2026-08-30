@@ -1,6 +1,6 @@
 # Cedar ABAC on federated MCP tools/call
 
-*Last modified: 2026-08-28*
+*Last modified: 2026-08-29*
 
 Three OpenAPI-derived tools behind one MCP gateway, with Cedar compiled at config load. RBAC allows all three so you can see Cedar allow, forbid, and Confirm-refuse on the same origin. The upstream is a local mock (`upstream.yml`), not `type: local`: the Cedar hook does not run on local tools.
 
@@ -49,7 +49,7 @@ curl -s -X POST http://127.0.0.1:8080 \
   -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"delete_repo","arguments":{}}}' | jq .
 ```
 
-Confirm-kind refuse (`approve_deploy`): look for `confirmation required: deploy needs a human` in the error message. That is a refusal, not a waiting approval.
+Confirm-kind refuse (`approve_deploy`): look for `confirmation required: deploy needs a human` in the error message. That is a refusal, not a waiting approval. Parking that verdict for a human is [`examples/cedar-confirm-flow/`](../cedar-confirm-flow/). Preview a Cedar edit offline with [`examples/cedar-replay/`](../cedar-replay/).
 
 ```bash
 curl -s -X POST http://127.0.0.1:8080 \
