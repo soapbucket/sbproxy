@@ -9265,11 +9265,12 @@ origins:
         // character, with a world-readable index, so `refuse_shared_files`
         // refuses and names the widened file.
         //
-        // Two things about the fixture are load bearing. The escape
-        // reaches the config through a YAML escape rather than a raw
-        // byte, because a raw one fails the parse before the store is
-        // opened at all and falls back to the default ring directory,
-        // which would make this test pass without the production change.
+        // Two things about the fixture are load bearing. The control
+        // byte reaches the config as a YAML `\u` sequence rather than
+        // literally, because a literal one fails the parse before the
+        // store is opened at all and falls back to the default ring
+        // directory, which would make this test pass without the
+        // production change.
         // And the store error has to be one that carries the path:
         // `RevisionStoreError::Io` renders an errno and no path, so the
         // permission-denied open this was first written against proved

@@ -2582,8 +2582,9 @@ mod tests {
     /// existed nothing drove it at all: hardcoding `0` there left every
     /// test green and made `delivered_unowned_skipped` unreachable for
     /// every clustered `SBProxy`. That is the one-of-two-arms shape this
-    /// branch has now hit three times, so the two tests are siblings on
-    /// purpose and each names its arm.
+    /// branch has now hit four times, most recently inside the fix for
+    /// the third, so the two tests are siblings on purpose and each
+    /// names its arm.
     #[tokio::test]
     async fn the_clustered_workload_pass_carries_the_count_that_picks_the_delivery_label() {
         use tower::ServiceExt as _;
@@ -2591,11 +2592,29 @@ mod tests {
         let stub = FallbackStub::start(r#"{"reloaded":true}"#);
         let (mut sbp, _cfg) =
             suspension_fixtures(i32::from(stub.port), "proxy:\n  http_bind_port: 8080\n");
+        // Gate 4 of `should_hot_reload_statefulset`, and the same
+        // `delivered_config_hash` requirement its Deployment sibling
+        // documents: both fields have to be set or the gate reads "no
+        // hash recorded yet" rather than "the config changed", and the
+        // test would pass for a reason it is not testing.
         sbp.status = Some(sbproxy_k8s_operator::crd::SBProxyStatus {
             config_hash: "old-hash".to_string(),
             observed_config_hash: "old-hash".to_string(),
             ..Default::default()
         });
+        // Gates 2 and 3: an existing StatefulSet whose operator-owned
+        // spec matches the desired one, built with the same builder the
+        // operator uses so a template change cannot silently drop this
+        // test onto the rollout path.
+        //
+        // `spec.clustering` is deliberately absent, which is worth
+        // saying because the real clustered path always has it. It
+        // makes `clustering_enabled` false, so the shared-key block
+        // above the workload apply does not generate a Secret. That is
+        // upstream of the arm under test and cannot reach
+        // `unowned_skipped`; leaving it out keeps the fixture to the
+        // one decision this test is about. The `get_opt` on that Secret
+        // still runs and is answered by the generic arm below.
         let existing = serde_json::to_value(reconcile::desired_statefulset(&sbp, "old-hash"))
             .expect("serialize the existing StatefulSet");
 
