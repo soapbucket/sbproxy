@@ -225,7 +225,26 @@ jobs:
       # cardinality and redaction canaries in the obs-budgets job, and the
       # required offline subset in the e2e-subset job (WOR-2469).
       - name: test (excludes e2e)
-        run: cargo nextest run --workspace --exclude sbproxy-e2e --locked --profile ci
+        # Wrapped in `timeout` so a hang leaves evidence.
+        #
+        # A job killed by its own `timeout-minutes` is CANCELLED, and GitHub
+        # uploads no log for a cancelled job, so the run tells you it walled
+        # and nothing else. Three rounds on one PR produced three identical
+        # 55-minute walls and zero diagnostic output.
+        #
+        # `timeout` makes the step exit 124 instead. The job COMPLETES as a
+        # failure, the log uploads, and nextest's progress lines name the
+        # test that was running when the clock ran out.
+        #
+        # 35m against the job's 45m: the step is ~14m on a warm cache, so
+        # this is 2.5x headroom for a slow runner, and it leaves 10m for the
+        # remaining steps and the log upload.
+        #
+        # This is not a substitute for `slow-timeout` in `.config/nextest.toml`,
+        # which kills one stuck TEST. This catches a hang anywhere else in the
+        # step, including the test-binary compile that `cargo build` above does
+        # not cover.
+        run: timeout --signal=TERM --kill-after=60s 35m cargo nextest run --workspace --exclude sbproxy-e2e --locked --profile ci
 
       # These tests are #[ignore]d in the default lane because they require a
       # redis-server executable. CI installs Redis above and runs them through
