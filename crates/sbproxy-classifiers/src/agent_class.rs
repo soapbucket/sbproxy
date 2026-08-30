@@ -573,6 +573,14 @@ mod tests {
             "a generic Mozilla UA must not classify as a coding agent: {:?}",
             mozilla.map(|entry| entry.id.as_str())
         );
+        assert!(
+            cat.lookup_by_user_agent("NotCursor/1.0").is_none(),
+            "an unanchored cursor substring must not classify SmartCursor or NotCursor"
+        );
+        assert!(
+            cat.lookup_by_user_agent("ResearchCursor/1.0").is_none(),
+            "a leading product name ending in Cursor/ must not share the Cursor budget"
+        );
     }
 
     #[test]

@@ -192,7 +192,7 @@ agent_classes:
     vendor: Anysphere
     purpose: assistant
     contact_url: https://docs.cursor.com/
-    expected_user_agent_pattern: "(?i)cursor[-/]"
+    expected_user_agent_pattern: "(?i)\\bcursor[-/]"
     expected_reverse_dns_suffixes: []
     expected_keyids: []
     robots_compliance_score: 0.50
@@ -225,7 +225,7 @@ agent_classes:
     vendor: GitHub
     purpose: assistant
     contact_url: https://docs.github.com/en/copilot
-    expected_user_agent_pattern: "(?i)github-copilot"
+    expected_user_agent_pattern: "(?i)\\bgithub-copilot"
     expected_reverse_dns_suffixes: []
     expected_keyids: []
     robots_compliance_score: 0.50

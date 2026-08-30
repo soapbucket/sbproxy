@@ -3952,6 +3952,16 @@ fn clear_unserved_cascade_selection(ctx: &mut crate::context::RequestContext) {
     ctx.admin_load_balancer_target = None;
 }
 
+/// Stamp the generic cascade connect-error arm (WOR-2709).
+///
+/// Same seed-clear as [`record_cascade_credential_lock`], without the
+/// lock stamps. The production `Err` arm calls this rather than the
+/// helper, so a later edit that drops the call site fails this module's
+/// zero-attempt test.
+fn record_cascade_connect_failure(ctx: &mut crate::context::RequestContext) {
+    clear_unserved_cascade_selection(ctx);
+}
+
 /// Stamp every operator-facing surface for a cascade that dispatched
 /// no tier because the credential's provider policy excluded all of
 /// them (WOR-2685).
@@ -4210,7 +4220,7 @@ mod cascade_credential_lock_tests {
         // The generic 502 arm calls the same helper without the lock
         // stamps. Re-seed and prove that path clears the row too.
         ctx.admin_load_balancer_target = Some("openai".to_string());
-        clear_unserved_cascade_selection(&mut ctx);
+        record_cascade_connect_failure(&mut ctx);
         assert_eq!(
             routing_decision_selected_provider(&ctx),
             None,
@@ -4269,6 +4279,7 @@ fn posture_refusal_body(
     }
     let request_id = ctx.request_id.to_string();
     record_posture_refusal(constraint, posture_excluded, method, ctx);
+    clear_unserved_cascade_selection(ctx);
     Some(
         ErrorEnvelope::new(
             "no_posture_eligible_provider",
@@ -4328,6 +4339,7 @@ mod posture_refusal_tests {
         let mut ctx = crate::context::RequestContext::new();
         ctx.tenant_id = "posture-refusal-test-tenant".into();
         ctx.request_id = "posture-refusal-test-rid".into();
+        ctx.admin_load_balancer_target = Some("openai".to_string());
         let excluded = vec!["mistral".to_string(), "groq".to_string()];
         let before = refused_count("require_zdr", "posture-refusal-test-tenant");
 
@@ -4376,6 +4388,10 @@ mod posture_refusal_tests {
                 .any(|event| event.request_id.as_deref() == Some("posture-refusal-test-rid")),
             "the refusal must land on the security-audit channel, which is what \
              reaches an `events:` sink as policy_denied"
+        );
+        assert_eq!(
+            ctx.admin_load_balancer_target, None,
+            "a cascade posture refusal never dispatched, so selected_provider must not keep the pre-cascade seed"
         );
     }
 
@@ -6155,6 +6171,7 @@ async fn refuse_over_price_ceiling(
     method: &str,
 ) -> Result<()> {
     sbproxy_ai::ai_metrics::record_price_ceiling("refused");
+    clear_unserved_cascade_selection(ctx);
     // A bare 402 classifies as `budget_exceeded` on
     // `sbproxy_ai_requests_attributed_total{outcome}`, which is the
     // label an exhausted tenant budget already owns. Stamping the
@@ -12682,6 +12699,7 @@ pub(super) async fn handle_ai_proxy(
                         if let QuotaPoolErrorDisposition::Reject { status, message } =
                             sbproxy_ai::quota_pool::pool_error_disposition(Some(pool), error)
                         {
+                            clear_unserved_cascade_selection(ctx);
                             send_error(session, status, message).await?;
                             return Ok(());
                         }
@@ -12716,7 +12734,7 @@ pub(super) async fn handle_ai_proxy(
                     // Streaming never reaches these arms (`cascade_owns_dispatch`
                     // is false when `is_stream`), so this bug does not exist
                     // on that path.
-                    clear_unserved_cascade_selection(ctx);
+                    record_cascade_connect_failure(ctx);
                     return Err(Error::because(
                         ErrorType::ConnectError,
                         "AI cascade failed",
