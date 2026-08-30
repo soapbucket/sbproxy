@@ -173,16 +173,37 @@ const PORT_ATTEMPTS: usize = 5;
 /// What the child writes when a listener cannot take the port it was
 /// handed.
 ///
-/// One marker covers both listeners because both report the same errno,
-/// but they are alike in nothing else, and both differences matter here.
-/// The public bind is fatal: the process prints to stderr and exits.
-/// The admin bind is not: `spawn_admin_server` logs at error through
-/// `tracing`, which this binary writes to **stdout**, and then the
-/// process goes on serving without an admin plane for the rest of its
-/// life. So the failure this test actually trips over is the quiet one,
-/// on the stream the test used to send to `/dev/null`, which is most of
-/// why it was opaque. Both streams are captured and both are searched.
-const ADDRESS_IN_USE: &str = "address already in use";
+/// Two spellings, because the runtime has two. Every other process test
+/// in this workspace that has to recognize this condition carries both
+/// (`chargeback_admin_wire.rs`, `classifier_hook_egress.rs`,
+/// `generated_response_large_body.rs`), and `listener_startup.rs`, whose
+/// whole subject is the public listener collision, requires both as
+/// well. A detector narrower than those is a detector that reports an
+/// ordinary redraw as a hard failure.
+///
+/// The two listeners report the same errno and are alike in nothing
+/// else. The public bind is fatal: the process prints to stderr and
+/// exits. The admin bind is not: `spawn_admin_server` logs at error
+/// through `tracing`, which this binary writes to **stdout**, and then
+/// the process goes on serving without an admin plane for the rest of
+/// its life. So the failure this test actually trips over is the quiet
+/// one, on the stream the test used to send to `/dev/null`, which is
+/// most of why it was opaque. Both streams are captured and both are
+/// searched.
+const ADDRESS_IN_USE_MARKERS: [&str; 2] = ["address already in use", "address in use"];
+
+/// Longest marker, so a scan that spans two reads carries enough of the
+/// previous one to match across the seam. Derived rather than written
+/// down, so adding a third spelling cannot leave the overlap short.
+const LONGEST_MARKER: usize = {
+    let first = ADDRESS_IN_USE_MARKERS[0].len();
+    let second = ADDRESS_IN_USE_MARKERS[1].len();
+    if first > second {
+        first
+    } else {
+        second
+    }
+};
 
 /// A running proxy and the two ports it actually took.
 ///
@@ -196,8 +217,7 @@ struct Proxy {
     output: ChildOutput,
 }
 
-/// Both of the child's output streams, drained on their own threads
-/// into one bounded buffer.
+/// Both of the child's output streams, drained on their own threads.
 ///
 /// Drained rather than left in the pipes for two reasons. The readiness
 /// loop below has to read them while the child is still running, to
@@ -207,67 +227,150 @@ struct Proxy {
 /// boot into a hang; the old `Stdio::null()` on stdout avoided that by
 /// throwing away the stream the admin bind failure is written to.
 struct ChildOutput {
-    buffer: std::sync::Arc<std::sync::Mutex<String>>,
+    /// Retained bytes, for a panic message. Bounded, and bounded at the
+    /// **front**: the interesting line is the last one the child wrote,
+    /// so a full buffer drops the oldest bytes rather than refusing the
+    /// newest.
+    buffer: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    /// Set by whichever pump sees a marker, so detection never depends
+    /// on what survived the cap. The bind failure is logged at the end
+    /// of a boot, which is exactly the part a front-filling buffer
+    /// discards, so a chatty boot used to blind the detector at the
+    /// moment it mattered.
+    lost_a_port: std::sync::Arc<std::sync::atomic::AtomicBool>,
     readers: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl ChildOutput {
-    /// Cap on what is retained. Enough for a boot's worth of log lines
-    /// and the bind failure that matters, bounded so a child that logs
-    /// in a loop cannot grow the test's memory without limit.
+    /// Cap on what is retained for the transcript.
     const CAP: usize = 256 * 1024;
 
+    /// How long `finish` waits for a pump to end before giving up on it.
+    ///
+    /// A pump ends when its pipe closes, which is when the last holder
+    /// of the write end exits. That is normally the child, but a
+    /// descendant that inherited the handle would keep it open, and an
+    /// unbounded join on a path that is already failing turns a panic
+    /// with a message into a hang with none.
+    const JOIN_GRACE: Duration = Duration::from_secs(5);
+
     fn drain(stdout: std::process::ChildStdout, stderr: std::process::ChildStderr) -> Self {
-        let buffer = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let lost_a_port = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let readers = vec![
-            Self::pump(Box::new(stdout), std::sync::Arc::clone(&buffer)),
-            Self::pump(Box::new(stderr), std::sync::Arc::clone(&buffer)),
+            Self::pump(
+                Box::new(stdout),
+                std::sync::Arc::clone(&buffer),
+                std::sync::Arc::clone(&lost_a_port),
+            ),
+            Self::pump(
+                Box::new(stderr),
+                std::sync::Arc::clone(&buffer),
+                std::sync::Arc::clone(&lost_a_port),
+            ),
         ];
-        Self { buffer, readers }
+        Self {
+            buffer,
+            lost_a_port,
+            readers,
+        }
     }
 
     fn pump(
         mut pipe: Box<dyn std::io::Read + Send>,
-        sink: std::sync::Arc<std::sync::Mutex<String>>,
+        sink: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        lost_a_port: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let mut chunk = [0u8; 8192];
+            // The tail of the previous read, lowercased, so a marker
+            // split across two reads still matches.
+            let mut carry: Vec<u8> = Vec::new();
             loop {
-                match pipe.read(&mut chunk) {
-                    Ok(0) | Err(_) => return,
-                    Ok(read) => {
+                let read = match pipe.read(&mut chunk) {
+                    Ok(0) => return,
+                    Ok(read) => read,
+                    Err(error) => {
+                        // Not the same thing as EOF, and the difference
+                        // matters: a stream that stopped early leaves a
+                        // partial transcript, and a reader who cannot
+                        // see that will read the absence of a line as
+                        // evidence the child never wrote it.
+                        let note =
+                            format!("\n[test harness: reading this stream failed: {error}]\n");
                         let mut held = sink.lock().unwrap_or_else(|e| e.into_inner());
-                        if held.len() < Self::CAP {
-                            held.push_str(&String::from_utf8_lossy(&chunk[..read]));
-                        }
+                        Self::append(&mut held, note.as_bytes());
+                        return;
                     }
+                };
+                let mut scan = carry.clone();
+                scan.extend(chunk[..read].iter().map(|b| b.to_ascii_lowercase()));
+                let scanned = String::from_utf8_lossy(&scan);
+                if ADDRESS_IN_USE_MARKERS
+                    .iter()
+                    .any(|marker| scanned.contains(marker))
+                {
+                    lost_a_port.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
+                let keep = scan.len().saturating_sub(LONGEST_MARKER.saturating_sub(1));
+                carry = scan[keep..].to_vec();
+                let mut held = sink.lock().unwrap_or_else(|e| e.into_inner());
+                Self::append(&mut held, &chunk[..read]);
             }
         })
     }
 
+    /// Append, dropping from the front rather than refusing at the back.
+    fn append(held: &mut Vec<u8>, bytes: &[u8]) {
+        held.extend_from_slice(bytes);
+        if held.len() > Self::CAP {
+            let excess = held.len() - Self::CAP;
+            held.drain(..excess);
+        }
+    }
+
     fn snapshot(&self) -> String {
-        self.buffer
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        let held = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
+        String::from_utf8_lossy(&held).into_owned()
     }
 
     /// True once the child has said it could not take a port. Either
-    /// listener, either stream: see [`ADDRESS_IN_USE`].
+    /// listener, either stream, either spelling: see
+    /// [`ADDRESS_IN_USE_MARKERS`].
+    ///
+    /// Reads one atomic. The readiness loop calls this every 50ms for up
+    /// to 45 seconds, and the previous version cloned the whole buffer
+    /// and lowercased the clone on each of those ~900 passes, which on a
+    /// full buffer is hundreds of megabytes of churn contending with the
+    /// two pumps.
     fn lost_a_port(&self) -> bool {
-        self.snapshot()
-            .to_ascii_lowercase()
-            .contains(ADDRESS_IN_USE)
+        self.lost_a_port.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Wait for both readers to finish, which happens when the child's
-    /// pipes close, and return everything they retained.
+    /// Everything the readers retained, once they have ended or the
+    /// grace has passed.
     fn finish(mut self) -> String {
+        let deadline = Instant::now() + Self::JOIN_GRACE;
+        let mut abandoned = 0usize;
         for reader in self.readers.drain(..) {
-            let _ = reader.join();
+            while !reader.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if reader.is_finished() {
+                let _ = reader.join();
+            } else {
+                abandoned += 1;
+            }
         }
-        self.snapshot()
+        let mut text = self.snapshot();
+        if abandoned > 0 {
+            text.push_str(&format!(
+                "\n[test harness: {abandoned} of the child's streams were still open after \
+                 {}s, so this transcript may be short; something still holds the write end]\n",
+                Self::JOIN_GRACE.as_secs()
+            ));
+        }
+        text
     }
 }
 
@@ -394,7 +497,11 @@ fn start_proxy(root: &Path, config_for: impl Fn(u16, u16) -> String) -> Proxy {
                 // port into a hard failure. `finish` joins the readers,
                 // so what it returns is everything the child ever said.
                 let transcript = output.finish();
-                if transcript.to_ascii_lowercase().contains(ADDRESS_IN_USE) {
+                let lowered = transcript.to_ascii_lowercase();
+                if ADDRESS_IN_USE_MARKERS
+                    .iter()
+                    .any(|marker| lowered.contains(marker))
+                {
                     lost.push(format!("attempt {attempt}: {port}/{admin_port}"));
                     continue;
                 }
