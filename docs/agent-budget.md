@@ -9,7 +9,7 @@ The `agent_budget` policy is a semantic rate-limit primitive keyed on the resolv
 
 This is a rate cap, not a cost cap: it tracks requests and tokens per minute/hour against one agent's identity, not dollars against a workspace. For a dollar-denominated spend cap with graceful degradation, see [ai-predictive-budget.md](ai-predictive-budget.md).
 
-One bucket per named agent collapses "every request from the Cursor instance" or "every request from the same OpenAI Assistant" into a single budget that an operator can actually size. The `agent_id` comes from the built-in agent-class catalog in `sbproxy-classifiers`: a User-Agent regex match, not ADRF and not `agent_detect`. That catalog includes coding agents such as Cursor (`Cursor/0.42.0` and `cursor-agent/...` resolve to `anysphere-cursor`), so the walkthrough below keys a real named bucket. When no catalog entry matches, the resolver emits the `human` sentinel and the policy applies the `on_anonymous` rule.
+One bucket per named agent collapses "every request from the Cursor instance" or "every request from the same OpenAI Assistant" into a single budget that an operator can actually size. The `agent_id` comes from the built-in agent-class catalog in `sbproxy-classifiers`: a User-Agent regex match, not ADRF and not `agent_detect`. That catalog includes coding agents such as Cursor (`Cursor/0.42.0` and `cursor-agent/...` resolve to `anysphere-cursor`), so the walkthrough below keys a real named bucket. When no catalog entry matches, the resolver still stamps the `human` sentinel and that is a named bucket, not `on_anonymous`; `on_anonymous` applies only when `agent_id` is unset (the agent-class feature is off).
 
 ## Config
 
