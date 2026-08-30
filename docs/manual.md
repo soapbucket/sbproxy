@@ -82,7 +82,10 @@ sbproxy --version
 ### Docker
 
 The official image runs the matching Linux release binary on a distroless
-Debian 12 base; there is no shell or package manager in the runtime layer.
+Debian 13 base; there is no shell or package manager in the runtime layer.
+Debian 13 ships glibc 2.41, so fetched engine binaries that need
+GLIBC_2.38 or newer (mistral.rs) can start. The sbproxy binary itself
+still requires glibc 2.36 or older so the Linux tarball runs on Debian 12.
 
 The image has no default config path, so every `docker run` must name the config explicitly, either as `serve -f <path>` or as a positional argument. Mount your config at `/etc/sbproxy` and point the command at it:
 
@@ -2260,7 +2263,7 @@ docker build -f Dockerfile.cloudbuild -t sbproxy:dev .
 
 This locally built image uses a multi-stage build: the builder stages compile the
 binary and the embedded admin UI, and the final image is
-`gcr.io/distroless/cc-debian12`, with no shell or package manager. The
+`gcr.io/distroless/cc-debian13`, with no shell or package manager. The
 default command is `serve -f /etc/sbproxy/sb.yml`, so mounting a
 config at that path is enough for this local image. The published release
 images are assembled separately in `.github/workflows/release.yml` and do not

@@ -11,7 +11,7 @@
 # This is intentionally NOT the production / release image: the release
 # pipeline at `.github/workflows/release.yml` produces signed multi-arch
 # images via a different flow (cross-compile + cosign + SBOM). Keep the
-# two in sync only on the runtime base (distroless/cc-debian12).
+# two in sync only on the runtime base (distroless/cc-debian13).
 #
 # Usage:
 #   DOCKER_BUILDKIT=1 docker build -t sbproxy:ci -f Dockerfile.ci .
@@ -60,7 +60,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
  && mkdir -p /var/lib/sbproxy
 
 # --- Stage 5: runtime --------------------------------------------------
-FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
+FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
 COPY --from=builder /usr/local/bin/sbproxy /usr/local/bin/sbproxy
 # /var/lib/sbproxy must exist and be writable by the nonroot runtime
 # user (uid 65532): the documented defaults for the key_management

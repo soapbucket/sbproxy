@@ -588,6 +588,17 @@ batch_durable_file_modes() {
   bash "$ROOT/scripts/check-durable-file-modes.sh"
 }
 
+# CI: ci.yml lint lane, "runtime images keep /var/lib/sbproxy and
+# debian13" (WOR-2705, WOR-2713). Pure grep plus fixtures. Fleet and
+# Cloud Build Dockerfiles must COPY /var/lib/sbproxy into the runtime
+# stage the way Dockerfile.ci already does, and every distroless
+# runtime FROM must not still name cc-debian12. Dockerfile.worker is
+# CUDA / Ubuntu, so it needs the COPY and is not required to name
+# debian13.
+batch_runtime_image_lockstep() {
+  bash "$ROOT/scripts/check-runtime-image-lockstep.sh"
+}
+
 # CI: ci.yml guards lane, "secret-bearing types do not derive Debug"
 # (WOR-2640). Pure grep over a committed registry, plus fixtures that
 # prove the detector still detects. Every type listed in
@@ -669,6 +680,7 @@ run_batch "read-only source and doc scans" \
   batch_env_mutation "no process-global env mutation outside test helpers" \
   batch_onnx_model_loaders "no call site hands tract a model directory" \
   batch_durable_file_modes "durable sinks create files owner-only" \
+  batch_runtime_image_lockstep "runtime images keep /var/lib/sbproxy and debian13" \
   batch_secret_debug_registry "secret-bearing types do not derive Debug" \
   batch_metric_visibility "every stable metric has a dashboard panel (ratchet)" \
   batch_notice_coverage "NOTICE covers Apache-2.0-only crates" \

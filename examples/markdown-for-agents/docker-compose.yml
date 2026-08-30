@@ -21,7 +21,7 @@ services:
   #
   # Builds the proxy from the workspace source. Cloud Build's variant
   # (`Dockerfile.cloudbuild`) is the reference Dockerfile; it builds a
-  # release binary and wraps it in distroless/cc-debian12. Operators
+  # release binary and wraps it in distroless/cc-debian13. Operators
   # who want to pin a specific release can swap `build:` for
   # `image: soapbucket/sbproxy:<tag>` once a public image tag
   # is available.

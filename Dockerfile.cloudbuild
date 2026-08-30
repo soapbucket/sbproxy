@@ -95,7 +95,8 @@ COPY --from=admin-ui /ui/dist ui/dist
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     cargo build --profile "${CARGO_PROFILE}" --bin sbproxy --features embed-admin-ui --locked \
- && cp "/src/target/${CARGO_PROFILE}/sbproxy" /usr/local/bin/sbproxy
+ && cp "/src/target/${CARGO_PROFILE}/sbproxy" /usr/local/bin/sbproxy \
+ && mkdir -p /var/lib/sbproxy
 
 # --- Stage 5: cert-gen -------------------------------------------------
 # Unchanged. Mints a self-signed loadtest cert so the bench stack has
@@ -113,8 +114,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends openssl \
 # --- Stage 6: runtime --------------------------------------------------
 # Distroless cc image. Carries the binary, the loadtest cert pair, and
 # nothing else.
-FROM gcr.io/distroless/cc-debian12 AS runtime
+FROM gcr.io/distroless/cc-debian13 AS runtime
 COPY --from=builder /usr/local/bin/sbproxy /usr/local/bin/sbproxy
+# /var/lib/sbproxy must exist and be writable by the nonroot runtime
+# user (uid 65532): the documented defaults for the key_management
+# keystore and usage rollups live there, and the base image only has a
+# root-owned /var/lib (WOR-2087). Keep in sync with the release image
+# built inline in .github/workflows/release.yml.
+COPY --from=builder --chown=65532:65532 /var/lib/sbproxy /var/lib/sbproxy
 COPY --from=cert-gen /out/etc/sbproxy/tls.crt /etc/sbproxy/tls.crt
 COPY --from=cert-gen /out/etc/sbproxy/tls.key /etc/sbproxy/tls.key
 ENTRYPOINT ["/usr/local/bin/sbproxy"]
