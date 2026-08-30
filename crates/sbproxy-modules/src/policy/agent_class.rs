@@ -521,6 +521,28 @@ mod tests {
         assert_eq!(r.source, AgentIdSource::UserAgent);
     }
 
+    /// WOR-2707: the production resolver path `agent_budget` reads.
+    /// `Cursor/0.42.0` used to fall through to the human sentinel
+    /// because the default catalog had no coding-agent entries.
+    #[test]
+    fn cursor_user_agent_resolves_to_a_named_coding_agent() {
+        let resolver = build_resolver_with_dns(StubResolver::new());
+        let inputs = ResolveInputs {
+            user_agent: Some("Cursor/0.42.0"),
+            ..Default::default()
+        };
+        let r = resolver.resolve(&inputs);
+        assert_eq!(r.agent_id.as_str(), "anysphere-cursor");
+        assert!(
+            !r.agent_id.is_sentinel(),
+            "agent_budget keys on this id; a sentinel would skip or share the anonymous bucket: {}",
+            r.agent_id.as_str()
+        );
+        assert_ne!(r.agent_id.as_str(), "human");
+        assert_eq!(r.purpose, AgentPurpose::Assistant);
+        assert_eq!(r.source, AgentIdSource::UserAgent);
+    }
+
     #[test]
     fn rdns_match_outranks_ua() {
         // Plant a googlebot rDNS entry; UA pretends to be Chrome.

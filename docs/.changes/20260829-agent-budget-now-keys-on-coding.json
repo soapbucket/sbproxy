@@ -1,0 +1,4 @@
+{
+  "type": "fixed",
+  "message": "agent_budget now keys on coding-agent User-Agents such as Cursor because those entries are in the default agent-class catalog"
+}
