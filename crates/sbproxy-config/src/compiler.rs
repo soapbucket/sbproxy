@@ -1714,13 +1714,20 @@ fn validate_compression_state_local_path(path: &str) -> Result<()> {
 
 /// Flat schema-v1 top-level keys that carry a single origin's behavior.
 ///
-/// Read off the three archived fixtures under
+/// The Go `v0.1.x` line wrote one origin's behavior at the top level of
+/// the file. This line reads origin behavior only from
+/// `origins.<hostname>:` and never translated the flat shape into it,
+/// so each of these used to be dropped with a warning while the proxy
+/// booted with no origin at all.
+///
+/// The evidence is the three archived fixtures under
 /// `crates/sbproxy-config/tests/v1-compat-fixtures/`, which came from
-/// `sbproxy-go`'s own `v0.1.2` `tests/config-compat` suite. The Go line
-/// wrote one origin's behavior at the top level of the file; the Rust
-/// line reads origin behavior only from `origins.<hostname>:` and never
-/// translated the flat shape into it, so each of these used to be
-/// dropped with a warning and the proxy booted with no origin at all.
+/// `sbproxy-go`'s own `v0.1.2` `tests/config-compat` suite. Twelve of
+/// the thirteen appear there. `ai_proxy` is the exception and no fixture
+/// exercises it; it is listed because it names an AI gateway origin the
+/// same way the others name a proxy one, so a flat file carrying it
+/// would fail open identically, and a list narrower than the failure it
+/// exists to stop is worse than no list.
 ///
 /// The descriptive metadata those same files carry (`config_version`,
 /// `id`, `workspace_id`, `version`, `environment`, `tags`, `debug`) is
