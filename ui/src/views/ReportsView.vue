@@ -6,6 +6,8 @@ import {
   ApiError,
   type RequestFilters,
   type RequestReportResponse,
+  type ScoreAggregate,
+  type ScoresResponse,
 } from "../api";
 import { useAsync } from "../composables/useAsync";
 import {
@@ -18,6 +20,7 @@ import PageHeader from "../components/PageHeader.vue";
 import StatCard from "../components/StatCard.vue";
 import ErrorState from "../components/ErrorState.vue";
 import EmptyState from "../components/EmptyState.vue";
+import StatusBadge from "../components/StatusBadge.vue";
 
 const route = useRoute();
 const router = useRouter();
@@ -191,6 +194,42 @@ function groupValue(row: { group: Record<string, string> }, dim: string): string
 function rowKey(row: { group: Record<string, string> }): string {
   return JSON.stringify(groupBy.value.map((d) => row.group[d] ?? ""));
 }
+
+// ---- scores and feedback (WOR-2581) ----
+//
+// The sibling reporting dimension. sbproxy computes no scores: these
+// arrive from an eval harness, a thumbs widget, or a human, keyed to a
+// request id, and this charts what came in.
+//
+// Deliberately a panel on this page rather than a page of its own. A
+// score is only meaningful next to what it is scoring, and a standalone
+// "Scores" page would be a list of integers with no context.
+const scores = useAsync(() => api.scores());
+onMounted(scores.run);
+
+const scoreAggregates = computed<ScoreAggregate[]>(
+  () => scores.data.value?.aggregates ?? [],
+);
+const scoreData = computed<ScoresResponse | null>(() => scores.data.value ?? null);
+
+// An empty sink is the common state and is not an error: most
+// deployments never post a score. Say what would put one here rather
+// than rendering a bare "no data".
+const noScores = computed(
+  () => scores.succeeded.value && !(scores.data.value?.scores.length ?? 0),
+);
+
+/*
+ * Mean is the number an operator reads first, so give it a tone.
+ * Thresholds are display-only and deliberately coarse: sbproxy has no
+ * opinion about what a good score is, because it does not know what the
+ * evaluator was measuring.
+ */
+function meanTone(mean: number): "ok" | "warn" | "err" {
+  if (mean > 2) return "ok";
+  if (mean >= -2) return "warn";
+  return "err";
+}
 </script>
 
 <template>
@@ -218,6 +257,56 @@ function rowKey(row: { group: Record<string, string> }): string {
       <button class="sb-btn sb-btn--primary" @click="applyFilters">Refresh</button>
     </template>
   </PageHeader>
+
+  <!-- Scores and feedback (WOR-2581) -->
+  <section class="section">
+    <div class="section__head">
+      <h2>Scores and feedback</h2>
+      <span class="sb-faint">
+        Quality signals posted against logged requests. sbproxy stores these; it
+        does not compute them.
+      </span>
+      <button class="sb-btn sb-btn--sm" :disabled="scores.loading.value" @click="scores.run">
+        {{ scores.loading.value ? "Loading..." : "Refresh" }}
+      </button>
+    </div>
+    <EmptyState
+      v-if="noScores"
+      message="No scores recorded. Post one with POST /api/requests/{id}/scores from an eval harness, a thumbs up/down widget, or a review tool, and it charts here."
+    />
+    <ErrorState
+      v-else-if="scores.error.value"
+      :error="scores.error.value"
+      @retry="scores.run"
+    />
+    <div v-else class="table-wrap">
+      <table class="sb-table">
+        <thead>
+          <tr>
+            <th>Evaluator</th>
+            <th>Scores</th>
+            <th>Mean</th>
+            <th>Range</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="row in scoreAggregates" :key="row.label">
+            <td class="sb-mono">{{ row.label }}</td>
+            <td class="sb-mono">{{ formatNumber(row.count) }}</td>
+            <td>
+              <StatusBadge :label="String(row.mean)" :tone="meanTone(row.mean)" />
+            </td>
+            <td class="sb-mono">{{ row.min }} to {{ row.max }}</td>
+          </tr>
+        </tbody>
+      </table>
+      <p v-if="scoreData" class="sb-faint">
+        Accepted range {{ scoreData.range.min }} to {{ scoreData.range.max }}. The
+        last {{ formatNumber(scoreData.capacity) }} scores are kept in process; ship
+        the sbproxy::admin::scores log lines to keep history.
+      </p>
+    </div>
+  </section>
 
   <section class="filter-panel" aria-label="Report filters">
     <div class="filters">

@@ -3421,6 +3421,64 @@ pub fn record_sink_install_failure() {
     counter.inc();
 }
 
+/// Feedback and eval scores accepted by the ingestion sink (WOR-2581),
+/// labeled by the evaluator `label` the caller supplied and by a coarse
+/// `bucket` (`negative`, `neutral`, `positive`).
+///
+/// Two labels and no more. The score itself is deliberately not a label:
+/// it is a value with 21 possible readings, and one series per reading
+/// per evaluator is how a cardinality problem starts. The bucket answers
+/// the question a dashboard actually asks ("is quality falling"), and
+/// the exact distribution lives in `GET /api/scores`, which the console
+/// charts.
+///
+/// The `label` is caller-supplied, so it is sanitized and length-capped
+/// before it reaches here (`admin_scores::sanitize_label`). An evaluator
+/// name is low-cardinality operator vocabulary in every real
+/// deployment; a caller that invents one per request is the reason the
+/// cap exists.
+static FEEDBACK_SCORES_TOTAL: std::sync::LazyLock<Option<IntCounterVec>> = std::sync::LazyLock::new(
+    || {
+        match prometheus::register_int_counter_vec!(
+            "sbproxy_feedback_scores_total",
+            "Feedback and eval scores accepted by the ingestion sink, by evaluator label and sign bucket.",
+            &["label", "bucket"]
+        ) {
+            Ok(metric) => Some(metric),
+            Err(error) => {
+                tracing::warn!(
+                    metric = "sbproxy_feedback_scores_total",
+                    %error,
+                    "metric family did not register; every panel reading it stays flat for this process"
+                );
+                None
+            }
+        }
+    },
+);
+
+/// Record one accepted score (WOR-2581).
+///
+/// Called only after the score has been range-checked, so a value
+/// outside the accepted bounds never reaches a series. An absent label
+/// counts as `unlabeled`, matching what `GET /api/scores` aggregates it
+/// under, so the metric and the JSON do not disagree about what an
+/// unlabeled score is called.
+pub fn record_feedback_score(label: Option<&str>, score: i64) {
+    let bucket = if score < 0 {
+        "negative"
+    } else if score == 0 {
+        "neutral"
+    } else {
+        "positive"
+    };
+    if let Some(metric) = FEEDBACK_SCORES_TOTAL.as_ref() {
+        metric
+            .with_label_values(&[label.unwrap_or("unlabeled"), bucket])
+            .inc();
+    }
+}
+
 /// Count telemetry that was dropped or failed to set up, by sink kind
 /// and reason. Makes otherwise-silent telemetry loss (a webhook task
 /// that never spawned, a file sink whose directory could not be

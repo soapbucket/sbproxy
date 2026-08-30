@@ -1643,6 +1643,34 @@ export interface LicensingStatus {
   origins: LicensingOrigin[];
 }
 
+/* ---- Scores and feedback (WOR-2581) ---- */
+
+/** One recorded score. sbproxy stores these; it never computes them. */
+export interface ScoreEntry {
+  request_id: string;
+  score: number;
+  label?: string;
+  recorded_at: string;
+}
+
+/** Per-label rollup accompanying a score listing. */
+export interface ScoreAggregate {
+  label: string;
+  count: number;
+  mean: number;
+  min: number;
+  max: number;
+}
+
+/** `GET /api/scores`. */
+export interface ScoresResponse {
+  scores: ScoreEntry[];
+  aggregates: ScoreAggregate[];
+  /** Ring size. Scores are a console window, not a datastore. */
+  capacity: number;
+  range: { min: number; max: number };
+}
+
 export interface DriftResponse {
   // Real server shape (GET /admin/drift).
   drift?: boolean;
@@ -2501,6 +2529,10 @@ export interface PromptEntry {
   pinned_version?: string;
   active?: string;
   versions?: (string | { version?: string; created_at?: string })[];
+  /** Movable labels pointing at a version (WOR-2582), e.g.
+   *  `{"production": "4", "staging": "7"}`. A caller references
+   *  `name@production` and the operator repoints it. */
+  labels?: Record<string, string>;
   [k: string]: unknown;
 }
 
@@ -2540,6 +2572,7 @@ export function flattenPromptOverlay(data: unknown): PromptEntry[] {
         default_version?: string | null;
         effective_version?: string | null;
         versions?: unknown;
+        labels?: unknown;
       };
       rows.push({
         host,
@@ -2547,6 +2580,12 @@ export function flattenPromptOverlay(data: unknown): PromptEntry[] {
         pinned: e.default_version ?? undefined,
         active: e.effective_version ?? undefined,
         versions: Array.isArray(e.versions) ? (e.versions as string[]) : [],
+        // The server sends a sorted object; an older server sends none,
+        // which reads as a prompt with no labels rather than an error.
+        labels:
+          e.labels && typeof e.labels === "object"
+            ? (e.labels as Record<string, string>)
+            : {},
       });
     }
   }
@@ -3281,6 +3320,20 @@ export const api = {
   // WOR-2574: the two routes that shipped with "a console page is
   // separate scope" written beside them.
   federation: () => getJson<FederationStatus>("/admin/federation"),
+  // WOR-2581. `requestId` narrows to one request, which is what the
+  // per-request panel asks for.
+  scores: (requestId?: string) =>
+    getJson<ScoresResponse>(
+      requestId
+        ? `/api/scores?request_id=${encodeURIComponent(requestId)}`
+        : "/api/scores",
+    ),
+  recordScore: (requestId: string, score: number, label?: string) =>
+    sendJson<ScoreEntry>(
+      "POST",
+      `/api/requests/${encodeURIComponent(requestId)}/scores`,
+      label ? { score, label } : { score },
+    ),
   licensing: () => getJson<LicensingStatus>("/admin/licensing"),
   reload: () => sendJson<unknown>("POST", "/admin/reload"),
   targets: () => getJson<unknown>("/api/health/targets"),
@@ -3501,6 +3554,19 @@ export const api = {
       "POST",
       `/admin/prompts/${encodeURIComponent(host)}/${encodeURIComponent(name)}/versions`,
       body,
+    ),
+  // WOR-2582: point a movable label at a version, or remove it. The
+  // caller's reference string (`name@production`) never changes.
+  setPromptLabel: (host: string, name: string, label: string, version: string) =>
+    sendJson<{ host: string; name: string; label: string; version: string }>(
+      "PUT",
+      `/admin/prompts/${encodeURIComponent(host)}/${encodeURIComponent(name)}/labels/${encodeURIComponent(label)}`,
+      { version },
+    ),
+  removePromptLabel: (host: string, name: string, label: string) =>
+    sendJson<{ removed: boolean }>(
+      "DELETE",
+      `/admin/prompts/${encodeURIComponent(host)}/${encodeURIComponent(name)}/labels/${encodeURIComponent(label)}`,
     ),
   pinPrompt: (host: string, name: string, body: unknown) =>
     sendJson<unknown>(

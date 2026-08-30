@@ -4450,10 +4450,148 @@ and `405` on the wrong method for the action they do recognize.
 Mutations persist to the operator-configured redb file when
 `admin.prompt_persistence_path` is set, so changes survive restart.
 
+### `PUT /admin/prompts/<host>/<name>/labels/<label>`
+
+Point a movable label at a version (WOR-2582), creating it or moving it.
+Body is `{"version": "<version>"}`.
+
+Request: `PUT /admin/prompts/ai.example.com/support-bot/labels/production`
+with `{"version": "2"}`.
+
+Response shape:
+
+```json
+{"host":"ai.example.com","name":"support-bot","label":"production","version":"2"}
+```
+
+[`examples/prompt-labels/`](../examples/prompt-labels/) is the runnable
+walkthrough, including the promote-and-refuse sequence.
+
+| Status | When |
+|---|---|
+| `200` | The label now points at that version. Every caller referencing `<name>@<label>` renders it from the next request, with no change on the caller's side. |
+| `400` | Missing or unparseable body. |
+| `404` | No such host or prompt. |
+| `409` | The label names an existing version, or the version named does not exist on this prompt. The body says which. |
+
+Two refusals are worth understanding, because both prevent a silent
+change to what a shipped caller renders. An exact version always wins
+over a label of the same name, so a label named after a version could
+never resolve and creating one is refused. From the other direction,
+adding a version named after an existing label would silently repoint
+every caller of that label, and `POST .../versions` refuses that with a
+`409` for the same reason.
+
+A label move is audited: an `admin action` line under
+`sbproxy::admin::audit` with `action = "prompt_label_set"` naming the
+operator, host, prompt, label, and version. The template body is never
+logged.
+
+### `DELETE /admin/prompts/<host>/<name>/labels/<label>`
+
+Remove a label.
+
+```json
+{"host":"ai.example.com","name":"support-bot","label":"staging","removed":true}
+```
+
+| Status | When |
+|---|---|
+| `200` | Removed. |
+| `404` | No such host, prompt, or label. |
+
+A caller still referencing the removed label gets an unknown-version
+error rather than the pinned version. Falling back would quietly serve a
+different prompt to a caller who asked for a specific label, which is
+the failure labels exist to prevent.
+
 The full set of request/response shapes is documented in
 [ai-gateway.md](./ai-gateway.md) under "Stored prompts". This
 reference only catalogs the route surface; the request/response
 contracts live with the feature.
+
+---
+
+## Scores and feedback (`POST /api/requests/{id}/scores`, `GET /api/scores`)
+
+An ingestion sink for quality signals computed elsewhere (WOR-2581).
+**sbproxy ships no scoring logic**: an external eval harness, a thumbs
+up/down widget, or a human reviewer decides what a score is and posts
+it here, and the console charts it. That boundary is deliberate, and it
+is Helicone's stated posture.
+
+Both routes sit behind the admin auth gate. `POST` is a state-changing
+method, so the `read_only` role is refused it like any other mutation.
+
+### `POST /api/requests/{request_id}/scores`
+
+Request body is `{"score": <int>, "label": "<evaluator>"}`; the label is
+optional.
+
+Response shape:
+
+```json
+{
+  "request_id": "01J8QF3M2N4P5R6S7T8V9W0X1Y",
+  "score": 8,
+  "label": "helpfulness",
+  "recorded_at": "2026-08-29T14:02:11.417Z"
+}
+```
+
+[`examples/eval-scores/`](../examples/eval-scores/) is the runnable
+walkthrough.
+
+| Field | Type | Notes |
+|---|---|---|
+| `score` | integer | Required. `-10` to `10` inclusive, which is Portkey's range. A bound is what makes two evaluators comparable on one axis. |
+| `label` | string | Optional. Names the evaluator. Control characters are stripped and the result is capped at 64 characters, because it reaches a log line and a metric label. A whitespace-only label reads as no label. |
+
+`recorded_at` is this proxy's clock, not a caller-supplied timestamp: a
+sink that trusts the caller's clock produces charts that cannot be read
+against anything else the proxy recorded.
+
+| Status | When |
+|---|---|
+| `200` | Recorded. |
+| `400` | Missing or unparseable body, or a request id that is empty or over 128 characters. |
+| `405` | Any method but `POST`. |
+| `422` | `code: score_out_of_range`. Refused rather than clamped: an evaluator misconfigured for a 0..100 scale would otherwise read as a stream of perfect tens. |
+
+### `GET /api/scores`
+
+Recent scores, newest first, with per-label aggregates. `request_id=<id>`
+narrows to one request.
+
+```json
+{
+  "scores": [{"request_id": "01J8...", "score": 8, "label": "helpfulness", "recorded_at": "..."}],
+  "aggregates": [{"label": "helpfulness", "count": 1, "mean": 8.0, "min": 8, "max": 8}],
+  "capacity": 5000,
+  "range": {"min": -10, "max": 10}
+}
+```
+
+`aggregates` is sorted by label so two console reads can be diffed. A
+score posted without a label aggregates under `unlabeled`, which is the
+same name the metric uses, so the JSON and the metric do not disagree.
+
+`mean` is the only arithmetic here and it is a display convenience, not
+a statistic: sbproxy adds up scores it was handed and computes none of
+them.
+
+**Retention is a bounded in-process ring**, reported as `capacity`. This
+is a console window rather than a datastore, and an unbounded ring
+behind a POST route is a memory-growth path. Every accepted score also
+emits a structured line under `sbproxy::admin::scores` carrying the
+request id, score, and label, so shipping those to a warehouse is how
+history is kept. **No prompt, completion, or caller content is stored
+with a score.**
+
+Metric: `sbproxy_feedback_scores_total{label,bucket}`, where `bucket` is
+`negative`, `neutral`, or `positive`. The score itself is not a label:
+21 readings times one series per evaluator is how a cardinality problem
+starts, and the distribution is in the JSON above.
 
 ---
 

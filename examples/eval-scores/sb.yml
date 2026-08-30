@@ -1,0 +1,66 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Scores and feedback ingestion: record a quality signal against a
+# request the proxy logged, and chart it.
+#
+# sbproxy is not an eval framework and deliberately ships no scoring
+# logic. Something else decides what a score is (an eval harness, a
+# thumbs up/down widget, a human reviewer) and posts an integer here;
+# this stores it beside a request id and charts it. That boundary is the
+# feature. It is Helicone's posture, and the bounded -10..10 range is
+# Portkey's, which is what makes scores from two evaluators comparable
+# on one axis.
+#
+# Nothing about the request's content is stored with a score: an integer,
+# an optional short evaluator label, and the request id.
+#
+# Setup:
+#   export OPENAI_API_KEY=sk-...
+#   make run CONFIG=examples/eval-scores/sb.yml
+#
+# Make a request and keep its id (the proxy returns it as X-Request-Id
+# and records it in the request ring the console's Logs page reads):
+#   curl -si http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' -H 'Content-Type: application/json' \
+#     -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}' \
+#     | grep -i x-request-id
+#
+# Post a score against it:
+#   curl -s -u admin:admin -X POST \
+#     http://127.0.0.1:9090/api/requests/<request-id>/scores \
+#     -H 'Content-Type: application/json' \
+#     -d '{"score": 8, "label": "helpfulness"}'
+#
+# Read them back, with per-label aggregates:
+#   curl -s -u admin:admin http://127.0.0.1:9090/api/scores | jq
+#
+# Narrow to one request:
+#   curl -s -u admin:admin \
+#     'http://127.0.0.1:9090/api/scores?request_id=<request-id>' | jq
+#
+# A score outside -10..10 is refused with 422 rather than clamped: an
+# evaluator misconfigured for a 0..100 scale would otherwise look like a
+# stream of perfect tens.
+#
+# The counter `sbproxy_feedback_scores_total{label,bucket}` carries the
+# sign bucket only. The distribution lives in the JSON above, because one
+# series per score value per evaluator is how a cardinality problem
+# starts.
+
+proxy:
+  http_bind_port: 8080
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    password: admin
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini

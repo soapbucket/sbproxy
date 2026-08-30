@@ -26,6 +26,79 @@ function pinnedOf(p: PromptEntry): string {
   return String(p.pinned ?? p.pinned_version ?? p.active ?? "");
 }
 
+// ---- labels (WOR-2582) ----
+//
+// A label is a movable pointer at a version. The point of it is that a
+// caller writes `support-bot@production` once and never changes, while
+// the operator repoints which version that renders. So the card shows
+// the pointer and where it points, and repointing is one control.
+//
+// A pin (`default_version`) is a different thing and both are shown: a
+// pin is one pointer per prompt, serving callers who name no version at
+// all, and it cannot express staging and production sitting on
+// different versions at the same time.
+function labelsOf(p: PromptEntry): { label: string; version: string }[] {
+  const labels = p.labels ?? {};
+  return Object.entries(labels)
+    .map(([label, version]) => ({ label, version: String(version) }))
+    .sort((a, b) => a.label.localeCompare(b.label));
+}
+
+const showLabel = ref(false);
+const labelTarget = ref<PromptEntry | null>(null);
+const labelForm = reactive({ label: "", version: "" });
+const labelBusy = ref(false);
+const labelError = ref<ApiError | null>(null);
+
+function openLabel(p: PromptEntry, existing?: { label: string; version: string }) {
+  labelTarget.value = p;
+  labelForm.label = existing?.label ?? "";
+  labelForm.version = existing?.version ?? "";
+  labelError.value = null;
+  showLabel.value = true;
+}
+
+async function submitLabel() {
+  const target = labelTarget.value;
+  if (!target || !labelForm.label || !labelForm.version) return;
+  labelBusy.value = true;
+  labelError.value = null;
+  try {
+    await api.setPromptLabel(
+      String(target.host ?? ""),
+      String(target.name ?? ""),
+      labelForm.label,
+      labelForm.version,
+    );
+    toast.success(
+      `Label @${labelForm.label} now points at version ${labelForm.version}`,
+      "Callers referencing this label render the new version with no change on their side.",
+    );
+    showLabel.value = false;
+    req.run();
+  } catch (e) {
+    // A 409 here is the server refusing a collision: a label named after
+    // an existing version would never resolve, because an exact version
+    // always wins. The operator needs to read that rather than retry.
+    labelError.value = e instanceof ApiError ? e : new ApiError(0, String(e));
+  } finally {
+    labelBusy.value = false;
+  }
+}
+
+async function removeLabel(p: PromptEntry, label: string) {
+  try {
+    await api.removePromptLabel(String(p.host ?? ""), String(p.name ?? ""), label);
+    toast.warn(
+      `Label @${label} removed`,
+      "A caller still referencing it now gets an unknown-version error rather than a different prompt.",
+    );
+    req.run();
+  } catch (e) {
+    toast.error(e, "Remove prompt label");
+  }
+}
+
 // ---- add version ----
 const showAdd = ref(false);
 const addTarget = ref<PromptEntry | null>(null);
@@ -165,6 +238,37 @@ const { canMutate, whyNot } = useCapabilities();
         <span class="sb-faint" v-else>none recorded</span>
       </div>
 
+      <div class="versions">
+        <span class="sb-eyebrow">Labels</span>
+        <div class="tags" v-if="labelsOf(p).length">
+          <span class="label-tag sb-mono" v-for="l in labelsOf(p)" :key="l.label">
+            <span class="label-tag__name">@{{ l.label }}</span>
+            <span class="label-tag__arrow">-&gt;</span>
+            <span class="label-tag__version">{{ l.version }}</span>
+            <button
+              class="label-tag__edit"
+              :disabled="!canMutate"
+              :title="canMutate ? 'Repoint this label' : whyNot('mutate')"
+              @click="openLabel(p, l)"
+            >
+              move
+            </button>
+            <button
+              class="label-tag__edit"
+              :disabled="!canMutate"
+              :title="canMutate ? 'Remove this label' : whyNot('mutate')"
+              @click="removeLabel(p, l.label)"
+            >
+              remove
+            </button>
+          </span>
+        </div>
+        <span class="sb-faint" v-else>
+          none. A label lets a caller reference "{{ p.name }}@production" while you
+          move which version that serves.
+        </span>
+      </div>
+
       <div class="prompt__actions">
         <button
             :title="canMutate ? undefined : whyNot('mutate')"
@@ -172,9 +276,44 @@ const { canMutate, whyNot } = useCapabilities();
         <button
             :title="canMutate ? undefined : whyNot('mutate')"
             :disabled="!canMutate" class="sb-btn sb-btn--sm" @click="openPin(p)">Pin version</button>
+        <button
+            :title="canMutate ? undefined : whyNot('mutate')"
+            :disabled="!canMutate" class="sb-btn sb-btn--sm" @click="openLabel(p)">Add label</button>
       </div>
     </div>
   </div>
+
+  <!-- Point a label at a version (WOR-2582) -->
+  <ModalDialog v-if="showLabel" title="Point a label at a version" @close="showLabel = false">
+    <p class="sb-faint">
+      A label is a movable pointer. A caller referencing
+      <code class="sb-mono">{{ labelTarget?.name }}@{{ labelForm.label || "label" }}</code>
+      keeps that string forever; moving the label changes which version it renders.
+    </p>
+    <label class="field">
+      <span class="sb-eyebrow">Label</span>
+      <input v-model="labelForm.label" class="sb-input sb-mono" placeholder="production" />
+    </label>
+    <label class="field">
+      <span class="sb-eyebrow">Version</span>
+      <select v-model="labelForm.version" class="sb-input sb-mono">
+        <option value="">select a version</option>
+        <option v-for="v in versionsOf(labelTarget ?? {})" :key="v" :value="v">{{ v }}</option>
+      </select>
+    </label>
+    <ErrorState v-if="labelError" :error="labelError" />
+    <template #actions>
+      <button class="sb-btn" @click="showLabel = false">Cancel</button>
+      <button
+        class="sb-btn sb-btn--primary"
+        :disabled="labelBusy || !canMutate || !labelForm.label || !labelForm.version"
+        :title="canMutate ? undefined : whyNot('mutate')"
+        @click="submitLabel"
+      >
+        {{ labelBusy ? "Saving..." : "Point label" }}
+      </button>
+    </template>
+  </ModalDialog>
 
   <!-- Add version -->
   <ModalDialog v-if="showAdd" :title="addForm.isNew ? 'New prompt overlay' : 'Add prompt version'" wide @close="showAdd = false">
@@ -283,5 +422,32 @@ const { canMutate, whyNot } = useCapabilities();
   display: flex;
   gap: var(--sb-space-3);
   margin-top: auto;
+}
+
+.label-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sb-space-2);
+  border: 1px solid var(--sb-border-strong);
+  border-radius: var(--sb-radius);
+  padding: 2px var(--sb-space-2);
+}
+.label-tag__name {
+  font-weight: 600;
+}
+.label-tag__arrow,
+.label-tag__edit {
+  color: var(--sb-text-muted);
+}
+.label-tag__edit {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font: inherit;
+  text-decoration: underline;
+}
+.label-tag__edit:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
 }
 </style>

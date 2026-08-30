@@ -336,6 +336,7 @@ mod tests {
         NamedPrompt {
             default_version: default.map(String::from),
             versions: map,
+            labels: std::collections::HashMap::new(),
         }
     }
 

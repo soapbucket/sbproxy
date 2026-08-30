@@ -1,0 +1,4 @@
+{
+  "type": "added",
+  "message": "Prompt labels: reference a prompt as `name@production` and repoint which version that serves, without any change on the caller side. `PUT`/`DELETE /admin/prompts/{host}/{name}/labels/{label}`."
+}

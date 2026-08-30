@@ -1,0 +1,4 @@
+{
+  "type": "added",
+  "message": "Scores and feedback ingestion: `POST /api/requests/{id}/scores` records an integer quality signal from an external evaluator against a logged request, and `GET /api/scores` returns recent scores with per-evaluator aggregates. sbproxy stores scores and computes none."
+}

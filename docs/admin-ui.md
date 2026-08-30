@@ -937,6 +937,39 @@ records on every request.
   survive restarts; this page answers "who spent what just now,
   exactly, and let me hand you the rows."
 
+### Scores and feedback
+
+A panel on this page rather than a page of its own, because a score is
+only meaningful next to what it is scoring: a standalone Scores page
+would be a list of integers with no context.
+
+- **Shows:** `GET /api/scores`, as a per-evaluator rollup (count, mean,
+  and the range actually seen).
+- **sbproxy computes none of these.** An external eval harness, a thumbs
+  up/down widget, or a human reviewer posts an integer against a logged
+  request id with
+  `POST /api/requests/{id}/scores`, and this charts what came in. There
+  is no judge, no rubric, and no notion here of a score being right.
+  That boundary is the feature: a sink that quietly started generating
+  its own scores would make every number on this panel unreadable.
+- **The accepted range is `-10` to `10`,** and a score outside it is
+  refused rather than clamped. Clamping would make an evaluator
+  accidentally configured for a 0..100 scale look like a stream of
+  perfect tens.
+- **The mean's color is display only.** sbproxy has no opinion about
+  what a good score is, because it does not know what the evaluator was
+  measuring.
+- **Retention is a bounded in-process ring**, whose size the panel
+  states. This is a console window, not a datastore. Every accepted
+  score also emits a structured line under `sbproxy::admin::scores`
+  carrying the request id, score, and label; ship those to keep
+  history.
+- **No caller content is stored with a score.** An integer, an optional
+  evaluator label, and a request id.
+- **Empty/error notes:** an empty sink is the common state and is not an
+  error. Most deployments never post a score, so the empty state names
+  the route that would put one here.
+
 ### Answering "who spent what" in one pass
 
 Finance asks why the morning's AI spend spiked. Open Reports, group by
@@ -1115,14 +1148,46 @@ Read-only alert operations over the runtime installed from `sb.yml`.
 The prompt overlay snapshot: managed prompt versions per host and
 name, and which version is pinned.
 
-- **Shows:** `GET /admin/prompts`.
+- **Shows:** `GET /admin/prompts`. Each card carries the versions, the
+  pin, and the labels.
 - **Mutations:** `POST /admin/prompts/{host}/{name}/versions` (add a
-  version), `PUT /admin/prompts/{host}/{name}/pin` (pin the default).
-  Persisted to the operator-configured redb file only when
-  `proxy.admin.prompt_persistence_path` is set; otherwise mutations
-  are in-memory and reset on restart.
+  version), `PUT /admin/prompts/{host}/{name}/pin` (pin the default),
+  `PUT`/`DELETE /admin/prompts/{host}/{name}/labels/{label}` (point or
+  remove a label). Persisted to the operator-configured redb file only
+  when `proxy.admin.prompt_persistence_path` is set; otherwise
+  mutations are in-memory and reset on restart.
 - **Empty/error notes:** no prompts registered is an empty state, not
   an error.
+
+### Labels, and why they are not the pin
+
+A version is immutable and numbered. A label is a movable pointer at
+one, shown on the card as `@production -> 2`. A caller ships
+`support-bot@production` once and never changes it; moving the label
+changes which version that string renders, with nothing to deploy on
+the caller's side.
+
+The pin is a different pointer and both are shown. A pin serves callers
+who name no version at all, and there is one per prompt, so it cannot
+express staging sitting on version 2 while production is still on
+version 1. That is what labels are for.
+
+Two refusals surface here as a `409` in the dialog rather than a retry,
+and both exist to prevent a silent change to what a shipped caller
+renders. A label named after an existing version is refused, because an
+exact version always wins at resolution and the label could never
+resolve. A version named after an existing label is refused from the
+Add version dialog, because adding it would silently repoint every
+caller of that label.
+
+Removing a label makes its references fail with an unknown-version
+error rather than falling back to the pin, and the console says so when
+you remove one. Quietly serving a different prompt to a caller who
+asked for `@production` is the failure labels exist to prevent.
+
+Every label move is audited under `sbproxy::admin::audit` with
+`action = "prompt_label_set"`, naming the operator, prompt, label, and
+version. The template body is never logged.
 
 ## Playground (`/playground`)
 

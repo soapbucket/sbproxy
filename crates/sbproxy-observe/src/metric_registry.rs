@@ -4609,6 +4609,25 @@ pub const METRICS: &[MetricCapability] = &[
              docs/performance.md was removed once the family was found to be dead",
         ),
     },
+    // WOR-2581. An ingestion sink, not a scoring engine: the writer is
+    // the admin route that accepts a score somebody else computed.
+    MetricCapability {
+        name: "sbproxy_feedback_scores_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_feedback_score"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        // `bucket` is the sign (`negative`, `neutral`, `positive`) and
+        // not the score. Twenty-one readings times one series per
+        // evaluator is how a cardinality problem starts; the
+        // distribution lives in `GET /api/scores`, which the console
+        // charts. `label` is caller-supplied and is stripped of control
+        // characters and capped at 64 chars before it reaches here.
+        labels: &["label", "bucket"],
+        description: "Feedback and eval scores accepted by the ingestion sink, by evaluator label and sign bucket.",
+        dead_reason: None,
+    },
     MetricCapability {
         name: "sbproxy_sink_install_failures_total",
         kind: MetricKind::Counter,

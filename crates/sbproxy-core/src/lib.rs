@@ -52,6 +52,11 @@ pub mod admin_payments;
 /// completion against any of them through the production AI dispatch
 /// path. Handled in the async admin connection handler.
 pub mod admin_playground;
+/// Scores and feedback ingestion sink (WOR-2581):
+/// `POST /api/requests/{id}/scores` and `GET /api/scores`. An
+/// ingestion and display surface for scores computed elsewhere;
+/// sbproxy deliberately ships no scoring logic of its own.
+pub mod admin_scores;
 /// Admin browser sessions + operator identity (WOR-1714 / WOR-1716).
 pub mod admin_session;
 /// Authenticated and tenant-scoped AI toolkit operator routes.

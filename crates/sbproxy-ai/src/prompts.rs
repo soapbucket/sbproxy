@@ -49,6 +49,21 @@ pub struct NamedPrompt {
     pub default_version: Option<String>,
     /// Versions keyed by version label (typically a number as a string).
     pub versions: HashMap<String, PromptVersion>,
+    /// Movable labels pointing at a version (WOR-2582), keyed by label
+    /// name: `{"production": "4", "staging": "7"}`.
+    ///
+    /// A caller references `support-bot@production` and keeps
+    /// referencing it; the operator repoints the label at a different
+    /// version and no caller changes. This is the shape Portkey and
+    /// Helicone both converged on, and it is the reason the pin
+    /// (`default_version`) is not enough on its own: a pin is one
+    /// pointer per prompt, so it cannot express "staging is on 7 while
+    /// production is on 4" at the same time.
+    ///
+    /// Empty by default and `#[serde(default)]`, so every prompt
+    /// persisted before this field existed round-trips unchanged.
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
 }
 
 /// One immutable version of a prompt.
@@ -159,6 +174,38 @@ fn scrub_detail(detail: &str) -> String {
 
 impl std::error::Error for PromptError {}
 
+/// Resolve what a caller wrote after the `@` into a concrete version
+/// label (WOR-2582).
+///
+/// **An exact version always wins over a label of the same name.** That
+/// ordering is the whole safety property: a reference naming a version
+/// has to keep meaning that exact version, because immutable version
+/// references are what the rest of the store rests on. If a label could
+/// shadow one, adding a label would silently change what already-shipped
+/// callers resolve to.
+///
+/// The ordering only matters when a label and a version share a name,
+/// and that collision is refused at write time in both directions by
+/// [`set_runtime_prompt_label`] and [`add_runtime_prompt_version`]. This
+/// function is the resolution half of the same rule and is written to
+/// agree with it rather than to depend on it: a store loaded from disk
+/// that predates the check, or one an operator hand-edited, still
+/// resolves predictably here instead of resolving by hash order.
+///
+/// An unresolvable reference is returned unchanged rather than being
+/// turned into an error here, so the caller's existing
+/// `PromptError::UnknownVersion` reports the label the operator actually
+/// typed instead of a version number they never wrote.
+fn resolve_version_reference(prompt: &NamedPrompt, requested: &str) -> String {
+    if prompt.versions.contains_key(requested) {
+        return requested.to_string();
+    }
+    if let Some(version) = prompt.labels.get(requested) {
+        return version.clone();
+    }
+    requested.to_string()
+}
+
 impl PromptStore {
     /// Resolve and render a `"name"` / `"name@version"` reference against
     /// the supplied request context. The rendered context exposes
@@ -211,7 +258,7 @@ impl PromptStore {
             .ok_or_else(|| PromptError::UnknownPrompt(name.to_string()))?;
 
         let version = match requested_version {
-            Some(v) => v.to_string(),
+            Some(v) => resolve_version_reference(prompt, v),
             None => prompt
                 .default_version
                 .clone()
@@ -541,7 +588,7 @@ pub fn add_runtime_prompt_version(
     version: &str,
     template: String,
     variables: serde_json::Map<String, serde_json::Value>,
-) -> Option<String> {
+) -> Result<Option<String>, String> {
     let _guard = overlay_mutator_lock()
         .lock()
         .unwrap_or_else(|p| p.into_inner());
@@ -555,7 +602,20 @@ pub fn add_runtime_prompt_version(
         .or_insert_with(|| NamedPrompt {
             default_version: None,
             versions: HashMap::new(),
+            labels: HashMap::new(),
         });
+    // The other half of the label collision rule (WOR-2582). Adding a
+    // version named `production` to a prompt that already has a
+    // `production` label would silently repoint every caller of that
+    // label at the new version, because an exact version wins at
+    // resolution time. Refuse instead of resolving it quietly.
+    if prompt.labels.contains_key(version) {
+        return Err(format!(
+            "cannot add version '{version}': a label of that name already points at \
+             version '{}'. Rename the version, or remove the label first",
+            prompt.labels.get(version).cloned().unwrap_or_default()
+        ));
+    }
     prompt.versions.insert(
         version.to_string(),
         PromptVersion {
@@ -568,7 +628,89 @@ pub fn add_runtime_prompt_version(
         .clone()
         .or_else(|| highest_numeric_version(&prompt.versions));
     handle.store(Arc::new(next));
-    effective_default
+    Ok(effective_default)
+}
+
+/// Point `label` at `version` on a runtime prompt (WOR-2582), creating
+/// the label or moving an existing one.
+///
+/// This is the operation the whole feature exists for: a caller
+/// references `support-bot@production` and never changes, and the
+/// operator moves which version that resolves to.
+///
+/// Refuses a label that collides with an existing version label. An
+/// exact version wins at resolution time, so such a label would be
+/// unreachable, and a pointer that silently never resolves is worse
+/// than a refusal an operator can read.
+pub fn set_runtime_prompt_label(
+    host: &str,
+    name: &str,
+    label: &str,
+    version: &str,
+) -> Result<(), String> {
+    if label.is_empty() {
+        return Err("label must not be empty".to_string());
+    }
+    let _guard = overlay_mutator_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let handle = overlay_handle();
+    let cur = handle.load();
+    let mut next = (**cur).clone();
+    let store = next
+        .by_host
+        .get_mut(host)
+        .ok_or_else(|| format!("no runtime prompts on host '{host}'"))?;
+    let prompt = store
+        .templates
+        .get_mut(name)
+        .ok_or_else(|| format!("no runtime prompt named '{name}' on host '{host}'"))?;
+    if prompt.versions.contains_key(label) {
+        return Err(format!(
+            "cannot create label '{label}': a version of that name already exists, and an \
+             exact version always wins at resolution, so the label would never resolve"
+        ));
+    }
+    // A label pointing at a version that is not there resolves to a
+    // reference the render path reports as an unknown version, which an
+    // operator would read as "the prompt is broken" rather than "the
+    // label is wrong". Refuse at the point the mistake is made.
+    if !prompt.versions.contains_key(version) {
+        return Err(format!(
+            "version '{version}' not present on runtime prompt '{name}'"
+        ));
+    }
+    prompt.labels.insert(label.to_string(), version.to_string());
+    handle.store(Arc::new(next));
+    Ok(())
+}
+
+/// Remove a label from a runtime prompt (WOR-2582).
+///
+/// Removing a label a caller still references makes that reference fail
+/// as an unknown version rather than falling back to the pin, which is
+/// the right failure: silently serving a different prompt to a caller
+/// who asked for `@production` is the outcome labels exist to prevent.
+pub fn remove_runtime_prompt_label(host: &str, name: &str, label: &str) -> Result<(), String> {
+    let _guard = overlay_mutator_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let handle = overlay_handle();
+    let cur = handle.load();
+    let mut next = (**cur).clone();
+    let store = next
+        .by_host
+        .get_mut(host)
+        .ok_or_else(|| format!("no runtime prompts on host '{host}'"))?;
+    let prompt = store
+        .templates
+        .get_mut(name)
+        .ok_or_else(|| format!("no runtime prompt named '{name}' on host '{host}'"))?;
+    if prompt.labels.remove(label).is_none() {
+        return Err(format!("no label '{label}' on runtime prompt '{name}'"));
+    }
+    handle.store(Arc::new(next));
+    Ok(())
 }
 
 /// Pin a prompt's default version (the version served when a
@@ -705,11 +847,308 @@ mod tests {
     // in the default `cargo test` invocation.
     static RUNTIME_OVERLAY_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// `add_runtime_prompt_version` returns a `Result` since WOR-2582
+    /// (it refuses a version whose name collides with an existing
+    /// label). These cases never hit that branch, so unwrap once here
+    /// rather than at every call site.
+    fn add_runtime_prompt_version_for_test(
+        host: &str,
+        name: &str,
+        version: &str,
+        template: String,
+        variables: serde_json::Map<String, serde_json::Value>,
+    ) -> Option<String> {
+        add_runtime_prompt_version(host, name, version, template, variables)
+            .expect("test fixture version should not collide with a label")
+    }
+
+    // ---- prompt labels (WOR-2582) ----
+    //
+    // The shape Portkey and Helicone converged on: a caller references
+    // `name@production` forever and the operator moves which version
+    // that resolves to. The tests below are named for that seam.
+
+    #[test]
+    fn a_label_resolves_to_the_version_it_points_at() {
+        let _guard = RUNTIME_OVERLAY_MUTEX.lock().unwrap();
+        reset_runtime_overlay_for_tests();
+        add_runtime_prompt_version_for_test(
+            "host-a.example.com",
+            "support-bot",
+            "1",
+            "v1".to_string(),
+            serde_json::Map::new(),
+        );
+        add_runtime_prompt_version_for_test(
+            "host-a.example.com",
+            "support-bot",
+            "2",
+            "v2".to_string(),
+            serde_json::Map::new(),
+        );
+        set_runtime_prompt_label("host-a.example.com", "support-bot", "production", "1").unwrap();
+
+        let store = current_runtime_overlay()
+            .by_host
+            .get("host-a.example.com")
+            .cloned()
+            .expect("host present");
+        let rendered = store
+            .render("support-bot@production", &serde_json::json!({}))
+            .expect("render");
+        assert_eq!(rendered.text, "v1");
+        assert_eq!(
+            rendered.version, "1",
+            "the label resolves to a real version"
+        );
+    }
+
+    #[test]
+    fn repointing_a_label_changes_what_an_unchanged_caller_gets() {
+        // This is the acceptance line: the operator repoints, and the
+        // caller's reference string never changes.
+        let _guard = RUNTIME_OVERLAY_MUTEX.lock().unwrap();
+        reset_runtime_overlay_for_tests();
+        for (version, body) in [("1", "v1"), ("2", "v2")] {
+            add_runtime_prompt_version_for_test(
+                "host-a.example.com",
+                "support-bot",
+                version,
+                body.to_string(),
+                serde_json::Map::new(),
+            );
+        }
+        set_runtime_prompt_label("host-a.example.com", "support-bot", "production", "1").unwrap();
+
+        let before = current_runtime_overlay()
+            .by_host
+            .get("host-a.example.com")
+            .cloned()
+            .expect("host")
+            .render("support-bot@production", &serde_json::json!({}))
+            .expect("render");
+        assert_eq!(before.text, "v1");
+
+        set_runtime_prompt_label("host-a.example.com", "support-bot", "production", "2").unwrap();
+
+        let after = current_runtime_overlay()
+            .by_host
+            .get("host-a.example.com")
+            .cloned()
+            .expect("host")
+            .render("support-bot@production", &serde_json::json!({}))
+            .expect("render");
+        assert_eq!(
+            after.text, "v2",
+            "the same reference string must now resolve to the repointed version"
+        );
+    }
+
+    #[test]
+    fn two_labels_point_at_different_versions_at_the_same_time() {
+        // The reason a pin is not enough: `default_version` is one
+        // pointer per prompt and cannot express staging and production
+        // sitting on different versions.
+        let _guard = RUNTIME_OVERLAY_MUTEX.lock().unwrap();
+        reset_runtime_overlay_for_tests();
+        for (version, body) in [("4", "stable"), ("7", "candidate")] {
+            add_runtime_prompt_version_for_test(
+                "host-a.example.com",
+                "support-bot",
+                version,
+                body.to_string(),
+                serde_json::Map::new(),
+            );
+        }
+        set_runtime_prompt_label("host-a.example.com", "support-bot", "production", "4").unwrap();
+        set_runtime_prompt_label("host-a.example.com", "support-bot", "staging", "7").unwrap();
+
+        let store = current_runtime_overlay()
+            .by_host
+            .get("host-a.example.com")
+            .cloned()
+            .expect("host");
+        assert_eq!(
+            store
+                .render("support-bot@production", &serde_json::json!({}))
+                .unwrap()
+                .text,
+            "stable"
+        );
+        assert_eq!(
+            store
+                .render("support-bot@staging", &serde_json::json!({}))
+                .unwrap()
+                .text,
+            "candidate"
+        );
+    }
+
+    #[test]
+    fn an_exact_version_reference_is_never_shadowed_by_a_label() {
+        // The immutability promise. A reference naming a version has to
+        // keep meaning that exact version, so version lookup wins.
+        let _guard = RUNTIME_OVERLAY_MUTEX.lock().unwrap();
+        reset_runtime_overlay_for_tests();
+        add_runtime_prompt_version_for_test(
+            "host-a.example.com",
+            "support-bot",
+            "1",
+            "the real version 1".to_string(),
+            serde_json::Map::new(),
+        );
+        let mut overlay = (*current_runtime_overlay()).clone();
+        // Reach past the guard deliberately: this is the store shape a
+        // hand-edited file or an older build could produce, and the
+        // resolver has to be predictable on it rather than trusting
+        // that the write-time check ran.
+        overlay
+            .by_host
+            .get_mut("host-a.example.com")
+            .unwrap()
+            .templates
+            .get_mut("support-bot")
+            .unwrap()
+            .labels
+            .insert("1".to_string(), "1".to_string());
+        let store = overlay.by_host.get("host-a.example.com").cloned().unwrap();
+
+        assert_eq!(
+            store
+                .render("support-bot@1", &serde_json::json!({}))
+                .unwrap()
+                .text,
+            "the real version 1"
+        );
+    }
+
+    #[test]
+    fn a_label_colliding_with_a_version_name_is_refused() {
+        let _guard = RUNTIME_OVERLAY_MUTEX.lock().unwrap();
+        reset_runtime_overlay_for_tests();
+        add_runtime_prompt_version_for_test(
+            "host-a.example.com",
+            "support-bot",
+            "1",
+            "v1".to_string(),
+            serde_json::Map::new(),
+        );
+        let err = set_runtime_prompt_label("host-a.example.com", "support-bot", "1", "1")
+            .expect_err("a label named after an existing version must be refused");
+        assert!(
+            err.contains("never resolve"),
+            "the refusal should say why rather than just failing: {err}"
+        );
+    }
+
+    #[test]
+    fn a_version_colliding_with_a_label_name_is_refused() {
+        // The other direction, and the one that matters more: adding a
+        // version called `production` to a prompt with a `production`
+        // label would silently repoint every caller of that label.
+        let _guard = RUNTIME_OVERLAY_MUTEX.lock().unwrap();
+        reset_runtime_overlay_for_tests();
+        add_runtime_prompt_version_for_test(
+            "host-a.example.com",
+            "support-bot",
+            "1",
+            "v1".to_string(),
+            serde_json::Map::new(),
+        );
+        set_runtime_prompt_label("host-a.example.com", "support-bot", "production", "1").unwrap();
+
+        let err = add_runtime_prompt_version(
+            "host-a.example.com",
+            "support-bot",
+            "production",
+            "sneaky".to_string(),
+            serde_json::Map::new(),
+        )
+        .expect_err("a version named after an existing label must be refused");
+        assert!(err.contains("label of that name"), "{err}");
+    }
+
+    #[test]
+    fn a_label_pointing_at_a_missing_version_is_refused_at_write_time() {
+        let _guard = RUNTIME_OVERLAY_MUTEX.lock().unwrap();
+        reset_runtime_overlay_for_tests();
+        add_runtime_prompt_version_for_test(
+            "host-a.example.com",
+            "support-bot",
+            "1",
+            "v1".to_string(),
+            serde_json::Map::new(),
+        );
+        let err = set_runtime_prompt_label("host-a.example.com", "support-bot", "production", "9")
+            .expect_err("a dangling label must be refused");
+        assert!(err.contains("not present"), "{err}");
+    }
+
+    #[test]
+    fn removing_a_label_makes_its_reference_fail_rather_than_fall_back_to_the_pin() {
+        // Silently serving the pinned version to a caller who asked for
+        // `@production` is exactly the outcome labels exist to prevent.
+        let _guard = RUNTIME_OVERLAY_MUTEX.lock().unwrap();
+        reset_runtime_overlay_for_tests();
+        add_runtime_prompt_version_for_test(
+            "host-a.example.com",
+            "support-bot",
+            "1",
+            "v1".to_string(),
+            serde_json::Map::new(),
+        );
+        set_runtime_prompt_label("host-a.example.com", "support-bot", "production", "1").unwrap();
+        remove_runtime_prompt_label("host-a.example.com", "support-bot", "production").unwrap();
+
+        let store = current_runtime_overlay()
+            .by_host
+            .get("host-a.example.com")
+            .cloned()
+            .expect("host");
+        let err = store
+            .render("support-bot@production", &serde_json::json!({}))
+            .expect_err("a removed label must not silently fall back");
+        assert!(
+            matches!(err, PromptError::UnknownVersion { .. }),
+            "expected UnknownVersion, got {err:?}"
+        );
+        // And the message names what the operator typed, not a version
+        // number they never wrote.
+        assert!(err.to_string().contains("production"), "{err}");
+    }
+
+    #[test]
+    fn removing_an_absent_label_is_an_error_rather_than_a_silent_success() {
+        let _guard = RUNTIME_OVERLAY_MUTEX.lock().unwrap();
+        reset_runtime_overlay_for_tests();
+        add_runtime_prompt_version_for_test(
+            "host-a.example.com",
+            "support-bot",
+            "1",
+            "v1".to_string(),
+            serde_json::Map::new(),
+        );
+        assert!(remove_runtime_prompt_label("host-a.example.com", "support-bot", "nope").is_err());
+    }
+
+    #[test]
+    fn a_prompt_persisted_before_labels_existed_round_trips() {
+        // `labels` is `#[serde(default)]`, so a stored NamedPrompt
+        // written by an older build deserializes rather than failing the
+        // whole store open.
+        let named: NamedPrompt = serde_json::from_value(serde_json::json!({
+            "default_version": "1",
+            "versions": {"1": {"template": "hi", "variables": {}}}
+        }))
+        .expect("a pre-labels record must still deserialize");
+        assert!(named.labels.is_empty());
+    }
+
     #[test]
     fn runtime_add_then_resolve_matches_request() {
         let _guard = RUNTIME_OVERLAY_MUTEX.lock().unwrap();
         reset_runtime_overlay_for_tests();
-        add_runtime_prompt_version(
+        add_runtime_prompt_version_for_test(
             "host-a.example.com",
             "summarize",
             "1",
@@ -731,7 +1170,7 @@ mod tests {
     fn runtime_overlay_misses_on_unknown_host() {
         let _guard = RUNTIME_OVERLAY_MUTEX.lock().unwrap();
         reset_runtime_overlay_for_tests();
-        add_runtime_prompt_version(
+        add_runtime_prompt_version_for_test(
             "host-a.example.com",
             "summarize",
             "1",
@@ -752,7 +1191,7 @@ mod tests {
         // from the overlay.
         let _guard = RUNTIME_OVERLAY_MUTEX.lock().unwrap();
         reset_runtime_overlay_for_tests();
-        add_runtime_prompt_version(
+        add_runtime_prompt_version_for_test(
             "host-a.example.com",
             "summarize",
             "1",
@@ -769,14 +1208,14 @@ mod tests {
     fn runtime_overlay_picks_highest_numeric_default() {
         let _guard = RUNTIME_OVERLAY_MUTEX.lock().unwrap();
         reset_runtime_overlay_for_tests();
-        add_runtime_prompt_version(
+        add_runtime_prompt_version_for_test(
             "host-a.example.com",
             "summarize",
             "1",
             "v1".to_string(),
             serde_json::Map::new(),
         );
-        let effective_default = add_runtime_prompt_version(
+        let effective_default = add_runtime_prompt_version_for_test(
             "host-a.example.com",
             "summarize",
             "3",
@@ -796,14 +1235,14 @@ mod tests {
     fn pin_runtime_prompt_overrides_default() {
         let _guard = RUNTIME_OVERLAY_MUTEX.lock().unwrap();
         reset_runtime_overlay_for_tests();
-        add_runtime_prompt_version(
+        add_runtime_prompt_version_for_test(
             "host-a.example.com",
             "summarize",
             "1",
             "v1".to_string(),
             serde_json::Map::new(),
         );
-        add_runtime_prompt_version(
+        add_runtime_prompt_version_for_test(
             "host-a.example.com",
             "summarize",
             "3",
@@ -824,7 +1263,7 @@ mod tests {
     fn pin_runtime_prompt_errors_on_unknown_version() {
         let _guard = RUNTIME_OVERLAY_MUTEX.lock().unwrap();
         reset_runtime_overlay_for_tests();
-        add_runtime_prompt_version(
+        add_runtime_prompt_version_for_test(
             "host-a.example.com",
             "summarize",
             "1",
@@ -841,14 +1280,14 @@ mod tests {
         // even if a different version is pinned as default.
         let _guard = RUNTIME_OVERLAY_MUTEX.lock().unwrap();
         reset_runtime_overlay_for_tests();
-        add_runtime_prompt_version(
+        add_runtime_prompt_version_for_test(
             "host-a.example.com",
             "summarize",
             "1",
             "v1".to_string(),
             serde_json::Map::new(),
         );
-        add_runtime_prompt_version(
+        add_runtime_prompt_version_for_test(
             "host-a.example.com",
             "summarize",
             "2",
@@ -922,6 +1361,7 @@ mod tests {
                         variables: serde_json::Map::new(),
                     },
                 )]),
+                labels: HashMap::new(),
             },
         );
         let r = resolve_prompt_object(
@@ -1063,6 +1503,7 @@ mod tests {
                         variables: serde_json::Map::new(),
                     },
                 )]),
+                labels: HashMap::new(),
             },
         );
         let err = resolve_prompt_object(

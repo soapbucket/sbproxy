@@ -4857,12 +4857,22 @@ fn handle_prompts_list() -> (u16, &'static str, String) {
                 .default_version
                 .clone()
                 .or_else(|| highest_numeric_version_label(&versions));
+            // WOR-2582. Sorted so the response is stable across calls:
+            // a HashMap iteration order that moves every poll makes a
+            // diff of two console reads unreadable.
+            let mut labels: Vec<(&String, &String)> = named.labels.iter().collect();
+            labels.sort_by(|a, b| a.0.cmp(b.0));
+            let labels: serde_json::Map<String, serde_json::Value> = labels
+                .into_iter()
+                .map(|(label, version)| (label.clone(), serde_json::Value::String(version.clone())))
+                .collect();
             prompts.insert(
                 name.clone(),
                 serde_json::json!({
                     "default_version": named.default_version,
                     "effective_version": effective_version,
                     "versions": versions,
+                    "labels": labels,
                 }),
             );
         }
@@ -4922,10 +4932,156 @@ fn dispatch_prompt_admin_route(
             }
             handle_prompt_pin(host, name, body, state)
         }
+        // WOR-2582: `labels/<label>`. `parse_prompt_admin_path` splits
+        // into three, so the label rides along in `action` rather than
+        // needing a fourth segment out of the parser.
+        action if action == "labels" || action.starts_with("labels/") => {
+            let label = action
+                .strip_prefix("labels")
+                .unwrap_or("")
+                .trim_start_matches('/');
+            if label.is_empty() || label.contains('/') {
+                return (
+                    404,
+                    "application/json",
+                    r#"{"error":"expected /admin/prompts/<host>/<name>/labels/<label>"}"#
+                        .to_string(),
+                );
+            }
+            if method.eq_ignore_ascii_case("PUT") {
+                handle_prompt_set_label(host, name, label, body, state)
+            } else if method.eq_ignore_ascii_case("DELETE") {
+                handle_prompt_remove_label(host, name, label, state)
+            } else {
+                method_not_allowed()
+            }
+        }
         _ => (
             404,
             "application/json",
             r#"{"error":"unknown prompt admin action"}"#.to_string(),
+        ),
+    }
+}
+
+/// Body shape for `PUT /admin/prompts/<host>/<name>/labels/<label>`.
+#[derive(serde::Deserialize)]
+struct SetLabelBody {
+    /// The version this label should point at.
+    version: String,
+}
+
+/// `PUT /admin/prompts/<host>/<name>/labels/<label>` (WOR-2582): point a
+/// movable label at a version, creating it or moving it.
+///
+/// This is the operation the feature exists for. A caller referencing
+/// `support-bot@production` is unaffected by this call in every way
+/// except which version it renders, which is the point: the operator
+/// promotes a version without touching a single caller.
+fn handle_prompt_set_label(
+    host: &str,
+    name: &str,
+    label: &str,
+    body: Option<&str>,
+    state: &AdminState,
+) -> (u16, &'static str, String) {
+    let raw = match body {
+        Some(b) if !b.is_empty() => b,
+        _ => {
+            return (
+                400,
+                "application/json",
+                r#"{"error":"missing JSON body; expected {\"version\": \"...\"}"}"#.to_string(),
+            );
+        }
+    };
+    let parsed: SetLabelBody = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                400,
+                "application/json",
+                format!(
+                    r#"{{"error":"invalid JSON body: {}"}}"#,
+                    escape_json(&e.to_string())
+                ),
+            );
+        }
+    };
+    match sbproxy_ai::prompts::set_runtime_prompt_label(host, name, label, &parsed.version) {
+        Ok(()) => {
+            // Same write-through policy as add and pin: best effort, a
+            // failure is logged rather than 5xx-ing an operator whose
+            // in-memory mutation already succeeded.
+            persist_named_prompt_if_configured(state, host, name);
+            // The label move is a governance-relevant decision: it
+            // changes what every caller of that label renders without
+            // any caller changing. Audited by name, never by template
+            // body, which is operator content and can carry anything.
+            tracing::info!(
+                target: "sbproxy::admin::audit",
+                operator = %current_admin_actor().unwrap_or_default(),
+                action = "prompt_label_set",
+                host = %host,
+                prompt = %name,
+                label = %label,
+                version = %parsed.version,
+                "prompt label repointed"
+            );
+            let body = serde_json::json!({
+                "host": host,
+                "name": name,
+                "label": label,
+                "version": parsed.version,
+            })
+            .to_string();
+            (200, "application/json", body)
+        }
+        Err(message) => (
+            409,
+            "application/json",
+            format!(r#"{{"error":"{}"}}"#, escape_json(&message)),
+        ),
+    }
+}
+
+/// `DELETE /admin/prompts/<host>/<name>/labels/<label>` (WOR-2582).
+///
+/// A caller still referencing the removed label gets an unknown-version
+/// error rather than the pinned version. That is deliberate: quietly
+/// serving a different prompt to a caller who asked for `@production` is
+/// the failure labels exist to prevent.
+fn handle_prompt_remove_label(
+    host: &str,
+    name: &str,
+    label: &str,
+    state: &AdminState,
+) -> (u16, &'static str, String) {
+    match sbproxy_ai::prompts::remove_runtime_prompt_label(host, name, label) {
+        Ok(()) => {
+            persist_named_prompt_if_configured(state, host, name);
+            tracing::info!(
+                target: "sbproxy::admin::audit",
+                operator = %current_admin_actor().unwrap_or_default(),
+                action = "prompt_label_removed",
+                host = %host,
+                prompt = %name,
+                label = %label,
+                "prompt label removed"
+            );
+            let body = serde_json::json!({
+                "host": host,
+                "name": name,
+                "label": label,
+                "removed": true,
+            })
+            .to_string();
+            (200, "application/json", body)
+        }
+        Err(message) => (
+            404,
+            "application/json",
+            format!(r#"{{"error":"{}"}}"#, escape_json(&message)),
         ),
     }
 }
@@ -4985,13 +5141,26 @@ fn handle_prompt_add_version(
             r#"{"error":"version and template are required and must be non-empty"}"#.to_string(),
         );
     }
-    let effective_default = sbproxy_ai::prompts::add_runtime_prompt_version(
+    let effective_default = match sbproxy_ai::prompts::add_runtime_prompt_version(
         host,
         name,
         &parsed.version,
         parsed.template,
         parsed.variables.unwrap_or_default(),
-    );
+    ) {
+        Ok(effective_default) => effective_default,
+        // WOR-2582: the version name collides with an existing label.
+        // A 409 rather than a 400: the body was well formed, the store
+        // state is what refuses it, and the operator's fix is to pick
+        // another name or drop the label.
+        Err(message) => {
+            return (
+                409,
+                "application/json",
+                format!(r#"{{"error":"{}"}}"#, escape_json(&message)),
+            );
+        }
+    };
     // PR4: write through to redb when persistence is configured. A
     // failure is logged but does not fail the request; the in-memory
     // mutation has already succeeded and the operator gets the 200.
@@ -6265,6 +6434,12 @@ pub fn handle_admin_request(
     // the public MCP origin ahead of the resource-server check. This is
     // the same JSON behind operator auth.
     if let Some(response) = crate::admin_mcp_oauth::dispatch(method, path) {
+        return response;
+    }
+    // WOR-2581: scores and feedback ingestion. An external eval
+    // framework posts an integer against a logged request id; the
+    // console charts it. No scoring logic lives behind this.
+    if let Some(response) = crate::admin_scores::dispatch(method, path, body) {
         return response;
     }
     // WOR-2386 / WOR-2454: time-boxed grant ledger and snapshot-bound
@@ -15761,6 +15936,255 @@ origins:
         sbproxy_ai::prompts::install_runtime_overlay(
             sbproxy_ai::prompts::RuntimePromptOverlay::default(),
         );
+    }
+
+    // --- WOR-2582: prompt label routes ---
+
+    /// Seed one prompt with two versions, for the label cases below.
+    fn seed_two_versions(state: &AdminState, auth: &str) {
+        for (version, body) in [("1", "v1"), ("2", "v2")] {
+            let add = format!(r#"{{"version":"{version}","template":"{body}"}}"#);
+            let (status, _, out) = handle_admin_request(
+                "POST",
+                "/admin/prompts/example.com/greet/versions",
+                state,
+                Some(auth),
+                Some(&add),
+            );
+            assert_eq!(status, 200, "seed version {version}: {out}");
+        }
+    }
+
+    #[test]
+    fn setting_a_label_reports_where_it_points_and_shows_up_in_the_listing() {
+        let _lock = prompts_admin_lock();
+        reset_runtime_overlay();
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        seed_two_versions(&state, &auth);
+
+        let (status, _, body) = handle_admin_request(
+            "PUT",
+            "/admin/prompts/example.com/greet/labels/production",
+            &state,
+            Some(&auth),
+            Some(r#"{"version":"1"}"#),
+        );
+        assert_eq!(status, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["label"], "production");
+        assert_eq!(v["version"], "1");
+
+        let (_, _, list_body) =
+            handle_admin_request("GET", "/admin/prompts", &state, Some(&auth), None);
+        let v: serde_json::Value = serde_json::from_str(&list_body).unwrap();
+        assert_eq!(
+            v["hosts"]["example.com"]["prompts"]["greet"]["labels"]["production"],
+            "1"
+        );
+    }
+
+    #[test]
+    fn a_label_can_be_repointed_without_touching_any_version() {
+        let _lock = prompts_admin_lock();
+        reset_runtime_overlay();
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        seed_two_versions(&state, &auth);
+
+        for version in ["1", "2"] {
+            let (status, _, body) = handle_admin_request(
+                "PUT",
+                "/admin/prompts/example.com/greet/labels/production",
+                &state,
+                Some(&auth),
+                Some(&format!(r#"{{"version":"{version}"}}"#)),
+            );
+            assert_eq!(status, 200, "repoint to {version}: {body}");
+        }
+
+        let (_, _, list_body) =
+            handle_admin_request("GET", "/admin/prompts", &state, Some(&auth), None);
+        let v: serde_json::Value = serde_json::from_str(&list_body).unwrap();
+        let greet = &v["hosts"]["example.com"]["prompts"]["greet"];
+        assert_eq!(greet["labels"]["production"], "2");
+        // Both versions are still there: a label move is not a delete.
+        assert_eq!(greet["versions"], serde_json::json!(["1", "2"]));
+    }
+
+    #[test]
+    fn a_label_naming_an_existing_version_is_refused_with_409() {
+        let _lock = prompts_admin_lock();
+        reset_runtime_overlay();
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        seed_two_versions(&state, &auth);
+
+        let (status, _, body) = handle_admin_request(
+            "PUT",
+            "/admin/prompts/example.com/greet/labels/1",
+            &state,
+            Some(&auth),
+            Some(r#"{"version":"1"}"#),
+        );
+        assert_eq!(status, 409, "{body}");
+        assert!(body.contains("never resolve"), "{body}");
+    }
+
+    #[test]
+    fn a_version_naming_an_existing_label_is_refused_with_409() {
+        // The direction that matters more: this would silently repoint
+        // every caller of the label.
+        let _lock = prompts_admin_lock();
+        reset_runtime_overlay();
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        seed_two_versions(&state, &auth);
+        let (status, _, _) = handle_admin_request(
+            "PUT",
+            "/admin/prompts/example.com/greet/labels/production",
+            &state,
+            Some(&auth),
+            Some(r#"{"version":"1"}"#),
+        );
+        assert_eq!(status, 200);
+
+        let (status, _, body) = handle_admin_request(
+            "POST",
+            "/admin/prompts/example.com/greet/versions",
+            &state,
+            Some(&auth),
+            Some(r#"{"version":"production","template":"sneaky"}"#),
+        );
+        assert_eq!(status, 409, "{body}");
+        assert!(body.contains("label of that name"), "{body}");
+    }
+
+    #[test]
+    fn a_label_pointing_at_a_missing_version_is_refused() {
+        let _lock = prompts_admin_lock();
+        reset_runtime_overlay();
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        seed_two_versions(&state, &auth);
+
+        let (status, _, body) = handle_admin_request(
+            "PUT",
+            "/admin/prompts/example.com/greet/labels/production",
+            &state,
+            Some(&auth),
+            Some(r#"{"version":"99"}"#),
+        );
+        assert_eq!(status, 409, "{body}");
+        assert!(body.contains("not present"), "{body}");
+    }
+
+    #[test]
+    fn removing_a_label_takes_it_out_of_the_listing() {
+        let _lock = prompts_admin_lock();
+        reset_runtime_overlay();
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        seed_two_versions(&state, &auth);
+        handle_admin_request(
+            "PUT",
+            "/admin/prompts/example.com/greet/labels/staging",
+            &state,
+            Some(&auth),
+            Some(r#"{"version":"2"}"#),
+        );
+
+        let (status, _, body) = handle_admin_request(
+            "DELETE",
+            "/admin/prompts/example.com/greet/labels/staging",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 200, "{body}");
+
+        let (_, _, list_body) =
+            handle_admin_request("GET", "/admin/prompts", &state, Some(&auth), None);
+        let v: serde_json::Value = serde_json::from_str(&list_body).unwrap();
+        assert_eq!(
+            v["hosts"]["example.com"]["prompts"]["greet"]["labels"],
+            serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn removing_a_label_that_is_not_there_is_a_404() {
+        let _lock = prompts_admin_lock();
+        reset_runtime_overlay();
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        seed_two_versions(&state, &auth);
+        let (status, _, _) = handle_admin_request(
+            "DELETE",
+            "/admin/prompts/example.com/greet/labels/nope",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn the_label_route_needs_a_label_segment() {
+        let _lock = prompts_admin_lock();
+        reset_runtime_overlay();
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        for path in [
+            "/admin/prompts/example.com/greet/labels",
+            "/admin/prompts/example.com/greet/labels/",
+            "/admin/prompts/example.com/greet/labels/a/b",
+        ] {
+            let (status, _, body) =
+                handle_admin_request("PUT", path, &state, Some(&auth), Some(r#"{"version":"1"}"#));
+            assert_eq!(status, 404, "{path} should not resolve: {body}");
+        }
+    }
+
+    #[test]
+    fn the_label_route_refuses_the_wrong_method() {
+        let _lock = prompts_admin_lock();
+        reset_runtime_overlay();
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        let (status, _, _) = handle_admin_request(
+            "GET",
+            "/admin/prompts/example.com/greet/labels/production",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 405);
+    }
+
+    #[test]
+    fn an_unauthenticated_label_write_is_refused() {
+        let _lock = prompts_admin_lock();
+        reset_runtime_overlay();
+        let state = make_state();
+        let (status, _, _) = handle_admin_request(
+            "PUT",
+            "/admin/prompts/example.com/greet/labels/production",
+            &state,
+            None,
+            Some(r#"{"version":"1"}"#),
+        );
+        assert_eq!(status, 401);
+    }
+
+    #[test]
+    fn parse_prompt_admin_path_carries_the_label_in_the_action_segment() {
+        // `splitn(3, '/')` is what makes the label route work without a
+        // parser change, so pin it.
+        let (h, n, a) = parse_prompt_admin_path("example.com/greet/labels/production").unwrap();
+        assert_eq!(h, "example.com");
+        assert_eq!(n, "greet");
+        assert_eq!(a, "labels/production");
     }
 
     #[test]

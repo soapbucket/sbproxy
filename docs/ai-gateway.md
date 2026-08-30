@@ -3369,8 +3369,10 @@ Fitting an oversized prompt to the model's window is what the compression pipeli
 ## Stored prompts and offline optimization
 
 The prompt store keeps named, versioned prompts. A request can refer to
-`"prompt": "name@version"` or use a bare name. An explicit version resolves
-only through the stored-prompt layers. A bare name uses this precedence:
+`"prompt": "name@version"`, to `"prompt": "name@label"` (see
+[Labels](#labels-a-stable-reference-the-operator-repoints)), or use a
+bare name. An explicit version resolves only through the stored-prompt
+layers. A bare name uses this precedence:
 
 1. the mutable runtime prompt overlay;
 2. a scoped generation-owned `proxy.ai_toolkit.prompt_rollouts` rollout;
@@ -3385,6 +3387,57 @@ versions are added, replaced, and pinned through the authenticated Admin API.
 Use a new version label when you need immutable history. See
 [Weighted prompt versioning](prompt-versioning.md) for rollout config, stable
 cohort assignment, the dry-run CLI, and content-safe observability.
+
+### Labels: a stable reference the operator repoints
+
+A version is immutable and numbered. A **label** is a movable pointer at
+one, so a caller ships `support-bot@production` once and never changes
+it while an operator moves which version that string renders.
+
+```bash
+curl -u admin:admin -X PUT \
+  http://127.0.0.1:9090/admin/prompts/ai.example.com/support-bot/labels/production \
+  -H 'Content-Type: application/json' -d '{"version":"2"}'
+```
+
+A label goes exactly where a version goes: `name@production` on the
+string form, and `{"id": "name", "version": "production"}` on the
+`/v1/responses` object form. Nothing else about resolution changes.
+
+This is not the same thing as the pin. `default_version` is one pointer
+per prompt and serves callers who name no version at all, so it cannot
+express staging sitting on version 2 while production is still on
+version 1. Labels can, and a prompt can carry as many as an operator
+wants.
+
+**An exact version always wins over a label of the same name.** That
+ordering is the safety property the rest of the store rests on: a
+reference naming a version has to keep meaning that exact version, or
+adding a label would silently change what already-shipped callers
+resolve to. The collision is refused at write time in both directions,
+so the two rules never disagree:
+
+- creating a label named after an existing version is refused, because
+  it could never resolve;
+- adding a version named after an existing label is refused, because it
+  would silently repoint every caller of that label.
+
+Both answer `409` naming which side collided.
+
+**Removing a label makes its references fail rather than fall back to
+the pin.** A caller that asked for `@production` and quietly received
+the pinned version instead is exactly the outcome labels exist to
+prevent, so the reference reports an unknown version and the error names
+the label the operator actually typed.
+
+Labels are part of the persisted record and round-trip through the
+prompt store's redb persistence. A prompt written before labels existed
+loads with an empty label set rather than failing the store open.
+
+See [`examples/prompt-labels/`](../examples/prompt-labels/) for the full
+promote-and-refuse walkthrough, and
+[admin-api-reference.md](admin-api-reference.md#put-adminpromptshostnamelabelslabel)
+for the route contracts.
 
 ### Which surfaces resolve a reference
 

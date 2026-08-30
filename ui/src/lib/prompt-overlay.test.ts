@@ -89,7 +89,51 @@ describe("flattenPromptOverlay", () => {
       hosts: { h: { prompts: { p: { effective_version: "1" } } } },
     });
     expect(rows).toEqual([
-      { host: "h", name: "p", pinned: undefined, active: "1", versions: [] },
+      {
+        host: "h",
+        name: "p",
+        pinned: undefined,
+        active: "1",
+        versions: [],
+        labels: {},
+      },
     ]);
+  });
+
+  // WOR-2582. Labels are a movable pointer at a version, so the row has
+  // to carry them separately from the pin: a pin is one pointer per
+  // prompt and cannot express staging and production sitting on
+  // different versions at once, which is the whole reason labels exist.
+  it("carries labels alongside the pin rather than collapsing them", () => {
+    const rows = flattenPromptOverlay({
+      hosts: {
+        h: {
+          prompts: {
+            p: {
+              default_version: "1",
+              effective_version: "1",
+              versions: ["1", "2"],
+              labels: { production: "1", staging: "2" },
+            },
+          },
+        },
+      },
+    });
+    expect(rows[0].labels).toEqual({ production: "1", staging: "2" });
+    expect(rows[0].pinned).toBe("1");
+  });
+
+  it("reads a server that predates labels as a prompt with none", () => {
+    const rows = flattenPromptOverlay({
+      hosts: { h: { prompts: { p: { effective_version: "1", versions: ["1"] } } } },
+    });
+    expect(rows[0].labels).toEqual({});
+  });
+
+  it("ignores a labels field that is not an object rather than throwing", () => {
+    const rows = flattenPromptOverlay({
+      hosts: { h: { prompts: { p: { effective_version: "1", labels: "nope" } } } },
+    });
+    expect(rows[0].labels).toEqual({});
   });
 });

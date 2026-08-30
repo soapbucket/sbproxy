@@ -1,0 +1,70 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Prompt labels: a caller's reference string never changes, the operator
+# moves which version it renders.
+#
+# A prompt version is immutable and numbered. A label is a movable
+# pointer at one: `support-bot@production` is a stable string a caller
+# ships, and promoting version 2 to production is one admin call that no
+# caller sees.
+#
+# This is a different thing from the pin (`default_version`). A pin is
+# one pointer per prompt, serving callers who name no version at all, so
+# it cannot express "staging is on 2 while production is still on 1".
+# That is exactly what labels are for, and this example shows both.
+#
+# Setup:
+#   export OPENAI_API_KEY=sk-...
+#   make run CONFIG=examples/prompt-labels/sb.yml
+#
+# Point `production` at version 1 and `staging` at version 2:
+#   curl -s -u admin:admin -X PUT \
+#     http://127.0.0.1:9090/admin/prompts/ai.local/support-bot/labels/production \
+#     -H 'Content-Type: application/json' -d '{"version":"1"}'
+#   curl -s -u admin:admin -X PUT \
+#     http://127.0.0.1:9090/admin/prompts/ai.local/support-bot/labels/staging \
+#     -H 'Content-Type: application/json' -d '{"version":"2"}'
+#
+# Call the label, not the version:
+#   curl -s http://127.0.0.1:8080/v1/responses \
+#     -H 'Host: ai.local' -H 'Content-Type: application/json' \
+#     -d '{"prompt":{"id":"support-bot@production"},"input":"hello"}'
+#
+# Promote. The caller's body above is unchanged and now renders v2:
+#   curl -s -u admin:admin -X PUT \
+#     http://127.0.0.1:9090/admin/prompts/ai.local/support-bot/labels/production \
+#     -H 'Content-Type: application/json' -d '{"version":"2"}'
+#
+# Two refusals worth knowing, both 409:
+#   - a label named after an existing version, because an exact version
+#     always wins at resolution and the label would never resolve;
+#   - a version named after an existing label, because adding it would
+#     silently repoint every caller of that label.
+
+proxy:
+  http_bind_port: 8080
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    password: admin
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini
+      prompts:
+        templates:
+          support-bot:
+            # No pin: callers naming no version get the highest numeric
+            # version, and callers naming a label get what it points at.
+            versions:
+              "1":
+                template: "You are a support agent. Answer briefly."
+              "2":
+                template: "You are a support agent. Answer briefly and cite a doc link."

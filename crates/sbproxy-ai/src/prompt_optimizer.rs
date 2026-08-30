@@ -862,6 +862,7 @@ mod tests {
                         prompt_version,
                     ))
                     .collect(),
+                    labels: std::collections::HashMap::new(),
                 },
             ))
             .collect(),
