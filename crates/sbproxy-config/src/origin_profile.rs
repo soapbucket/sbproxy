@@ -1977,6 +1977,12 @@ fn parse_profile(
 /// including the field name the write-boundary refusal has to name,
 /// survives.
 ///
+/// Public because the credential rotate route needs the identical scrub
+/// on the identical hazard: `POST /admin/credentials/{id}/rotate` is the
+/// one admin body carrying a plaintext upstream credential, and serde's
+/// `invalid type` text embeds the offending scalar. One scrub with two
+/// callers beats two scrubs that drift.
+///
 /// # What this cannot see
 ///
 /// A value serde renders **without** quoting it. `invalid value: integer
@@ -1984,10 +1990,10 @@ fn parse_profile(
 /// text. Both are bounded, non-string shapes that a secret cannot be, so
 /// the residue is a number or an identifier rather than a credential. The
 /// length cap is the backstop for anything this reasoning misses: a
-/// message longer than [`MAX_SERDE_MESSAGE_BYTES`] is cut on a character
+/// message longer than `MAX_SERDE_MESSAGE_BYTES` is cut on a character
 /// boundary and marked, so a pathological rendering cannot put a document
 /// in a log line.
-fn redact_serde_message(message: &str) -> String {
+pub fn redact_serde_message(message: &str) -> String {
     let mut out = String::with_capacity(message.len());
     let mut in_quotes = false;
     let mut escaped = false;

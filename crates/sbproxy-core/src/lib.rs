@@ -94,6 +94,8 @@ pub(crate) mod federation_peer;
 /// by `payments`, so a build without settlement carries none of it.
 #[cfg(feature = "payments")]
 pub mod billing_runtime;
+/// WOR-2573: break-glass emergency access to the key/credential admin API.
+pub(crate) mod break_glass;
 /// Empty-shell registry for built-in policy
 /// enforcer wrappers.
 ///
@@ -208,6 +210,8 @@ pub mod key_capability;
 pub mod key_plane;
 /// Canonical, secret-free lowering for governed key policy.
 pub mod key_policy;
+/// WOR-2568: customer-managed root of trust for the credential envelope.
+pub mod key_root_of_trust;
 /// WOR-1562: mesh distributed-cache tier for the key plane.
 pub mod mesh_cache;
 pub mod mesh_keystore;

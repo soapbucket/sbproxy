@@ -451,7 +451,7 @@ proxy:
 | `cluster` | object | unset | Canonical local or distributed cluster identity, membership, mTLS, enrollment, snapshot, and signed deployment-authority settings. |
 | `model_host` | object | unset | Canonical managed-model authority, cache, engines, deployments, placement, and rollout policy. |
 | `config_authority` | object | unset | Subscribe to or publish signed configuration bundles. |
-| `key_management` | object | unset | Mutable key store, policy cache, encryption, claim mapping, and declarative seed. |
+| `key_management` | object | unset | Mutable key store, policy cache, encryption, claim mapping, declarative seed, read audit, and break-glass access. See [Key management crypto, audit, and break-glass fields](#key-management-crypto-audit-and-break-glass-fields). |
 | `agent_registry` | object | unset | Signed agent-catalog subscriber plus the owner-approval queue for agent self-registration, over one embedded store. Boot-only. See [Agent registry fields](#agent-registry-fields). |
 | `notifications` | object | unset | Outbound webhook subscriptions with per-destination filters, signing keys, retries, and a durable deadletter queue. Boot-only. See [Notification fields](#notification-fields). |
 | `l2_cache_settings` | object | | Optional shared-state backend. Alias: `l2_cache`. |
@@ -991,6 +991,86 @@ proxy:
 | `enabled` | bool | `false` | Master switch. False opens no store file and answers `404` on `/admin/notifications`. |
 | `store_path` | path | required | Embedded store holding the subscriptions and the deadletter queue. It holds live HMAC signing secrets, which cannot be one-way hashed because a signature has to be re-derived on every delivery, so it is created owner-only and belongs on the volume you already trust with the rest of your configuration. |
 | `queue_capacity` | int | `4096` | Bound on the hand-off queue between the request path and the delivery worker. A full queue drops the event and counts the drop rather than making a request wait on a customer's endpoint. |
+
+### Key management crypto, audit, and break-glass fields
+
+`proxy.key_management` is documented in full in
+[key-management.md](key-management.md). This section covers the crypto,
+read-audit, and break-glass sub-blocks; the store, cache, governance, inbound,
+and seed sub-blocks live on that page.
+
+```yaml
+proxy:
+  key_management:
+    enabled: true
+    crypto:
+      pepper: env:SBPROXY_KEY_PEPPER
+      master_key: env:SBPROXY_KEY_MASTER
+      root_of_trust:
+        provider: vault_transit
+        address: https://vault.internal:8200
+        key_name: sbproxy-root
+        token: env:SBPROXY_TRANSIT_TOKEN
+      rotation:
+        credential_days: 90
+        credential_grace_secs: 300
+    read_audit:
+      enabled: true
+    break_glass:
+      enabled: true
+      approvers: [alice, bob, carol]
+      quorum: 2
+```
+
+`key_management.crypto`:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `pepper` | string | unset | Server pepper for inbound virtual-key hashing. A secret reference (`env:`, `file:`, `vault://`, ...) or an inline literal. Required when `key_management.enabled` unless `allow_ephemeral_secrets` is set: an unpinned pepper is regenerated on restart and every stored key hash stops verifying. |
+| `master_key` | string | unset | Master key for the upstream-credential envelope. Same forms and same requirement as `pepper`. Also derives the key-audit chain's fingerprint key, and still opens envelopes sealed before a customer-managed root was configured. |
+| `allow_ephemeral_secrets` | bool | `false` | Let the process mint its own `pepper` and `master_key` when neither is pinned, warning on every boot. For a local development run only: the key plane then does not outlive the process. |
+| `root_of_trust` | object | unset | Customer-managed root of trust for the credential envelope. Absent means `master_key` is the root. See below. |
+| `rotation` | object | | Named crypto periods and the credential rotation overlap. See below. |
+
+`key_management.crypto.root_of_trust`:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `provider` | enum | required | Which external key service performs the wrap and unwrap. `vault_transit` is the only value: its contract returns ciphertext and plaintext and never the key, which is what makes the claim true. |
+| `address` | string | required | Base address of the key service, for example `https://vault.internal:8200`. |
+| `mount` | string | `transit` | Transit mount path. |
+| `key_name` | string | required | Name of the Transit key that wraps sbproxy's data keys. Created and owned by the customer; sbproxy never creates it. |
+| `token` | string | required | Secret reference for the token sbproxy authenticates with. Resolved once at boot. Losing it is a second, independent way for the customer to cut sbproxy off. |
+| `namespace` | string | unset | Optional Vault Enterprise namespace header. |
+| `unwrap_cache_ttl_secs` | int | `60` | How long an unwrapped data key may be reused before the key service is consulted again. **This number is the deployment's revocation-latency bound in full, not the first of two windows** and is reported verbatim on `GET /admin/crypto/root-of-trust`. A decrypted credential inherits the time left on the data key that opened it rather than starting a fresh window, so the two caches in series do not compose: clamping each to the same value would have given up to twice it. |
+| `liveness_interval_secs` | int | `30` | How often to probe the key service for reachability and continued authorization. A failed probe drops every cached data key *and* every already-decrypted credential, which is what turns the TTL above into an upper bound rather than a bound on only the first of the two caches. Zero disables the probe; the on-demand path still fails closed. |
+
+`key_management.crypto.rotation`:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `inbound_key_days` | int | `90` | Named crypto period for minted virtual keys. Nothing enforces it; it is the number to alert `sbproxy_key_rotation_age_days{kind="key"}` against, which `GET /admin/keys` publishes from each key's `rotated_at`. |
+| `credential_days` | int | `90` | Named crypto period for upstream provider credentials, alerted the same way on `{kind="credential"}`, which `GET /admin/credentials` publishes. Both gauges are refreshed by the listing rather than by a timer, so a deployment that never lists never pays and never sees them move. |
+| `master_key_days` | int | `365` | Named crypto period for the envelope master key. Under a customer-managed root this is the customer's Transit key cadence, not sbproxy's. |
+| `credential_grace_secs` | int | `300` | Default overlap window for `POST /admin/credentials/{id}/rotate`: how long the previous material stays usable when the new material will not resolve. Zero retires the old material at once, which is what a compromised secret needs. |
+
+`key_management.read_audit`:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Emit chained detail records for credential resolutions. `sbproxy_credential_read_total` is unconditional and is not gated by this. Reaching the chain also needs `audit.key_path`. |
+| `detail_window_secs` | int | `300` | Minimum seconds between detail records for the same credential. The first resolution in each window emits; the rest are counted `suppressed`, so cost scales with credential count rather than with request rate. |
+| `hash_identifiers` | bool | `true` | Replace the credential id in the detail record with `hmac-sha256:<hex>` under the key-audit fingerprint key, so a chain handed to an auditor does not enumerate which credentials exist. Timestamps, outcomes, and tenant pass through readable. With no fingerprint key installed the record is refused rather than emitted in the clear. |
+
+`key_management.break_glass`:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Turn on `/admin/break-glass`. Off by default: an emergency path nobody configured is an emergency path nobody reviews. |
+| `approvers` | list | `[]` | Admin usernames who may approve a grant. A requester is never counted among their own approvers even when listed here. |
+| `quorum` | int | `2` | How many distinct approvers a grant needs before it activates. Config compile refuses `0` (a grant would activate on its first approval while the admin surface called it quorate) and refuses a value above the number of configured approvers (no grant could ever activate, and you would find out during the incident). |
+| `max_ttl_secs` | int | `3600` | Hard cap on a requested TTL. A request naming more is refused rather than clamped, so the requester finds out at request time instead of at expiry. |
+| `review_window_secs` | int | `86400` | How long after expiry an unreviewed grant is merely open rather than overdue. Drives the overdue marker on `GET /admin/break-glass`, not deletion. |
 
 ### Metrics fields
 
@@ -1665,9 +1745,28 @@ either ever leaves the process, the same redaction pass
 [`GET /admin/config`](admin-api-reference.md#get-put-adminconfig) applies.
 Masking is by recognized credential shape and key name (vendor key
 prefixes, `Authorization` values, and the schema's own key / secret /
-token / password fields); a secret under a name or shape the redactor
-does not recognize is returned as written, which is one more reason the
-permission boundary above is the real control. And it is display
+token / password fields), plus a URL's userinfo, which is masked by
+position: `https://user:token@vault.internal:8200` comes back as
+`https://[REDACTED]@vault.internal:8200`, host intact. The authority is
+matched by an allowlist, and these routes take the wider of the two the
+redactor carries: `[A-Za-z0-9]`, plus `-._~%:@`, plus the userinfo
+sub-delims `!$&*+=`. It excludes both `"` and `\`, so a mask can never
+leave the JSON string or the YAML scalar it started in. It does include
+`&` and `=`, which is what lets it reach a base64-padded token such as
+`https://sbproxy:hvs.CAESIQpAbCdEf=@vault.internal:8200`; the cost is
+that a `&`- or `=`-separated value in a config field can be crossed, so
+`extra: u=https://a.example&op=x&next=b@c.example` comes back as
+`extra: u=https://[REDACTED]@c.example`. Still returned verbatim, because
+they are structure in YAML or a quoted scalar: `,`, `;`, `'`, `(`, `)`,
+`/`, and whitespace.
+
+The access log takes the narrower set, without `!$&*+=`, because a log
+line carries a caller's raw query string, where those bytes are chosen by
+whoever sent the request rather than by the renderer. `docs/access-log.md`
+carries the full reasoning for that surface. A secret under a
+name or shape the redactor does not recognize is returned as written,
+which is one more reason the permission boundary above is the real
+control. And it is display
 redaction either way: the ring file underneath still holds the
 original bytes, because a rollback needs them.
 

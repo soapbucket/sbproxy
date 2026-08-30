@@ -2772,6 +2772,201 @@ pub fn record_credential_resolution(
     }
 }
 
+/// Count one credential read on `sbproxy_credential_read_total{outcome}`
+/// (WOR-2570).
+///
+/// The *volume* half of the read audit, and unconditional: it moves on
+/// every resolution including the ones that ride the per-request cache,
+/// because "how often was this credential used" is a question an
+/// investigator asks about traffic, not about cache layers. The detail
+/// half is the chained `key_access` record, which fires at most once per
+/// credential per `key_management.read_audit.detail_window_secs`. The two
+/// diverging under load is the design, not a bug, and
+/// `docs/key-management.md` says so.
+///
+/// `outcome` is `ok`, `refused`, or `error`, the same vocabulary
+/// `sbproxy_credential_resolution_duration_seconds` uses, so one alerting
+/// expression covers both. No credential id label: a per-id counter on a
+/// gateway is unbounded cardinality, and the id lives on the detail
+/// record where it belongs.
+pub fn record_credential_read(outcome: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_credential_read_total",
+            "Credential resolutions counted for the read audit, by outcome (ok, refused, error). Unconditional; the chained detail record is rate limited",
+            &["outcome"],
+        )
+        .ok()
+    });
+    if let Some(counter) = counter {
+        counter.with_label_values(&[outcome]).inc();
+    }
+}
+
+/// Count one chained read-audit detail record on
+/// `sbproxy_credential_read_audit_records_total{outcome}` (WOR-2570).
+///
+/// The denominator for "how much of the read volume did we actually
+/// record". `outcome` is `emitted` when a record reached the chain,
+/// `suppressed` when the credential's window had not lapsed, or `failed`
+/// when the append itself did not land.
+pub fn record_credential_read_audit(outcome: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_credential_read_audit_records_total",
+            "Read-audit detail records, by outcome (emitted, suppressed, failed)",
+            &["outcome"],
+        )
+        .ok()
+    });
+    if let Some(counter) = counter {
+        counter.with_label_values(&[outcome]).inc();
+    }
+}
+
+/// Report the last customer-managed root-of-trust liveness probe on
+/// `sbproxy_root_of_trust_liveness` (WOR-2568).
+///
+/// A gauge rather than a counter: an operator alerting on this wants the
+/// current state ("can we still reach the customer's key service"), and a
+/// zero here means credential decryption stops as soon as the unwrap
+/// cache lapses. Zero is also the state after a revoked grant, which is
+/// the intended outcome rather than an incident, so the alert text on the
+/// dashboard panel says both.
+pub fn record_root_of_trust_liveness(ok: bool) {
+    use prometheus::{register_gauge, Gauge};
+    use std::sync::OnceLock;
+    static G: OnceLock<Option<Gauge>> = OnceLock::new();
+    let gauge = G.get_or_init(|| {
+        register_gauge!(
+            "sbproxy_root_of_trust_liveness",
+            "1 when the last customer-managed root-of-trust probe reached and was authorized by the external key service, 0 otherwise",
+        )
+        .ok()
+    });
+    if let Some(gauge) = gauge {
+        gauge.set(if ok { 1.0 } else { 0.0 });
+    }
+}
+
+/// Count one customer-managed root-of-trust operation on
+/// `sbproxy_root_of_trust_operations_total{operation, outcome}`
+/// (WOR-2568).
+///
+/// `operation` is `wrap`, `unwrap` (the external service was consulted),
+/// or `unwrap_cached` (a data key was reused inside the revocation
+/// window). The ratio of `unwrap` to `unwrap_cached` is how an operator
+/// sees what the cache is actually buying, and the absolute `unwrap` rate
+/// is what a key service's own rate limit is sized against.
+pub fn record_root_of_trust_operation(operation: &'static str, ok: bool) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_root_of_trust_operations_total",
+            "Customer-managed root-of-trust operations, by operation (wrap, unwrap, unwrap_cached) and outcome",
+            &["operation", "outcome"],
+        )
+        .ok()
+    });
+    if let Some(counter) = counter {
+        counter
+            .with_label_values(&[operation, if ok { "ok" } else { "error" }])
+            .inc();
+    }
+}
+
+/// Count one break-glass grant transition on
+/// `sbproxy_break_glass_grants_total{event}` (WOR-2573).
+///
+/// `event` is `requested`, `approved`, `activated`, `denied`, `used`,
+/// `expired`, `reviewed`, `reviewed_without_roster`, or `refused`. An
+/// emergency path that is used more than it is reviewed is the thing worth
+/// alerting on, and that alert is `expired - reviewed` on this one series.
+///
+/// `refused` covers a self-approval, a self-review, an operator off the
+/// roster, and a full registry. Which one it was is on the audit record's
+/// structured diff under `reason`, not on this series: a label there would
+/// be a second place to keep the vocabulary honest, and the refusals worth
+/// paging on are worth reading the record for.
+///
+/// `expired` and `denied` are the two time-driven transitions, and expiry
+/// is computed on read rather than swept, so they are emitted by the first
+/// read that observes them and latched so they fire once. A deployment
+/// that never reads `GET /admin/break-glass` therefore never emits them,
+/// which is the same trade the rotation-age gauge makes: the number is
+/// refreshed by the thing that was going to look at it anyway.
+pub fn record_break_glass(event: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_break_glass_grants_total",
+            "Break-glass grant transitions, by event (requested, approved, activated, denied, used, expired, reviewed, reviewed_without_roster, refused)",
+            &["event"],
+        )
+        .ok()
+    });
+    if let Some(counter) = counter {
+        counter.with_label_values(&[event]).inc();
+    }
+}
+
+/// Report open break-glass items on
+/// `sbproxy_break_glass_open{state}` (WOR-2573).
+///
+/// `state` is `pending_approval`, `active`, or `awaiting_review`. The
+/// third is the one a security reviewer opens the dashboard for: a grant
+/// that expired with nobody signing off on what was done under it.
+pub fn record_break_glass_open(state: &'static str, count: f64) {
+    use prometheus::{register_gauge_vec, GaugeVec};
+    use std::sync::OnceLock;
+    static G: OnceLock<Option<GaugeVec>> = OnceLock::new();
+    let gauge = G.get_or_init(|| {
+        register_gauge_vec!(
+            "sbproxy_break_glass_open",
+            "Break-glass grants currently open, by state (pending_approval, active, awaiting_review)",
+            &["state"],
+        )
+        .ok()
+    });
+    if let Some(gauge) = gauge {
+        gauge.with_label_values(&[state]).set(count);
+    }
+}
+
+/// Report the age in days of the oldest un-rotated record on
+/// `sbproxy_key_rotation_age_days{kind}` (WOR-2567).
+///
+/// `kind` is `key` or `credential`. Paired with the named crypto period
+/// in `key_management.crypto.rotation`, this is what makes "rotate
+/// periodically" into an alert: page when this exceeds the configured
+/// period for its kind.
+pub fn record_rotation_age_days(kind: &'static str, days: f64) {
+    use prometheus::{register_gauge_vec, GaugeVec};
+    use std::sync::OnceLock;
+    static G: OnceLock<Option<GaugeVec>> = OnceLock::new();
+    let gauge = G.get_or_init(|| {
+        register_gauge_vec!(
+            "sbproxy_key_rotation_age_days",
+            "Days since the oldest record of this kind was minted or rotated, by kind (key, credential)",
+            &["kind"],
+        )
+        .ok()
+    });
+    if let Some(gauge) = gauge {
+        gauge.with_label_values(&[kind]).set(days);
+    }
+}
+
 /// Count one keystore TTL-cache lookup on
 /// `sbproxy_key_lookup_cache_total{kind, outcome}` (WOR-2572).
 ///

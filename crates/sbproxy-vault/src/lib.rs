@@ -19,6 +19,7 @@ pub mod scope;
 pub mod secret_string;
 #[cfg(test)]
 mod test_env;
+pub mod transit;
 pub mod vault_ref;
 
 pub use aws::{AwsAuth, AwsSecretsManagerBackend, AwsSecretsManagerConfig, DEFAULT_AWS_CACHE_TTL};
@@ -46,6 +47,7 @@ pub use rotation::{
 };
 pub use scope::{auto_scope, parse_scope, validate_access, SecretScope};
 pub use secret_string::SecretString;
+pub use transit::{TransitClient, TransitConfig};
 pub use vault_ref::{
     legacy_vault_env_name, legacy_vault_reference_replacement, looks_like_secret_reference_uri,
     looks_like_vault_uri, migrate_legacy_vault_references_in_text, unexpanded_env_placeholder,

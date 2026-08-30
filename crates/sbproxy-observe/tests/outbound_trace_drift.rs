@@ -133,6 +133,12 @@ const INJECTS: &[&str] = &[
     "crates/sbproxy-extension/src/mcp/federation.rs",
     // The Web Bot Auth signature-agent directory fetch.
     "crates/sbproxy-modules/src/auth/bot_auth_directory.rs",
+    // Vault Transit wrap and unwrap for the customer-managed root of trust.
+    // Unlike the read backends in this crate, these sit on the credential
+    // resolution path, so there is a request behind them; the caller
+    // captures the pairs on the async side because `spawn_blocking` loses
+    // the ambient context. WOR-2568.
+    "crates/sbproxy-vault/src/transit.rs",
     // The `ext_authz` authorization callout (WOR-2667).
     "crates/sbproxy-modules/src/auth/ext_authz.rs",
     // The KYA issuer's JWKS and denylist fetches (WOR-2667).
