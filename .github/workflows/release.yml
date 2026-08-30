@@ -70,10 +70,14 @@ jobs:
     name: build / ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
     # Linux builds run inside a rust:bookworm container so the binaries
-    # link against glibc 2.36, the floor shared by the distroless
-    # cc-debian12 Docker base and Debian-12-era hosts. Building directly
-    # on the runner links against the runner's glibc (ubuntu-24.04 =
-    # 2.39), which produced Docker images that could not start at all:
+    # link against glibc 2.36. That is the floor Debian-12-era hosts and
+    # Linux tarballs require. The Docker runtime base is now
+    # cc-debian13 (glibc 2.41) so fetched engine binaries that need
+    # GLIBC_2.38+ (mistral.rs) can start. Older glibc binaries run on
+    # newer glibc, so debian13 is a strict superset. The sbproxy binary
+    # itself must still require <= 2.36. Building directly on the runner
+    # links against the runner's glibc (ubuntu-24.04 = 2.39), which
+    # produced binaries that could not start on Debian 12:
     # "version `GLIBC_2.39' not found". The `container` value is empty
     # for macOS, which GitHub treats as "no container".
     container: ${{ matrix.container }}
@@ -256,9 +260,12 @@ jobs:
           RUSTUP_TOOLCHAIN: stable
         run: cargo build --release --locked --target ${{ matrix.target }} --bin sbproxy --features embed-admin-ui
 
-      # Contract: linux binaries must not require a glibc newer than the
-      # distroless cc-debian12 runtime base (2.36), or the Docker image
-      # dies on startup and the tarball only runs on 2026-era distros.
+      # Contract: the sbproxy binary itself must still require glibc
+      # <= 2.36 so Linux tarballs run on Debian 12. The Docker runtime
+      # base is now cc-debian13 (glibc 2.41), a strict superset: older
+      # glibc binaries run on newer glibc, and fetched engine binaries
+      # that need GLIBC_2.38+ (mistral.rs) can start there. MAX_ALLOWED
+      # stays 2.36; do not raise it when the container base moves.
       - name: assert glibc baseline (linux)
         if: runner.os == 'Linux'
         shell: bash
@@ -270,7 +277,7 @@ jobs:
           echo "highest glibc symbol version required: ${NEEDED} (allowed: <= ${MAX_ALLOWED})"
           HIGHEST="$(printf '%s\n%s\n' "${NEEDED}" "${MAX_ALLOWED}" | sort -V | tail -1)"
           if [ "${HIGHEST}" != "${MAX_ALLOWED}" ]; then
-            echo "::error::binary requires GLIBC_${NEEDED} > ${MAX_ALLOWED}; it will not start on the distroless cc-debian12 image. Build inside the pinned rust:bookworm container."
+            echo "::error::binary requires GLIBC_${NEEDED} > ${MAX_ALLOWED}; Linux tarballs will not start on Debian 12. Build inside the pinned rust:bookworm container."
             exit 1
           fi
 
@@ -1040,7 +1047,7 @@ jobs:
           mkdir -p docker-ctx/var/lib/sbproxy
           cat > docker-ctx/Dockerfile <<'EOF'
           # syntax=docker/dockerfile:1.7
-          FROM gcr.io/distroless/cc-debian12:nonroot
+          FROM gcr.io/distroless/cc-debian13:nonroot
           ARG TARGETOS
           ARG TARGETARCH
           COPY ${TARGETOS}/${TARGETARCH}/sbproxy /usr/local/bin/sbproxy

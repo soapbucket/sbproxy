@@ -93,6 +93,7 @@ CHECKS=(
 
   # --- Source scans. Pure grep and python.
   "durable sinks create files owner-only||bash scripts/check-durable-file-modes.sh"
+  "runtime images keep /var/lib/sbproxy and debian13||bash scripts/check-runtime-image-lockstep.sh"
   "secret-bearing types do not derive Debug||bash scripts/check-secret-debug-registry.sh"
   "tapes do not render credentials||bash scripts/check-tape-secrets.sh"
   "no env mutation outside test helpers||bash scripts/check-env-mutation.sh"
