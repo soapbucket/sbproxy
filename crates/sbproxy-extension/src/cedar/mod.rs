@@ -33,6 +33,10 @@
 //! - [`schema`]: the default MCP entity/action schema Cedar policies
 //!   are authored against, plus workspace-override merging and the
 //!   schema-evolution validate-before-apply check.
+//! - [`mod@replay`]: offline evaluation of recorded MCP tool-call samples
+//!   against compiled Cedar source. `sbproxy cedar replay` is the
+//!   operator surface; this module is the engine so the CLI and the
+//!   tests share one verdict mapping.
 //! - [`storage`]: storage for Cedar policies minted or edited at
 //!   runtime, outside a config reload (WOR-2586). Statically authored
 //!   `.cedar` policies compile straight into memory via [`compiler`]
@@ -54,6 +58,7 @@
 pub mod cel_bridge;
 pub mod compiler;
 pub mod evaluator;
+pub mod replay;
 pub mod request_bridge;
 pub mod schema;
 pub mod storage;
@@ -61,5 +66,8 @@ pub mod storage;
 pub use cel_bridge::{CelBridgeError, CelPredicate};
 pub use compiler::{compile_all, CompiledPolicySet, CompilerError};
 pub use evaluator::{CedarEvaluator, EvaluatorError};
+pub use replay::{
+    format_text, parse_jsonl, replay, ReplayReport, ReplayRow, ReplaySample, MCP_CALL_TOOL_ACTION,
+};
 pub use request_bridge::{stub_request_for_unit_tests, CedarRequest, RequestBridgeError};
 pub use storage::{EmbeddedPolicyStore, PolicyStore, StoredPolicy};

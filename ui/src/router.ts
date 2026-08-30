@@ -76,6 +76,12 @@ const routes = [
     meta: { title: "Routing decisions", documentation: "admin-ui" },
   },
   {
+    path: "/mcp-approvals",
+    name: "mcp-approvals",
+    component: () => import("./views/McpApprovalsView.vue"),
+    meta: { title: "MCP approvals", documentation: "cedar-policy" },
+  },
+  {
     path: "/metrics",
     name: "metrics",
     component: () => import("./views/MetricsView.vue"),

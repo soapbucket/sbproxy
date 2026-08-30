@@ -15,6 +15,8 @@ use std::path::PathBuf;
 use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 
+mod cedar_cli;
+
 /// `sbproxy connect` / `sbproxy disconnect`: detect the coding agents on this
 /// machine and point them at the gateway. Its own module because it is the
 /// only verb here that writes files belonging to other programs, and the
@@ -229,6 +231,8 @@ enum Cmd {
     Models(ModelsCmd),
     /// MCP gateway tools (pin the federated tool catalogue, check it).
     Mcp(McpCmd),
+    /// Cedar policy tools (offline replay against a traffic sample).
+    Cedar(CedarCmd),
     /// Rego policy tools (the offline `opa test` analogue).
     Rego(RegoCmd),
     /// Update the engines and cached models (add `--self` for the
@@ -1547,6 +1551,46 @@ struct McpVerifyLockArgs {
 }
 
 #[derive(clap::Args, Debug)]
+struct CedarCmd {
+    #[command(subcommand)]
+    sub: CedarSub,
+}
+
+#[derive(Subcommand, Debug)]
+enum CedarSub {
+    /// Replay recorded MCP tool-call samples against Cedar source from
+    /// an `sb.yml`. Exit 0 when every `expected` label holds and (with
+    /// `--baseline`) no verdict moved; 1 when a sample missed or a
+    /// verdict changed; 2 when the sample, the YAML, or the Cedar
+    /// source could not be compiled.
+    Replay(CedarReplayArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct CedarReplayArgs {
+    /// Proposed config whose `cedar_policies` block is evaluated.
+    #[arg(short = 'f', long = "config")]
+    config: Option<PathBuf>,
+    /// JSONL traffic sample. Each line is
+    /// `{principal, resource, expected?, action?, id?}`.
+    #[arg(long = "against", required = true)]
+    against: PathBuf,
+    /// Optional baseline config. When set, the report diffs each
+    /// sample's verdict against this file's Cedar source.
+    #[arg(long = "baseline")]
+    baseline: Option<PathBuf>,
+    /// Restrict extraction to one origin hostname. Required when more
+    /// than one origin has `cedar_policies`, so replay matches one live
+    /// hook instead of mixing policy sets.
+    #[arg(long = "origin")]
+    origin: Option<String>,
+    /// Output format. `text` (default) prints one line per sample;
+    /// `json` emits a single object for CI.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(clap::Args, Debug)]
 struct RegoCmd {
     #[command(subcommand)]
     sub: RegoSub,
@@ -2172,6 +2216,33 @@ fn main() {
                     McpSub::Lock(a) => handle_mcp_lock(a, global_config_path.as_deref()),
                     McpSub::VerifyLock(a) => {
                         handle_mcp_verify_lock(a, global_config_path.as_deref())
+                    }
+                },
+            );
+        }
+        Some(Cmd::Cedar(cmd)) => {
+            run_subcommand(
+                "cedar",
+                2,
+                match &cmd.sub {
+                    CedarSub::Replay(a) => {
+                        let config = a
+                            .config
+                            .clone()
+                            .or(global_config_path.clone())
+                            .ok_or_else(|| anyhow::anyhow!("missing -f / --config"));
+                        match config {
+                            Ok(config) => {
+                                cedar_cli::handle_cedar_replay(&cedar_cli::CedarReplayRequest {
+                                    config,
+                                    against: a.against.clone(),
+                                    baseline: a.baseline.clone(),
+                                    origin: a.origin.clone(),
+                                    json: matches!(a.format, OutputFormat::Json),
+                                })
+                            }
+                            Err(error) => Err(error),
+                        }
                     }
                 },
             );
@@ -16396,6 +16467,37 @@ proxy:
                 }
             },
             other => panic!("expected Rego, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_cedar_replay_subcommand() {
+        let cli = parse(&[
+            "sbproxy",
+            "cedar",
+            "replay",
+            "-f",
+            "sb.yml",
+            "--against",
+            "traffic.jsonl",
+            "--baseline",
+            "old.yml",
+            "--origin",
+            "mcp.example.com",
+            "--format",
+            "json",
+        ]);
+        match cli.cmd {
+            Some(Cmd::Cedar(cmd)) => match cmd.sub {
+                CedarSub::Replay(args) => {
+                    assert_eq!(args.config, Some(std::path::PathBuf::from("sb.yml")));
+                    assert_eq!(args.against, std::path::PathBuf::from("traffic.jsonl"));
+                    assert_eq!(args.baseline, Some(std::path::PathBuf::from("old.yml")));
+                    assert_eq!(args.origin.as_deref(), Some("mcp.example.com"));
+                    assert!(matches!(args.format, OutputFormat::Json));
+                }
+            },
+            other => panic!("expected Cedar, got {other:?}"),
         }
     }
 
