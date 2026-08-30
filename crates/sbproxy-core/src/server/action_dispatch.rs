@@ -16095,8 +16095,33 @@ mod mcp_catalog_snapshot_tests {
                 "Cedar denial must answer INVALID_PARAMS, got: {call:?}"
             );
 
+            // The verdict this scenario means, not merely its tool.
+            //
+            // A policy-hook denial is raised inside the federation
+            // dispatch, so unlike the RBAC and flow refusals above, this
+            // call does reach dispatch, and its failure there emits a
+            // second event for the same tool through
+            // `emit_mcp_tool_attribution`. That funnel records the
+            // dispatch outcome rather than the policy one, so it carries
+            // verdict "allow" with no rule_id, and the egress writes it
+            // first:
+            //
+            //     verdict="allow" rule_id=null       reason=null
+            //     verdict="deny"  rule_id="policy_hook_deny" reason="policy_hook"
+            //
+            // `poll_for_governance_event` stops at the first read that
+            // matches, so a predicate naming only the tool returned
+            // whichever of the two had landed when it looked. It usually
+            // saw both and took the last, and on a loaded runner it saw
+            // only the allow and failed the assertion below with
+            // `left: "allow", right: "deny"`. The refusal itself is
+            // asserted above and always held, so the gateway was right
+            // and the test was reading the wrong record. Scenario 4
+            // documents this same two-event shape and pins its verdict
+            // for exactly this reason.
             let event = poll_for_governance_event(&events_path, |event| {
                 event["data"]["gen_ai.tool.name"] == TOOL_NAME
+                    && event["data"]["sbproxy.decision.verdict"] == "deny"
             })
             .await
             .expect(
