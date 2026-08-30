@@ -386,10 +386,19 @@ fn start_proxy(root: &Path, config_for: impl Fn(u16, u16) -> String) -> Proxy {
             }
             Startup::Exited => {
                 let _ = child.wait();
-                panic!(
-                    "sbproxy exited before serving the CoMP manifest: {}",
-                    output.finish()
-                );
+                // Re-checked on the completed transcript rather than on
+                // the snapshot the loop happened to see. The child
+                // writes its bind failure and exits immediately after,
+                // so a reader thread that had not drained the pipe yet
+                // when `try_wait` observed the exit would turn a lost
+                // port into a hard failure. `finish` joins the readers,
+                // so what it returns is everything the child ever said.
+                let transcript = output.finish();
+                if transcript.to_ascii_lowercase().contains(ADDRESS_IN_USE) {
+                    lost.push(format!("attempt {attempt}: {port}/{admin_port}"));
+                    continue;
+                }
+                panic!("sbproxy exited before serving the CoMP manifest: {transcript}");
             }
             Startup::TimedOut => {
                 let _ = child.kill();
