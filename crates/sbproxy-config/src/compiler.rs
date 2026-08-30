@@ -1161,8 +1161,8 @@ fn migrate_features_to_extensions(yaml: &str) -> Result<String> {
 /// `origins: { <hostname>: { ... } }` (WOR-2706).
 ///
 /// The archived Go schema put `hostname`, `action`, `authentication`,
-/// and the rest of an origin's behaviour at the document root. The
-/// current `ConfigFile` only stores origin behaviour under `origins:`,
+/// and the rest of an origin's behavior at the document root. The
+/// current `ConfigFile` only stores origin behavior under `origins:`,
 /// so without this rewrite those keys warn as unknown and the compiled
 /// proxy has no origins.
 ///
@@ -1207,7 +1207,7 @@ fn migrate_flat_v1_origin(yaml: &str) -> Result<String> {
     ];
     // Go-era document metadata. These have no current `ConfigFile`
     // field; leaving them at the root keeps the existing warn-on-
-    // unknown-top-level behaviour rather than failing as nested
+    // unknown-top-level behavior rather than failing as nested
     // unknowns under the new origin.
     const V1_METADATA_KEYS: &[&str] = &[
         "config_version",
@@ -1218,6 +1218,68 @@ fn migrate_flat_v1_origin(yaml: &str) -> Result<String> {
         "environment",
         "tags",
         "debug",
+    ];
+    // Only keys `RawOriginConfig` actually accepts. Anything else stays
+    // at the root and keeps warning as a top-level unknown (WOR-1140).
+    // Lifting an unrecognized key into `origins.<host>` turns that warn
+    // into a nested `deny_unknown_fields` failure, which is how
+    // `v1_flat_file_with_unknown_top_level_keys_still_compiles` broke.
+    const ORIGIN_KEYS: &[&str] = &[
+        "action",
+        "tenant_id",
+        "credentials",
+        "auth",
+        "authentication",
+        "policies",
+        "transforms",
+        "filters",
+        "request_modifiers",
+        "response_modifiers",
+        "cors",
+        "hsts",
+        "compression",
+        "session",
+        "session_config",
+        "properties",
+        "sessions",
+        "user",
+        "force_ssl",
+        "allowed_methods",
+        "forward_rules",
+        "fallback_origin",
+        "response_cache",
+        "variables",
+        "on_request",
+        "on_response",
+        "bot_detection",
+        "threat_protection",
+        "error_pages",
+        "problem_details",
+        "proxy_status",
+        "deprecation",
+        "traffic_capture",
+        "mirror",
+        "message_signatures",
+        "olp",
+        "comp",
+        "web_bot_auth_publish",
+        "idempotency",
+        "connection_pool",
+        "timeouts",
+        "extensions",
+        "expose_openapi",
+        "stream_safety",
+        "default_content_shape",
+        "content_signal",
+        "token_bytes_ratio",
+        "agent_skills",
+        "agents_md",
+        "ai_txt",
+        "agents_json",
+        "outbound_credential",
+        "outbound_web_bot_auth",
+        "attestation",
+        "observability",
     ];
 
     let hostname_key = YamlValue::String("hostname".to_string());
@@ -1247,6 +1309,9 @@ fn migrate_flat_v1_origin(yaml: &str) -> Result<String> {
             continue;
         };
         if CONFIG_FILE_KEYS.contains(&name) || V1_METADATA_KEYS.contains(&name) {
+            continue;
+        }
+        if !ORIGIN_KEYS.contains(&name) {
             continue;
         }
         if let Some(value) = map.remove(&key) {
