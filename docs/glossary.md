@@ -1,6 +1,6 @@
 # Glossary
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-30*
 
 A plain-English mapping of the terms that appear in SBproxy configuration and documentation. Start with the gateway words below, then use the longer protocol list when you meet an acronym.
 
@@ -40,7 +40,7 @@ See [core-concepts.md](core-concepts.md) for the request flow and [configuration
 | Web Bot Auth        | IETF draft (HTTP message signatures + key directory) | The signed-bot-traffic standard. SBproxy fetches `/.well-known/http-message-signatures-directory` from a vendor, caches the JWKS with TTL, and verifies signatures on inbound bot requests. |
 | KYA                 | Know-Your-Agent (Skyfire)                            | A token format for verified agent identity. The proxy verifies KYA tokens and exposes `request.kya` to scripting. |
 | JA3 / JA4 / JA4H    | TLS fingerprinting algorithms                        | ClientHello fingerprints supplied by a trusted TLS-terminating sidecar via `x-sbproxy-tls-*` request headers (accepted only from peers in `proxy.trusted_proxies`) and stamped onto the request context. JA3 plus the JA4 family power the headless-detection signals. |
-| schema-v1           | Internal config schema label                         | The `sb.yml` schema shared by the [archived `v0.1.x` line](https://github.com/soapbucket/sbproxy-go) and the Rust `v1.x` line. Schema-v1 is independent of binary version and is pinned by `v1_compat::v1_fixtures_compile_unmodified` in `crates/sbproxy-config/`. |
+| schema-v1           | Internal config schema label                         | The label for the `sb.yml` schema, independent of binary version. Key names and their meanings carry over from the [archived Go `v0.1.x` line](https://github.com/soapbucket/sbproxy-go); the file's shape does not. Go compatibility is deprecated: a flat single-origin file from that line is refused rather than translated, and the Rust line reads origin behavior only from `origins.<hostname>:`. See [MIGRATION.md](../MIGRATION.md). |
 | Apache 2.0          | Apache License, Version 2.0                          | The open source license under which SBproxy is published. Free for any use, including production and commercial, with no field-of-use restriction. See [LICENSE](../LICENSE). |
 | Pingora             | Cloudflare's Rust proxy framework                    | The async runtime SBproxy is built on. The `sbproxy-core` crate plugs into Pingora's `request_filter`, `response_filter`, and `response_body_filter` lifecycle. |
 | CEL                 | Common Expression Language                           | Google's expression language. Used for per-origin policy rules, request modifiers, and response transforms. Powered by `cel-rust`. |

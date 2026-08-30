@@ -1,10 +1,10 @@
 # Upgrade SBproxy
 
-*Last modified: 2026-08-28*
+*Last modified: 2026-08-30*
 
 Use this procedure for the Rust v1 release line. Upgrade a test or canary instance before the rest of a fleet, and keep the previous binary or image available until the new process has served traffic.
 
-If you are moving from the archived Go `v0.1.x` implementation, read [MIGRATION.md](../MIGRATION.md) before this page. The config schema is called `schema-v1`; it is separate from the Rust binary version. The per-release record is [CHANGELOG.md](../CHANGELOG.md), and [release-notes.md](release-notes.md) groups the same changes by feature area; the [notes by version](#notable-changes-by-version) below pull out only what can bite during an upgrade.
+If you are moving from the archived Go `v0.1.x` implementation, read [MIGRATION.md](../MIGRATION.md) before this page. Go compatibility is deprecated: key names carry over, but a flat single-origin `sb.yml` from that line is refused rather than translated, and has to be rewritten under `origins:` first. The config schema is called `schema-v1`; it is separate from the Rust binary version. The per-release record is [CHANGELOG.md](../CHANGELOG.md), and [release-notes.md](release-notes.md) groups the same changes by feature area; the [notes by version](#notable-changes-by-version) below pull out only what can bite during an upgrade.
 
 ## Before replacing anything
 
