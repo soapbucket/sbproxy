@@ -1,0 +1,4 @@
+{
+  "type": "fixed",
+  "message": "A Rego policy whose load-time trial exceeds `budget_ms` no longer fails boot. The trial is inconclusive rather than a semantic fault; slow requests still deny per-request under the same budget."
+}

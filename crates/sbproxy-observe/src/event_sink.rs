@@ -861,8 +861,9 @@ fn pin_collector(
         // `validate_url_resolved` returns an empty address set on one
         // branch only: an allowlisted hostname it could not resolve
         // (split-horizon DNS answering at dial time and not before).
-        // Production passes an empty allowlist, so that branch is
-        // unreachable from here, and the earlier version of this
+        // Production passes an empty allowlist unless
+        // `egress.usage_sinks.allow_private` armed hosts, so that
+        // branch is rare from here, and the earlier version of this
         // comment described a state the one caller cannot produce.
         // Reaching it anyway means the guard changed shape, and the
         // answer is the same one the rest of this path gives: a batch
@@ -920,12 +921,46 @@ fn sign_batch(secret: &str, body: &[u8], timestamp: i64) -> Option<String> {
     Some(format!("v1={}", hex::encode(mac.finalize().into_bytes())))
 }
 
+/// Process-wide hosts the events webhook SSRF guard exempts from its
+/// private-address block.
+///
+/// Armed from compiled `egress.usage_sinks` when `allow_private` is
+/// true (see [`arm_webhook_ssrf_allowlist`]). Empty when that block is
+/// absent, unarmed, or `allow_private` is false: the guard still runs
+/// and still blocks private addresses. Deny-by-default.
+static WEBHOOK_SSRF_ALLOWLIST: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// Arm the process-wide events-webhook SSRF host allowlist.
+///
+/// Called from `arm_egress_gates_from_config` with the hosts compiled
+/// from `egress.usage_sinks` when `allow_private` is true, or an empty
+/// list otherwise. `start_webhook_worker` reads this list at boot, and
+/// `install_event_egress` is set-once, so a SIGHUP cannot newly permit
+/// a private collector that was already refused at start. A later
+/// reload can still refresh the list for the per-batch check.
+pub fn arm_webhook_ssrf_allowlist(hosts: Vec<String>) {
+    match WEBHOOK_SSRF_ALLOWLIST.write() {
+        Ok(mut slot) => *slot = hosts,
+        Err(poisoned) => *poisoned.into_inner() = hosts,
+    }
+}
+
+/// Hosts currently armed for the events webhook SSRF guard.
+fn armed_webhook_ssrf_hosts() -> Vec<String> {
+    match WEBHOOK_SSRF_ALLOWLIST.read() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
 /// The allowlist the SSRF guard runs the collector URL against, or
 /// `None` to skip the guard entirely.
 ///
-/// Production always answers with an empty allowlist: the guard runs,
-/// at boot and again before every batch, and no host is exempt from its
-/// private-address block.
+/// Production answers with the process-wide list armed from
+/// `egress.usage_sinks` (empty when that block is absent or
+/// `allow_private` is false): the guard runs at boot and again before
+/// every batch, and only listed hosts are exempt from its
+/// private-address block (WOR-2712).
 ///
 /// Tests point the sink at a loopback stub, which is exactly what the
 /// guard exists to refuse, so the test build answers `None` by default.
@@ -938,7 +973,7 @@ fn sign_batch(secret: &str, body: &[u8], timestamp: i64) -> Option<String> {
 /// least one test drives the real path against a real stub.
 #[cfg(not(test))]
 fn ssrf_allowlist() -> Option<Vec<String>> {
-    Some(Vec::new())
+    Some(armed_webhook_ssrf_hosts())
 }
 
 #[cfg(test)]
@@ -956,7 +991,10 @@ static EGRESS: OnceLock<EventEgress> = OnceLock::new();
 /// Startup-only and set-once, the same shape as the request-event sink
 /// and the session ledger. A reload does not re-register: swapping a
 /// live sink would either strand a queue nothing will drain or open a
-/// second file that looks like a gap in the first.
+/// second file that looks like a gap in the first. The webhook
+/// destination and the SSRF allowlist `start_webhook_worker` reads at
+/// that moment are therefore taken at boot; a SIGHUP cannot newly
+/// permit a private collector that was refused at start.
 pub fn install_event_egress(egress: EventEgress) -> Result<(), &'static str> {
     EGRESS
         .set(egress)
@@ -1088,6 +1126,21 @@ mod tests {
             Ok(guard) => guard.as_ref().cloned(),
             Err(poisoned) => poisoned.into_inner().as_ref().cloned(),
         }
+    }
+
+    #[test]
+    fn arm_webhook_ssrf_allowlist_stores_the_hosts_production_reads() {
+        arm_webhook_ssrf_allowlist(vec!["127.0.0.1".to_string()]);
+        assert_eq!(
+            armed_webhook_ssrf_hosts(),
+            vec!["127.0.0.1".to_string()],
+            "the process-wide slot is what production ssrf_allowlist() returns"
+        );
+        arm_webhook_ssrf_allowlist(Vec::new());
+        assert!(
+            armed_webhook_ssrf_hosts().is_empty(),
+            "re-arming empty must restore deny-by-default"
+        );
     }
 
     /// Turns the SSRF guard on, with `hosts` exempt from its
@@ -1492,6 +1545,13 @@ mod tests {
     /// allowlist filed under both purposes, the way
     /// `sbproxy_config::compiler::compile_egress_gates` builds it.
     fn usage_sinks_allowlist(host: &str) -> sbproxy_security::egress::EgressAuthorizer {
+        usage_sinks_allowlist_with_private(host, false)
+    }
+
+    fn usage_sinks_allowlist_with_private(
+        host: &str,
+        allow_private: bool,
+    ) -> sbproxy_security::egress::EgressAuthorizer {
         use sbproxy_security::egress::{
             EgressAuthorizer, EgressConfig, EgressPurpose, PurposeAllowlist,
         };
@@ -1501,7 +1561,7 @@ mod tests {
             hosts: HashSet::from([host.to_string()]),
             schemes: HashSet::from(["http".to_string(), "https".to_string()]),
             ports: HashSet::from([80u16, 443u16]),
-            allow_private: false,
+            allow_private,
         };
         let mut purposes = HashMap::new();
         purposes.insert(EgressPurpose::UsageSink, allowlist.clone());
@@ -1528,6 +1588,14 @@ mod tests {
     fn an_unlisted_collector_is_refused_and_the_batch_never_leaves() {
         use sbproxy_security::egress::{
             egress_inventory_snapshot, install_configured_gate, EgressPurpose,
+        };
+
+        // Same lock `SsrfGuard` holds: this test writes the process-wide
+        // `Webhook` gate, and a sibling that clears it mid-delivery
+        // would let the stub accept.
+        let _serialize = match SSRF_GUARD_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
         };
 
         install_configured_gate(
@@ -1760,6 +1828,101 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("x-sbproxy-signature: v1="),
             "the signed batch never arrived: {request}"
+        );
+    }
+
+    #[test]
+    fn usage_sinks_allow_private_listed_host_lets_loopback_webhook_start_and_deliver() {
+        // WOR-2712: `allow_private` plus a listed host must reach the
+        // SSRF guard, not only the later governed-egress authorizer.
+        // Derive the exemption list from a compiled usage_sinks
+        // authorizer the way boot does, then drive the existing stub
+        // path with that list armed.
+        use sbproxy_security::egress::EgressPurpose;
+
+        let authorizer = usage_sinks_allowlist_with_private("127.0.0.1", true);
+        let hosts = authorizer.ssrf_private_hosts(EgressPurpose::Webhook);
+        assert_eq!(
+            hosts,
+            vec!["127.0.0.1".to_string()],
+            "allow_private must put the listed host on the SSRF allowlist"
+        );
+        let host_refs: Vec<&str> = hosts.iter().map(String::as_str).collect();
+        let _guard = SsrfGuard::enforced_for(&host_refs);
+        // SsrfGuard already serializes against other tests that write
+        // the Webhook gate. Clear a sibling's deny_by_default so the
+        // stub's ephemeral port is not refused after the SSRF check.
+        sbproxy_security::egress::install_configured_gate(
+            sbproxy_security::egress::EgressPurpose::Webhook,
+            None,
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind collector");
+        let addr = listener.local_addr().expect("collector addr");
+        let seen = Arc::new(std::sync::Mutex::new(String::new()));
+        let seen_side = Arc::clone(&seen);
+        let stub = std::thread::spawn(move || {
+            if let Ok((mut socket, _)) = listener.accept() {
+                let request = read_request_and_ack(&mut socket);
+                if let Ok(mut slot) = seen_side.lock() {
+                    *slot = request;
+                }
+            }
+        });
+
+        let egress = EventEgress::start(
+            EventSinkTarget::Webhook {
+                url: format!("http://{addr}/ingest"),
+                signing_secret: Some("shhh".to_string()),
+            },
+            EventTypeMask::from_types(&[EventType::PolicyDenied]),
+            16,
+        )
+        .expect("loopback collector on an allow_private usage_sinks host must start");
+        egress.publish(event(EventType::PolicyDenied));
+        drop(egress);
+        let _ = stub.join();
+        let request = seen.lock().map(|slot| slot.clone()).unwrap_or_default();
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("x-sbproxy-signature: v1="),
+            "the signed batch never arrived: {request}"
+        );
+    }
+
+    #[test]
+    fn loopback_webhook_is_refused_when_usage_sinks_does_not_permit_private() {
+        // Inverse of the start-and-deliver test above. Do not flip the
+        // process-wide `SsrfGuard` to an empty list here: that override
+        // is shared with every other test in a `cargo test` process, and
+        // an empty allowlist would refuse sibling loopback stubs that
+        // still expect the default skip. The boot-time refusal with the
+        // `SSRF guard` message is pinned by the lifecycle tests that
+        // compile observe as a non-test crate. This test pins the
+        // derivation and the guard's own verdict on that empty list.
+        use sbproxy_security::egress::EgressPurpose;
+
+        let authorizer = usage_sinks_allowlist("127.0.0.1");
+        let hosts = authorizer.ssrf_private_hosts(EgressPurpose::Webhook);
+        assert!(
+            hosts.is_empty(),
+            "allow_private false must not exempt any host"
+        );
+        assert!(
+            sbproxy_security::egress::EgressAuthorizer::new(Default::default())
+                .ssrf_private_hosts(EgressPurpose::Webhook)
+                .is_empty(),
+            "an absent usage_sinks authorizer must not exempt any host"
+        );
+        let error = sbproxy_security::ssrf::validate_url_with_allowlist(
+            "http://127.0.0.1:9/ingest",
+            &hosts,
+        )
+        .expect_err("an empty SSRF allowlist must refuse loopback");
+        assert!(
+            error.contains("private") || error.contains("blocked"),
+            "the guard must name the private-address block: {error}"
         );
     }
 

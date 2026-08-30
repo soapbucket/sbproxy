@@ -1048,15 +1048,41 @@ impl CompiledRego {
         // otherwise a print from this call would sit in the buffer and
         // get attributed to whatever the first real evaluation is.
         let _ = self.engine.take_prints();
-        result.with_context(|| {
-            format!(
-                "{}: rule `{}` could not be evaluated. The module parsed, so this is a \
-                     semantic fault: an unsafe variable, or a query naming a rule the module \
-                     does not define",
-                self.site, self.query
-            )
-        })?;
-        Ok(())
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                // A trial that only ran out of `budget_ms` is
+                // inconclusive, not damning. The module parsed and the
+                // analyzer got far enough to start evaluating; it did
+                // not finish inside the same wall-clock bound the
+                // request path uses. Refusing compile here called a
+                // timeout an unsafe-variable / missing-rule fault and
+                // blocked boot of a policy that is still well-formed
+                // (WOR-2708). Log and proceed. The request path still
+                // denies when the same budget is exceeded for real.
+                if let Some(regorus::LimitError::TimeLimitExceeded { elapsed, limit }) =
+                    error.downcast_ref()
+                {
+                    tracing::warn!(
+                        site = %self.site,
+                        rule = %self.query,
+                        elapsed_ms = elapsed.as_millis(),
+                        limit_ms = limit.as_millis(),
+                        "Rego load-time trial exceeded budget_ms; compile proceeds, but this \
+                         policy may deny requests under the same budget at runtime"
+                    );
+                    return Ok(());
+                }
+                Err(error).with_context(|| {
+                    format!(
+                        "{}: rule `{}` could not be evaluated. The module parsed, so this is a \
+                         semantic fault: an unsafe variable, or a query naming a rule the module \
+                         does not define",
+                        self.site, self.query
+                    )
+                })
+            }
+        }
     }
 
     /// Drain `print()` output gathered during the last evaluation into
@@ -2274,6 +2300,65 @@ allow if {
         .expect_err("an unsafe variable must not load");
         let message = format!("{error:#}");
         assert!(message.contains("semantic fault"), "{message}");
+        assert!(
+            !message.contains("time limit"),
+            "a semantic fault must not be described as a time-limit miss: {message}"
+        );
+    }
+
+    #[test]
+    fn a_load_time_trial_timeout_is_inconclusive_not_a_semantic_fault() {
+        // WOR-2708: `prove_evaluable` used to wrap every `eval_rule`
+        // error as an unsafe-variable / missing-rule fault and refuse
+        // compile. A trial that only ran out of `budget_ms` is not that
+        // fault. The module is evaluable; the trial did not finish. Boot
+        // must proceed, and the same budget still denies at request time.
+        const SLOW_ALLOW: &str = r#"
+package sbproxy
+
+allow if {
+    count([x | x := numbers.range(1, 3000000)[_]]) > 0
+}
+"#;
+        let compiled = CompiledRego::compile(
+            "policy `rego`",
+            SLOW_ALLOW,
+            "data.sbproxy.allow",
+            5,
+            None,
+            false,
+        );
+        assert!(
+            compiled.is_ok(),
+            "a trial that exceeds budget_ms must not refuse compile: {}",
+            compiled
+                .err()
+                .map(|error| format!("{error:#}"))
+                .unwrap_or_default()
+        );
+
+        const UNSAFE_VAR: &str = r#"
+package sbproxy
+
+allow if {
+    x == 1
+}
+"#;
+        let error = CompiledRego::compile(
+            "policy `rego`",
+            UNSAFE_VAR,
+            "data.sbproxy.allow",
+            50,
+            None,
+            false,
+        )
+        .expect_err("an unsafe variable must still refuse at load");
+        let message = format!("{error:#}");
+        assert!(message.contains("semantic fault"), "{message}");
+        assert!(
+            !message.contains("time limit"),
+            "a semantic fault must not be described as a time-limit miss: {message}"
+        );
     }
 
     #[test]
