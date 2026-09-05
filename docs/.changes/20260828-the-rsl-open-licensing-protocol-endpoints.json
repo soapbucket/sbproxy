@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "The RSL Open Licensing Protocol endpoints are now observable. `sbproxy_olp_decisions_total{endpoint,outcome}` counts token issuance, JWK publication, RFC 7662 introspection, and RFC 7009 revocation; each emits an `olp_decision` structured event carrying the bound `sub`, the license URN, and the signing kid but never the token; and `GET /admin/licensing` reports each origin's issuer configuration alongside its CoMP bridge. Two Grafana panels draw the family."
-}

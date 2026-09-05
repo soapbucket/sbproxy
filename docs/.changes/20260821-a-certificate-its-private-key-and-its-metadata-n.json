@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**A certificate, its private key, and its metadata now publish as\none atomic record.** `put_cert_bundle` documented atomic persistence\nand performed three independent writes, so a crash between them left\na new certificate paired with the previous generation's key, and\nmetadata describing material the store could not serve steered\npeers away from repairing it. The bundle is now a single versioned,\ndigest-checked record written in one backend operation (the file\nbackend also gained write-temp-then-rename, so a concurrent reader\nnever observes a short read). Readers validate the whole record,\nincluding the certificate/key pairing, before serving it; legacy\nthree-key rows are adopted read-only only when the pair proves to\nmatch, and a torn row is quarantined instead of served."
-}

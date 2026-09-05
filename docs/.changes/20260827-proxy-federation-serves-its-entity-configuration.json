@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "`proxy.federation` serves its entity configuration with a `Cache-Control` directive and `authority_hints` a peer can chain, and `proxy.federation.peer_trust` verifies a caller claimed entity against pinned trust anchors on the request path. `GET /admin/federation` reports both."
-}

@@ -651,6 +651,7 @@ jobs:
         run: |
           python3 scripts/changelog-fragments.py --self-test
           bash scripts/tests/changelog_fragments_test.sh
+          python3 scripts/tests/release_notes_test.py
 
       # WOR-2108. One file per change under docs/.changes/, assembled at
       # release. Refuses a malformed fragment, hand-written content under

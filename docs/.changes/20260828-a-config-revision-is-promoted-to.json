@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "A config revision is promoted to last known good only after it survives a soak window judged on four signals: degraded subsystems, upstream health across every origin (circuit breakers, active health checks, and outlier ejections), the request-outcome delta, and an operator probe. The upstream signal abstains rather than passing when an origin exposes none of the three, so a revision is never promoted on health nobody looked for. The verdict is three-way, so a window that measured nothing is inconclusive rather than a promotion. `POST /admin/config/confirm` closes the window early for a pipeline that ran its own smoke test."
-}

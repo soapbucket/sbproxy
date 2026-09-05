@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**`transforms:` on an `ai_proxy` origin are refused at config load.** Those origins never reach the transform pipeline, so a listed transform used to load as active and then silently no-op. Use the AI bundle hooks `ai_guardrail_output` and `ai_tool_call` to inspect model output instead."
-}

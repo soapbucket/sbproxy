@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "The Kubernetes operator reads each proxy pod boot-fallback pin, reports it as a ConfigFallbackActive condition on the SBProxy naming the rescued revision and the compile failure, and stops pushing configuration to that SBProxy until the pin is cleared. A config that arms proxy.config_history.soak.auto_revert under operator ownership is refused at validation with an error naming the owner."
-}

@@ -1,4 +1,0 @@
-{
-  "type": "security",
-  "message": "**The MCP tool-quota counter map is bounded per tenant and per process.** The sliding-window store was keyed on the caller-presented principal id and never evicted, so every distinct `sub` that called a quota'd tool once left a permanent entry and an attacker able to mint subs drove the footprint deliberately. Aged-out windows are reclaimed now, and two ceilings bound what is left: 10,000 live windows per tenant and 100,000 across the process. A principal the store cannot track is refused rather than admitted unmetered, and the per-tenant ceiling is what keeps one tenant's flood from refusing every other tenant's next unseen caller. Because that refusal looks identical to a real quota rejection on the wire, it has its own counter, `sbproxy_mcp_tool_quota_registry_saturated_total`; alert on it. See [docs/mcp.md](docs/mcp.md)."
-}

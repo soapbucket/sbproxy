@@ -1,4 +1,0 @@
-{
-  "type": "security",
-  "message": "The S3 Cache Reserve backend enforces `cache_reserve.max_size_bytes` before it calls AWS. An oversized declared `Content-Length` is refused up front, the body is read incrementally against a hard byte cap that accounts for the GCM tag, and the AWS clients are built on first use instead of at config compile."
-}

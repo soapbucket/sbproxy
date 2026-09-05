@@ -1,4 +1,0 @@
-{
-  "type": "security",
-  "message": "The device-code consent POST requires a same-origin `Origin` or `Referer` and a single-use form token bound to the signed-in subject, and both `/verify` responses refuse framing."
-}

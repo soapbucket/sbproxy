@@ -7156,7 +7156,7 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 [[package]]
 name = "pingora-cache"
 version = "0.8.0"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#2d9dc2b908dd1dee69ade3378054c0d8b472bac5"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#1fad45f3274f1fae5a3649d23269840494d81833"
 dependencies = [
  "ahash",
  "arrayvec 0.7.6",
@@ -7191,7 +7191,7 @@ dependencies = [
 [[package]]
 name = "pingora-core"
 version = "0.8.0"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#2d9dc2b908dd1dee69ade3378054c0d8b472bac5"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#1fad45f3274f1fae5a3649d23269840494d81833"
 dependencies = [
  "ahash",
  "async-trait",
@@ -7244,12 +7244,12 @@ dependencies = [
 [[package]]
 name = "pingora-error"
 version = "0.8.0"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#2d9dc2b908dd1dee69ade3378054c0d8b472bac5"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#1fad45f3274f1fae5a3649d23269840494d81833"
 
 [[package]]
 name = "pingora-header-serde"
 version = "0.8.0"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#2d9dc2b908dd1dee69ade3378054c0d8b472bac5"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#1fad45f3274f1fae5a3649d23269840494d81833"
 dependencies = [
  "bytes",
  "http 1.4.0",
@@ -7264,7 +7264,7 @@ dependencies = [
 [[package]]
 name = "pingora-http"
 version = "0.8.0"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#2d9dc2b908dd1dee69ade3378054c0d8b472bac5"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#1fad45f3274f1fae5a3649d23269840494d81833"
 dependencies = [
  "bytes",
  "http 1.4.0",
@@ -7274,7 +7274,7 @@ dependencies = [
 [[package]]
 name = "pingora-lru"
 version = "0.8.0"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#2d9dc2b908dd1dee69ade3378054c0d8b472bac5"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#1fad45f3274f1fae5a3649d23269840494d81833"
 dependencies = [
  "ahash",
  "arrayvec 0.7.6",
@@ -7290,7 +7290,7 @@ dependencies = [
 [[package]]
 name = "pingora-pool"
 version = "0.8.0"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#2d9dc2b908dd1dee69ade3378054c0d8b472bac5"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#1fad45f3274f1fae5a3649d23269840494d81833"
 dependencies = [
  "crossbeam-queue",
  "dashmap 5.5.3",
@@ -7305,7 +7305,7 @@ dependencies = [
 [[package]]
 name = "pingora-proxy"
 version = "0.8.0"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#2d9dc2b908dd1dee69ade3378054c0d8b472bac5"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#1fad45f3274f1fae5a3649d23269840494d81833"
 dependencies = [
  "async-trait",
  "bytes",
@@ -7327,7 +7327,7 @@ dependencies = [
 [[package]]
 name = "pingora-runtime"
 version = "0.8.0"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#2d9dc2b908dd1dee69ade3378054c0d8b472bac5"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#1fad45f3274f1fae5a3649d23269840494d81833"
 dependencies = [
  "log",
  "once_cell",
@@ -7340,7 +7340,7 @@ dependencies = [
 [[package]]
 name = "pingora-rustls"
 version = "0.8.0"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#2d9dc2b908dd1dee69ade3378054c0d8b472bac5"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#1fad45f3274f1fae5a3649d23269840494d81833"
 dependencies = [
  "log",
  "no_debug",
@@ -7356,7 +7356,7 @@ dependencies = [
 [[package]]
 name = "pingora-timeout"
 version = "0.8.0"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#2d9dc2b908dd1dee69ade3378054c0d8b472bac5"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#1fad45f3274f1fae5a3649d23269840494d81833"
 dependencies = [
  "once_cell",
  "parking_lot",
@@ -8814,7 +8814,7 @@ dependencies = [
 
 [[package]]
 name = "sbproxy"
-version = "1.13.0"
+version = "1.14.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -9180,7 +9180,7 @@ dependencies = [
 
 [[package]]
 name = "sbproxy-core"
-version = "1.13.0"
+version = "1.14.0"
 dependencies = [
  "allocation-counter",
  "anyhow",
@@ -9419,7 +9419,7 @@ dependencies = [
 
 [[package]]
 name = "sbproxy-k8s-controller"
-version = "1.13.0"
+version = "1.14.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -9445,7 +9445,7 @@ dependencies = [
 
 [[package]]
 name = "sbproxy-k8s-operator"
-version = "1.13.0"
+version = "1.14.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -9768,7 +9768,7 @@ dependencies = [
 
 [[package]]
 name = "sbproxy-observe"
-version = "1.13.0"
+version = "1.14.0"
 dependencies = [
  "anyhow",
  "arc-swap",

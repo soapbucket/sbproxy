@@ -1,4 +1,0 @@
-{
-  "type": "security",
-  "message": "**Two linked crates claiming the same auth plugin name are refused instead of resolved by link order.** `build_auth_plugin` took the first registration that matched, so a binary linking two crates that both register `saml` authenticated origins with whichever one the linker happened to emit first, and no config, log line, or admin surface said which. It now behaves like the policy, transform, and action channels it sits beside: the config compiler fails the load with `duplicate auth plugin registration: <name>`, naming how many claims there are, and no factory runs. Which crates they came from is a question for the binary's dependency graph, since a registration carries a name and a function pointer and nothing else. This is reachable only in a fork or an embedding that links its own auth providers; the shipped binary registers none."
-}

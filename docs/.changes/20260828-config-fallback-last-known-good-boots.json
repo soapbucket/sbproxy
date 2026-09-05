@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "`--config-fallback=last-known-good` boots on the config revision ring when the configured document does not work, pins the node loudly, and suspends the file watcher, SIGHUP, and the `source:` refresh poller until `DELETE /admin/config/fallback` clears it, which also applies the config file in the same call so recovery finishes in one step. Off by default; an exhausted ring exits 78 naming every revision it tried."
-}

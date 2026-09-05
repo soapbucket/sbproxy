@@ -1,4 +1,0 @@
-{
-  "type": "changed",
-  "message": "Fallback origin: `fallback_origin.on_error` no longer runs for an AI request the gateway cancelled because the caller's connection broke mid-generation. There is no caller left to serve, and on an `ai_proxy` fallback the substitute action would be a second paid provider call. Every other failure, including one attributed to the client such as a malformed request header, serves the fallback exactly as before."
-}

@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "**Federated MCP server runtime is distinct from per-tool-call auth.** A scope step-up on one `tools/call` stays on that call; the server keeps serving other tools. `GET /admin/mcp-runtime` reports each server as `starting`, `ready`, `authRequired`, `error`, or `stopped`, plus in-flight challenges. `requiredScopes` is parsed from `WWW-Authenticate: Bearer scope=\"...\"`, not from metadata `scopes_supported`. The same `sbproxy_mcp_tool_dispatch_total` family records `server_auth_required` and `call_auth_required`. A console page is separate scope."
-}

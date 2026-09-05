@@ -1,4 +1,0 @@
-{
-  "type": "breaking",
-  "message": "**A relative `model_host.cache.directory` is refused at config load.**\nThe engine subprocess that reads the weight cache is launched with its own\nworking directory and requires an absolute snapshot path, so a relative\nvalue was accepted by `validate` and `models pull`, survived a complete\nmulti-gigabyte download, and then failed at engine launch with\n`artifact_not_ready: verified snapshot path must be absolute`, naming a\nfield the operator never wrote. `proxy.model_host.cache.directory`, the\ncompatibility `serve.cache_dir`, and the `--cache-dir` flag now each\nrefuse a relative path by name before anything is downloaded. Point the\nkey at an absolute path, or interpolate a variable with an\nabsolute `:-` default, such as `${SB_MODEL_CACHE_DIR:-/var/lib/sbproxy/models}`,\nwhen the location differs per host. `catalog_file` is\nunchanged and still resolves relative paths against the config directory."
-}

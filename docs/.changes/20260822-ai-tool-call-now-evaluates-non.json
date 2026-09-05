@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**`ai_tool_call` now evaluates non-streaming tool calls, and a block after stream headers writes an SSE error.** A buffered tool-call completion used to skip the hook, and a streaming block after headers used to close the connection with no payload. Both now refuse with the same bounded error envelope as the pre-header path."
-}

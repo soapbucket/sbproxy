@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "A usage-less non-streaming AI response now debits `max_usd` from the same catalog-priced estimate it already debited the token caps from, instead of reporting `PerCall` and moving no dollars."
-}

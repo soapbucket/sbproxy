@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**Output-guardrail decisions are recorded for live provider responses.** `ai.guardrail.output` was published for an idempotency replay and a semantic-cache hit but not for the response the provider actually generated, so a route with output guardrails and `decision_audit` enabled saw decisions only for the replayed subset. The live relay and the cascade arm now run through the same funnel and publish once per response, for the allow as well as for the block. Expect more records on that feed: if you size a SIEM pipeline on `ai.guardrail.output` volume, this is a volume change, not a behavior change to the guardrails themselves. Streamed and live multipart responses still publish nothing, because neither materializes a body to evaluate."
-}

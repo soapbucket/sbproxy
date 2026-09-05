@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "Ported `sbproxy-classifier`, a rich multi-tenant classification sidecar (gRPC + TCP/MessagePack) with quality scoring, PII-redacting normalization, intent/content-type detection, and per-token streaming safety, plus a `FallbackClassifier` in `sbproxy-classifier-client` that degrades to the existing in-process ONNX classifier when no sidecar is deployed or reachable."
-}

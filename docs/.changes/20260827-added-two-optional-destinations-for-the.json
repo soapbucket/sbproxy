@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "Added two optional destinations for the request-event stream: `request_events.sink: nats` publishes one message per event to a NATS subject tree, and `sink: clickhouse` inserts batches over the HTTP interface. Neither adds a dependency, and a delivery watermark in the shared embedded store replaces the reconciliation table. The NATS client reads the server's `INFO`: a message past `max_payload` is skipped and counted rather than killing its batch, and a broker advertising `tls_required` is refused at connect rather than handed the authentication token on a plaintext socket. `request_events` is boot-only and a reload that changes it is refused by name."
-}

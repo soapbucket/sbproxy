@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**`sbproxy config print` and `sbproxy mcp lock` now resolve `${VAR}` through the config compiler's own pass rather than a near-copy of it.** The copy had drifted three ways: it substituted `$${VAR}`, which is the documented escape and has to stay literal; it substituted the MCP local-tool forms `${args.x}` and `${steps.x.y}`, which the tool executor owns at call time; and it had no `${VAR:-default}` support, so a config resolving to a default printed the raw placeholder instead."
-}

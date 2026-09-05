@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**Prompts admin page \"Add version\" now sends the field the backend\nexpects.** The form built a `content` key while\n`POST /admin/prompts/<host>/<name>/versions` deserializes into a\nrequired `template` field with no alias, so every submission 400ed.\nThe form now sends `template`; the same operation already worked via\nthe raw admin API."
-}

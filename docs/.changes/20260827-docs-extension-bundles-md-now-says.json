@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "`docs/extension-bundles.md` now describes `ai_close` accurately: it fires before the end-of-stream marker reaches the client, a `block` verdict is honored, and both outcomes publish an `ai.close` decision record; `ai_failure` remains the one event whose verdict is never consulted."
-}

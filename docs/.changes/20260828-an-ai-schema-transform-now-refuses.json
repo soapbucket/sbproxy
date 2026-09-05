@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "An `ai_schema` transform now refuses an unrecognized `on_failure` value at config load instead of treating it as \"forward silently\", so a typo can no longer downgrade a blocking schema check to a no-op."
-}

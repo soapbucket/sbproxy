@@ -1,4 +1,0 @@
-{
-  "type": "security",
-  "message": "The access log, its rotated `.gz` copies, the decision event feed, and the compiled file sink now create their files owner-only (`0600`) and their own directories `0700`, closing the last five sinks that still let the umask decide. Under the common `0022` they landed at `0644`, so every account on the host could read the path, the identity, and the decision for every request the proxy served. A file that already exists at a wider mode is tightened when the sink opens it rather than inherited, so a shipper or backup job running as a different user loses access on the first write after an upgrade; run it as the proxy user or point the sink at a fifo or `/dev/stdout`, which are left as the operator set them. A directory that already exists keeps its mode, so a shared `/var/log` is never narrowed."
-}

@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "A buffered AI response records `usage_source` on the access log the same way a streamed one does, so filtering for invoiceable rows no longer drops every non-streaming AI request."
-}

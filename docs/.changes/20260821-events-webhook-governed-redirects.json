@@ -1,4 +1,0 @@
-{
-  "type": "security",
-  "message": "The `events:` webhook sink no longer follows redirects. Its dial is pinned to the addresses the SSRF guard resolved, the collector is authorized against `egress.usage_sinks` when that block is armed, a `3xx` `Location` at another origin is refused rather than handed the signed event batch, and the five-second timeout now covers the whole chain rather than restarting on every hop. A refused batch counts under `sbproxy_events_dropped_total{sink=\"webhook\",reason=\"egress_denied\"}` and shows as a `denied` row in `GET /api/egress`."
-}

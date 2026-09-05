@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**The Extensions admin page reserves its red load-evidence styling for a real failure.** Every poll of a Git-sourced bundle writes a refresh line into `load.detail`, so the page used to paint healthy bundles error-red on every refresh. Red now means the bundle failed: its hooks collided unresolved, or its refresh candidate was rejected. A rejected candidate moves that bundle to `load.status: degraded` on `GET /api/extensions` and holds it there until a poll reaches the source and succeeds, so a proxy serving a stale generation no longer reads as healthy. A collided hook now carries the reason in `hooks[].detail` instead of reporting a state with nothing to act on."
-}

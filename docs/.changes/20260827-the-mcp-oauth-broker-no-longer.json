@@ -1,4 +1,0 @@
-{
-  "type": "security",
-  "message": "The MCP OAuth broker no longer puts a raw `reqwest::Error` on a log line when an upstream `/token`, token-exchange, or introspection call fails. `reqwest` ends its `Display` with the request URL, and for a broker that URL is an operator credential, so those three sites now log `request_error_summary` instead."
-}

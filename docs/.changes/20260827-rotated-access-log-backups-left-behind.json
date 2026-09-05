@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "Rotated access-log backups left behind by a change of the `compress` setting are made owner-only. The sweep followed the configured compression mode, so an operator who turned compression on after upgrading left the plain `access.log.1..N` files at whatever mode the older build gave them, holding the same request records as the compressed files beside them."
-}

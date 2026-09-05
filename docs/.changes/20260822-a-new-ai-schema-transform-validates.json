@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "A new `ai_schema` transform validates AI provider responses against an operator-supplied schema, with a `block`/`warn`/passthrough `on_failure` mode independent of the pipeline's shared failure posture."
-}

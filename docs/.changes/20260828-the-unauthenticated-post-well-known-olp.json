@@ -1,4 +1,0 @@
-{
-  "type": "security",
-  "message": "The unauthenticated `POST /.well-known/olp/token` endpoint now carries a per-source token budget. `origins.<host>.olp.token_rate_limit_per_minute` (default 60, `0` refused at config load) bounds how many Ed25519 bearer license tokens one source IP can mint; past it the answer is `429 slow_down` with `Retry-After`, counted as `sbproxy_olp_decisions_total{outcome=\"rate_limited\"}` and logged as an `olp_decision` event. The budget is keyed on the raw socket peer, not `X-Forwarded-For`, because a forgeable header is not an identity on an endpoint that needs no credential."
-}

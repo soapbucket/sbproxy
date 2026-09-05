@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "MCP `tools/call` requests can now be governed by a Cedar ABAC policy (`cedar_policies:` on the `mcp` action), running alongside the existing RBAC `tool_access` gate rather than replacing it."
-}

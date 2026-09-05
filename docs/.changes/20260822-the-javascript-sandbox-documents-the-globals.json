@@ -1,4 +1,0 @@
-{
-  "type": "changed",
-  "message": "**The JavaScript sandbox documents the globals it actually provides.** Only `json_encode` and `json_decode` are registered; there is no `atob`, `btoa`, `Buffer`, `TextEncoder`, or `crypto`. A hook that needs encoding carries its own. The `hello-javascript` example now encodes `body_base64` in the sandbox instead of shipping a hardcoded string."
-}

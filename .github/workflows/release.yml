@@ -1,6 +1,6 @@
 # Release pipeline for SBproxy.
 #
-# Activates on tags matching v*.*.*. Produces signed binaries (4 platforms),
+# Activates on tags matching v*.*.*. Produces signed binaries (3 platforms),
 # signed multi-arch Docker images on ghcr.io, a CycloneDX SBOM, and SLSA
 # build provenance attestations. All signing is keyless via Sigstore +
 # GitHub OIDC; the expected cert identity for tag vX.Y.Z is documented in
@@ -100,7 +100,9 @@ jobs:
     # still banks its dependency build, so a retry (even one that also
     # times out) resumes from a warm cache instead of paying the full
     # cold fat-LTO build again.
-    timeout-minutes: 90
+    # The last macOS release job took 89m30s against that 90-minute cap.
+    # Leave room for the larger workspace and packaging on a cold runner.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -419,6 +421,7 @@ jobs:
             cargo test -p sbproxy-e2e --test model_cluster_dispatch --locked -- --nocapture
 
   certify-model-host-apple-silicon:
+    needs: build
     # Blocking since the v1.9.0 cycle. The lane's two historical failure
     # modes are both fixed: the pinned llama-server refusing the hosted
     # macos-14 runner (resolved by the runner-compat pin fix) and the
@@ -443,25 +446,45 @@ jobs:
     # certify-model-host.sh defaults to for `serve:`-block deployments,
     # so SB_HOST is pinned to 127.0.0.1 below to match.
     runs-on: macos-14
-    # The release-profile build (fat LTO) alone can exceed 30 minutes on
-    # a cold macOS runner cache; certification needs headroom on top.
-    timeout-minutes: 75
+    # Certify the exact packaged binary instead of paying for a second
+    # cold fat-LTO build, which exhausted the former 75-minute job limit.
+    # The build matrix keeps its own compile budget; this is hardware time.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
 
-      - uses: ./.github/actions/pinned-toolchain
-
-      - uses: Swatinem/rust-cache@v2
+      - name: download packaged Apple Silicon binary
+        uses: actions/download-artifact@v5
         with:
-          shared-key: certify-model-host-apple-silicon
+          name: bin-darwin_arm64
+          path: artifacts/apple-release
 
-      # sbproxy-classifier-proto's build script requires protoc; macOS
-      # runners do not ship it, unlike the preprovisioned Linux images.
-      - name: install protoc
-        run: brew install protobuf
-
-      - name: build release binary
-        run: cargo build --release -p sbproxy --locked
+      - name: verify and stage packaged binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd artifacts/apple-release && shasum -a 256 -c sbproxy_darwin_arm64.tar.gz.sha256)
+          mkdir -p target/release
+          tar -xzf artifacts/apple-release/sbproxy_darwin_arm64.tar.gz -C target/release ./sbproxy
+          # The artifact is built on macos-latest and certified on macos-14.
+          # Show its deployment target and libraries before checking it runs.
+          file target/release/sbproxy
+          otool -L target/release/sbproxy
+          otool -l target/release/sbproxy | awk '
+            /LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX/ { remaining = 8 }
+            remaining > 0 { print; remaining-- }
+          '
+          binary_version="$(./target/release/sbproxy --version)"
+          printf '%s\n' "${binary_version}"
+          python3 - "${binary_version}" "${GITHUB_SHA}" <<'PYVERSION'
+          import re, sys
+          match = re.fullmatch(
+              r"sbproxy \S+ \(rev ([0-9a-f]{7,40}), built \d{4}-\d{2}-\d{2}\)",
+              sys.argv[1],
+          )
+          if not match or not sys.argv[2].startswith(match.group(1)):
+              raise SystemExit("packaged binary revision does not match this checkout")
+          PYVERSION
 
       - name: record version metadata
         run: |
@@ -940,19 +963,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Draft notes are the tagged version's CHANGELOG section, not
-          # the whole file: GitHub caps release bodies at 125k
-          # characters and the full CHANGELOG passed that at v1.9.0.
+          # Keep the complete tagged notes as an asset. A single release's
+          # section can also exceed GitHub's 125k-character body limit.
           version="${GITHUB_REF_NAME#v}"
-          awk -v ver="$version" '
-            $0 ~ "^## \\[" ver "\\]" { on = 1; print; next }
-            on && /^## \[/ { exit }
-            on { print }
-          ' CHANGELOG.md > /tmp/release-notes.md
-          if ! [ -s /tmp/release-notes.md ]; then
-            echo "no CHANGELOG section found for ${version}" >&2
-            exit 1
-          fi
+          python3 scripts/release-notes.py "$version" \
+            --notes-file /tmp/release-notes.md \
+            --full-notes-file dist/release-notes.md
           # A tag-time-only failure's documented recovery is to move the
           # tag (git tag -d + recreate + push) and let this workflow run
           # again. gh release create refuses to reuse a tag name a draft
@@ -1083,9 +1099,11 @@ jobs:
         shell: bash
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
-          echo "image=${REGISTRY}/${IMAGE_NAME}" >> "${GITHUB_OUTPUT}"
-          echo "dockerhub_image=docker.io/soapbucket/sbproxy" >> "${GITHUB_OUTPUT}"
+          {
+            echo "version=${VERSION}"
+            echo "image=${REGISTRY}/${IMAGE_NAME}"
+            echo "dockerhub_image=docker.io/soapbucket/sbproxy"
+          } >> "${GITHUB_OUTPUT}"
 
       - name: build and push image
         id: push

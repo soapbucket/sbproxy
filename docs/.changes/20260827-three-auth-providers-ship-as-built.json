@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "Three auth providers ship as built-ins: `ext_authz` (Envoy-style external authorization), `oauth_introspection` (RFC 7662 opaque-token validation), and `kya` (Know Your Agent identity with an optional spend floor). Each carries its own metric family and a Grafana panel."
-}

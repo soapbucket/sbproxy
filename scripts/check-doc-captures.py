@@ -1504,10 +1504,19 @@ def main() -> int:
 
     all_results: list[Result] = []
     for path in docs:
+        started = time.monotonic()
+        print(f"capture check: starting {display_path(path)}", flush=True)
         results = check_document(path, binary, logs, args.stackless_only)
         if args.update:
             apply_updates(path, results)
         all_results.extend(results)
+        statuses = sorted({result.status for result in results})
+        print(
+            f"capture check: finished {display_path(path)}: {len(results)} capture(s), "
+            f"{', '.join(statuses) or 'nothing to check'}, "
+            f"{time.monotonic() - started:.1f}s",
+            flush=True,
+        )
 
     counts: dict[str, int] = {}
     for result in all_results:

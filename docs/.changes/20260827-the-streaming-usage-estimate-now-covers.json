@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "The streaming usage estimate now covers every wire shape the `usage_parser` table documents. Vertex and Gemini `candidates[].content.parts[]` and Bedrock's base64 `bytes` envelope extracted to nothing before, so a delivered answer on either provider refunded in full; frames past 16 KiB and chunks that split a multi-byte character are no longer dropped either."
-}

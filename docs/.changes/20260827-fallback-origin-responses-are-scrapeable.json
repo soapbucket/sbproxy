@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "**A fallback taken is now scrapeable.** `sbproxy_fallback_total{trigger, origin, tenant}` counts every `fallback_origin` response served, with `trigger` either `status` (the primary answered with a status listed under `on_status`) or `error` (the primary failed outright and `on_error` caught it). Until now the only evidence a fallback had fired was the `fallback_triggered` boolean on an access-log row, so alerting on \"the fallback is carrying checkout.local\" meant scraping logs. A fallback is a degraded response by construction, and its rate is the first number worth an alert when a primary starts failing. Drawn on the Origins dashboard (`dashboards/grafana/sbproxy-origins.json`)."
-}

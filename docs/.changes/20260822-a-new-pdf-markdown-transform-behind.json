@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "A new `pdf_markdown` transform (behind the opt-in `transform-pdf` cargo feature) projects an `application/pdf` response body into Markdown, the same shape `html_to_markdown` produces."
-}

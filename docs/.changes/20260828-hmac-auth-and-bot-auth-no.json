@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**hmac_auth and bot_auth no longer record an allow when a later content-digest check refuses the body.** A signature that verified in the header phase used to emit `sbproxy_auth_results_total{result=\"allow\"}` and an allowed SIEM decision, then answer 401 after the body proof failed. The auth record is now deferred until the body proof resolves, so a mismatch is one deny. GraphQL inbound binding and the idempotency short circuit take the same path."
-}

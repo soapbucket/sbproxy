@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "Restarted mesh workers now refute stale leave announcements from their previous process, allowing peers to converge after rejoin. Graceful shutdown stops membership reception before publishing its final leave."
-}

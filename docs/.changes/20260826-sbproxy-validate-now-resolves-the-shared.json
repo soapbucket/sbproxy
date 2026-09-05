@@ -1,4 +1,0 @@
-{
-  "type": "changed",
-  "message": "**`sbproxy validate` now resolves the shared secret of every configured AI toolkit agent.** Validation used to substitute a placeholder, so a config whose `proxy.ai_toolkit.agents[].auth.shared_secret` names an unset `env:` variable or an absent `file:` path passed validation and then failed at startup. Export the same secrets in the validating environment, or point the reference at material the validating process can read."
-}

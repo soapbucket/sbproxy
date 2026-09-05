@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**Each shadow target's usage row gets its own ledger id.** The shadow usage record minted its `:shadow` request id when it was built rather than when it was recorded. With one target that was invisible; with the multi-target lists this release adds, every target's row would have carried the same id, and that id is the verifiable ledger's dedup key, so N rows would have collapsed to one on replay. The id is now minted per recorded row."
-}

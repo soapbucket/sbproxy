@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**The `websocket` action's `max_message_size` and `subprotocols` are\nenforced.** Both fields parsed and did nothing. `max_message_size`\n(default 10 MB, now enforced including the default) closes the\nupgraded tunnel as soon as a message in either direction declares\nmore payload than the cap; frame headers are scanned, payloads are\nnever read or buffered. A non-empty `subprotocols` list now\nallowlists `Sec-WebSocket-Protocol` negotiation: the client's offer\nis filtered to it before going upstream, an offer with no allowed\nentry is refused with a `400` before any upstream connection, and an\nupstream selection outside the negotiated set fails the upgrade with\na `502`."
-}

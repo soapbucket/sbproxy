@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**`docs/comparison.md` no longer advertises PROXY protocol support.** The table listed PROXY protocol v1 as shipped. A complete v1 parser exists in the source tree, nothing calls it, no listener reads the preamble, and there is no configuration key of any spelling. An operator who enabled PROXY protocol on the load balancer in front of SBproxy got a 400 on every connection, because the `PROXY TCP4 ...` line reached the HTTP parser as the request line, and the address the access log, the WAF, and the IP-filter policy evaluated was the load balancer's. The row now reads \"No (v1 parser present, not wired to a listener)\", a build guard fails if the row and the wiring ever disagree, and [docs/config-stability.md](docs/config-stability.md#there-is-no-proxy-protocol-configuration-key) says what to do instead."
-}

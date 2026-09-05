@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "Added `proxy.config_history.soak.auto_revert`, off by default: with it armed, a failed soak re-applies this node last known good on its own. It arms only for a change an in-process swap can undo, so a listener port, admin block, cluster identity, or origin action-type failure logs its blast radius and leaves boot fallback and manual rollback as the answer. A revision an earlier revert restored that then fails its own soak escalates instead of reverting to itself, a revert that will not compile leaves the running pipeline serving, and an inconclusive verdict never reverts. New counter `sbproxy_config_apply_total{outcome}` separates an automatic revert from an operator rollback."
-}

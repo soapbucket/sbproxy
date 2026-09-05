@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**`print()` inside a Rego bundle hook is bounded and redacted.** A\ntransform hook's input is the complete buffered response body, so\n`print(input.body.body_base64)` copied every response into the log at\n`info`, uncapped and unredacted. Messages now pass through the secret\nredactor, are truncated at 512 bytes, and at most eight events are\nemitted per evaluation with one summary line for the remainder."
-}

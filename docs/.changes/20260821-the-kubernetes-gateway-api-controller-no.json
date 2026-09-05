@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "The Kubernetes Gateway API controller no longer publishes a truncated `sb.yml` while a watch relist is in flight. The replayed objects are staged beside the live snapshot and swapped in when the relist completes, which is also the only point a relist schedules a reconcile, and the first document a fresh controller writes waits for all four watched kinds to finish their first list."
-}

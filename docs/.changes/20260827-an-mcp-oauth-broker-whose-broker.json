@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "An MCP OAuth broker whose `broker_signing_key` is a PEM with no `public_jwk` is refused at startup instead of serving an empty JWKS every verifier rejects, and a colocated resource server takes that key set in process instead of dialing the proxy own JWKS URL."
-}

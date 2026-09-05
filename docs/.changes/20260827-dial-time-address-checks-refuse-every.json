@@ -1,4 +1,0 @@
-{
-  "type": "security",
-  "message": "Dial-time address checks refuse every IPv4-embedding IPv6 form, not just `::ffff:a.b.c.d`. The NAT64 well-known prefixes (`64:ff9b::/96`, `64:ff9b:1::/48`), the IPv4-translated SIIT form (`::ffff:0:a.b.c.d`), and 6to4 (`2002::/16`) over a private or reserved address all passed every range check, because `to_ipv4_mapped` and `to_ipv4` return `None` for them. NAT64 is how an IPv6-only Kubernetes cluster reaches IPv4, so on that network `64:ff9b::a9fe:a9fe` was a live route to the cloud metadata endpoint from an unauthenticated request."
-}
