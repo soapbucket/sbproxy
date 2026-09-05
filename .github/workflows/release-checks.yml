@@ -137,6 +137,9 @@ jobs:
       - uses: ./.github/actions/rust-setup
         with:
           cache-key: test-isolation
+          # Preserve compiled dependencies from the preceding 57 minutes of
+          # builds in run 33989363173, even when validation fails afterward.
+          cache-on-failure: 'true'
 
       - uses: taiki-e/install-action@nextest
 
