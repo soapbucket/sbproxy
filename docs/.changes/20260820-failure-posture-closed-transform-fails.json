@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**A `failure_posture: closed` transform now fails a `static` or\n`mock` response closed instead of serving it untransformed.** The\ntransform chain has reached generated bodies since the response-phase\nwork landed, but a fault there logged a warning and continued with\nthe untransformed buffer, whatever the transform's declared posture.\nA redaction transform on a `type: static` origin therefore shipped\nthe exact string it existed to strip whenever it faulted (a budget\noverrun, a non-string result, a body over the buffer cap). A `closed`\ntransform's fault now answers `500` with\n`x-sbproxy-transform-error: <transform>` and never writes the\ngenerated body, matching the proxied and plugin-action paths.\n`failure_posture: open`, which is what a `transforms:` entry defaults\nto, keeps warning and continuing."
-}

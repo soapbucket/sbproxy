@@ -14,6 +14,4827 @@ landing the same night produce two files instead of one conflict.
 Render what the next release will say with
 `python3 scripts/changelog-fragments.py --preview`.
 
+## [1.14.0] - 2026-09-05
+
+### Breaking
+
+- **Two outbound paths that ignored their `egress:` allowlist now honor
+  it.** No key changed and the same file still compiles; what changed is
+  that the value you already wrote is enforced where it previously was
+  not.
+
+  If `egress.usage_sinks` is set to `mode: deny_by_default` and you run
+  an `events:` webhook sink, add your collector's host to
+  `egress.usage_sinks.hosts` before upgrading. `ports` defaults to `[80,
+  443]`, so a collector on another port needs an explicit `ports:`, and
+  one that resolves onto a private address needs `allow_private: true`.
+  Until you do, every batch is refused: a `warn` on the `events` target,
+  one
+  `sbproxy_events_dropped_total{sink="webhook",reason="egress_denied"}`
+  per event, and a `denied` row in `GET /api/egress`.
+
+  If `egress.token_exchange` is set to `mode: deny_by_default` and an
+  MCP server uses `run_as_user_auth` with the token-exchange mode, add
+  that token endpoint's host to `egress.token_exchange.hosts`. A
+  per-server `egress:` block does not cover it. Until you do, the tool
+  call fails with `token exchange egress denied`.
+
+  Read the current hosts off `GET /api/egress` on the running proxy: the
+  `webhook` and `token_exchange` rows name exactly what has to be
+  listed. See
+  [config-stability.md](../config-stability.md#upgrade-affecting-behavior-changes).
+
+- **An unreadable MCP `tool_quotas[].rate.per` is refused at config
+  load.** A `per:` value outside `ms / s / m / h / d` was never
+  validated anywhere: `per: 1hour` compiled clean, `sbproxy validate`
+  accepted it, and the request path then read the parse failure as "this
+  tool has no quota" and let every `tools/call` through with no log line
+  and no counter, so the dashboard showed the quota configured and zero
+  rejections. The `mcp` action now refuses the config naming the policy,
+  the tool, and the string, so a config carrying a typo stops loading
+  rather than loading a quota nothing enforces; the request-path branch
+  survives as a backstop and denies instead of allowing. Grep your
+  configs for `per:` under `tool_quotas` before upgrading, starting with
+  any quota that has never rejected anything. See
+  [docs/config-stability.md](docs/config-stability.md) and
+  [docs/mcp.md](docs/mcp.md).
+
+- **A relative `model_host.cache.directory` is refused at config load.**
+  The engine subprocess that reads the weight cache is launched with its
+  own working directory and requires an absolute snapshot path, so a
+  relative value was accepted by `validate` and `models pull`, survived
+  a complete multi-gigabyte download, and then failed at engine launch
+  with `artifact_not_ready: verified snapshot path must be absolute`,
+  naming a field the operator never wrote.
+  `proxy.model_host.cache.directory`, the compatibility
+  `serve.cache_dir`, and the `--cache-dir` flag now each refuse a
+  relative path by name before anything is downloaded. Point the key at
+  an absolute path, or interpolate a variable with an absolute `:-`
+  default, such as `${SB_MODEL_CACHE_DIR:-/var/lib/sbproxy/models}`,
+  when the location differs per host. `catalog_file` is unchanged and
+  still resolves relative paths against the config directory.
+
+- The S3 Cache Reserve backend refuses to read an object written before
+  this release. Its envelope now binds the ciphertext to a versioned
+  canonical AAD covering bucket, prefix, logical key, object key, and
+  stored metadata, so a moved or renamed object cannot be decrypted in
+  its new place. Objects carrying the previous AAD fail closed with an
+  explicit rewrite-required error rather than being silently accepted;
+  drop the prefix and let it refill.
+
+- **A mesh node that exits cleanly now announces `Left` to a fan-out of
+  live peers.** That is a wire break: every node in the cluster must
+  understand the new membership state, so rolling this out means
+  upgrading the whole cluster together. A peer that received the
+  announcement is evicted under
+  `mesh_peer_evicted_total{reason="graceful_leave"}` instead of waiting
+  out the suspect window and `dead_timeout`. `dead_peer_gc_secs` still
+  GCs the routing membership after that, and the admin roster keeps its
+  bounded tombstone.
+
+- **Go compatibility is deprecated: a flat schema-v1 `sb.yml` is now
+  refused instead of booting an empty proxy.** The archived Go `v0.1.x`
+  line wrote one origin's behavior at the top level of the file. This
+  binary reads origin behavior only from `origins.<hostname>:` and never
+  translated the flat shape into it, so such a file used to compile:
+  each top-level key was dropped with a single warning, the proxy booted
+  with no origin at all and answered 404 for the hostname the file
+  declared, and `sbproxy validate` reported the same file as valid. An
+  operator who believed they had authentication and IP allow-listing
+  deployed with neither. `serve`, `validate`, and hot reload now fail
+  when a top-level key carries origin behavior (`hostname`, `action`,
+  `authentication`, `policies`, `forward_rules`, `cors`,
+  `request_modifiers`, `response_modifiers`, `session`, `variables`,
+  `allowed_methods`, `force_ssl`, `ai_proxy`), with a message naming the
+  keys it would have dropped and pointing at
+  [`soapbucket/sbproxy-go`](https://github.com/soapbucket/sbproxy-go)
+  for anyone who would rather keep running the Go binary, which is
+  maintenance only. Descriptive top-level leftovers (`config_version`,
+  `id`, `workspace_id`, `version`, `environment`, `tags`, `debug`) are
+  unaffected and still only warn, so a modern config carrying one keeps
+  booting. There is no translation shim and there will not be one; the
+  rewrite is one nesting level and is shown side by side in
+  [MIGRATION.md](MIGRATION.md).
+
+### Security
+
+- **`hmac_auth` now binds a signature to the body it covers.** A
+  signature covering `content-digest` was checked against the empty body
+  the authentication phase can offer, not against the bytes the client
+  sent. The check was inverted rather than weak: a client sending the
+  true digest of its body was refused, while one declaring the
+  empty-body digest
+  `sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:` was admitted
+  and could then send any body at all. Because covering `content-digest`
+  could not work, deployments signed `("@method" "@target-uri")` and
+  nothing else, so a request captured off the wire replayed with an
+  attacker-chosen body until its `created` timestamp left the
+  `clock_skew_seconds` window. An attacker could not forge a signature,
+  change the method or the route, or extend the window; they substituted
+  the body of a request someone else signed.
+
+  Verification now defers the digest half to the request body filter and
+  completes it against the complete pre-transform body, the same
+  two-step contract `bot_auth` uses, answering `401` on a mismatch.
+  Covering `content-digest` works, so `required_components` can require
+  it and mean it. Two consequences worth knowing before you upgrade: a
+  body-covering signature now caps the request at the 8 MiB request-body
+  buffer and a larger body answers `413`, and the `401` body for a
+  mismatch changed from `bot_auth: content-digest body mismatch` to
+  `signature: content-digest body mismatch`, since either provider can
+  raise it. See the `hmac_auth` section of
+  [docs/configuration.md](docs/configuration.md).
+
+- **`ldap_auth` bounds what it dials.** Authentication runs before an
+  origin's `policies:`, so no `rate_limit` or `ddos` policy could cap
+  the directory bind: anyone able to send an `Authorization: Basic`
+  header drove one bind per request, which made the gateway a 1:1
+  amplifier pointed at the directory and offered account lockout for any
+  guessable username. Three bounds now run before the dial, none of
+  which caches a success: a 30 second refused-credential cache keyed on
+  a salted SHA-256 of the exact username and password, a per-username
+  failed-bind budget of 5 per 60 seconds that then throttles to one bind
+  per 12 seconds, and a cap of 32 binds in flight. The budget throttles
+  rather than blocks on purpose, so nobody can spend a username's budget
+  with wrong guesses and lock its owner out; a throttled request answers
+  `503`, not `401`, because the directory was never consulted. An
+  attacker cycling *distinct* usernames is still bounded only by what
+  runs in front of the origin.
+
+- **Refused LDAP binds and refused JWE algorithms are visible in release
+  builds.** Both logged at `debug`, which the release profile's
+  `release_max_level_info` compiles out, so the shipped binary recorded
+  nothing for a refused credential while the documentation promised the
+  log named the offending algorithm. Raised to `info`. A failed
+  `content-digest` body binding now logs at `warn` at all three refusal
+  sites; it previously logged at `debug` in one and nowhere in the other
+  two. No credential is logged at any of them.
+
+- A `policy: rego` or `ai_routing_policy` base-data document that lands
+  on any rule the module defines is now refused at config load, not just
+  one that lands on the rule the query names. Rego resolves base data
+  over a rule at the same path, so a table that collided with a helper
+  several references from the query turned that helper into a constant:
+  the query kept evaluating, the decision kept looking computed, and a
+  `deny` rule that stopped running failed open with nothing in the logs
+  to say so. The refusal names the data path, the rule it landed on, and
+  the reference chain from the query to that rule: ``base data defines
+  `data.sbproxy.trusted`, and the module defines a rule at that path, so
+  Rego resolves the base document there and the rule never evaluates.
+  The query `data.sbproxy.allow` reaches it: data.sbproxy.allow ->
+  data.sbproxy.trusted.`` A JSON `null` at a rule path and a scalar
+  above one refuse for the same reason, and a query that reads a parent
+  path (`data.sbproxy.denies` over a `denies[k]` rule) now resolves to
+  the rules beneath it, so the chain is printed instead of the collision
+  being reported as latent. A partial rule whose keys are computed
+  (`limits[k] := ...`) is comparable only down to the fixed part of its
+  path, so any key already sitting under that path refuses, including
+  keys the rule would never have produced; an empty object there still
+  loads, and the message for this shape says the base keys win rather
+  than claiming the rule never evaluates. Every base-data refusal now
+  counts on
+  `sbproxy_script_compile_total{engine="rego",result="semantic_error"}`,
+  the same family the parse and analysis outcomes use. This is
+  upgrade-affecting: a config that compiled before can refuse now, and
+  the fix is to move the table off the rule path. Sibling keys inside
+  the package and top-level keys are unaffected.
+
+- **A query parameter can no longer overwrite a gRPC transcode path
+  binding.** `GET /v1/echo/allowed?message=forbidden` bound `message`
+  from the path and then let the query replace it, so the value the
+  route matched on and the header-phase policies read was not the value
+  the gRPC upstream received. A query key addressing a bound field path,
+  or a parent or a child of one, is now dropped. Two caps come with it:
+  at most 256 query parameters per request, and at most 32 dotted
+  segments in a parameter name, which bounds a recursion that a
+  self-referential message type could otherwise drive into the worker
+  stack. A client that was correcting a path segment from the query has
+  to send the corrected value in the path instead.
+
+- **A saturated metric label warns once, and never logs the demoted
+  value.** When a label reached its cardinality budget, every subsequent
+  unseen value emitted a `WARN` line carrying that value, and the
+  accepted-value set never shrinks, so the flood was permanent.
+  `project`, `feature`, `team`, `environment`, and `agent_type` arrive
+  on `SB-Attr-*` request headers with nothing upstream bounding them, so
+  one client sending a distinct value per request could drive one log
+  line per request, each carrying a string it chose. The proxy now
+  announces a label's saturation once per label per process and names
+  only the label. The saturation itself stays scrapeable for as long as
+  it lasts on `sbproxy_label_cardinality_unique_values{label}` against
+  `sbproxy_label_cardinality_budget{label}`, which are recomputed at
+  scrape from the limiter's own accepted-value map and so cover every
+  proxy-wide label; `sbproxy_label_cardinality_overflow_total{metric,
+  label}` counts each individual demotion, but only for the labels
+  routed through the per-label-budget path, so alert on the gauge ratio
+  rather than on that counter. The announcement is also emitted after
+  the limiter's lock is released rather than while holding it. What this
+  does not distinguish: a tenant-scoped saturation is announced under
+  its label name alone, so the first tenant to fill a label mutes the
+  line for the rest;
+  `sbproxy_label_cardinality_overflow_per_tenant_total{metric, label,
+  tenant_id}` carries the tenant dimension.
+
+- **Every configurable built-in auth provider now refuses a
+  configuration key it does not recognize.** Until this release an
+  unrecognized key inside an `authentication:` block was dropped
+  silently and the setting it was meant to be took its default, and
+  every optional switch on an auth provider defaults to the permissive
+  value. `require_dp0p: true` on a `bearer` block, with a zero for the
+  `o`, compiled, booted, and served every request with DPoP
+  proof-of-possession off while the config read as though it were on.
+  The same held for `require_mtls_bound` on `jwt`, `tls_verify` on
+  `ldap_auth`, `require_agent_binding` on `cap`, `nonce_policy` on
+  `bot_auth`, and `clock_skew_seconds` on `hmac_auth`.
+
+  This is upgrade-affecting: a configuration that carried a stray key
+  inside an `authentication:` block used to boot and now fails to
+  compile, at `serve`, `validate`, and hot reload alike, with an error
+  naming the key and the ones the provider accepts (``unknown field
+  `require_dp0p`, expected `tokens` or `require_dpop` ``). Run `sbproxy
+  validate <path>` before rolling. Any key it names is one the proxy was
+  already ignoring, so correcting the spelling gives you the control the
+  file claimed and deleting the line gives you the behavior you were
+  already running. A rejected hot reload leaves the last-good
+  configuration serving.
+
+  `noop` has no configuration to check and is unchanged, and the
+  per-credential entries under `api_keys:`, `tokens:`, `users:`, and
+  `hmac_auth`'s `keys:` stay permissive because they fold free-form
+  attribution metadata into the same mapping as the secret.
+  `proxy.extensions.agent_detect` also refuses unknown keys now, and a
+  malformed block that sets `enabled: true` is a hard compile error
+  rather than a warning that left the scorer off; an absent block still
+  means detection off with nothing logged.
+
+- **A validate-only bundle load no longer un-redacts the serving
+  config's secrets.** `Candidate::finish` installed the process-wide
+  structured-log field-key denylist at candidate-construction time, so
+  every load that is not an adoption reprogrammed the redactor for the
+  generation still serving: a `/config/publish` dry run carrying no
+  `extensions:` block, a doctor run, or any
+  `CompiledPipeline::from_config` (which loads an empty registry)
+  replaced the live list with its own, and from that moment the serving
+  config emitted its bundles' `secret_vars` in cleartext in every
+  structured log line. The registry now carries its names and the single
+  pipeline publisher installs them, so the denylist moves only when the
+  pipeline that owns it does.
+
+- **A shared certificate-store backend that cannot be opened now refuses
+  to start instead of silently disabling the fleet-wide ACME issuance
+  lock.** Every failure path in the certificate-store open (`redb` and
+  `sqlite` directory creation, `redb`, `sqlite`, `file`, and
+  object-store opens, and a rejected Redis DSN) logged one `warn`
+  reading "certs will NOT persist (in-memory fallback)" and handed back
+  a `MemoryKVStore`. Persistence was the smaller half of what that cost:
+  `MemoryKVStore` overrides neither `try_lock` nor `renew_lock`, so it
+  inherits the single-node trait defaults, both an unconditional
+  `Ok(true)`. Every replica therefore won its own issuance lease and its
+  own fencing generation, opened its own ACME order for the same
+  hostname, and published its HTTP-01 token to a store no peer could
+  read, so roughly two thirds of the CA's validation fetches landed on a
+  replica that had never seen the token and the account burned through
+  Let's Encrypt's limit of five duplicate certificates per hostname set
+  per week. Nothing in `/metrics` told that apart from a CA outage, and
+  the operator's multi-replica guard could not catch it either, because
+  the configured backend was a shared one and it was the open that
+  failed. A failure on `file`, `redis`, `s3`, `gcs`, or `azure` is now a
+  startup error naming the backend, with no part of `storage_path` in
+  the message since a DSN or bucket URL can carry credentials. A
+  pod-local backend (`redb`, `sqlite`, `memory`) still degrades, because
+  a single node has no peer to be excluded from, but loudly: the log is
+  at `error` and the new `sbproxy_cert_store_degraded{backend}` gauge
+  goes to 1, and reads 0 when the configured backend opened. See the
+  certificate-store-backends section of
+  [docs/configuration.md](docs/configuration.md) and the upgrade note in
+  [docs/config-stability.md](docs/config-stability.md).
+
+- **The classifier sidecar bounds every inference it runs.** `Classify`
+  and `Embed` accepted caller-supplied text and handed it straight to
+  `spawn_blocking` with no size check, no batch-size check, no admission
+  permit, and no deadline. Only `Compress` was bounded. An unbounded
+  `spawn_blocking` is a thread-pool exhaustion primitive: the blocking
+  pool has a fixed ceiling and every task queued past it stalls every
+  other blocking caller in the process, so a single caller could park
+  the sidecar with either a stream of large requests or one batch of a
+  million texts.
+
+  All three RPCs now check the encoded request size before the model is
+  resolved, take a running permit from their own semaphores, and run
+  under a deadline that starts when the request arrives, so it covers
+  the wait for a running slot as well as the inference. A refused
+  request answers `RESOURCE_EXHAUSTED`, a request past the deadline
+  answers `DEADLINE_EXCEEDED`, and a panic inside inference is contained
+  by the runtime and answers `INTERNAL` without echoing the panic
+  payload, which is derived from the caller's own text. Every refusal
+  increments a per-reason counter and logs the first of each reason plus
+  every hundredth after that, so a refusal storm cannot become a log
+  flood.
+
+  **This is upgrade-affecting: a sidecar that answered every concurrent
+  `Classify` and `Embed` its hardware could run will now shed load above
+  its ceiling, and you widen that ceiling with
+  `--inference-max-concurrent` and `--inference-max-queued`.** The
+  ceiling is not a fixed number. Concurrency defaults to the host's
+  available parallelism, held between 4 and 64, and queue depth to eight
+  slots per running slot, so the sidecar tracks what the machine can
+  actually do instead of a literal chosen on somebody else's box. On the
+  proxy side a shed request is a failed call: the `prompt_injection_v2`
+  sidecar detector gives up after 250 ms and takes its `failure_posture`
+  path, the same as for a sidecar that is down, so size the flags for
+  peak concurrent inferences and not for average load.
+
+  The other defaults apply whether or not you configure anything:
+  `Classify` and `Embed` cap one request at 1 MiB encoded, an `Embed`
+  batch at 64 texts, and any request at 30 seconds end to end. Widen
+  them with `--inference-max-request-bytes`, `--inference-max-items`,
+  and `--inference-timeout-ms`. When the proxy supervises the sidecar
+  itself, `SupervisorConfig` now carries all five as optional overrides
+  and passes each one it is given to the child. See
+  [docs/classifier-sidecar.md](docs/classifier-sidecar.md) for the full
+  table and the status each bound returns.
+
+- **The MCP concealed-text detector now flags variation selectors.**
+  `U+FE00` to `U+FE0F` and `U+E0100` to `U+E01EF` are 256 invisible,
+  non-control code points wide enough to carry a byte each, and they are
+  the channel current tool-metadata smuggling work uses. A federated
+  tool description carrying a payload encoded in them produced no
+  finding, no change record, and `strip_concealed` handed the smuggled
+  bytes back unchanged. They are reported now under a new
+  `variation_selector` class on
+  `sbproxy_mcp_concealed_text_findings_total{class}`, alongside newly
+  covered invisible format characters (`U+00AD`, `U+180E`,
+  `U+2061`-`U+2064`, `U+FFF9`-`U+FFFB`) under `zero_width`. This class
+  has expected false positives: `U+FE0F` is the emoji presentation
+  selector and `U+E0100` onward is the Ideographic Variation Sequence
+  range legitimate Japanese and Chinese text uses, so a description
+  ending in an emoji or written in CJK is reported. That is deliberate,
+  because the code point a script needs and the code point a payload
+  rides on are the same code point, and the separate class label is what
+  lets an operator baseline the noise and tell the findings apart. See
+  [docs/mcp.md](docs/mcp.md).
+
+- **Two linked crates claiming the same auth plugin name are refused
+  instead of resolved by link order.** `build_auth_plugin` took the
+  first registration that matched, so a binary linking two crates that
+  both register `saml` authenticated origins with whichever one the
+  linker happened to emit first, and no config, log line, or admin
+  surface said which. It now behaves like the policy, transform, and
+  action channels it sits beside: the config compiler fails the load
+  with `duplicate auth plugin registration: <name>`, naming how many
+  claims there are, and no factory runs. Which crates they came from is
+  a question for the binary's dependency graph, since a registration
+  carries a name and a function pointer and nothing else. This is
+  reachable only in a fork or an embedding that links its own auth
+  providers; the shipped binary registers none.
+
+- **Durable sinks now create their files owner-only (`0o600`).** The
+  signed usage ledger, the settlement database and its `-wal` and `-shm`
+  sidecars, the request event file, the session ledger, and the JSONL
+  usage feed were all opened with a bare `OpenOptions`, which asks for
+  `0o666` and lets the umask decide. Under the near-universal default of
+  `0o022` every one of them landed on disk as `0o644`, readable by every
+  account on the host: per-tenant token counts and the amounts they
+  price, payer identifiers, and the route, identity, and decision for
+  every call the proxy served. Directories this process creates for its
+  own state, currently the parent of `payments.state_path`, are now
+  `0o700` for the same reason; a `0o600` file inside a world-traversable
+  directory still discloses its name, its size, and its existence. Read
+  this before you upgrade if anything outside the proxy reads those
+  files. A log shipper, a backup job, or a metrics scraper running as a
+  different user loses access the first time the sink opens its file,
+  because a file that already exists at a looser mode is tightened
+  rather than inherited. Run those readers as the proxy user, add them
+  to a setup that grants access explicitly, or point the sink at a fifo
+  or `/dev/stdout`, which are left exactly as the operator configured
+  them. A directory that already exists keeps the mode it has, so a
+  shared parent such as `/var/log` is never narrowed.
+
+- The `events:` webhook sink no longer follows redirects. Its dial is
+  pinned to the addresses the SSRF guard resolved, the collector is
+  authorized against `egress.usage_sinks` when that block is armed, a
+  `3xx` `Location` at another origin is refused rather than handed the
+  signed event batch, and the five-second timeout now covers the whole
+  chain rather than restarting on every hop. A refused batch counts
+  under
+  `sbproxy_events_dropped_total{sink="webhook",reason="egress_denied"}`
+  and shows as a `denied` row in `GET /api/egress`.
+
+- **The `html` transform's `rewrite_attributes` now reads a tag's
+  attribute list instead of pattern-matching the tag text.** It found
+  the attribute with a regex over the whole opening tag, and that got
+  two cases wrong. A tag carrying the attribute unquoted, which HTML
+  minifiers emit routinely (`<a target=_self>`), did not match, so the
+  transform appended a second copy; an HTML parser keeps the first of a
+  duplicated attribute, so the rewrite silently did nothing to exactly
+  the tags it reported stamping. Worse, the same characters inside
+  another attribute's *value* did match: upstream content of the shape
+  `<a title="pick target='b' onmouseover=x">` came back as `<a
+  title="pick target="_blank" onmouseover=x">`, closing the title early
+  and promoting the rest of an upstream-controlled string to real
+  attributes, event handlers included.
+
+  Both are fixed by walking the tag's attributes and only ever rewriting
+  something parsed as a value. If you configure `rewrite_attributes`
+  against an upstream that reflects user content into attribute values,
+  this closes an injection path that needed no cooperation from the
+  operator's config beyond having the transform enabled. Two visible
+  changes to expect: a tag whose value was unquoted now comes back
+  quoted and rewritten rather than duplicated, and text inside another
+  attribute's value is left exactly as the upstream sent it.
+
+- **Redis-backed idempotency entries are namespaced per origin.**
+  `idempotency.backend: redis` wraps the one cluster-wide
+  `proxy.l2_store`, and its storage key was
+  `sbproxy:idem::<Idempotency-Key>`: the workspace segment it was
+  supposed to be scoped by is a field nothing in the tree ever assigns,
+  so every origin on every node shared one flat keyspace. A client
+  posting `Idempotency-Key: order-1234` to one origin could be served
+  another origin's cached response verbatim, or park a permanent 409 on
+  a key it did not own, for the full 24h TTL. Keys now carry the owning
+  origin's `tenant_id` and origin id, and every segment is
+  length-delimited so a colon inside an operator-supplied id or a
+  caller-supplied key cannot straddle a separator. The `memory` backend
+  was never affected, which is why no test saw this. Entries written
+  under the old key are not readable under the new one, so plan the
+  upgrade the way [docs/config-stability.md](docs/config-stability.md)
+  describes: a retry that spans the restart re-executes upstream once.
+  The three idempotency metrics also stop labeling everything
+  `backend="default"`: the label is now `memory` or `kv`, so a broken
+  shared store is distinguishable from a cold local cache, and a
+  store-side read or write failure counts a new `result="error"`
+  alongside the miss the read degrades into, so an unreachable store
+  reads as a fault rather than as cold traffic.
+
+- **A keystore cache invalidation that does not propagate is now
+  reported instead of dropped.** `CacheTier::invalidate` and
+  `TtlCache::invalidate` returned `()`, folding a failed revocation into
+  the same best-effort bucket as a failed lookup. A failed lookup is a
+  cache miss the store covers for; a failed revocation is a credential
+  every other replica keeps accepting for a full cache TTL while the
+  admin console reports it revoked, with nothing in the logs, metrics,
+  or events saying so. Both now return `Result`. A key mutation whose
+  invalidation did not reach the shared tier still returns 2xx, because
+  the store write did land, but the body carries a `cache_propagation`
+  object naming the failure and its effect. `POST
+  /admin/cache/key-policy/evict` returns 502 instead, because
+  propagating is the whole operation there. Both paths log a warning and
+  increment the new
+  `sbproxy_key_cache_invalidation_failures_total{scope}` counter, so a
+  revoke that did not land is alertable.
+
+- **`allow_patterns: false` now also disables `string.gsub`.** The Lua
+  sandbox gate stubbed `string.find`, `string.match`, and
+  `string.gmatch` and left `string.gsub` live, so the knob whose stated
+  purpose is containing catastrophic backtracking left the same C-level
+  matcher reachable. `max_execution_ms` cannot help there either: the
+  matcher runs inside Luau's C string library, where the interrupt the
+  timer relies on never fires, so one request pinned a worker thread
+  indefinitely. All four pattern functions are stubbed now, which is the
+  complete pattern-taking surface of the `string` table. See
+  [docs/scripting.md](docs/scripting.md) and
+  [docs/config-stability.md](docs/config-stability.md).
+
+- The MCP run-as-user token cache mixes tenant, scope, and client
+  credential reference into its key, so two federated servers that
+  differ only in `scope`, or one inbound token arriving at two tenants'
+  origins, no longer share a cached credential. The cache is bounded at
+  4096 entries with LRU eviction, drops expired entries rather than
+  stepping over them, and zeroizes evicted bearer values.
+
+- The MCP run-as-user token exchange keeps the pin set its egress
+  authorization resolved and dials only those addresses, so a DNS answer
+  that changes between the check and the connect no longer moves the
+  request. A cross-origin redirect is refused instead of replaying the
+  form body carrying the caller subject token, the token response is
+  read under a 64 KiB ceiling, and the exchange is now armed by the
+  top-level `egress.token_exchange` block, which the only production
+  call site previously bypassed.
+
+- **The MCP tool-quota counter map is bounded per tenant and per
+  process.** The sliding-window store was keyed on the caller-presented
+  principal id and never evicted, so every distinct `sub` that called a
+  quota'd tool once left a permanent entry and an attacker able to mint
+  subs drove the footprint deliberately. Aged-out windows are reclaimed
+  now, and two ceilings bound what is left: 10,000 live windows per
+  tenant and 100,000 across the process. A principal the store cannot
+  track is refused rather than admitted unmetered, and the per-tenant
+  ceiling is what keeps one tenant's flood from refusing every other
+  tenant's next unseen caller. Because that refusal looks identical to a
+  real quota rejection on the wire, it has its own counter,
+  `sbproxy_mcp_tool_quota_registry_saturated_total`; alert on it. See
+  [docs/mcp.md](docs/mcp.md).
+
+- **Mesh node-to-node RPC has network deadlines and inbound connection
+  admission.** The cross-node cache transport had neither. A peer could
+  open a socket on the mesh transport port and then stop reading, or
+  accept a connection and never answer, and the task serving it waited
+  forever; enough such peers occupied every task there was, and nothing
+  on the calling side bounded a routed cache read either. Both halves
+  are now bounded. Outbound: connect 3s, peer mTLS 5s, request write
+  10s, response 10s (60s for the scanning operations: prefix purge,
+  digest, snapshot), all clamped by one overall per-request budget of
+  15s (90s for a scan) fixed before the per-peer lock is taken, so the
+  phases cannot add up past it. Inbound: at most 1024 connections and 64
+  concurrent TLS handshakes, a 10s deadline covering the handshake and
+  the wait for a handshake slot, a five-minute idle reaper, a 30s
+  deadline on delivering a frame body once its length has been
+  announced, and a 30s deadline on draining a response. Refused and
+  reaped connections count on the new
+  `mesh_transport_inbound_rejected_total{reason}`, and client-side
+  deadlines land on `mesh_transport_rpc_errors_total` under five new
+  `timeout_` kinds. Alert on `reason!="idle_timeout"`: a link nobody
+  uses for a whole idle window is reclaimed as a matter of course on a
+  quiet cluster, so that one value moves on a healthy fleet and logs at
+  `debug` rather than `warn`. Neither set is configurable: each default
+  is sized against mesh behavior at its constant, and see the mesh
+  transport limits table in
+  [docs/key-management.md](docs/key-management.md).
+
+  Upgrade-affecting on one axis. A node running an older build that
+  holds a mesh transport connection idle for more than the five-minute
+  inbound idle window now has it closed by the upgraded peer and loses
+  that one RPC to the reconnect. Nodes on this build reach the reaper
+  too on a link nobody uses, but they re-check their own 60-second
+  recycle mark before every request, so their next call after such a gap
+  dials fresh instead of writing into a closed socket and costs a
+  handshake rather than an RPC. The exposure is the mixed-version window
+  during a rolling restart.
+
+- **Two operator replicas can no longer both win the leader Lease, and a
+  deposed leader is fenced before a successor may act.** Takeover of an
+  expired `sbproxy-operator-leader` Lease was a plain merge PATCH with
+  no `resourceVersion` in the body, so the holder check that preceded it
+  constrained nothing at the apiserver: two standbys reading the same
+  stale Lease within a few milliseconds both wrote themselves in, both
+  reported acquired, and both began reconciling the same `SBProxy` set.
+  Creation now uses POST and takeover uses a
+  `resourceVersion`-conditional replace, so exactly one candidate wins
+  and the loser gets a 409 and keeps polling. Separately, the renew loop
+  stepped down on the first transient apiserver error, turning a single
+  500 during an apiserver rollout into a pod restart and 15s of no
+  reconciliation; renewals are now retried until an absolute safety
+  deadline of 10s measured from the start of the last successful
+  renewal. That deadline is enforced from inside the wait rather than
+  checked after it, so an apiserver that hangs instead of erroring still
+  fences at 10s rather than at the old 15s, which was exactly the lease
+  duration and therefore the instant a standby's takeover became legal
+  rather than any time before it. Losing leadership now closes a write
+  gate that the reconcile path checks before every status patch, every
+  server-side apply, and every `/admin/reload` fan-out, because aborting
+  the controller task only takes effect at its next await point and does
+  not recall a request already dispatched. A refused pass is counted as
+  `sbproxy_operator_reconcile_total{result="fenced"}`. See the
+  leader-election section of [docs/kubernetes.md](docs/kubernetes.md).
+
+- Operator URLs no longer reach log lines or error strings in full.
+  Redis and object-store DSNs, alert and callback webhook targets, JWKS
+  endpoints, usage sink collectors, and WAF feed URLs are now rendered
+  as `scheme://host:port` (plus the database index for a Redis DSN), so
+  an inline password or a webhook secret in the path cannot land in the
+  process log. `reqwest` failures are summarized by failure class
+  instead of interpolated directly, since that error's own `Display`
+  prints the whole request URL, and the same stripped error is what gets
+  wrapped rather than only what gets logged. A new ratchet,
+  `scripts/check-log-url-ratchet.sh`, refuses new sites of either shape;
+  its header states what its detector can and cannot see.
+
+- **Proxy-Wasm `proxy_log` is bounded, sanitized, and level-clamped.** A
+  guest capped one message at 4 KiB and nothing else, so a filter
+  looping `proxy_log` inside `proxy_on_http_request_headers` turned a
+  single request into thousands of records at whatever level it chose,
+  including `error`. The message bytes were also emitted verbatim, so a
+  payload containing a newline forged a whole log line no part of the
+  proxy wrote. Guest output is now capped at 1 MiB per callback (dropped
+  past the cap, with one `warn` saying so and no backpressure signal to
+  the guest), split one record per line with control characters escaped,
+  and emitted at a host-chosen level: trace and debug at `debug`, info
+  at `info`, and warn, error, and critical all at `warn`. The guest's
+  requested level stays on the record as `log_level`. A guest can no
+  longer mint an `error` line in its host's log. See
+  [docs/extension-bundles.md](docs/extension-bundles.md).
+
+- **Response cache keys no longer let one request seed another's entry,
+  and no longer let one caller read another's.** Key fields were joined
+  with a raw `:` and nothing escaped the fields themselves, so a colon
+  in a path or a query moved the boundary: `GET /victim:foo?bar` and
+  `GET /victim?foo:bar` rendered one key, and the `POST` invalidation
+  prefix for `/victim` was a string prefix of every `/victim:foo` key,
+  purging paths the caller never named. Fields are now percent-escaped
+  and the key carries a `v2:` version tag. Separately, nothing about the
+  caller was in the key at all, so an origin running `authentication`
+  and `response_cache` together stored the first caller's `GET /me` and
+  replayed it to every later caller as a hit; the key now carries a
+  digest of the resolved principal, the `Authorization` and
+  `Proxy-Authorization` headers, and the `Cookie` header, plus the
+  origin's tenant and the set of content codings the caller accepts. A
+  request that presents no credential keys exactly as it did.
+
+  Upgrade-affecting, in two ways. Every entry written by an earlier
+  build is unreadable to this one and ages out on its TTL, so expect one
+  cold cache per origin, and on a shared Redis or file store expect the
+  old entries to hold space until they expire. And on an origin whose
+  callers authenticate or carry cookies, one shared entry becomes one
+  entry per caller, so the hit rate falls toward the per-caller repeat
+  rate. That is the fix rather than a side effect, and
+  [docs/configuration.md](docs/configuration.md#who-a-cached-entry-belongs-to)
+  covers what to do when the content really is public. Hand-written
+  `POST /admin/cache/purge` prefixes have to be rewritten in the new
+  format.
+
+  Two more ways a stored entry could be read by a request that should
+  have missed, both on the write side. A response carrying a `Vary:` the
+  key does not cover is no longer stored at all: the upstream names the
+  request headers that change its answer, nothing read that header, and
+  an origin answering `Vary: Accept-Language` had one variant stored and
+  served to every language. `Accept-Encoding`, `Authorization`,
+  `Proxy-Authorization`, `Cookie`, and `Host` are covered by the proxy;
+  anything else has to be in `response_cache.vary`, and `Vary: *` is
+  never storable. The symptom of getting this wrong is a hit rate stuck
+  at zero, and a `debug` line names the header to add. And an entry no
+  longer stores a `Content-Encoding` the proxy itself applied:
+  compression runs after the entry is written and a hit never replays
+  it, so every hit on a compressed origin was shipping identity bytes
+  labeled `gzip`, which no client could decode.
+
+- **Reverse-DNS agent verification no longer lets a client spend the
+  request path.** Resolver step 2 of the agent-class chain queries a
+  zone the client being identified controls, and it used to follow that
+  zone wherever it led: one forward lookup per PTR name with no cap, on
+  the host resolver's default 5s-by-2-attempts timeout, on a fresh OS
+  thread wrapping a fresh multi-thread Tokio runtime per query, and with
+  the resulting DNS-error verdict deliberately not cached. A client
+  whose IP has no PTR record (most of them) therefore paid the whole
+  thing again on every request, and a client that answered its own
+  reverse zone with fifty black-holed names could pin a proxy worker
+  thread for minutes per request. Every part of that is now bounded: at
+  most four PTR names are forward-confirmed, each query is capped at two
+  seconds, the forward-confirm loop stops issuing new lookups once two
+  seconds of it have elapsed (so a whole verification costs at most
+  about six seconds), at most 32 queries are in flight process-wide, all
+  queries share one background runtime and one `hickory-resolver`
+  instance (so repeats hit its response cache), DNS failures are cached
+  for 30 seconds, and a request that needs a lookup runs it on the
+  blocking pool instead of an async worker. A check that stops at a
+  bound reports a DNS-error verdict, not a not-matched one, so it falls
+  through to User-Agent matching rather than caching a negative for five
+  minutes. See the `agent_classes` section of
+  [docs/configuration.md](docs/configuration.md) and the upgrade note in
+  [docs/config-stability.md](docs/config-stability.md).
+
+- **Service tier is the operator's choice, not the caller's.** A caller
+  POSTing `{"service_tier": "priority"}` to `/v1/chat/completions`
+  reached OpenAI-shaped upstreams verbatim, because that surface never
+  round-trips through the canonical hub request. Raising the tier raises
+  the bill and the operator pays it, so the field is now removed from
+  every request on the way through and replaced by the destination's own
+  tier. A new `service_tier:` key on a `providers[]` entry takes `flex`,
+  `standard`, or `priority`, translated to the vendor's wire spelling by
+  the provider catalog (OpenAI's `standard` is its `default`). Unset
+  sends no tier field at all and the vendor serves on its own default.
+  To run two tiers of one vendor, declare two entries with the same
+  `provider_type` and different tiers; the router treats them as two
+  candidates with independent weights, health, and observed latency. A
+  tier the catalog does not record for that vendor is refused at config
+  load, naming the tier and the vendor, rather than booting and serving
+  on a tier nobody chose. The Anthropic native-bypass path, which
+  rebuilds the request from the inbound bytes, carries the operator's
+  tier too. `sbproxy_ai_service_tier_decisions_total{disposition}`
+  counts the replacements, the strips, and the plain applications, so a
+  caller losing the tier they asked for is visible rather than silent.
+  See the service tier section of
+  [docs/ai-gateway.md](docs/ai-gateway.md) and the declared service
+  tiers table in [docs/providers.md](docs/providers.md).
+
+- **RFC 9421 verification refuses a stale `created`, and `@target-uri`
+  is the absolute URI the spec defines.** The freshness check enforced
+  only the future half of the window: there was no lower bound on
+  `created` at all. Since `nonce` is optional in the Web Bot Auth
+  profile, `required_components` can require a component but never a
+  parameter, and nothing in the tree wires `bot_auth`'s nonce store, a
+  captured `Signature-Input` / `Signature` pair with no `expires`
+  verified forever, which made the two headers an unexpiring bearer
+  token for whatever identity the `keyid` carried. `clock_skew_seconds`
+  is now the symmetric window both docs already described it as, and
+  `hmac_auth`'s hand-rolled copy of the stale check is gone so one
+  function owns it. Separately, `@target-uri` emitted the origin-form
+  request target where RFC 9421 §2.2.2 defines the full absolute URI,
+  and `@request-target` emitted draft-cavage's `METHOD /path` where
+  §2.2.5 is the bare target, so no conformant peer could interoperate in
+  either direction. Both derive correctly now, the proxy stamps the
+  listener's scheme and the `Host` authority onto an origin-form request
+  line so the reconstruction matches what a conformant signer signed,
+  and inbound verification accepts the old derivation for a deprecation
+  window, counting every acceptance on a new
+  `sbproxy_signature_legacy_derivation_total{component}` and logging it
+  once per process with the verifier's key id. Watch that counter go to
+  zero before the window closes. See the upgrade notes in
+  [docs/config-stability.md](docs/config-stability.md).
+
+- **Terminal actions now bound the request body they read, and run the
+  body policies they were skipping.** An action that answers inside the
+  request phase returns before Pingora ever calls `request_body_filter`,
+  so the streaming `max_body_size` check that guards a proxied request
+  never ran behind one. Three drains had no cap of their own: the AI
+  gateway's POST path, its PUT/PATCH path, and the linked Rust action
+  plugin arm. Each read the whole downstream body into a growing buffer
+  first and asked questions afterwards, so one client could size a
+  worker's allocation by choosing what to send. A `request_limit` policy
+  did not help: it rejects an honest `Content-Length` and otherwise only
+  records the cap for the streaming check, which these paths never
+  reach.
+
+  All three now read through one bounded reader. An oversize declared
+  `Content-Length` is refused before the first read, a chunked upload
+  that declares nothing is refused on the chunk that crosses the cap,
+  and both answer `413` ahead of provider dispatch, guardrails, and
+  idempotency capture, so no upstream is contacted and no cache or
+  idempotency record is written. The cap is `ai_proxy.max_body_size` on
+  the AI paths and `request_limit.max_body_size` on the action path;
+  where neither is set it is 64 MiB rather than unlimited, because a
+  bound that exists only once somebody configures it is not a bound. `0`
+  reads as unset and anything above 1 GiB is clamped. The reader also
+  keeps `bytes_in` on these paths, which the access log and the usage
+  meter previously read as zero for every AI request.
+
+  The linked action arm had a second gap: it ran the handler without
+  ever dispatching the `body_mode: buffered` bundle policies that the
+  header phase defers precisely because it has no body to give them. A
+  fail-closed policy on such an origin was never consulted and the
+  handler ran on content that policy would have denied. Those policies
+  now run in configured chain order before the handler, the same way
+  they already did for bundle actions, and each one's own
+  `max_buffer_bytes` is checked before every append rather than once the
+  read has finished, so a policy that declared a kilobyte never has the
+  host cap streamed past it. Reachability, stated plainly: every
+  action-plugin registration in this workspace is test-only, so a stock
+  `sbproxy` binary cannot reach that arm from `sb.yml`; a downstream
+  binary that links an action plugin reaches it with ordinary config.
+  See the `max_body_size` rows in
+  [docs/configuration.md](docs/configuration.md) and the linked-action
+  body section of [docs/architecture.md](docs/architecture.md).
+
+- Three log-redaction patterns (`api_key`, a `secret`-labeled 40-char
+  value, and `password`) consumed the key separator along with the
+  value, so a structured log line carrying one of those field names was
+  no longer valid JSON. The field-key denylist runs only on a line that
+  parses, so `prompt`, `messages`, `cookie` and bundle secret vars on
+  that same line were emitted unredacted. All three now preserve the key
+  and separator verbatim and mask only the value.
+
+- **The MCP run-as-user token exchange now fails the tool call rather
+  than dialing with a redirect-following client.** The exchange builds a
+  client with redirects disabled, because the POST carries the caller's
+  subject token in the form body and a `307` or `308` replays that body
+  verbatim at whatever host the `Location` names. If that client failed
+  to build, the call fell back to a default `reqwest` client, which
+  follows up to ten hops, so the fallback reinstated the exact hole the
+  no-redirect policy closes and did so only on runs where something had
+  already gone wrong. The tool call now returns an internal error
+  instead.
+
+  The egress section of [docs/security.md](../security.md) also said
+  outright that outbound dials pass a default-deny, DNS-pinned
+  authorizer. Neither half held unconditionally: a purpose stays
+  `ungated` until its sub-block under the top-level `egress:` section
+  sets `mode: deny_by_default`, and three of the wired purposes (AI
+  provider dispatch, the usage-sink webhook, and model-artifact
+  downloads) re-authorize each redirect hop but still let their HTTP
+  client resolve the host again at dial time. That page now says which
+  purposes are armed by what, and reading `GET /api/egress` for a row
+  still marked `ungated` is the way to tell what is actually enforcing.
+
+- `prompt_injection_v2` now preserves typed local-classifier failures,
+  fails closed with a generic 503 for mandatory policies, isolates
+  deterministic cache entries by verified model semantics, and exposes
+  bounded degraded health through metrics, events, Grafana, and the
+  authenticated admin API.
+
+- An MCP action running a colocated OAuth broker now refuses to compile
+  unless the broker issuer it derives from `external_base_url` and
+  `base_path` is listed in
+  `oauth.resource_server.authorization_servers`. A mismatch previously
+  left the verifier rejecting every token the colocated broker minted.
+  The key half of the same mismatch is refused separately at startup:
+  see the `public_jwk` entry.
+
+- An MCP action with an OAuth `resource_server` now checks the verified
+  token per operation: `tools/call` needs the `mcp.call` scope and every
+  other method needs `mcp.read`, matching the vocabulary `docs/mcp.md`
+  and `examples/mcp-oauth-discovery` publish. The mapping applies only
+  when `oauth.scopes_supported` advertises those names, so a deployment
+  using a scope vocabulary of its own is unaffected and keeps
+  per-operation authorization at its authorization server.
+
+- **A body-phase policy refusal now holds against an HTTP/2 upstream.**
+  `openapi_validation`, `request_validator`, `content_digest`,
+  `body_threat_protection`, `prompt_injection_v2`'s body scan, and the
+  A2A push-notification check all decide on the buffered request body
+  and refuse by aborting the upstream exchange. Pingora propagates that
+  abort on an HTTP/1.1 upstream and swallows it on an HTTP/2 one, so
+  against an h2 backend the upstream's own answer was forwarded to the
+  client and the refused body counted as admitted. Since every TLS
+  upstream negotiates h2 by default, that was the behavior for any
+  `https://` backend that offers it. The proxy now withholds the
+  upstream response and answers with the policy's configured status and
+  body on both protocols. If you worked around this by pinning a backend
+  to HTTP/1.1, you no longer need to.
+
+- **A config fragment and an extension bundle manifest no longer resolve
+  the compiling machine's secrets, and a config-authority bundle no
+  longer reads its host directly.** Three powers now belong to config
+  the operator wrote: naming a process variable (`${VAR}`,
+  `${VAR:-default}`, `{{env.X}}`), referencing a secret the resolver
+  reads straight off the host (`env:NAME`, `vault://env/NAME`,
+  `file:PATH`), and naming a host path through one of the config keys
+  that opens one (`rego_module_path`, `module_path`, `spec_file`,
+  `bulk_list.path`, `feed.cache_file`, `agent_skills[].url`,
+  `action.path`, the audit chain's four sinks, the access log's output
+  path, `extensions.bundles_dir`, the engine binary a `serve:` block
+  names, and the rest of the seventy-five in the docs). A config
+  fragment loses all three and resolves only the `{{vars.X}}` inputs its
+  caller binds. A config-authority bundle keeps `${VAR}` (the documented
+  way to name per-node values in a fleet) and loses the other two. An
+  extension bundle manifest may no longer resolve a secret for a config
+  var it supplied the value for itself, including a `secret://`
+  reference to a backend the operator declared, because guest code reads
+  its own config; a value the operator wrote in `sb.yml` for that same
+  var still resolves, and a signature on the bundle does not change
+  either half. A git-sourced document gets the same treatment when its
+  `source:` block sets the new `confine: true`, which defaults to
+  `false` so no existing GitOps repository changes behavior on upgrade;
+  an unconfined source whose document reaches for the host now logs one
+  warning naming the source and the first finding, at boot and on
+  refresh. Each refusal names the document and the field and never
+  echoes a value. The secret-reference power is the one a template check
+  cannot see: `api_key: "env:AWS_SECRET_ACCESS_KEY"` contains no
+  template syntax at all and reads the same secret as
+  `${AWS_SECRET_ACCESS_KEY}`. Publish validation and the subscriber both
+  run the check, so a payload cannot pass the authority and then be
+  refused fleet-wide. A `${VAR:-default}` default is treated as document
+  text throughout: the document is checked a second time with its own
+  defaults filled in, so a default cannot assemble a mapping key or a
+  secret reference the pre-substitution check never saw, and a default
+  that is itself a secret reference or an absolute path is refused
+  outright. Not closed: a remote document may still name a process
+  variable that resolves, which needs an operator-declared allowlist
+  this release does not add, and the host-path half is a list of config
+  keys rather than a rule about files, kept honest by a test that walks
+  every JSON Schema this repository generates, all six of them, for
+  every property whose name or description says it is a path.
+
+- Credential-bearing types no longer derive `Debug`. An AWS secret
+  access key, an Entra client secret, an inline GCP service-account key,
+  a HashiCorp Vault client token or AppRole `secret_id`, a cached OAuth
+  bearer token, a minted virtual key's one-time token, a plaintext
+  credential at rest, an RFC 9421 HMAC verification key or signing seed,
+  and a credential secret posted to the admin API all rendered in full
+  through any `{:?}`, which is one `anyhow` chain or one rejected
+  request body away from a log line. Each now has a manual `Debug` that
+  prints `[REDACTED]` for the reusable half and keeps the identifiers
+  that say which backend, role, or key failed. Redacting
+  `CredentialMaterial::Plaintext` covers every record that contains it.
+  Nine tests push a sentinel through each type and fail if it comes back
+  out.
+
+- Dial-time address checks refuse every IPv4-embedding IPv6 form, not
+  just `::ffff:a.b.c.d`. The NAT64 well-known prefixes (`64:ff9b::/96`,
+  `64:ff9b:1::/48`), the IPv4-translated SIIT form (`::ffff:0:a.b.c.d`),
+  and 6to4 (`2002::/16`) over a private or reserved address all passed
+  every range check, because `to_ipv4_mapped` and `to_ipv4` return
+  `None` for them. NAT64 is how an IPv6-only Kubernetes cluster reaches
+  IPv4, so on that network `64:ff9b::a9fe:a9fe` was a live route to the
+  cloud metadata endpoint from an unauthenticated request.
+
+- Every credential-bearing config type whose runtime twin was already
+  redacted now redacts too, and every runtime type whose config twin
+  was: the AWS secret access key and session token, the usage sink
+  Langfuse, Datadog and ledger-signing credentials, the outbound client
+  secrets, the legacy Vault token, the Web Bot Auth directory signing
+  seed and the OLP signing and content-key seeds, the RAG embedding and
+  vector store keys, the Stripe secret key, an imported LiteLLM provider
+  key, the event and alert webhook HMAC keys, the Consul ACL token,
+  seeded inbound keys and upstream credentials, the admin Basic-auth
+  password, and the inbound token the header sweep lifts out of a
+  request. A `redis://` DSN with a password in its userinfo now renders
+  as its origin. The registry that enforces this covers 58 types and its
+  detector no longer misses a rustfmt-wrapped derive or one separated
+  from its declaration by an ordinary comment.
+
+- Nineteen more credential-bearing types stop deriving Debug: inbound
+  API keys, bearer tokens and Basic/Digest passwords, the JWT HMAC
+  secret, the OIDC client and cookie secrets, stored refresh tokens,
+  outbound OAuth and vault secrets, AI provider keys, usage-sink write
+  keys, the CSRF and crawl-ledger signing keys, the admin session key,
+  mesh enrollment tokens, and the config-side twins of the Vault, Entra
+  and toolkit credentials. A CI guard now refuses a tree where any
+  registered type regains its derive.
+
+- OpenID Federation JWS verification checks a verifier-owned algorithm
+  allowlist before it resolves the attacker-selected `kid`, and binds
+  the header `alg` to the JWK's own `alg`, `use`, `key_ops`, `kty`, and
+  `crv`. Missing required claims are named explicitly, a future `iat`
+  outside five minutes of leeway is rejected, metadata-policy
+  composition stays monotonic across all seven operators, the trust
+  chain is walked anchor to leaf, and no error string interpolates a
+  URL, a credential, or a transport error.
+
+- OpenID Federation peer fetches run through the governed egress
+  machinery. A peer URL that resolves to a loopback, RFC 1918,
+  link-local, or CGNAT address is refused before any connect whether or
+  not egress is configured, and the dial is pinned to the addresses that
+  check resolved so a rebind between check and connect is refused too. A
+  new `egress.federation` sub-block adds the host, scheme, and port
+  allowlist and per-hop redirect re-authorization, and `federation`
+  joins the fourteen purposes reported by `GET /api/egress` and
+  `sbproxy_egress_refused_total`.
+
+- OpenID Federation peer-trust chain walks have a real fetch budget.
+  `proxy.federation.peer_trust.max_chain_depth` capped recursion depth
+  and was documented as the fetch budget; it is not one, because
+  `authority_hints` is an array and one entity naming five thousand
+  superiors cost five thousand outbound GETs at depth 1. With
+  `peer_trust` configured that made one unauthenticated request header
+  an attacker-directed request amplifier. Four new keys bound a walk for
+  real: `max_chain_fetches` (16), `max_chain_bytes` (2 MiB),
+  `max_chain_duration_ms` (5000), and `max_authority_hints` (8), all
+  refused at zero when the config compiles. No fetch is driven by an
+  unverified document either: every entity configuration is
+  signature-checked before its hints are read, against the pinned anchor
+  key set where the entity is an anchor and against its own published
+  `jwks` otherwise, and a configuration served at one URL claiming to be
+  another entity is refused. The decision cache is keyed on the source
+  address and the claimed entity id together rather than the entity id
+  alone, which a caller defeats by rotating it, and `walks_per_minute`
+  (30) limits walks per source.
+
+- Rotated access-log backups are made owner-only at each rotation, not
+  only when a sink opens the active file: an uncompressed rotation is a
+  rename, so backups written by an earlier build kept their old mode for
+  as many rotations as `max_backups` allows.
+
+- The access log, its rotated `.gz` copies, the decision event feed, and
+  the compiled file sink now create their files owner-only (`0600`) and
+  their own directories `0700`, closing the last five sinks that still
+  let the umask decide. Under the common `0022` they landed at `0644`,
+  so every account on the host could read the path, the identity, and
+  the decision for every request the proxy served. A file that already
+  exists at a wider mode is tightened when the sink opens it rather than
+  inherited, so a shipper or backup job running as a different user
+  loses access on the first write after an upgrade; run it as the proxy
+  user or point the sink at a fifo or `/dev/stdout`, which are left as
+  the operator set them. A directory that already exists keeps its mode,
+  so a shared `/var/log` is never narrowed.
+
+- The device-code consent POST requires a same-origin `Origin` or
+  `Referer` and a single-use form token bound to the signed-in subject,
+  and both `/verify` responses refuse framing.
+
+- The MCP OAuth broker canonicalizes IPv4-mapped IPv6 before every
+  private-range check, so the `::ffff:10.0.0.5` spelling of a private
+  address can no longer reach the CIMD fetcher or the OAuth egress
+  client.
+
+- The MCP OAuth broker no longer puts a raw `reqwest::Error` on a log
+  line when an upstream `/token`, token-exchange, or introspection call
+  fails. `reqwest` ends its `Display` with the request URL, and for a
+  broker that URL is an operator credential, so those three sites now
+  log `request_error_summary` instead.
+
+- The MCP OAuth broker refuses a zero `session_ttl_secs`, and a zero
+  `cimd_cache_ttl_secs` when CIMD is enabled, at startup. Either one
+  built a store whose every row expired before the round trip that would
+  read it, so the flow it backed could never complete; the broker booted
+  anyway and rejected every callback.
+
+- The MCP OAuth broker refuses an over-length URL-shaped `client_id`
+  instead of downgrading it. The bound was applied by returning `None`
+  from the CIMD detector, which fell through to the pre-registered
+  client path where the only gate is the `redirect_uri` allowlist, so a
+  deployment running both admitted the request with the metadata
+  document own `redirect_uris` and scope checks skipped. `/token`
+  applied no bound at all. Both now answer `invalid_client`, and the
+  bound is sized to fit under the session store key budget so the
+  refusal names the client id rather than a document that was never
+  fetched.
+
+- The MCP OAuth broker refuses three configurations at startup that used
+  to fail or downgrade at runtime: a `base_path` of `/` or empty, which
+  would capture every route on the origin; `device_code_enabled` without
+  a `broker_signing_key`, which could never mint the token it promised;
+  and an advertised `token_endpoint_auth_method` the broker cannot
+  process. Device authorization also answers `invalid_scope` for a
+  missing or unadvertised scope when `scopes_supported` is set.
+
+- **The project write boundary is an allowlist, and `origin_sources` is
+  denied to a config authority.** A project profile may set exactly the
+  origin fields `OriginProfileSpec` names. Everything else on an origin
+  is unrepresentable in a profile rather than merely rejected, so the
+  parser refuses the document and names the key. An origin has 53 fields
+  and gains more regularly, so a deny list would have made every future
+  field a silent privilege grant to every project repository, with no
+  review step that would catch it; a test enumerates the origin's fields
+  and fails when one lands on neither side. The deny list first
+  considered would already have missed `filters[].failure_posture` (a
+  project flipping a platform security filter to fail-open while the
+  config still advertises protection), `force_ssl: false`,
+  `response_cache` (an authenticated response cached and served to
+  somebody else), the `on_request` and `on_response` extension hooks,
+  and `allowed_methods`. A profile is also a confined document, so it
+  reaches the composing process environment through neither `${VAR}` nor
+  `{{env.X}}`, carries no `env:NAME`, `file:/path` or `vault://env/NAME`
+  reference, and names no host path the proxy opens: the one secret
+  spelling it keeps is a provider URI resolved against a backend
+  declared under `proxy.secrets`, which no project can write. A secret
+  written out in full is refused without the refusal echoing it, and the
+  check runs after inputs are substituted, so an entry binding a raw
+  token is refused the same way. `origin_sources` joins `source` on the
+  paths no config authority may set: `source` names one repository,
+  while this block names N of them, and the documents it pulls carry
+  Lua, WASM and JavaScript bodies the `{{ }}` interpolator deliberately
+  never reads. Its sibling `origin_defaults` stays authority-writable,
+  because that block is the platform raising a security floor, which is
+  what the channel exists for. In a `production` tier every entry must
+  pin a full commit sha or a tag spelled `refs/tags/<name>`; the tier is
+  a property of the runtime document rather than of an entry, because an
+  entry that could declare its own tier could declare its way out of the
+  rule.
+
+- The S3 Cache Reserve backend enforces `cache_reserve.max_size_bytes`
+  before it calls AWS. An oversized declared `Content-Length` is refused
+  up front, the body is read incrementally against a hard byte cap that
+  accounts for the GCM tag, and the AWS clients are built on first use
+  instead of at config compile.
+
+- A CoMP redeem now fails closed on a `quote_id` this process never
+  issued (`403 unknown_quote`, opt out with `comp.allow_unknown_quotes`)
+  and on a buyer acceptance whose `accepted_at` is unparseable, more
+  than five minutes ahead of the proxy clock, or older than a whole
+  quote validity window. `CompRedeemResponse` no longer derives `Debug`,
+  so a minted license token cannot reach a log line, a `dbg!`, or a
+  panic message.
+
+- The CoMP marketplace bridge is single-use per quote and bounded. A
+  second redeem of the same `quote_id` is refused with `403
+  already_redeemed`; a quote request past 50,000 live ledger rows is
+  refused with `429 quote_ledger_full`, counted like every other
+  refusal, so an unauthenticated flood on `POST
+  /.well-known/iab-comp/quote` cannot grow the process out of memory. A
+  catalog carrying more than one `authorization: olp` tier is now
+  refused at config load, because a redeem names no tier and would mint
+  whichever the manifest lists first.
+
+- The unauthenticated `POST /.well-known/olp/token` endpoint now carries
+  a per-source token budget.
+  `origins.<host>.olp.token_rate_limit_per_minute` (default 60, `0`
+  refused at config load) bounds how many Ed25519 bearer license tokens
+  one source IP can mint; past it the answer is `429 slow_down` with
+  `Retry-After`, counted as
+  `sbproxy_olp_decisions_total{outcome="rate_limited"}` and logged as an
+  `olp_decision` event. The budget is keyed on the raw socket peer, not
+  `X-Forwarded-For`, because a forgeable header is not an identity on an
+  endpoint that needs no credential.
+
+- A credential carried in a URL's userinfo is now masked wherever
+  secrets are redacted, including the YAML `GET /admin/config` and `GET
+  /admin/config/effective` return and the output of `sbproxy config
+  print`. `key_management.crypto.root_of_trust.address` is an unparsed
+  URL under a key name no pattern matched, so
+  `https://sbproxy:hvs.MUSTNOTAPPEAR...@vault.internal:8200` came back
+  in full while the `token` beside it was masked. The scheme and the
+  host survive the mask, so the route still says which key service is
+  configured. The URL's authority is matched by an allowlist, and there
+  are two, because one set could not serve both surfaces. The config
+  routes above take `[A-Za-z0-9]`, plus `-._~%:@`, plus the userinfo
+  sub-delims `!$&*+=`, so a base64-padded token such as
+  `hvs.CAESIQpAbCdEf=` is reached; the access log takes the same set
+  without `!$&*+=`, because a log line carries a caller's raw query
+  string, whose delimiters the caller chose rather than the renderer.
+  Neither set contains `"` or `\\`, so a deleted span can never leave
+  the JSON string token or the YAML scalar it started in. Userinfo
+  containing any byte outside the set that applies, including `,`, `;`,
+  `'`, `(`, `)`, `/`, whitespace, and any non-ASCII byte, is left
+  unmasked rather than masked halfway.
+
+- An origin that configures `sessions` or `csrf` together with
+  `response_cache` can serve one caller the `Set-Cookie` the proxy
+  minted for another. The cache key partitions on the `Cookie` header a
+  caller sends, so every caller that sends none shares one partition,
+  and a stored entry replays the session identifier or CSRF token
+  captured with it. This is long-standing behavior rather than a change
+  in this release, and it is now documented under "Who a cached entry
+  belongs to" in `docs/configuration.md` with the two remedies available
+  today: leave `response_cache` off on an origin that mints either
+  cookie, or raise `response_cache.epoch` to partition away from entries
+  already written. The third pairing, `abtest` with `response_cache`, is
+  refused at config load instead.
+
+- Updated Wasmtime and WASI to 46.0.3 and cap-std to 4.0.3, applying
+  upstream fixes for filesystem sandbox escapes and guest-controlled
+  host allocations (RUSTSEC-2026-0268 and RUSTSEC-2026-0269).
+
+### Added
+
+- **Audit chain viewer: `GET /api/audit/chain` and the console's Audit
+  view.** The four tamper-evident audit chains (`audit.path`,
+  `audit.config_path`, `audit.key_path`, `audit.admin_path`) were
+  CLI-only reads until now. The new route reads the chained files
+  themselves with channel, actor, and time-range filters plus cursor
+  paging, re-verifying every hash link and Ed25519 signature as it
+  reads; reads are windowed (streamed one record at a time, never a
+  whole-file load) and a verification failure is served in the response
+  with the first broken sequence and reason, alongside the records that
+  verified. A truncated or deleted chain file is reported as a failure
+  too: what is left of a truncated file links and signs perfectly, so
+  the read compares the walk against the number of records **this
+  process** wrote to that chain, which means it catches a truncation the
+  running proxy outlived and not one that survived a restart. The
+  console's Audit view renders the four channel cards, the merged entry
+  table, and a failure banner. GET-only, readable by the `read_only`
+  role; a login narrowed with `proxy.admin.operators[].tenant` is
+  refused, because the chains are deployment-wide and a per-tenant slice
+  of an audit trail reads as "nothing else happened". Read access is
+  wider than the bounded ring at `GET /api/audit/events` on two axes,
+  both stated in [docs/audit-log.md](docs/audit-log.md): history is the
+  whole chain rather than the last `max_audit_events` records, and each
+  entry carries the chained payload verbatim rather than the ring's
+  `detail` projection. No secrets cross either way; a deployment that
+  wants the trail narrower turns the channel's chain path off or fronts
+  the admin port. Every call is itself recorded on the admin channel
+  (`read_audit_chain`, or `read_audit_chain_denied` on the refusal). See
+  the audit-chain sections of [docs/audit-log.md](docs/audit-log.md),
+  [docs/admin-api-reference.md](docs/admin-api-reference.md), and
+  [docs/admin-ui.md](docs/admin-ui.md).
+
+- **`body_threat_protection`: structural JSON and XML request-body
+  limits.** A new `policies:` entry that refuses bodies by shape rather
+  than by content: a thousand levels of nesting to blow a recursive
+  parser's stack, a million-key object to soak CPU in hash insertion, an
+  XML DTD whose entities expand into gigabytes. JSON limits are
+  `max_depth` (64), `max_object_entries` (10 000), `max_array_items` (10
+  000), `max_key_length` (1 024 bytes), `max_string_length` (128 KiB),
+  and `max_containers` (50 000, objects plus arrays); XML limits are
+  `max_depth` (64), `max_elements` (10 000), and `max_attributes` (256).
+  Any single limit set to `0` disables that one check. A `<!DOCTYPE`
+  declaration is refused unconditionally and is not configurable, which
+  closes the entity-expansion class by construction rather than by
+  pattern. The JSON scanner is iterative with an explicit stack and a
+  hard 10 000-depth ceiling that holds even when the operator disables
+  the depth check, so the attack the policy exists to stop cannot
+  overflow the scanner itself. A violation answers `400` naming the
+  limit and the observed and allowed numbers, and never echoes body
+  content into the response, the log, or the audit record. `mode: tap`
+  logs and counts without blocking, for sizing limits against real
+  traffic before enforcing; the policy counter's `action` label keeps
+  the two apart. One thing to know if you are migrating from the
+  origin-level `threat_protection:` block: this policy has no body-size
+  knob. The successor to `json.max_total_size` is
+  `request_limit.max_body_size`, not a key here, and all three of the
+  policy's structs refuse unknown fields, so an invented one fails
+  config load instead of being silently ignored. See
+  [docs/api-security.md](docs/api-security.md#structural-body-threat-limits)
+  and
+  [examples/body-threat-protection/](examples/body-threat-protection/).
+
+- **First-class API deprecation: RFC 9745 `Deprecation`, RFC 8594
+  `Sunset`, and the successor and documentation `Link` relations.** A
+  `deprecation:` block on an origin or on a single forward rule stamps
+  the standard announcement headers onto the responses that rule
+  matches. Per-path deprecation, the normal case where `/v1/*` is going
+  away and `/v2/*` is not, was not expressible before: response
+  modifiers hang only off the origin, so it was the whole origin or
+  nothing. `deprecated:` takes a date or an RFC 3339 timestamp and emits
+  `Deprecation: @<unix>`, the structured-field Date the RFC requires; a
+  bare `true` marks the route for spec emission and metrics but emits no
+  header, because the draft-era literal `true` did not survive into the
+  final RFC. `sunset:` emits the HTTP-date form, and a sunset earlier
+  than the deprecation instant is refused at config compile rather than
+  shipped as a contradiction. `successor:` and `link:` emit the
+  `successor-version` and `deprecation` relations, appended so an
+  upstream's own `Link` headers survive. `after_sunset: gone` retires
+  the route with `410 Gone` and a JSON body naming the successor once
+  the instant passes; the default `serve` keeps proxying, so a forgotten
+  config never takes an API down by surprise. That refusal is
+  enforcement, so it also emits a `policy_violation` audit record with
+  `event_type: api_deprecation` carrying the tenant and the accountable
+  key id. `openapi_validation.deprecation_headers:` (off by default)
+  drives the same emission from operations a loaded spec marks
+  `deprecated: true`, and `/.well-known/openapi.json` marks
+  config-deprecated operations `deprecated: true` with
+  `x-sbproxy-sunset` and `x-sbproxy-successor` extensions, so the
+  published spec and the wire headers cannot disagree.
+  `sbproxy_deprecated_requests_total{origin, route, past_sunset,
+  outcome}` is the migration tracker: who is still calling, against
+  which announcement, and whether they are being served or refused. See
+  [docs/api-gateway.md](docs/api-gateway.md#deprecating-endpoints) and
+  [examples/api-deprecation/](examples/api-deprecation/).
+
+- **`hmac_auth`: signed-request authentication.** A new auth provider
+  for machine callers that prove possession of a shared secret by
+  signing each request (RFC 9421 HTTP Message Signatures, `hmac-sha256`)
+  instead of sending a static credential. Config is a `keys` list of
+  `key_id` + `secret` pairs (secrets resolve through the secret
+  resolver) with optional per-credential metadata, a
+  `required_components` list defaulting to `["@method", "@target-uri"]`,
+  and a `clock_skew_seconds` window (default 300) enforced against the
+  mandatory `created` parameter as the replay defense. Failures answer
+  `401` with a `WWW-Authenticate: Signature` challenge that never
+  carries key material. See the `hmac_auth` section of
+  [docs/configuration.md](docs/configuration.md) and
+  [examples/auth-hmac/](examples/auth-hmac/).
+
+- **Key-lifecycle events reach the SIEM feed.** The `events:` type list
+  grows to eighteen declared types with five key-lifecycle kinds.
+  `key_minted`, `key_revoked`, `key_rotated`, and `key_blocked` bridge
+  from the `key_audit` channel, so every admin mint, revoke, rotate, or
+  block of a key or upstream credential publishes one typed event beside
+  its audit-chain entry instead of a SIEM having to poll the admin API.
+  `credential_resolved` fires once per actual resolution of an upstream
+  credential's material (never per request), with `outcome:
+  stale_served` marking the start of a rotation grace window serving
+  through a secret-backend outage. That one is per outage, not per
+  request in the window; the per-serve count is the `cache="stale"`
+  series on the resolution histogram. Payloads are an explicit allowlist
+  (`op`, `resource`, the public id, actor, tenant, outcome, and closed
+  status labels), never the `key_audit` diff, a token, or a hash;
+  `events.types:` filters the new kinds like any other, and
+  `sbproxy_events_dropped_total` covers them. See
+  [docs/events.md](docs/events.md#key-lifecycle-events-the-dual-record).
+
+- **Key management gets its four operational metrics.**
+  `sbproxy_key_operations_total{operation, outcome}` counts every admin
+  key-lifecycle call at the dispatch seam, keeping `refused` (a 4xx the
+  caller can fix) apart from `error` (the store or governance backend
+  failed) so a busy console never reads as an outage.
+  `sbproxy_credential_resolution_duration_seconds{cache, outcome}` times
+  each bound-credential resolution and names the layer that answered,
+  with `stale` marking a grace-window serve rather than folding it into
+  `hit`. `sbproxy_key_lookup_cache_total{kind, outcome}` reports the
+  keystore TTL cache, including `negative_hit` as its own value so a
+  stampede of unknown keys stays visible. And
+  `sbproxy_audit_write_failures_total{channel}` counts audit emissions
+  that did not reach a sink they were promised, touching the series at 0
+  on every emission so an `increase()` alert has a baseline from the
+  first scrape; its two channels are the key-mutation trail (`key_path`)
+  and the admin-console action trail (`admin_path`), which is why it is
+  named for the audit signal rather than for the key plane. Every label
+  value is a compile-time constant, so none passes through the
+  cardinality limiter. The `sbproxy-security` Grafana dashboard gains
+  the matching panels. See the operational metrics section of
+  [docs/key-management.md](docs/key-management.md#operational-metrics).
+
+- **New metric `sbproxy_audit_chain_read_total{channel, outcome}`.** One
+  increment per chain walked per viewer read, with an `outcome` of
+  `verified`, `broken`, or `unreadable`; a refusal increments all four
+  channels with `denied`, because it refuses all four. A broken chain
+  that only a person looking at the console can see is a finding nobody
+  is on call for, and a tenant-scoped operator probing a deployment-wide
+  security surface is one whose only other record sits inside the chain
+  that operator was refused. Both leave the page: alert on
+  `increase(sbproxy_audit_chain_read_total{outcome!="verified"}[15m]) >
+  0`. That rule does not cover a chain file truncated at the tail and
+  read after a restart: the boot re-baselines on what is left, every
+  link and signature holds, and the read is `verified`. Pre-restart
+  records are covered by `sbproxy audit verify` against an offsite copy.
+
+- **`POST /v1/responses` resolves an object-valued `prompt` against the
+  gateway prompt store.** A request carrying `{"prompt": {"id": "...",
+  "version": "...", "variables": {...}}}` previously had the whole
+  object dropped in translation. The `id` now maps onto a stored prompt
+  name and `version` onto a stored version label, an absent version
+  takes the pinned default, and caller `variables` render into the
+  template before guardrails scan the result. One stored prompt serves
+  every configured provider, which is the part a dashboard-hosted
+  template cannot do. An unknown reference answers `404`, a malformed
+  object or a failed render answers `400`, and nothing falls through to
+  the raw input. Caller-supplied `variables` override an operator's
+  static `variables:` on a version, so a constraint that must hold
+  regardless of the caller belongs in the template text; see the
+  prompt-object section of [docs/ai-gateway.md](docs/ai-gateway.md).
+
+- **Reporting: multi-dimension spend aggregation and raw export on the
+  request log, with shareable filtered views.** `GET
+  /api/requests/report` aggregates the same filtered ring that `GET
+  /api/requests` serves into one row per composite group: `group_by`
+  takes any mix of `model`, `api_key_id`, `tenant`, and `user`
+  simultaneously, and each row carries request count, tokens in/out, and
+  estimated cost. `GET /api/requests/export` downloads the filtered rows
+  as CSV or JSONL, bounded by the ring cap and hardened against
+  spreadsheet formula injection. Every export is an audited admin action
+  (`export_request_log`, naming the format, the row count, and which
+  filter dimensions were set) and increments the new
+  `sbproxy_admin_request_exports_total{format}` and
+  `sbproxy_admin_request_export_rows_total{format}` counters, so every
+  export is recorded and alertable. That record covers the export route,
+  not every bulk read: `GET /api/requests?limit=<max>` returns the same
+  rows under the same cap with no record and no counter, so a detection
+  built on `export_request_log` alone covers the download button rather
+  than the whole read surface. The response is bounded by the ring cap
+  but materialized rather than streamed, because the admin dispatcher
+  answers with a whole body; what the row-at-a-time encoding avoids is a
+  second copy, not the response itself. All three routes share one
+  filter surface, which gains exact `model`, `tenant`, and `user`
+  filters, refuses a malformed `status`, `offset`, or `limit` with a
+  `400` instead of ignoring it, and treats an empty filter value as
+  "rows with nothing there", so the report's unattributed group drills
+  through to its own rows like any other. The admin console's new
+  Reports view drives them and serializes filter and grouping state into
+  URL query params, so a filtered report is a shareable link. See the
+  reporting sections of
+  [docs/admin-api-reference.md](docs/admin-api-reference.md) and
+  [docs/admin-ui.md](docs/admin-ui.md), and the worked example in
+  [examples/admin-reporting/](examples/admin-reporting/).
+
+- **Routing decision traces: `GET /api/routing-decisions` and the admin
+  console's Routing decisions view.** Every routed request (AI dispatch
+  or a load-balanced origin) now records a per-request decision trace:
+  the strategy or operator plan that decided, the ordered candidates it
+  weighed, the winner, the reason, the fallback chain actually
+  traversed, and timing. The record's open `detail` map is additive by
+  design so later explanatory columns land as keys, not schema changes.
+  Bounded in-memory ring sharing `proxy.admin.max_log_entries` with the
+  request log; server-side filters by origin, strategy, model (either
+  side of a substitution), provider, and time range. See the
+  routing-decisions sections of
+  [docs/admin-api-reference.md](docs/admin-api-reference.md) and
+  [docs/admin-ui.md](docs/admin-ui.md).
+
+- **`sbproxy_ai_translation_dropped_total{surface, field}` counts every
+  request field lost in translation.** `/v1/messages` and
+  `/v1/responses` now push a note for each unrepresented top-level
+  field, each dropped content block, and each extension attribute on a
+  block they keep, then emit one aggregated warn per request naming at
+  most eight distinct fields. `surface` uses the same `messages` and
+  `responses` values as `sbproxy_ai_surface_requests_total`, so a
+  drop-rate query joins the two. The log line to grep is `AI proxy:
+  request fields dropped in translation`, and it carries the origin and
+  tenant.
+
+- **`sbproxy_target_health_state`: per-target load-balancer health as a
+  Prometheus gauge.** Whether a target is actually taking traffic used
+  to mean polling `GET /api/health/targets`. It is a gauge now, on
+  LiteLLM's 0/1/2 deployment-state scale (0 healthy, 1 degraded with the
+  circuit breaker half-open, 2 excluded from selection), so Grafana
+  panels built against that convention port over unchanged. The value
+  folds all three exclusion mechanisms, active probe, passive outlier
+  ejection, and circuit breaker, and is sampled at scrape time from the
+  same pipeline walk that renders the admin endpoint, so the two
+  surfaces cannot tell different stories about one target. A target
+  dropped by a config reload leaves the scrape on the next render
+  instead of freezing at its last value. The `target` label is the
+  configured URL, or the load balancer's own `url#index` identifier when
+  one origin configures that URL more than once. A Target Health State
+  panel ships on the origins dashboard, and a Budget Utilization by
+  Scope panel on the AI gateway dashboard for the already-exported
+  `sbproxy_ai_budget_utilization_ratio`; headroom is `1 -
+  sbproxy_ai_budget_utilization_ratio` in PromQL, and there is
+  deliberately no separate remaining family, because a family and its
+  complement double the series without adding information. See
+  [docs/observability.md](docs/observability.md#budget-headroom-and-target-health)
+  and
+  [examples/health-and-budget-gauges/](examples/health-and-budget-gauges/).
+
+- **A signed extension bundle can ship a `runtime: rego` transform, not
+  just a policy.** A `kind: transform` hook on a Rego bundle attaches
+  under `transforms[]` by its `type` name and evaluates once per
+  buffered response body. Its input is `input.body.body_base64` (the
+  complete body, base64), `input.body.content_type`,
+  `input.body.origin`, and `input.config`; the pinned rule must return a
+  base64 string, which becomes the replacement body, bounded by
+  `sandbox.max_output_bytes`. An undefined rule is the transform
+  declining and the body passes through untouched. The module compiles
+  once per hook at candidate load and its query is proved evaluable
+  there, so a bad rule reference refuses the bundle instead of failing
+  every request. Bounded by `sandbox.budget_ms` plus the buffer and
+  output caps; `memory_mb` and `stack_kb` do not apply to Rego and are
+  now refused on a Rego manifest rather than accepted and ignored. See
+  the Rego transform section of
+  [docs/extension-bundles.md](docs/extension-bundles.md).
+
+- **Temporary, auto-expiring budget overrides on dynamic keys.** `POST
+  /admin/keys/{id}/budget-override` raises a governed key's effective
+  budget on top of its base caps (`max_tokens_increase`,
+  `max_cost_usd_increase`) until a `ttl_secs` or `expires_at` expiry,
+  after which the base caps resume with no operator action: expiry is
+  persisted on the key record and evaluated lazily at every budget read,
+  so it survives restarts and needs no sweeper. Read responses and the
+  console's Keys page show the base budget, the override with its
+  countdown and grantor, and the enforced `effective_budget`; `DELETE`
+  on the same path ends a raise early. Three points in the raise's life
+  land in the `key_audit` trail: `budget_override_grant` and
+  `budget_override_clear` name the operator who granted or ended one,
+  and `budget_override_expire` is the unattributed, time-driven end. All
+  three routes are counted on `sbproxy_key_operations_total{operation,
+  outcome}` alongside the other key mutations. See the temp-override
+  section of [docs/ai-gateway.md](docs/ai-gateway.md) and
+  [examples/temp-budget-override/](examples/temp-budget-override/).
+
+- **A hard price ceiling per request.** `max_price_per_request` on an
+  `ai_proxy` origin refuses a request whose estimated cost exceeds the
+  ceiling before any provider is chosen, rather than capping spend after
+  the fact the way a budget does. Callers can tighten it per request
+  with `x-sbproxy-max-price` (the header only ever lowers the effective
+  ceiling); a malformed or non-positive value is refused with 400 rather
+  than ignored. Each routing candidate, including a cascade's tiers, is
+  priced through the same resolution cost tracking bills with
+  (`model_prices`, rate card, built-in catalog, then a pessimistic $5 /
+  $5 fallback) against the model it would actually dispatch after
+  `model_map`. When every candidate is over the ceiling the request
+  fails closed with `402 price_ceiling_exceeded`, naming the ceiling and
+  each excluded candidate's estimated cost and price source, and it
+  writes a `security_audit` record so the refusal reaches a configured
+  `events:` sink like every other gateway refusal. Its attributed
+  outcome is `price_ceiling_block`, distinct from `budget_exceeded`. A
+  ceiling estimate includes the output allowance a configured
+  `reasoning:` budget will raise, so a reasoning request cannot dispatch
+  above a ceiling it priced under. See the per-request price ceiling
+  section of [docs/ai-gateway.md](docs/ai-gateway.md) and
+  [examples/price-ceiling/](examples/price-ceiling/).
+
+- **A pre-header streaming timeout that bounds the failover window.**
+  `resilience.pre_header_timeout_ms` on an `ai_proxy` origin bounds
+  connect through the provider's response headers on a streaming
+  request, and hands the request to the next candidate when it elapses,
+  where the origin's attempt budget defines one. Before this, a provider
+  that accepted the connection and then went quiet was bounded only by
+  `providers[].timeout_ms` (or the gateway's 30-second HTTP client
+  default), and that budget has to be long enough for a real completion,
+  so no failover happened for as long as it ran. The two budgets are
+  distinct: this one ends at the upstream response headers, `timeout_ms`
+  runs through the end of the response body. The key applies to
+  streaming requests only, is refused at load when set to `0` or written
+  at the action level instead of inside `resilience:`, and only ever
+  shortens an attempt, so a value above the attempt's own `timeout_ms`
+  (or above the gateway's 30-second HTTP client default when
+  `timeout_ms` is unset) never fires. On a cluster it also bounds a
+  `managed_model` served by another node, cold start included. A
+  failover it takes is labeled
+  `sbproxy_ai_failovers_total{reason="pre_header_timeout"}` rather than
+  `transport`. Which origins can take one is worth knowing before you
+  alert on that series: the attempt loop runs the whole provider order
+  only when the strategy is `fallback_chain`, when
+  `resilience.content_policy_fallback` is on, or when a typed fallback
+  list is configured. On any other origin, `round_robin` among them, the
+  budget has no successor to hand the request to, the caller gets a
+  `502` naming the budget, and that failover series stays silent through
+  the whole incident. What always ticks there is
+  `sbproxy_ai_provider_errors_total{provider,error_kind="timeout"}`,
+  which is what to alert on when the budget cannot hand anything on.
+  Past the response headers the request is committed to that provider
+  and a later candidate cannot replace output the caller is already
+  reading, so a stall, reset, or guardrail block there ends the stream
+  and ticks the new
+  `sbproxy_ai_stream_post_commit_failures_total{provider, cause}` with
+  `cause` one of `upstream_timeout`, `upstream_error`, or `guardrail`.
+  See the [pre-header streaming
+  budget](docs/ai-llm-aware-resilience.md#pre-header-streaming-budget)
+  and [docs/ai-gateway.md](docs/ai-gateway.md).
+
+- **A trust row on the AI Value dashboard.** Four panels on the
+  `sbproxy-ai-value` Grafana board read four metric families no
+  dashboard read before, so an operator can now see how much of the
+  spend figure is measured rather than guessed:
+  `sbproxy_ai_price_source_total` as the share of price lookups served
+  by the shipped catalog, an operator rate card, config, or the flat
+  fallback rate, which is the signal that spend, budget debits, and the
+  price ceiling are all comparing against a guess;
+  `sbproxy_ai_price_ceiling_total` split by outcome, where refusals
+  climbing behind steady exclusions means the ceiling now sits below the
+  cheapest available candidate; `sbproxy_ai_token_estimate_error_ratio`
+  as signed p05 and p95 error per model, where positive means the
+  estimator under-reserved against the budget it debited and negative
+  means it over-reserved and held rate-limit headroom the request never
+  used; and `sbproxy_ai_cost_saved_micros_total` as semantic-cache
+  dollars per hour avoided, joined to the Tenant dropdown through the
+  family's `tenant` label. All four families exist only once the feature
+  that writes them is configured, so each panel carries a second
+  `absent()` target drawn as a red `not reported` series. A red line at
+  1 means the family was never written and the panel is not measuring
+  anything; a flat zero with no red line is a measured zero. Each panel
+  description also names the dropdowns its family cannot honor: price
+  provenance, ceiling outcomes, and estimator error carry no tenant
+  label, and cache savings carries no `api_key_id`, so a saving cannot
+  be credited to a credential.
+
+- **The admin console shows requests the AI gateway refused before any
+  provider was called.**
+  `sbproxy_ai_admission_decisions_total{surface,reason,outcome}` and the
+  `ai.admission` decision record shipped with nothing in the console
+  reading either, so the one class of refusal that is invisible in
+  provider-side metrics, because no provider was called, was invisible
+  here too. The AI performance page now carries a `Refused before
+  dispatch` tile and a panel listing every `surface / reason` pair, with
+  the bounded label values rendered as the phrase they mean (`OpenAI
+  Responses`, `MCP tool block, which would reach an MCP server past this
+  gateway`) and the raw code kept beside them so a row still joins the
+  metric and the record. The counter is published on its first
+  increment, so a proxy that has never refused a request before dispatch
+  exports no family at all: the tile reads `not reported` rather than
+  `0`, because a flat zero over a measurement nobody has taken reads as
+  a healthy signal. A deployment whose only AI activity is refusals no
+  longer renders the page's empty state, which is the state an operator
+  opening the page to find that refusal would have hit. See the AI
+  performance section of [docs/admin-ui.md](docs/admin-ui.md).
+
+- **The admin console now reads three security signals that shipped with
+  writers and no reader.** Guardrails gained a CORS panel over
+  `sbproxy_cors_refusals_total{reason}` and an RFC 9421 panel over
+  `sbproxy_signature_legacy_derivation_total{component}`, which is the
+  number that has to reach zero before the pre-conformance `@target-uri`
+  / `@request-target` fallback can be removed; acceptance was otherwise
+  announced in one log line per process, which says a signer somewhere
+  has not moved and nothing about whether that is still true today.
+  Overview gained a certificate-store row over
+  `sbproxy_cert_store_degraded{backend}`, and raises a warning block
+  when the node is not persisting certificates: when the gauge reads 1,
+  because the configured backend could not be opened, and when it reads
+  0 on `acme.storage_backend: memory`, which opens cleanly and still
+  loses every certificate on restart. Both spend the CA rate limit for
+  the hostname by re-issuing on every boot. All three signals
+  distinguish an absent family from a measured zero, so a signal nothing
+  has ever incremented reads as "not reported" rather than as a healthy
+  zero, and a scrape that did not answer reads as "unavailable" rather
+  than dropping the row, and the CORS copy names the single reason the
+  counter covers (`wildcard_with_credentials`) rather than letting a low
+  total read as "every cross-origin request was allowed". See the
+  Overview and Guardrails sections of
+  [docs/admin-ui.md](docs/admin-ui.md).
+
+- **A pre-provider AI gateway refusal now reaches the SIEM as a typed
+  decision.** A `/v1/responses` body carrying `tools: [{"type": "mcp",
+  ...}]` asks the model provider to reach an MCP server directly, behind
+  this gateway's MCP governance. The gateway already refused it, but the
+  only trace was a free-text warn and a bare 400, which reads in a
+  metrics store exactly like a typo'd JSON body. Five refusal arms now
+  publish `ai.admission`, a nineteenth decision event: the three of the
+  inbound native-format shim (the Anthropic Messages translate, the
+  Responses stored-prompt bridge, and the Responses translate) and the
+  two of the shared stored-prompt resolver (a template that fails to
+  render, and a reference on a native surface that no prompt layer
+  holds), enabled with
+  `observability.log.decision_audit.events.ai.admission: true`. Each
+  record carries `surface` (`messages` or `responses` for a shim
+  refusal, and the surface the request arrived on for a resolver
+  refusal, `chat_completions` included) and `verdict`, a bounded reason
+  code such as `tools_mcp_unsupported`,
+  `previous_response_id_unsupported`, `store_unsupported`, or
+  `prompt_object_unresolved`, and the matching series lands on
+  `sbproxy_ai_admission_decisions_total{surface, reason, outcome}`. The
+  refusal message is deliberately not carried on either: several codes
+  interpolate caller bytes into it, and neither a metric label nor a
+  decision record's structured detail is scrubbed. Coverage is those
+  five arms only; a request refused later by a model gate, a guardrail,
+  a budget, or a policy still records under that plane's own event.
+
+- **AWS SigV4 request signing for Bedrock and SageMaker.** A new
+  `aws_sigv4:` block on a `providers[]` entry makes SBproxy compute the
+  `Authorization: AWS4-HMAC-SHA256 ...` header for each outbound
+  request, so Bedrock and SageMaker work without a signing sidecar or a
+  hand-rotated session token. `region` is required and is the credential
+  scope, independent of `base_url` the same way an AWS SDK's
+  `endpoint_url` override is, and it fills the `{region}` placeholder in
+  the provider catalog when `base_url` is unset. Credentials come from
+  the standard AWS provider chain by default, or from an explicit key
+  pair (`source: static`) or an STS role session (`source: assume_role`)
+  renewed 900 seconds before expiry, with a 600-second window in which a
+  failed refresh is logged rather than fatal. Secret fields
+  (`secret_access_key`, `session_token`, `external_id`) are dereferenced
+  at config load through `${VAR}`, `vault://`, `awssm://`, `secret://`,
+  and `file:`, an unresolvable reference is a hard error rather than a
+  value AWS rejects later, and the resolved bytes are held in a type
+  that renders `[REDACTED]` and zeroes on drop. An unusable `aws_sigv4:`
+  block is refused at config load, so `sbproxy validate` catches it.
+  Signing happens at the transport boundary, so it re-runs on every
+  retry and every redirect hop rather than replaying a signature bound
+  to the previous host. A signed provider sends no `api_key`; setting
+  both is refused at config load. Active health checks are skipped for
+  signed providers, since `bedrock-runtime` has no signable liveness
+  route. See the `aws_sigv4` section of
+  [docs/providers.md](docs/providers.md) and
+  [examples/ai-bedrock-direct/](examples/ai-bedrock-direct/).
+
+- **Bedrock guardrails inline on the Converse call.** A Bedrock provider
+  entry can now set `bedrock_guardrail: {identifier, version, trace}`,
+  which attaches `guardrailConfig` to the `Converse` request so AWS
+  evaluates the prompt and the completion inside the generation instead
+  of through a separate `ApplyGuardrail` call. Bedrock answers an
+  intervention with a 200 and `stopReason: guardrail_intervened`, which
+  previously relayed to the caller as a successful empty completion;
+  SBproxy now turns it into a 403 `guardrail_violation` under the
+  guardrail name `bedrock_guardrail`, records it on the
+  `ai.guardrail.output` decision feed, counts it as
+  `sbproxy_ai_external_guardrail_verdicts_total{provider="bedrock_inline",
+  outcome="block"}`, flags the billed tokens as `validation_failed`
+  waste, and writes nothing to the semantic cache or the idempotency
+  store. The block reason names the policy types and your own topic and
+  regex names, never the matched span, because a Bedrock assessment
+  quotes the caller's own text. The intervention is read off every
+  Bedrock response, not only off routes that set the new key: a
+  guardrail attached to the model or profile outside SBproxy produces
+  the same `stopReason`, and relaying that as a 200 was the bug. If you
+  run Bedrock today and see a `guardrail_intervened` response, it
+  becomes a 403 on upgrade; see
+  [docs/config-stability.md](docs/config-stability.md#a-bedrock-guardrail_intervened-response-is-now-a-403).
+  The key is refused at config load on any non-Bedrock provider, and a
+  route that also configures `guardrails.external[]` with `provider:
+  bedrock` gets one warning at load: both are legal, and AWS bills each
+  evaluation. There is no failure posture, because a bad guardrail
+  reference fails the generation call itself. Streaming requests are
+  guarded upstream and the client sees `finish_reason: content_filter`,
+  but they get no decision record. See
+  [docs/guardrails.md](docs/guardrails.md#bedrock-guardrails-inline-on-the-converse-call).
+
+- **Evidence records name the process that minted their sequence
+  number.** `mcp_governance_decision` records now carry
+  `sbproxy.evidence.instance` beside `sbproxy.evidence.seq`. The
+  sequence counter lives in proxy memory and starts every tenant at 1,
+  so two replicas serving one tenant each emit 1, 2, 3 and a restarted
+  replica emits 1 again after reaching 901: a SIEM grouping on the
+  tenant alone could neither find a hole nor deduplicate, and read a
+  restart as a 900-record rollback. The guarantee is now stated as what
+  it always was, gapless per `(sbproxy.evidence.instance,
+  sbproxy.tenant.id)`, and rules that group on the tenant alone should
+  add the instance. One case stays undetectable and is now documented as
+  such: a run whose tail was cut off looks the same whether the replica
+  was killed mid-stream or shut down cleanly. The proxy also has one
+  instance identifier now instead of three. The alert webhook envelope,
+  the callback webhook envelope, both surfaces' `x-sbproxy-instance`
+  header, and `sbproxy.evidence.instance` each derived their own from
+  the same host-plus-random-tag recipe, so one running proxy stamped
+  three different strings under one name and a receiver could not join
+  them. They all read the same value from today. See
+  [docs/events.md](docs/events.md) and
+  [docs/mcp-security.md](docs/mcp-security.md).
+
+- **A Mesh Admission and Storage dashboard, and alerts on both halves.**
+  `mesh_transport_inbound_rejected_total` and the two storage families
+  `sbproxy_storage_op_duration_seconds` and
+  `sbproxy_storage_op_errors_total` shipped with no panel and no rule on
+  any of the three dashboard trees, and all thirty-four `mesh_*`
+  families were uncharted: the one file that claimed to cover them,
+  `crates/sbproxy-observe/dashboards/mesh-overview.json`, spells every
+  metric `sbproxy_mesh_*`, which is not a sanctioned prefix and matches
+  nothing. The new `dashboards/grafana/sbproxy-mesh-storage.json` charts
+  the inbound refusal counter twice, once split by `reason` and once
+  regrouped so each line names one thing an operator can change (the
+  connection cap, mesh mTLS, or the peer), plus storage latency
+  percentiles overall and per operation, errors by `error_kind` and by
+  operation and record kind, throughput, and an error ratio taken
+  against the latency histogram's `_count` series, which is observed on
+  success and failure alike and so is genuinely bounded to 0 and 1.
+  Neither family is zero on a deployment that does not run the mesh with
+  its Redis backend; both are absent, and the mesh Redis backend is
+  still the only production caller of the storage layer. Two header
+  tiles say which case you are looking at, one from `mesh_node_isolated`
+  and one an `absent()` check on the storage histogram, and every panel
+  carries a no-data string instead of drawing a flat line at zero.
+  `SBPROXY-MESH-INBOUND-REJECTED` (ticket, runbook `RB-MESH-ADMISSION`)
+  fires off a recorded series that excludes `idle_timeout`, because the
+  client half of the transport recycles a connection only when it next
+  sends, so a quiet cluster reclaims idle peer connections by itself and
+  an alert covering all six reasons would page on housekeeping.
+  `SBPROXY-STORAGE-BACKEND-ERRORS` (ticket, runbook
+  `RB-STORAGE-BACKEND`) groups by `error_kind` so a disconnected backend
+  surfaces on its own, which is the rule
+  `crates/sbproxy-storage/src/metrics.rs` has asked for in its module
+  docs since it was written. A promtool test covers a connection-limit
+  burn, the idle-reclaim control that must stay silent, a five percent
+  disconnected rate, and an all-healthy control.
+
+- **Admin console: inbound peer admission on Cluster, storage backend
+  operations on Storage.** Three metric families that shipped with live
+  writers were named nowhere in the console, so nothing rendered them
+  and the only record of what they counted was a log line. Cluster now
+  carries an **Inbound peer admission** panel reading
+  `mesh_transport_inbound_rejected_total` off this node's own scrape
+  rather than the fleet aggregate, since the node a refusal landed on is
+  the part an operator can act on: peers turned away, connections closed
+  at the inbound ceiling, idle connections reclaimed, and every `reason`
+  listed with what it means. `idle_timeout` is counted apart from the
+  refusal total on purpose, because a quiet cluster reclaims idle links
+  by itself and folding those in makes an idle fleet look under attack;
+  alert on `reason!="idle_timeout"`. Storage now carries a **Storage
+  backend operations** panel reading
+  `sbproxy_storage_op_duration_seconds` and
+  `sbproxy_storage_op_errors_total`: operations completed, operations
+  that returned an error, p95 across every backend and operation, the
+  slowest `backend / op` pair, and failures by error kind. Both panels
+  distinguish an absent family from a zero one. All three counters
+  register lazily on first use, so a node that has refused nothing, or
+  on which no backend has run, publishes no family at all and the panel
+  says the counter is not reported rather than drawing a healthy-looking
+  zero over a signal nobody has observed. The reverse case is stated
+  too: a present latency histogram with no error counter is a true zero,
+  because the error counter only increments on failure. Both panels read
+  the `/metrics` scrape the console already consumes; no admin route was
+  added. See [docs/admin-ui.md](docs/admin-ui.md).
+
+- **Token limits, aliases, and groups on `GET /v1/models`.** Each listed
+  model now carries `context_window` and, where a rate card declares
+  one, `max_output_tokens`, resolved through the same lookup the
+  `ai.catalog` routing base data reads, so a policy and a client are
+  never told different numbers for one model. Both fields are omitted
+  rather than nulled when this process was not told the limit. The
+  LiteLLM rate card parser used to read the two cost keys and discard
+  `max_input_tokens` and `max_output_tokens`; it now carries both, for
+  every entry in the card rather than only the priced ones, so an
+  embeddings or image model publishes its window too. The listing also
+  gained the names it was missing: a `model_aliases` entry is listed
+  under its own name with the facts of the id it resolves to, gated on
+  that resolved id so an alias is never a way around `blocked_models`,
+  and a `model_groups` entry is listed with the union of its members'
+  capabilities and the floor of their windows, because a prompt has to
+  fit whichever member serves it. Every entry now carries `created`,
+  which the OpenAI `Model` object declares required and without which an
+  SDK-shaped client refuses to deserialize the response; the gateway
+  does not know a publication date and emits the epoch constant rather
+  than inventing one. `ai.catalog` gained `max_output_tokens` from the
+  same resolution, and its `context_window` now falls back to the rate
+  card's `max_input_tokens`, so a policy writing `ai.model in
+  ai.catalog` can now match a declared model that only the rate card
+  knows and that carried no price. See the model discovery section of
+  [docs/ai-gateway.md](docs/ai-gateway.md).
+
+- **Shadow evaluation against more than one target.** `shadow:` now
+  takes a `targets:` list, so one route can compare a primary against
+  several candidate providers at once. The single-target `shadow:
+  {provider: ...}` form still parses and means a one-entry list; an
+  empty `targets:` list and two entries naming the same provider are
+  both refused at config load, because the provider name identifies the
+  target on every metric and every ledger row. Each target takes its own
+  slot out of the same 16-task and 64 MiB admission ceiling, so a shared
+  bound cannot be multiplied by editing a config list; a target that
+  cannot get a slot is dropped as `saturated` while the others run.
+  Sampling draws once per request and every target compares against that
+  same draw, so target populations nest instead of diverging: everything
+  a `sample_rate: 0.1` target saw, a `0.5` target on the same route also
+  saw, which is what makes two targets comparable. Two new metric
+  families, `sbproxy_ai_shadow_calls_total{target, status_class,
+  finish_reason}` and `sbproxy_ai_shadow_latency_seconds{target}`,
+  report per-target outcomes. See
+  [docs/ai-gateway.md](docs/ai-gateway.md#shadow-eval) and
+  [examples/ai-shadow/](examples/ai-shadow/).
+
+- **Named model groups.** A `model_groups:` block on an `ai_proxy`
+  action binds one public model name to several deployments, each naming
+  a provider, the upstream model id that provider serves, and its share
+  of traffic. Members may serve *different* model ids, which is what the
+  same-model-name pool could never express: one group can front an
+  OpenAI model and an Azure deployment name at once. Each group carries
+  its own `routing:` and its own rotation cursor, independent of the
+  action's, so two groups never interleave each other's round robin and
+  a `weighted` group splits by member weight rather than by provider
+  weight. A group resolves on the dispatch path at the point a
+  `model_aliases` entry does, before every gate, so `blocked_models`,
+  the credential's allowlist, the per-model rate limiter, the budget
+  scope, and the price ceiling all judge the member's real model id and
+  never the group name. The pick is resilience-aware: an open circuit
+  breaker, an outlier ejection, or a failed health probe moves traffic
+  to a sibling member instead of refusing. A group with no member left
+  to pick refuses rather than routing to a provider nobody named: `403`
+  when the credential's provider policy forbids every member, `503` when
+  every member's provider is switched off. Either refusal logs the group
+  name and publishes an `ai.admission` decision record carrying
+  `model_group_forbidden` or `model_group_no_member`, so it reaches the
+  SIEM feed rather than only the client. Thirteen selection strategies
+  are accepted per group; `cascade`, `cost_quality`, `race`,
+  `semantic_route`, `prefix_affinity`, and `token_rate` are refused at
+  config load, because each dispatches through its own action-level path
+  a per-group pick never reaches. Config load also refuses a group that
+  shadows a served model, a `model_map` key, a `default_model`, or an
+  alias; an alias that resolves to a group; two members on one provider;
+  a member the provider does not serve; and an all-zero weighted split.
+  Groups appear on `GET /v1/models` and on the LiteLLM-parity `GET
+  /model_group/info`, the latter with per-member provider, model, and
+  weight. Every pick increments
+  `sbproxy_ai_model_group_selections_total{group, provider}` and writes
+  a `model_group: <name> -> <provider>/<model>` reason on the admin
+  routing row. See the model groups section of
+  [docs/ai-gateway.md](docs/ai-gateway.md) and
+  [examples/ai-model-group/](examples/ai-model-group/).
+
+- **Nine AI routing and reliability metrics are now on a dashboard, and
+  one of them alerts.** The AI Gateway board
+  (`dashboards/grafana/sbproxy-ai-gateway.json`) gains a routing and
+  reliability section covering
+  `sbproxy_ai_stream_post_commit_failures_total` by cause and by
+  per-provider share, `sbproxy_ai_key_fallbacks_total` by provider and
+  outcome, `sbproxy_ai_model_group_selections_total` by group and
+  member, `sbproxy_ai_cache_affinity_decisions_total` drawn against
+  `sbproxy_ai_cache_affinity_evictions_total` on one axis,
+  `sbproxy_ai_service_tier_decisions_total` by disposition,
+  `sbproxy_ai_request_timeout_override_total` by outcome, and
+  `sbproxy_ai_shadow_calls_total` and
+  `sbproxy_ai_shadow_latency_seconds` by target. Five of those families
+  are absent rather than zero until the feature behind them is
+  configured, so four `absent()` tiles head the section reading `In use`
+  or `Not in use` and every panel sets a `noValue` string saying which
+  kind of emptiness it is showing. A new ticket-tier alert,
+  `SBPROXY-AI-STREAM-POST-COMMIT`, fires when more than 1% of one
+  provider's accepted responses fail part way through the stream for 15
+  minutes. That failure is invisible everywhere else: response headers
+  already carried a 200, so the availability SLO scores it a success,
+  and failover is impossible past the commit point, so the caller is
+  handed a truncated body with nothing in the response saying so.
+  Guardrail terminations are excluded, because those are the gateway
+  enforcing what it was configured to enforce. See
+  [RB-AI-STREAM-POST-COMMIT](docs/operator-runbook.md#rb-ai-stream-post-commit)
+  and [SLO-AI-STREAM-COMMIT](docs/observability.md).
+
+- **Per-request timeout overrides, behind an operator opt-in.** A caller
+  can send `x-sbproxy-timeout-ms` to replace the selected provider's
+  `timeout_ms` for one request, but only on an `ai_proxy` origin that
+  sets `allow_request_timeout_override: true`, and only up to that
+  origin's `max_request_timeout_ms`. Both default off, and the flag
+  without a ceiling is refused at config load rather than defaulted,
+  because an unbounded caller timeout is the failure the gate exists to
+  prevent. With the flag off the header is ignored rather than refused,
+  so a caller hitting a fleet where only some origins opted in does not
+  collect 400s from the rest; the drop is counted on the new
+  `sbproxy_ai_request_timeout_override_total{outcome}` alongside
+  `applied`, `over_ceiling`, and `invalid_header`. A header above the
+  ceiling, or one that is not a positive whole number of milliseconds,
+  is refused with 400 `invalid_request_timeout` naming the accepted
+  range rather than silently clamped, so a caller does not build a retry
+  schedule on a budget it never got. The honored budget rides a
+  per-request clone of the AI client, so the race legs, cascade tiers,
+  and every retry attempt inherit it; the gateway's own semantic-cache
+  embeddings, semantic-route embeddings, and shadow copies deliberately
+  do not, and neither does a `managed_model` served by another node in a
+  cluster, which dispatches over the model plane. An honored header
+  replaces the gateway's 30-second HTTP client default as well as the
+  provider's `timeout_ms`, so the ceiling is the only thing bounding how
+  long one caller can hold a connection open. The ceiling bounds one
+  attempt, so `max_retries` and the candidate count multiply it. See
+  [docs/ai-gateway.md](docs/ai-gateway.md) and
+  [docs/headers-reference.md](docs/headers-reference.md).
+
+- **Pre-provider AI refusals are now on a dashboard and on an alert.**
+  `sbproxy_ai_admission_decisions_total` counts requests the gateway
+  refuses at the inbound native-format shim or the shared stored-prompt
+  resolver, before it dials any provider. Because nothing upstream is
+  contacted, those requests were invisible on every panel of the AI
+  Gateway dashboard: no provider error, no latency, no tokens, no cost.
+  An operator watching a client integration break saw traffic quietly
+  disappear. Three panels close that. "Pre-provider Refusals by Reason"
+  breaks the refusals down by bounded reason code, which is the label
+  that names the fix. "Pre-provider Refusal Share by Surface" divides
+  the refusals by `sbproxy_ai_surface_requests_total` on the same
+  `surface` label, an exact join because the surface counter increments
+  on arrival, and marks the 5 percent line the alert files at. "AI
+  Requests Arrived, Dispatched, and Refused" puts arrivals, provider
+  dispatches, and refusals on one axis so a gap that this funnel cannot
+  explain is visible as a gap. Both refusal panels declare a "no data"
+  string rather than drawing a zero: the metric family is registered on
+  first use, so an empty panel means no request has been refused since
+  start, not a broken scrape. A new recording rule,
+  `sbproxy:ai:admission_refusal_share:5m`, and a ticket-tier alert,
+  `SBPROXY-AI-ADMISSION-REFUSAL-SHARE`, fire when more than 5 percent of
+  one surface's arriving traffic is refused for 15 minutes, with a
+  `RB-AI-ADMISSION` runbook section that sorts the reason codes into
+  caller-side, prompt-layer, and malformed-body fixes. This is the one
+  class of AI failure the availability SLO cannot see: a refusal answers
+  4xx, so `sbproxy:slo:substrate:availability` reads 1.0 the whole time.
+  The alert ships with a promtool unit test carrying a firing case and
+  two controls, one of which pins that an absent refusal family records
+  no series rather than a healthy zero, and
+  `scripts/check-prometheus-rules.sh` now globs every test file instead
+  of naming one.
+
+- **Prompt-cache affinity.** A new `cache_affinity:` block on an
+  `ai_proxy` action routes a caller's repeated requests back to the
+  provider that already holds their warm prompt cache, so the cached
+  prefix is billed at the vendor's discount instead of being re-sent at
+  full price to whichever provider came next in the rotation. It keys on
+  the caller's own `prompt_cache_key`, or `user` when that is absent,
+  and never writes either field; a request that sends neither is routed
+  by the configured strategy alone. It is not a routing strategy: it
+  layers over whatever `routing.strategy` is set, `round_robin`
+  included, and only moves a live lease holder to the front of the order
+  that strategy produced. The four strategies that own their ordering
+  outright are left alone, and record no lease: `fallback_chain`,
+  `cascade`, `cost_quality`, and a `routing_policy` plan. It is a
+  preference, never a pin, so an unhealthy, breaker-open, ejected, or
+  policy-ineligible holder is skipped and a lease recorded against a
+  different resolved model is dropped rather than followed. The lease
+  identity is a digest over the tenant, the credential, the origin, the
+  API surface, and the caller's key, so one tenant's key can never steer
+  another's routing. `ttl_secs` (default 300) and
+  `max_keys_per_provider` (default 1024) bound the process-local table
+  and are refused at zero; the block sits beside `routing:` and is
+  refused with an explanatory error if written inside it.
+  `sbproxy_ai_cache_affinity_decisions_total{outcome}` reports `hit`,
+  `miss`, `missing_signal`, `ineligible`, and `model_changed`, and
+  `sbproxy_ai_cache_affinity_evictions_total{reason}` reports `ttl`,
+  `capacity`, and `model_changed`. See the prompt-cache affinity section
+  of [docs/ai-gateway.md](docs/ai-gateway.md).
+
+- **Provider eligibility by data-handling posture (ZDR / data-retention
+  allow-deny).** Every provider-catalog entry now declares a
+  `data_posture` block (`retains_data`, `zdr_available`, optional
+  `data_region`), seeded for every entry from each vendor's published
+  data-processing terms and pessimistic where no commitment is
+  published. A `data_posture:` block on an `ai_proxy` action
+  (`require_zdr`, `allow_data_collection`), or the per-request
+  `x-sbproxy-require-zdr` / `x-sbproxy-disallow-data-collection`
+  headers, gates provider eligibility as a hard candidate-set filter
+  ahead of every routing strategy, fallback order, cascade tier, race
+  fan-out, shadow dispatch, model listing, realtime session admission,
+  and the semantic cache's embedding call. `/v1/messages` and
+  `/v1/responses` are gated identically, because both reach routing as
+  the canonical chat body. A request left with no eligible provider
+  fails closed with a `no_posture_eligible_provider` error naming the
+  constraint and the excluded providers, and an origin whose own block
+  excludes every provider it configures is refused at config load rather
+  than left to deny every request at runtime.
+
+- **Provider-key failure fallback, with an explicit per-entry opt-out.**
+  An AI provider entry can now name an operator-held credential to retry
+  on when the provider refuses that entry's own `api_key` with a `401`
+  or `403`. Two keys on `providers[]`: `fallback_credential_id`, naming
+  a record under `key_management.seed.credentials[]` rather than a
+  second secret written into the origin, and `on_key_failure`
+  (`fallback`, the default, or `fail_closed`). Before this, a credential
+  rejection was terminal: it is not retryable, it opens no availability
+  failover, and it reached the caller verbatim. The retry is once per
+  request, against the same provider, and it does not spend the
+  availability budget. It never fires for a caller-owned native
+  credential: the caller presented their own key and the provider
+  refused it, so spending the operator's would bill the operator for
+  someone else's authorization failure. The fallback credential resolves
+  per request through the key plane, so it picks up a rotation with no
+  config reload and is refused across tenants; when it does not resolve,
+  the provider's own rejection stands and the warn names the credential
+  id, never the material. A new `credential_fallback` typed event
+  carries the provider, the credential id, the status, and `outcome`
+  (`engaged` or `unavailable`); the same pair is scrapeable as
+  `sbproxy_ai_key_fallbacks_total{provider,outcome}`, and `unavailable`
+  is the one to alert on, because a broken house credential otherwise
+  looks exactly like a broken tenant key. A new `credential_source`
+  field (`provider_entry`, `native_caller`, `fallback`) lands on the
+  admin request row and the usage ledger as the outbound counterpart to
+  `key_mode`. Key fallback owns `401`/`403` and nothing else; a `429`, a
+  `5xx`, or a timeout stays with the provider failover and
+  `cooldown_policy`, because a different key against a rate-limited
+  provider is still rate limited. See
+  [docs/multi-tenant.md](docs/multi-tenant.md#when-a-tenants-provider-key-is-refused)
+  and [examples/tenant-key-fallback/](examples/tenant-key-fallback/).
+
+- `sbproxy connect` points the coding agents installed on this machine
+  at the gateway, and `sbproxy disconnect` puts them back. It detects
+  Codex, Claude Code, Cursor, Cline, and Copilot; writes
+  `$CODEX_HOME/sbproxy.config.toml` as a Codex profile of its own (never
+  your `config.toml`) through a temp file and a rename, after taking a
+  one-time `.sbproxy.bak` copy; and prints the exports or
+  settings-screen fields for the rest. `disconnect` copies the profile
+  to `<path>.sbproxy.removed` before it unlinks it, so a hand edit made
+  after connecting survives the removal that the `.sbproxy.bak`, which
+  holds the file as it was before the first `connect`, was never going
+  to hold. `--dry-run` shows the unified diff and writes nothing. No
+  credential is read or written: the config names the environment
+  variable each client reads its key from. The four per-editor connect
+  pages collapse into `docs/use-case-connect-coding-agents.md`.
+
+- **The Security dashboard covers CORS refusals, RFC 9421 legacy
+  signature derivation, and certificate-store degradation, and a
+  degraded certificate store now alerts.** All three families shipped
+  with no panel, and the two counters and the one gauge go wrong in
+  three different ways if they are all charted as a flat line at zero.
+  `sbproxy_cors_refusals_total` is broken out by `reason`, because a
+  refusal count with no breakdown does not tell an operator what to fix;
+  the only value today, `wildcard_with_credentials`, names a config that
+  was applied before that pairing became a compile error and is still
+  running. `sbproxy_signature_legacy_derivation_total` gets both a
+  per-component rate and a 24h count, since the number that decides
+  whether the compatibility fallback can be removed is the one that has
+  to hold at zero across a full traffic cycle, weekly and monthly batch
+  callers included, not the one that is quiet this afternoon.
+  `sbproxy_cert_store_degraded` is a gauge and is queried as one, with
+  no `rate()`, and its panel carries a second `absent()` series: the
+  family is published only by a proxy that has an `acme` block, so an
+  absent series is a deployment that does not terminate TLS and is not a
+  healthy zero. `SBPROXY-CERT-STORE-DEGRADED` (ticket, runbook
+  `RB-CERT-STORE-DEGRADED`) fires off `max by (backend)` of that gauge
+  so one degraded pod in a fleet is not averaged away, and a promtool
+  test covers the one-of-two-pods case, the all-healthy control, and the
+  family-absent control.
+
+- **`semantic_route`: semantic (embedding-similarity) AI routing.** A
+  new AI gateway routing strategy that routes on what the request means:
+  each deployment declares its specialty as exemplar prompts or
+  precomputed centroids, the proxy embeds the request's final user
+  message through the configured embedding source (the semantic cache's
+  `provider` / `sidecar` / `openai` source shapes), and the best cosine
+  match above `min_similarity` pins that deployment. Below-floor scores,
+  promptless requests, and embedder failures all fall to the declared
+  `fallback` deployment (or round-robin), counted on
+  `sbproxy_ai_semantic_route_decisions_total{outcome}` and
+  `sbproxy_ai_routing_fallbacks_total`, never failing the request. A
+  missing embedding source or an unknown deployment name refuses at
+  config compile. Routing embeds are metered through the origin's
+  `quota_pool` like every other embedding call, and the exemplar index
+  is bounded: one build at a time, at most 256 exemplars, and a failed
+  build is negatively cached behind a retry floor that doubles from 30s
+  to 300s, so an unreachable embedder cannot turn each request into an
+  N-call amplifier. See the `semantic_route` section of
+  [docs/ai-gateway.md](docs/ai-gateway.md) and
+  [examples/semantic-routing/](examples/semantic-routing/).
+
+- **Shadow usage rows carry `shadow_of` and `finish_reason`.** A shadow
+  evaluation's ledger row had no way back to the request it evaluated,
+  so cost and latency per target could be totalled but not compared
+  against the primary they mirrored. Rows now carry `shadow_of`, the
+  primary's request id, as the join key, and `finish_reason`, which the
+  shadow path already parsed and then discarded and which is the
+  cheapest disagreement signal there is: one target stopping on `length`
+  where another stopped on `stop` truncated its answer, and no cost
+  comparison says that. `finish_reason` is a shadow-row field; the
+  primary's finish reasons stay on the request span as
+  `gen_ai.response.finish_reasons`, so comparing a target against the
+  primary on that axis joins the ledger to the trace. `shadow_of` is
+  carried as data and never as the ledger's dedup key, because the
+  correlation-id feature lets a caller choose the primary's request id
+  and a derived key would let one caller suppress another caller's rows
+  on replay. Both fields are absent on ordinary completions. Shadow
+  response *text* is still drained rather than retained, so what this
+  compares is numbers, not answers.
+
+- The **Spend console** now answers what a period cost against the
+  period before it, where the money went, what the gateway saved, and
+  how much of the figure is measured. `GET /api/usage/spend` is called
+  twice, once for the selected window and once for the equal-length
+  window before it (a new `from`/`to` client call over the same route,
+  no server change), so every figure above the fold is windowed and
+  durable: spend against the prior period, a run rate in dollars per day
+  with its basis window printed on the tile, unattributed spend promoted
+  from a table row to a headline, and blended cost per million tokens.
+  The chart is a two-series line of this window against the last with a
+  per-bucket and cumulative toggle, re-bucketed client-side to between
+  24 and 40 points so a 30 day window stops rendering 720 rows. The
+  breakdown carries share of window, dollar delta per row with `new` and
+  `gone` marked rather than shown as a zero, cost per million tokens,
+  and requests blocked before dispatch, and it groups by every dimension
+  the rollup accepts, with `tenant` and `agent` added to the selector.
+  Three panels below read the metrics scrape that no console view read
+  before: realized savings per lever from the semantic cache and context
+  compression, per-key budget headroom with money held in reserve as its
+  own bar segment, and a trust panel showing price provenance,
+  price-ceiling outcomes, and signed estimator error per model. Absent
+  is never rendered as zero: every block branches on whether the metric
+  family exists, so an unconfigured cache reads "not reported" while a
+  configured one that saved nothing reads `$0.00`. Two figures are
+  deliberately withheld and say so on the page: the dollars avoided by
+  refused requests, which nothing accumulates, and any per-key savings
+  total, which no attribution supports. See the Spend section of
+  [docs/admin-ui.md](docs/admin-ui.md).
+
+- **Typed fallback triggers: `context_window_fallbacks` and
+  `content_policy_fallbacks`.** Two new lists on the `ai_proxy` action,
+  siblings of `routing:`, each naming providers to reroute to for one
+  specific failure class. A chat prompt whose pre-flight token estimate
+  overflows the primary model's context window reroutes to a
+  larger-window provider before anything dispatches (streaming
+  included); a content-policy refusal reroutes to the aimed list instead
+  of the generic chain's next provider. Unknown provider names fail
+  config load, and nesting either key inside `routing:` or inside
+  `resilience:` is refused rather than silently ignored (the singular
+  `resilience.content_policy_fallback` boolean remains a real key
+  there). A new `resilience.cooldown_policy` maps the same failure
+  classes to provider cooldown seconds (a `429` can park a provider for
+  30s), fed directly by the dispatch loop's failure classification.
+  Provider cooldowns are counted on
+  `sbproxy_ai_provider_cooldowns_total{provider, cause}`, so a fleet
+  quietly parking providers is alertable. The admin request log gains a
+  `failover_trigger` column (`context_window`, `content_policy`, or
+  `generic`) and the LogsView failover badge names the trigger. See the
+  typed fallback triggers section of
+  [docs/ai-llm-aware-resilience.md](docs/ai-llm-aware-resilience.md) and
+  [examples/typed-fallbacks/](examples/typed-fallbacks/).
+
+- **Zone-aware target selection.** The load balancer prefers targets
+  whose `targets[].zone` matches the proxy's own zone and spills across
+  zones, per request, only when no same-zone target is healthy, so
+  cross-zone traffic is a failover path rather than a steady state. The
+  proxy's zone comes from a new `proxy.zone` key, with the `SB_ZONE`
+  environment variable as the fallback (config wins); a proxy with no
+  zone identity selects exactly as before and warns at boot when zone
+  labels are authored anyway. Locality runs as a narrowing stage between
+  the health filters and the priority filter, so it composes with every
+  algorithm, registered strategy, and deployment mode;
+  `locality.min_pool_size` (default 2) deactivates it for small pools.
+  The admin surfaces show the mechanism working: `GET
+  /api/health/targets` reports `proxy_zone`, per-origin `local_zone`,
+  and each target's `zone`, and `GET /api/requests` entries carry a
+  `zone_locality` verdict (`local` or `spilled`). The same verdict is on
+  the access log as a `zone_locality` field and on a new
+  `sbproxy_lb_zone_locality_total{origin, verdict}` counter, so
+  `rate(sbproxy_lb_zone_locality_total{verdict="spilled"}[5m]) > 0`
+  alerts on a cross-zone spill without the admin server enabled. Both
+  are absent, rather than empty, on a request the locality stage never
+  engaged for. This also reverses the short-lived compile refusal of
+  `targets[].zone`: the key is back, now that it routes. See the
+  zone-aware routing section of [docs/routing.md](docs/routing.md) and
+  [examples/multi-zone/](examples/multi-zone/).
+
+- A new `abtest` action splits traffic across weighted backend variants,
+  with a sticky cookie pinning a returning client to its first
+  assignment.
+
+- A new `ai_schema` transform validates AI provider responses against an
+  operator-supplied schema, with a `block`/`warn`/passthrough
+  `on_failure` mode independent of the pipeline's shared failure
+  posture.
+
+- A new `https_proxy` action relays a request to its own resolved host,
+  allow-listed by `allowed_hosts`, for wildcard origins that want to
+  narrow which hosts actually get proxied.
+
+- A new `license_leak` output guardrail scores AI responses against an
+  operator-supplied corpus of licensed documents and blocks, warns, or
+  logs on a confident match.
+
+- A new `pdf_markdown` transform (behind the opt-in `transform-pdf`
+  cargo feature) projects an `application/pdf` response body into
+  Markdown, the same shape `html_to_markdown` produces.
+
+- MCP `tools/call` requests can now be governed by a Cedar ABAC policy
+  (`cedar_policies:` on the `mcp` action), running alongside the
+  existing RBAC `tool_access` gate rather than replacing it.
+
+- New `sbproxy-federation` crate: OpenID Federation 1.0 entity
+  statements, JWS sign and verify, RFC 7638 key thumbprints, a
+  well-known issuer, and a trust-chain resolver, backed entirely by
+  in-process memory (no Postgres, sqlx, or Redis dependency).
+
+- New `sbproxy-licensing` crate: IAB CoMP marketplace bridge (manifest,
+  signed quote, redeem), minting license tokens in the OSS OLP wire
+  format on redeem so they verify against an origin's own
+  `/.well-known/olp/introspect`; no Postgres, ClickHouse, or NATS
+  dependency.
+
+- New `sbproxy-mcp-gateway` crate: a standalone MCP OAuth 2.1 broker
+  (PKCE, DPoP, mTLS-bound tokens, device-code grant, RFC 8707/8693/7591)
+  plus a resource-server companion, both backed by an in-process store
+  with Redis as the optional multi-replica backend.
+
+- Ported `sbproxy-classifier`, a rich multi-tenant classification
+  sidecar (gRPC + TCP/MessagePack) with quality scoring, PII-redacting
+  normalization, intent/content-type detection, and per-token streaming
+  safety, plus a `FallbackClassifier` in `sbproxy-classifier-client`
+  that degrades to the existing in-process ONNX classifier when no
+  sidecar is deployed or reachable.
+
+- Two new policies, `geoip` and `user_agent_parser`, resolve client
+  geography and parse the User-Agent header into typed data for identity
+  and anomaly hooks, and optionally as X-Geo-*/X-Parsed-Ua upstream
+  headers.
+
+- Added the bounded live AI toolkit: scoped governed agent workflows,
+  immutable offline-evaluation datasets, stable weighted prompt
+  rollouts, authenticated admin and CLI operations, typed content-safe
+  events, one closed-cardinality Prometheus family, Grafana panels, and
+  no-Redis examples.
+
+- New `sbproxy_classifier_client_fallback_total{reason}` counts every
+  classifier call the proxy served from its in-process fallback, and the
+  matching warning is held to one line per reason per 60 seconds.
+
+- **The AI request span carries `sbproxy.ai.intent`.** The detected
+  intent category was recorded on an undeclared field, which the tracing
+  core dropped, so it reached neither a span exporter nor a trace
+  backend. It now sits on the request span under the same spelling the
+  access log uses.
+
+- A buffered AI response records `usage_source` on the access log the
+  same way a streamed one does, so filtering for invoiceable rows no
+  longer drops every non-streaming AI request.
+
+- A colocated MCP OAuth broker is visible to an operator. `GET
+  /admin/mcp-oauth` on the proxy admin API reports every `mcp` action
+  carrying an `oauth.broker` block, what each has wired in, and whether
+  a resource server is configured to check the tokens it mints. The
+  broker own `GET {base_path}/admin/status` stays unmounted in process,
+  because that route tree sits on the public MCP origin ahead of the
+  resource-server check; this is the same JSON behind operator auth,
+  matching what `GET /admin/federation` does for the federation half.
+
+- **A credential provider lock on an AI cascade is now visible to the
+  caller, the admin console, and Prometheus.** A cascade that dispatched
+  no tier because the credential's `provider` policy excluded every one
+  of them used to be indistinguishable from a dead upstream on every
+  surface. The `502` now carries the RFC 9209 error token
+  `credential_provider_locked`: on `Proxy-Status` where the origin sets
+  `proxy_status.enabled: true`, and in the problem document's `detail`
+  field where it sets `problem_details.enabled: true`. Both surfaces are
+  opt-in, as they already were for every other error token, and an
+  origin with neither still returns the plain `bad gateway` body. The
+  token is all the caller is told, so no policy contents, key ids, or
+  provider names cross the boundary. The request's admin Routing
+  Decisions row carries the reason, metering classifies it as a policy
+  denial rather than an upstream failure, and the refusal reaches a
+  configured `events:` sink as a `policy_denied` record.
+  `sbproxy_ai_cascade_tier_outcomes_total` gains the closed `outcome`
+  values `credential_lock`, `data_posture`, `disabled`, `not_found`, and
+  `unhealthy`, all of which used to be filed under `retry` alongside
+  real dispatch failures; `retry` still counts every tier that
+  dispatched and did not produce an accepted response, so existing
+  alerts on it are unchanged.
+
+- Added a shared embedded state store, a `PersistentKv` and
+  `EphemeralKv` pair backed by redb, so subsystems that need durable
+  state get one ACID store rather than a database dependency each. Every
+  operation runs on tokio's blocking pool, since a redb write ends in an
+  fsync and holding an executor thread through one stalls whatever else
+  it was scheduled to run. Metric families across the new modules
+  register without `expect`, so a duplicate or malformed family name
+  logs an error rather than panicking inside whichever request first
+  reached the new code path.
+
+- Added `proxy.agent_registry`: an owner-approval queue for agents that
+  register themselves, plus a signed agent catalog verified with Ed25519
+  over canonical JSON, both on one embedded store with no database
+  behind them. A reviewer's decision is durable and keyed on the
+  fingerprint of the description they decided about, so a rejected or
+  revoked registration is refused for good and an approved description
+  cannot become a second agent with its own credentials. The admin
+  surface honors the operator tenant from `proxy.admin.operators`: a
+  tenant-scoped operator sees and acts only inside its own tenant, and
+  the deployment-wide catalog listing and feed refresh are refused
+  rather than silently narrowed. The configured feed is read at boot and
+  on a timer derived from `stale_grace_secs`, the catalog reports on
+  `/readyz` as `agent_catalog`, and the whole block is boot-only: a
+  reload that changes it is refused by name rather than accepted and
+  ignored. Decisions publish an `agent_registration_decided` event and
+  appear on a new Agents page in the admin console.
+
+- Added `proxy.notifications`: outbound webhook subscriptions with
+  per-subscription event filters and signing keys, three backed-off
+  delivery attempts, and a durable deadletter queue with paged listing
+  and replay, all on one embedded store. A filter is an exact event
+  name, a family prefix like `key_*` anchored on the separator, or `*`;
+  a wildcard that reaches the per-request lifecycle events needs
+  `allow_firehose: true` in the same call, because one webhook delivery
+  per proxied request is not a rate this worker can serve. A replay
+  drops its record only once the worker has taken the delivery, so a
+  full queue answers `429` with `replayed: false` and keeps it. Like the
+  registry, the block is boot-only and a reload that changes it is
+  refused by name. Manage subscriptions from the new Notifications page
+  in the admin console.
+
+- Added two optional destinations for the request-event stream:
+  `request_events.sink: nats` publishes one message per event to a NATS
+  subject tree, and `sink: clickhouse` inserts batches over the HTTP
+  interface. Neither adds a dependency, and a delivery watermark in the
+  shared embedded store replaces the reconciliation table. The NATS
+  client reads the server's `INFO`: a message past `max_payload` is
+  skipped and counted rather than killing its batch, and a broker
+  advertising `tls_required` is refused at connect rather than handed
+  the authentication token on a plaintext socket. `request_events` is
+  boot-only and a reload that changes it is refused by name.
+
+- AI gateway: a non-streaming provider call is now cancelled when the
+  caller's connection breaks while the model is still generating,
+  instead of running the generation to completion and billing for a
+  response nobody received. The signal is the downstream connection
+  itself and never a timer: a TCP reset or read error on HTTP/1, or an
+  `RST_STREAM` or `GOAWAY` on HTTP/2. A bare HTTP/1 half-close never
+  cancels by default, because RFC 9112 section 9.6 makes it
+  indistinguishable from a client that has simply finished sending; such
+  a client keeps its generation until a write to it fails, unless the
+  origin sets `cancel_on_half_close`. The cancelled call settles on the
+  `client_disconnected` receipt outcome, carries
+  `error.type=client_disconnected` on its span, and is counted on
+  `sbproxy_ai_provider_attempts_total{outcome="client_disconnected"}`.
+
+- AI gateway: new `cancel_on_half_close` boolean on the `ai_proxy`
+  action (default `false`). Off, a downstream HTTP/1 half-close is not
+  treated as the client leaving, because RFC 9112 section 9.6 makes it
+  indistinguishable from a client that has finished sending and is
+  waiting to read. On, that half-close cancels the in-flight provider
+  call and the request bills as `client_disconnected`, which is what
+  makes the common HTTP/1 abandonment (a caller whose own deadline fired
+  and closed its socket) reachable. Enable only when your clients never
+  half-close after sending. HTTP/2 stream resets and TCP resets cancel
+  either way.
+
+- Behavioral anomaly detection: a rolling per-tenant, per-agent-class
+  window over the TLS fingerprint, resolver-source, headless-library,
+  and per-address rate signals the proxy already collects, flagging what
+  sits in the long tail. `AnomalyDetectorHook` had been declared and
+  dispatched since Wave 5 with nothing implementing it, so the verdict
+  loop ran over an empty list on every request. Verdicts now reach
+  `sbproxy_anomaly_detected_total`, a structured log line, a typed
+  `anomaly` decision-audit record, and a per-tenant reputation score on
+  `sbproxy_agent_reputation_score`. The score is advisory until an
+  operator sets `proxy.anomaly.reputation.deny_below` or
+  `challenge_below`, which turn it into an admission decision; both are
+  unset by default. See
+  [docs/anomaly-detection.md](docs/anomaly-detection.md).
+
+- Cache Reserve gains an object-storage backend: S3, Google Cloud
+  Storage, Azure Blob, or a local directory, with optional AES-256-GCM
+  sealing before an entry leaves the process. Entries are named by the
+  SHA-256 of their cache key, fanned out two levels. A new
+  `sbproxy_cache_reserve_errors_total` counter makes a failing cold tier
+  visible, since every reserve error is swallowed on the request path by
+  design; `operation="init"` is the one to alert on, because a backend
+  that never built reads as flat zero on every other reserve series. New
+  background behavior worth knowing before you point this at a paid
+  bucket: the proxy now runs the reserve's expiry sweep every fifteen
+  minutes, listing and reading at most 1,000 objects per tick and
+  resuming where the previous tick stopped. A bucket lifecycle rule is
+  still the answer at scale. See
+  [docs/cache-reserve.md](docs/cache-reserve.md).
+
+- Cache Reserve reports its own health. A `cache.reserve.health`
+  decision record names the backend, state, and a closed reason code on
+  every transition; `sbproxy_cache_reserve_degraded` and
+  `sbproxy_cache_reserve_health_transitions_total` chart it; and `GET
+  /admin/cache` carries a bounded `reserve` object. A reserve that fails
+  to initialize or starts failing at runtime is now visible instead of
+  silently absent, and the health state belongs to its pipeline
+  generation so a config reload cannot leave a stale gauge behind.
+
+- **A fallback taken is now scrapeable.**
+  `sbproxy_fallback_total{trigger, origin, tenant}` counts every
+  `fallback_origin` response served, with `trigger` either `status` (the
+  primary answered with a status listed under `on_status`) or `error`
+  (the primary failed outright and `on_error` caught it). Until now the
+  only evidence a fallback had fired was the `fallback_triggered`
+  boolean on an access-log row, so alerting on "the fallback is carrying
+  checkout.local" meant scraping logs. A fallback is a degraded response
+  by construction, and its rate is the first number worth an alert when
+  a primary starts failing. Drawn on the Origins dashboard
+  (`dashboards/grafana/sbproxy-origins.json`).
+
+- **`GET /admin/origin-composition`.** Which project repositories this
+  node's configuration pulls, what hosts each one claims, and the
+  platform floor every composed origin starts from, read off the
+  effective config with nothing fetched. `origin_sources` names the
+  hosts itself, so the pin state and the two-writers-one-hostname check
+  are both properties of the document: an operator sees a collision
+  before an aggregation run does, and `sbproxy validate` refuses it at
+  config load. A repository URL is credential-stripped, an entry
+  credential is reported as present or absent and never by value, and an
+  input is reported by name only, because an input value is exactly
+  where a secret reference lands. The metric
+  `sbproxy_origin_source_entries{tier,pinned}` carries the same two
+  facts for alerting, with a panel on the origins dashboard. All four
+  series are written every time a pipeline is applied, including the
+  apply where the block is gone, so deleting it shows up as the drop to
+  zero the panel describes and promoting a document between tiers does
+  not leave the old tier's series standing. They are written at the
+  apply seam rather than at config compile, because compile also
+  validates candidate documents and an authority payload can never carry
+  the block. See
+  [docs/admin-api-reference.md](docs/admin-api-reference.md#get-adminorigin-composition).
+
+- MCP OAuth enforcement decisions reach an operator:
+  `sbproxy_mcp_gateway_decisions_total` counts the resource-server 401,
+  the per-operation scope refusal and its fail-open twin, the
+  `/authorize` limiter, the session-capacity refusal, the stale
+  AS-metadata fallback, and the consent CSRF refusal, each with a
+  decision log line and a typed audit record.
+
+- **Project-owned origin profiles: `origin_defaults`, `origin_sources`,
+  and the composition resolver.** A project repository can now commit
+  the part of the proxy config it actually knows about. It ships a
+  hostless profile at `sbproxy/origin.yaml` declaring its action,
+  policies, transforms and the inputs it needs from whoever deploys it,
+  and never names a hostname, because a hostname is an environment fact.
+  The runtime config keeps `proxy:`, the new `origin_defaults` floor
+  every origin starts from, and the new `origin_sources` list saying
+  which project repositories to pull and what hosts each answers on. A
+  service team changes its own rate limit by merging in its own
+  repository, and the platform team adds a WAF default no project can
+  switch off. One profile may declare more than one origin from day one,
+  so `entry.hosts` binds a map of profile origin name to hosts rather
+  than a bare list. Layering is `origin_defaults`, then the profile
+  `base:`, then the profile `environments.<env>:` the entry selected,
+  then the entry `overrides:`, so the runtime bookends the stack.
+  `policies`, `transforms`, `request_modifiers` and `response_modifiers`
+  merge entry by entry against a `name:` key while every other list
+  replaces wholesale, which means `policies: []` in a project profile
+  leaves the floor intact rather than deleting it. `locked: true` on a
+  default refuses a project override and names the policy, the profile
+  and the entry, and refuses the three ways a project could otherwise
+  reach the same effect without one: an addition sharing the locked
+  entry's `type:` or its header paths, an addition carrying a script
+  body into a modifier list that holds a lock, and an override of an
+  unlocked entry that rewrites it into a locked entry's mechanism. A
+  lock binds what an entry does, not what it is called; `disabled: true`
+  drops an unlocked default and records the drop, because there is no
+  delete verb and an absence leaves no record. Composition runs in one
+  aggregator and publishes through the config authority that already
+  exists, so a node keeps the subscriber it has and never clones a
+  project repository. Both blocks are checked at config load rather than
+  at the aggregator: every top-level key must be a real origin field,
+  every merged-list entry must carry a `name:`, and every
+  `origin_defaults` policy and transform must name a `type:` some module
+  answers to, because neither block carries `deny_unknown_fields` and a
+  misspelling used to surface at the far end of a GitOps loop. A
+  document that declares an extension bundle source warns on an
+  unrecognized type instead of refusing it, because the built-in list is
+  not the whole vocabulary and config load cannot resolve what a bundle
+  provides. This release ships the schema, the resolver and the config
+  blocks; the aggregator command itself follows. See
+  [docs/configuration.md](docs/configuration.md#project-owned-origin-profiles)
+  and [examples/origin-profiles/](examples/origin-profiles/).
+
+- `proxy.federation` serves its entity configuration with a
+  `Cache-Control` directive and `authority_hints` a peer can chain, and
+  `proxy.federation.peer_trust` verifies a caller claimed entity against
+  pinned trust anchors on the request path. `GET /admin/federation`
+  reports both.
+
+- **Shadow evaluation gains a comparison surface.** The dispatch half of
+  shadow eval could tell you a candidate provider cost less and answered
+  faster; it could not tell you whether the candidate answered *worse*,
+  because the target's response text was drained. Retention now rides
+  the same two-sided gate the primary content store uses (the origin's
+  `capture_content` **and** the calling key's `allow_content_capture`),
+  so with either side off no sink is installed and the text is never
+  held rather than held and discarded. The pair is whole or absent: a
+  target's answer whose primary was not captured is refused by the store
+  rather than kept on its own, and an answer is never written into a
+  sample belonging to a different tenant, because the store key is a
+  correlation id a caller can choose and a shadow answer arrives from a
+  task that outlives its request. Retained pairs arrive on the existing
+  `GET /api/requests/{id}/content` under `shadow_responses[]`, through
+  the same redaction stack and payload cap as the primary's own answer,
+  capped at eight targets per request.
+
+  A new `GET /api/ai/shadow/report?window=15m|1h|24h|7d|30d` folds a
+  window into one row per target, and it leads with provenance (requests
+  seen, the sample rate applied, pairs retained, pairs dropped by
+  reason, and the three sum) because a delta over four pairs and a delta
+  over four thousand read identically once each is a single number.
+  Under that: cost delta per request and extrapolated to the eligible
+  population, latency delta at p50 and p95 rather than a mean because a
+  mean hides the tail regression that kills a migration, the
+  finish-reason distribution, error rate by class, and a
+  `cost_to_decide_usd` line, every one of them over the same retained
+  pairs. The ring behind it holds the last 512 requests that reached
+  per-target admission, and `provenance.evicted_before_primary` counts
+  the requests that left it before their primary leg landed, so a report
+  over a saturated ring says its counts are a truncated sample instead
+  of certifying them. A copy that has been admitted and has not answered
+  yet is counted under `pairs_dropped.not_reported` and stays off the
+  error axis, so `errors.shadow_rate` does not climb with concurrency on
+  a target whose every call succeeds. Both sides of the cost delta are
+  priced on the vendors' prompt-cache counters, so a candidate serving a
+  warm prefix is not reported as dearer than the primary it beat.
+
+  A `shadow.judge:` block configures the batch judge that will score
+  agreement, and takes three keys: `provider`, which is resolved against
+  this action's `providers[]` at config load and refused when it names
+  nothing; `max_spend_usd`, required and refused at zero because an
+  unbounded judge is the failure the key exists to prevent; and
+  `spend_window`, `daily` or `weekly`, both rolling from when the window
+  opened rather than from a calendar boundary. One `max_spend_usd` is
+  one ceiling for the whole block: every target under one `shadow:`
+  draws on the same budget rather than getting a copy of it. Nothing
+  behind the key runs yet. The deterministic divergence pre-filter and
+  the cap are implemented and tested and have no caller, because the
+  batch job that would call them is the judge prompt and the scoring
+  loop, which are a scoped follow-up; the block's entire runtime effect
+  today is that `agreement.status` reads `scoring_pending` and
+  `judge_spend_cap_usd` appears in the row. Do not read the cap as a
+  control in force. Streaming shadows stay out of scope and the reason
+  is now written down. See the shadow-eval section of
+  [docs/ai-gateway.md](docs/ai-gateway.md), the two endpoints in
+  [docs/admin-api-reference.md](docs/admin-api-reference.md), and
+  [examples/ai-shadow/](examples/ai-shadow/).
+
+- `stream_include_usage` asks an OpenAI-compatible provider to end a
+  stream with a usage frame, by adding `stream_options.include_usage` to
+  the outbound body. Off by default: with it on the caller receives one
+  extra terminal chunk whose `choices` is empty.
+
+- The access log records `usage_source` (`measured`, `estimated` or
+  `absent`) beside `tokens_in` and `tokens_out`, so one AI request can
+  be attributed to a provider's own count or to the gateway's estimate.
+  `sbproxy_ai_usage_parse_miss_total` carries the same label.
+
+- The proxy can serve its own OpenID Federation entity statement. A new
+  `proxy.federation` block names the entity id, signing key, algorithm,
+  JWKS, statement lifetime, refresh margin, and `authority_hints`, and
+  the public listener answers `GET /.well-known/openid-federation` with
+  the compact JWS. Config compile refuses an http entity id, a missing
+  key reference, an algorithm outside the asymmetric allowlist, an empty
+  JWKS, a refresh margin at or above the lifetime, and an http authority
+  hint.
+
+- The readiness report carries a `durable_file_modes` component naming
+  what the build enforces on the files its durable sinks write, so the
+  posture is visible where an operator looks rather than only in a
+  startup log line.
+
+- The redb and SQLite key-value backends implement atomic create and
+  conditional swap, so `idempotency.backend: redis` single-flights on
+  them instead of degrading. The in-memory backend honors the TTL it is
+  given.
+
+- **The admin request row names the prompt-cache tokens.** `GET
+  /api/requests` already carried the provider, the model, the prompt and
+  completion tokens, the derived cost, and `credential_source`, which is
+  the record an operator reads to answer what one request cost and which
+  secret paid for it. The provider's own prompt-cache read and write
+  counts were not on it: they reached the request-event envelope and
+  `sbproxy_ai_tokens_attributed_total{direction="cache_read"}` and
+  stopped there, so the one per-request record could show a bill that
+  dropped without showing the cache hit that explains it. The operator's
+  service tier was in the same position: it reached
+  `sbproxy_ai_service_tier_decisions_total{disposition}` and the
+  outbound body, and that counter answers a deployment-wide question
+  rather than a per-request one, so the row could show a bill without
+  showing the tier that priced it. `tokens_cached`, `tokens_cache_write`
+  and `service_tier` now ride on the row and on the CSV and JSONL
+  exports, appended after `credential_source` so an importer keyed on
+  column position keeps working. `service_tier` is always the
+  operator's: a caller's own `service_tier` field is stripped before
+  dispatch and never reaches the row. It carries the tier as written on
+  the provider entry (`flex`, `standard`, `priority`), which is not
+  always the spelling the vendor sees on the wire: OpenAI's catalog
+  spells the `standard` tier `default`, and the row shows the word the
+  operator wrote. The two token counts are subsets of `tokens_in` rather
+  than additions to it, and both are absent when the provider reported
+  neither; `service_tier` is absent when the serving provider entry
+  declared none. See the request-log section of
+  [docs/admin-api-reference.md](docs/admin-api-reference.md).
+
+- Three auth providers ship as built-ins: `ext_authz` (Envoy-style
+  external authorization), `oauth_introspection` (RFC 7662 opaque-token
+  validation), and `kya` (Know Your Agent identity with an optional
+  spend floor). Each carries its own metric family and a Grafana panel.
+
+- A config revision is promoted to last known good only after it
+  survives a soak window judged on four signals: degraded subsystems,
+  upstream health across every origin (circuit breakers, active health
+  checks, and outlier ejections), the request-outcome delta, and an
+  operator probe. The upstream signal abstains rather than passing when
+  an origin exposes none of the three, so a revision is never promoted
+  on health nobody looked for. The verdict is three-way, so a window
+  that measured nothing is inconclusive rather than a promotion. `POST
+  /admin/config/confirm` closes the window early for a pipeline that ran
+  its own smoke test.
+
+- Added `POST /admin/config/rollback` and `sbproxy config rollback`:
+  re-apply any config revision the node already stored, naming a
+  revision, a content digest, or the last known good. A rollback is an
+  ordinary candidate that resolves, compiles, publishes through the same
+  reload transaction, and soaks, so rolling into a second bad config is
+  caught the same way the first one was. It refuses a stale
+  `expected_current` naming both revisions, refuses a lineage break
+  unless forced, refuses a restart-class or breaking change until the
+  caller names the revision back, and appends a new ring entry rather
+  than rewinding, so the rollback is itself in the history. `GET
+  /admin/config/diff` and `sbproxy config diff` render a plan between
+  two stored revisions, or between one and what is running, without
+  touching either.
+
+- Added `proxy.config_history.soak.auto_revert`, off by default: with it
+  armed, a failed soak re-applies this node last known good on its own.
+  It arms only for a change an in-process swap can undo, so a listener
+  port, admin block, cluster identity, or origin action-type failure
+  logs its blast radius and leaves boot fallback and manual rollback as
+  the answer. A revision an earlier revert restored that then fails its
+  own soak escalates instead of reverting to itself, a revert that will
+  not compile leaves the running pipeline serving, and an inconclusive
+  verdict never reverts. New counter
+  `sbproxy_config_apply_total{outcome}` separates an automatic revert
+  from an operator rollback.
+
+- Break-glass emergency access to the key and credential admin API under
+  `/admin/break-glass`: scoped, time-boxed, N-of-M quorum approved with
+  no self-approval, every action tagged with the grant id in the audit
+  chain, and an expired grant held on a review queue until a human signs
+  off.
+
+- **Cheap change detection and coalesced publishes.** Polling asks `git
+  ls-remote` which commit a reference points at, in one round trip with
+  no working tree, and clones only when that sha moved. An entry pinned
+  to a full commit sha is never polled, because a sha cannot move; two
+  entries naming one repository at one revision are one fetch; and a
+  round where nothing moved composes nothing, publishes nothing, and
+  leaves every subscriber on its `304`. A debounce window collects a
+  burst of unrelated project merges into one composed document and one
+  published revision, with a ceiling measured from the window's first
+  movement so a continuously-changing entry still publishes. Timings
+  live under `origin_sources.aggregator` with the defaults documented
+  alongside what they cost in requests per hour per repository.
+
+- **Composition provenance.** Every leaf of a composed origin records
+  the layer that set it (`origin_defaults`, the profile's `base`, its
+  environment layer, or the entry's `overrides`) and, for the two layers
+  a project authored, the entry, the repository and the resolved commit.
+  `sbproxy aggregate --explain <host>` and `sbproxy plan
+  --explain-origin <host>` render it for a human without a JSON tool. A
+  field-level override reports per field, so the fields a project did
+  not touch still name the floor; a policy dropped by `disabled: true`
+  records both the layer that dropped it and the layer that had
+  introduced it, because an absence explains nothing on its own; and the
+  merged lists are keyed by `name:` rather than by index, because an
+  index moves whenever an earlier entry is dropped. Provenance carries
+  no values at all: a composed leaf can be a `secret://` reference an
+  entry bound, so it says which layer and which repository, never what.
+
+- Config-authority subscribers now report what they applied, not just
+  what they fetched. On each poll a subscriber sends the revision and
+  config hash it is actually serving, a status in OpenTelemetry OpAMP
+  `RemoteConfigStatus` terms, an error when the last attempt failed, its
+  own soak verdict, and whether its boot fallback is active. `GET
+  /admin/config-authority/status` answers "31 of 34 nodes applied r42, 3
+  failed" instead of leaving that to be inferred from who fetched, keeps
+  a degraded apply distinguishable from a clean one, renders a
+  subscriber that has never reported as unknown rather than as applied,
+  discards a revision above what the authority has published, and
+  separates a node that has not polled recently from one that polled and
+  failed. The report rides the existing bundle fetch, so it adds no new
+  auth surface.
+
+- `--config-fallback=last-known-good` boots on the config revision ring
+  when the configured document does not work, pins the node loudly, and
+  suspends the file watcher, SIGHUP, and the `source:` refresh poller
+  until `DELETE /admin/config/fallback` clears it, which also applies
+  the config file in the same call so recovery finishes in one step. Off
+  by default; an exhausted ring exits 78 naming every revision it tried.
+
+- Customer-managed root of trust for the upstream-credential envelope:
+  `key_management.crypto.root_of_trust` wraps and unwraps each envelope
+  data key through HashiCorp Vault Transit, so sbproxy never holds the
+  key. Revoking the grant stops decryption within
+  `unwrap_cache_ttl_secs` in full, or at the next failed liveness probe:
+  a decrypted credential inherits the time left on the data key that
+  opened it rather than starting a second window. `GET
+  /admin/crypto/root-of-trust` reports the mode, the last liveness
+  check, the cached data keys a revocation still has to age out, and the
+  revocation-latency bound.
+
+- docs/config-rollback.md is the operator runbook for a config that
+  broke production: read the history, roll a running node back, boot a
+  dead one on its last known good, and undo a fleet-wide publish at the
+  authority. examples/config-rollback runs the middle of it against a
+  real binary.
+
+- docs/origin-profiles.md and docs/origin-aggregation.md are the two
+  guides for project-owned origin profiles: one for a service team
+  writing its first profile, one for a platform team standing up the
+  aggregator.
+
+- **Federated MCP server runtime is distinct from per-tool-call auth.**
+  A scope step-up on one `tools/call` stays on that call; the server
+  keeps serving other tools. `GET /admin/mcp-runtime` reports each
+  server as `starting`, `ready`, `authRequired`, `error`, or `stopped`,
+  plus in-flight challenges. `requiredScopes` is parsed from
+  `WWW-Authenticate: Bearer scope="..."`, not from metadata
+  `scopes_supported`. The same `sbproxy_mcp_tool_dispatch_total` family
+  records `server_auth_required` and `call_auth_required`. A console
+  page is separate scope.
+
+- Gateway-originated MCP approval holds park a high-risk `tools/call`
+  against a content snapshot, not a tool name. The caller is not kept
+  waiting on HTTP: JSON-RPC `-32097` returns `hold_id` immediately.
+  Operators approve or deny via `/api/mcp/approvals`. TrueFoundry is the
+  surveyed SOTA for this gate.
+
+- **`GET /admin/origin-composition` reports the aggregator.** The route
+  now carries the configured timings, including
+  `polls_per_hour_per_repo`, and `last_round` on the one node that
+  aggregates: what it decided, which revision it published, how long it
+  took, which entries resolved or fell back to a cached profile, and
+  which repositories are unreachable by name. Four metric families back
+  it: `sbproxy_aggregate_entries{outcome}`,
+  `sbproxy_aggregate_compose_duration_seconds`,
+  `sbproxy_aggregate_published_revision` and
+  `sbproxy_aggregate_rounds_total{outcome}`, with panels on the origins
+  dashboard. The entry name is deliberately not a metric label; fifty
+  entries would be fifty series that churn as the block is edited.
+
+- **gRPC, Cedar, and digest-auth docs now have a page or a runnable
+  example.** [docs/grpc.md](docs/grpc.md) plus an offline
+  [examples/grpc-h2c/](examples/grpc-h2c/) fixture;
+  [docs/cedar-policy.md](docs/cedar-policy.md) plus
+  [examples/cedar-mcp-full/](examples/cedar-mcp-full/); digest auth
+  linked from [docs/configuration.md](docs/configuration.md#digest) and
+  [examples/auth-digest/](examples/auth-digest/).
+
+- **hmac_auth can consume an RFC 9421 nonce for exactly-once replay
+  defense inside the clock-skew window.** Set `nonce_store: memory` (or
+  inject a `NonceStore` the way `bot_auth` does) and the first
+  presentation of a nonce verifies; a replay is `nonce_replay`. A wired
+  store requires a nonce and fails closed on a store error. Omit the key
+  to keep timestamp-window-only replay defense. This config takes no
+  filesystem path.
+
+- **hmac_auth can require body coverage without forcing it on GET.** Set
+  `require_body_digest: true` (or the same key on one entry) and a
+  header-only signature on a request that carries a body is refused with
+  a reason that names the missing `content-digest` coverage and never
+  echoes key material. Bodyless requests stay header-only, matching
+  Apache APISIX `hmac-auth` `validate_request_body`. Default remains
+  false.
+
+- **Inspect-only `ai_guardrail_input` hooks can set `execution.mode:
+  parallel` to run alongside the upstream call.** A block cancels the
+  in-flight generation. Allow adds no time-to-first-token; a reject may
+  still be billed by the provider. Watch
+  `sbproxy_ai_parallel_moderation_total` (`allow`, `block`,
+  `cancelled_upstream`, `refused`) and
+  `sbproxy_ai_provider_attempts_total{outcome="moderation_cancelled"}`.
+  Parallel cannot combine with `mutates: true`.
+
+- Key-lifecycle events are also emitted as ArcSight CEF on the
+  `key_audit_cef` tracing target, and every record on the feed now
+  carries `sbproxy.evidence.seq` and `sbproxy.evidence.instance` so a
+  SIEM can detect a dropped record.
+
+- Leased upstream credentials for cloud IAM: a credential can name a
+  dynamic-secrets mount instead of storing anything static, and resolved
+  material is never cached past the lease. Scoped to AWS, GCP, and Azure
+  IAM and Vault-fronted database mounts; `lease` on an AI provider with
+  no short-TTL issuance is refused with the limitation named.
+
+- **`max_message_size` is now a first-class key on `websocket`,
+  `load_balancer`, and `ai_proxy`.** Unset keeps the previous 10 MB cap.
+  `0` means unbounded. The cap is keyed on the action, not the origin,
+  so two actions on one host can differ.
+
+- **Offline aggregation.** `sbproxy aggregate --out <path>` composes to
+  a file rather than publishing, which is the single-node and self-host
+  path and the natural fit for a CI job that wants to review the
+  composed output before it ships. The written document is ordinary
+  config: it boots normally, reloads normally, and needs none of the
+  runtime machinery. It carries no `origin_sources` block, because a
+  composed output is not a source of further composition and
+  re-composing one would loop, and no `origin_defaults`, because the
+  floor is already folded into every composed origin. The same inputs at
+  the same revisions produce a byte-identical file, so a CI diff means
+  something, and `--dry-run` prints what would change against a file
+  already there rather than writing. A header comment names every source
+  entry and its resolved sha, so the file is traceable after it lands in
+  a repository. A resolve failure writes nothing at all, not even a
+  partial.
+
+- `POST /admin/credentials/{id}/rotate` rotates an upstream provider
+  credential with a bounded overlap window: the previous material stays
+  usable only while the new material will not resolve, for
+  `key_management.crypto.rotation.credential_grace_secs`. Credential
+  views carry `rotated_at` and `rotation_age_days`, and
+  `sbproxy_key_rotation_age_days` is the gauge to alert against the
+  named crypto periods.
+
+- Read and access audit for credential resolution:
+  `sbproxy_credential_read_total` counts every read unconditionally, and
+  `key_management.read_audit` adds a rate-limited detail record per
+  credential per window on the `key_audit` channel, with the credential
+  id HMAC-hashed by default.
+
+- Refused config candidates are kept under the revision ring with the
+  reason, the refusing stage, the provenance, and the document as
+  written, and read back at `GET /admin/config/rejected`.
+
+- **`sbproxy aggregate`.** One aggregator fetches every project
+  repository an `origin_sources:` block names, composes the `origins:`
+  map from the platform floor and the project profiles, and publishes
+  the result through the config authority that already ships, so it goes
+  through `compile_config`, the pipeline construction and the
+  model-runtime check before it is signed. What travels is an overlay
+  built from the composed and hand-written `origins:` plus
+  `origin_defaults`, and nothing else: the node running the aggregator
+  necessarily declares `proxy.config_authority`, and an entry with a
+  `credential:` needs a `proxy.secrets` backend in the same file, so a
+  payload assembled by removing keys from the runtime document would be
+  refused by the denied-path screen on every real configuration and
+  would be the wrong thing to send even if it were not. Nodes are
+  unchanged: they keep the subscriber they already have and never clone
+  a project repository. A proxy that both declares entries and publishes
+  an authority runs the same loop in process at boot; a node with
+  entries and no authority logs that it is not composing rather than
+  doing it quietly. Two failure classes are kept apart: one unreachable
+  repository falls back to its last resolved profile and is named in the
+  output, while an entry that has never resolved refuses the whole round
+  rather than publishing an `origins:` map silently missing that
+  project's hosts. Fetches run concurrently under a bounded pool with
+  one deadline for the round. See
+  [docs/configuration.md](docs/configuration.md#project-owned-origin-profiles).
+
+- SBproxy now measures how much of a worker's stack the AI request path
+  uses, warns once per process when it passes three quarters of it, and
+  holds the measurement to a budget that can only fall.
+
+- The config authority keeps a bounded archive of earlier revisions, so
+  POST /admin/config-authority/rollback and sbproxy config authority
+  rollback --to-revision N can return a fleet to a revision from further
+  back than one step. proxy.config_authority.publish.archive_keep sets
+  how many revisions a rollback can name and defaults to 20, so the ring
+  holds one file more than that and a ring of one offers one real
+  target; zero keeps the one-step rollback exactly as it was. An
+  archived revision is written before the served bundle rotates, so a
+  disk-full or permission error on the ring cannot leave a publish the
+  operator was told had failed to be adopted at the next start.
+
+- The IAB CoMP marketplace bridge is now a configured proxy surface.
+  `origins.<host>.comp` serves
+  `/.well-known/iab-comp/{manifest.json,quote,redeem}` on that origin: a
+  signed catalog of licensing tiers, a signed price for a requested
+  volume, and a redeem endpoint that exchanges a paid buyer acceptance
+  for an OLP license token signed with the origin's own
+  `olp.signing_key`. `GET /admin/licensing` reports what each configured
+  origin publishes and which quote-signing key is live. See
+  `docs/comp-marketplace.md` and `examples/comp-marketplace/`.
+
+- The Kubernetes operator reads each proxy pod boot-fallback pin,
+  reports it as a ConfigFallbackActive condition on the SBProxy naming
+  the rescued revision and the compile failure, and stops pushing
+  configuration to that SBProxy until the pin is cleared. A config that
+  arms proxy.config_history.soak.auto_revert under operator ownership is
+  refused at validation with an error naming the owner.
+
+- The `license_leak` guardrail takes a `max_scan_bytes` cap (default 256
+  KiB) applied before its detectors allocate, so an oversize AI response
+  cannot drive unbounded per-request work.
+
+- The RSL Open Licensing Protocol endpoints are now observable.
+  `sbproxy_olp_decisions_total{endpoint,outcome}` counts token issuance,
+  JWK publication, RFC 7662 introspection, and RFC 7009 revocation; each
+  emits an `olp_decision` structured event carrying the bound `sub`, the
+  license URN, and the signing kid but never the token; and `GET
+  /admin/licensing` reports each origin's issuer configuration alongside
+  its CoMP bridge. Two Grafana panels draw the family.
+
+- Time-boxed MCP RBAC grants (`tool_access[].ttl` plus
+  `grant_ledger.path`) expire unless an operator renews them. An elapsed
+  grant is hidden from `tools/list` and refused on `tools/call` with
+  JSON-RPC `-32098`. Renew with `POST /api/mcp/grants/renew`.
+
+- **`/.well-known/openapi.json` and `.yaml` accept `version=` to emit
+  OpenAPI 3.1.** `3.0`, `3.0.3`, `3.1`, and `3.1.0` are the accepted
+  values. Omit the parameter and the document stays 3.0.3. An unknown
+  value is 400 rather than a silent default. Admin `GET
+  /api/openapi.json` stays 3.0.3.
+
+- Boot fallback covers a configured document that parses and compiles
+  but whose modules will not construct, which is where most operator
+  typos land. Without the construct check such a document exits fatally
+  with no pin, no boot counter and no ring walk on every restart, even
+  with --config-fallback=last-known-good; it is rescued from the
+  revision ring like any other failure and the pin names the
+  construction error. Neither the flag nor this check has appeared in a
+  release, so they ship together.
+
+- **Cedar MCP policies participate in `sbproxy plan` and `sbproxy cedar
+  replay`, and Confirm parks in the admin queue.** A Cedar-only edit is
+  a named Reload. `cedar replay --against` evaluates a JSONL traffic
+  sample, optionally `--baseline` to preview a change. A Confirm verdict
+  with `approval:` parks, fires `mcp_confirm` on existing alerting
+  channels, and shows at `/admin/ui/mcp-approvals`. Holds still expire
+  fail-closed after 15 minutes.
+
+### Changed
+
+- **`POST /admin/keys/{id}/rotate` returns the current `sbp_` token
+  shape, and refuses a key id it cannot mint one for.** Every shipped
+  release before this returned the legacy `sk-<id>-<secret>` shape from
+  this endpoint while `POST /admin/keys` had already moved to
+  `sbp_<id>_<secret>`. Any operator script matching `^sk-`, or splitting
+  a rotated token on `-` to recover the key id, needs updating.
+
+  The refusal is the part to check before you upgrade. A minted key id
+  is sixteen lowercase hex characters, and the strict parser on the
+  inbound path asserts exactly that. A key seeded from config under
+  `key_management.seed.keys[]` can carry any id its author wrote, and
+  rotating one produced a token nothing could parse: the endpoint
+  answered `200` with a credential that authenticated on no code path,
+  and when the grace window closed the working token died with it.
+  Rotating a non-conforming id now answers `409 {"error": "key id is not
+  in the minted format ..."}` and changes nothing. If you rotated a
+  seeded key on a build carrying the earlier behavior, the token you
+  were handed is not usable; create a replacement key with `POST
+  /admin/keys`, move callers over, and revoke the seeded id.
+
+- **`tool_choice` is honored end to end, and `top_k` is now stripped for
+  OpenAI-format upstreams.** `/v1/messages` used to parse neither field,
+  so both were dropped silently and a forced-tool request came back as
+  an ordinary completion. Both are honored now, and each provider
+  translator rewrites `tool_choice` into that provider's own spelling:
+  `{"type": "any" | "none" | "tool"}` for Anthropic,
+  `toolConfig.functionCallingConfig` for Gemini, and Bedrock already
+  mapped it. `top_k` has no OpenAI Chat Completions equivalent, so the
+  OpenAI arm drops it rather than forwarding an argument
+  `api.openai.com` answers with a `400`. Check this one before you
+  upgrade if you point an origin with `format: openai` at an
+  OpenAI-compatible upstream that does honor `top_k`, such as Together
+  or a self-hosted vLLM: that value used to be forwarded and is now
+  removed, and sampling will change. `format: custom` byte-forwards the
+  body and is the escape hatch. See the translation section of
+  [docs/ai-gateway.md](docs/ai-gateway.md).
+
+- **`transport: stdio` MCP servers now run as one supervised persistent
+  child per configured server, not one process per JSON-RPC exchange.**
+  Server-side session state survives between calls, and process startup
+  is paid once per child rather than once per call. The supervisor
+  health-probes an idle child with an MCP `ping`, restarts a crashed
+  child under bounded exponential backoff, replays the `initialize`
+  handshake on the replacement child, fails in-flight calls closed with
+  a typed error on a crash or timeout instead of hanging, and kills the
+  child when its server leaves the configuration. Legacy one-shot
+  commands that answer a single request and exit keep working: a child
+  that dies after serving is respawned on the next call. See the stdio
+  section of
+  [docs/mcp-gateway-guardrails.md](docs/mcp-gateway-guardrails.md).
+
+- **Every upgraded WebSocket tunnel is now scanned, and every one that
+  is not a `websocket` action's is held to a 10 MB message ceiling.**
+  The frame scanner was armed inside a match on `Action::WebSocket`, so
+  `/v1/realtime` (which runs under an `ai_proxy` origin and hands off to
+  transparent forwarding) and any `type: proxy` or `type: load_balancer`
+  origin fronting a WebSocket backend opened a completely unscanned
+  tunnel. Those now get the scanner, with the same documented 10 MB
+  default a `websocket` action gets when it configures nothing. A `101`
+  for a non-WebSocket upgrade is still left alone.
+
+  Check this one before you upgrade if you front a WebSocket backend
+  through any action other than `websocket` and your peers send messages
+  larger than 10 MB. Those tunnels were unbounded on every prior release
+  and are not any more: the first oversized message drops both TCP
+  connections mid-message, with no close frame and no HTTP status,
+  because nothing HTTP may be written into a stream the client is
+  already reading as frames.
+  `sbproxy_websocket_teardowns_total{reason="message_too_large"}` and a
+  `websocket_message_too_large` audit record are how it shows up. There
+  is no config key to raise the ceiling for those origins yet;
+  `max_message_size` is a `websocket`-action field, so today the escape
+  hatch is to front the backend with a `websocket` action, which also
+  gets you the subprotocol allowlist. Widening the key to the other
+  action types is tracked separately.
+
+- **`compression.algorithms` selects in the order you wrote, and `q=0`
+  means no.** The list was documented as a priority order on three
+  surfaces and read as a membership set, with a hardcoded zstd > br >
+  gzip ladder deciding the winner, so `algorithms: [gzip, br]` served
+  Brotli to a client that accepted both. The list is now walked as
+  authored and the first entry the client accepts is served; an empty
+  list keeps the built-in best-ratio-first order. An entry naming no
+  codec (`algorithms: [deflate]`) fails config compile rather than
+  silently serving every response uncompressed. `Accept-Encoding`
+  quality values are also honored as refusals per RFC 9110 §12.5.3:
+  `gzip;q=0` refuses gzip, `*` stands in only for codings the header
+  does not name, and the standard opt-out `identity;q=1, *;q=0` now gets
+  an uncompressed response instead of zstd it declared it could not
+  decode. See the upgrade note in
+  [docs/config-stability.md](docs/config-stability.md).
+
+- **CORS: the wildcard-plus-credentials refusal moved to config load,
+  and a plain `OPTIONS` reaches the upstream.** `allowed_origins: ["*"]`
+  with `allow_credentials: true` passed `sbproxy validate` and then
+  emitted zero CORS headers plus one `warn` line per request for as long
+  as the config was live. It fails config compile now; the runtime guard
+  that remains logs once per process and counts every occurrence on a
+  new `sbproxy_cors_refusals_total{reason}`. Separately, a CORS
+  preflight is now what the Fetch standard defines it as, an `OPTIONS`
+  request carrying `Access-Control-Request-Method`. `Origin` alone rides
+  on every cross-origin request of every method, so adding a `cors:`
+  block used to make the proxy answer 204 to any browser `OPTIONS` and
+  silently delete an upstream's own `OPTIONS` endpoint (a discovery
+  route answering with `Allow:`, anything WebDAV). A refused preflight
+  also no longer publishes the configured method and header allowlists
+  on its 204. See the upgrade notes in
+  [docs/config-stability.md](docs/config-stability.md).
+
+- **gRPC transcoding now percent-decodes captured path segments, and
+  reads a query parameter according to the kind of field it names.** A
+  capture is decoded except for the RFC 3986 reserved characters, so a
+  `%2F` stays encoded rather than becoming a path separator the template
+  never allowed. On the query side, a parameter naming a real field
+  whose value will not read into it now returns 400 instead of being
+  dropped and sending the upstream that field at its default:
+  `?count=abc` against an `int32`, and `?dry_run=yes` against a `bool`,
+  which used to arrive as `false` under a 200 and run the job for real.
+  `bool` now reads the twelve spellings Go's `strconv.ParseBool` reads
+  (`1 t T TRUE true True` and `0 f F FALSE false False`) and refuses the
+  rest, and an enum resolves by declared value name and then by number,
+  so `?status=ACTIVE` reaches the upstream instead of being dropped. A
+  parameter with nothing to read is still ignored rather than refused: a
+  name matching no field, a `message` or `bytes` field, and an empty
+  value such as `?count=` or a bare `?count`. Check any client sending a
+  boolean flag spelled outside those twelve forms, because those
+  requests now get a 400 where they used to get a silent `false`. See
+  [docs/routing.md](docs/routing.md#grpc-limits).
+
+- **Three metric families are renamed under the `sbproxy_` prefix, and
+  the drift guard now refuses an unsanctioned one.**
+  `storage_op_duration_seconds`, `storage_op_errors_total`, and
+  `prompt_injection_v2_results_total` carried neither sanctioned prefix
+  and appeared in no registry, no dashboard, and no alert rule, so a
+  scrape config or federation relabel built from the `sbproxy_` and
+  `mesh_` prefixes `docs/metrics-stability.md` sanctions dropped all
+  three at the scrape: they produced no series at all. They are now
+  `sbproxy_storage_op_duration_seconds`,
+  `sbproxy_storage_op_errors_total`, and
+  `sbproxy_prompt_injection_v2_results_total`, declared in the metric
+  registry with their writers. No deprecation window applies, because
+  the old names were never published. The coverage guard used to scan
+  only for names that already carried a sanctioned prefix, which is why
+  it could not see any of them; it now collects every declared family
+  and refuses the prefix by name.
+
+- **The provider catalog is re-verified against vendor documentation,
+  and seven dead entries are gone.** Every one of the 72 catalog entries
+  was checked against the vendor's own current API docs. Seven services
+  no longer exist and were removed: Anyscale Endpoints (API host 404s),
+  Lepton AI (folded into NVIDIA DGX Cloud Lepton, host returns 530),
+  Lambda Inference (host is NXDOMAIN), kluster.ai (sunset after the MITO
+  acquisition), OpenPipe (migrated to Weights & Biases and CoreWeave),
+  GitHub Models (retired, endpoint returns 410 Gone), and Aleph Alpha
+  (no hosted base URL appears in any current PhariaAI doc). Five were
+  added: `meta` (Meta Model API, which replaced the Llama API), `wandb`
+  (W&B Inference on CoreWeave), `gmi` (GMI Cloud), and the `sglang` and
+  `localai` self-hosted runtimes. Nine base URLs and two auth headers
+  were stale and would have failed at request time rather than at config
+  load: `cohere` pointed `format: openai` at Cohere's native v2 API
+  instead of its compatibility host, `writer` is not OpenAI-shaped at
+  all and is now `custom`, `upstage` carried a `/solar` path segment the
+  vendor has dropped, and `perplexity`, `together`, `azure`, `novita`,
+  `crusoe`, `nebius`, `moonshot`, `dashscope`, and `zhipu` all moved
+  host or path. `reka` authenticates with `X-Api-Key` and `oracle` with
+  a signed `Authorization` header that must not be given a `Bearer `
+  prefix. The catalog now ships 70 providers: 63 OpenAI-wire
+  passthrough, 3 with in-tree translators, and 4 native pass-through.
+
+- **The JavaScript sandbox documents the globals it actually provides.**
+  Only `json_encode` and `json_decode` are registered; there is no
+  `atob`, `btoa`, `Buffer`, `TextEncoder`, or `crypto`. A hook that
+  needs encoding carries its own. The `hello-javascript` example now
+  encodes `body_base64` in the sandbox instead of shipping a hardcoded
+  string.
+
+- **AI toolkit dataset registration is charged against a per-scope
+  ceiling.** A scope may hold `max_datasets` x `max_dataset_versions`
+  versions and that many `max_request_bytes` of serialized entries,
+  clamped to the process totals, so a registration past it is refused
+  with `dataset_versions_scope` or `dataset_bytes_scope` rather than
+  reading as the whole process running out. The ceiling is derived from
+  the scope caps alone and does not shrink with the number of origins a
+  gateway compiles.
+
+- **Four AI metric families gained a label value or a label.**
+  `sbproxy_ai_toolkit_operations_total` adds the closed outcome
+  `agent_failed`, which a customer agent rejecting or failing a call now
+  records instead of `internal`;
+  `sbproxy_ai_quality_routing_decisions_total` adds `prompt_too_large`
+  for a prompt refused ahead of the quality hook; and the four
+  chargeback tracker families carry an `origin` label naming the origin
+  whose billing a refusal invalidated. Alerts that match on
+  `outcome="internal"` or aggregate the chargeback families without
+  `origin` need updating.
+
+- **`sbproxy validate` now resolves the shared secret of every
+  configured AI toolkit agent.** Validation used to substitute a
+  placeholder, so a config whose
+  `proxy.ai_toolkit.agents[].auth.shared_secret` names an unset `env:`
+  variable or an absent `file:` path passed validation and then failed
+  at startup. Export the same secrets in the validating environment, or
+  point the reference at material the validating process can read.
+
+- Fallback origin: `fallback_origin.on_error` no longer runs for an AI
+  request the gateway cancelled because the caller's connection broke
+  mid-generation. There is no caller left to serve, and on an `ai_proxy`
+  fallback the substitute action would be a second paid provider call.
+  Every other failure, including one attributed to the client such as a
+  malformed request header, serves the fallback exactly as before.
+
+- **`openapi_validation` now publishes its `policy_verdict_event` from
+  the phase that decides.** The header-phase dispatcher used to publish
+  an `allow` for this policy before the request body it validates had
+  arrived, which was the only audit record a refused request ever got.
+  The verdict is now published where the body is checked, carrying
+  `deny` for a refused body and `allow` for one that passes, and a
+  refusal also emits a `security_audit` record of type
+  `openapi_validation` with reason `schema_violation` and sets the
+  `policy_blocked` billing outcome. One request produces one record for
+  this policy: a SIEM query filtering `policy_id="openapi_validation"
+  AND verdict="allow"` no longer matches requests the policy denied. A
+  request that never reaches the body phase, because an earlier policy
+  refused it or the action answers without going upstream, now produces
+  no record for this policy rather than a premature `allow`.
+
+- The ported MCP OAuth, OpenID Federation, and CoMP marketplace crates
+  no longer end the process on a path an operator cannot recover from.
+  Lock poisoning in the CoMP key manager, revocation denylist, buyer-key
+  registry, quote ledger, and federation entity-configuration cache now
+  recovers the guarded value instead of unwrapping it; a Prometheus
+  family that fails to register is dropped with a warning naming it
+  instead of aborting startup; and the in-memory session store, CIMD
+  cache, DCR cache, and local KV store build without a fallible step.
+
+- An enabled `key_management` block now refuses to boot when
+  `crypto.pepper` or `crypto.master_key` is unset, naming the missing
+  key, instead of minting an ephemeral one and warning. Set
+  `key_management.crypto.allow_ephemeral_secrets: true` for a local
+  development run that wants the old behavior.
+
+- **Codex Compact, resume, and stateful follow-ups get a 400.** `sbproxy
+  connect` now names those flows: a first turn that resends the full
+  conversation in `input` works, but `previous_response_id`,
+  `conversation`, and `store: true` are refused because the gateway does
+  not hold server-side Responses state.
+
+- **Docs start at four walkthroughs; upgrade.md no longer pins a rotting
+  tag.** [docs/all-traffic-gateway.md](docs/all-traffic-gateway.md) and
+  [docs/getting-started-inbound.md](docs/getting-started-inbound.md) are
+  the hubs. [docs/features.md](docs/features.md) and
+  [docs/comparison.md](docs/comparison.md) are stubs that keep the bound
+  claim rows. [docs/upgrade.md](docs/upgrade.md) points at GitHub
+  releases and documents Restart vs reload, including
+  `proxy.config_history`.
+
+- **Each `ai_proxy` origin keeps its own price table.** Two origins with
+  different `model_prices` or rate cards no longer clobber each other,
+  `ai.catalog` reads the origin that is handling the request, and a
+  validation-only compile never installs the candidate as the process
+  global.
+
+- Pingora worker, blocking-pool and offload threads now get an 8 MiB
+  stack instead of tokio's 2 MiB default, so a debug build of the
+  request path no longer aborts with a stack overflow. New
+  `SB_WORKER_STACK_BYTES` overrides it.
+
+- The `backend` label on `sbproxy_cache_reserve_degraded` and
+  `sbproxy_cache_reserve_health_transitions_total` now names the
+  object-storage provider (`s3`, `gcs`, `azure`, `local`) rather than
+  `object_store`, so an S3 reserve and an Azure one are separate series.
+
+- An `abtest` action and `response_cache` on the same origin are now
+  refused at config load, whether the action is the origin's own or
+  reached through a `forward_rules` entry. The cache lookup runs before
+  the variant is chosen and the variant is not part of the cache key, so
+  a cache hit served one variant's body to clients assigned another.
+
+- The customer-managed root of trust liveness probe now round-trips a
+  fixed non-secret value through `transit/encrypt` and `transit/decrypt`
+  instead of reading `transit/keys/<name>`. It therefore needs exactly
+  the grant the credential path needs, `update` on those two paths and
+  nothing more, which is the least-privilege policy now documented in
+  [docs/key-management.md](docs/key-management.md). Against that policy
+  the old key-read probe failed on every interval on a healthy
+  deployment, dropping the data-key cache each time; against a
+  revocation that removed encrypt and decrypt while leaving the key
+  readable, it stayed green and the "or at the next failed liveness
+  probe" clause never fired. No working deployment needs a config
+  change: a deployment that could resolve credentials already granted
+  both capabilities.
+
+- **Pingora refreshed to upstream main.** The proxy includes upstream
+  HTTP/2 cancellation, timeout, and cache fixes through `09696b5`, while
+  retaining SBproxy's dynamic TLS certificate resolver, retry boundary,
+  listener preparation, and runtime stack configuration. The fork is no
+  longer behind upstream at this release cut.
+
+### Removed
+
+- **`AdaptiveBreaker` is removed from `sbproxy-platform`.** Nothing in
+  the workspace constructed one, and the type could not do what its
+  documentation described: `record_failure` set `Open`, the only
+  transition out fired on `HalfOpen`, and nothing anywhere assigned
+  `HalfOpen`, so the breaker latched open on the first error spike past
+  `min_samples` and stayed open for the life of the process. Its
+  counters were lifetime cumulative with no window, so the "recent
+  traffic history" it adapted against did not exist either. Use
+  `CircuitBreaker`, which implements the timed Open to HalfOpen
+  transition and is the type every consumer in the workspace already
+  uses.
+
+- **The unused convergent secret-reuse scaffolding is gone from
+  `sbproxy-vault`.** `ConvergentFingerprinter` derived a
+  per-installation key, hashed secret values with it, and would have
+  persisted a generated key at a reserved vault path on first run. No
+  configuration key, metric, event, admin surface, or other crate ever
+  reached any of it, so no installation has one of those keys and
+  nothing an operator wrote could have produced one. Deleting it also
+  removes the read-then-write race in its first-run key generation,
+  where two processes starting together would each have generated and
+  stored a different key. Secret-reuse detection was never a shipped
+  capability and this does not remove one.
+
+- Cache Reserve now ships one object-storage backend.
+  `cache_reserve.backend.type: object_store` covers S3, Google Cloud
+  Storage, Azure Blob, a local directory, and any S3-compatible store an
+  `endpoint` names; the separate AWS-SDK `type: s3` backend is retired
+  and refused at config load with the replacement block printed in the
+  error. See `docs/cache-reserve.md` for the field-by-field migration
+  and what happens to KMS envelope encryption.
+
+### Fixed
+
+- **A `failure_posture: closed` transform now fails a `static` or `mock`
+  response closed instead of serving it untransformed.** The transform
+  chain has reached generated bodies since the response-phase work
+  landed, but a fault there logged a warning and continued with the
+  untransformed buffer, whatever the transform's declared posture. A
+  redaction transform on a `type: static` origin therefore shipped the
+  exact string it existed to strip whenever it faulted (a budget
+  overrun, a non-string result, a body over the buffer cap). A `closed`
+  transform's fault now answers `500` with `x-sbproxy-transform-error:
+  <transform>` and never writes the generated body, matching the proxied
+  and plugin-action paths. `failure_posture: open`, which is what a
+  `transforms:` entry defaults to, keeps warning and continuing.
+
+- **GraphQL validation refuses before connecting upstream.** On a
+  validated `graphql` origin without `request_modifiers`, an invalid
+  document now gets its `400` in the request phase, before any upstream
+  connection is attempted; previously validation ran only after the
+  connect, so an invalid query against a down upstream surfaced as a
+  `502`. Routes with `request_modifiers` still validate at the
+  post-modifier seam, since the modified request is the one the contract
+  holds.
+
+- **A large request body no longer costs the client the response sbproxy
+  already wrote.** Any response the proxy generates itself goes out
+  before the client's body has been read: `type: mock`, `type: static`,
+  `type: echo`, `type: beacon`, every policy denial, and the 502 for an
+  upstream that could not be reached. The socket therefore still held
+  unread bytes when the session ended, and closing a socket in that
+  state makes the kernel send a TCP RST rather than a FIN, which
+  discards whatever the peer had buffered but not yet read, the response
+  included. Clients saw a reset connection instead of their 200, 403, or
+  502. The proxy now reads and discards the rest of the body before
+  closing, bounded at five seconds the way nginx bounds
+  `lingering_close`; the response still goes out immediately and only
+  the teardown waits. Hitting the bound increments the new
+  `sbproxy_request_body_drain_timeout_total`. One consequence worth
+  knowing: a client that sends `Expect: 100-continue`, receives the
+  final response instead of a 100, and then correctly sends no body now
+  holds its connection for that bound rather than being closed at once.
+
+- **`ldap_auth` and its `ldap` alias validate clean.** Both were missing
+  from the OSS auth catalog, so `sbproxy validate` reported that the
+  type "is not in the OSS catalog (will fail at runtime)" on every LDAP
+  config, including this repository's own `examples/auth-ldap/sb.yml`,
+  which was false. The same omission stopped both names being reserved
+  against a bundle hook claiming them.
+
+- **Mid-tunnel failures on an upgraded websocket tear the connection
+  down instead of writing an HTTP error body into the frame stream.**
+  Once the `101` reaches the downstream wire the client is speaking
+  WebSocket frames, but a post-upgrade failure fell through to the
+  generic upstream-error tail and wrote a synthesized `502 Bad Gateway`
+  response, which arrives as garbage bytes spliced into the frame
+  sequence. Every post-upgrade failure (upstream reset, timeout, read
+  error) now closes both connections and writes nothing, on both
+  surfaces that upgrade: the `websocket` action, and the AI gateway's
+  realtime tunnel (`type: ai_proxy` reaching `/v1/realtime`), where a
+  provider reset used to splice a `502` into a client's audio frames.
+  What decides it is the `101` reaching the wire rather than which
+  action opened the tunnel, so pre-upgrade failures still render an
+  ordinary HTTP error a client can read: a connect error, a refused
+  subprotocol negotiation, or a realtime handshake the provider answered
+  `401`. The real failure mode still lands in the log, classified the
+  way the `Proxy-Status` machinery classifies upstream errors, and on
+  `sbproxy_websocket_teardowns_total{reason="upstream_error"}`. See
+  [docs/websocket.md](docs/websocket.md#mid-tunnel-errors-never-write-http-bytes).
+
+- **`print()` inside a Rego bundle hook is bounded and redacted.** A
+  transform hook's input is the complete buffered response body, so
+  `print(input.body.body_base64)` copied every response into the log at
+  `info`, uncapped and unredacted. Messages now pass through the secret
+  redactor, are truncated at 512 bytes, and at most eight events are
+  emitted per evaluation with one summary line for the remainder.
+
+- **Prompts admin page "Add version" now sends the field the backend
+  expects.** The form built a `content` key while `POST
+  /admin/prompts/<host>/<name>/versions` deserializes into a required
+  `template` field with no alias, so every submission 400ed. The form
+  now sends `template`; the same operation already worked via the raw
+  admin API.
+
+- **`type: mock` and `type: beacon` responses declare
+  `Content-Length`.** Without it the body was close-delimited, so the
+  only end-of-body signal was the connection closing: a client could not
+  tell a complete body from a killed one, and every mock or beacon
+  response burned a connection even when it advertised `keep-alive`.
+  That missing header is why the reset above surfaced on the mock path
+  from roughly 70 KB while `type: static`, which has always declared its
+  length, survived to a megabyte. Neither arm declares a length on 204
+  or 304, where RFC 9110 section 8.6 forbids it; `type: static` no
+  longer does either.
+
+- **The `websocket` action's `max_message_size` and `subprotocols` are
+  enforced.** Both fields parsed and did nothing. `max_message_size`
+  (default 10 MB, now enforced including the default) closes the
+  upgraded tunnel as soon as a message in either direction declares more
+  payload than the cap; frame headers are scanned, payloads are never
+  read or buffered. A non-empty `subprotocols` list now allowlists
+  `Sec-WebSocket-Protocol` negotiation: the client's offer is filtered
+  to it before going upstream, an offer with no allowed entry is refused
+  with a `400` before any upstream connection, and an upstream selection
+  outside the negotiated set fails the upgrade with a `502`.
+
+- **A WebSocket control frame can no longer disable
+  `max_message_size`.** Control frames do not count toward a message
+  total, so their declared payload length was skipped rather than
+  checked. A fourteen-byte masked pong header declaring `u64::MAX` was
+  enough: the scanner spent the declared count skipping payload bytes,
+  never parsed another frame header, and the cap stopped applying in
+  that direction for the life of the connection, with nothing logged and
+  no teardown. RFC 6455 section 5.5 is now enforced on the frames it
+  governs: a control frame over 125 payload bytes, or one arriving
+  without `FIN`, closes the tunnel.
+
+- **A certificate, its private key, and its metadata now publish as one
+  atomic record.** `put_cert_bundle` documented atomic persistence and
+  performed three independent writes, so a crash between them left a new
+  certificate paired with the previous generation's key, and metadata
+  describing material the store could not serve steered peers away from
+  repairing it. The bundle is now a single versioned, digest-checked
+  record written in one backend operation (the file backend also gained
+  write-temp-then-rename, so a concurrent reader never observes a short
+  read). Readers validate the whole record, including the
+  certificate/key pairing, before serving it; legacy three-key rows are
+  adopted read-only only when the pair proves to match, and a torn row
+  is quarantined instead of served.
+
+- **A failed transcoded gRPC call reaches the REST client as an HTTP
+  error.** gRPC reports the outcome of a call in `grpc-status` and
+  leaves the status line at 200, and the transcoder mapped that code to
+  an HTTP status for the JSON error envelope in the body and then
+  discarded the mapped value, so a `NOT_FOUND` or a `PERMISSION_DENIED`
+  arrived as a 200 whose failure was discoverable only by parsing the
+  document. The mapping now reaches the status line, using the same
+  `google.rpc.Code` table `grpc-gateway` uses, whenever the upstream
+  reports the failure in the response headers, which is what tonic and
+  grpc-go send for a unary handler that returns an error. A `status`
+  response modifier on the same origin still wins. The one shape that
+  does not change is a failure reported in real HTTP/2 trailers after
+  the response headers, typically a server-streaming method that fails
+  partway: the status line is committed downstream before the trailers
+  arrive, so that response stays 200 with the error in the body.
+  `grpc_web: true` is untouched, since gRPC-Web requires HTTP 200 with
+  the outcome in the trailer frame. The mapped status is also what the
+  access log, the `status` label on the request metrics, response-cache
+  eligibility, the RFC 9209 `Proxy-Status` header, response `assert`
+  policies, and `on_response` callbacks see. One surface is now excluded
+  on purpose: `fallback_origin.on_status` is no longer consulted on an
+  origin with `transcode` or `grpc_web: true`, because both translated
+  modes own the response body and a fallback that fired there would
+  commit the fallback's status and `content-length` over a body that
+  never changed. `on_error` is unaffected. Error-rate alerts on affected
+  origins move; see the gRPC limits in
+  [docs/routing.md](docs/routing.md) and the upgrade note in
+  [docs/config-stability.md](docs/config-stability.md).
+
+- **A late Redis failure no longer discards the RAG vector store's
+  replacement connection.** The `redis` vector-store adapter caches one
+  multiplexed connection and drops it when a search fails on a dead
+  socket, so the next search reconnects. That discard named no
+  particular connection: it cleared whatever was cached at the moment it
+  ran. Searches that were in flight together on a dropped socket do not
+  fail together, so a search whose failure surfaced late threw away the
+  connection a search in between had already opened and validated. Under
+  steady traffic against a flapping Redis the adapter re-dialed once per
+  failed search instead of once per drop, and each dial re-ran the
+  protected DNS resolution, so a store under load could churn
+  connections without settling on one. The cache slot now carries a
+  generation and a discard only evicts the generation the failing
+  command actually ran on; a straggler complaining about a socket that
+  is already gone leaves the replacement alone. See the vector stores
+  section of [docs/rag.md](docs/rag.md).
+
+- **A Redis key revocation can no longer be missed for the life of the
+  positive cache.** Key-store mutations ran the record write, the
+  revision bump, and the invalidation publish as three separate
+  commands, so a failure between them could commit a revocation without
+  ever announcing it; a replica whose pub/sub subscription dropped
+  during a revoke missed the message permanently (Redis pub/sub has no
+  replay) and kept accepting the credential until its L1 TTL expired.
+  Mutations now run as one atomic Lua script, so an acknowledged change
+  has always published, and the subscriber clears its whole local cache
+  on every (re)subscription, after the subscription is live, so a
+  revocation during a gap is covered either by the resync or by the
+  stream. A subscription stream that ends now reports an error, so the
+  supervising loop resubscribes with backoff instead of treating silence
+  as health.
+
+- **ACME fleet followers install the leader's certificate without a
+  restart.** A shared certificate bundle was loaded into the TLS
+  resolver exactly once, during startup. A replica that booted against
+  an empty store, waited while a peer issued, and then saw valid
+  metadata skipped issuance and kept serving its self-signed bootstrap
+  certificate indefinitely; after a renewal, followers stayed on the old
+  certificate until a restart. Every path that observes the shared store
+  now installs through one helper: initialization, every renewal tick,
+  the lease-wait path (a follower installs the winner's bundle within
+  seconds of publication), and the post-publication path. The installer
+  tracks the installed generation per hostname, so an unchanged bundle
+  is a no-op, a regressed one is refused, and a torn or corrupted one
+  keeps the last good certificate serving while the renewal path repairs
+  the store. A node that never wins the issuance lock says so again on
+  every tick, and the per-hostname wait is now bounded by a budget
+  shared across the whole tick rather than per hostname, so a proxy with
+  dozens of hostnames cannot spend hours inside one renewal pass.
+
+- **`expected_user_agent_pattern` documentation now matches what the
+  matcher does.** The field's description called the pattern "anchored,
+  case-insensitive" and it is neither: it is compiled exactly as written
+  and searched for anywhere in the `User-Agent` header. An operator who
+  believed the description wrote `Acme-Crawler/\d`, saw
+  `acme-crawler/2.1` fall through to `unknown`, and never got the price
+  or policy rule keyed on that agent; the same belief in the other
+  direction made `MyPartnerBot` classify `Mozilla/5.0 (compatible;
+  MyPartnerBot-imposter)` as the partner and hand it that entry's
+  allowance. The behavior is unchanged, because anchoring or
+  case-folding every pattern would silently change the meaning of every
+  catalog already deployed. The documentation is corrected instead, in
+  the field's own description, in the `agent_classes` table of
+  [docs/configuration.md](docs/configuration.md), and in the pricing
+  example in [docs/ai-crawl-control.md](docs/ai-crawl-control.md), and
+  the proxy now warns once at load for each catalog entry whose pattern
+  carries no inline `(?i)`, which is the case that fails silently. Write
+  the `(?i)` and your own boundary: prefer `(?i)\bMyPartnerBot/\d` to
+  `MyPartnerBot`.
+
+- **The Anthropic translator carries the whole tool surface, in both
+  directions.** A multi-turn tool conversation aimed at an Anthropic
+  upstream used to reach the provider with an OpenAI `role: "tool"`
+  turn, a top-level `tool_calls` key, and OpenAI-nested tool
+  definitions, none of which Anthropic accepts, so the call failed with
+  a 400 naming a role the client had every right to send. The request
+  direction now converts tool definitions to `{name, description,
+  input_schema}`, an assistant turn's `tool_calls` to `tool_use` content
+  blocks, and a `tool` turn to a `user` turn holding a `tool_result`
+  block. A `developer` turn hoists into `system` like the `system` turn
+  it renames, a `system` turn whose content is a block array contributes
+  its text instead of vanishing, and `user` maps onto Anthropic's
+  `metadata.user_id`. The response direction surfaces `thinking` blocks
+  as `message.reasoning_content`. Every remaining drop (`logit_bias`,
+  `n`, `presence_penalty`, `frequency_penalty`, `response_format`,
+  `seed`, an unrepresentable `tool_choice`) is counted on
+  `sbproxy_ai_translation_dropped_total{surface="anthropic_translator"}`
+  and named in the request's one aggregated warn, rather than dropped in
+  silence.
+
+- **`basic_auth` now sends the `WWW-Authenticate` challenge its `realm`
+  configures.** The key parsed and validated, and then nothing read it:
+  a denied request got a bare `401` with `{"error":"unauthorized"}` and
+  no challenge header, so no browser prompted for credentials and a
+  conforming client had no way to learn which scheme to retry with.
+  Missing-credential and wrong-password denials both now carry
+  `WWW-Authenticate: Basic realm="<realm>"`. RFC 9110 section 11.6.1
+  requires the parameter, so an origin that configures no `realm` is
+  challenged as `Basic realm="restricted"` rather than left without a
+  challenge. A `"` or `\` in a `basic_auth` or `digest` realm is now
+  escaped into the quoted string instead of being able to end it and
+  append auth-params nobody configured. In a list-form `authentication:`
+  composition, the basic slot's challenge joins the merged 401 alongside
+  every other slot's. One shape change to know: an origin that authored
+  an `error_pages` entry, or turned on `problem_details`, now gets that
+  body on a challenge-carrying denial too; the challenge header and the
+  body are chosen independently. One thing to check before you upgrade
+  if you read the raw audit stream: a `basic_auth` denial is now a
+  header-carrying denial, so its `security_audit` record's `event_type`
+  moves from `auth_denied` to `auth_denied_with_headers`, the value
+  `digest` and `cap` denials already carry. A SIEM rule matching that
+  field exactly stops seeing Basic denials; match on the `auth_` prefix
+  instead. The typed `events:` feed is unaffected, since every `auth_*`
+  record still bridges to one `auth_denied` event. See
+  [docs/configuration.md](docs/configuration.md) and
+  [examples/auth-basic/](examples/auth-basic/).
+
+- **Cache decision scripts no longer run on the connection loop.** The
+  `cache.key` and `cache.admit` events under `origins.*.response_cache`
+  were evaluated inline on the worker that owned the connection. An
+  operator script is allowed a 100 ms CPU budget by default and has no
+  yield points, so a script that spent its budget stalled every other
+  connection that worker was serving, not only its own request. Both
+  events, and the copy of `cache.admit` the stale-while-revalidate
+  refresh runs, now evaluate on the blocking worker pool. Nothing
+  changes for an origin with neither event configured: the scheduling
+  hop is only paid when a script exists to run. For an origin with an
+  `admit_event`, the cache write-back is dispatched one hop later than
+  before, and the deferral is capped at 64 evaluations in flight so a
+  slow script cannot pile up response bodies in memory; past the cap the
+  event runs on the connection loop rather than queueing. The Lua arm
+  also stops building a throwaway VM per evaluation, since a Lua engine
+  holds no script state and every call already builds its own sandboxed
+  VM; JavaScript deliberately keeps a per-evaluation engine, because a
+  shared one would carry one tenant's context into the next tenant's
+  script. See the cache-event section of
+  [docs/scripting.md](docs/scripting.md).
+
+- **Circuit breakers now admit one probe at a time in half-open, instead
+  of all traffic.** `allow_request()` returned true unconditionally in
+  `HalfOpen`, so the moment `open_duration_secs` lapsed every concurrent
+  request was dispatched at the upstream that had just been failing,
+  before any of them had reported back, once per open duration for as
+  long as the upstream stayed down. Four places already documented the
+  opposite. Half-open now hands out a probe slot through a
+  compare-and-swap: the request that wins it goes through, the rest are
+  refused as if the breaker were open, and the slot returns when that
+  probe calls `record_success` or `record_failure`. A caller whose
+  request produced no verdict about the upstream at all hands the slot
+  straight back: the crawl-control ledger client does that on a hard,
+  non-retryable refusal such as an already-spent token, which a healthy
+  ledger answers with and which deliberately does not flap the breaker.
+  A slot nothing returns is written off after one more open duration, so
+  a breaker cannot get stuck refusing. Reaches the `load_balancer`
+  action's `circuit_breaker:` block, the AI router's breakers, and the
+  AI crawl-control ledger client. On a load balancer the breaker is
+  still advisory: when it filters out every target in the pool the
+  request is routed anyway rather than failed. See
+  [docs/config-stability.md](docs/config-stability.md#circuit-breakers-now-admit-one-probe-at-a-time-in-half-open).
+
+- **`config_revision` is a function of the config again, not of the
+  process that read it.** On any config with more than one origin the
+  revision changed across restarts with nothing else changing: the
+  compiler assigned each origin its index by walking a `HashMap`, and
+  the revision hash consumed those indices, so a two-origin file
+  reported two revisions across three boots and an N-origin file had up
+  to N! of them. `config_revision` rides the request log, the access
+  log, the CSV export, webhook envelopes and `policy_version`'s prefix,
+  where it is read as the config generation that served a request, so a
+  value that moved on its own made that unanswerable across a restart
+  and fired a revision-change signal on every reboot. Origin indices are
+  now assigned in sorted key order, which also makes the compiled origin
+  list itself deterministic, and the hash pairs each hostname with its
+  rank in that order rather than with a stored position. Two upgrade
+  notes: a single-origin config hashes to exactly the value it did
+  before, and a multi-origin config settles on one of the values it was
+  already alternating between, so anything keyed on a revision sees at
+  most one final change and none after that. The `servers` array in an
+  emitted OpenAPI document is now ordered by hostname for the same
+  reason; it was previously in whatever order that config's origins
+  landed in.
+
+- **`content_digest`'s `on_missing: require` refuses before the upstream
+  is dialed.** The missing-header check ran in `request_body_filter`,
+  which Pingora reaches only after `upstream_peer` has selected a peer
+  and the connection is up. The verdict was never wrong, only late, and
+  late is an availability problem: every refusal paid for a full
+  upstream dial and held the connection slot for it, and pointed at an
+  upstream that was slow or unreachable the client got the upstream's
+  failure instead of the policy's. Against an unreachable upstream the
+  proxy answered `502` rather than the configured `400`. Nothing about
+  that verdict depends on the body, so it now runs in the header phase:
+  the upstream is never dialed, `missing_status`, `error_body`, and
+  `error_content_type` are honored exactly as before, and `on_missing:
+  skip` still falls through to the body filter unchanged. Digest
+  refusals from either phase now increment
+  `sbproxy_policy_triggers_total{policy_type="content_digest",action="deny"}`,
+  which none of the body-phase refusals did, and log on the
+  `sbproxy::content_digest` target with a `reason` naming the outcome.
+  See [docs/content-digest.md](docs/content-digest.md).
+
+- **Ephemeral storage refuses a TTL it cannot honor instead of rounding
+  it up.** `EphemeralKv` promises an entry is evicted on or before its
+  TTL elapses, but the Redis backend clamped anything under a second up
+  to one second, so a caller asking for a 200ms lifetime would have got
+  a record readable for a full second, while the in-memory test double,
+  which keeps the whole `Duration`, expired it on time. No shipped path
+  reaches that: the only consumer is the mesh backend and it counts TTLs
+  in whole seconds, so no deployment was affected and this is the
+  contract being closed before a caller such as a single-use nonce or a
+  PKCE verifier lands on it. Both backends now reject a zero TTL with
+  `InvalidConfig`, and the Redis backend rejects anything under one
+  second because Redis expiry counts in whole seconds; the rejection
+  happens before the connection is opened, so it does not depend on
+  Redis being reachable. The in-memory double still accepts sub-second
+  TTLs, which is the documented difference between them. The mesh
+  backend's `expire` refuses a zero TTL rather than guessing between the
+  two conventions that collide on it, Redis `EXPIRE key 0` meaning
+  delete and its own `set` meaning no expiry.
+
+- **`EventBus::publish` no longer calls subscriber closures while it
+  holds the handler-map lock.** A handler that blocked on a socket used
+  to stall every other thread publishing to the bus, and a handler that
+  called back into `publish`, `subscribe`, or `subscriber_count`
+  deadlocked its thread permanently, because `parking_lot::Mutex` is not
+  reentrant and waits rather than panicking. Fan-out now runs against a
+  snapshot of the subscriber list taken when `publish` starts: a handler
+  registered during a fan-out first receives the next event rather than
+  the one in flight, and nested publishes on one thread stop at eight
+  with a `warn` naming the event type instead of overflowing the stack.
+  Only code that embeds the workspace crates reaches this bus; the
+  `events:` file and webhook sinks were never routed through it and are
+  unchanged.
+
+- **`rollout_percent`'s documentation named the wrong hash.** The field
+  doc said a request's bucket is `xxhash(flag_name + key) % 100`; the
+  bucketer is and always was FNV-1a 64-bit over `flag_name`, a `|`
+  separator byte, then `key`. Anyone reproducing the documented formula
+  to preview a canary cohort or audit rollout fairness got different
+  buckets than the proxy computes. The doc now states `fnv1a64(flag_name
+  + "|" + key) % 100` and calls out the separator, and a test recomputes
+  the documented formula independently so the two cannot drift again.
+
+- **The Kubernetes Gateway controller publishes `sb.yml` whole or not at
+  all.** It rendered the document straight over the existing file, so a
+  controller pod killed between the truncate and the write left a
+  partial config on the shared volume, and a data plane restarting on it
+  could not boot. Each publish now writes a temporary file in the same
+  directory, flushes it, renames it into place, and syncs the directory,
+  so a reader opens either the previous complete document or the new
+  one. A publish that fails leaves the last good document byte for byte
+  intact and no temporary behind, and a mode an operator set on the
+  published file survives the next reconcile. Rename atomicity and
+  `fsync` durability are the filesystem's promise, so on an NFS-backed
+  volume this is as strong as the server underneath it. A volume that
+  refuses the directory `fsync` outright logs a warning and still counts
+  as a successful publish, because the rename has already landed by
+  then. See [docs/gateway-api.md](docs/gateway-api.md).
+
+- **`GET /api/openapi.json` and `.yaml` refresh on every reload.** The
+  admin OpenAPI render is cached, and the cache was keyed on
+  `config_revision`, which identifies the set of origins served and
+  deliberately holds still when the behavior behind an unchanged
+  hostname changes. So a reload that added an auth block, edited a
+  forward rule or set a deprecation left the cache in place and the
+  admin routes served the pre-reload document for the life of the
+  process. It is keyed on the pipeline generation now, which moves on
+  every swap. The per-host `/.well-known/openapi.json` route was never
+  affected; it rebuilds per request. Three docs that described
+  `config_revision` as a content hash of the configuration have been
+  corrected to say what it identifies, most importantly
+  [docs/metering.md](docs/metering.md), which told buyers to verify a
+  signed receipt's pricing against it.
+
+- **`GET /v1/models` no longer advertises a surface the gateway
+  refuses.** The per-model `capabilities` array came from the provider
+  catalog's `supports_chat`, `supports_embeddings`, and
+  `supports_streaming` keys in
+  `crates/sbproxy-ai/data/ai_providers.yml`, while the request path
+  decided its 501 from the per-provider surface matrix in
+  `crates/sbproxy-ai/src/api_routes.rs`. The two disagreed on 43 of the
+  72 shipped catalog entries: a `bedrock` origin advertised `embeddings`
+  and then answered `POST /v1/embeddings` with 501. Every model listing
+  now publishes the intersection of the two, so a caller can act on what
+  a listing names. The array is never wider than the 501 gate and can be
+  narrower, because the matrix answers on the wire format while the
+  catalog keys answer on the vendor. An `openai`-format provider is
+  still forwarded every OpenAI path, but its listing names only the
+  surfaces the catalog records for that vendor, so a `deepseek` model
+  lists `chat_completions`, `messages`, `responses`, and `streaming`
+  rather than the whole OpenAI set, and a `voyage` model lists
+  `embeddings` alone. Absence from the array is not a refusal. Three
+  smaller changes ride along: `vertex` now declares
+  `supports_embeddings: true`, which its OpenAI-compatible endpoint has
+  always served; `messages` and `responses` appear wherever chat does,
+  since the gateway translates them itself; and the LiteLLM-parity `GET
+  /model/info` and `GET /model_group/info` carry the same array, a group
+  reporting the union across its deployments. See
+  [docs/providers.md](docs/providers.md) and the model-listing section
+  of [docs/ai-gateway.md](docs/ai-gateway.md).
+
+- **gRPC streaming support is described accurately.**
+  `examples/grpc-h2c/README.md` reported that server reflection (`list`)
+  came back as a garbled framing error through the proxy and steered
+  readers away from it. Rechecked against a grpc-go server with
+  reflection registered: `list` works, `grpcurl describe` returns
+  byte-identical output through the proxy and straight at the upstream,
+  and bidirectional streaming round-trips every message. New end-to-end
+  coverage pins all of it; there was none before. A new [gRPC
+  limits](docs/routing.md#grpc-limits) section records what is genuinely
+  narrower, including one composition worth avoiding: a body-reading
+  policy on a `grpc` origin needs the complete request body, so it
+  stalls every streaming RPC on that origin while leaving unary calls
+  working.
+
+- **`default_model` now applies on the hosted AI dispatch path, not only
+  on locally served providers.** The field's own schema description says
+  "Default model used when the request omits an explicit model", and the
+  main JSON dispatch path never read it: it substituted the empty string
+  and shipped that to the provider. The empty string is not a harmless
+  placeholder, because every model-aware gate is written as "if a model
+  was named", so `allowed_models`, `blocked_models`, a virtual key's
+  per-key model scoping, model-scoped budgets, provider eligibility, and
+  the context-compression pipeline were all skipped for exactly those
+  requests. Against an upstream that infers the model itself (an Azure
+  deployment-scoped `base_url`, a single-model vLLM or Ollama) the
+  request reached the provider ungated. A request that omits `model` now
+  takes the origin's default when every enabled provider naming one
+  names the same one; providers that name nothing abstain, a disabled
+  provider gets no vote, and two enabled providers that disagree leave
+  the request modelless rather than picking whichever is listed first.
+  Two carve-outs keep the old behavior and say so. The fallback is
+  scoped to the chat-shaped surfaces (`/v1/chat/completions`,
+  `/v1/messages`, `/v1/responses`), because `default_model` names a chat
+  model and surfaces like `/v1/moderations` and `/v1/images/generations`
+  treat `model` as optional and default it upstream from their own
+  vocabulary. And a multipart request (audio transcription, image edits,
+  image variations) with no `model` form field is still forwarded
+  without one, because the multipart rewrite can replace a `model` part
+  and cannot add one. See [docs/ai-gateway.md](docs/ai-gateway.md).
+
+- **The `jsonl_file` usage sink no longer interleaves two concurrent
+  rows onto one line.** It wrote the row and its newline as two separate
+  appends and held no lock, so two calls landing together, the shadow
+  legs of one request or two requests finishing at the same instant,
+  produced `{row}{row}` on one line followed by two blank ones. Both
+  rows were written and neither was parseable, which reads to any JSONL
+  consumer as rows that were never recorded at all rather than as a
+  corrupt file. The row and its newline now go out in one append, which
+  is atomic against other appenders. The other durable line sinks
+  (`session_ledger`, the request event sink, and the verifiable usage
+  ledger) each serialize their writers already and were never affected.
+
+- **Output-guardrail decisions are recorded for live provider
+  responses.** `ai.guardrail.output` was published for an idempotency
+  replay and a semantic-cache hit but not for the response the provider
+  actually generated, so a route with output guardrails and
+  `decision_audit` enabled saw decisions only for the replayed subset.
+  The live relay and the cascade arm now run through the same funnel and
+  publish once per response, for the allow as well as for the block.
+  Expect more records on that feed: if you size a SIEM pipeline on
+  `ai.guardrail.output` volume, this is a volume change, not a behavior
+  change to the guardrails themselves. Streamed and live multipart
+  responses still publish nothing, because neither materializes a body
+  to evaluate.
+
+- **A stored-prompt reference on `/v1/messages` or `/v1/responses` now
+  resolves instead of being dropped.** `"prompt": "name@version"`
+  belongs to no provider wire format, so both native translators dropped
+  it, and the shared resolver reads the already-translated canonical
+  body where it no longer existed. A `prompts:` origin plus a
+  `/v1/messages` request naming a stored prompt therefore reached the
+  provider with no rendered system turn at all, running without the
+  template it asked for. The reference is now lifted off the inbound
+  body before translation and put back on the canonical body afterwards,
+  so the same resolution, the same `system` turn, and the same run
+  metadata apply on all three surfaces. Fail-closed where the field can
+  only be a gateway reference: on the two native surfaces a name a
+  configured store does not hold is a 400 and an origin with no prompt
+  store at all answers 404, in both cases without the gateway-only key
+  reaching the provider. The canonical `/v1/chat/completions`
+  pass-through is unchanged, because `prompt` is also a legacy
+  completions field there. Both refusals publish an `ai.admission`
+  decision record with a `verdict` of `prompt_render_failed` or
+  `prompt_reference_not_found`. See the stored-prompt surface matrix in
+  [docs/ai-gateway.md](docs/ai-gateway.md).
+
+- **The emitted OpenAPI document no longer names a method the gateway
+  refuses, and no longer drops an operation it serves.**
+  `allowed_methods` accepts any valid HTTP method token, and the request
+  path enforces that set exactly with a `405`, but emission mapped every
+  verb outside OpenAPI 3.0's eight onto `get`. An origin allowing only
+  `PROPFIND` therefore published a `get` operation the gateway would
+  refuse, said nothing about the verb it does serve, and collapsed two
+  such verbs onto one key so only the second survived. Those verbs are
+  now listed on the path item under `x-sbproxy-unrepresentable-methods`
+  and no operation is invented for them, one entry per method and host
+  so a shared path key cannot claim a verb against a host that answers
+  it with a `405`. Separately, the write that placed an operation was
+  unconditional, so two forward rules resolving to the same path and
+  method (two origins in the all-hosts document, or two rules on one
+  origin separated by a `header`, `query`, `body`, `method`, or `when`
+  condition) silently overwrote each other. The first now keeps the key,
+  matching the runtime's first-match-wins rule order; the rest are
+  preserved under the path item's `x-sbproxy-alternate-operations` and
+  summarized in a top-level `x-sbproxy-collisions` array. Each operation
+  also carries its own `servers` entry naming the origin that serves it,
+  and an `x-sbproxy-match` extension describing the matcher conditions
+  OpenAPI cannot express. `x-sbproxy-match` names the field a rule looks
+  at and the comparison it performs and stops there: the per-host
+  document is served without authentication, so a shared-secret routing
+  header, an internal query token, or the text of a `when:` predicate
+  would otherwise be published to anyone who can fetch the spec. Two
+  rules that differ only in a withheld value are kept apart by a
+  `variant` counter rather than by a digest, which would let a holder of
+  the document confirm a guessed value offline. A config with no
+  unrepresentable verbs and no colliding rules emits the document it
+  emitted before, with none of the new keys.
+
+- **A successful operator hot reload no longer repeats on every
+  requeue.** The hot-reload decision's last gate compared the new config
+  hash against the pod template's `sbproxy.dev/config-hash` annotation,
+  and the hot-reload success path deliberately skips the workload patch,
+  so that annotation could never advance on the path it gated. It was
+  therefore permanently stale, the gate was permanently true, and every
+  300s requeue plus every watch event on the `SBProxy`, `ConfigMap`,
+  `Service`, `Deployment`, or `SBProxyConfig` fanned `/admin/reload` at
+  every pod again, rebuilding each handler chain and dropping warmed
+  per-process state for a config the fleet already ran. The gate now
+  reads `status.configHash`, which advances on both delivery paths, so a
+  pass over an unchanged `SBProxy` reloads nothing. The pod template
+  keeps the hash the pods were started with until something has to roll
+  them: re-stamping the current hash there would have restarted the
+  whole fleet for a config it was already serving, which is what the hot
+  reload existed to avoid. Both the Deployment and the clustered
+  StatefulSet paths are fixed. See the reconcile-loop section of
+  [docs/kubernetes.md](docs/kubernetes.md).
+
+- **`SBProxy.status.configHash` is stamped after the rollout lands, not
+  before it starts.** The operator patched `configHash` and cleared
+  `lastError` immediately after validating the referenced
+  `SBProxyConfig`, before the ConfigMap, Service, and workload applies.
+  A 403 on the ConfigMap patch (an operator Role missing
+  `configmaps/patch` in that namespace), or a 409 or 500 from the
+  apiserver, therefore left `kubectl get sbproxy demo -o yaml` reading
+  `configHash: H1` with an empty `lastError` while every pod kept
+  serving H0. Since the CRD documents `configHash` as the hash "rolled
+  out" and `lastError` as "cleared on successful runs", that is the
+  documented signal for a completed rollout, and the only contrary
+  evidence was one warn line in the operator's own log. Both writes now
+  happen after the workload apply succeeds, or after every pod has
+  accepted a hot reload. The early write moved to a new
+  `status.observedConfigHash`, which says the operator has read and
+  validated the config and nothing more, so `configHash` trailing
+  `observedConfigHash` is now the visible signal that a rollout is in
+  progress or stuck. Upgrade the CRDs with the operator image: the
+  operator only trusts a `configHash` that has an `observedConfigHash`
+  beside it, because the older build wrote `configHash` before applying
+  anything and a hash meaning "seen" must not read as "delivered". Until
+  the CRD carries the new field the apiserver prunes it, and the
+  operator re-delivers the config once per requeue instead of skipping
+  the pass. `helm upgrade` handles it; a raw `kubectl apply` needs
+  `deploy/crds/sbproxy.yaml` reapplied too. See the reconcile-loop
+  section of [docs/kubernetes.md](docs/kubernetes.md).
+
+- **Outlier ejection now restarts the endpoint's measurement window.**
+  The failures that caused an ejection kept counting against the
+  endpoint after it was re-admitted, until `window_secs` expired from
+  the original window start. A recovered endpoint serving four clean
+  requests and then one unrelated 5xx was re-ejected at a 60 % lifetime
+  error rate even though its post-recovery rate was 20 %, on repeat, so
+  a configured 30 s `ejection_duration_secs` behaved as a
+  `window_secs`-long one. Ejection now zeroes the endpoint's counters,
+  so the probe after re-admission is graded only on post-ejection
+  traffic. See
+  [docs/config-stability.md](docs/config-stability.md#outlier-ejection-restarts-the-endpoints-measurement-window).
+
+- **`error_pages` and `problem_details` now cover policy denials, not
+  only authentication ones.** An `ip_filter`, `waf`, `dlp`, `rego`,
+  `csrf`, `object_authz`, or other `policies:` refusal answered with a
+  hard-coded `{"error": ...}` in `application/json` regardless of what
+  the origin configured, so an operator who opted in to RFC 9457 got
+  `application/problem+json` from an auth denial and a different body
+  shape from a policy denial on the same origin. Both blocks now render
+  those refusals, with the same precedence they already had: an authored
+  page wins, the renderer catches the rest. This also makes
+  `include_detail: false` mean something on the policy path, where it
+  previously suppressed nothing: the WAF's message appends the id of the
+  rule that matched, and that reached the client verbatim. Unchanged on
+  purpose are the refusals whose body a protocol pins, which keep their
+  own shapes: the 429 rate-limit set, the AI-crawl payment family,
+  settlement responses, and agent-to-agent chain refusals. So do the
+  three policies that write their own body on every refusal, configured
+  or not, and therefore never reach the renderer: `concurrent_limit`,
+  `content_digest`, and `prompt_injection_v2`. Also still outside the
+  renderer, and now stated as such: the 404 for a `Host` matching no
+  origin, `bot_detection`'s 403 and the other refusals that run before
+  the policy chain, and the AI gateway surface. See
+  [docs/configuration.md](docs/configuration.md) and
+  [examples/problem-details/](examples/problem-details/).
+
+- **`prompt_injection_v2`: the URI and header scan now honors
+  `block_body` and `block_content_type`.** The policy can block from
+  four places. Three of them (the buffered request body, the `ai_proxy`
+  prompt segments, and A2A message parts) wrote the operator's
+  configured rejection body and media type to the wire. The fourth, the
+  synchronous scan of the request line and non-auth headers, denied
+  through the generic policy renderer instead: it wrapped the body in a
+  fixed `{"error": "<block_body>"}` envelope and always answered
+  `Content-Type: application/json`. `block_content_type` was ignored
+  outright on that path, and a `block_body` that was already JSON came
+  back double-encoded as a string inside an `error` field, so
+  enforcement depended on which internal path happened to run. All four
+  paths now serve `block_body` verbatim with `block_content_type`. If
+  you pre-wrapped `block_body` to work around this, unwrap it. Each
+  block increments the new
+  `sbproxy_prompt_injection_blocks_total{scan_path,tenant}` counter, so
+  the four paths can be compared rather than merged.
+
+- Provider prompt-cache token counts now reach the attribution metrics.
+  The billing choke point parsed `cached_input` and `cache_creation` off
+  the provider's usage block and then passed literal zeros for them, so
+  a cache hit showed up in dollars, because the cost table already
+  discounts both, and nowhere in tokens.
+  `sbproxy_ai_tokens_attributed_total{direction="cache_read"}` and
+  `{direction="cache_write"}` now carry real numbers. Both are subsets
+  of `direction="input"`, not additions to it, so sum the directions
+  separately rather than folding the label. The usage record also gained
+  a `tokens_cache_write` field beside the existing `tokens_cached`.
+
+- **`proxy.attestation.role: claim` and `role: both` are refused at
+  config load, because this build implements neither.** Both spellings
+  parsed, validated, and produced nothing: no claim is written before a
+  call is served, nothing ever reads `proxy.attestation.queue`, and no
+  ceiling is computed for `proxy.attestation.enforcement_mode` to act
+  on. A proxy set to `claim` compiled clean and served traffic that
+  produced neither a claim nor a receipt, so an operator who had
+  configured a spend ceiling and a bounded queue got an unmetered proxy
+  and no signal that anything was wrong. Config load now refuses both
+  roles with a message naming the three missing pieces and pointing at
+  `role: receipt`, the half that is complete, and it refuses the same
+  widening on a per-origin `attestation.role` so one host cannot slip
+  past the proxy-wide check. Boot also stops creating the claim queue's
+  directory: nothing in this build can write there, and state an
+  operator has to explain is worse than none. The ledger's directory is
+  still created, because the receipt chain is opened in it. `role:
+  receipt` and `role: off` are unaffected, and no shipped example or e2e
+  config used either refused role. See the `role` section of
+  [docs/metering.md](docs/metering.md).
+
+- **`docs/comparison.md` no longer advertises PROXY protocol support.**
+  The table listed PROXY protocol v1 as shipped. A complete v1 parser
+  exists in the source tree, nothing calls it, no listener reads the
+  preamble, and there is no configuration key of any spelling. An
+  operator who enabled PROXY protocol on the load balancer in front of
+  SBproxy got a 400 on every connection, because the `PROXY TCP4 ...`
+  line reached the HTTP parser as the request line, and the address the
+  access log, the WAF, and the IP-filter policy evaluated was the load
+  balancer's. The row now reads "No (v1 parser present, not wired to a
+  listener)", a build guard fails if the row and the wiring ever
+  disagree, and
+  [docs/config-stability.md](docs/config-stability.md#there-is-no-proxy-protocol-configuration-key)
+  says what to do instead.
+
+- **Three rustdoc claims that the code did not have.** The reverse-DNS
+  verifier's docs said the verdict cache TTL was "the smaller of the
+  observed PTR / forward TTLs"; the resolver port returns no TTL at all
+  and the caller passes a fixed value, now documented as the fixed value
+  it is. The same file said the verifier "never silently falls back to
+  `User-Agent` matching", while its only production consumer falls
+  through to UA matching for every non-verified verdict, which is now
+  what it says. The SSRF module's caller-status list, which exists so a
+  reviewer can enumerate every path needing dial-time re-validation,
+  named seven call sites and asserted `validate_url_with_allowlist` had
+  none outside the module; the `events:` webhook sink had two it did not
+  name. The list is now nine, split by whether the caller pins the
+  address it validated, and a test fails the build if a new call site
+  lands without being added to it.
+
+- **The `html` transform's `rewrite_attributes` stamps every matching
+  tag.** It used to rewrite the tags that already carried the attribute
+  and stop, and when no tag carried it, add it to the first match only,
+  so a page that mixed the two came out half-rewritten. One pass now
+  handles both: a tag with the attribute has its value replaced, a tag
+  without it has the attribute inserted before the closing `>`, and a
+  self-closing `/` is kept. The attribute match also requires a
+  whitespace boundary, so a `target` rewrite no longer fires inside
+  `data-target`, and a configured value containing `$1` stays literal
+  text.
+
+- **The secrets-manager keystore no longer loses key-index entries or
+  revision bumps to concurrent writers.** Each mutation is three
+  unguarded vault round trips, two of them a read-modify-write on a
+  secret shared by every record of that kind, on the one backend that
+  refuses compare-and-set for exactly that reason. Two concurrent mints
+  could each read `["a"]` and write their own array over the other's,
+  dropping a key id from the index forever: `list_keys()` never returned
+  it and the console could not revoke it, while `get_key()` still
+  authenticated it. Mutations are now serialized within the process, the
+  index and revision writes read back what they wrote and re-apply on a
+  mismatch, and the write order is chosen so a mid-sequence failure
+  leaves a survivable state: the index entry goes in before the record
+  (a dangling id is skipped by `list_keys`) and the tombstone goes down
+  before the index entry is removed. A writer this process cannot see, a
+  second replica on the same prefix or an operator editing the secret by
+  hand, is narrowed by the read-back retry rather than excluded; only a
+  real conditional write could exclude it.
+
+- **`security_headers`: a configured `content_security_policy` is no
+  longer silently dropped.** Setting both a `headers:` array and a
+  `content_security_policy` block emitted the array and no CSP at all
+  whenever `enable_nonce` was false and no `dynamic_routes` were set: no
+  error, no warning, just responses with no CSP. The two now merge, with
+  the `content_security_policy` block as the single source of truth for
+  that header and `headers:` supplying everything else. Two siblings of
+  the same bug went with it: `report_only` and `report_uri` were
+  consulted only on the nonce path, so a policy asking for report-only
+  monitoring was emitted as an enforcing one, and a CSP block whose
+  `policy` string was empty emitted nothing. Authoring a CSP in both
+  places at once is now refused at config compile rather than resolved
+  quietly, and a `headers:` array that supersedes legacy flat fields
+  logs which ones it is dropping. Emitted policies are counted by
+  `sbproxy_security_headers_csp_emitted_total{mode,tenant}`.
+
+- **A metering node no longer holds one claim id per request for the
+  life of the process.** `SegmentRecorder` folds a retry into the sale
+  it belongs to by remembering the claim ids it has already counted, and
+  nothing ever removed one. Because a claim id is a fresh per-request
+  value, a proxy with a metering role at 1,000 requests a second added
+  around 86 million distinct 26-character ids a day to a set that only
+  grew, on the order of a gigabyte a day of unreclaimable heap until the
+  process was killed, and nothing reported the set's size so the growth
+  read as generic memory pressure rather than as the meter. The recorder
+  now keeps a fixed window of the 65,536 most recent claim ids, which is
+  65 seconds of traffic at that rate and far longer than any attempt at
+  one claim survives, and reports the window's occupancy beside the
+  lifetime claim count in its `Debug` output. The published `claims`
+  figure on a chain segment is unchanged: it is a separate lifetime
+  counter, so bounding the window does not shorten the total.
+
+- **One broken settlement sweep no longer cancels the rest of the
+  tick.** The recovery worker chained its six sweeps with `?`, so a
+  single store error, from a second process holding the write lock past
+  the busy timeout for instance, returned from the whole tick and the
+  sweeps below it never ran. For as long as the contention recurred,
+  reconciliation stopped asking providers what happened to ambiguous
+  writes and expired recovery ciphertext was retained past its hard
+  expiry, while the sweep that retires unresolved payments kept running
+  ahead of them. Every sweep is now attempted independently: the one
+  that failed logs at warn under its own name, increments
+  `sbproxy_payment_recovery_total{operation="<sweep>",
+  outcome="failed"}`, and the tick reports the first error only after
+  all six have run. `sbproxy_payment_worker_ticks_total` still counts
+  only ticks where every sweep completed, which now means something it
+  could not mean before: a flat tick rate beside a moving `failed` rate
+  reads as a degraded worker rather than a dead one. See the `worker`
+  section of [docs/payment-settlement.md](docs/payment-settlement.md).
+
+- **Each shadow target's usage row gets its own ledger id.** The shadow
+  usage record minted its `:shadow` request id when it was built rather
+  than when it was recorded. With one target that was invisible; with
+  the multi-target lists this release adds, every target's row would
+  have carried the same id, and that id is the verifiable ledger's dedup
+  key, so N rows would have collapsed to one on replay. The id is now
+  minted per recorded row.
+
+- `routing.strategy: sticky` is now documented as what it does. The
+  session-affinity map exists in the router and nothing on the request
+  path supplies it a session key, so every request has always taken the
+  round-robin fallback; the documentation claimed it pinned a user or
+  session to one provider. The strategy still loads, so no config
+  breaks, and the docs now point at `cache_affinity` for caller affinity
+  that works.
+
+- **The ACME issuance lease renews for as long as the CA takes, and a
+  holder that lost it can no longer publish.** The fleet issuance lock
+  was a fixed 120 second TTL with no heartbeat, while a normal ACME
+  order can legitimately poll longer than that; stale takeover on the
+  file and object-store backends was read-then-overwrite, so two
+  replicas racing the same expired lease both believed they won. The
+  lease is now renewed every 20 seconds for the whole order, a holder
+  whose renewals keep failing fences itself before any successor can
+  have started, takeover is a conditional write (an atomic create-marker
+  on the file backend, an etag precondition on object storage, a single
+  Lua script on Redis) so exactly one contender per expired lease wins,
+  and every acquisition mints a strictly increasing fencing generation
+  that publication is checked against. An object-store backend with no
+  conditional write support refuses the takeover instead of quietly
+  double-acquiring.
+
+- **The file log sink counts every record it drops.** An append that
+  failed after the file was already open discarded its error, so a sink
+  on a full volume, a read-only remount, or a failing disk stopped
+  writing while `sbproxy_telemetry_dropped_total{kind="file_sink"}`
+  stayed flat and an operator alerting on that counter read the sink as
+  healthy. A failed append now ticks `reason="write_error"`, a failed
+  open ticks `reason="open_failed"` (it warned before but counted
+  nothing), and a failed rotation ticks `reason="rotate_failed"`. All
+  four file-sink warnings, including the existing `mkdir_failed` one,
+  are now rate-limited to one per minute per sink path: they fire once
+  per emitted record, so the first ENOSPC used to turn a broken sink
+  into a log flood at request rate. The counter carries the rate.
+
+- The Kubernetes Gateway API controller no longer publishes a truncated
+  `sb.yml` while a watch relist is in flight. The replayed objects are
+  staged beside the live snapshot and swapped in when the relist
+  completes, which is also the only point a relist schedules a
+  reconcile, and the first document a fresh controller writes waits for
+  all four watched kinds to finish their first list.
+
+- **The Kubernetes Gateway controller renews its leader Lease and fences
+  every write on loss.** Leader election acquired the 15 second Lease
+  once and returned, so after 15 seconds a standby took it over while
+  the original leader kept writing `sb.yml` and Gateway API status, and
+  takeover used force-apply, which lets a non-holder steal the holder
+  field. Leadership is now a lifecycle: the leader renews every 5
+  seconds, takeover is conditional on the Lease's `resourceVersion` so
+  racing standbys see exactly one winner, and a leader that cannot renew
+  fences its own config and status writes after 10 seconds, fails
+  readiness, releases the Lease on graceful shutdown, and exits so the
+  Deployment restarts it as a standby.
+
+- The Redis virtual key store, its L2 cache tier, and the shared Redis
+  storage backend now reconnect after their socket dies. A Redis
+  restart, failover, or `CLIENT KILL` used to leave a cached connection
+  that never reconnects, so every later key resolution and every later
+  mesh membership write failed for the life of the process.
+
+- **The translated gRPC paths negotiate away message compression instead
+  of mis-reading it.** `transcode` decodes the response frame to build
+  JSON and `grpc_web: true` re-frames it for a browser, and neither can
+  read a compressed payload, but neither said so: no request carried
+  `grpc-accept-encoding`, the frame's compression flag was parsed and
+  then never read, and the `grpc-encoding` response header was stripped
+  from both paths regardless of what it said. A gzipped frame was handed
+  to the protobuf decoder as if it were a message, which fails as a
+  schema error or, for bytes that happen to parse, succeeds with the
+  wrong field values. Both paths now advertise `grpc-accept-encoding:
+  identity` upstream, so a compliant server stops compressing; a frame
+  whose compression flag is set anyway is refused by name rather than
+  decoded; and the gRPC-Web bridge keeps a non-`identity`
+  `grpc-encoding` header on the response, because the frames under it
+  are forwarded byte for byte. Plain gRPC passthrough never looks inside
+  a frame and is unaffected. See the gRPC limits in
+  [docs/routing.md](docs/routing.md).
+
+- **The upgrade guide's provider count.** `MIGRATION.md` described the
+  AI provider catalog as "90+" entries, a number it has carried since
+  the initial commit and that the catalog has never held. It ships 72,
+  which is what every other page already published. The count is now
+  read out of `crates/sbproxy-ai/data/ai_providers.yml` at check time
+  rather than written down in prose: `scripts/check-doc-drift.sh` holds
+  every digit-form provider total in the scanned docs to the catalog's
+  entry count, holds the published wire-format breakdown of that total
+  ("66 of the 72 catalog entries", "3 custom-format entries") to the
+  catalog's `format:` values wherever it appears on a line carrying such
+  a total, scans `MIGRATION.md` for the first time, and runs on a change
+  to the catalog itself, so a provider added without updating the docs
+  fails the lane instead of shipping. Word-form counts stay the job of
+  the fixed-string list beside it, and a breakdown claim reworded off a
+  total's line stops being read, which the check reports rather than
+  passes over.
+
+- **The usage-bridge example replays the metrics it shows.**
+  `examples/usage-bridge-queue/README.md` published a
+  `sbproxy_usage_bridge_enqueued_total` scrape and its counter values
+  that nothing re-ran, on a page the capture harness otherwise covers.
+  The block now carries a `CAPTURE` marker like the three steps above
+  it, and `scripts/check-doc-captures.py` refuses any `bash` block on a
+  covered page whose next fenced block shows output, unless a marker
+  replays it, a heading separates the two, or the block is recorded with
+  the reason it cannot be replayed. Each recorded reason must match
+  exactly one block, so a later block cannot inherit an older exemption.
+  The fence parser behind that now reads any info string CommonMark
+  allows, and reports a fence it cannot read instead of walking past it:
+  a ```rust,no_run block on `docs/audit-log.md` was silently costing the
+  page one of its 31 blocks and inverting code and prose for everything
+  below it.
+
+- **The usage ledger now writes each entry in one syscall and forces it
+  to disk.** The append path called `writeln!` followed by
+  `Write::flush`, which `std::fs::File` documents as a no-op, so entries
+  the ledger reported as written lived in the page cache until the host
+  wrote them back. A power cut lost them silently: a truncated hash
+  chain is still a valid hash chain, so the shortened file verified
+  clean, `sbproxy_meter_chain_gap_total` counted nothing, and the
+  revenue was simply unbilled with no marker anywhere. `writeln!` also
+  lowered to two writes, so a process killed between the payload and its
+  newline left a line the next append merged into, after which
+  `UsageLedger::open` refused the file permanently and a `failure_mode:
+  closed` deployment refused traffic until somebody edited it by hand.
+  Each entry is now a single `write` of the line and its terminator
+  followed by `sync_data`, and a write that moved some bytes and then
+  failed marks the ledger unappendable rather than chaining onto a torn
+  line; a write that failed having moved nothing, which is what a full
+  disk does, leaves the file intact and the ledger appendable, so
+  metering resumes when the space does. The cost is one `fsync` per
+  metered call, inside the mutex that already serializes appends and
+  inside what `sbproxy_meter_append_duration_seconds` measures: put
+  `proxy.attestation.ledger.path` on local storage. See
+  [docs/metering.md](docs/metering.md) and the upgrade-affecting section
+  of [docs/config-stability.md](docs/config-stability.md).
+
+- x402 settle now reads the HTTP status before the body, so only a 2xx
+  response saying `success: false` is an authoritative refusal. A settle
+  answered outside 2xx moves the intent to `NeedsReconciliation` instead
+  of closing it `Terminal`, whatever a foreign error envelope
+  deserializes to.
+
+- **`ai_guardrail_output` now evaluates streamed model output.** The
+  hook used to run only on a buffered completion, so a `stream: true`
+  client bypassed it. An enforcing output hook holds the stream until
+  close and can replace or refuse the assembled assistant text.
+
+- **`ai_tool_call` now evaluates non-streaming tool calls, and a block
+  after stream headers writes an SSE error.** A buffered tool-call
+  completion used to skip the hook, and a streaming block after headers
+  used to close the connection with no payload. Both now refuse with the
+  same bounded error envelope as the pre-header path.
+
+- **Buffered bundle policies now run on empty-body requests and on
+  `ai_proxy` origins.** `body_mode: buffered` (the hook default) used to
+  skip GET/HEAD and every AI request, so a deny hook never saw them.
+  Those requests now dispatch against the complete body, including an
+  empty one.
+
+- **Git-sourced config and extension bundles no longer require a `git`
+  binary.** Fetch prefers `git` on `PATH` and falls back to an
+  in-process clone when it is missing, which is what the official
+  distroless image needs. `verify_signature: true` still requires `git`,
+  because GPG and SSH signature verification are not in the in-process
+  path.
+
+- **Linux Model Host spawn no longer wraps the engine in `/bin/sh`.**
+  Distroless images have no shell, so a serve entry on the official
+  image never reached exec. The startup gate now waits in the child
+  before the engine image is exec'd. macOS still uses a shell wrapper
+  because Darwin has no `pipe2`.
+
+- **`transforms:` on an `ai_proxy` origin are refused at config load.**
+  Those origins never reach the transform pipeline, so a listed
+  transform used to load as active and then silently no-op. Use the AI
+  bundle hooks `ai_guardrail_output` and `ai_tool_call` to inspect model
+  output instead.
+
+- **A confidence cascade that dispatches no tier now says which
+  exclusion stopped each one.** A cascade tier naming a provider the
+  calling credential's `provider` allow/block policy excludes used to
+  log a bare `cascade exhausted without dispatching any tier` before the
+  client's `502`, naming neither the lock nor the requested provider.
+  When that lock is the only reason no tier dispatched, the logged error
+  now reads `cascade exhausted: every candidate tier was excluded by the
+  credential's provider policy (allowed=..., blocked=...); routing plan
+  requested provider(s) ..., which this credential cannot reach`. When
+  the causes are mixed the message stays generic and appends each tier's
+  own closed reason, `(skipped: openai (data_posture), anthropic
+  (credential_lock), ...)`, so a mixed cause is diagnosable instead of
+  silent. A tier excluded by the request's data-handling posture
+  (`x-sbproxy-require-zdr`, `x-sbproxy-disallow-data-collection`, or the
+  origin's `data_posture:` block) is reported as `data_posture` and
+  never as the credential's own lock, and a tier naming a provider that
+  is not configured is reported as `not_found`.
+
+- **`fallback_origin`'s `on_status` trigger now serves a clean,
+  correctly framed fallback response.** It used to edit the primary's
+  response header in place, overwriting a handful of names and leaving
+  every other header the primary set (`Server`, its own
+  `Access-Control-Allow-*`, and the rest) on what is meant to be an
+  independent response, and it stashed the fallback body for
+  `response_body_filter` to swap in later. Pingora only calls that hook
+  when the primary actually produces a body chunk, so a primary that
+  answered with no body at all (`Content-Length: 0`, the common shape
+  for a bare `503`) sent the fallback's declared `Content-Length` with
+  zero bytes behind it and desynchronized the keep-alive connection. The
+  fallback response is now built from nothing and written in full, so
+  neither can happen. Three operator-visible consequences. First, the
+  headers SBproxy itself owns are put back on the fallback rather than
+  lost with the primary's, and this half applies to **both** triggers,
+  so an origin running only `on_error` is affected too: those responses
+  were built from nothing and carried none of these headers before
+  either, and they will start carrying them on upgrade. The set is:
+  CORS, HSTS, `security_headers` and Page Shield, the CSRF cookie, the
+  debug request-id and correlation-id echo, `traceparent`/`tracestate`,
+  RFC 9209 `Proxy-Status` carrying the *primary's* status, and the
+  idempotency and retry-skip markers. `response_modifiers`,
+  `Deprecation`/`Sunset`, `Content-Signal`, compression, the
+  `Content-Type` rewrite, and response caching do not apply to a
+  fallback;
+  [routing.md](docs/routing.md#what-a-fallback-response-carries) lists
+  both sides. Second, a fallback with `status_code: 204` or `304` now
+  declares no `Content-Length`, matching the carve-out the `static` and
+  `mock` actions already took, and a fallback answering a `HEAD`
+  declares the length its `GET` would return and sends no bytes. Third,
+  `bytes_out` in the access log and in the metering receipt now counts
+  the fallback body: on the `on_error` path it was `0` and is now the
+  body's length, so a `measured` unit rule on `bytes_out` will see
+  billed quantities move on upgrade. The access log's `upstream_status`
+  also starts working: it read the same field it was being compared
+  against, so it was empty on every request the proxy has ever served,
+  and it now carries the primary's status whenever a fallback, a
+  `status` response modifier, or a metering refusal replaced the status
+  the client sees.
+
+- Classifier sidecar: a model id a validated manifest names but no
+  `--model` loaded now fails with a typed status instead of answering
+  `safe` at score 1.0 or a zero embedding, tenant ids are bounded and
+  character-checked at registration, and normalization refuses past a 4
+  MiB output ceiling, and a label pattern or normalization rule that
+  compiles past its charged compiled-program budget (48 KiB per pattern,
+  64 KiB per rule) is refused at registration with a message naming the
+  budget.
+
+- Classifier sidecar: the public TCP listener can no longer take the
+  whole in-flight frame budget. 4 MiB of the 16 MiB budget is reserved
+  for the admin listener, so unauthenticated sockets that pin their
+  share cannot lock an operator out of `register`, `delete`, and `list`.
+
+- Classifier sidecar: the public TCP listener now runs every CPU-bound
+  command behind the same bounded executor and per-request budgets as
+  the gRPC surface, carries whole-frame and whole-connection deadlines
+  (`--tcp-frame-timeout-ms`, `--tcp-connection-timeout-ms`), and refuses
+  a non-loopback bind unless `--tcp-allow-nonlocal` is set. The
+  connection deadline is refreshed by every answered frame, so a pooled
+  connection that stays busy is never cut mid-exchange.
+
+- A buffered AI response the caller walked away from during the write
+  now prices as `client_disconnected` rather than as a delivered sale or
+  a provider 5xx, and declines the `on_error` fallback that would have
+  made a second paid provider call for a caller who had already left.
+
+- A cancelled request no longer orphans its idempotency key for the
+  whole lease, a transient store read failure no longer hands out an
+  unfenced claim during a failover, and the validated-GraphQL path takes
+  its key off the proxy worker like every other path. Proxied requests
+  now record their idempotency outcome, so the `result` metric means
+  what the reference says it does.
+
+- A client that disconnects mid-stream now settles on a
+  `client_disconnected` receipt and ticks
+  `sbproxy_ai_stream_post_commit_failures_total{cause="client_disconnected"}`,
+  where the failed relay write previously priced as a delivered sale.
+
+- A streamed AI response now settles its token usage through one
+  finalizer on every way the stream can end, so a client that hangs up
+  mid-stream is billed for what it received rather than refunded in
+  full, and a clean stream with an exact `usage` frame reaches the
+  access log, the usage sinks and the payment bridge instead of
+  reporting zero.
+
+- A streamed AI response whose provider never sends a `usage` frame is
+  now billed from the assistant text it delivered, counted with the
+  model tokenizer, instead of debiting nothing;
+  `sbproxy_ai_usage_parse_miss_total` marks every stream priced that
+  way.
+
+- A usage-less non-streaming AI response now debits `max_usd` from the
+  same catalog-priced estimate it already debited the token caps from,
+  instead of reporting `PerCall` and moving no dollars.
+
+- An abandoned streamed AI request now settles what it delivered. The
+  settlement moved into a guard, so a shutdown that drops in-flight
+  streams, an outer timeout, or a panic in the relay bills the tokens
+  the provider already generated instead of refunding every reservation.
+
+- An `ai_close` hook that blocks the stream close now publishes an
+  `ai.close` decision record with a `deny` outcome, naming the hook's
+  refusal code. Only a clean close published one before, so a refused
+  close left the audit feed silent.
+
+- An MCP OAuth broker whose `broker_signing_key` is a PEM with no
+  `public_jwk` is refused at startup instead of serving an empty JWKS
+  every verifier rejects, and a colocated resource server takes that key
+  set in process instead of dialing the proxy own JWKS URL.
+
+- **Prompt-cache affinity now stands aside for `fallback_chain`, as
+  documented.** Four routing strategies own their candidate order
+  outright and a cache lease must not jump the queue: `fallback_chain`
+  sorts by declared priority, `cascade` walks tiers in cost order,
+  `cost_quality` splits cheap against frontier, and a `routing_policy`
+  plan names its providers. [docs/ai-gateway.md](docs/ai-gateway.md)
+  says of all four that "on those origins no lease is read and none is
+  recorded", and the dispatch site's own comment named all four. The
+  condition beside it tested three. On a `fallback_chain` origin with
+  `cache_affinity:` configured, a caller who had sent a
+  `prompt_cache_key` therefore had the lease holder moved to the front
+  of the operator's priority order, and a fresh lease was recorded on
+  every success, so the chain drifted further from its declared order
+  the longer it ran. The strategy half of the rule is now
+  `Router::owns_candidate_order` and the whole rule is one named
+  predicate with a test per arm, so the sentence in the docs and the
+  expression in the code can be read against each other.
+
+- **A `cel` transform's `headers:` rules now run exactly once, in a
+  phase that can bind what they read.** The same rules were evaluated
+  twice on a proxied response, once in the header phase against an empty
+  body and again in the body phase against an empty header map with the
+  headers already committed, and a `plugin` response evaluated them and
+  drained nothing, so even a constant `set` vanished with no error, log,
+  metric, or event. Each rule now evaluates once, in the phase the
+  dispatched action settles in. A rule reaching for a binding no route
+  on its origin can supply is refused when the config compiles, naming
+  the origin, the rule, and the action: `response.body` where every
+  route streams, `response.headers` where every route buffers, and any
+  header rule at all on an action that never runs the transform chain. A
+  rule some other route can serve is skipped on the route that cannot,
+  counted on `sbproxy_errors_total` under a closed reason and logged,
+  rather than resolved against an empty value. `op: append` now adds a
+  value on every action type; on a `static` or `plugin` origin two
+  `append` rules for one header used to leave only the second.
+
+- **`sbproxy config print` and `sbproxy mcp lock` now resolve `${VAR}`
+  through the config compiler's own pass rather than a near-copy of
+  it.** The copy had drifted three ways: it substituted `$${VAR}`, which
+  is the documented escape and has to stay literal; it substituted the
+  MCP local-tool forms `${args.x}` and `${steps.x.y}`, which the tool
+  executor owns at call time; and it had no `${VAR:-default}` support,
+  so a config resolving to a default printed the raw placeholder
+  instead.
+
+- CoMP redeem is bound to the quote it names. An expired quote stays
+  refusable after a later quote request, where the sweep used to remove
+  the row that rejected it, and `accepted_quote_hash` is verified
+  against the quote this publisher issued for that `quote_id`. A
+  `quote_id` the process's ledger has never seen is still admitted,
+  because that ledger is same-process and refusing would break every
+  redeem across a restart; `docs/comp-marketplace.md` names that limit
+  under Honest limits.
+
+- `docs/extension-bundles.md` now describes `ai_close` accurately: it
+  fires before the end-of-stream marker reaches the client, a `block`
+  verdict is honored, and both outcomes publish an `ai.close` decision
+  record; `ai_failure` remains the one event whose verdict is never
+  consulted.
+
+- `docs/policy.md` no longer says the Cedar compiler and policy store
+  were removed; it separates the retired natural-language-to-Cedar path
+  from the Cedar engine that ships for the MCP `tools/call` hook.
+
+- Idempotency now caches a response whose upstream outlived the claim
+  lease, and a waiter polling a key no longer deletes a successor's live
+  claim. The claim lease and the overlap wait are config keys
+  (`idempotency.claim_lease_secs`, `idempotency.claim_wait_ms`); waiting
+  requests draw on their own pool so one key's retry storm cannot starve
+  every other key.
+
+- Idempotency now single-flights overlapping first requests. The
+  middleware looked a key up and, after the response was final, stored
+  it, with nothing in between: fifty parallel retries of one payment
+  POST all missed, all reached the upstream, and all charged the card,
+  which is the case the feature exists to prevent. A first request now
+  claims its key atomically and every overlapping retry waits for that
+  request's response and replays it, so the upstream is called once. A
+  retry that outlives the three-second wait gets 409
+  `ledger.idempotency_in_flight` with `x-sbproxy-idempotency: IN-FLIGHT`
+  and `Retry-After: 1` rather than a second upstream call, and a retry
+  carrying a different body still gets `ledger.idempotency_conflict`.
+  The claim is a sixty-second lease, released the moment its holder
+  finishes, fails, or is cancelled, so a crashed request bounds rather
+  than wedges the key, and a superseded holder cannot overwrite the
+  response its successor published. Single-flight across replicas needs
+  an `l2_store` that can create a key atomically; redis can, and a store
+  that cannot is warned about once and counted under
+  `result="single_flight_unsupported"` instead of silently doing
+  nothing.
+
+- **A linked plugin returning the legacy `ActionOutcome::Responded` now
+  gets a defined response on every transport.** The variant claims the
+  handler already wrote a response through host state, and no host state
+  a linked `ActionHandler` reaches writes one: HTTP/1.1 and HTTP/2
+  marked the request served and sent zero bytes, so the client saw an
+  empty exchange and the access log had no status, while HTTP/3 answered
+  a `501`. All three now answer `501 Not Implemented` with the same
+  `application/json` body carrying the stable
+  `unsupported_action_outcome` reason, stamp the status onto the request
+  context, tick
+  `sbproxy_errors_total{error_type="unsupported_action_outcome"}`, and
+  publish a `request_error` event naming the outcome, so the refusal is
+  alertable and reaches the SIEM feed rather than living in a log line.
+
+- **Two `${...}` placeholder forms were misclassified as environment
+  references.** `${}`, which names nothing, lost its closing brace
+  during interpolation and was reported as an unresolved environment
+  reference, which a config-authority subscriber turns into a refusal of
+  the whole bundle. `${request.header.NAME}` and `${attribution.KEY}`,
+  the dotted half of the access-log `custom_fields` vocabulary
+  documented in `docs/access-log.md`, were treated the same way even
+  though `custom_log` resolves both per request and never from the
+  environment. Both now round-trip as the literal text they are.
+
+- **`resilience.circuit_breaker` and `resilience.outlier_detection` now
+  see real request outcomes.** The AI dispatch path counted per-provider
+  attempts but never fed the router's health axes, so neither the
+  breaker nor the outlier detector learned that a provider had failed
+  and a provider that failed every request was never ejected, on any
+  routing strategy. Every settled attempt now records one outcome
+  against the attempt metric, the breaker, the outlier detector, and the
+  per-error-class cooldown policy together: a 5xx or a transport error
+  is the provider's failure, a 4xx is the caller's and counts as a
+  success, a managed-local engine that never started counts for load but
+  is no health sample, and a raced leg the winner cancelled records
+  nothing at all.
+
+- Rotated access-log backups left behind by a change of the `compress`
+  setting are made owner-only. The sweep followed the configured
+  compression mode, so an operator who turned compression on after
+  upgrading left the plain `access.log.1..N` files at whatever mode the
+  older build gave them, holding the same request records as the
+  compressed files beside them.
+
+- **The admin console no longer triggers the browser's native credential
+  dialog, and neither does a browser opening an admin URL directly.** A
+  `401` answering a browser now comes back without `WWW-Authenticate:
+  Basic`, so a session that lapses mid-use drops the operator on the
+  console's own sign-in page instead of behind a popup whose Cancel
+  button left the page unusable until a hard reload. The server tells a
+  browser apart by `X-Requested-With: XMLHttpRequest`, which the
+  console's fetch layer sends on every admin call, or by the presence of
+  `Sec-Fetch-Dest`, which browsers send on every request and shell
+  clients send on none. Both only choose that one response header;
+  neither changes how credentials are resolved, so a marked request with
+  no password is refused exactly as before. Two things to know before
+  you upgrade. Opening an admin route in a browser tab now shows the
+  JSON refusal rather than prompting for the top-level password, which
+  is the point: that prompt was how a browser picked up the credential
+  and began re-sending it invisibly, minting fresh sessions with no
+  login. `Sec-Fetch-Dest` shipped in Chrome 80, Firefox 90, and Safari
+  16.4, so a browser older than those still gets the prompt on a direct
+  navigation; the console's own calls carry `X-Requested-With` and are
+  covered on any browser. And a separately hosted console
+  (`proxy.admin.cors_origins`) that sends `X-Requested-With` preflights
+  every call, so the preflight's `Access-Control-Allow-Headers` now
+  names it. Scripted and CLI callers send neither marker and still get
+  the RFC 7235 challenge, so `curl -u` and `sbproxy admin` are
+  unaffected. A 401 now carries `Vary: X-Requested-With, Sec-Fetch-Dest`
+  for anything caching in front of the admin port. See
+  [docs/admin-api-guide.md](docs/admin-api-guide.md).
+
+- The emitted OpenAPI document now maps every auth type the gateway
+  implements, including the three providers WOR-2667 ported. The
+  `api_key` provider previously fell through to a generic placeholder
+  that told clients to send `Authorization` when the origin wanted the
+  header it had configured, and a `noop` origin published a credential
+  requirement it does not have.
+
+- **The Extensions admin page reserves its red load-evidence styling for
+  a real failure.** Every poll of a Git-sourced bundle writes a refresh
+  line into `load.detail`, so the page used to paint healthy bundles
+  error-red on every refresh. Red now means the bundle failed: its hooks
+  collided unresolved, or its refresh candidate was rejected. A rejected
+  candidate moves that bundle to `load.status: degraded` on `GET
+  /api/extensions` and holds it there until a poll reaches the source
+  and succeeds, so a proxy serving a stale generation no longer reads as
+  healthy. A collided hook now carries the reason in `hooks[].detail`
+  instead of reporting a state with nothing to act on.
+
+- The idempotency reference no longer claims a full waiter pool skips
+  the cache: it answers 409 `ledger.idempotency_in_flight` immediately,
+  and only the buffering pool produces `x-sbproxy-idempotency:
+  SKIPPED-POOL-FULL`. `SKIPPED-MULTIPART` is documented as the seventh
+  header value, and the outcome metric now says which requests it counts
+  rather than claiming it sums to the origin request count.
+
+- The MCP OAuth broker device-code consent page works when a branded
+  verification URI is configured, and refuses to boot without a
+  canonical origin. Naming `device_code_verification_uri` used to
+  replace the expected origin rather than add to it, so the shipped
+  consent page became cross-origin against itself; and
+  `device_code_enabled` with DPoP off booted with no base URL at all,
+  which made every consent POST a 403.
+
+- The streaming usage estimate now covers every wire shape the
+  `usage_parser` table documents. Vertex and Gemini
+  `candidates[].content.parts[]` and Bedrock's base64 `bytes` envelope
+  extracted to nothing before, so a delivered answer on either provider
+  refunded in full; frames past 16 KiB and chunks that split a
+  multi-byte character are no longer dropped either.
+
+- Thirteen metric families the ported MCP OAuth broker, OpenID
+  Federation, and IAB CoMP crates declare are now classified in the
+  metric registry and appear in `docs/metrics-stability.md`.
+  `sbproxy_mcp_gateway_sessions_active` also gained the writer it never
+  had: the in-memory session store updates it on every put, take, and
+  purge, so the dashboard panel reading it stops drawing a flat zero. A
+  deployment on the storage-backed session store still reads zero there,
+  and the catalog entry says so.
+
+- Two MCP OAuth broker refusals now appear in the metric catalogue that
+  always counted them: an unresolvable `client_id` metadata document on
+  `/authorize` and on `/token`. Both answer a fixed string on the wire,
+  because the detail would name the address a client-chosen URL resolved
+  to, so `sbproxy_mcp_gateway_decisions_total` is the only place their
+  rate is visible. A new guard pins every surface that writes that
+  family against the catalogue entry in both directions, so a refusal
+  cannot stop being counted, or start being counted undocumented,
+  without a test going red.
+
+- **A composed payload is screened where it composes.** A hand-written
+  `origins:` entry on the aggregator node, and an `origin_sources`
+  entry's `overrides:` block, both travel to every subscriber, and the
+  config authority refuses any document that names a file on the
+  publishing host or a host-backed secret reference. Those keys are
+  legal on a node that owns its own filesystem, so an aggregator whose
+  own origins validated against an OpenAPI document on disk had every
+  round refused with nothing to see it coming. The check runs at
+  composition now, which means `sbproxy aggregate`, `--out` and
+  `--dry-run` all name the offending key rather than leaving it to the
+  publish. Two more from the same round: the poll a compose takes before
+  a fetch runs under the round's bounded pool and deadline like every
+  other poll, so a handful of blackholing hosts cannot hold a
+  composition open past its own deadline; and an edit to the runtime
+  document that moves no repository now composes and publishes, so
+  raising a floor in `origin_defaults` or rebinding an entry's hosts
+  reaches the fleet instead of waiting for a repository to move.
+
+- **A fully-qualified git ref now resolves.** `git clone --branch` takes
+  a short name and refuses a full ref, so a `source:` or
+  `origin_sources` entry pinned to `refs/tags/v1.4.2` failed with
+  "Remote branch refs/tags/v1.4.2 not found in upstream origin". That is
+  the spelling a production-tier `origin_sources` entry is required to
+  use, because git does not tell a tag from a branch by spelling, so a
+  production aggregator could not have resolved a single entry. A
+  revision beginning with `refs/` now takes the same targeted `git init`
+  plus shallow fetch that a bare commit sha takes, which accepts a full
+  ref exactly as written. An annotated tag resolves to the commit a
+  checkout reports rather than to the tag object.
+
+- A git source or origin_sources entry pinned to a branch ref now checks
+  out on a server that refuses a shallow targeted fetch. The full-fetch
+  fallback checked out the pin as written, which finds nothing for a
+  branch: a full fetch writes the head to refs/remotes/origin/<name>.
+  Commit shas and tags were unaffected.
+
+- A `pdf_markdown` transform configured with `extract_tables` now warns
+  once at config load rather than on every decoded response, and a
+  successful decode logs at debug rather than info.
+
+- **A repository this proxy does not own cannot read a file it does not
+  ship.** A `source:` checkout and an `origin_sources` profile are both
+  read through one guard now: the configured path stays relative with no
+  traversal, and the checkout itself has to yield a regular file, inside
+  the checkout, under a 4 MiB cap checked before the read rather than
+  after it. `git clone` materializes symlinks, so a project repository
+  could previously commit its profile as a link at any file the
+  composing process could reach, and a 2 GiB file could take down the
+  one process the whole fleet composes in. The refusal now distinguishes
+  missing, symlink, oversized and unreadable, because those send an
+  operator to different places.
+
+- **A tool call held by a streaming tool-call guard now reaches the
+  client.** The gateway holds every tool-call frame back until the call
+  is judged, and for a call that completes at the end of the turn that
+  verdict arrives with the stop event, which is also the event the
+  gateway turns into the stream terminator. The released frame was
+  written after that terminator, so a client that stops reading at
+  `data: [DONE]`, which the OpenAI Python and Node SDKs do, received an
+  assistant turn carrying `finish_reason: tool_calls` and no tool call
+  in it. Turning tool-call governance on is what deleted the tool call,
+  and a hook that rewrote the call lost the rewrite the same way. This
+  shipped in v1.6.0 through v1.13.0 for an `agent_alignment` guardrail
+  in `mode: block`, and in v1.10.0 through v1.13.0 for an extension
+  bundle with an `ai_tool_call` hook, on any streamed request whose turn
+  ended with a tool call. The released frame now goes ahead of the
+  terminator, frames released earlier in the stream keep their arrival
+  order, and a stream with no held call is not reordered at all. A new
+  counter, `sbproxy_ai_stream_tool_frames_discarded_total`, reports held
+  frames that never reached the client at all, split into `blocked` (a
+  guardrail ended the stream) and `unjudged` (the stream ended with the
+  call never judged), with a panel on the AI gateway dashboard.
+
+- **Aggregation is honest under load and under reload.** The poll phase
+  runs under the same bounded pool and round deadline the fetch phase
+  already used, so a handful of blackholing git hosts can no longer turn
+  a two-minute poll interval into a continuous poll storm against the
+  healthy repositories. The per-outcome entry gauges are written on
+  every exit, including the two aborts an operator alerts on, so a
+  partition that takes out every repository shows as `failed` climbing
+  rather than as the last good round standing still. The runtime
+  document is re-read every cycle, so a SIGHUP or a config-watcher
+  reload reaches the aggregator instead of leaving it composing from the
+  document it read at boot. `--dry-run` compares the whole text rather
+  than a set of lines, so reordering two entries is reported as the
+  change it is, and the printed diff is linear and bounded instead of
+  quadratic. `--watch` refuses to combine with `--out`, `--dry-run` and
+  `--explain` rather than silently dropping them. And a restart seeds
+  its change detector from what the authority is already serving, so it
+  does not republish a byte-identical revision and rebuild every
+  subscriber pipeline for nothing.
+
+- An `abtest` variant `url` carrying a path now sends the request to
+  that path, matching what the same URL does on a `proxy` action,
+  instead of dropping it.
+
+- An `ai_schema` transform now refuses an unrecognized `on_failure`
+  value at config load instead of treating it as "forward silently", so
+  a typo can no longer downgrade a blocking schema check to a no-op.
+
+- An automatic config revert now names the revision it is reverting, so
+  a fix an operator pushed while the revert was in flight is no longer
+  overwritten by a document older than it. A rollback onto the document
+  already running no longer marks that revision as one this node rolled
+  away from, which had been flipping the last known good to `reverted`
+  on the history panel. A rollback whose blast radius cannot be measured
+  now needs the same typed confirmation a restart-class one does, rather
+  than applying straight through. A config revision a soak measured as
+  bad stays the boot walk last resort after an automatic revert
+  annotates it, instead of climbing back to the front. An armed node
+  that decides not to revert now counts
+  `sbproxy_config_apply_total{outcome="declined"}` and publishes a
+  `config_rollback` event with the reason, so a fleet that declined
+  everywhere is no longer indistinguishable from one where no soak
+  failed.
+
+- **Anonymous x402 callers no longer wait on another wallet's stuck
+  payment.** After `/verify` succeeds, the facilitator `payer` is hashed
+  onto the intent. Unidentified requests then match only unattributed
+  rows. The first stall of a never-verified payer stays route-wide.
+
+- **DLP documentation matches the live request path.** The policy scans
+  the request URI and headers. `scan_body` defaults true and
+  `body_max_bytes` defaults 16384, but the header-phase policy chain
+  snapshots an empty body, so a secret that appears only in the POST
+  body is not seen. There is no body rewrite. See
+  [docs/configuration.md](docs/configuration.md#dlp) and
+  [examples/dlp-catalog/](examples/dlp-catalog/).
+
+- Every CoMP response now comes from the crate's shared body on both
+  transports. The oversize refusal and the wrong-method refusal were
+  answered by axum itself on the standalone router (`text/plain`, no
+  `Cache-Control`, no counter, no decision event); both now return the
+  same JSON shape, headers, counter, and event as every other refusal.
+  `GET /admin/licensing` also reports `comp.enabled` on every origin
+  rather than only on origins without a bridge, so one field answers
+  whether a bridge is configured.
+
+- **hmac_auth and bot_auth no longer record an allow when a later
+  content-digest check refuses the body.** A signature that verified in
+  the header phase used to emit
+  `sbproxy_auth_results_total{result="allow"}` and an allowed SIEM
+  decision, then answer 401 after the body proof failed. The auth record
+  is now deferred until the body proof resolves, so a mismatch is one
+  deny. GraphQL inbound binding and the idempotency short circuit take
+  the same path.
+
+- The `abtest` action now sets its sticky cookie on a first visit, so a
+  client stays on the variant it was assigned instead of taking a fresh
+  weighted roll on every request.
+
+- The AI request path no longer overflows a Pingora worker's stack on an
+  origin that runs context compression and an `ai_policy` expression
+  together. The two relay futures are boxed, so the dispatch state
+  machine no longer carries them inline, and a guard now measures the
+  size rather than arguing about it.
+
+- The CoMP oversize-body refusal now moves the quote and redeem counters
+  and emits a decision event, from the same shared body every other CoMP
+  response comes from. It was hand-rolled in both transports and wrote
+  neither, so a client looping oversize bodies was indistinguishable
+  from no traffic at all.
+
+- The `geoip` policy now loads its database when the config compiles
+  rather than on the first request that needs it, so a large database no
+  longer stalls a worker thread, and a corrected `database_path` is
+  picked up by a reload instead of needing a restart.
+
+- A boot fallback pin reason is scrubbed of URL userinfo and of an
+  inline literal echoed by the secret resolver, and flattened of control
+  characters, before it reaches GET /admin/config/fallback or a
+  Kubernetes condition. POST /admin/config-authority/rollback refuses a
+  ?to_revision= query parameter instead of silently running the one-step
+  rollback.
+
+- A cascade that never dispatches (credential lock, connect error,
+  posture refusal, emptied price-ceiling, or quota-pool reject) no
+  longer reports a stale selected_provider on routing-decisions rows.
+
+- A Rego policy whose load-time trial exceeds `budget_ms` no longer
+  fails boot. The trial is inconclusive rather than a semantic fault;
+  slow requests still deny per-request under the same budget.
+
+- agent_budget now keys on coding-agent User-Agents such as Cursor
+  because those entries are in the default agent-class catalog
+
+- Config Validate + save no longer reports a missing `source:` block
+  when the editor buffer is invalid YAML for any other reason. A syntax
+  error is reported as a config parse failure, and the editor refuses to
+  submit leftover `[REDACTED]` markers from the load-time secret mask.
+
+- **Distroless runtime images now use `cc-debian13`.** Fetched
+  mistral.rs prebuilts that need GLIBC_2.38 or newer can start.
+
+- **Gateway, worker, and Cloud Build images now ship
+  `/var/lib/sbproxy`.** Usage rollups and the keystore can open under
+  the documented default path.
+
+- POST /admin/config-authority/publish and rollback now report
+  revision_consumed from where the failure happened rather than always
+  false: a validation refusal costs nothing, while a failure past the
+  reservation has spent a number the counter never reissues. The store
+  code covers both sides of the reservation, so revision_consumed rather
+  than the code is what says whether a number went. The Kubernetes
+  operator bounds a fallback probe pass by wall clock as well as pod
+  count, caps the response body it will read from a pod, and refreshes
+  the ConfigFallbackActive condition before it refuses a config that
+  arms auto_revert, so a cleared pin is no longer frozen True on the CR.
+
+- Refuse ONNX models that keep their tensors in a separate file. An
+  operator-supplied model could name any path in an `external_data`
+  reference and have the proxy read it (GHSA-h668-6x6g-f8r5); every ONNX
+  loader now refuses such a model before opening anything, and
+  translates the parsed model with no directory for the runtime to
+  resolve against.
+
+- The admin Add/Edit deployment form now sends `cold_start` (default
+  `wait`), numeric fields no longer crash submit after typing, and a
+  text-selection drag that ends on the modal backdrop no longer
+  dismisses the dialog.
+
+- The config authority store writes owner-only files and directories.
+  Every bundle it persists was created with the process umask, so a
+  signed configuration document was world-readable to any local account
+  on the authority host; files are now 0600 and the store's own
+  directories 0700.
+
+- The events webhook SSRF allowlist now honors
+  `egress.usage_sinks.hosts` when that sub-block is `mode:
+  deny_by_default` and `allow_private` is true, so a private collector
+  listed there can boot and deliver. Without that trio the guard still
+  refuses private addresses.
+
+- The Kubernetes operator asks only pods its own workload created before
+  it sends them the admin credential, behind the leader fence and with a
+  bounded fan-out, and it re-bounds the reason a pod reports before
+  putting it in a CR condition. The ConfigFallbackActive condition keeps
+  its lastTransitionTime across passes and is written only when it
+  changes, so an SBProxy no longer re-triggers its own reconcile loop,
+  and the Service still reconciles while config delivery is suspended.
+  sbproxy_operator_config_delivery_total and
+  sbproxy_operator_fallback_probes_total make a stopped delivery
+  visible.
+
+- Workspace rate-limit AutoSuspend and resume transitions now append to
+  the tamper-evident `audit.sink: chain` file. They previously only hit
+  the `security_audit` tracing target and `/api/audit/recent`.
+
+- Restarted mesh workers now refute stale leave announcements from their
+  previous process, allowing peers to converge after rejoin. Graceful
+  shutdown stops membership reception before publishing its final leave.
+
+- NATS event ingestion no longer builds an unused HTTP client before
+  connecting to its broker, avoiding TLS initialization and certificate
+  loading delays on the first batch.
+
 ## [1.13.0] - 2026-08-18
 
 ### Security

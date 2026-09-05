@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "`routing.strategy: sticky` is now documented as what it does. The session-affinity map exists in the router and nothing on the request path supplies it a session key, so every request has always taken the round-robin fallback; the documentation claimed it pinned a user or session to one provider. The strategy still loads, so no config breaks, and the docs now point at `cache_affinity` for caller affinity that works."
-}

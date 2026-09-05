@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "New `sbproxy-federation` crate: OpenID Federation 1.0 entity statements, JWS sign and verify, RFC 7638 key thumbprints, a well-known issuer, and a trust-chain resolver, backed entirely by in-process memory (no Postgres, sqlx, or Redis dependency)."
-}

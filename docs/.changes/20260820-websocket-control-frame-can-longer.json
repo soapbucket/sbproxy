@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**A WebSocket control frame can no longer disable\n`max_message_size`.** Control frames do not count toward a message\ntotal, so their declared payload length was skipped rather than\nchecked. A fourteen-byte masked pong header declaring `u64::MAX` was\nenough: the scanner spent the declared count skipping payload bytes,\nnever parsed another frame header, and the cap stopped applying in\nthat direction for the life of the connection, with nothing logged\nand no teardown. RFC 6455 section 5.5 is now enforced on the frames\nit governs: a control frame over 125 payload bytes, or one arriving\nwithout `FIN`, closes the tunnel."
-}

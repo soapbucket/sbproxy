@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**Linux Model Host spawn no longer wraps the engine in `/bin/sh`.** Distroless images have no shell, so a serve entry on the official image never reached exec. The startup gate now waits in the child before the engine image is exec'd. macOS still uses a shell wrapper because Darwin has no `pipe2`."
-}

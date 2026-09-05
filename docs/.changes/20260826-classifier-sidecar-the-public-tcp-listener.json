@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "Classifier sidecar: the public TCP listener now runs every CPU-bound command behind the same bounded executor and per-request budgets as the gRPC surface, carries whole-frame and whole-connection deadlines (`--tcp-frame-timeout-ms`, `--tcp-connection-timeout-ms`), and refuses a non-loopback bind unless `--tcp-allow-nonlocal` is set. The connection deadline is refreshed by every answered frame, so a pooled connection that stays busy is never cut mid-exchange."
-}

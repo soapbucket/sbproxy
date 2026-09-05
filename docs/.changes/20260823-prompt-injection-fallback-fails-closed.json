@@ -1,4 +1,0 @@
-{
-  "type": "security",
-  "message": "`prompt_injection_v2` now preserves typed local-classifier failures, fails closed with a generic 503 for mandatory policies, isolates deterministic cache entries by verified model semantics, and exposes bounded degraded health through metrics, events, Grafana, and the authenticated admin API."
-}

@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "The config authority keeps a bounded archive of earlier revisions, so POST /admin/config-authority/rollback and sbproxy config authority rollback --to-revision N can return a fleet to a revision from further back than one step. proxy.config_authority.publish.archive_keep sets how many revisions a rollback can name and defaults to 20, so the ring holds one file more than that and a ring of one offers one real target; zero keeps the one-step rollback exactly as it was. An archived revision is written before the served bundle rotates, so a disk-full or permission error on the ring cannot leave a publish the operator was told had failed to be adopted at the next start."
-}

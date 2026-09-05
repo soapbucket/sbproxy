@@ -1,4 +1,0 @@
-{
-  "type": "changed",
-  "message": "**`openapi_validation` now publishes its `policy_verdict_event` from the phase that decides.** The header-phase dispatcher used to publish an `allow` for this policy before the request body it validates had arrived, which was the only audit record a refused request ever got. The verdict is now published where the body is checked, carrying `deny` for a refused body and `allow` for one that passes, and a refusal also emits a `security_audit` record of type `openapi_validation` with reason `schema_violation` and sets the `policy_blocked` billing outcome. One request produces one record for this policy: a SIEM query filtering `policy_id=\"openapi_validation\" AND verdict=\"allow\"` no longer matches requests the policy denied. A request that never reaches the body phase, because an earlier policy refused it or the action answers without going upstream, now produces no record for this policy rather than a premature `allow`."
-}

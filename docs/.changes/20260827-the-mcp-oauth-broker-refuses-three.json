@@ -1,4 +1,0 @@
-{
-  "type": "security",
-  "message": "The MCP OAuth broker refuses three configurations at startup that used to fail or downgrade at runtime: a `base_path` of `/` or empty, which would capture every route on the origin; `device_code_enabled` without a `broker_signing_key`, which could never mint the token it promised; and an advertised `token_endpoint_auth_method` the broker cannot process. Device authorization also answers `invalid_scope` for a missing or unadvertised scope when `scopes_supported` is set."
-}

@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "The `geoip` policy now loads its database when the config compiles rather than on the first request that needs it, so a large database no longer stalls a worker thread, and a corrected `database_path` is picked up by a reload instead of needing a restart."
-}

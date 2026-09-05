@@ -1,4 +1,0 @@
-{
-  "type": "changed",
-  "message": "**`transport: stdio` MCP servers now run as one supervised\npersistent child per configured server, not one process per\nJSON-RPC exchange.** Server-side session state survives between\ncalls, and process startup is paid once per child rather than once\nper call. The supervisor health-probes an idle child with an MCP\n`ping`, restarts a crashed child under bounded exponential backoff,\nreplays the `initialize` handshake on the replacement child, fails\nin-flight calls closed with a typed error on a crash or timeout\ninstead of hanging, and kills the child when its server leaves the\nconfiguration. Legacy one-shot commands that answer a single\nrequest and exit keep working: a child that dies after serving is\nrespawned on the next call. See the stdio section of\n[docs/mcp-gateway-guardrails.md](docs/mcp-gateway-guardrails.md)."
-}

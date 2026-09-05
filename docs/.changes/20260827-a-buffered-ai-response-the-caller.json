@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "A buffered AI response the caller walked away from during the write now prices as `client_disconnected` rather than as a delivered sale or a provider 5xx, and declines the `on_error` fallback that would have made a second paid provider call for a caller who had already left."
-}

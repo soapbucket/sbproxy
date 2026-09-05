@@ -1,4 +1,0 @@
-{
-  "type": "security",
-  "message": "**`allow_patterns: false` now also disables `string.gsub`.** The Lua sandbox gate stubbed `string.find`, `string.match`, and `string.gmatch` and left `string.gsub` live, so the knob whose stated purpose is containing catastrophic backtracking left the same C-level matcher reachable. `max_execution_ms` cannot help there either: the matcher runs inside Luau's C string library, where the interrupt the timer relies on never fires, so one request pinned a worker thread indefinitely. All four pattern functions are stubbed now, which is the complete pattern-taking surface of the `string` table. See [docs/scripting.md](docs/scripting.md) and [docs/config-stability.md](docs/config-stability.md)."
-}

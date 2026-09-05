@@ -1,4 +1,0 @@
-{
-  "type": "changed",
-  "message": "The `backend` label on `sbproxy_cache_reserve_degraded` and `sbproxy_cache_reserve_health_transitions_total` now names the object-storage provider (`s3`, `gcs`, `azure`, `local`) rather than `object_store`, so an S3 reserve and an Azure one are separate series."
-}

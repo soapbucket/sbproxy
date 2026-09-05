@@ -1,4 +1,0 @@
-{
-  "type": "security",
-  "message": "**Proxy-Wasm `proxy_log` is bounded, sanitized, and level-clamped.** A guest capped one message at 4 KiB and nothing else, so a filter looping `proxy_log` inside `proxy_on_http_request_headers` turned a single request into thousands of records at whatever level it chose, including `error`. The message bytes were also emitted verbatim, so a payload containing a newline forged a whole log line no part of the proxy wrote. Guest output is now capped at 1 MiB per callback (dropped past the cap, with one `warn` saying so and no backpressure signal to the guest), split one record per line with control characters escaped, and emitted at a host-chosen level: trace and debug at `debug`, info at `info`, and warn, error, and critical all at `warn`. The guest's requested level stays on the record as `log_level`. A guest can no longer mint an `error` line in its host's log. See [docs/extension-bundles.md](docs/extension-bundles.md)."
-}

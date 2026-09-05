@@ -1,4 +1,0 @@
-{
-  "type": "security",
-  "message": "An origin that configures `sessions` or `csrf` together with `response_cache` can serve one caller the `Set-Cookie` the proxy minted for another. The cache key partitions on the `Cookie` header a caller sends, so every caller that sends none shares one partition, and a stored entry replays the session identifier or CSRF token captured with it. This is long-standing behavior rather than a change in this release, and it is now documented under \"Who a cached entry belongs to\" in `docs/configuration.md` with the two remedies available today: leave `response_cache` off on an origin that mints either cookie, or raise `response_cache.epoch` to partition away from entries already written. The third pairing, `abtest` with `response_cache`, is refused at config load instead."
-}

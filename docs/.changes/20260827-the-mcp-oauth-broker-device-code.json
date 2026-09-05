@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "The MCP OAuth broker device-code consent page works when a branded verification URI is configured, and refuses to boot without a canonical origin. Naming `device_code_verification_uri` used to replace the expected origin rather than add to it, so the shipped consent page became cross-origin against itself; and `device_code_enabled` with DPoP off booted with no base URL at all, which made every consent POST a 403."
-}

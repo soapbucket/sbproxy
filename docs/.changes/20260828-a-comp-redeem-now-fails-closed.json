@@ -1,4 +1,0 @@
-{
-  "type": "security",
-  "message": "A CoMP redeem now fails closed on a `quote_id` this process never issued (`403 unknown_quote`, opt out with `comp.allow_unknown_quotes`) and on a buyer acceptance whose `accepted_at` is unparseable, more than five minutes ahead of the proxy clock, or older than a whole quote validity window. `CompRedeemResponse` no longer derives `Debug`, so a minted license token cannot reach a log line, a `dbg!`, or a panic message."
-}

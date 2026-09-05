@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "The redb and SQLite key-value backends implement atomic create and conditional swap, so `idempotency.backend: redis` single-flights on them instead of degrading. The in-memory backend honors the TTL it is given."
-}

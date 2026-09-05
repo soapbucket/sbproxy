@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "An `ai_close` hook that blocks the stream close now publishes an `ai.close` decision record with a `deny` outcome, naming the hook's refusal code. Only a clean close published one before, so a refused close left the audit feed silent."
-}

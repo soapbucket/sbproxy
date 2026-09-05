@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "**Inspect-only `ai_guardrail_input` hooks can set `execution.mode: parallel` to run alongside the upstream call.** A block cancels the in-flight generation. Allow adds no time-to-first-token; a reject may still be billed by the provider. Watch `sbproxy_ai_parallel_moderation_total` (`allow`, `block`, `cancelled_upstream`, `refused`) and `sbproxy_ai_provider_attempts_total{outcome=\"moderation_cancelled\"}`. Parallel cannot combine with `mutates: true`."
-}

@@ -85,7 +85,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "1.13.0"
+version = "1.14.0"
 edition = "2021"
 # Raised from 1.82 on 2026-08-07, because 1.82 was not remotely true and
 # nothing had ever checked. The msrv lane added alongside this change found
@@ -539,14 +539,14 @@ codegen-units = 16
 # resolves a single consistent copy.
 #
 # The crates declare 0.8.0, and that number is not what we run. The fork
-# tracks upstream `main`, so the tree here carries 167 upstream commits that
+# tracks upstream `main`, so the tree here carries 190 upstream commits that
 # the 0.8.0 tag does not, plus our seven. Read the version as an API
 # generation, not as a thing to match against an advisory. What we actually
-# run, as of the 2026-08-28 lockfile:
+# run, as of the 2026-09-05 lockfile:
 #
-#   base:   0046038 (2026-08-07), the merge base with upstream main
+#   base:   09696b5 (2026-08-24), the merge base with upstream main
 #   ahead:  7 commits of ours
-#   behind: 23 upstream commits
+#   behind: 0 upstream commits
 #   files:  20 differ, 14 of them outside .github/
 #
 # Refresh those numbers with `scripts/divergence.sh` in the fork; the fork's

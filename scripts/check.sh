@@ -730,6 +730,7 @@ step "gate helper self-tests"
 bash "$ROOT/scripts/tests/workspace_bin_test.sh"
 bash "$ROOT/scripts/tests/runner_disk_test.sh"
 bash "$ROOT/scripts/tests/changelog_fragments_test.sh"
+python3 "$ROOT/scripts/tests/release_notes_test.py"
 python3 "$ROOT/scripts/lib/cert_record.py" --self-test
 python3 "$ROOT/scripts/tests/test_cert_record.py"
 python3 "$ROOT/scripts/lib/notice_coverage.py" --self-test

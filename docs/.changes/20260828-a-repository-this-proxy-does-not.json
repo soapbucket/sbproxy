@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**A repository this proxy does not own cannot read a file it does not ship.** A `source:` checkout and an `origin_sources` profile are both read through one guard now: the configured path stays relative with no traversal, and the checkout itself has to yield a regular file, inside the checkout, under a 4 MiB cap checked before the read rather than after it. `git clone` materializes symlinks, so a project repository could previously commit its profile as a link at any file the composing process could reach, and a 2 GiB file could take down the one process the whole fleet composes in. The refusal now distinguishes missing, symlink, oversized and unreadable, because those send an operator to different places."
-}

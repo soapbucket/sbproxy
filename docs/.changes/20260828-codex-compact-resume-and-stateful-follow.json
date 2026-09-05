@@ -1,4 +1,0 @@
-{
-  "type": "changed",
-  "message": "**Codex Compact, resume, and stateful follow-ups get a 400.** `sbproxy connect` now names those flows: a first turn that resends the full conversation in `input` works, but `previous_response_id`, `conversation`, and `store: true` are refused because the gateway does not hold server-side Responses state."
-}

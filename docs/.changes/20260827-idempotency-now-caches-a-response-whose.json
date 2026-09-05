@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "Idempotency now caches a response whose upstream outlived the claim lease, and a waiter polling a key no longer deletes a successor's live claim. The claim lease and the overlap wait are config keys (`idempotency.claim_lease_secs`, `idempotency.claim_wait_ms`); waiting requests draw on their own pool so one key's retry storm cannot starve every other key."
-}

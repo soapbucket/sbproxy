@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "**`hmac_auth`: signed-request authentication.** A new auth provider\nfor machine callers that prove possession of a shared secret by\nsigning each request (RFC 9421 HTTP Message Signatures,\n`hmac-sha256`) instead of sending a static credential. Config is a\n`keys` list of `key_id` + `secret` pairs (secrets resolve through\nthe secret resolver) with optional per-credential metadata, a\n`required_components` list defaulting to `[\"@method\",\n\"@target-uri\"]`, and a `clock_skew_seconds` window (default 300)\nenforced against the mandatory `created` parameter as the replay\ndefense. Failures answer `401` with a `WWW-Authenticate: Signature`\nchallenge that never carries key material. See the `hmac_auth`\nsection of [docs/configuration.md](docs/configuration.md) and\n[examples/auth-hmac/](examples/auth-hmac/)."
-}

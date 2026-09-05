@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**A linked plugin returning the legacy `ActionOutcome::Responded` now gets a defined response on every transport.** The variant claims the handler already wrote a response through host state, and no host state a linked `ActionHandler` reaches writes one: HTTP/1.1 and HTTP/2 marked the request served and sent zero bytes, so the client saw an empty exchange and the access log had no status, while HTTP/3 answered a `501`. All three now answer `501 Not Implemented` with the same `application/json` body carrying the stable `unsupported_action_outcome` reason, stamp the status onto the request context, tick `sbproxy_errors_total{error_type=\"unsupported_action_outcome\"}`, and publish a `request_error` event naming the outcome, so the refusal is alertable and reaches the SIEM feed rather than living in a log line."
-}

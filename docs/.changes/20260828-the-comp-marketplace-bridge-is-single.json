@@ -1,4 +1,0 @@
-{
-  "type": "security",
-  "message": "The CoMP marketplace bridge is single-use per quote and bounded. A second redeem of the same `quote_id` is refused with `403 already_redeemed`; a quote request past 50,000 live ledger rows is refused with `429 quote_ledger_full`, counted like every other refusal, so an unauthenticated flood on `POST /.well-known/iab-comp/quote` cannot grow the process out of memory. A catalog carrying more than one `authorization: olp` tier is now refused at config load, because a redeem names no tier and would mint whichever the manifest lists first."
-}

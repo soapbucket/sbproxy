@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "**gRPC, Cedar, and digest-auth docs now have a page or a runnable example.** [docs/grpc.md](docs/grpc.md) plus an offline [examples/grpc-h2c/](examples/grpc-h2c/) fixture; [docs/cedar-policy.md](docs/cedar-policy.md) plus [examples/cedar-mcp-full/](examples/cedar-mcp-full/); digest auth linked from [docs/configuration.md](docs/configuration.md#digest) and [examples/auth-digest/](examples/auth-digest/)."
-}

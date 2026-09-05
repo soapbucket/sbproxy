@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "The AI request path no longer overflows a Pingora worker's stack on an origin that runs context compression and an `ai_policy` expression together. The two relay futures are boxed, so the dispatch state machine no longer carries them inline, and a guard now measures the size rather than arguing about it."
-}

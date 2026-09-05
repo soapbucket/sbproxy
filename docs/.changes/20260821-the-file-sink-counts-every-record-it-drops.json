@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**The file log sink counts every record it drops.** An append that failed after the file was already open discarded its error, so a sink on a full volume, a read-only remount, or a failing disk stopped writing while `sbproxy_telemetry_dropped_total{kind=\"file_sink\"}` stayed flat and an operator alerting on that counter read the sink as healthy. A failed append now ticks `reason=\"write_error\"`, a failed open ticks `reason=\"open_failed\"` (it warned before but counted nothing), and a failed rotation ticks `reason=\"rotate_failed\"`. All four file-sink warnings, including the existing `mkdir_failed` one, are now rate-limited to one per minute per sink path: they fire once per emitted record, so the first ENOSPC used to turn a broken sink into a log flood at request rate. The counter carries the rate."
-}

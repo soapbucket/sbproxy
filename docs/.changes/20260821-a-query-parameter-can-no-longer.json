@@ -1,4 +1,0 @@
-{
-  "type": "security",
-  "message": "**A query parameter can no longer overwrite a gRPC transcode path binding.** `GET /v1/echo/allowed?message=forbidden` bound `message` from the path and then let the query replace it, so the value the route matched on and the header-phase policies read was not the value the gRPC upstream received. A query key addressing a bound field path, or a parent or a child of one, is now dropped. Two caps come with it: at most 256 query parameters per request, and at most 32 dotted segments in a parameter name, which bounds a recursion that a self-referential message type could otherwise drive into the worker stack. A client that was correcting a path segment from the query has to send the corrected value in the path instead."
-}

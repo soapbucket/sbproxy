@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**gRPC streaming support is described accurately.**\n`examples/grpc-h2c/README.md` reported that server reflection\n(`list`) came back as a garbled framing error through the proxy and\nsteered readers away from it. Rechecked against a grpc-go server\nwith reflection registered: `list` works, `grpcurl describe` returns\nbyte-identical output through the proxy and straight at the\nupstream, and bidirectional streaming round-trips every message.\nNew end-to-end coverage pins all of it; there was none before. A new\n[gRPC limits](docs/routing.md#grpc-limits) section records what is\ngenuinely narrower, including one composition worth avoiding: a\nbody-reading policy on a `grpc` origin needs the complete request\nbody, so it stalls every streaming RPC on that origin while leaving\nunary calls working."
-}

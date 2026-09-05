@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**`EventBus::publish` no longer calls subscriber closures while it holds the handler-map lock.** A handler that blocked on a socket used to stall every other thread publishing to the bus, and a handler that called back into `publish`, `subscribe`, or `subscriber_count` deadlocked its thread permanently, because `parking_lot::Mutex` is not reentrant and waits rather than panicking. Fan-out now runs against a snapshot of the subscriber list taken when `publish` starts: a handler registered during a fan-out first receives the next event rather than the one in flight, and nested publishes on one thread stop at eight with a `warn` naming the event type instead of overflowing the stack. Only code that embeds the workspace crates reaches this bus; the `events:` file and webhook sinks were never routed through it and are unchanged."
-}

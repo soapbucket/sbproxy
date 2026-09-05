@@ -1,4 +1,0 @@
-{
-  "type": "security",
-  "message": "Operator URLs no longer reach log lines or error strings in full. Redis and object-store DSNs, alert and callback webhook targets, JWKS endpoints, usage sink collectors, and WAF feed URLs are now rendered as `scheme://host:port` (plus the database index for a Redis DSN), so an inline password or a webhook secret in the path cannot land in the process log. `reqwest` failures are summarized by failure class instead of interpolated directly, since that error's own `Display` prints the whole request URL, and the same stripped error is what gets wrapped rather than only what gets logged. A new ratchet, `scripts/check-log-url-ratchet.sh`, refuses new sites of either shape; its header states what its detector can and cannot see."
-}

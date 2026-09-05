@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**`resilience.circuit_breaker` and `resilience.outlier_detection` now see real request outcomes.** The AI dispatch path counted per-provider attempts but never fed the router's health axes, so neither the breaker nor the outlier detector learned that a provider had failed and a provider that failed every request was never ejected, on any routing strategy. Every settled attempt now records one outcome against the attempt metric, the breaker, the outlier detector, and the per-error-class cooldown policy together: a 5xx or a transport error is the provider's failure, a 4xx is the caller's and counts as a success, a managed-local engine that never started counts for load but is no health sample, and a raced leg the winner cancelled records nothing at all."
-}

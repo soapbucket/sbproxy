@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "Config-authority subscribers now report what they applied, not just what they fetched. On each poll a subscriber sends the revision and config hash it is actually serving, a status in OpenTelemetry OpAMP `RemoteConfigStatus` terms, an error when the last attempt failed, its own soak verdict, and whether its boot fallback is active. `GET /admin/config-authority/status` answers \"31 of 34 nodes applied r42, 3 failed\" instead of leaving that to be inferred from who fetched, keeps a degraded apply distinguishable from a clean one, renders a subscriber that has never reported as unknown rather than as applied, discards a revision above what the authority has published, and separates a node that has not polled recently from one that polled and failed. The report rides the existing bundle fetch, so it adds no new auth surface."
-}

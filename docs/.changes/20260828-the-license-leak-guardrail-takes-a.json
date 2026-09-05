@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "The `license_leak` guardrail takes a `max_scan_bytes` cap (default 256 KiB) applied before its detectors allocate, so an oversize AI response cannot drive unbounded per-request work."
-}

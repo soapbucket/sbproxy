@@ -940,19 +940,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Draft notes are the tagged version's CHANGELOG section, not
-          # the whole file: GitHub caps release bodies at 125k
-          # characters and the full CHANGELOG passed that at v1.9.0.
+          # Keep the complete tagged notes as an asset. A single release's
+          # section can also exceed GitHub's 125k-character body limit.
           version="${GITHUB_REF_NAME#v}"
-          awk -v ver="$version" '
-            $0 ~ "^## \\[" ver "\\]" { on = 1; print; next }
-            on && /^## \[/ { exit }
-            on { print }
-          ' CHANGELOG.md > /tmp/release-notes.md
-          if ! [ -s /tmp/release-notes.md ]; then
-            echo "no CHANGELOG section found for ${version}" >&2
-            exit 1
-          fi
+          python3 scripts/release-notes.py "$version" \
+            --notes-file /tmp/release-notes.md \
+            --full-notes-file dist/release-notes.md
           # A tag-time-only failure's documented recovery is to move the
           # tag (git tag -d + recreate + push) and let this workflow run
           # again. gh release create refuses to reuse a tag name a draft
@@ -1083,9 +1076,11 @@ jobs:
         shell: bash
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
-          echo "image=${REGISTRY}/${IMAGE_NAME}" >> "${GITHUB_OUTPUT}"
-          echo "dockerhub_image=docker.io/soapbucket/sbproxy" >> "${GITHUB_OUTPUT}"
+          {
+            echo "version=${VERSION}"
+            echo "image=${REGISTRY}/${IMAGE_NAME}"
+            echo "dockerhub_image=docker.io/soapbucket/sbproxy"
+          } >> "${GITHUB_OUTPUT}"
 
       - name: build and push image
         id: push

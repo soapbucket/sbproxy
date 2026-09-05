@@ -1,4 +1,0 @@
-{
-  "type": "security",
-  "message": "The MCP OAuth broker refuses an over-length URL-shaped `client_id` instead of downgrading it. The bound was applied by returning `None` from the CIMD detector, which fell through to the pre-registered client path where the only gate is the `redirect_uri` allowlist, so a deployment running both admitted the request with the metadata document own `redirect_uris` and scope checks skipped. `/token` applied no bound at all. Both now answer `invalid_client`, and the bound is sized to fit under the session store key budget so the refusal names the client id rather than a document that was never fetched."
-}

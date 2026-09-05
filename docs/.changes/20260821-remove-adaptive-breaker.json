@@ -1,4 +1,0 @@
-{
-  "type": "removed",
-  "message": "**`AdaptiveBreaker` is removed from `sbproxy-platform`.** Nothing in the workspace constructed one, and the type could not do what its documentation described: `record_failure` set `Open`, the only transition out fired on `HalfOpen`, and nothing anywhere assigned `HalfOpen`, so the breaker latched open on the first error spike past `min_samples` and stayed open for the life of the process. Its counters were lifetime cumulative with no window, so the \"recent traffic history\" it adapted against did not exist either. Use `CircuitBreaker`, which implements the timed Open to HalfOpen transition and is the type every consumer in the workspace already uses."
-}

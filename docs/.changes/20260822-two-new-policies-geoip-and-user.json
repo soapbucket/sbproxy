@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "Two new policies, `geoip` and `user_agent_parser`, resolve client geography and parse the User-Agent header into typed data for identity and anomaly hooks, and optionally as X-Geo-*/X-Parsed-Ua upstream headers."
-}

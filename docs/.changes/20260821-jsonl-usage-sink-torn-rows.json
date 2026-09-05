@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**The `jsonl_file` usage sink no longer interleaves two concurrent rows onto one line.** It wrote the row and its newline as two separate appends and held no lock, so two calls landing together, the shadow legs of one request or two requests finishing at the same instant, produced `{row}{row}` on one line followed by two blank ones. Both rows were written and neither was parseable, which reads to any JSONL consumer as rows that were never recorded at all rather than as a corrupt file. The row and its newline now go out in one append, which is atomic against other appenders. The other durable line sinks (`session_ledger`, the request event sink, and the verifiable usage ledger) each serialize their writers already and were never affected."
-}

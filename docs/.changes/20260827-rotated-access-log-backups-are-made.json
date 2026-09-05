@@ -1,4 +1,0 @@
-{
-  "type": "security",
-  "message": "Rotated access-log backups are made owner-only at each rotation, not only when a sink opens the active file: an uncompressed rotation is a rename, so backups written by an earlier build kept their old mode for as many rotations as `max_backups` allows."
-}

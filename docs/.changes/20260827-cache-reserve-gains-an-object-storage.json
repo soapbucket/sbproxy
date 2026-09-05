@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "Cache Reserve gains an object-storage backend: S3, Google Cloud Storage, Azure Blob, or a local directory, with optional AES-256-GCM sealing before an entry leaves the process. Entries are named by the SHA-256 of their cache key, fanned out two levels. A new `sbproxy_cache_reserve_errors_total` counter makes a failing cold tier visible, since every reserve error is swallowed on the request path by design; `operation=\"init\"` is the one to alert on, because a backend that never built reads as flat zero on every other reserve series. New background behavior worth knowing before you point this at a paid bucket: the proxy now runs the reserve's expiry sweep every fifteen minutes, listing and reading at most 1,000 objects per tick and resuming where the previous tick stopped. A bucket lifecycle rule is still the answer at scale. See [docs/cache-reserve.md](docs/cache-reserve.md)."
-}

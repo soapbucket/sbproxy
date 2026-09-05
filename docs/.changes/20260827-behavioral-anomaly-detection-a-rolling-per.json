@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "Behavioral anomaly detection: a rolling per-tenant, per-agent-class window over the TLS fingerprint, resolver-source, headless-library, and per-address rate signals the proxy already collects, flagging what sits in the long tail. `AnomalyDetectorHook` had been declared and dispatched since Wave 5 with nothing implementing it, so the verdict loop ran over an empty list on every request. Verdicts now reach `sbproxy_anomaly_detected_total`, a structured log line, a typed `anomaly` decision-audit record, and a per-tenant reputation score on `sbproxy_agent_reputation_score`. The score is advisory until an operator sets `proxy.anomaly.reputation.deny_below` or `challenge_below`, which turn it into an admission decision; both are unset by default. See [docs/anomaly-detection.md](docs/anomaly-detection.md)."
-}

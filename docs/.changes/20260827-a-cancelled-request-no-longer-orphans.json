@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "A cancelled request no longer orphans its idempotency key for the whole lease, a transient store read failure no longer hands out an unfenced claim during a failover, and the validated-GraphQL path takes its key off the proxy worker like every other path. Proxied requests now record their idempotency outcome, so the `result` metric means what the reference says it does."
-}

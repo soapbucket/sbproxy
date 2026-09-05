@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "`docs/policy.md` no longer says the Cedar compiler and policy store were removed; it separates the retired natural-language-to-Cedar path from the Cedar engine that ships for the MCP `tools/call` hook."
-}
