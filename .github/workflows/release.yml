@@ -136,9 +136,14 @@ jobs:
             build_jobs: 1
           - target: aarch64-apple-darwin
             runner: macos-latest
-            lto: fat
-            # No cap - see x86_64-unknown-linux-gnu above.
-            build_jobs: 16
+            # The fat-LTO build exhausted 120 minutes on a warm dependency cache,
+            # with one rustc process still running at cancellation. Keep
+            # cross-crate optimization using ThinLTO, as on Linux ARM64;
+            # opt-level=3 and codegen-units=1 remain unchanged.
+            lto: thin
+            # The standard Apple Silicon runner has three CPU cores.
+            # Avoid queueing sixteen memory-heavy compiler processes.
+            build_jobs: 3
             platform: darwin_arm64
           # darwin_amd64 (Intel Mac) is not built. The GitHub macos-13
           # runner pools have multi-hour queue times that stalled
@@ -217,8 +222,9 @@ jobs:
         # CARGO_PROFILE_RELEASE_LTO overrides [profile.release]'s
         # workspace-wide `lto = "fat"` per matrix leg (see the `lto: thin`
         # comment on the aarch64-unknown-linux-gnu entry above).
-        # CARGO_BUILD_JOBS is per matrix leg too, not workflow-wide: only
-        # aarch64-unknown-linux-gnu needs the parallelism cap.
+        # CARGO_BUILD_JOBS is per matrix leg too: Linux ARM64 uses one
+        # compiler job for memory headroom, and Apple ARM64 uses three
+        # to match its standard runner's CPU count.
         # sccache was deliberately REMOVED from this job: the binary
         # embeds the git SHA, and a compile cache keyed without it can
         # serve an object carrying a stale revision into a release
