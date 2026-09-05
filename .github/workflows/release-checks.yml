@@ -25,6 +25,14 @@ on:
   schedule:
     - cron: '30 9 * * *' # 09:30 UTC daily
   workflow_dispatch:
+    inputs:
+      scope:
+        description: 'Checks to run (documentation replays captures and checks the corpus)'
+        type: choice
+        options:
+          - all
+          - documentation
+        default: all
 
 # Default to read-only contents access for every job in this workflow.
 # CodeQL (actions/missing-workflow-permissions) wants every workflow
@@ -34,7 +42,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.scope || 'all' }}
   cancel-in-progress: true
 
 env:
@@ -106,6 +114,9 @@ jobs:
         run: python3 -u scripts/check-doc-captures.py --check
 
   test-isolation:
+    # A manual documentation replay does not rebuild the unchanged workspace.
+    # Tag, nightly, and default manual runs always retain this coverage.
+    if: inputs.scope != 'documentation'
     name: test isolation (single-threaded)
     runs-on: ubuntu-latest
     # A recent run spent 71m33s compiling its three binary variants and
@@ -173,6 +184,7 @@ jobs:
         run: cargo test --workspace --locked --no-fail-fast -- --test-threads=1
 
   acme-pebble:
+    if: inputs.scope != 'documentation'
     name: acme integration (pebble)
     runs-on: ubuntu-latest
     timeout-minutes: 30
