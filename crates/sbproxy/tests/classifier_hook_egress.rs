@@ -31,7 +31,10 @@ const PROMPT_MARKER: &str = "classifier-egress-private-prompt-c0";
 const INTENT_MODEL: &str = "intent-v1";
 const QUALITY_MODEL: &str = "quality-local-openai-v1";
 const QUALITY_LABEL: &str = "preferred";
-const HOOK_TIMEOUT: Duration = Duration::from_millis(250);
+const DENIED_HOOK_TIMEOUT: Duration = Duration::from_millis(250);
+// The positive control includes a cold lazy HTTP/2 connection in a debug
+// child. Its egress assertions must not depend on subsecond runner scheduling.
+const AUTHORIZED_HOOK_TIMEOUT: Duration = Duration::from_secs(2);
 const DENIAL_QUIET_WINDOW: Duration = Duration::from_millis(500);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const FIXTURE_STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -674,7 +677,11 @@ origins:
           models: [gpt-4o]
 "#,
         classifier_endpoint = classifier.endpoint(),
-        hook_timeout_ms = HOOK_TIMEOUT.as_millis(),
+        hook_timeout_ms = match policy {
+            HookEgressPolicy::DenyAll => DENIED_HOOK_TIMEOUT,
+            HookEgressPolicy::AllowLoopback => AUTHORIZED_HOOK_TIMEOUT,
+        }
+        .as_millis(),
         egress_policy = policy.yaml(classifier.port()),
         intent_model = INTENT_MODEL,
         quality_model = QUALITY_MODEL,

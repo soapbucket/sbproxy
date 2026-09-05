@@ -537,8 +537,8 @@ fn a_rego_policy_reads_base_data_and_drives_the_plan() {
 /// from stdin and answers with a plan naming `frontier` / `gpt-4o`, or
 /// declines with `plan: null` when the bytes `decline` appear in the input.
 /// A normal chat request carries no such bytes, so the plan fires. Wired ⇒
-/// frontier serves and cheap is untouched; a broken seam (hook unresolved,
-/// program not threaded, plan ignored) ⇒ decline ⇒ round_robin ⇒ cheap.
+/// frontier serves and cheap is untouched. Evaluation errors block so their
+/// cause is visible; an ignored plan still falls back to cheap and fails.
 const PLAN_ROUTER_WASM: &[u8] =
     include_bytes!("../../crates/sbproxy-extension/src/bundle/testdata/wasm/ai-routing-plan.wasm");
 
@@ -549,6 +549,9 @@ version: 1.0.0
 runtime: wasm
 abi: sbproxy-envelope/v1
 entry: plan.wasm
+# Allow cold debug execution; this test asserts routing, not timeout enforcement.
+sandbox:
+  budget_ms: 1000
 hooks:
   - kind: ai_routing
     type: plan_router
@@ -585,6 +588,7 @@ origins:
       ai_routing_policy:
         engine: wasm
         type: plan_router
+        on_error: block
 "#
     )
 }
@@ -609,12 +613,26 @@ fn a_wasm_bundle_policy_drives_the_plan_end_to_end() {
     let resp = proxy
         .post_json("/v1/chat/completions", "ai.localhost", &chat(), &[])
         .expect("send");
-    assert_eq!(resp.status, 200);
+    let diagnostics = || {
+        format!(
+            "status={} body={}\nstdout={}\nstderr={}",
+            resp.status,
+            String::from_utf8_lossy(&resp.body),
+            proxy.stdout_contents(),
+            proxy.stderr_contents(),
+        )
+    };
+    assert_eq!(resp.status, 200, "{}", diagnostics());
     assert!(
         !frontier.captured().is_empty(),
-        "the wasm plan must dispatch to frontier"
+        "the wasm plan must dispatch to frontier: {}",
+        diagnostics()
     );
-    assert!(cheap.captured().is_empty(), "cheap must be untouched");
+    assert!(
+        cheap.captured().is_empty(),
+        "cheap must be untouched: {}",
+        diagnostics()
+    );
 }
 
 /// A plan whose first candidate names a provider the origin does not
