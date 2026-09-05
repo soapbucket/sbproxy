@@ -10,6 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Read;
 use std::net::{TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -374,6 +375,53 @@ fn ready_engine_port(client: &reqwest::blocking::Client, node: &NodeSpec) -> Res
         .and_then(|deployments| deployments.iter().find_map(|item| item["port"].as_u64()))
         .context("assigned worker has no ready engine port")?;
     u16::try_from(port).context("engine port exceeds u16")
+}
+
+/// Keep an admission-owned request active so recreate's drain phase cannot
+/// disappear before the admin assertion observes it.
+fn retain_managed_stream(
+    client: &reqwest::blocking::Client,
+    node: &NodeSpec,
+    process: &ProxyHarness,
+) -> Result<reqwest::blocking::Response> {
+    let engine_port = ready_engine_port(client, node)?;
+    client
+        .post(format!(
+            "http://127.0.0.1:{engine_port}/__control/mode/stream_until_cancelled"
+        ))
+        .send()
+        .context("configure retained model stream")?
+        .error_for_status()
+        .context("fake engine refused streaming mode")?;
+    let streaming_client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .context("build retained-stream client")?;
+    let mut response = streaming_client
+        .post(format!("{}/v1/chat/completions", process.base_url()))
+        .header("host", "cluster.test")
+        .json(&serde_json::json!({
+            "model": "fixture-model",
+            "messages": [{"role": "user", "content": "hold this request during recreate"}],
+            "stream": true,
+        }))
+        .send()
+        .context("start admission-owned model stream")?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "retained model stream returned {}: {}",
+        response.status(),
+        response.text().unwrap_or_default()
+    );
+    let mut first = [0u8; 6];
+    response
+        .read_exact(&mut first)
+        .context("read first retained stream frame")?;
+    anyhow::ensure!(
+        &first == b"data: ",
+        "retained request did not stream model output"
+    );
+    Ok(response)
 }
 
 fn validate_config(root: &Path, index: usize, config: &str) -> Result<()> {
@@ -881,16 +929,36 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
             )
         })
         .collect::<Vec<_>>();
-    reload_cluster_configs(&client, &nodes, &processes, &recreate_configs)?;
+    let retained_stream = retain_managed_stream(&client, &nodes[3], &processes["worker-b"])?;
+    let reload_client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(45))
+        .build()
+        .context("build recreate reload client")?;
     let recreate_generation = rolling_generation + 1;
-    wait_for_one_status(
-        &client,
-        nodes[1].admin_port,
-        Duration::from_secs(15),
-        |status| {
-            recreate_is_draining_before_start(status, recreate_generation, "worker-b", "worker-a")
-        },
-    );
+    std::thread::scope(|scope| -> Result<()> {
+        // Keep the stream inside the scope so a failed assertion releases
+        // its admission before the reload thread is joined during unwinding.
+        let draining_request = retained_stream;
+        let reload = scope.spawn(|| {
+            reload_cluster_configs(&reload_client, &nodes, &processes, &recreate_configs)
+        });
+        wait_for_one_status(
+            &client,
+            nodes[1].admin_port,
+            Duration::from_secs(15),
+            |status| {
+                recreate_is_draining_before_start(
+                    status,
+                    recreate_generation,
+                    "worker-b",
+                    "worker-a",
+                )
+            },
+        );
+        drop(draining_request);
+        reload.join().expect("recreate reload thread")?;
+        Ok(())
+    })?;
     statuses = wait_for_statuses(&client, &all_admin_ports, CONVERGENCE_TIMEOUT, converged);
     assert_eq!(deployment_generation(&statuses[0]), recreate_generation);
     assert_eq!(

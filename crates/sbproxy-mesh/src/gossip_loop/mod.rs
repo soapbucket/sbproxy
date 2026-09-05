@@ -1224,6 +1224,11 @@ impl GossipLoop {
                 tokio::select! {
                     biased;
                     _ = &mut shutdown_rx => {
+                        // Join the receiver before publishing Left: an in-flight
+                        // self-refutation must not publish a newer Alive after
+                        // our final leave announcement.
+                        recv_task.abort();
+                        let _ = recv_task.await;
                         announce_graceful_leave(
                             &protocol_cfg,
                             &peers_proto,
@@ -1239,7 +1244,6 @@ impl GossipLoop {
                             event = "mesh_graceful_leave",
                             "SWIM loop shutting down; leave announced"
                         );
-                        recv_task.abort();
                         break;
                     }
                     _ = protocol_tick.tick() => {
@@ -3284,6 +3288,202 @@ mod tests {
     }
 
     // --- apply_update unit tests ---
+
+    #[test]
+    fn restarted_peer_refutes_stale_leave_after_authenticated_rejoin() {
+        let now = Instant::now();
+        let mut old = PeerEntry::new("worker", "127.0.0.1:12000", now);
+        old.state = PeerState::Left;
+        old.incarnation = 1;
+        let retained = Arc::new(RwLock::new(PeerTable::from_entries(vec![old])));
+        let recreated = Arc::new(RwLock::new(PeerTable::new()));
+        let routes = Arc::new(RwLock::new(HashMap::new()));
+        let authenticated = Arc::new(RwLock::new(HashMap::from([(
+            "worker".to_string(),
+            AuthenticatedPeerRecord {
+                certificate_fingerprint: "certificate-a".to_string(),
+                identity_epoch: 1,
+                boot_epoch: 1,
+            },
+        )])));
+        assert_eq!(
+            record_join(
+                JoinContext {
+                    peers: &recreated,
+                    peer_addr_map: &routes,
+                    routing_cache: None,
+                    authenticated_peers: &authenticated,
+                    local_node_id: "observer",
+                },
+                JoinAdvertisement {
+                    node_id: "worker",
+                    gossip_addr: "127.0.0.1:12000",
+                    transport_addr: Some("127.0.0.1:13000"),
+                },
+                Some(&AuthenticatedJoin {
+                    certificate_fingerprint: "certificate-a".to_string(),
+                    identity_epoch: 1,
+                    boot_epoch: 2,
+                }),
+                "127.0.0.1:12000".parse().unwrap(),
+            ),
+            Some(true)
+        );
+        let stale_leave = PeerUpdate {
+            node_id: "worker".to_string(),
+            state: PeerStateWire::Left,
+            incarnation: 1,
+        };
+        let observer_incarnation = Arc::new(AtomicU64::new(0));
+        let observer_updates = Arc::new(Disseminator::new());
+        let evictor = Arc::new(PeerEvictor::new(3, Arc::new(|_p: &str| {})));
+        apply_update(
+            &stale_leave,
+            &recreated,
+            "observer",
+            &observer_incarnation,
+            &observer_updates,
+            &evictor,
+        );
+        assert!(matches!(
+            recreated
+                .read()
+                .unwrap()
+                .get_by_node_id("worker")
+                .unwrap()
+                .state,
+            PeerState::Left
+        ));
+
+        let worker_incarnation = Arc::new(AtomicU64::new(0));
+        let worker_updates = Arc::new(Disseminator::new());
+        apply_update(
+            &stale_leave,
+            &Arc::new(RwLock::new(PeerTable::new())),
+            "worker",
+            &worker_incarnation,
+            &worker_updates,
+            &evictor,
+        );
+        let updates = worker_updates.drain_for_send(16);
+        assert_eq!(
+            updates.len(),
+            1,
+            "a live restarted worker must refute its old leave"
+        );
+        assert_eq!(updates[0].state, PeerStateWire::Alive);
+        assert_eq!(updates[0].incarnation, 2);
+        for peers in [&retained, &recreated] {
+            apply_update(
+                &updates[0],
+                peers,
+                "observer",
+                &observer_incarnation,
+                &observer_updates,
+                &evictor,
+            );
+            let table = peers.read().unwrap();
+            let worker = table.get_by_node_id("worker").unwrap();
+            assert!(matches!(worker.state, PeerState::Alive));
+            assert_eq!(worker.incarnation, 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn graceful_leave_follows_the_last_self_refutation() {
+        let observer = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let observer_addr = observer.local_addr().unwrap().to_string();
+        let (mut worker, _, _, _) = spawn_loop(
+            "worker",
+            vec![PeerEntry::new("observer", observer_addr, Instant::now())],
+            None,
+        )
+        .await;
+        let worker_addr = format!("127.0.0.1:{}", worker.local_port())
+            .parse()
+            .unwrap();
+        send_msg(
+            &observer,
+            None,
+            &GossipMsg::Ping {
+                seq: 77,
+                from: "observer".to_string(),
+                updates: vec![PeerUpdate {
+                    node_id: "worker".to_string(),
+                    state: PeerStateWire::Left,
+                    incarnation: 1,
+                }],
+            },
+            worker_addr,
+        )
+        .await;
+        let mut buf = [0u8; 65536];
+        let alive = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let (n, _) = observer.recv_from(&mut buf).await.unwrap();
+                let message: GossipMsg = crate::transport::wire::decode(&buf[..n]).unwrap();
+                if let GossipMsg::Ping { seq, .. } = &message {
+                    send_msg(
+                        &observer,
+                        None,
+                        &GossipMsg::Ack {
+                            seq: *seq,
+                            from: "observer".to_string(),
+                            updates: vec![],
+                        },
+                        worker_addr,
+                    )
+                    .await;
+                }
+                if let GossipMsg::Ack {
+                    seq: 77, updates, ..
+                } = message
+                {
+                    return updates
+                        .into_iter()
+                        .find(|update| {
+                            update.node_id == "worker" && update.state == PeerStateWire::Alive
+                        })
+                        .expect("the live worker must refute the stale leave in its ACK");
+                }
+            }
+        })
+        .await
+        .expect("worker ACK");
+        assert_eq!(alive.incarnation, 2);
+
+        worker.request_shutdown();
+        let leave = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let (n, _) = observer.recv_from(&mut buf).await.unwrap();
+                let message: GossipMsg = crate::transport::wire::decode(&buf[..n]).unwrap();
+                if let GossipMsg::Ping { seq, updates, .. } = message {
+                    send_msg(
+                        &observer,
+                        None,
+                        &GossipMsg::Ack {
+                            seq,
+                            from: "observer".to_string(),
+                            updates: vec![],
+                        },
+                        worker_addr,
+                    )
+                    .await;
+                    if let Some(leave) = updates.into_iter().find(|update| {
+                        update.node_id == "worker" && update.state == PeerStateWire::Left
+                    }) {
+                        return leave;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("graceful leave announcement");
+        assert_eq!(leave.incarnation, alive.incarnation + 1);
+        (&mut worker._protocol_join)
+            .await
+            .expect("protocol shutdown");
+    }
 
     #[test]
     fn apply_update_self_suspect_bumps_incarnation_and_refutes() {
