@@ -1,8 +1,8 @@
 name: release checks
 
 # Heavyweight regression checks that run before a release rather than
-# on every PR. Single-threaded test isolation reruns the full workspace
-# tests one-thread-at-a-time, and the ACME integration test stands up
+# on every PR. Process-isolated tests rerun the full workspace
+# one test at a time, and the ACME integration test stands up
 # a Pebble service container and exercises real cert issuance. Both
 # run on tag pushes, nightly, and on workflow_dispatch so day-to-day
 # CI stays cheap while we still catch ordering and CA regressions
@@ -117,7 +117,7 @@ jobs:
     # A manual documentation replay does not rebuild the unchanged workspace.
     # Tag, nightly, and default manual runs always retain this coverage.
     if: inputs.scope != 'documentation'
-    name: test isolation (single-threaded)
+    name: test isolation (serial processes)
     runs-on: ubuntu-latest
     # A recent run spent 71m33s compiling its three binary variants and
     # workspace tests, then hit the old 90-minute cap mid-suite. Preserve
@@ -137,6 +137,8 @@ jobs:
       - uses: ./.github/actions/rust-setup
         with:
           cache-key: test-isolation
+
+      - uses: taiki-e/install-action@nextest
 
       # Build the standalone sbproxy binary BEFORE running tests. The
       # e2e harness in `e2e/src/lib.rs` spawns `target/debug/sbproxy` at
@@ -172,16 +174,28 @@ jobs:
           df -h /
           du -sh target target/no-default-features 2>/dev/null || true
 
-      - name: test (single thread)
-        # --no-fail-fast: without it, cargo stops launching further test
-        # binaries the moment one fails, so a single failing test hides
-        # every result after it alphabetically. That produced a string
-        # of tag-time runs where "the failing test" looked different
-        # every retry - it was really the earliest alphabetical failure
-        # each time, masking whatever came later (including a real,
-        # deterministic bug this same investigation found and fixed in
-        # the semantic cache).
-        run: cargo test --workspace --locked --no-fail-fast -- --test-threads=1
+      # Tests intentionally own immutable process-wide registrations (event
+      # egress, audit chains, secret resolvers). Sharing one libtest process
+      # makes later tests inherit a dead fixture's registration or cache.
+      # Match the required runner while retaining the full workspace and
+      # serial scheduling. No retries: release validation reports every failure.
+      - name: test (one isolated process at a time)
+        id: isolated-tests
+        run: cargo nextest run --workspace --locked --profile ci --test-threads 1 --retries 0 --no-fail-fast
+
+      # nextest does not execute doctests. Run these even after a test failure
+      # so one failing target does not conceal the rest of the release evidence.
+      - name: doctests
+        if: success() || (failure() && steps.isolated-tests.outcome == 'failure')
+        run: cargo test --workspace --locked --doc --no-fail-fast -- --test-threads=1
+
+      - name: upload test results
+        if: success() || failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-test-isolation-results
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
 
   acme-pebble:
     if: inputs.scope != 'documentation'
