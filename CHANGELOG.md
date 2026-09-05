@@ -590,7 +590,7 @@ Render what the next release will say with
 - Operator URLs no longer reach log lines or error strings in full.
   Redis and object-store DSNs, alert and callback webhook targets, JWKS
   endpoints, usage sink collectors, and WAF feed URLs are now rendered
-  as `scheme://host:port` (plus the database index for a Redis DSN), so
+  with only their scheme, host, and port (plus a Redis DSN's database index), so
   an inline password or a webhook secret in the path cannot land in the
   process log. `reqwest` failures are summarized by failure class
   instead of interpolated directly, since that error's own `Display`

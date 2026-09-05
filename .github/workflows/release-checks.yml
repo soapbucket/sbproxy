@@ -71,14 +71,9 @@ jobs:
   doc-captures:
     name: documented output still reproduces
     runs-on: ubuntu-latest
-    # Was 25; this job's payments-featured build was still on the default
-    # [profile.release] (fat LTO, codegen-units=1), the same slow profile
-    # test-isolation's identical build step already works around with
-    # CARGO_PROFILE_RELEASE_LTO: thin below. Without it, a cold-cache build
-    # alone can eat most of a 25-minute budget before the capture replay
-    # even starts, and the v1.11.0 tag run's job was cancelled by this
-    # timeout mid-compile.
-    timeout-minutes: 35
+    # A recent cold build took 33m18s, leaving about a minute for replay
+    # under the former 35-minute cap. Keep time for the full capture sweep.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
 
@@ -108,15 +103,15 @@ jobs:
       - name: replay documented commands
         env:
           SBPROXY_CAPTURE_BIN: target/release/sbproxy
-        run: python3 scripts/check-doc-captures.py --check
+        run: python3 -u scripts/check-doc-captures.py --check
 
   test-isolation:
     name: test isolation (single-threaded)
     runs-on: ubuntu-latest
-    # Was 60; the added payments-featured build step (thin LTO, but
-    # still a release build on top of the two debug ones and the full
-    # workspace test compile) needs more headroom.
-    timeout-minutes: 90
+    # A recent run spent 71m33s compiling its three binary variants and
+    # workspace tests, then hit the old 90-minute cap mid-suite. Preserve
+    # single-threaded coverage and allow the complete sweep to finish.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v5
 
