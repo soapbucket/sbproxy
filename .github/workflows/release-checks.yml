@@ -27,11 +27,12 @@ on:
   workflow_dispatch:
     inputs:
       scope:
-        description: 'Checks to run (documentation replays captures and checks the corpus)'
+        description: 'Checks to run (focused scopes retain corpus validation)'
         type: choice
         options:
           - all
           - documentation
+          - test-isolation
         default: all
 
 # Default to read-only contents access for every job in this workflow.
@@ -77,6 +78,7 @@ jobs:
   # minutes and it answers a question the rest of CI cannot, so a stale
   # doc should not wait behind a 60-minute single-threaded test run.
   doc-captures:
+    if: inputs.scope != 'test-isolation'
     name: documented output still reproduces
     runs-on: ubuntu-latest
     # A recent cold build took 33m18s, leaving about a minute for replay
@@ -201,7 +203,7 @@ jobs:
           if-no-files-found: warn
 
   acme-pebble:
-    if: inputs.scope != 'documentation'
+    if: inputs.scope != 'documentation' && inputs.scope != 'test-isolation'
     name: acme integration (pebble)
     runs-on: ubuntu-latest
     timeout-minutes: 30
