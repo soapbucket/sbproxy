@@ -1,0 +1,4 @@
+{
+  "type": "security",
+  "message": "Updated Wasmtime and WASI to 46.0.3 and cap-std to 4.0.3, applying upstream fixes for filesystem sandbox escapes and guest-controlled host allocations (RUSTSEC-2026-0268 and RUSTSEC-2026-0269)."
+}
