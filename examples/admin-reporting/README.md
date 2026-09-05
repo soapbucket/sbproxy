@@ -103,6 +103,7 @@ curl -s -u "$SB_ADMIN" \
 
 ```json
 {
+    "schema_version": 1,
     "group_by": [
         "model",
         "api_key_id",
@@ -111,60 +112,59 @@ curl -s -u "$SB_ADMIN" \
     ],
     "rows": [
         {
-            "cost_usd_micros": 5250,
-            "group": {
-                "api_key_id": "cfg:4:acme:13:acme.ai.local:acme-platform",
-                "model": "gpt-4o",
-                "tenant": "acme",
-                "user": "ops@acme.test"
-            },
             "requests": 1,
             "tokens_in": 900,
-            "tokens_out": 300
+            "tokens_out": 300,
+            "cost_usd_micros": 5250,
+            "group": {
+                "model": "gpt-4o",
+                "api_key_id": "cfg:4:acme:13:acme.ai.local:acme-platform",
+                "tenant": "acme",
+                "user": "ops@acme.test"
+            }
         },
         {
-            "cost_usd_micros": 84,
-            "group": {
-                "api_key_id": "cfg:4:acme:13:acme.ai.local:acme-platform",
-                "model": "gpt-4o-mini",
-                "tenant": "acme",
-                "user": "dev@acme.test"
-            },
             "requests": 2,
             "tokens_in": 240,
-            "tokens_out": 80
+            "tokens_out": 80,
+            "cost_usd_micros": 84,
+            "group": {
+                "model": "gpt-4o-mini",
+                "api_key_id": "cfg:4:acme:13:acme.ai.local:acme-platform",
+                "tenant": "acme",
+                "user": "dev@acme.test"
+            }
         },
         {
+            "requests": 1,
+            "tokens_in": 120,
+            "tokens_out": 40,
             "cost_usd_micros": 42,
             "group": {
-                "api_key_id": "cfg:4:acme:13:acme.ai.local:acme-research",
                 "model": "gpt-4o-mini",
+                "api_key_id": "cfg:4:acme:13:acme.ai.local:acme-research",
                 "tenant": "acme",
                 "user": "sci@acme.test"
-            },
-            "requests": 1,
-            "tokens_in": 120,
-            "tokens_out": 40
+            }
         },
         {
-            "cost_usd_micros": 42,
-            "group": {
-                "api_key_id": "cfg:6:globex:15:globex.ai.local:globex-platform",
-                "model": "gpt-4o-mini",
-                "tenant": "globex",
-                "user": "dev@globex.test"
-            },
             "requests": 1,
             "tokens_in": 120,
-            "tokens_out": 40
+            "tokens_out": 40,
+            "cost_usd_micros": 42,
+            "group": {
+                "model": "gpt-4o-mini",
+                "api_key_id": "cfg:6:globex:15:globex.ai.local:globex-platform",
+                "tenant": "globex",
+                "user": "dev@globex.test"
+            }
         }
     ],
-    "schema_version": 1,
     "totals": {
-        "cost_usd_micros": 5418,
         "requests": 5,
         "tokens_in": 1380,
-        "tokens_out": 460
+        "tokens_out": 460,
+        "cost_usd_micros": 5418
     }
 }
 ```
@@ -187,26 +187,26 @@ curl -s -u "$SB_ADMIN" \
 
 ```json
 {
+    "schema_version": 1,
     "group_by": [
         "model"
     ],
     "rows": [
         {
+            "requests": 1,
+            "tokens_in": 900,
+            "tokens_out": 300,
             "cost_usd_micros": 5250,
             "group": {
                 "model": "gpt-4o"
-            },
-            "requests": 1,
-            "tokens_in": 900,
-            "tokens_out": 300
+            }
         }
     ],
-    "schema_version": 1,
     "totals": {
-        "cost_usd_micros": 5250,
         "requests": 1,
         "tokens_in": 900,
-        "tokens_out": 300
+        "tokens_out": 300,
+        "cost_usd_micros": 5250
     }
 }
 ```
@@ -234,14 +234,14 @@ head -3 acme-requests.csv
 <!-- CAPTURE: curl -s -u admin:demo-change-me 'http://127.0.0.1:9090/api/requests/export?format=csv&tenant=acme' -o /tmp/acme-requests.csv; head -3 /tmp/acme-requests.csv -->
 
 ```text
-timestamp,origin,method,path,status,latency_ms,client_ip,request_id,trace_id,session_id,parent_session_id,cache_status,retry_count,failover_engaged,failover_from,failover_to,load_balancer_strategy,load_balancer_target,provider,model,tokens_in,tokens_out,cost_usd_micros,guardrail_category,guardrail_action,api_key_id,key_mode,key_provider,tenant_id,user_id,error_class,config_revision,policy_version,deny_reason,policy_decisions,properties
-2026-08-21T01:11:55.226687+00:00,acme.ai.local,POST,/v1/chat/completions,200,1.887458,127.0.0.1:64696,01a021dfe05874f1b6ba866697bd518b,6531cb754eae46b5ba1b255f2c61eadb,,,disabled,0,false,,,round_robin,openai,openai,gpt-4o-mini,120,40,42,,,cfg:4:acme:13:acme.ai.local:acme-research,minted,,acme,sci@acme.test,,8cb4b33d8ffc,c:8cb4b33d8ffc:ae10235dbb7fdde7,,[],"{""feature"":""literature-scan""}"
-2026-08-21T01:11:55.214716+00:00,acme.ai.local,POST,/v1/chat/completions,200,1.116375,127.0.0.1:64695,01a021dfe04d7b11960a65be634aca3e,c4f486ae935b41fa854201f66422ad16,,,disabled,0,false,,,round_robin,openai,openai,gpt-4o,900,300,5250,,,cfg:4:acme:13:acme.ai.local:acme-platform,minted,,acme,ops@acme.test,,8cb4b33d8ffc,c:8cb4b33d8ffc:cd949575bc0dca2d,,[],"{""feature"":""incident-triage""}"
+timestamp,origin,method,path,status,latency_ms,client_ip,request_id,trace_id,session_id,parent_session_id,cache_status,retry_count,failover_engaged,failover_from,failover_to,load_balancer_strategy,load_balancer_target,provider,model,tokens_in,tokens_out,cost_usd_micros,guardrail_category,guardrail_action,api_key_id,key_mode,key_provider,tenant_id,user_id,error_class,config_revision,policy_version,deny_reason,policy_decisions,properties,credential_source,tokens_cached,tokens_cache_write,service_tier
+<RFC3339>,acme.ai.local,POST,/v1/chat/completions,200,<LATENCY>,127.0.0.1:<PORT>,<HEX32>,<HEX32>,,,disabled,0,false,,,round_robin,openai,openai,gpt-4o-mini,120,40,42,,,cfg:4:acme:13:acme.ai.local:acme-research,minted,,acme,sci@acme.test,,8cb4b33d8ffc,c:8cb4b33d8ffc:ae10235dbb7fdde7,,[],"{""feature"":""literature-scan""}",provider_entry,,,
+<RFC3339>,acme.ai.local,POST,/v1/chat/completions,200,<LATENCY>,127.0.0.1:<PORT>,<HEX32>,<HEX32>,,,disabled,0,false,,,round_robin,openai,openai,gpt-4o,900,300,5250,,,cfg:4:acme:13:acme.ai.local:acme-platform,minted,,acme,ops@acme.test,,8cb4b33d8ffc,c:8cb4b33d8ffc:cd949575bc0dca2d,,[],"{""feature"":""incident-triage""}",provider_entry,,,
 ```
 
-Thirty-six fixed columns, the `globex` row filtered out, and the
+Forty fixed columns, the `globex` row filtered out, and the
 `properties` cell carrying JSON with its inner quotes doubled per RFC
-4180 so the record still splits into 36 fields. Cells that would open
+4180 so the record still splits into 40 fields. Cells that would open
 with `=`, `+`, `-`, `@`, a tab, or a carriage return get a leading
 apostrophe first, so an export nobody inspected cannot execute a
 formula in whichever laptop opens it.
@@ -258,15 +258,15 @@ curl -s -u "$SB_ADMIN" \
 
 ```json
 {
-    "timestamp": "2026-08-21T01:11:55.203180+00:00",
+    "timestamp": "<RFC3339>",
     "origin": "acme.ai.local",
     "method": "POST",
     "path": "/v1/chat/completions",
     "status": 200,
-    "latency_ms": 2.8585,
-    "client_ip": "127.0.0.1:64694",
-    "request_id": "01a021dfe0407331a26b80c75e648ba2",
-    "trace_id": "03db4bd210cc4aaab55079b097ccc623",
+    "latency_ms": <LATENCY>,
+    "client_ip": "127.0.0.1:<PORT>",
+    "request_id": "<HEX32>",
+    "trace_id": "<HEX32>",
     "properties": {
         "feature": "summarize"
     },
@@ -282,6 +282,7 @@ curl -s -u "$SB_ADMIN" \
     "cost_usd_micros": 42,
     "api_key_id": "cfg:4:acme:13:acme.ai.local:acme-platform",
     "key_mode": "minted",
+    "credential_source": "provider_entry",
     "tenant_id": "acme",
     "user_id": "dev@acme.test",
     "config_revision": "8cb4b33d8ffc",

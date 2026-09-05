@@ -85,12 +85,12 @@ curl -is -H 'Host: blog.local' -H 'User-Agent: GPTBot/1.0' \
 ```text
 HTTP/1.1 402 Payment Required
 content-type: application/json
-crawler-payment: eyJhbGciOiJFZERTQSIsInR5cCI6InNicHJveHktcXVvdGUrandzIiwia2lkIjoic2Jwcm94eS1wYXltZW50cyJ9.eyJpc3MiOiJzYnByb3h5LXBheW1lbnRzIiwic3ViIjoiX19kZWZhdWx0X18iLCJhdWQiOiJsZWRnZXIiLCJpYXQiOjE3ODU3OTQ2MTUsImV4cCI6MTc4NTc5NDkxNSwibm9uY2UiOiJyZXFfMDFrejR0ZW5xNzJhOXkzNnlqaHMwajZjY3oiLCJxdW90ZV9pZCI6InF1b3RlXzAxa3o0dGVucTcyYTl5MzZ5amhzMGo2Y2N6Iiwicm91dGUiOiIvYXJ0aWNsZSIsInNoYXBlIjoicGF5bWVudC1yZXF1aXJlbWVudCIsInByaWNlIjp7ImFtb3VudF9taWNyb3MiOjEwMCwiY3VycmVuY3kiOiJCVEMifSwicmFpbCI6ImxpZ2h0bmluZyIsInJlcXVpcmVtZW50X2lkIjoicmVxXzAxa3o0dGVucTcyYTl5MzZ5amhzMGo2Y2N6IiwiZHJhZnRfZGlnZXN0IjoiX2FYSkVkYmtZcFM0UVlzb09nLUdNT3BrcW1kbzhXYndBSGlCanJwWWRqZyIsInJlcXVpcmVtZW50X2RpZ2VzdCI6Im1vUXY0WldRVUlzZVVUWFFPOEJvR05mZkdHcTg4ZXl4WEZaODBadFZWaHcifQ.bCzYFCGteQF5cT6sV3pcjJxA9hY27uDJyj72eKy8uoYQrTPW-jmoDTZr_WKM8ew-0-XmiluHDiAjM3oeBJT3Ag
-content-length: 448
-Date: Mon, 03 Aug 2026 22:03:35 GMT
+crawler-payment: <JWS>
+content-length: <LEN>
+Date: <DATE>
 Connection: keep-alive
 
-{"amount_micros":100,"challenge":{"bolt11":"lnbcrt100u1stubinvoicestubinvoicestubinvoice","label":"sbproxy-invoice-sbpi_ppFV2kS5oWRd-WqoDUGQ-3ROCgyXYjARyFOiq2pcQ6Y","payment_hash":"1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f"},"currency":"BTC","error":"payment_required","expires_at_ms":1785794915015,"header":"crawler-payment","rail":"lightning","requirement_id":"req_01kz4tenq72a9y36yjhs0j6ccz","target":"blog.local/article"}
+{"error":"payment_required","rail":"lightning","requirement_id":"req_<ULID>","amount_micros":100,"currency":"BTC","target":"blog.local/article","header":"crawler-payment","expires_at_ms":<EPOCH_MS>,"challenge":{"bolt11":"lnbcrt<INVOICE>","label":"sbproxy-invoice-sbpi_<INTENT>","payment_hash":"<HEX64>"}}
 ```
 
 Retrying before the invoice is paid is the case the gate exists for. The quote token authenticates and names a live intent, so this is not a refusal; it is verified-but-not-settled, which is a 503 with `Retry-After` and never origin access. The intent is left `retry_wait`, not stranded, so run this and the crawler's very next request, once it has actually paid, is the one that reaches the origin:
@@ -124,11 +124,11 @@ curl -is -H 'Host: blog.local' -H 'User-Agent: GPTBot/1.0' \
 ```text
 HTTP/1.1 406 Not Acceptable
 content-type: application/json
-content-length: 189
-Date: Mon, 03 Aug 2026 22:03:35 GMT
+content-length: <LEN>
+Date: <DATE>
 Connection: keep-alive
 
-{"error":"no_acceptable_rail","message":"Accept-Payment does not overlap with the settlement rails configured for this route.","supported_rails":["lightning"],"target":"blog.local/article"}
+{"error":"no_acceptable_rail","supported_rails":["lightning"],"target":"blog.local/article","message":"Accept-Payment does not overlap with the settlement rails configured for this route."}
 ```
 
 ## What is left behind
@@ -168,7 +168,7 @@ curl -s -u admin:demo-change-me http://127.0.0.1:9090/admin/payments/status
 <!-- CAPTURE: curl -s -u admin:demo-change-me http://127.0.0.1:9090/admin/payments/status -->
 
 ```text
-{"configured":true,"rails":["lightning_cln"],"schema_version":3,"worker":{"challenges_expired":<N>,"clean_shutdown":false,"leases_moved_to_needs_reconciliation":<N>,"leases_returned_to_retry_wait":<N>,"reconciliations_succeeded":<N>,"reconciliations_unresolved":<N>,"ticks":<N>}}
+{"configured":true,"schema_version":3,"rails":["lightning_cln"],"worker":{"ticks":<N>,"challenges_expired":<N>,"leases_returned_to_retry_wait":<N>,"leases_moved_to_needs_reconciliation":<N>,"reconciliations_succeeded":<N>,"reconciliations_unresolved":<N>,"clean_shutdown":false}}
 ```
 
 The metrics carry four labels and no more: `rail`, `operation`, `outcome`, and `provider_class`.
