@@ -462,6 +462,33 @@ fn drain_batch(rx: &Receiver<RequestEvent>) -> Vec<RequestEvent> {
     batch
 }
 
+fn http_client_for_target(target: &IngestTarget) -> Option<reqwest::Client> {
+    // NATS uses a raw TCP connection. Building an unused HTTP client can
+    // block its first batch on TLS initialization and certificate loading.
+    if matches!(target, IngestTarget::Nats { .. }) {
+        return None;
+    }
+
+    match reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(NETWORK_TIMEOUT)
+        .build()
+    {
+        Ok(client) => Some(client),
+        Err(error) => {
+            // Without this every ClickHouse batch is an `error` tick with
+            // no line anywhere saying why, which is a destination that
+            // never works and never explains itself.
+            tracing::error!(
+                target: "event_ingest",
+                error = %error,
+                "the event ingest http client would not build; no batch will reach clickhouse"
+            );
+            None
+        }
+    }
+}
+
 fn run_worker(
     rx: Receiver<RequestEvent>,
     target: IngestTarget,
@@ -495,24 +522,7 @@ fn run_worker(
     // than inside `publish_to_nats` so a redial on a later batch is counted
     // as the reconnect it is.
     let mut nats_dialed = false;
-    let http = match reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(NETWORK_TIMEOUT)
-        .build()
-    {
-        Ok(client) => Some(client),
-        Err(error) => {
-            // Without this every ClickHouse batch is an `error` tick with
-            // no line anywhere saying why, which is a destination that
-            // never works and never explains itself.
-            tracing::error!(
-                target: "event_ingest",
-                error = %error,
-                "the event ingest http client would not build; no batch will reach clickhouse"
-            );
-            None
-        }
-    };
+    let http = http_client_for_target(&target);
 
     loop {
         let batch = drain_batch(&rx);
