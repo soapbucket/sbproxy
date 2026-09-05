@@ -100,7 +100,9 @@ jobs:
     # still banks its dependency build, so a retry (even one that also
     # times out) resumes from a warm cache instead of paying the full
     # cold fat-LTO build again.
-    timeout-minutes: 90
+    # The last macOS release job took 89m30s against that 90-minute cap.
+    # Leave room for the larger workspace and packaging on a cold runner.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -443,9 +445,10 @@ jobs:
     # certify-model-host.sh defaults to for `serve:`-block deployments,
     # so SB_HOST is pinned to 127.0.0.1 below to match.
     runs-on: macos-14
-    # The release-profile build (fat LTO) alone can exceed 30 minutes on
-    # a cold macOS runner cache; certification needs headroom on top.
-    timeout-minutes: 75
+    # This candidate spent over 72 minutes in its cold fat-LTO build;
+    # the previous hardware certification then needed another 3 minutes.
+    # The former 75-minute cap could expire before certification finished.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v5
 
@@ -454,6 +457,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: certify-model-host-apple-silicon
+          # Retain the dependency build if compilation or certification
+          # fails, so retrying this lane does not start cold again.
+          cache-on-failure: true
 
       # sbproxy-classifier-proto's build script requires protoc; macOS
       # runners do not ship it, unlike the preprovisioned Linux images.
