@@ -15,6 +15,7 @@
 //!   authority-state.json      revision counters + subscriber registry
 //!   revisions/current.json    the signed bundle subscribers fetch
 //!   revisions/previous.json   the one before it, kept for rollback
+//!   revisions/archive/<n>.json  bounded ring of earlier signed bundles
 //! ```
 //!
 //! Every file is written to a temporary name in its own directory,
@@ -47,6 +48,35 @@
 //! That one is repaired at open rather than refused: the reservation
 //! already covered the number, so nothing else can claim it, and the file
 //! on disk is the one that was signed.
+//!
+//! # The archive ring sits beside the two slots, not in place of them
+//!
+//! `current.json` and `previous.json` are load bearing: the crash-repair
+//! rules above and the reserve-before-commit ordering that makes a
+//! revision number a promise are both written in terms of them. So
+//! `revisions/archive/` is additive. [`AuthorityStore::commit`] writes
+//! the same signed bundle bytes it puts in `current.json` into
+//! `revisions/archive/<revision>.json`, and the two slots keep exactly
+//! the contents they had before this ring existed.
+//!
+//! The ring exists so a fleet rollback can name a revision from further
+//! back than one step. `previous.json` answers "undo the last publish";
+//! the archive answers "go back to what we were running on Tuesday".
+//! Rolling back to an archived revision is still a *forward* publish of
+//! that revision's payload under a fresh number, for the same
+//! anti-replay reason a one-step rollback is: see
+//! [`AuthorityStore::archived`].
+//!
+//! `archive` in the state file names which revisions the ring holds, in
+//! ascending order, and the write ordering matches the one
+//! [`AuthorityStore::commit`] already uses: the archive file is written
+//! before the state file names it, so the crash window leaves a file
+//! nothing points at rather than a pointer at a file that is not there.
+//! [`AuthorityStore::open`] repairs that window by adopting any archive
+//! file whose revision was reserved, then trimming back to the bound.
+//! Eviction persists the shrunk list before it unlinks anything, so the
+//! only residue a crash can leave is a file the list no longer names,
+//! which the next open adopts and evicts again.
 //!
 //! # Credentials
 //!
@@ -111,6 +141,23 @@ const MAX_STATE_FILE_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_STORED_BUNDLE_BYTES: u64 =
     2 * crate::config_bundle::MAX_CONFIG_YAML_BYTES as u64 + 65_536;
 
+/// Worst-case bytes the archive ring can occupy at [`MAX_ARCHIVE_KEEP`].
+///
+/// Written down rather than left to be discovered on a full disk. One
+/// archived file is bounded by the same envelope limit a subscriber
+/// applies on the wire, which is twice
+/// [`MAX_CONFIG_YAML_BYTES`](crate::config_bundle::MAX_CONFIG_YAML_BYTES)
+/// (4 MiB) plus 64 KiB of envelope, so 8.06 MiB. The ring holds one
+/// file more than `archive_keep`, because the revision being served is
+/// stored too and only becomes a rollback target once something else
+/// publishes. At the 200-target ceiling that is 201 files, so 1.58
+/// GiB, and at the [`DEFAULT_ARCHIVE_KEEP`] of 20 it is 21 files, so
+/// 169 MiB. Those are ceilings for a configuration document at the
+/// 4 MiB wire limit; a real `sb.yml` runs four orders of magnitude
+/// smaller, so the default ring costs kilobytes in practice.
+pub const MAX_ARCHIVE_BYTES: u64 =
+    MAX_STORED_BUNDLE_BYTES * archive_files_for(MAX_ARCHIVE_KEEP) as u64;
+
 /// State file name inside the store directory.
 const STATE_FILE: &str = "authority-state.json";
 
@@ -123,6 +170,41 @@ const CURRENT_BUNDLE_FILE: &str = "current.json";
 /// The bundle before the current one, kept so a later change can offer a
 /// one-step rollback without re-deriving it.
 const PREVIOUS_BUNDLE_FILE: &str = "previous.json";
+
+/// Subdirectory under `revisions/` holding the bounded archive ring.
+const ARCHIVE_DIR: &str = "archive";
+
+/// How many **earlier** revisions the archive ring keeps when nothing
+/// says otherwise.
+///
+/// Twenty publications is roughly a busy month of platform changes, and
+/// at the worst case one payload can reach it is well under a gigabyte
+/// (see [`MAX_ARCHIVE_BYTES`]). An operator who wants a longer memory
+/// raises `proxy.config_authority.publish.archive_keep`; one who wants
+/// none sets it to zero and keeps the one-step rollback that
+/// `previous.json` has always offered.
+pub const DEFAULT_ARCHIVE_KEEP: usize = 20;
+
+/// Largest accepted `archive_keep`.
+///
+/// The bound is a disk-footprint bound, not a correctness one: see
+/// [`MAX_ARCHIVE_BYTES`] for the arithmetic it caps.
+pub const MAX_ARCHIVE_KEEP: usize = 200;
+
+/// Files the ring holds at a given `archive_keep`, which is one more
+/// than the number of rollback targets.
+///
+/// `archive_keep` counts revisions an operator can roll *back to*, so
+/// the revision currently being served does not count against it: a
+/// rollback to what is already running is a no-op republish, and a
+/// bound that counted it made `archive_keep: 1` advertise exactly one
+/// target that could never do anything. The ring stores the current
+/// revision anyway, because it becomes an earlier revision the moment
+/// anything else publishes. `archive_keep: 0` keeps no ring at all and
+/// never reaches this.
+const fn archive_files_for(keep: usize) -> usize {
+    keep + 1
+}
 
 /// Random material a caller supplies when minting one subscriber
 /// credential.
@@ -565,6 +647,12 @@ struct AuthorityState {
     /// Registered subscribers, keyed by clear-text credential ID.
     #[serde(default)]
     subscribers: BTreeMap<String, SubscriberRecord>,
+    /// Revisions the archive ring holds, ascending.
+    ///
+    /// `#[serde(default)]` so a state file written before the ring
+    /// existed opens as an empty archive rather than as a corrupt file.
+    #[serde(default)]
+    archive: Vec<u64>,
 }
 
 impl AuthorityState {
@@ -575,6 +663,7 @@ impl AuthorityState {
             high_water_revision: 0,
             current_revision: 0,
             subscribers: BTreeMap::new(),
+            archive: Vec::new(),
         }
     }
 
@@ -619,6 +708,24 @@ impl AuthorityState {
                 )));
             }
         }
+        // The archive names revisions this authority reserved, in
+        // ascending order and each one once. A list that fails either
+        // rule came from somewhere other than this store's own commit
+        // path, and adopting it would let a rollback target a number the
+        // counter never handed out.
+        if self.archive.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(AuthorityStoreError::Corrupt(
+                "the archive list is not strictly ascending".to_string(),
+            ));
+        }
+        if let Some(highest) = self.archive.last() {
+            if *highest > self.high_water_revision {
+                return Err(AuthorityStoreError::Corrupt(format!(
+                    "the archive names revision {highest} but only {} was ever reserved",
+                    self.high_water_revision
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -637,6 +744,9 @@ pub struct AuthorityStore {
     state: AuthorityState,
     current: Option<SignedConfigBundle>,
     previous: Option<SignedConfigBundle>,
+    /// How many archived revisions the ring keeps. Clamped to
+    /// [`MAX_ARCHIVE_KEEP`] at open.
+    archive_keep: usize,
 }
 
 impl AuthorityStore {
@@ -658,13 +768,32 @@ impl AuthorityStore {
         directory: impl AsRef<Path>,
         authority_id: &str,
     ) -> Result<Self, AuthorityStoreError> {
+        Self::open_with_archive_keep(directory, authority_id, DEFAULT_ARCHIVE_KEEP)
+    }
+
+    /// [`Self::open`] with an explicit archive ring bound.
+    ///
+    /// `archive_keep` is clamped to [`MAX_ARCHIVE_KEEP`]. Zero keeps no
+    /// archive at all, which leaves the store behaving exactly as it did
+    /// before the ring existed: `current.json`, `previous.json`, and a
+    /// one-step rollback.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::open`], plus [`AuthorityStoreError::Corrupt`] when the
+    /// archive directory holds a file the state file cannot account for.
+    pub fn open_with_archive_keep(
+        directory: impl AsRef<Path>,
+        authority_id: &str,
+        archive_keep: usize,
+    ) -> Result<Self, AuthorityStoreError> {
         if !is_valid_bundle_identifier(authority_id) {
             return Err(AuthorityStoreError::invalid(
                 "authority_id is empty, invalid, or oversized",
             ));
         }
         let directory = directory.as_ref().to_path_buf();
-        std::fs::create_dir_all(directory.join(REVISIONS_DIR))?;
+        create_private_dirs(&directory)?;
         let state_path = directory.join(STATE_FILE);
         let (state, claim_directory) = match read_bounded(&state_path, MAX_STATE_FILE_BYTES)? {
             Some(bytes) => {
@@ -689,13 +818,144 @@ impl AuthorityStore {
             state,
             current,
             previous,
+            archive_keep: archive_keep.min(MAX_ARCHIVE_KEEP),
         };
         store.reconcile_current_bundle()?;
+        store.reconcile_archive()?;
         if claim_directory {
             let state = store.state.clone();
             store.save_state(&state)?;
         }
         Ok(store)
+    }
+
+    /// Reconcile the state file's archive list with the files actually in
+    /// `revisions/archive/`.
+    ///
+    /// [`Self::commit`] writes the archive file before the state file
+    /// names it, so a crash between the two leaves a file nothing points
+    /// at. That is adopted rather than deleted: the reservation already
+    /// covered the number, so nothing else can ever claim it, and the
+    /// file on disk is the one that was signed. A listed revision whose
+    /// file is gone is dropped from the list, because an archive is a
+    /// convenience and an operator who deleted a file meant it, unlike
+    /// `current.json`, which the authority is actively serving.
+    ///
+    /// The reconciled list is then trimmed to `archive_keep`, so lowering
+    /// the bound takes effect at the next open rather than waiting for
+    /// enough publications to push the old entries out.
+    fn reconcile_archive(&mut self) -> Result<(), AuthorityStoreError> {
+        let on_disk = self.scan_archive_dir()?;
+        let mut adopted: Vec<u64> = Vec::new();
+        for revision in &on_disk {
+            if *revision > self.state.high_water_revision {
+                // A file claiming a number this authority never reserved
+                // did not come from this store. Refusing is the same call
+                // `reconcile_current_bundle` makes for the same shape.
+                return Err(AuthorityStoreError::Corrupt(format!(
+                    "{} holds revision {revision} but only {} was ever reserved",
+                    archive_path(&self.directory, *revision).display(),
+                    self.state.high_water_revision
+                )));
+            }
+            adopted.push(*revision);
+        }
+        let trimmed: Vec<u64> = adopted
+            .iter()
+            .rev()
+            .take(archive_files_for(self.archive_keep))
+            .rev()
+            .copied()
+            .collect();
+        let evicted: Vec<u64> = adopted
+            .iter()
+            .filter(|revision| !trimmed.contains(revision))
+            .copied()
+            .collect();
+        if trimmed == self.state.archive && evicted.is_empty() {
+            return Ok(());
+        }
+        if adopted != self.state.archive {
+            tracing::warn!(
+                recorded = self.state.archive.len(),
+                on_disk = adopted.len(),
+                "config authority archive list did not match the files on disk; adopting the \
+                 files, which are the ones that were signed",
+            );
+        }
+        let mut next = self.state.clone();
+        next.archive = trimmed;
+        // Persist the shrunk list before unlinking, so the only residue a
+        // crash here can leave is a file nothing names, which the next
+        // open adopts and evicts again.
+        self.save_state(&next)?;
+        self.state = next;
+        self.remove_archived(&evicted);
+        Ok(())
+    }
+
+    /// Every `<revision>.json` in the archive directory, ascending.
+    ///
+    /// Anything that is not a decimal revision followed by `.json` is
+    /// ignored rather than refused: the directory is on an operator's
+    /// disk, and a stray editor swap file is not a corruption signal.
+    fn scan_archive_dir(&self) -> Result<Vec<u64>, AuthorityStoreError> {
+        let dir = self.directory.join(REVISIONS_DIR).join(ARCHIVE_DIR);
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut revisions = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(stem) = name.strip_suffix(".json") else {
+                continue;
+            };
+            let Ok(revision) = stem.parse::<u64>() else {
+                continue;
+            };
+            // Only the canonical spelling. `007.json` and `+7.json`
+            // both parse as 7, and a backup tool that zero-pads would
+            // leave two files naming one revision: `reconcile_archive`
+            // would adopt `[7, 7]`, persist it, and the next open would
+            // refuse the state file this store wrote itself, because
+            // the archive list has to be strictly ascending.
+            if revision.to_string() != stem {
+                continue;
+            }
+            if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                continue;
+            }
+            revisions.push(revision);
+        }
+        revisions.sort_unstable();
+        // Belt and braces: the canonical-spelling filter above already
+        // makes a duplicate unreachable, and an invariant the next open
+        // refuses on is worth not depending on one filter alone.
+        revisions.dedup();
+        Ok(revisions)
+    }
+
+    /// Unlink archived bundles, logging rather than failing: an archive
+    /// file that outlives its eviction is an orphan the next open cleans
+    /// up, and failing a commit over it would be worse.
+    fn remove_archived(&self, revisions: &[u64]) {
+        for revision in revisions {
+            let path = archive_path(&self.directory, *revision);
+            if let Err(error) = std::fs::remove_file(&path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        error = %error,
+                        path = %path.display(),
+                        "could not evict an archived config revision; it will be evicted again \
+                         at the next open",
+                    );
+                }
+            }
+        }
     }
 
     /// Reconcile the state file's `current_revision` with the bundle that is
@@ -787,6 +1047,46 @@ impl AuthorityStore {
         self.previous.as_ref()
     }
 
+    /// Revisions the archive ring holds, ascending.
+    ///
+    /// This is what a refusal lists when a rollback names a revision the
+    /// ring no longer has, so an operator reading the error can pick a
+    /// target that exists rather than guessing again.
+    #[must_use]
+    pub fn archived_revisions(&self) -> &[u64] {
+        &self.state.archive
+    }
+
+    /// How many revisions this ring keeps.
+    #[must_use]
+    pub const fn archive_keep(&self) -> usize {
+        self.archive_keep
+    }
+
+    /// Read one archived signed bundle back off disk.
+    ///
+    /// `Ok(None)` means the ring does not hold that revision, which is
+    /// the ordinary answer for anything older than the ring bound. The
+    /// bundle comes back exactly as it was signed; republishing its
+    /// payload is [`crate::config_authority`]'s caller's job, and it goes
+    /// out under a **new** revision number because a subscriber's cursor
+    /// refuses a repeat of one it has already applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthorityStoreError::Corrupt`] when the file is there
+    /// but does not decode, and [`AuthorityStoreError::Io`] when it
+    /// cannot be read.
+    pub fn archived(
+        &self,
+        revision: u64,
+    ) -> Result<Option<SignedConfigBundle>, AuthorityStoreError> {
+        if !self.state.archive.contains(&revision) {
+            return Ok(None);
+        }
+        read_bundle(&archive_path(&self.directory, revision))
+    }
+
     /// Reserve the next revision number and persist the reservation.
     ///
     /// Call this only after the payload has passed validation: a reserved
@@ -836,6 +1136,37 @@ impl AuthorityStore {
         let encoded = signed
             .to_json()
             .map_err(|error| AuthorityStoreError::invalid(error.to_string()))?;
+        // The archive goes first, before either slot is rotated.
+        //
+        // This ordering is load bearing rather than tidy. The ring
+        // doubles this store's write volume, so a filling volume hits
+        // the archive write before anything else, and an `Err` here
+        // must leave the published state exactly as it was: the two
+        // slots untouched and `current_revision` unmoved. Writing the
+        // archive after `current.json` would return `Err` with
+        // `current.json` already holding the new revision and
+        // `save_state` never reached, and the next `open` would see a
+        // bundle inside `(current_revision, high_water]` and adopt it.
+        // A publish the operator was told had failed, with
+        // `"revision_consumed": false` on the wire, would become the
+        // fleet's configuration after a restart.
+        //
+        // Failing forward is the safe direction here. An archive file
+        // for a revision that never published is an orphan
+        // `reconcile_archive` adopts and the ring later evicts; the
+        // reverse is a served configuration nobody chose.
+        //
+        // Beside the two slots, never instead of them: the bytes are
+        // the same ones `current.json` takes below, so both slots hold
+        // exactly what they would have without the ring.
+        let mut next = self.state.clone();
+        if self.archive_keep > 0 {
+            write_atomically(
+                &archive_path(&self.directory, signed.bundle.revision),
+                &encoded,
+            )?;
+            next.archive.push(signed.bundle.revision);
+        }
         if let Some(current) = self.current.as_ref() {
             let body = current
                 .to_json()
@@ -843,12 +1174,19 @@ impl AuthorityStore {
             write_atomically(&bundle_path(&self.directory, PREVIOUS_BUNDLE_FILE), &body)?;
         }
         write_atomically(&bundle_path(&self.directory, CURRENT_BUNDLE_FILE), &encoded)?;
-        let mut next = self.state.clone();
+        let bound = archive_files_for(self.archive_keep);
+        let evicted: Vec<u64> = if next.archive.len() > bound {
+            next.archive.drain(..next.archive.len() - bound).collect()
+        } else {
+            Vec::new()
+        };
         next.current_revision = signed.bundle.revision;
         self.save_state(&next)?;
         self.previous = self.current.take();
         self.state = next;
         self.current = Some(signed);
+        // After the state that stopped naming them is durable.
+        self.remove_archived(&evicted);
         Ok(())
     }
 
@@ -1116,9 +1454,58 @@ impl AuthorityStore {
     }
 }
 
+/// Create the store's own directory tree, owner-only on unix.
+///
+/// `create_dir_all` alone takes `0777 & ~umask`, so a permissive umask
+/// leaves the store's directories world-readable. The files inside are
+/// owner-only (see [`write_atomically`]); the directories have to be
+/// too, or a listing still tells an unprivileged local account which
+/// revisions exist and when they published.
+///
+/// Exactly three directories are tightened, all of them this store's
+/// own: `store_dir`, `store_dir/revisions`, and the archive beneath it.
+/// Nothing above `store_dir` is touched. An operator who points
+/// `store_dir` at a path whose parents they share is choosing that;
+/// walking up and narrowing `/var/lib` on their behalf is not this
+/// function's call to make, and on a bad path would be catastrophic.
+///
+/// A `set_permissions` failure is not fatal. The directory exists and
+/// the store works; on a filesystem with no unix modes, or a path owned
+/// by someone else, refusing to open would trade a working authority
+/// for a hardening step the platform cannot provide.
+fn create_private_dirs(store_dir: &Path) -> Result<(), AuthorityStoreError> {
+    let revisions = store_dir.join(REVISIONS_DIR);
+    let archive = revisions.join(ARCHIVE_DIR);
+    std::fs::create_dir_all(&archive)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        for directory in [store_dir, revisions.as_path(), archive.as_path()] {
+            if let Err(error) =
+                std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+            {
+                tracing::debug!(
+                    error = %error,
+                    path = %directory.display(),
+                    "could not tighten a config authority store directory to owner-only",
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Path of one stored bundle file.
 fn bundle_path(directory: &Path, name: &str) -> PathBuf {
     directory.join(REVISIONS_DIR).join(name)
+}
+
+/// Path of one archived bundle file.
+fn archive_path(directory: &Path, revision: u64) -> PathBuf {
+    directory
+        .join(REVISIONS_DIR)
+        .join(ARCHIVE_DIR)
+        .join(format!("{revision}.json"))
 }
 
 /// Whether `value` is usable as a `subscriber_id`.
@@ -1205,6 +1592,22 @@ fn write_atomically(path: &Path, body: &[u8]) -> Result<(), AuthorityStoreError>
     let temporary = parent.join(format!(".{file_name}.{}.{nanos}.tmp", std::process::id()));
     let result = (|| {
         let mut file = std::fs::File::create(&temporary)?;
+        // Owner only, set on the temporary before any bytes are
+        // written, so the mode is never observably 0644 even for the
+        // instant between create and rename.
+        //
+        // Every file this writes is authority-private: the state file
+        // is the subscriber registry, and each bundle is a whole signed
+        // configuration for the fleet. The ring turned "two of those on
+        // disk" into "twenty one", which is what made the default umask
+        // worth stopping at rather than inheriting. The sibling bar in
+        // this crate is already higher: `ConfigBundleSigner`'s seed
+        // loader refuses a group- or world-readable signing key.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         file.write_all(body)?;
         file.sync_all()?;
         std::fs::rename(&temporary, path)
@@ -1798,5 +2201,367 @@ mod tests {
         let error = AuthorityStore::open(temp.path(), AUTHORITY)
             .expect_err("a state file pointing at nothing is corruption, not an empty store");
         assert!(matches!(error, AuthorityStoreError::Corrupt(_)), "{error}");
+    }
+
+    // --- The archive ring (WOR-2463) ---
+
+    /// Publish `count` revisions into a store opened with `keep`, and hand
+    /// back the directory so the files can be inspected.
+    fn published(temp: &Path, keep: usize, count: u64) -> AuthorityStore {
+        let mut store =
+            AuthorityStore::open_with_archive_keep(temp, AUTHORITY, keep).expect("open store");
+        for revision in 1..=count {
+            assert_eq!(store.reserve_revision().expect("reserve"), revision);
+            store
+                .commit(signed(revision, &format!("{YAML}# {revision}\n")))
+                .expect("commit");
+        }
+        store
+    }
+
+    #[test]
+    fn the_archive_keeps_the_newest_entries_up_to_its_bound() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let store = published(temp.path(), 3, 6);
+        assert_eq!(
+            store.archived_revisions(),
+            &[3, 4, 5, 6],
+            "archive_keep counts rollback targets, so a ring of three holds three earlier \
+             revisions plus the one being served",
+        );
+        for revision in [1u64, 2] {
+            assert!(
+                !archive_path(temp.path(), revision).exists(),
+                "revision {revision} was evicted, so its file is gone too",
+            );
+        }
+        for revision in [3u64, 4, 5, 6] {
+            assert!(
+                archive_path(temp.path(), revision).is_file(),
+                "revision {revision} is in the ring, so its file is on disk",
+            );
+        }
+
+        let fewer = tempfile::TempDir::new().expect("tempdir");
+        let shallow = published(fewer.path(), 10, 2);
+        assert_eq!(
+            shallow.archived_revisions(),
+            &[1, 2],
+            "fewer publications than the bound keep all of them",
+        );
+    }
+
+    /// The off-by-one this fixes: `archive_keep` counts revisions an
+    /// operator can roll *back to*, so the one being served must not
+    /// eat a slot. With the current revision counted, `archive_keep: 1`
+    /// advertised exactly one target, `current_revision` itself, whose
+    /// rollback is a no-op republish of what is already running. That
+    /// made `1` behave identically to `0` while the status page said
+    /// otherwise.
+    #[test]
+    fn a_ring_of_one_offers_one_real_rollback_target() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let store = published(temp.path(), 1, 4);
+        assert_eq!(store.archived_revisions(), &[3, 4]);
+        let current = store.current_revision();
+        let targets: Vec<u64> = store
+            .archived_revisions()
+            .iter()
+            .copied()
+            .filter(|revision| *revision != current)
+            .collect();
+        assert_eq!(
+            targets,
+            vec![3],
+            "one configured target means one revision that is not the one already serving",
+        );
+    }
+
+    #[test]
+    fn the_archive_leaves_the_current_and_previous_slots_byte_identical() {
+        // The whole design constraint of this ticket, asserted rather than
+        // asserted about: the same publications into a ring-less store and
+        // a ringed one leave the two durability-critical files identical.
+        let without = tempfile::TempDir::new().expect("tempdir");
+        let with = tempfile::TempDir::new().expect("tempdir");
+        drop(published(without.path(), 0, 4));
+        drop(published(with.path(), 3, 4));
+        for slot in [CURRENT_BUNDLE_FILE, PREVIOUS_BUNDLE_FILE] {
+            let plain = std::fs::read(bundle_path(without.path(), slot)).expect("read");
+            let ringed = std::fs::read(bundle_path(with.path(), slot)).expect("read");
+            assert_eq!(plain, ringed, "{slot} differs once the archive is on");
+        }
+        assert!(
+            !without
+                .path()
+                .join(REVISIONS_DIR)
+                .join(ARCHIVE_DIR)
+                .join("1.json")
+                .exists(),
+            "archive_keep of zero writes no ring at all",
+        );
+    }
+
+    #[test]
+    fn an_archived_revision_reads_back_the_bundle_that_was_signed() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let store = published(temp.path(), 5, 3);
+        let archived = store
+            .archived(2)
+            .expect("read archive")
+            .expect("revision 2 is in the ring");
+        assert_eq!(archived.bundle.revision, 2);
+        assert_eq!(archived.bundle.config_yaml, format!("{YAML}# 2\n"));
+        assert!(
+            store.archived(9).expect("read archive").is_none(),
+            "a revision the ring never held is absent, not an error",
+        );
+    }
+
+    #[test]
+    fn a_crash_between_the_archive_write_and_the_state_write_is_repaired_at_open() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        drop(published(temp.path(), 5, 2));
+        // Reserve 3 and write its archive file, then die before the state
+        // file names it. This is exactly the window `commit` leaves.
+        {
+            let mut store =
+                AuthorityStore::open_with_archive_keep(temp.path(), AUTHORITY, 5).expect("open");
+            assert_eq!(store.reserve_revision().expect("reserve"), 3);
+            let encoded = signed(3, YAML).to_json().expect("encode");
+            write_atomically(&archive_path(temp.path(), 3), &encoded).expect("write archive");
+        }
+        let repaired =
+            AuthorityStore::open_with_archive_keep(temp.path(), AUTHORITY, 5).expect("open");
+        assert_eq!(
+            repaired.archived_revisions(),
+            &[1, 2, 3],
+            "the orphaned archive file is adopted on the first open",
+        );
+        assert_eq!(
+            repaired.current_revision(),
+            2,
+            "adopting an archive file never moves what subscribers fetch",
+        );
+        // A second open is a no-op rather than a second repair.
+        let again =
+            AuthorityStore::open_with_archive_keep(temp.path(), AUTHORITY, 5).expect("open");
+        assert_eq!(again.archived_revisions(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn a_listed_archive_file_that_was_deleted_drops_out_of_the_list() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        drop(published(temp.path(), 5, 3));
+        std::fs::remove_file(archive_path(temp.path(), 2)).expect("remove");
+        let reopened =
+            AuthorityStore::open_with_archive_keep(temp.path(), AUTHORITY, 5).expect("open");
+        assert_eq!(
+            reopened.archived_revisions(),
+            &[1, 3],
+            "an archive is a convenience: a deleted file is dropped, not refused",
+        );
+    }
+
+    #[test]
+    fn lowering_the_ring_bound_trims_the_archive_at_the_next_open() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        drop(published(temp.path(), 10, 6));
+        let trimmed =
+            AuthorityStore::open_with_archive_keep(temp.path(), AUTHORITY, 2).expect("open");
+        assert_eq!(trimmed.archived_revisions(), &[4, 5, 6]);
+        assert!(
+            !archive_path(temp.path(), 3).exists(),
+            "trimming unlinks the files it stopped naming",
+        );
+    }
+
+    /// A zero-padded or sign-prefixed file name is not a revision.
+    ///
+    /// `007.json` parses as 7 exactly as `7.json` does, so a backup tool
+    /// that pads would have the ring adopt `[7, 7]`, persist it, and
+    /// then refuse the state file it wrote itself at the next open,
+    /// because the archive list has to be strictly ascending.
+    #[test]
+    fn an_archive_file_with_a_non_canonical_name_is_ignored() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        drop(published(temp.path(), 5, 2));
+        let encoded = signed(2, YAML).to_json().expect("encode");
+        for name in ["002.json", "+2.json"] {
+            let path = temp.path().join(REVISIONS_DIR).join(ARCHIVE_DIR).join(name);
+            write_atomically(&path, &encoded).expect("write");
+        }
+        let reopened =
+            AuthorityStore::open_with_archive_keep(temp.path(), AUTHORITY, 5).expect("open");
+        assert_eq!(
+            reopened.archived_revisions(),
+            &[1, 2],
+            "only the canonical spelling names a revision",
+        );
+        // And the state it just persisted opens again rather than
+        // failing the strictly-ascending check.
+        let again =
+            AuthorityStore::open_with_archive_keep(temp.path(), AUTHORITY, 5).expect("reopen");
+        assert_eq!(again.archived_revisions(), &[1, 2]);
+    }
+
+    /// Every file this store writes is authority-private: the state
+    /// file is the subscriber registry and each bundle is a whole
+    /// signed configuration for the fleet. The ring took that from two
+    /// files to twenty one at the default.
+    #[cfg(unix)]
+    #[test]
+    fn the_store_writes_owner_only_files_and_directories() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        drop(published(temp.path(), 5, 2));
+
+        let mode = |path: &Path| -> u32 {
+            std::fs::metadata(path)
+                .unwrap_or_else(|error| panic!("stat {}: {error}", path.display()))
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        for file in [
+            temp.path().join(STATE_FILE),
+            bundle_path(temp.path(), CURRENT_BUNDLE_FILE),
+            bundle_path(temp.path(), PREVIOUS_BUNDLE_FILE),
+            archive_path(temp.path(), 1),
+            archive_path(temp.path(), 2),
+        ] {
+            assert_eq!(mode(&file), 0o600, "{} is not owner-only", file.display());
+        }
+        for directory in [
+            temp.path().to_path_buf(),
+            temp.path().join(REVISIONS_DIR),
+            temp.path().join(REVISIONS_DIR).join(ARCHIVE_DIR),
+        ] {
+            assert_eq!(
+                mode(&directory),
+                0o700,
+                "{} is not owner-only",
+                directory.display(),
+            );
+        }
+    }
+
+    /// A Blocker from the WOR-2463 review: an archive write that fails
+    /// must not leave `current.json` ahead of the state file.
+    ///
+    /// The ring doubles this store's write volume, so a filling volume
+    /// hits the archive write first. With the archive written *after*
+    /// `current.json`, an ENOSPC or EACCES returned `Err` with the new
+    /// revision already in `current.json` and `save_state` never
+    /// reached, and the next `open` adopted it: a publish reported as
+    /// failed, with `"revision_consumed": false` on the wire, became
+    /// the fleet's configuration after a restart.
+    #[cfg(unix)]
+    #[test]
+    fn an_archive_write_that_fails_leaves_the_published_revision_exactly_where_it_was() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        drop(published(temp.path(), 5, 2));
+
+        let archive_dir = temp.path().join(REVISIONS_DIR).join(ARCHIVE_DIR);
+        let original = std::fs::metadata(&archive_dir)
+            .expect("archive dir")
+            .permissions();
+
+        // Opened *before* the directory is locked down: `open` creates
+        // the store's tree and tightens it to 0700, which would undo
+        // the mode this test is setting.
+        let mut store =
+            AuthorityStore::open_with_archive_keep(temp.path(), AUTHORITY, 5).expect("open");
+
+        // Read and traverse, but not write: the shape ENOSPC and EACCES
+        // both present to `write_atomically`.
+        std::fs::set_permissions(&archive_dir, std::fs::Permissions::from_mode(0o500))
+            .expect("make the archive unwritable");
+
+        // Root bypasses the mode bits, and so do some filesystems, so
+        // check that the directory really is unwritable before
+        // asserting on what happens when it is. Skipping is honest;
+        // asserting a refusal that never happened is not.
+        let probe = archive_dir.join(".writability-probe");
+        if std::fs::write(&probe, b"x").is_ok() {
+            let _ = std::fs::remove_file(&probe);
+            std::fs::set_permissions(&archive_dir, original).expect("restore permissions");
+            return;
+        }
+
+        assert_eq!(store.reserve_revision().expect("reserve"), 3);
+        let error = store
+            .commit(signed(3, &format!("{YAML}# 3\n")))
+            .expect_err("an unwritable archive must fail the commit");
+        assert!(matches!(error, AuthorityStoreError::Io(_)), "{error}");
+
+        std::fs::set_permissions(&archive_dir, original).expect("restore permissions");
+
+        // Nothing rotated. This is the assertion the ordering exists for.
+        assert_eq!(
+            store.current_revision(),
+            2,
+            "a failed commit must leave the served revision untouched",
+        );
+        assert_eq!(
+            read_bundle(&bundle_path(temp.path(), CURRENT_BUNDLE_FILE))
+                .expect("read current")
+                .expect("a current bundle")
+                .bundle
+                .revision,
+            2,
+            "current.json must still hold revision 2 on disk",
+        );
+        assert_eq!(
+            read_bundle(&bundle_path(temp.path(), PREVIOUS_BUNDLE_FILE))
+                .expect("read previous")
+                .expect("a previous bundle")
+                .bundle
+                .revision,
+            1,
+            "and previous.json must not have been rotated either",
+        );
+
+        // And a restart does not adopt the revision that never published.
+        let reopened =
+            AuthorityStore::open_with_archive_keep(temp.path(), AUTHORITY, 5).expect("reopen");
+        assert_eq!(
+            reopened.current_revision(),
+            2,
+            "the next open must not promote a revision the commit refused",
+        );
+        assert_eq!(reopened.archived_revisions(), &[1, 2]);
+    }
+
+    #[test]
+    fn an_archive_file_claiming_an_unreserved_revision_is_refused() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        drop(published(temp.path(), 5, 2));
+        let encoded = signed(9, YAML).to_json().expect("encode");
+        write_atomically(&archive_path(temp.path(), 9), &encoded).expect("write");
+        let error = AuthorityStore::open_with_archive_keep(temp.path(), AUTHORITY, 5)
+            .expect_err("an archive file past the high-water mark is not this store's");
+        assert!(error.to_string().contains("was ever reserved"), "{error}");
+    }
+
+    #[test]
+    fn the_archive_bound_is_clamped_and_its_worst_case_is_written_down() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let store = AuthorityStore::open_with_archive_keep(temp.path(), AUTHORITY, usize::MAX)
+            .expect("open");
+        assert_eq!(store.archive_keep(), MAX_ARCHIVE_KEEP);
+        // One archived file is bounded by the same envelope bound a
+        // subscriber applies on the wire, so the ring's worst case is that
+        // bound times the ceiling. Asserted so a change to either constant
+        // has to restate the disk cost rather than move it silently.
+        assert_eq!(
+            MAX_ARCHIVE_BYTES,
+            MAX_STORED_BUNDLE_BYTES * archive_files_for(MAX_ARCHIVE_KEEP) as u64,
+            "the ring holds one file more than archive_keep: the revision being served",
+        );
+        assert_eq!(MAX_ARCHIVE_BYTES, 1_699_282_944, "1.58 GiB at the ceiling");
     }
 }

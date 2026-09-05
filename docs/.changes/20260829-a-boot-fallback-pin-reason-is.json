@@ -1,0 +1,4 @@
+{
+  "type": "fixed",
+  "message": "A boot fallback pin reason is scrubbed of URL userinfo and of an inline literal echoed by the secret resolver, and flattened of control characters, before it reaches GET /admin/config/fallback or a Kubernetes condition. POST /admin/config-authority/rollback refuses a ?to_revision= query parameter instead of silently running the one-step rollback."
+}

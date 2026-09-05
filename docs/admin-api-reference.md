@@ -3110,9 +3110,17 @@ whether a feature is on.
   "active": true,
   "revision": 41,
   "digest": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a5",
+  "reason": "unknown action type: statik",
   "suspended": ["file_watcher", "sighup", "config_refresh_poller"]
 }
 ```
+
+`reason` is why the configured document did not boot, taken from the same
+compile failure the boot path logs and bounded to 512 characters. It is
+`null` on a node that is not pinned, and on a pin set by something other
+than a boot walk. A controller that stops reconciling over this pin reads it
+to say what it is waiting for; see
+[kubernetes.md](kubernetes.md#a-node-that-rescued-itself-is-not-drift).
 
 `suspended` names the reload paths that are inert while the pin is in place.
 Config-authority polling is deliberately absent from that list: a fleet-wide

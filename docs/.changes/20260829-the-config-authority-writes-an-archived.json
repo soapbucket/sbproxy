@@ -1,0 +1,4 @@
+{
+  "type": "fixed",
+  "message": "The config authority store writes owner-only files and directories. Every bundle it persists was created with the process umask, so a signed configuration document was world-readable to any local account on the authority host; files are now 0600 and the store's own directories 0700."
+}

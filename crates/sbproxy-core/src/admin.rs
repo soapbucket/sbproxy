@@ -3752,6 +3752,11 @@ fn handle_config_fallback_status() -> (u16, &'static str, String) {
         "active": crate::config_boot::on_fallback(),
         "revision": pinned.as_ref().map(|pin| pin.revision),
         "digest": pinned.as_ref().map(|pin| pin.digest.clone()),
+        // Why the configured document did not boot, bounded and taken
+        // from the same compile failure the boot path logs. A controller
+        // that stops reconciling over this pin says what it is waiting
+        // for rather than only that it is waiting (WOR-2467).
+        "reason": pinned.as_ref().and_then(|pin| pin.reason.clone()),
         // Named rather than implied: an operator reading this is
         // deciding whether their edit to the config file will do
         // anything, and the answer is no until they clear the pin.
@@ -13324,6 +13329,7 @@ origin_sources:
         crate::config_boot::mark_on_fallback(crate::config_boot::PinnedRevision {
             revision: 12,
             digest: "cafe".to_string(),
+            reason: None,
         });
         let (status, _, body) =
             handle_admin_request("GET", "/admin/config/fallback", &state, Some(&auth), None);
@@ -13369,6 +13375,7 @@ origin_sources:
         crate::config_boot::mark_on_fallback(crate::config_boot::PinnedRevision {
             revision: 7,
             digest: "rescued".to_string(),
+            reason: None,
         });
         let before = crate::reload::current_pipeline_full();
 
@@ -13403,6 +13410,7 @@ origin_sources:
         crate::config_boot::mark_on_fallback(crate::config_boot::PinnedRevision {
             revision: 7,
             digest: "rescued".to_string(),
+            reason: None,
         });
 
         let (status, _, body) = handle_config_fallback_clear(&state);

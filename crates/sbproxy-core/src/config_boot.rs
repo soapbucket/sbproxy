@@ -69,7 +69,7 @@ use sbproxy_config::{BootFallbackMode, ConfigHistoryConfig, RevisionStore};
 /// died, without parsing a log line.
 pub const EXIT_CONFIG_RING_EXHAUSTED: i32 = 78;
 
-/// The phrase [`BootWalkFailure::Exhausted`] renders, and the one
+/// The phrase the crate-private `BootWalkFailure::Exhausted` renders, and the one
 /// `crates/sbproxy/src/main.rs` matches on to choose
 /// [`EXIT_CONFIG_RING_EXHAUSTED`] over the plain `1`.
 ///
@@ -91,6 +91,51 @@ fn pinned() -> &'static Mutex<Option<PinnedRevision>> {
     PINNED.get_or_init(|| Mutex::new(None))
 }
 
+/// Longest rendered boot failure, in characters.
+///
+/// The reason is the compile failure the configured document produced.
+/// Bounding it keeps a pathological error (a parser that echoes a large
+/// document back) from turning a status route into a way to read the
+/// node's configuration a kilobyte at a time.
+///
+/// This used to bound only the copy the admin surface serves, on the
+/// stated grounds that the failure was available in full elsewhere.
+/// That is still true on the default mode, where the binary prints it
+/// on stderr rather than logging it, and false on the other one, where
+/// the boot path's own `error!` is scrubbed and bounded like every
+/// other rendering.
+///
+/// Which mode carries the untruncated text, exactly:
+///
+/// * `--config-fallback=off`, **the default**, never reaches this bound
+///   at all. `boot_document` returns the file's bytes untouched, the
+///   compile failure surfaces from `run_with_fallback`, and the binary
+///   prints it whole with `eprintln!("Fatal: {e:#}")`. Unscrubbed and
+///   unbounded, exactly as it was before any of this existed.
+/// * `--config-fallback=last-known-good` bounds every rendering,
+///   because they all go through [`scrub_boot_failure`]: the pin, the
+///   boot walk's `error!`, each ring candidate's reason, and the fatal
+///   error on the ring-empty and store-unavailable paths.
+///
+/// So the trade is scoped to the mode that asked for a fallback, and it
+/// is the right way round: that mode is the one whose failure text
+/// becomes a product surface, served on `GET /admin/config/fallback`
+/// and copied into a Kubernetes condition. A node on it that needs the
+/// untruncated failure runs `sbproxy validate` against the document,
+/// which prints the whole thing. A node on the default already has it
+/// on stderr.
+///
+/// Characters rather than bytes, deliberately, because the cut has to
+/// land on a character boundary and a byte budget would have to walk
+/// back to one anyway. What that costs is stated rather than left to be
+/// discovered: a reason made entirely of four-byte scalars is 2 KiB on
+/// the wire, so this is a bound on how much of a document can be echoed
+/// and not a bound on response size. The operator edge applies the same
+/// character bound again over what a pod returns
+/// (`sbproxy-k8s-operator`'s `bounded_reason`), and the pod response
+/// body itself is capped in bytes there.
+const MAX_FALLBACK_REASON_CHARS: usize = 512;
+
 /// The ring entry a fallback boot is serving.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PinnedRevision {
@@ -98,22 +143,190 @@ pub struct PinnedRevision {
     pub revision: u64,
     /// Its content digest.
     pub digest: String,
+    /// Why the configured document did not boot, credential-scrubbed,
+    /// flattened of control characters, and bounded to 512 characters.
+    ///
+    /// `None` on a pin an operator or a test set directly rather than
+    /// one a boot walk produced. A controller that owns this node's
+    /// configuration reads this to say *why* it stopped reconciling,
+    /// which is the difference between an alert somebody can act on and
+    /// one that only says something is wrong (WOR-2467).
+    pub reason: Option<String>,
+}
+
+/// What replaces a redacted value in a pin reason.
+const REDACTED: &str = "[REDACTED]";
+
+/// The phrase the secret resolver's refusal is built around.
+///
+/// `resolve_secret_reference` bails with
+/// `<field> references the secret '<value>' but no secret backend is
+/// configured` and echoes `<value>` verbatim, so an operator who inlined
+/// a literal credential where a `secret://` reference belongs has that
+/// credential in the compile error. That error reaches
+/// [`PinnedRevision::reason`], `GET /admin/config/fallback`, and from
+/// there a Kubernetes condition message any CR reader can see.
+const SECRET_ECHO_MARKER: &str = "references the secret '";
+
+impl PinnedRevision {
+    /// A pin carrying the failure that caused the fallback, scrubbed,
+    /// flattened of control characters, and truncated to 512 characters
+    /// on a character boundary.
+    ///
+    /// # Why this flattens control characters
+    ///
+    /// The reason is quoted from an operator-authored document, so it
+    /// can carry whatever that document contained: a newline, a `\r`,
+    /// or an ANSI escape introducer. It is served by
+    /// `GET /admin/config/fallback` and copied into a Kubernetes
+    /// condition, and both reach a terminal verbatim through `curl` and
+    /// `kubectl describe`. The operator applies the same flattening at
+    /// its own edge, because it cannot trust a pod; this one is here
+    /// because the node's own admin route is a consumer too and had no
+    /// such edge in front of it.
+    ///
+    /// # Why this scrubs
+    ///
+    /// The reason is a compile or resolve failure over an
+    /// operator-authored document, and two shapes in that document can
+    /// carry a credential into the message: a URL with userinfo, which
+    /// [`sbproxy_config::scrub_credentials`] strips, and an inline
+    /// literal where a secret reference belongs, which the resolver
+    /// echoes between single quotes. Both are removed here, at the one
+    /// place a boot failure becomes a value this process will serve.
+    ///
+    /// This is a second line rather than the first. The right place to
+    /// stop the second shape is the resolver's own message, and the
+    /// documented answer is not to inline a literal at all. What makes
+    /// scrubbing worth doing here anyway is the audience: before this,
+    /// the echo reached an admin-authenticated route; the operator
+    /// copies it into a CR condition that `kubectl get sbproxy` shows to
+    /// anyone with read access to the namespace.
+    #[must_use]
+    pub fn with_reason(revision: u64, digest: String, reason: &str) -> Self {
+        let bounded = scrub_boot_failure(reason);
+        Self {
+            revision,
+            digest,
+            reason: (!bounded.is_empty()).then_some(bounded),
+        }
+    }
+}
+
+/// Everything a boot failure needs before anything renders it, in one
+/// place: credential scrub, control-character flattening, trim, and the
+/// [`MAX_FALLBACK_REASON_CHARS`] bound.
+///
+/// # Every consumer, because a partial list is what went wrong here
+///
+/// This string is quoted from an operator-authored document, so it can
+/// carry an inlined credential the secret resolver echoes, an ANSI
+/// escape, or a whole document. It reaches four places:
+///
+/// * [`PinnedRevision::reason`], served by `GET /admin/config/fallback`
+///   and copied into a Kubernetes condition.
+/// * the boot walk's `error!` log line.
+/// * [`FailedCandidate::reason`], which
+///   [`BootWalkFailure::Exhausted`]'s `Display` renders into the error
+///   that reaches `eprintln!("Fatal: ...")`, and from there pod logs.
+/// * the primary document's own failure on the ring-empty and
+///   store-unavailable paths, same destination.
+///
+/// The first two were sanitized and the last two were not, while this
+/// function's own documentation claimed there were only two consumers.
+/// Naming all four is the point: the next one added has somewhere to
+/// look.
+///
+/// Not covered, deliberately: `--config-fallback=off` returns the raw
+/// error, exactly as it did before any of this existed. Widening that
+/// is a separate change to a path this one does not own.
+pub(crate) fn scrub_boot_failure(reason: &str) -> String {
+    let scrubbed = redact_secret_echo(&sbproxy_config::scrub_credentials(reason));
+    let flattened: String = scrubbed
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let trimmed = flattened.trim();
+    match trimmed.char_indices().nth(MAX_FALLBACK_REASON_CHARS) {
+        Some((cut, _)) => format!("{}...", &trimmed[..cut]),
+        None => trimmed.to_string(),
+    }
+}
+
+/// Replace the value the secret resolver echoes between single quotes.
+///
+/// Deliberately narrow: it rewrites only the text between the quotes
+/// that follow [`SECRET_ECHO_MARKER`], so the rest of the message, which
+/// is what makes the failure diagnosable, survives intact.
+fn redact_secret_echo(reason: &str) -> String {
+    let mut out = String::with_capacity(reason.len());
+    let mut rest = reason;
+    while let Some(index) = rest.find(SECRET_ECHO_MARKER) {
+        let (before, tail) = rest.split_at(index + SECRET_ECHO_MARKER.len());
+        out.push_str(before);
+        match tail.find('\'') {
+            Some(end) => {
+                out.push_str(REDACTED);
+                out.push('\'');
+                rest = &tail[end + 1..];
+            }
+            // An unterminated quote: drop the remainder rather than
+            // guess where the value ends.
+            None => {
+                out.push_str(REDACTED);
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// One candidate the walk tried and why it did not boot.
+///
+/// Crate-private, with [`BootWalkFailure`] and [`walk_for_bootable`],
+/// because `server::lifecycle` is the only consumer and always has
+/// been. They were `pub` by habit, which put them in the pub-item
+/// ratchet's unreferenced bucket, where the count came to rest on
+/// whether a comment in another file happened to spell the name. A
+/// visibility the compiler enforces is a better floor than a sentence.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FailedCandidate {
+pub(crate) struct FailedCandidate {
     /// Ring revision tried.
     pub revision: u64,
     /// Its content digest.
     pub digest: String,
     /// Why it did not boot, or why it was skipped.
+    ///
+    /// Built through the crate-private `FailedCandidate::new`, which
+    /// applies the same `scrub_boot_failure` the pin gets. Every one of
+    /// these is rendered into the fatal error by
+    /// [`BootWalkFailure::Exhausted`]'s `Display`, so an unsanitized
+    /// one reaches pod logs multiplied by the number of candidates
+    /// tried.
     pub reason: String,
+}
+
+impl FailedCandidate {
+    /// A candidate failure with its reason sanitized and bounded.
+    fn new(revision: u64, digest: String, reason: &str) -> Self {
+        Self {
+            revision,
+            digest,
+            reason: scrub_boot_failure(reason),
+        }
+    }
 }
 
 /// Why a fallback boot could not produce a document.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BootWalkFailure {
+pub(crate) enum BootWalkFailure {
     /// The ring held no candidate at all. A first boot: the node exits
     /// exactly the way `fallback: off` does, and says the ring was empty
     /// rather than pretending a fallback was attempted.
@@ -268,7 +481,7 @@ pub fn history_config_from_broken_document(yaml: &str) -> ConfigHistoryConfig {
 ///
 /// Returns [`BootWalkFailure`] when the ring cannot be opened, holds no
 /// candidate, or holds only candidates that do not boot.
-pub fn walk_for_bootable(
+pub(crate) fn walk_for_bootable(
     history: &ConfigHistoryConfig,
     max_attempts: u32,
     mut compiles: impl FnMut(&str) -> Result<(), String>,
@@ -296,15 +509,15 @@ pub fn walk_for_bootable(
             // Already spent its budget on an earlier boot that died
             // before it could clear the counter.
             retire(&mut store, candidate.revision);
-            tried.push(FailedCandidate {
-                revision: candidate.revision,
-                digest: candidate.digest.clone(),
-                reason: format!(
+            tried.push(FailedCandidate::new(
+                candidate.revision,
+                candidate.digest.clone(),
+                &format!(
                     "already failed {} boot attempt(s), at or past the max_attempts of \
                      {max_attempts}; retired",
                     candidate.boot_attempts
                 ),
-            });
+            ));
             continue;
         }
         let attempts = match store.begin_boot_attempt(candidate.revision) {
@@ -313,11 +526,11 @@ pub fn walk_for_bootable(
                 // A counter that cannot be persisted would let this walk
                 // retry the same dead entry forever, so the candidate is
                 // skipped rather than tried.
-                tried.push(FailedCandidate {
-                    revision: candidate.revision,
-                    digest: candidate.digest.clone(),
-                    reason: format!("its boot attempt counter could not be persisted: {error}"),
-                });
+                tried.push(FailedCandidate::new(
+                    candidate.revision,
+                    candidate.digest.clone(),
+                    &format!("its boot attempt counter could not be persisted: {error}"),
+                ));
                 continue;
             }
         };
@@ -325,20 +538,20 @@ pub fn walk_for_bootable(
             Ok(bytes) => match String::from_utf8(bytes) {
                 Ok(yaml) => yaml,
                 Err(error) => {
-                    tried.push(FailedCandidate {
-                        revision: candidate.revision,
-                        digest: candidate.digest.clone(),
-                        reason: format!("its stored document is not UTF-8: {error}"),
-                    });
+                    tried.push(FailedCandidate::new(
+                        candidate.revision,
+                        candidate.digest.clone(),
+                        &format!("its stored document is not UTF-8: {error}"),
+                    ));
                     continue;
                 }
             },
             Err(error) => {
-                tried.push(FailedCandidate {
-                    revision: candidate.revision,
-                    digest: candidate.digest.clone(),
-                    reason: format!("its stored document could not be read: {error}"),
-                });
+                tried.push(FailedCandidate::new(
+                    candidate.revision,
+                    candidate.digest.clone(),
+                    &format!("its stored document could not be read: {error}"),
+                ));
                 continue;
             }
         };
@@ -349,18 +562,23 @@ pub fn walk_for_bootable(
                     pinned: PinnedRevision {
                         revision: candidate.revision,
                         digest: candidate.digest,
+                        // The walk knows which candidate booted, not why
+                        // the configured document did not. The boot path
+                        // has that error and stamps it on with
+                        // `PinnedRevision::with_reason`.
+                        reason: None,
                     },
-                })
+                });
             }
             Err(reason) => {
                 if attempts >= max_attempts {
                     retire(&mut store, candidate.revision);
                 }
-                tried.push(FailedCandidate {
-                    revision: candidate.revision,
-                    digest: candidate.digest.clone(),
-                    reason: format!("attempt {attempts} of {max_attempts}: {reason}"),
-                });
+                tried.push(FailedCandidate::new(
+                    candidate.revision,
+                    candidate.digest.clone(),
+                    &format!("attempt {attempts} of {max_attempts}: {reason}"),
+                ));
             }
         }
     }
@@ -811,10 +1029,16 @@ mod tests {
             "nothing is suspended before a fallback boot",
         );
 
-        mark_on_fallback(PinnedRevision {
-            revision: 4,
-            digest: "abc".to_string(),
-        });
+        mark_on_fallback(PinnedRevision::with_reason(
+            4,
+            "abc".to_string(),
+            "unknown action type: statik",
+        ));
+        assert_eq!(
+            pinned_revision().and_then(|pin| pin.reason).as_deref(),
+            Some("unknown action type: statik"),
+            "the pin carries why the configured document failed",
+        );
         assert!(on_fallback());
         assert!(reload_suspended("file_watcher"));
         assert!(reload_suspended("config_refresh_poller"));
@@ -857,5 +1081,148 @@ mod tests {
         let history = history_config_from_broken_document("\t: [unbalanced\n");
         assert_eq!(history.dir, "/var/lib/sbproxy/config-history");
         assert!(history.enabled);
+    }
+
+    /// The reason is a compile failure over an operator-authored
+    /// document, and it is served on an admin route and copied into a
+    /// Kubernetes condition any CR reader can see.
+    #[test]
+    fn a_fallback_reason_carries_no_credential_into_the_admin_surface() {
+        let inline = PinnedRevision::with_reason(
+            1,
+            "digest".to_string(),
+            "source.credential references the secret 'ghp_exampleliteraltoken' but no secret \
+             backend is configured to resolve it; declare one under proxy.secrets.backends",
+        )
+        .reason
+        .expect("a reason");
+        assert!(
+            !inline.contains("ghp_exampleliteraltoken"),
+            "an inlined literal must not reach the admin surface: {inline}",
+        );
+        assert!(inline.contains("[REDACTED]"), "{inline}");
+        assert!(
+            inline.contains("proxy.secrets.backends"),
+            "and the rest of the message, which is what makes it diagnosable, survives: \
+             {inline}",
+        );
+
+        let url = PinnedRevision::with_reason(
+            1,
+            "digest".to_string(),
+            "source: clone of https://user:ghp_exampleurltoken@git.example.com/acme/cfg.git \
+             failed",
+        )
+        .reason
+        .expect("a reason");
+        assert!(
+            !url.contains("ghp_exampleurltoken") && !url.contains("user:"),
+            "userinfo in a URL must not reach it either: {url}",
+        );
+        assert!(url.contains("git.example.com"), "{url}");
+
+        // An unterminated quote drops the remainder rather than guessing.
+        let ragged = PinnedRevision::with_reason(
+            1,
+            "digest".to_string(),
+            "source.credential references the secret 'ghp_exampleunterminated",
+        )
+        .reason
+        .expect("a reason");
+        assert!(!ragged.contains("ghp_exampleunterminated"), "{ragged}");
+
+        // An ordinary compile failure is untouched.
+        let ordinary = "unknown action type: statik";
+        assert_eq!(
+            PinnedRevision::with_reason(1, "digest".to_string(), ordinary).reason,
+            Some(ordinary.to_string()),
+        );
+    }
+
+    #[test]
+    fn a_fallback_reason_is_bounded_so_a_status_route_cannot_echo_a_document_back() {
+        let long = "x".repeat(MAX_FALLBACK_REASON_CHARS * 3);
+        let pin = PinnedRevision::with_reason(1, "digest".to_string(), &long);
+        let reason = pin.reason.expect("a reason");
+        assert_eq!(
+            reason.chars().count(),
+            MAX_FALLBACK_REASON_CHARS + 3,
+            "bounded, with an ellipsis saying it was cut",
+        );
+        assert!(reason.ends_with("..."), "{reason}");
+
+        // A multi-byte character on the boundary is cut on a character
+        // boundary rather than panicking mid-codepoint.
+        let wide = "\u{00e9}".repeat(MAX_FALLBACK_REASON_CHARS * 2);
+        let cut = PinnedRevision::with_reason(1, "digest".to_string(), &wide)
+            .reason
+            .expect("a reason");
+        assert_eq!(cut.chars().count(), MAX_FALLBACK_REASON_CHARS + 3);
+
+        assert_eq!(
+            PinnedRevision::with_reason(1, "digest".to_string(), "   ").reason,
+            None,
+            "an empty reason is absent rather than an empty string",
+        );
+    }
+
+    /// The same string, on the path that renders every candidate.
+    ///
+    /// `BootWalkFailure::Exhausted`'s `Display` writes each candidate's
+    /// reason into the error that reaches `eprintln!("Fatal: ...")`, so
+    /// an unsanitized one is multiplied by the number of candidates
+    /// tried. The pin was sanitized and this was not.
+    #[test]
+    fn a_failed_candidate_reason_is_sanitized_like_the_pin() {
+        let hostile = format!(
+            "source.credential references the secret 'ghp_realtoken' at \u{1b}[2J{}",
+            "x".repeat(MAX_FALLBACK_REASON_CHARS * 2),
+        );
+        let candidate = FailedCandidate::new(4, "digest".to_string(), &hostile);
+
+        assert!(
+            !candidate.reason.contains("ghp_realtoken"),
+            "the resolver's echo must not reach a fatal log: {}",
+            candidate.reason,
+        );
+        assert!(
+            !candidate.reason.chars().any(char::is_control),
+            "no control character survives: {:?}",
+            candidate.reason,
+        );
+        assert_eq!(
+            candidate.reason.chars().count(),
+            MAX_FALLBACK_REASON_CHARS + 3,
+            "bounded like the pin, with an ellipsis saying it was cut",
+        );
+
+        // And the whole rendered failure carries the bounded form, so a
+        // ring of candidates cannot multiply an unbounded string.
+        let rendered = BootWalkFailure::Exhausted(vec![candidate]).to_string();
+        assert!(!rendered.contains("ghp_realtoken"), "{rendered}");
+        assert!(rendered.contains("revision 4"), "{rendered}");
+    }
+
+    #[test]
+    fn a_fallback_reason_carries_no_control_character_to_a_terminal() {
+        // The reason is quoted from an operator-authored document and
+        // is served raw by the admin route, so an escape introducer in
+        // that document would reach whatever renders the answer.
+        let hostile = "unknown action type:\u{1b}[2Jstatik\r\nsecond line\u{0}";
+        let reason = PinnedRevision::with_reason(7, "digest".to_string(), hostile)
+            .reason
+            .expect("a reason");
+        assert!(
+            !reason.chars().any(char::is_control),
+            "no control character survives: {reason:?}"
+        );
+        assert!(
+            reason.starts_with("unknown action type:"),
+            "the diagnosable part survives: {reason:?}"
+        );
+        assert!(
+            reason.contains("statik") && reason.contains("second line"),
+            "flattened rather than truncated at the first control character: {reason:?}"
+        );
     }
 }

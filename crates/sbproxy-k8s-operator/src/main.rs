@@ -448,6 +448,7 @@ async fn reconcile_one(sbproxy: Arc<SBProxy>, ctx: Arc<Ctx>) -> Result<Action, R
     let result_label = match &outcome {
         Ok(_) => "ok",
         Err(ReconcileError::Fenced) => "fenced",
+        Err(ReconcileError::SuspendedOnFallback { .. }) => "suspended_on_fallback",
         Err(ReconcileError::MissingNamespace) | Err(ReconcileError::MissingName) => "crd_invalid",
         Err(ReconcileError::ConfigFetch { source, .. }) => match source {
             kube::Error::Api(e) if e.code == 409 => "conflict",
@@ -505,6 +506,92 @@ async fn reconcile_one_inner(
             serde_json::json!({ "status": { "lastError": msg } }),
         )
         .await;
+        sbproxy_observe::metrics::record_operator_config_delivery("refused_invalid_config");
+        return Ok(Action::requeue(Duration::from_secs(60)));
+    }
+
+    // --- Refuse node-side auto-revert while this operator owns the config ---
+    // A node that reverts its own configuration loses the race with the
+    // next reconcile, which reapplies the ConfigMap it just reverted away
+    // from. Accepting the key and losing that race, or refusing it
+    // quietly, are both worse than saying so at validation time
+    // (WOR-2467).
+    // Recorded now and acted on *after* the condition block below. This
+    // refusal is permanent until somebody edits the config, so returning
+    // here left whatever `ConfigFallbackActive` an earlier pass wrote
+    // frozen on the CR for the whole time: a node that had since cleared
+    // its pin still read `True`, forever, with nothing to move it.
+    let auto_revert_refusal =
+        reconcile::check_auto_revert_under_operator_ownership(&cfg.spec.config).err();
+    if let Some(msg) = auto_revert_refusal.as_deref() {
+        tracing::warn!(
+            name = %name,
+            namespace = %ns,
+            error = %msg,
+            "referenced SBProxyConfig arms node-side auto_revert under operator ownership; not \
+             rolling out"
+        );
+        patch_status(
+            &ctx,
+            &ns,
+            &name,
+            serde_json::json!({ "status": { "lastError": msg } }),
+        )
+        .await;
+    }
+
+    // --- Suspend config delivery while a pod is on its boot fallback ---
+    // Boot fallback is local recovery, not drift. A node that could not
+    // compile its configuration and came up on its last good one has not
+    // diverged on purpose, and reapplying the document it could not
+    // compile restarts it into the same crash loop. So the pin suspends
+    // config delivery for this SBProxy and the condition says so; the
+    // resume is `DELETE /admin/config/fallback` on the node, and the next
+    // loop picks it up (WOR-2467).
+    //
+    // Behind the write gate: the probe sends this operator's admin
+    // credential to each pod, and a replica that can no longer prove it
+    // holds the lease has no business making that call. Its successor
+    // will.
+    require_write_gate(&ctx, &ns, &name)?;
+    let fallbacks = read_fallback_reports(&ctx.client, &sbproxy, &ns).await;
+    let suspension = reconcile::fallback_suspension(&fallbacks).cloned();
+    let previous_condition = reconcile::current_fallback_condition(&sbproxy).cloned();
+    let condition = reconcile::fallback_condition(
+        &fallbacks,
+        sbproxy.metadata.generation,
+        &now_rfc3339(),
+        previous_condition.as_ref(),
+    );
+    // Written only when it actually changed. An identical patch still
+    // bumps `resourceVersion`, which this operator's own watch reads as
+    // a change, so an unconditional write made every SBProxy re-enqueue
+    // itself forever, and each self-triggered pass re-ran the
+    // credentialed pod fan-out and a full server-side apply.
+    if let Some(patch) =
+        reconcile::fallback_condition_patch(&condition, previous_condition.as_ref())
+    {
+        patch_status(&ctx, &ns, &name, patch).await;
+    }
+    if let Some(pinned) = suspension.as_ref() {
+        tracing::warn!(
+            name = %name,
+            namespace = %ns,
+            pod = %pinned.pod,
+            revision = pinned.report.revision,
+            condition = reconcile::FALLBACK_CONDITION_TYPE,
+            "SBProxy has a pod on a fallback configuration; suspending config delivery until \
+             the pin is cleared"
+        );
+    }
+
+    // Now the refusal acts, with the condition already refreshed above.
+    // Counted, because the pass itself completes cleanly and
+    // `sbproxy_operator_reconcile_total{result}` reads `ok` for it, so
+    // without this series an SBProxy whose image bumps are all being
+    // dropped looks healthy in operator metrics.
+    if auto_revert_refusal.is_some() {
+        sbproxy_observe::metrics::record_operator_config_delivery("refused_auto_revert");
         return Ok(Action::requeue(Duration::from_secs(60)));
     }
 
@@ -529,6 +616,7 @@ async fn reconcile_one_inner(
             serde_json::json!({ "status": { "lastError": msg } }),
         )
         .await;
+        sbproxy_observe::metrics::record_operator_config_delivery("refused_acme");
         return Ok(Action::requeue(Duration::from_secs(60)));
     }
 
@@ -556,6 +644,7 @@ async fn reconcile_one_inner(
                     serde_json::json!({ "status": { "lastError": msg } }),
                 )
                 .await;
+                sbproxy_observe::metrics::record_operator_config_delivery("refused_invalid_config");
                 return Ok(Action::requeue(Duration::from_secs(60)));
             }
         }
@@ -572,26 +661,14 @@ async fn reconcile_one_inner(
     // config.
     patch_status(&ctx, &ns, &name, reconcile::observed_status_patch(&hash)).await;
 
-    // --- Apply ConfigMap + Service unconditionally ---
+    // --- Apply the Service, which carries no configuration ---
+    // Ahead of the suspension return on purpose. A Service is a name
+    // and a port selector; recreating a deleted one cannot put a
+    // document on a pod, and leaving it unreconciled while a single pod
+    // sits pinned would turn a config incident into an outage.
     require_write_gate(&ctx, &ns, &name)?;
     let pp = PatchParams::apply(FIELD_MANAGER).force();
-    let desired_cm = reconcile::desired_configmap_with_body(&sbproxy, &body);
     let desired_svc = reconcile::desired_service(&sbproxy);
-
-    let cm_api: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), &ns);
-    cm_api
-        .patch(
-            desired_cm
-                .metadata
-                .name
-                .as_deref()
-                .ok_or(ReconcileError::MissingName)?,
-            &pp,
-            &Patch::Apply(&desired_cm),
-        )
-        .await
-        .map_err(ReconcileError::Apply)?;
-
     let svc_api: Api<Service> = Api::namespaced(ctx.client.clone(), &ns);
     svc_api
         .patch(
@@ -606,10 +683,46 @@ async fn reconcile_one_inner(
         .await
         .map_err(ReconcileError::Apply)?;
 
-    let action = if clustered {
-        reconcile_clustered_workload(&ctx, &sbproxy, &ns, &name, &hash, &pp).await?
+    // --- Everything below this line puts configuration on a pod ---
+    //
+    // The ConfigMap is the document itself. The workload is how a pod
+    // comes to read it: applying it rolls pods, and a rolled pod
+    // re-reads the ConfigMap this operator is not allowed to update, so
+    // it restarts into the very document that pinned it. So an image
+    // bump and a replica change wait too, and `docs/kubernetes.md` says
+    // so rather than promising only the ConfigMap is held.
+    if suspension.is_some() {
+        sbproxy_observe::metrics::record_operator_config_delivery("suspended_on_fallback");
+        // The ordinary cadence rather than a back-off: the resume is an
+        // operator clearing the pin on the node, and the condition has
+        // to follow within one loop interval.
+        return Ok(Action::requeue(Duration::from_secs(30)));
+    }
+    require_config_push_allowed(suspension.as_ref(), &ns, &name)?;
+    let desired_cm = reconcile::desired_configmap_with_body(&sbproxy, &body);
+    let cm_api: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), &ns);
+    cm_api
+        .patch(
+            desired_cm
+                .metadata
+                .name
+                .as_deref()
+                .ok_or(ReconcileError::MissingName)?,
+            &pp,
+            &Patch::Apply(&desired_cm),
+        )
+        .await
+        .map_err(ReconcileError::Apply)?;
+
+    // Bound rather than inlined so both calls stay on one line: the
+    // write-order guard in this file's tests greps for
+    // `reconcile_deployment_workload(&ctx,` and would stop seeing a
+    // wrapped call.
+    let pinned = suspension.as_ref();
+    let pass = if clustered {
+        reconcile_clustered_workload(&ctx, &sbproxy, &ns, &name, &hash, &pp, pinned).await?
     } else {
-        reconcile_deployment_workload(&ctx, &sbproxy, &ns, &name, &hash, &pp).await?
+        reconcile_deployment_workload(&ctx, &sbproxy, &ns, &name, &hash, &pp, pinned).await?
     };
 
     // Everything landed. Only now is `configHash` the hash the pods are
@@ -618,8 +731,18 @@ async fn reconcile_one_inner(
     // `?`s above, so any failed apply leaves the previous values in place and
     // `observedConfigHash` ahead of `configHash` shows the rollout is stuck.
     patch_status(&ctx, &ns, &name, reconcile::rolled_out_status_patch(&hash)).await;
+    // One count per pass, here and nowhere else. This line has counted
+    // every delivery since the metric was added, including the ones the
+    // hot-reload arms return early from, because those returns unwind
+    // into the `?` above rather than out of this function. Recording a
+    // second time down there made a clean hot reload count twice.
+    sbproxy_observe::metrics::record_operator_config_delivery(if pass.unowned_skipped == 0 {
+        "delivered"
+    } else {
+        "delivered_unowned_skipped"
+    });
 
-    Ok(action)
+    Ok(pass.action)
 }
 
 /// Non-clustered workload path: the original Deployment flow, plus
@@ -634,10 +757,12 @@ async fn reconcile_deployment_workload(
     name: &str,
     hash: &str,
     pp: &PatchParams,
-) -> Result<Action, ReconcileError> {
+    suspension: Option<&reconcile::PodFallback>,
+) -> Result<WorkloadPass, ReconcileError> {
     // The deletes below are the most destructive writes in the operator, so
     // the fence is re-checked here rather than trusted from the caller.
     require_write_gate(ctx, ns, name)?;
+    require_config_push_allowed(suspension, ns, name)?;
 
     // --- GC clustered children on the clustering-off transition ---
     let sts_api: Api<StatefulSet> = Api::namespaced(ctx.client.clone(), ns);
@@ -705,22 +830,37 @@ async fn reconcile_deployment_workload(
     );
 
     // Re-checked after the reads above: a hot reload fans an authenticated
-    // POST out to every proxy pod, and the apply below rolls them.
+    // POST out to every proxy pod, and the apply below rolls them. Both
+    // put configuration on a node, so the fallback pin gates them too.
     require_write_gate(ctx, ns, name)?;
+    require_config_push_allowed(suspension, ns, name)?;
 
     if hot_reload_eligible {
-        // Best-effort hot-reload across every running proxy pod.
-        // If any pod fails, we fall through to the rollout-restart
-        // path so the cluster is never left in a half-reloaded
-        // state.
+        // Best-effort hot-reload across every proxy pod this operator's
+        // workload created. If any of them fails, we fall through to the
+        // rollout-restart path so the workload is never left in a
+        // half-reloaded state.
+        //
+        // A pod carrying the instance label that this workload did not
+        // create is skipped rather than failed, and that is deliberate.
+        // Erroring would fall through to the rollout restart, which
+        // patches the workload's own pod template and therefore cannot
+        // reach the very pod that was skipped; it would restart every
+        // healthy owned pod on every config change, forever, and leave
+        // the unowned one exactly as stale as before. So the owned fleet
+        // is what `Ok` claims, the skipped pods are counted rather than
+        // silently absorbed, and an operator who orphaned pods on
+        // purpose owns them from that point on.
         match try_hot_reload(&ctx.client, sbproxy, ns).await {
-            Ok(()) => {
+            Ok(outcome) => {
                 tracing::info!(
                     name = %name,
                     namespace = %ns,
                     config_revision = %hash,
-                    "hot-reloaded all proxy pods via /admin/reload"
+                    unowned_skipped = outcome.unowned_skipped,
+                    "hot-reloaded every proxy pod this workload created via /admin/reload"
                 );
+
                 // Skip the Deployment patch entirely: the pod template's
                 // config-hash annotation is the rolling-restart trigger, so
                 // advancing it here would restart the pods a reload just
@@ -729,7 +869,10 @@ async fn reconcile_deployment_workload(
                 // what gate 4 above reads on the next pass. The ConfigMap is
                 // already up to date for any pod that restarts for unrelated
                 // reasons.
-                return Ok(Action::requeue(Duration::from_secs(300)));
+                return Ok(WorkloadPass {
+                    action: Action::requeue(Duration::from_secs(300)),
+                    unowned_skipped: outcome.unowned_skipped,
+                });
             }
             // `hot_reload_error`, not `e`: `HotReloadError::Request`
             // wraps a `reqwest::Error`, whose Display ends with the pod
@@ -753,7 +896,10 @@ async fn reconcile_deployment_workload(
         .map_err(ReconcileError::Apply)?;
 
     // Requeue periodically as a belt-and-braces against missed watch events.
-    Ok(Action::requeue(Duration::from_secs(300)))
+    Ok(WorkloadPass {
+        action: Action::requeue(Duration::from_secs(300)),
+        unowned_skipped: 0,
+    })
 }
 
 /// Clustered workload path: shared-key Secret, headless Service, and
@@ -770,8 +916,10 @@ async fn reconcile_clustered_workload(
     name: &str,
     hash: &str,
     pp: &PatchParams,
-) -> Result<Action, ReconcileError> {
+    suspension: Option<&reconcile::PodFallback>,
+) -> Result<WorkloadPass, ReconcileError> {
     require_write_gate(ctx, ns, name)?;
+    require_config_push_allowed(suspension, ns, name)?;
 
     // --- Ensure the shared cluster key exists ---
     // Create-if-absent, never overwrite: existing key material is what
@@ -872,17 +1020,24 @@ async fn reconcile_clustered_workload(
 
     // Same re-check as the Deployment path, for the same reason.
     require_write_gate(ctx, ns, name)?;
+    require_config_push_allowed(suspension, ns, name)?;
 
     if hot_reload_eligible {
         match try_hot_reload(&ctx.client, sbproxy, ns).await {
-            Ok(()) => {
+            Ok(outcome) => {
                 tracing::info!(
                     name = %name,
                     namespace = %ns,
                     config_revision = %hash,
-                    "hot-reloaded all clustered proxy pods via /admin/reload"
+                    unowned_skipped = outcome.unowned_skipped,
+                    "hot-reloaded every clustered proxy pod this workload created via \
+                     /admin/reload"
                 );
-                return Ok(Action::requeue(Duration::from_secs(300)));
+
+                return Ok(WorkloadPass {
+                    action: Action::requeue(Duration::from_secs(300)),
+                    unowned_skipped: outcome.unowned_skipped,
+                });
             }
             // `hot_reload_error`, not `e`: `HotReloadError::Request`
             // wraps a `reqwest::Error`, whose Display ends with the pod
@@ -904,7 +1059,19 @@ async fn reconcile_clustered_workload(
         .await
         .map_err(ReconcileError::Apply)?;
 
-    Ok(Action::requeue(Duration::from_secs(300)))
+    Ok(WorkloadPass {
+        action: Action::requeue(Duration::from_secs(300)),
+        unowned_skipped: 0,
+    })
+}
+
+/// The current time as an RFC 3339 timestamp, for a status condition.
+///
+/// Seconds resolution and a `Z` suffix, which is how Kubernetes renders
+/// `metav1.Time` in a condition. `chrono` is already a dependency here
+/// for the Lease timestamps.
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 /// Collapse a delete result so a concurrent deletion (404) is not an
@@ -982,14 +1149,19 @@ async fn patch_status(ctx: &Ctx, ns: &str, name: &str, body: serde_json::Value) 
 /// Best-effort `POST /admin/reload` against every running proxy
 /// pod for the given `SBProxy`.
 ///
-/// Returns `Ok(())` only when every pod returned 200. Any pod that
-/// returns a non-200 (or fails to dial) propagates as `Err`, which
-/// triggers the rollout-restart fallback in `reconcile_one`.
+/// Returns `Ok` only when every pod this operator's workload created
+/// returned 200. Any pod that returns a non-200 (or fails to dial)
+/// propagates as `Err`, which triggers the rollout-restart fallback in
+/// `reconcile_one`.
+///
+/// The `Ok` value counts the pods that carried this SBProxy's instance
+/// label and were skipped because its workload did not create them, so
+/// the caller can say which kind of success this was.
 async fn try_hot_reload(
     client: &Client,
     sbproxy: &SBProxy,
     namespace: &str,
-) -> Result<(), HotReloadError> {
+) -> Result<HotReloadOutcome, HotReloadError> {
     let secret_ref = sbproxy
         .spec
         .admin_auth_secret_ref
@@ -998,8 +1170,34 @@ async fn try_hot_reload(
 
     let auth_header = read_admin_auth(client, namespace, secret_ref).await?;
 
-    // Find every Pod owned by the proxy Deployment via the standard
-    // selector (`app.kubernetes.io/instance=<sbproxy-name>`).
+    // Select by the standard instance label, then keep only the pods
+    // this operator's own workload created.
+    //
+    // The label alone is a value anyone with `pods/create` in the
+    // namespace can type, and this loop posts the admin Basic credential
+    // in cleartext to every pod it keeps. That is the same disclosure
+    // the fallback probe was fixed for; this is the second path carrying
+    // it, and a fix on one of two paths is not the fix the release note
+    // describes.
+    //
+    // What over-filtering costs depends on how much of the list it
+    // takes, and the two cases are not the same.
+    //
+    // Filter everything and this returns `NoPodsFound`; every
+    // `HotReloadError` falls back to a rollout restart, which reloads
+    // by replacing the pods, so the cost is a restart.
+    //
+    // Filter some and this returns `Ok`, the caller skips the workload
+    // patch on purpose, and the pods that were filtered keep the old
+    // configuration. That is deliberate rather than overlooked: a pod
+    // that fails this check was not created by the workload whose pod
+    // template a rollout would patch, so restarting cannot reach it,
+    // and erroring would restart every healthy owned pod on every
+    // config change while leaving that one exactly as stale. The count
+    // travels back on `HotReloadOutcome` so the pass is recorded as
+    // `delivered_unowned_skipped` rather than passing silently. The
+    // caller's comment at the `Ok` arm carries the same reasoning; if
+    // you change one, change both.
     let pods_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
     let sbp_name = sbproxy
         .metadata
@@ -1009,9 +1207,29 @@ async fn try_hot_reload(
     let lp = ListParams::default().labels(&format!("app.kubernetes.io/instance={sbp_name}"));
     let pods = pods_api.list(&lp).await.map_err(HotReloadError::ListPods)?;
 
-    if pods.items.is_empty() {
+    let deployment = reconcile::deployment_name(sbproxy);
+    let statefulset = reconcile::statefulset_name(sbproxy);
+    let owned: Vec<&Pod> = pods
+        .items
+        .iter()
+        .filter(|pod| {
+            let owned = reconcile::pod_is_operator_owned(pod, &deployment, &statefulset);
+            if !owned {
+                tracing::warn!(
+                    pod = %pod.metadata.name.as_deref().unwrap_or("?"),
+                    namespace = %namespace,
+                    "a pod carries this SBProxy's instance label but was not created by its \
+                     workload; not reloading it and not sending it the admin credential",
+                );
+            }
+            owned
+        })
+        .collect();
+
+    if owned.is_empty() {
         return Err(HotReloadError::NoPodsFound);
     }
+    let unowned_skipped = pods.items.len() - owned.len();
 
     let admin_port = sbproxy.spec.admin_port;
     let http = reqwest::Client::builder()
@@ -1019,13 +1237,22 @@ async fn try_hot_reload(
         .build()
         .map_err(HotReloadError::HttpClient)?;
 
-    for pod in &pods.items {
+    for pod in owned {
         let pod_ip = pod
             .status
             .as_ref()
             .and_then(|s| s.pod_ip.as_deref())
             .ok_or(HotReloadError::PodHasNoIp)?;
-        let url = format!("http://{pod_ip}:{admin_port}/admin/reload");
+        // A bare IPv6 literal has to be bracketed or the URL does not
+        // parse, and the whole fleet would fall back to a rollout
+        // restart on every config change. The probe sibling carries the
+        // same bracketing.
+        let authority = if pod_ip.contains(':') {
+            format!("[{pod_ip}]")
+        } else {
+            pod_ip.to_string()
+        };
+        let url = format!("http://{authority}:{admin_port}/admin/reload");
         let resp = http
             .post(&url)
             .header("authorization", &auth_header)
@@ -1041,7 +1268,312 @@ async fn try_hot_reload(
         }
     }
 
-    Ok(())
+    Ok(HotReloadOutcome { unowned_skipped })
+}
+
+/// What a successful hot reload actually covered.
+///
+/// A bare `Ok(())` could not distinguish "every labeled pod reloaded"
+/// from "every pod I own reloaded, and some sharing the label did not",
+/// and the caller skips the workload patch on both. That is the right
+/// call and it should not be silent, so the count travels with the
+/// success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HotReloadOutcome {
+    /// Pods carrying the instance label that this operator's workload
+    /// did not create. Never reloaded and never sent the credential.
+    unowned_skipped: usize,
+}
+
+/// What one workload pass did, for the caller that records it.
+///
+/// `reconcile_one` counts the delivery exactly once, after the workload
+/// function returns, and it has counted it there since the metric was
+/// added. The label is the only thing the workload path knows and the
+/// caller does not, so it travels up rather than being recorded a second
+/// time down here: two call sites meant a clean hot reload counted
+/// `delivered` twice and a partial one counted both labels, so the
+/// series stopped counting passes.
+struct WorkloadPass {
+    /// What to tell the controller to do next.
+    action: Action,
+    /// Pods this pass could not reload because this operator's workload
+    /// did not create them. Zero on every path but a partial hot reload.
+    unowned_skipped: usize,
+}
+
+/// Most pods one pass probes before it gives up and applies.
+///
+/// A count bound alone is not enough, and setting it at fifty was
+/// setting it at exactly the failure case: fifty pods behind a
+/// NetworkPolicy, each costing the full per-request timeout, is over
+/// four minutes in which the SBProxy's ConfigMap and workload are not
+/// applied, because both happen after this. [`FALLBACK_PROBE_BUDGET`]
+/// is the bound that actually holds; this one stays as a second limit
+/// for a large fleet whose pods all answer instantly.
+const MAX_FALLBACK_PROBES: usize = 50;
+
+/// Largest fallback answer this operator will read off a pod.
+///
+/// The pod is the untrusted end of this call. `reqwest` caps nothing,
+/// so `resp.json()` would buffer whatever arrives before any bound this
+/// operator applies could look at it: `FallbackReport::bounded` fixes
+/// what reaches the CR, not what reaches the heap. A real answer is a
+/// few hundred bytes; 64 KiB is generous for one and small enough that
+/// a hostile pod cannot make it matter.
+const MAX_FALLBACK_BODY_BYTES: usize = 64 * 1024;
+
+/// Wall clock one pass spends probing before it gives up and applies.
+///
+/// The overall budget the count bound could not provide. Giving up is
+/// safe and is the posture already documented: a pod that does not
+/// answer contributes no report and does not suspend anything, so the
+/// worst case of an exhausted budget is one pass that fails open on a
+/// pod it never asked, counted as `budget_exhausted`, and a pin that is
+/// noticed on the next loop 30 seconds later.
+///
+/// Fifteen seconds is three unreachable pods at the 5s per-request
+/// timeout. The check runs before each request rather than cancelling
+/// one in flight, so a pass can overshoot by a single timeout; the real
+/// ceiling is 20 seconds.
+///
+/// Deliberately still serial. Concurrency would need a `Semaphore` to
+/// avoid a thundering herd against a large fleet, and serial issuance
+/// is what keeps exactly one response body in the operator's heap at a
+/// time, which is the other half of bounding an untrusted pod's answer.
+const FALLBACK_PROBE_BUDGET: Duration = Duration::from_secs(15);
+
+/// Ask every running proxy pod whether it is serving a configuration
+/// its boot fallback restored (WOR-2467).
+///
+/// Best effort by design. A pod that cannot be reached, has no IP yet,
+/// or answers something this build cannot parse contributes **no**
+/// report, which means it does not suspend reconciliation. Suspending
+/// on a failure to ask would let one unreachable pod freeze config
+/// delivery for the whole `SBProxy`, which is a worse failure than the
+/// one this is here to prevent. The suspension is keyed on a node
+/// actually saying "I am on a fallback", never on silence.
+///
+/// Needs `spec.adminAuthSecretRef`, the same credential the hot-reload
+/// path uses. Without it there is no way to ask, so the answer is an
+/// empty list and the operator reconciles as it always did.
+async fn read_fallback_reports(
+    client: &Client,
+    sbproxy: &SBProxy,
+    namespace: &str,
+) -> Vec<reconcile::PodFallback> {
+    let Some(secret_ref) = sbproxy.spec.admin_auth_secret_ref.as_ref() else {
+        return Vec::new();
+    };
+    let Ok(auth_header) = read_admin_auth(client, namespace, secret_ref).await else {
+        return Vec::new();
+    };
+    let Some(sbp_name) = sbproxy.metadata.name.as_deref() else {
+        return Vec::new();
+    };
+    let pods_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let lp = ListParams::default().labels(&format!("app.kubernetes.io/instance={sbp_name}"));
+    let Ok(pods) = pods_api.list(&lp).await else {
+        return Vec::new();
+    };
+    let deployment = reconcile::deployment_name(sbproxy);
+    let statefulset = reconcile::statefulset_name(sbproxy);
+    let admin_port = sbproxy.spec.admin_port;
+    let Ok(http) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    else {
+        return Vec::new();
+    };
+    let mut reports = Vec::new();
+    let mut probed = 0usize;
+    let deadline = std::time::Instant::now() + FALLBACK_PROBE_BUDGET;
+    for pod in &pods.items {
+        let name = pod.metadata.name.clone().unwrap_or_else(|| "?".to_string());
+        // The credential goes only to a pod this operator's own
+        // workload created. The instance label alone is a value anyone
+        // with pod-create in the namespace can type, and this request
+        // carries the admin Basic credential in cleartext.
+        if !reconcile::pod_is_operator_owned(pod, &deployment, &statefulset) {
+            tracing::warn!(
+                pod = %name,
+                namespace = %namespace,
+                "a pod carries this SBProxy's instance label but was not created by its \
+                 workload; not probing it and not sending it the admin credential",
+            );
+            sbproxy_observe::metrics::record_operator_fallback_probe("unowned");
+            continue;
+        }
+        // A bounded fan-out. Each request costs up to the 5s client
+        // timeout, so an unreachable fleet would otherwise pin a
+        // reconcile worker for `replicas * 5s` before anything is
+        // applied.
+        if probed >= MAX_FALLBACK_PROBES || std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                namespace = %namespace,
+                probed,
+                "reached the per-pass fallback probe budget; the remaining pods are treated \
+                 as not pinned this pass and are asked again on the next loop",
+            );
+            sbproxy_observe::metrics::record_operator_fallback_probe("budget_exhausted");
+            break;
+        }
+        let Some(pod_ip) = pod.status.as_ref().and_then(|s| s.pod_ip.as_deref()) else {
+            continue;
+        };
+        probed += 1;
+        // A bare IPv6 literal has to be bracketed or the URL does not
+        // parse, and every pod on an IPv6 cluster would take the error
+        // arm and read as "not pinned" for the whole fleet.
+        let authority = if pod_ip.contains(':') {
+            format!("[{pod_ip}]")
+        } else {
+            pod_ip.to_string()
+        };
+        let url = format!("http://{authority}:{admin_port}/admin/config/fallback");
+        // `without_url` on every error path: the rule is that no reqwest
+        // Display reaches a log line with its URL attached (WOR-2629).
+        let resp = match http
+            .get(&url)
+            .header("authorization", &auth_header)
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(error) => {
+                // Counted, not only logged: `debug!` is compiled out in
+                // release, so without this the documented fail-open
+                // ("it does not suspend when it cannot ask") would be
+                // invisible in production.
+                sbproxy_observe::metrics::record_operator_fallback_probe("unreachable");
+                tracing::debug!(
+                    pod = %name,
+                    error = %error.without_url(),
+                    "could not read the config fallback status from a proxy pod; treating it \
+                     as not pinned",
+                );
+                continue;
+            }
+        };
+        if !resp.status().is_success() {
+            sbproxy_observe::metrics::record_operator_fallback_probe("refused");
+            continue;
+        }
+        let body = match read_capped_body(resp, MAX_FALLBACK_BODY_BYTES).await {
+            Ok(body) => body,
+            Err(reason) => {
+                sbproxy_observe::metrics::record_operator_fallback_probe("unreadable");
+                tracing::debug!(
+                    pod = %name,
+                    reason,
+                    "a proxy pod's fallback answer was refused before it was parsed; treating \
+                     it as not pinned",
+                );
+                continue;
+            }
+        };
+        match serde_json::from_slice::<reconcile::FallbackReport>(&body) {
+            Ok(report) => {
+                sbproxy_observe::metrics::record_operator_fallback_probe(if report.active {
+                    "pinned"
+                } else {
+                    "running_configured"
+                });
+                reports.push(reconcile::PodFallback {
+                    pod: name,
+                    // The node bounds its own reason; this operator
+                    // re-bounds what a pod hands it, because the pod is
+                    // the untrusted end of this call and the value goes
+                    // straight into a Kubernetes condition message.
+                    report: report.bounded(),
+                });
+            }
+            Err(error) => {
+                sbproxy_observe::metrics::record_operator_fallback_probe("unreadable");
+                // Serde's classification, not its message. `invalid
+                // type` and friends quote the offending value, so
+                // `%error` would put pod-supplied bytes on this line.
+                // The pod is the untrusted end of this call and the
+                // reason it hands back is already re-bounded below;
+                // this is the same rule applied to the parse failure.
+                tracing::debug!(
+                    pod = %name,
+                    error_line = error.line(),
+                    error_column = error.column(),
+                    error_class = %match error.classify() {
+                        serde_json::error::Category::Io => "io",
+                        serde_json::error::Category::Syntax => "syntax",
+                        serde_json::error::Category::Data => "data",
+                        serde_json::error::Category::Eof => "eof",
+                    },
+                    "a proxy pod answered the fallback route with a body this operator cannot \
+                     read; treating it as not pinned",
+                );
+            }
+        }
+    }
+    reports
+}
+
+/// Read at most `cap` bytes of a response body, refusing a larger one
+/// rather than buffering it.
+///
+/// Streamed chunk by chunk, because `Content-Length` is absent on a
+/// chunked response and is attacker-supplied on any other: the only
+/// bound that holds is the one applied while reading.
+async fn read_capped_body(
+    response: reqwest::Response,
+    cap: usize,
+) -> Result<Vec<u8>, &'static str> {
+    let mut response = response;
+    let mut body = Vec::new();
+    loop {
+        // `without_url` on the error path: no reqwest Display reaches a
+        // log line with its URL attached (WOR-2629). The caller logs the
+        // `&'static str` this returns instead.
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if body.len() + chunk.len() > cap {
+                    return Err("the answer is larger than this operator will read");
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => return Ok(body),
+            Err(_) => return Err("the answer could not be read to the end"),
+        }
+    }
+}
+
+/// Refuse to push configuration to an `SBProxy` whose pods rescued
+/// themselves onto a fallback configuration (WOR-2467).
+///
+/// Called immediately before each group of config writes rather than
+/// once at the top of the pass, for the same reason
+/// [`require_write_gate`] is: a single entry check would leave the rest
+/// of the pass, which includes several apiserver round-trips, running on
+/// a decision taken before them. The early return in
+/// `reconcile_one_inner` is the ordinary path; these calls are what stop
+/// a future write path from being added without deciding about the pin.
+fn require_config_push_allowed(
+    suspension: Option<&reconcile::PodFallback>,
+    ns: &str,
+    name: &str,
+) -> Result<(), ReconcileError> {
+    let Some(pinned) = suspension else {
+        return Ok(());
+    };
+    tracing::warn!(
+        name = %name,
+        namespace = %ns,
+        pod = %pinned.pod,
+        revision = pinned.report.revision,
+        condition = reconcile::FALLBACK_CONDITION_TYPE,
+        "a pod is serving a configuration its boot fallback restored; not pushing config to \
+         this SBProxy until the pin is cleared",
+    );
+    Err(ReconcileError::SuspendedOnFallback {
+        pod: pinned.pod.clone(),
+    })
 }
 
 /// Fetch the basic-auth header from the Secret named in
@@ -1101,6 +1633,22 @@ enum ReconcileError {
     /// successor will do the pass.
     #[error("this replica no longer holds the leader lease; refusing to write")]
     Fenced,
+
+    /// A pod owned by this `SBProxy` is serving a configuration its boot
+    /// fallback restored, so config delivery is suspended (WOR-2467).
+    ///
+    /// Not a failure of the object under reconcile and not an error to
+    /// alert on: the `ConfigFallbackActive` condition on the CR is the
+    /// signal, and this exists so a write path added later cannot get
+    /// past the suspension by not knowing about it.
+    #[error(
+        "pod {pod} is serving a configuration its boot fallback restored; config delivery is \
+         suspended for this SBProxy until the pin is cleared"
+    )]
+    SuspendedOnFallback {
+        /// The pod that reported the pin.
+        pod: String,
+    },
 
     /// Server-side-apply patch failed.
     #[error("failed to apply child object: {0}")]
@@ -1342,6 +1890,1008 @@ mod tests {
             !production_source().contains("\"configHash\""),
             "configHash belongs in reconcile::rolled_out_status_patch, not in an \
              inline json! at some other point in the pass"
+        );
+    }
+
+    // --- WOR-2467: a pinned pod suspends config delivery ---
+    //
+    // These drive the real `reconcile_one_inner` against a `kube::Client`
+    // built over a recording `tower` service, plus a loopback HTTP server
+    // standing in for the proxy's admin port. That is the only shape that
+    // can assert "no write was issued": a pure decision function proves
+    // the decision and not the enforcement, and this operator has three
+    // separate config write sites.
+
+    use std::sync::Mutex as StdMutex;
+
+    /// Every apiserver request one reconcile issued, as `METHOD path`.
+    type Recorded = Arc<StdMutex<Vec<String>>>;
+
+    /// A loopback server answering `GET /admin/config/fallback` with
+    /// `body`, standing in for one proxy pod's admin port.
+    struct FallbackStub {
+        port: u16,
+        shutdown: Arc<std::sync::atomic::AtomicBool>,
+        /// How many requests this stub actually answered, so a test can
+        /// assert the operator never dialed it at all.
+        served: Arc<std::sync::atomic::AtomicUsize>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl FallbackStub {
+        fn requests(&self) -> usize {
+            self.served.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl FallbackStub {
+        fn start(body: &'static str) -> Self {
+            use std::io::{Read as _, Write as _};
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("bind the fallback stub");
+            let port = listener.local_addr().expect("addr").port();
+            listener
+                .set_nonblocking(true)
+                .expect("non-blocking so the loop can notice shutdown");
+            let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let stop = Arc::clone(&shutdown);
+            let counted = Arc::clone(&served);
+            let handle = std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut socket, _)) => {
+                            // This counts accepts, not requests, which
+                            // is only the same number because of the
+                            // `connection: close` below. reqwest pools
+                            // by default, so without that header two
+                            // requests to the same pod IP would ride one
+                            // connection and arrive as a single accept.
+                            // `a_partial_owner_filter_reloads_only_the_owned_pod_and_reports_the_rest`
+                            // discriminates on exactly that difference,
+                            // one reload against two, so removing the
+                            // header would leave that test green while
+                            // it stopped testing anything. Load bearing.
+                            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let mut buf = [0u8; 2048];
+                            socket.set_nonblocking(false).ok();
+                            let _ = socket.read(&mut buf);
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                                body.len(),
+                            );
+                            let _ = socket.write_all(response.as_bytes());
+                            let _ = socket.flush();
+                        }
+                        Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                port,
+                shutdown,
+                served,
+                handle: Some(handle),
+            }
+        }
+    }
+
+    impl Drop for FallbackStub {
+        fn drop(&mut self) {
+            self.shutdown
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn json_response(
+        value: &serde_json::Value,
+    ) -> http::Response<http_body_util::Full<bytes::Bytes>> {
+        http::Response::builder()
+            .status(200)
+            .header("content-type", "application/json")
+            .body(http_body_util::Full::new(bytes::Bytes::from(
+                value.to_string(),
+            )))
+            .expect("build a response")
+    }
+
+    /// The `SBProxy` under reconcile, and the `SBProxyConfig` it names.
+    fn suspension_fixtures(admin_port: i32, config: &str) -> (SBProxy, serde_json::Value) {
+        let mut sbp: SBProxy = serde_json::from_value(serde_json::json!({
+            "apiVersion": "sbproxy.dev/v1alpha1",
+            "kind": "SBProxy",
+            "metadata": { "name": "edge", "namespace": "sbproxy", "generation": 3 },
+            "spec": {
+                "image": "ghcr.io/soapbucket/sbproxy:v1",
+                "configRef": "edge-config",
+                "replicas": 1,
+                "adminPort": admin_port,
+                "adminAuthSecretRef": { "name": "admin-auth" },
+            },
+        }))
+        .expect("SBProxy fixture");
+        sbp.metadata.generation = Some(3);
+        let cfg = serde_json::json!({
+            "apiVersion": "sbproxy.dev/v1alpha1",
+            "kind": "SBProxyConfig",
+            "metadata": { "name": "edge-config", "namespace": "sbproxy" },
+            "spec": { "config": config },
+        });
+        (sbp, cfg)
+    }
+
+    /// Run one reconcile against a recording apiserver, with the pod's
+    /// admin port pointed at `stub_port`. Returns every request issued.
+    async fn drive_one_reconcile(stub_port: u16) -> Vec<String> {
+        drive_one_reconcile_with(stub_port, "proxy:\n  http_bind_port: 8080\n").await
+    }
+
+    async fn drive_one_reconcile_with(stub_port: u16, config: &str) -> Vec<String> {
+        drive_one_reconcile_full(stub_port, config, OWNED_POD_OWNER).await
+    }
+
+    /// The controller reference a pod created by this operator's own
+    /// Deployment carries: `deployment_name` is `<sbproxy>-proxy`, and
+    /// Kubernetes appends the pod-template hash to name its ReplicaSet.
+    const OWNED_POD_OWNER: Option<(&str, &str)> = Some(("ReplicaSet", "edge-proxy-7d9f8c"));
+
+    async fn drive_one_reconcile_full(
+        stub_port: u16,
+        config: &str,
+        pod_owner: Option<(&str, &str)>,
+    ) -> Vec<String> {
+        use tower::ServiceExt as _;
+
+        let (sbp, cfg) = suspension_fixtures(i32::from(stub_port), config);
+        let recorded: Recorded = Arc::new(StdMutex::new(Vec::new()));
+        let seen = Arc::clone(&recorded);
+        let cfg_body = cfg.clone();
+        let sbp_body = serde_json::to_value(&sbp).expect("serialize the SBProxy");
+
+        let owner_refs = match pod_owner {
+            Some((kind, name)) => serde_json::json!([{
+                "apiVersion": "apps/v1",
+                "kind": kind,
+                "name": name,
+                "uid": "owner-uid",
+                "controller": true,
+            }]),
+            // A bare `kubectl run` with the right label and nothing else.
+            None => serde_json::json!([]),
+        };
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let seen = Arc::clone(&seen);
+            let owner_refs = owner_refs.clone();
+            let cfg_body = cfg_body.clone();
+            let sbp_body = sbp_body.clone();
+            async move {
+                let method = request.method().clone();
+                let path = request.uri().path().to_string();
+                seen.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(format!("{method} {path}"));
+                let answer = if path.ends_with("/sbproxyconfigs/edge-config") {
+                    cfg_body
+                } else if path.ends_with("/secrets/admin-auth") {
+                    // `authorization` is the default key, and the value is
+                    // the whole header. Base64 of "admin:pw".
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Secret",
+                        "metadata": { "name": "admin-auth", "namespace": "sbproxy" },
+                        "data": { "authorization": "QmFzaWMgWVdSdGFXNDZjSGM9" },
+                    })
+                } else if path.ends_with("/pods") {
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "PodList",
+                        "metadata": {},
+                        "items": [{
+                            "apiVersion": "v1",
+                            "kind": "Pod",
+                            "metadata": {
+                                "name": "edge-0",
+                                "namespace": "sbproxy",
+                                "ownerReferences": owner_refs,
+                            },
+                            "status": { "podIP": "127.0.0.1" },
+                        }],
+                    })
+                } else if path.contains("/sbproxies/") {
+                    sbp_body
+                } else {
+                    // A server-side apply answers with the object it
+                    // stored, and `kube` deserializes it into the typed
+                    // resource. Echoing the SBProxy back for a Service
+                    // or a ConfigMap apply fails that decode and the
+                    // reconcile aborts there, which silently truncated
+                    // this test the moment the Service moved ahead of
+                    // the ConfigMap.
+                    serde_json::json!({
+                        "metadata": { "name": "applied", "namespace": "sbproxy" },
+                    })
+                };
+                Ok::<_, std::convert::Infallible>(json_response(&answer))
+            }
+        });
+
+        let client = Client::new(service.boxed_clone(), "sbproxy");
+        let ctx = Arc::new(Ctx {
+            client,
+            write_gate: WriteGate::always(),
+        });
+        let _ = reconcile_one_inner(Arc::new(sbp), ctx).await;
+        let requests = recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        requests
+    }
+
+    /// The acceptance criterion, driven rather than reasoned about: a
+    /// reconcile against an SBProxy whose pod is on a fallback config
+    /// issues no ConfigMap, Service, Deployment, or StatefulSet write.
+    #[tokio::test]
+    async fn a_reconcile_writes_no_config_while_a_pod_is_on_its_boot_fallback() {
+        let stub = FallbackStub::start(
+            r#"{"active":true,"revision":7,"digest":"sha256:abc","reason":"unknown action type: statik","suspended":["file_watcher"]}"#,
+        );
+        let requests = drive_one_reconcile(stub.port).await;
+
+        for kind in ["configmaps", "deployments", "statefulsets"] {
+            assert!(
+                !requests.iter().any(|request| request.contains(kind)),
+                "a pinned SBProxy must not have config pushed to it; saw {kind} in \
+                 {requests:?}",
+            );
+        }
+        // The Service is deliberately still reconciled: it is a name and
+        // a port selector, it cannot put a document on a pod, and
+        // leaving a deleted one unrecreated would turn a config incident
+        // into an outage.
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.starts_with("PATCH") && request.contains("services")),
+            "the Service carries no configuration and must still be applied: {requests:?}",
+        );
+        // It did do the reads, so the absence above is a decision rather
+        // than a reconcile that never started.
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("sbproxyconfigs")),
+            "{requests:?}",
+        );
+        assert!(
+            requests.iter().any(|request| request.contains("/pods")),
+            "the pin is read from the pods themselves: {requests:?}",
+        );
+        // And it wrote the condition, which is the operator-visible
+        // signal an alert fires on.
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.starts_with("PATCH") && request.contains("/status")),
+            "the condition is a status write: {requests:?}",
+        );
+    }
+
+    /// The other half: the same reconcile, the same fixtures, a pod that
+    /// reports no pin. Without this the test above would pass on a build
+    /// that never reconciles anything.
+    #[tokio::test]
+    async fn clearing_the_pin_resumes_config_delivery_on_the_next_loop() {
+        let stub = FallbackStub::start(
+            r#"{"active":false,"revision":null,"digest":null,"reason":null,"suspended":[]}"#,
+        );
+        let requests = drive_one_reconcile(stub.port).await;
+
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.starts_with("PATCH") && request.contains("configmaps")),
+            "a node that is not pinned gets its config pushed: {requests:?}",
+        );
+    }
+
+    /// The `auto_revert` refusal is an enforcement, not just a
+    /// function. Driven through the same reconcile so a call site that
+    /// was never wired would show up here rather than pass on the pure
+    /// function alone.
+    #[tokio::test]
+    async fn a_config_arming_auto_revert_is_never_rolled_out_under_the_operator() {
+        let stub = FallbackStub::start(r#"{"active":false}"#);
+        let requests = drive_one_reconcile_with(
+            stub.port,
+            "proxy:\n  config_history:\n    enabled: true\n    soak:\n      auto_revert: true\n",
+        )
+        .await;
+        for kind in ["configmaps", "services", "deployments", "statefulsets"] {
+            assert!(
+                !requests.iter().any(|request| request.contains(kind)),
+                "an auto_revert config must not roll out; saw {kind} in {requests:?}",
+            );
+        }
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.starts_with("PATCH") && request.contains("/status")),
+            "and the refusal reaches the CR as lastError: {requests:?}",
+        );
+    }
+
+    /// One delivery count per pass, pinned where it can be checked
+    /// without a metrics registry.
+    ///
+    /// `reconcile_one` has counted every pass at its single site since
+    /// the metric was added, including the hot-reload arms, whose early
+    /// `return` unwinds into the `?` there rather than out of the
+    /// function. A round that believed otherwise added a second call in
+    /// each workload function: a clean hot reload then counted
+    /// `delivered` twice and a partial one counted both labels, so the
+    /// series stopped counting passes. Nothing failed, because nothing
+    /// asserted a count.
+    ///
+    /// What this cannot see, and what covers each. Whether the one call
+    /// site is reachable: the driven reconcile tests. **Which of the two
+    /// delivered labels it records**, because this counts call sites and
+    /// not their arguments, so hardcoding `unowned_skipped: 0` in either
+    /// workload `Ok` arm would make `delivered_unowned_skipped`
+    /// unreachable and leave this green. There are two such arms and
+    /// each has its own witness, because covering one and claiming both
+    /// is how that gap survived a round:
+    /// `the_workload_pass_carries_the_count_that_picks_the_delivery_label`
+    /// drives `reconcile_deployment_workload` and
+    /// `the_clustered_workload_pass_carries_the_count_that_picks_the_delivery_label`
+    /// drives `reconcile_clustered_workload`, each asserting the count
+    /// survives the trip on its own arm. And a second call added inside a helper the workload
+    /// functions call rather than in their own bodies: the total
+    /// assertion below still catches that, because it counts the whole
+    /// production half of this file, but the per-function assertion does
+    /// not.
+    #[test]
+    fn the_delivery_metric_is_recorded_once_per_pass() {
+        let src = production_source();
+        assert_eq!(
+            src.matches("record_operator_config_delivery(").count(),
+            6,
+            "five refusal or suspension states plus the one success at the end of \
+             reconcile_one; a seventh call site needs a line here saying which pass it counts",
+        );
+        for name in [
+            "async fn reconcile_deployment_workload",
+            "async fn reconcile_clustered_workload",
+        ] {
+            let start = src
+                .find(name)
+                .expect("the workload function is in this file");
+            let rest = &src[start + name.len()..];
+            let end = rest.find("\nasync fn ").unwrap_or(rest.len());
+            assert_eq!(
+                rest[..end]
+                    .matches("record_operator_config_delivery(")
+                    .count(),
+                0,
+                "{name} must not record a delivery: its caller already counts the pass, and \
+                 a call here is a second increment rather than a first",
+            );
+        }
+    }
+
+    /// Drive `try_hot_reload` itself against a pod the operator did
+    /// not create, and assert the credential never leaves.
+    ///
+    /// The source counter proves the ownership call exists in the file.
+    /// It cannot prove the call *gates* the send: inverting the filter,
+    /// or iterating `pods.items` again after computing `owned`, leaves
+    /// both counts at two. This is the backstop the counter's own
+    /// disclosure names, for the path that did not have one.
+    #[tokio::test]
+    async fn the_reload_credential_never_reaches_a_pod_the_operator_did_not_create() {
+        use tower::ServiceExt as _;
+
+        // A stub on a real port, so a request that escapes the filter is
+        // counted rather than merely rejected somewhere downstream.
+        let stub = FallbackStub::start(r#"{"reloaded":true}"#);
+        let (sbp, _cfg) =
+            suspension_fixtures(i32::from(stub.port), "proxy:\n  http_bind_port: 8080\n");
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let path = request.uri().path().to_string();
+            async move {
+                let answer = if path.ends_with("/secrets/admin-auth") {
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Secret",
+                        "metadata": { "name": "admin-auth", "namespace": "sbproxy" },
+                        "data": { "authorization": "QmFzaWMgWVdSdGFXNDZjSGM9" },
+                    })
+                } else if path.ends_with("/pods") {
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "PodList",
+                        "metadata": {},
+                        // Carries the instance label the selector asks
+                        // for, and no controller owner reference: a bare
+                        // `kubectl run` by anyone with pods/create.
+                        "items": [{
+                            "apiVersion": "v1",
+                            "kind": "Pod",
+                            "metadata": {
+                                "name": "impostor-0",
+                                "namespace": "sbproxy",
+                                "ownerReferences": [],
+                            },
+                            "status": { "podIP": "127.0.0.1" },
+                        }],
+                    })
+                } else {
+                    serde_json::json!({
+                        "metadata": { "name": "applied", "namespace": "sbproxy" },
+                    })
+                };
+                Ok::<_, std::convert::Infallible>(json_response(&answer))
+            }
+        });
+        let client = Client::new(service.boxed_clone(), "sbproxy");
+
+        let outcome = try_hot_reload(&client, &sbp, "sbproxy").await;
+
+        assert!(
+            matches!(outcome, Err(HotReloadError::NoPodsFound)),
+            "every labeled pod was unowned, so there is nothing this operator may reload, and \
+             the caller must fall through to the rollout restart: {outcome:?}",
+        );
+        assert_eq!(
+            stub.requests(),
+            0,
+            "the admin credential must not be sent to a pod this operator did not create",
+        );
+    }
+
+    /// The mixed case, which the all-unowned test cannot reach: `owned`
+    /// is non-empty, so the loop actually runs and the filter has to
+    /// hold inside it.
+    ///
+    /// This is what catches iterating `pods.items` again after computing
+    /// `owned`, which the all-unowned fixture cannot see because it
+    /// returns `NoPodsFound` before the client is built. It is also the
+    /// only test of `unowned_skipped`, which is what picks the delivery
+    /// label.
+    #[tokio::test]
+    async fn a_partial_owner_filter_reloads_only_the_owned_pod_and_reports_the_rest() {
+        use tower::ServiceExt as _;
+
+        let stub = FallbackStub::start(r#"{"reloaded":true}"#);
+        let (sbp, _cfg) =
+            suspension_fixtures(i32::from(stub.port), "proxy:\n  http_bind_port: 8080\n");
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let path = request.uri().path().to_string();
+            async move {
+                let answer = if path.ends_with("/secrets/admin-auth") {
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Secret",
+                        "metadata": { "name": "admin-auth", "namespace": "sbproxy" },
+                        "data": { "authorization": "QmFzaWMgWVdSdGFXNDZjSGM9" },
+                    })
+                } else if path.ends_with("/pods") {
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "PodList",
+                        "metadata": {},
+                        "items": [
+                            {
+                                "apiVersion": "v1",
+                                "kind": "Pod",
+                                "metadata": {
+                                    "name": "edge-proxy-abc123-0",
+                                    "namespace": "sbproxy",
+                                    "ownerReferences": [{
+                                        "apiVersion": "apps/v1",
+                                        "kind": "ReplicaSet",
+                                        "name": "edge-proxy-abc123",
+                                        "uid": "rs-uid",
+                                        "controller": true,
+                                    }],
+                                },
+                                "status": { "podIP": "127.0.0.1" },
+                            },
+                            {
+                                "apiVersion": "v1",
+                                "kind": "Pod",
+                                "metadata": {
+                                    "name": "impostor-0",
+                                    "namespace": "sbproxy",
+                                    "ownerReferences": [],
+                                },
+                                "status": { "podIP": "127.0.0.1" },
+                            },
+                        ],
+                    })
+                } else {
+                    serde_json::json!({
+                        "metadata": { "name": "applied", "namespace": "sbproxy" },
+                    })
+                };
+                Ok::<_, std::convert::Infallible>(json_response(&answer))
+            }
+        });
+        let client = Client::new(service.boxed_clone(), "sbproxy");
+
+        let outcome = try_hot_reload(&client, &sbp, "sbproxy")
+            .await
+            .expect("the owned pod reloads, so this is a success");
+
+        assert_eq!(
+            outcome.unowned_skipped, 1,
+            "the impostor is reported so the caller can pick the delivery label",
+        );
+        assert_eq!(
+            stub.requests(),
+            1,
+            "exactly the owned pod was reloaded: iterating the unfiltered list would make \
+             this two, and that is the mutation the source counter cannot see",
+        );
+    }
+
+    /// Which label the pass records, not merely that one is
+    /// recorded.
+    ///
+    /// `the_delivery_metric_is_recorded_once_per_pass` counts call
+    /// sites, so it cannot see the argument. Hardcoding
+    /// `unowned_skipped: 0` in either workload `Ok` arm makes
+    /// `delivered_unowned_skipped` unreachable and leaves that test, and
+    /// every other, green.
+    ///
+    /// **This one covers the Deployment arm.** The clustered arm is
+    /// covered by
+    /// `the_clustered_workload_pass_carries_the_count_that_picks_the_delivery_label`,
+    /// and the two are siblings because the first version of this test
+    /// covered one arm while its own doc claimed both.
+    ///
+    /// It drives the real workload function down the hot-reload path
+    /// with one owned pod and one impostor and asserts the count that
+    /// picks the label survives the trip, which is the whole wiring
+    /// between `try_hot_reload` and the recording site.
+    ///
+    /// Self-discriminating in both directions: the rollout path
+    /// hardcodes `unowned_skipped: 0`, so a fixture that failed to enter
+    /// the hot-reload path would fail this assertion rather than pass
+    /// it.
+    #[tokio::test]
+    async fn the_workload_pass_carries_the_count_that_picks_the_delivery_label() {
+        use tower::ServiceExt as _;
+
+        let stub = FallbackStub::start(r#"{"reloaded":true}"#);
+        let (mut sbp, _cfg) =
+            suspension_fixtures(i32::from(stub.port), "proxy:\n  http_bind_port: 8080\n");
+        // Gate 4 of `should_hot_reload`: the pods are running an older
+        // config than the one this pass is delivering.
+        // `delivered_config_hash` returns `None` unless both are set,
+        // so both are, or gate 4 reads "no hash recorded yet" instead of
+        // "the config changed" and the test would pass for a reason it
+        // is not testing.
+        sbp.status = Some(sbproxy_k8s_operator::crd::SBProxyStatus {
+            config_hash: "old-hash".to_string(),
+            observed_config_hash: "old-hash".to_string(),
+            ..Default::default()
+        });
+        // Gate 2 and 3: an existing Deployment whose operator-owned spec
+        // matches the desired one. Built with the same builder the
+        // operator uses, so a change to the template cannot silently
+        // drop this test onto the rollout path.
+        let existing = serde_json::to_value(reconcile::desired_deployment(&sbp, "old-hash"))
+            .expect("serialize the existing Deployment");
+
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let path = request.uri().path().to_string();
+            let existing = existing.clone();
+            async move {
+                let answer = if path.ends_with("/secrets/admin-auth") {
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Secret",
+                        "metadata": { "name": "admin-auth", "namespace": "sbproxy" },
+                        "data": { "authorization": "QmFzaWMgWVdSdGFXNDZjSGM9" },
+                    })
+                } else if path.ends_with("/pods") {
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "PodList",
+                        "metadata": {},
+                        "items": [
+                            {
+                                "apiVersion": "v1",
+                                "kind": "Pod",
+                                "metadata": {
+                                    "name": "edge-proxy-abc123-0",
+                                    "namespace": "sbproxy",
+                                    "ownerReferences": [{
+                                        "apiVersion": "apps/v1",
+                                        "kind": "ReplicaSet",
+                                        "name": "edge-proxy-abc123",
+                                        "uid": "rs-uid",
+                                        "controller": true,
+                                    }],
+                                },
+                                "status": { "podIP": "127.0.0.1" },
+                            },
+                            {
+                                "apiVersion": "v1",
+                                "kind": "Pod",
+                                "metadata": {
+                                    "name": "impostor-0",
+                                    "namespace": "sbproxy",
+                                    "ownerReferences": [],
+                                },
+                                "status": { "podIP": "127.0.0.1" },
+                            },
+                        ],
+                    })
+                } else if path.contains("/deployments/") {
+                    existing
+                } else {
+                    serde_json::json!({
+                        "metadata": { "name": "applied", "namespace": "sbproxy" },
+                    })
+                };
+                Ok::<_, std::convert::Infallible>(json_response(&answer))
+            }
+        });
+        let ctx = Ctx {
+            client: Client::new(service.boxed_clone(), "sbproxy"),
+            write_gate: WriteGate::always(),
+        };
+
+        let pass = reconcile_deployment_workload(
+            &ctx,
+            &sbp,
+            "sbproxy",
+            "edge",
+            "new-hash",
+            &PatchParams::apply(FIELD_MANAGER).force(),
+            None,
+        )
+        .await
+        .expect("the owned pod reloads, so the pass succeeds");
+
+        assert_eq!(
+            pass.unowned_skipped, 1,
+            "the impostor has to reach the recording site: at zero the label is `delivered` \
+             and `delivered_unowned_skipped` is unreachable on every path",
+        );
+        assert_eq!(
+            stub.requests(),
+            1,
+            "and it really went down the hot-reload path, reloading only the owned pod",
+        );
+    }
+
+    /// The clustered arm of the same wiring.
+    ///
+    /// `reconcile_clustered_workload` carries an identical
+    /// `unowned_skipped: outcome.unowned_skipped`, and until this test
+    /// existed nothing drove it at all: hardcoding `0` there left every
+    /// test green and made `delivered_unowned_skipped` unreachable for
+    /// every clustered `SBProxy`. That is the one-of-two-arms shape this
+    /// branch has now hit four times, most recently inside the fix for
+    /// the third, so the two tests are siblings on purpose and each
+    /// names its arm.
+    #[tokio::test]
+    async fn the_clustered_workload_pass_carries_the_count_that_picks_the_delivery_label() {
+        use tower::ServiceExt as _;
+
+        let stub = FallbackStub::start(r#"{"reloaded":true}"#);
+        let (mut sbp, _cfg) =
+            suspension_fixtures(i32::from(stub.port), "proxy:\n  http_bind_port: 8080\n");
+        // Gate 4 of `should_hot_reload_statefulset`, and the same
+        // `delivered_config_hash` requirement its Deployment sibling
+        // documents: both fields have to be set or the gate reads "no
+        // hash recorded yet" rather than "the config changed", and the
+        // test would pass for a reason it is not testing.
+        sbp.status = Some(sbproxy_k8s_operator::crd::SBProxyStatus {
+            config_hash: "old-hash".to_string(),
+            observed_config_hash: "old-hash".to_string(),
+            ..Default::default()
+        });
+        // Gates 2 and 3: an existing StatefulSet whose operator-owned
+        // spec matches the desired one, built with the same builder the
+        // operator uses so a template change cannot silently drop this
+        // test onto the rollout path.
+        //
+        // `spec.clustering` is deliberately absent, which is worth
+        // saying because the real clustered path always has it. It
+        // makes `clustering_enabled` false, so the shared-key block
+        // above the workload apply does not generate a Secret. That is
+        // upstream of the arm under test and cannot reach
+        // `unowned_skipped`; leaving it out keeps the fixture to the
+        // one decision this test is about. The `get_opt` on that Secret
+        // still runs and is answered by the generic arm below.
+        let existing = serde_json::to_value(reconcile::desired_statefulset(&sbp, "old-hash"))
+            .expect("serialize the existing StatefulSet");
+
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let path = request.uri().path().to_string();
+            let existing = existing.clone();
+            async move {
+                // No Deployment to garbage collect. A 404 rather than a
+                // decode failure, so the absence is the fixture saying
+                // so rather than an accident of deserialization.
+                if path.contains("/deployments/") {
+                    return Ok::<_, std::convert::Infallible>(
+                        http::Response::builder()
+                            .status(404)
+                            .header("content-type", "application/json")
+                            .body(http_body_util::Full::new(bytes::Bytes::from(
+                                serde_json::json!({"kind": "Status", "code": 404}).to_string(),
+                            )))
+                            .expect("build a 404"),
+                    );
+                }
+                let answer = if path.ends_with("/secrets/admin-auth") {
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Secret",
+                        "metadata": { "name": "admin-auth", "namespace": "sbproxy" },
+                        "data": { "authorization": "QmFzaWMgWVdSdGFXNDZjSGM9" },
+                    })
+                } else if path.ends_with("/pods") {
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "PodList",
+                        "metadata": {},
+                        "items": [
+                            {
+                                "apiVersion": "v1",
+                                "kind": "Pod",
+                                "metadata": {
+                                    "name": "edge-proxy-0",
+                                    "namespace": "sbproxy",
+                                    // A StatefulSet owns its pods by
+                                    // exact name, which is the other
+                                    // half of `pod_is_operator_owned`.
+                                    "ownerReferences": [{
+                                        "apiVersion": "apps/v1",
+                                        "kind": "StatefulSet",
+                                        "name": "edge-proxy",
+                                        "uid": "sts-uid",
+                                        "controller": true,
+                                    }],
+                                },
+                                "status": { "podIP": "127.0.0.1" },
+                            },
+                            {
+                                "apiVersion": "v1",
+                                "kind": "Pod",
+                                "metadata": {
+                                    "name": "impostor-0",
+                                    "namespace": "sbproxy",
+                                    "ownerReferences": [],
+                                },
+                                "status": { "podIP": "127.0.0.1" },
+                            },
+                        ],
+                    })
+                } else if path.contains("/statefulsets/") {
+                    existing
+                } else {
+                    serde_json::json!({
+                        "metadata": { "name": "applied", "namespace": "sbproxy" },
+                    })
+                };
+                Ok::<_, std::convert::Infallible>(json_response(&answer))
+            }
+        });
+        let ctx = Ctx {
+            client: Client::new(service.boxed_clone(), "sbproxy"),
+            write_gate: WriteGate::always(),
+        };
+
+        let pass = reconcile_clustered_workload(
+            &ctx,
+            &sbp,
+            "sbproxy",
+            "edge",
+            "new-hash",
+            &PatchParams::apply(FIELD_MANAGER).force(),
+            None,
+        )
+        .await
+        .expect("the owned pod reloads, so the pass succeeds");
+
+        assert_eq!(
+            pass.unowned_skipped, 1,
+            "the clustered arm has to carry the count too: at zero the label is `delivered` \
+             and `delivered_unowned_skipped` is unreachable for every clustered SBProxy",
+        );
+        assert_eq!(
+            stub.requests(),
+            1,
+            "and it really went down the hot-reload path, reloading only the owned pod",
+        );
+    }
+
+    /// A Blocker from the WOR-2467 review. A pod is selected for the
+    /// probe by label, and a label is a value anyone with pod-create in
+    /// the namespace can type. Before the owner gate, any pod answering
+    /// `{"active":true}` halted config delivery for the whole SBProxy
+    /// and was handed the operator's admin Basic credential in
+    /// cleartext, on every pass.
+    #[tokio::test]
+    async fn a_labeled_pod_the_operator_did_not_create_is_neither_probed_nor_obeyed() {
+        let stub = FallbackStub::start(
+            r#"{"active":true,"revision":7,"digest":"sha256:abc","reason":"trust me"}"#,
+        );
+        let requests = drive_one_reconcile_full(
+            stub.port,
+            "proxy:\n  http_bind_port: 8080\n",
+            // No controller reference: this pod was not created by the
+            // operator's Deployment or StatefulSet.
+            None,
+        )
+        .await;
+
+        // It did not get to stop the rollout.
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.starts_with("PATCH") && request.contains("configmaps")),
+            "an unowned pod claiming a pin must not suspend config delivery: {requests:?}",
+        );
+        // And the credential never left the operator: the stub counts
+        // every request it answered, and it answered none.
+        assert_eq!(
+            stub.requests(),
+            0,
+            "the admin credential must not be sent to a pod this operator did not create",
+        );
+    }
+
+    /// The refusal is permanent until somebody edits
+    /// the config, so returning before the condition block left a
+    /// `ConfigFallbackActive` from an earlier pass frozen on the CR with
+    /// nothing able to move it. The condition is refreshed first now.
+    #[tokio::test]
+    async fn an_auto_revert_refusal_still_refreshes_the_fallback_condition() {
+        let stub = FallbackStub::start(r#"{"active":false}"#);
+        let requests = drive_one_reconcile_with(
+            stub.port,
+            "proxy:\n  config_history:\n    enabled: true\n    soak:\n      auto_revert: true\n",
+        )
+        .await;
+        // The pods were still asked, which is what refreshes the
+        // condition, and the refusal still stopped the rollout.
+        assert!(
+            requests.iter().any(|request| request.contains("/pods")),
+            "the condition cannot be refreshed without asking: {requests:?}",
+        );
+        for kind in ["configmaps", "deployments", "statefulsets"] {
+            assert!(
+                !requests.iter().any(|request| request.contains(kind)),
+                "an auto_revert config must not roll out; saw {kind} in {requests:?}",
+            );
+        }
+    }
+
+    /// The guard every config write site calls. The early return in
+    /// `reconcile_one_inner` is the ordinary path; this is what stops a
+    /// write path added later from getting past the suspension by not
+    /// knowing about it.
+    #[test]
+    fn the_config_push_guard_refuses_while_a_pod_is_pinned() {
+        assert!(require_config_push_allowed(None, "ns", "edge").is_ok());
+        let pinned = reconcile::PodFallback {
+            pod: "edge-0".to_string(),
+            report: reconcile::FallbackReport {
+                active: true,
+                revision: Some(7),
+                digest: None,
+                reason: None,
+            },
+        };
+        let error = require_config_push_allowed(Some(&pinned), "ns", "edge")
+            .expect_err("a pinned pod refuses the write");
+        assert!(matches!(
+            error,
+            ReconcileError::SuspendedOnFallback { ref pod } if pod == "edge-0"
+        ));
+        assert!(error.to_string().contains("edge-0"), "{error}");
+    }
+
+    /// Every config write site consults the guard. Narrow in the way the
+    /// write-order guard above is narrow, and for the same reason: this
+    /// reads the source rather than a live apiserver. What it buys is
+    /// that a fourth write path cannot be added without deciding about
+    /// the pin, which is the failure mode a decision-function-only test
+    /// would miss.
+    #[test]
+    fn every_config_write_site_consults_the_fallback_guard() {
+        let src = production_source();
+        assert_eq!(
+            src.matches("require_config_push_allowed(").count(),
+            // The definition, the pre-apply call, and two per workload
+            // path: the entry check and the re-check before the apply.
+            6,
+            "a config write site that does not call the guard would push config to a pinned node",
+        );
+        // The write gate is deliberately *wider* than the config guard:
+        // it also covers the credentialed pod probe and the Service
+        // apply, neither of which puts configuration on a pod. Pinned as
+        // an exact count rather than an inequality so adding a site to
+        // either one has to be a deliberate edit here.
+        assert_eq!(
+            src.matches("require_write_gate(").count(),
+            7,
+            "the leader fence guards the five config write sites plus the credentialed pod \
+             probe, plus its own definition",
+        );
+    }
+
+    /// The detector has to be as wide as the thing it protects.
+    ///
+    /// The round-one Blocker was that the operator sent its admin
+    /// credential to any pod carrying the instance label. The fix added
+    /// `pod_is_operator_owned` to the fallback probe and stopped there,
+    /// while `try_hot_reload` went on posting the same credential to the
+    /// same unfiltered list. One of two paths fixed reads as fixed to
+    /// anyone checking the path the finding cited, which is how it
+    /// survived two rounds.
+    ///
+    /// So this counts the credential sends rather than the check: every
+    /// place that puts `authorization` on a request to a pod must have
+    /// an ownership filter, and adding a third sender without one moves
+    /// these two numbers apart.
+    ///
+    /// What it cannot see, stated rather than implied. It matches the
+    /// literal `header("authorization"`, so `.basic_auth(...)`,
+    /// `.bearer_auth(...)` and `.header(AUTHORIZATION, ...)` are all
+    /// invisible to it; none exists in this crate today, and this
+    /// assertion is what makes adding one a deliberate edit here. It
+    /// also cannot see whether a counted check actually *gates* its
+    /// send, because it counts occurrences and not control flow. Three
+    /// tests cover that half, and the split follows the two paths'
+    /// different shapes rather than being symmetric.
+    ///
+    /// The **probe** gates inside its loop: it iterates `&pods.items`
+    /// and `continue`s on an unowned pod, so there is no filter step to
+    /// empty and the loop is always entered.
+    /// `a_labeled_pod_the_operator_did_not_create_is_neither_probed_nor_obeyed`
+    /// therefore exercises the in-loop gate directly with a single
+    /// unowned pod, and asserting the stub was asked nothing is proof
+    /// the gate holds.
+    ///
+    /// The **hot reload** filters first and returns `NoPodsFound` when
+    /// nothing survives, so an all-unowned fixture returns before the
+    /// request loop:
+    /// `the_reload_credential_never_reaches_a_pod_the_operator_did_not_create`
+    /// covers that early return, and
+    /// `a_partial_owner_filter_reloads_only_the_owned_pod_and_reports_the_rest`
+    /// is the one that reaches the loop, with one owned pod and one
+    /// impostor, and catches iterating the unfiltered list after
+    /// computing `owned`. All three drive the real code against a stub
+    /// that counts what it was asked.
+    #[test]
+    fn every_credentialed_pod_request_is_filtered_by_ownership() {
+        let src = production_source();
+        let senders = src.matches("header(\"authorization\"").count();
+        let checks = src.matches("pod_is_operator_owned(").count();
+        assert_eq!(
+            senders, 2,
+            "the credentialed pod requests are the fallback probe and the hot reload; a third \
+             needs an ownership filter and a line here saying so",
+        );
+        assert_eq!(
+            checks, senders,
+            "every path that sends a pod the admin credential must first check the pod is one \
+             this operator's own workload created",
         );
     }
 }

@@ -46,4 +46,4 @@ pub mod reconcile;
 /// timing constants and the step-down semantics.
 pub mod leader;
 
-pub use crd::{SBProxy, SBProxyConfig, SBProxyConfigSpec, SBProxySpec};
+pub use crd::{Condition, SBProxy, SBProxyConfig, SBProxyConfigSpec, SBProxySpec};

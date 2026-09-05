@@ -1876,9 +1876,17 @@ struct RevisionRecordingInput<'a> {
     /// misreport a git-sourced base as
     /// [`sbproxy_config::BaseOrigin::Local`].
     origin: sbproxy_config::BaseOrigin,
-    /// Who or what produced this revision: `"file_watcher"`,
-    /// `"config_authority"`, `"config_refresh_poller"`, an admin
-    /// operator id, or `"boot"`.
+    /// Who or what produced this revision.
+    ///
+    /// The whole vocabulary, because a partial list here is what let
+    /// `docs/config-rollback.md` document a value this field never
+    /// holds: `"file_watcher"`, `"config_authority"`,
+    /// `"config_refresh_poller"`, `"boot"`, `"boot_fallback"`,
+    /// `"auto_revert"`, `"rollback"` or `"rollback:<operator>"`, and
+    /// `"api"` or the authenticated operator's own id.
+    ///
+    /// Never empty. The CLI renders an absent field as `-`, which no
+    /// apply path produces.
     actor: &'a str,
 }
 
@@ -2996,12 +3004,13 @@ fn resolve_or_default_admin_operator_pepper(
 /// the caller's own compile report any problem, so `fallback: off`
 /// behavior is byte identical to what shipped before.
 ///
-/// The "does it work" test the walk applies is `source:` resolution plus
-/// `compile_config`, the same two steps `run` performs on the primary
-/// document immediately after this returns. A candidate that passes them
-/// and then fails later in `run` (a port already bound, a model runtime
-/// that will not start) leaves its boot counter incremented, which is
-/// what makes the next boot move past it after `max_attempts`.
+/// The "does it work" test the walk applies is `source:` resolution,
+/// `compile_config`, and a construct check, the same three steps `run`
+/// performs on the primary document immediately after this returns. A
+/// candidate that passes them and then fails later in `run` (a port
+/// already bound, a model runtime that will not start) leaves its boot
+/// counter incremented, which is what makes the next boot move past it
+/// after `max_attempts`.
 fn boot_document(
     config_path: &str,
     fallback: Option<sbproxy_config::BootFallbackMode>,
@@ -3040,10 +3049,20 @@ fn boot_document(
 
     // Only a node that asked for a fallback pays the pre-check, and it
     // has to: the walk cannot know the configured document failed
-    // without trying it, and it applies the same two steps to a
+    // without trying it, and it applies the same three steps to a
     // candidate so "works" means the same thing on both sides.
+    // The configured document's own directory: a relative
+    // extension-bundle path resolves against it at boot, so the
+    // construct check has to use the same base.
+    let base_dir = std::path::Path::new(config_path)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map_or_else(
+            || std::path::PathBuf::from("."),
+            std::path::Path::to_path_buf,
+        );
     let primary = match &read {
-        Ok(yaml) => match boot_candidate_compiles(yaml) {
+        Ok(yaml) => match boot_candidate_compiles(yaml, &base_dir) {
             Ok(()) => return Ok((yaml.clone(), None)),
             Err(reason) => anyhow::anyhow!("{reason}"),
         },
@@ -3056,40 +3075,125 @@ fn boot_document(
         &std::fs::read_to_string(config_path).unwrap_or_default(),
     );
 
+    // Scrubbed for the same reason the pin four lines below is: this
+    // string is a compile or resolve failure over an operator-authored
+    // document, and the secret resolver echoes an inlined literal
+    // credential verbatim into it. The pin was scrubbed when it became a
+    // product surface and this log line was left, which made the
+    // unscrubbed twin the easier of the two to read.
     tracing::error!(
-        error = %format!("{primary:#}"),
+        error = %crate::config_boot::scrub_boot_failure(&format!("{primary:#}")),
         "the configured document did not boot; walking the config revision ring for the last \
          known good configuration",
     );
     match crate::config_boot::walk_for_bootable(
         &boot_config,
         boot_config.boot.max_attempts,
-        boot_candidate_compiles,
+        |yaml| boot_candidate_compiles(yaml, &base_dir),
     ) {
         Ok(document) => {
-            crate::config_boot::mark_on_fallback(document.pinned.clone());
-            crate::config_boot::spawn_boot_success_timer(
+            // The pin carries why the configured document failed, not
+            // only which revision rescued the node. A controller that
+            // suspends reconciliation on this pin has to be able to say
+            // what it is waiting for (WOR-2467).
+            let pinned = crate::config_boot::PinnedRevision::with_reason(
                 document.pinned.revision,
+                document.pinned.digest.clone(),
+                &format!("{primary:#}"),
+            );
+            crate::config_boot::mark_on_fallback(pinned.clone());
+            crate::config_boot::spawn_boot_success_timer(
+                pinned.revision,
                 boot_config.boot.success_secs,
             );
-            Ok((document.yaml, Some(document.pinned)))
+            Ok((document.yaml, Some(pinned)))
         }
         // An empty ring is a first boot: exit exactly the way `off`
         // does, saying the ring was empty rather than pretending a
         // fallback was attempted.
+        // Scrubbed on the way out, like the pin and the log line above.
+        // This error is printed by `eprintln!("Fatal: ...")`, which in
+        // Kubernetes is pod logs: a wider audience than the operator's
+        // own terminal, and wider than the config file they already
+        // hold. `--config-fallback=off` still returns the raw error and
+        // that path is not this change's to widen.
         Err(failure @ crate::config_boot::BootWalkFailure::RingEmpty)
         | Err(failure @ crate::config_boot::BootWalkFailure::StoreUnavailable(_)) => {
-            Err(primary.context(format!("{failure}")))
+            Err(anyhow::anyhow!(
+                "{}: {}",
+                crate::config_boot::scrub_boot_failure(&format!("{primary:#}")),
+                // The failure half too, not only the primary. Both end
+                // up in the same `eprintln!("Fatal: ...")`, and
+                // `StoreUnavailable` carries an unbounded store-open
+                // string that the first argument's scrub does not reach.
+                crate::config_boot::scrub_boot_failure(&format!("{failure}")),
+            ))
         }
+        // Every `FailedCandidate::reason` this renders was sanitized
+        // when it was built, so this is bounded per candidate; the
+        // wrapper text around them is this crate's own.
         Err(failure) => Err(anyhow::anyhow!("{failure}")),
     }
 }
 
-/// Whether one candidate document resolves its `source:` pointer and
-/// compiles.
-fn boot_candidate_compiles(yaml: &str) -> Result<(), String> {
+/// Whether one candidate document resolves its `source:` pointer,
+/// compiles, **and constructs**.
+///
+/// The third step is the one that matters and the one this used to be
+/// missing. `compile_config` leaves `action`, `policies`, `transforms`
+/// and `authentication` as opaque JSON, so an unknown action type, a
+/// policy that will not build, a bad regex, or a JSON schema that does
+/// not compile all pass it and then fail in
+/// `CompiledPipeline::from_config_at` well after this decision has been
+/// made. Module construction is where most operator typos land, so
+/// "works" without it excluded the majority of the failures a boot
+/// fallback exists for.
+///
+/// The cost of the gap was worse on the **primary** document than on a
+/// candidate. A primary that compiled returned early and skipped the
+/// walk entirely, so a node whose operator had asked for a fallback
+/// exited fatally with no pin, no boot counter, and no walk, and every
+/// restart repeated it.
+///
+/// [`crate::pipeline::CompiledPipeline::from_config_for_validation_at`]
+/// is the purpose-built construct check the config authority already
+/// runs before it publishes a payload to a fleet, under
+/// `PipelineConstructionMode::Validation` with no background tasks
+/// started and no listener bound. Using it here makes the boot
+/// fallback's "does this work" test the same question every other
+/// pre-apply gate in this workspace asks.
+///
+/// # What it is not
+///
+/// It is **not** side-effect free, and its own documentation says so:
+/// module construction reads the AI provider registry, resolves secret
+/// references through the process secret resolver, populates the shared
+/// JWKS cache, and loads extension bundles, which for a `Git` source is
+/// a real fetch that can block for the source timeout. Those are reads
+/// and idempotent inserts rather than installs, so repeated calls are
+/// safe, but a caller cannot treat this as a pure function and this one
+/// does not.
+///
+/// Two consequences worth stating rather than discovering. A
+/// fallback-enabled node with a git-sourced extension bundle pays that
+/// fetch here and again in `run`, and each ring candidate the walk
+/// tries pays it once; the cost is bounded by the source timeout and by
+/// `max_attempts`, and it is the price of knowing a candidate
+/// constructs before booting onto it. And a candidate whose bundle
+/// source is unreachable fails this check, so a network partition
+/// during a rescue boot makes a candidate look unbootable when it is
+/// only unfetchable. Both are on the fallback path only: a node with
+/// `fallback: off` never reaches this function.
+///
+/// `base_dir` is the configured document's own directory, because a
+/// relative extension-bundle path in a candidate resolves against it
+/// exactly as it would at boot.
+fn boot_candidate_compiles(yaml: &str, base_dir: &std::path::Path) -> Result<(), String> {
     let resolved = crate::config_source::resolve(yaml).map_err(|error| format!("{error:#}"))?;
-    sbproxy_config::compile_config(&resolved.text).map_err(|error| format!("{error:#}"))?;
+    let compiled =
+        sbproxy_config::compile_config(&resolved.text).map_err(|error| format!("{error:#}"))?;
+    crate::pipeline::CompiledPipeline::from_config_for_validation_at(compiled, base_dir)
+        .map_err(|error| format!("{error:#}"))?;
     Ok(())
 }
 
@@ -3133,7 +3237,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
 ///
 /// As [`run`]. Additionally, when the fallback walked the whole ring and
 /// nothing booted, the returned error is the one
-/// [`crate::config_boot::BootWalkFailure`] renders, naming every
+/// the crate-private `config_boot::BootWalkFailure` renders, naming every
 /// revision tried and why; the binary turns that into
 /// [`crate::config_boot::EXIT_CONFIG_RING_EXHAUSTED`] rather than the
 /// plain `1` every other fatal boot failure uses.
@@ -8921,6 +9025,7 @@ egress:
         crate::config_boot::mark_on_fallback(crate::config_boot::PinnedRevision {
             revision: 3,
             digest: "rescued".to_string(),
+            reason: None,
         });
 
         let failures_before = reload_total("failure");
@@ -8944,6 +9049,90 @@ egress:
             suspended_before + 1.0,
             "it lands on its own label instead",
         );
+    }
+
+    /// A document that compiles and then fails to construct is a
+    /// failure the boot fallback must act on.
+    ///
+    /// `compile_config` leaves `action`, `policies`, `transforms` and
+    /// `authentication` as opaque JSON, so an unknown action type
+    /// passes it and fails later at
+    /// `CompiledPipeline::from_config_at`. While the pre-check stopped
+    /// at `compile_config`, the primary document's early return skipped
+    /// the walk entirely: the process exited fatally with no pin, no
+    /// boot counter and no walk, on every restart, on a node whose
+    /// operator had explicitly asked for a fallback. Module
+    /// construction is where most operator typos land, so the gap
+    /// covered the majority of the failures the feature exists for.
+    #[test]
+    fn a_document_that_compiles_but_does_not_construct_is_rescued_by_the_ring() {
+        crate::config_boot::reset_for_test();
+        let temp = tempfile::tempdir().expect("temp dir");
+        let config_path = temp.path().join("sb.yml");
+        // Compiles cleanly: `type` is opaque JSON to `compile_config`.
+        // Fails at construction with "unknown action type".
+        let will_not_construct = r#"
+proxy:
+  http_bind_port: 0
+  config_history:
+    enabled: true
+    dir: RING_DIR
+origins:
+  "api.test":
+    action:
+      type: load_balancerr
+"#
+        .replace("RING_DIR", &temp.path().join("ring").to_string_lossy());
+        std::fs::write(&config_path, &will_not_construct).expect("write");
+
+        // The document really does pass the two steps the pre-check
+        // used to stop at, so this test is measuring the third one and
+        // not a parse error.
+        let resolved =
+            crate::config_source::resolve(&will_not_construct).expect("source: resolves");
+        sbproxy_config::compile_config(&resolved.text)
+            .expect("it compiles; that is the whole point");
+
+        let good = "proxy:\n  http_bind_port: 0\n";
+        let _history = ring_with_a_good_revision(&temp.path().join("ring"), good);
+
+        let (yaml, pin) = boot_document(
+            config_path.to_str().expect("utf-8"),
+            Some(sbproxy_config::BootFallbackMode::LastKnownGood),
+        )
+        .expect("the ring holds a revision that constructs");
+
+        assert_eq!(
+            yaml, good,
+            "the node boots on the ring's revision, not on the document that will not construct",
+        );
+        let pin = pin.expect("a rescued boot is pinned");
+        let reason = pin
+            .reason
+            .expect("the pin names why the configured document failed");
+        assert!(
+            reason.contains("unknown action type"),
+            "and the reason is the construction failure itself: {reason}",
+        );
+        crate::config_boot::reset_for_test();
+    }
+
+    /// The construct step is in the candidate walk too, not only on the
+    /// primary. A ring entry that compiles and does not construct must
+    /// be walked past rather than booted onto.
+    #[test]
+    fn the_walk_skips_a_candidate_that_compiles_but_does_not_construct() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        assert!(
+            boot_candidate_compiles(
+                "origins:\n  \"api.test\":\n    action:\n      type: load_balancerr\n",
+                temp.path(),
+            )
+            .is_err_and(|reason| reason.contains("unknown action type")),
+            "the candidate test and the primary test have to be the same question",
+        );
+        boot_candidate_compiles("proxy:\n  http_bind_port: 0\n", temp.path())
+            .expect("a document that constructs still passes");
     }
 
     /// WOR-2459, tightened in the fix round (Major 6). With
@@ -8976,7 +9165,8 @@ egress:
 
         // And the error the operator sees is still the compile error,
         // raised by the same step `run` has always run on these bytes.
-        let reason = boot_candidate_compiles(&yaml).expect_err("a misspelled key must not compile");
+        let reason = boot_candidate_compiles(&yaml, std::path::Path::new("."))
+            .expect_err("a misspelled key must not compile");
         assert!(
             reason.contains("http2_cleartextt"),
             "the compile error is what the operator sees: {reason}",
@@ -9064,6 +9254,7 @@ egress:
         crate::config_boot::mark_on_fallback(crate::config_boot::PinnedRevision {
             revision: 9,
             digest: "rescued".to_string(),
+            reason: None,
         });
 
         // Exactly what the file watcher calls once the burst it saw goes
@@ -9142,6 +9333,89 @@ egress:
             "and it says the ring was empty: {rendered}",
         );
         assert!(!crate::config_boot::on_fallback());
+        crate::config_boot::reset_for_test();
+    }
+
+    /// The failure half of the fatal line is sanitized too, not only the
+    /// primary.
+    ///
+    /// `StoreUnavailable` carries a store-open error that names the ring
+    /// path, and that string is the operator's, so it can carry whatever
+    /// a path can. Reverting the second `scrub_boot_failure` at the
+    /// ring-empty and store-unavailable exits leaves the raw text in the
+    /// error that reaches `eprintln!("Fatal: ...")`, and before this
+    /// nothing noticed.
+    #[test]
+    fn the_store_unavailable_half_of_the_fatal_error_is_sanitized() {
+        crate::config_boot::reset_for_test();
+        let temp = tempfile::tempdir().expect("temp dir");
+
+        // A real ring at a path whose own name carries a control
+        // character, with a world-readable index, so `refuse_shared_files`
+        // refuses and names the widened file.
+        //
+        // Two things about the fixture are load bearing. The control
+        // byte reaches the config as a YAML `\u` sequence rather than
+        // literally, because a literal one fails the parse before the
+        // store is opened at all and falls back to the default ring
+        // directory, which would make this test pass without the
+        // production change.
+        // And the store error has to be one that carries the path:
+        // `RevisionStoreError::Io` renders an errno and no path, so the
+        // permission-denied open this was first written against proved
+        // nothing. Other store errors do carry it, including
+        // `RevisionStore::open`'s own `Corrupt` arms for a missing blob
+        // and an oversized file, so this is one of several routes rather
+        // than the only one; `refuse_shared_files` is simply the
+        // cheapest to set up.
+        use std::os::unix::fs::PermissionsExt as _;
+        let ring = temp.path().join("ring\u{1b}[2Jdir");
+        let _history = ring_with_a_good_revision(&ring, "proxy:\n  http_bind_port: 8080\n");
+        std::fs::set_permissions(
+            ring.join("index.json"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .expect("widen the index so the walk refuses and names the path");
+        let quoted = format!(
+            "{}/ring\\u001B[2Jdir",
+            temp.path().display().to_string().replace('\\', "\\\\")
+        );
+
+        let config_path = temp.path().join("sb.yml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "proxy:\n  http2_cleartextt: true\n  config_history:\n    enabled: true\n    \
+                 dir: \"{quoted}\"\n",
+            ),
+        )
+        .expect("write");
+
+        let error = boot_document(
+            config_path.to_str().expect("utf-8"),
+            Some(sbproxy_config::BootFallbackMode::LastKnownGood),
+        )
+        .expect_err("a ring that will not open cannot rescue this boot");
+        let rendered = format!("{error:#}");
+
+        assert!(
+            !rendered.chars().any(char::is_control),
+            "no control character reaches the fatal line: {rendered:?}",
+        );
+        assert!(
+            rendered.contains("http2_cleartextt"),
+            "the original failure is still the headline: {rendered}",
+        );
+        assert!(
+            rendered.contains("could not be opened"),
+            "and this really took the store-unavailable arm, which is the one that carries an \
+             operator-controlled string: {rendered}",
+        );
+        assert!(
+            rendered.contains("2Jdir"),
+            "the ring path reached this line, which is what makes the scrub load bearing \
+             rather than decorative: {rendered}",
+        );
         crate::config_boot::reset_for_test();
     }
 

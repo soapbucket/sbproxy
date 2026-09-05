@@ -15,6 +15,16 @@ retries = 0
 retries = 1
 fail-fast = false
 
+# A hung test has to name itself.
+#
+# Without a per-test termination limit, a stuck test can hold the lane
+# until the job timeout. A recent successful CI run took 349s for the
+# suite, with a process test exceeding 60s, so allow four minutes per
+# attempt rather than relying on local timings to size this limit.
+# `terminate-after = 2` means two 120s periods. The CI retry above allows
+# one further attempt; a persistent hang fails and reports the test name.
+slow-timeout = { period = "120s", terminate-after = 2 }
+
 [profile.ci.junit]
 path = "junit.xml"
 

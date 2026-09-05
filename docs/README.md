@@ -209,6 +209,7 @@ Point a framework you already run at the gateway: chat completions through the O
 - [operator-runbook.md](operator-runbook.md) - the `runbook_id` index every paging alert resolves through, a response section per id, plus dashboard triage and rollback actions.
 - [performance.md](performance.md) - tuning guide, benchmark methodology, profiling.
 - [capacity-planning.md](capacity-planning.md) - how big a pod: what memory is and is not measured, the commands that fill the gaps, a `resources:` starting point with its arithmetic shown, and OOM triage.
+- [config-rollback.md](config-rollback.md) - my config broke production, what do I type: read the history, roll a running node back, boot a dead one on its last known good, and undo a fleet-wide publish at the authority.
 - [degradation.md](degradation.md) - failure modes and graceful degradation behavior.
 
 ## Deployment
@@ -219,6 +220,8 @@ Point a framework you already run at the gateway: chat completions through the O
 - [kubernetes.md](kubernetes.md) - the Kubernetes operator and its CRDs.
 - [gateway-api.md](gateway-api.md) - the Gateway API controller: which `gateway.networking.k8s.io/v1` fields it translates, the status conditions it writes, and the explicit list of what it does not support.
 - [sidecar-deployment.md](sidecar-deployment.md) - running sbproxy as a per-pod sidecar: traffic capture (iptables / eBPF), service-mesh integration (Istio, Linkerd), and the kustomize overlay under `deploy/k8s/sidecar/`.
+- [origin-profiles.md](origin-profiles.md) - writing an `OriginProfile`: why it never names a host, how `inputs` work, what a project may set, and how to test one before merging.
+- [origin-aggregation.md](origin-aggregation.md) - running the aggregator: `origin_defaults` and what `locked` means, `origin_sources`, pinning per environment, and what happens when a project pushes something broken.
 - [upgrade.md](upgrade.md) - migration notes between releases.
 
 ## Migration and upgrading

@@ -62,11 +62,24 @@ fn temp_dir() -> PathBuf {
     path
 }
 
+/// What one transport attempt against the proxy reports.
+///
+/// These helpers returned `Option`, and every call site spent it on
+/// `.expect("...")`. That threw the cause away: a refused connection,
+/// a failed write and a read that timed out all arrived as the same
+/// bare `None`, so the panic at step 8 said only
+/// `admin licensing response` and named neither the port nor the
+/// errno. The error half carries both now.
+type Transport = Result<Vec<u8>, String>;
+
 /// One HTTP/1.1 request over a fresh connection. Returns the raw
-/// response bytes, or `None` while the listener is not yet up.
-fn request(port: u16, method: &str, path: &str, body: Option<&[u8]>) -> Option<Vec<u8>> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+/// response bytes, or the transport error that stopped it.
+fn request(port: u16, method: &str, path: &str, body: Option<&[u8]>) -> Transport {
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .map_err(|error| format!("connect to 127.0.0.1:{port} for {method} {path}: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| format!("set the read timeout on 127.0.0.1:{port}: {error}"))?;
     let mut head =
         format!("{method} {path} HTTP/1.1\r\nHost: marketplace.test\r\nConnection: close\r\n");
     if let Some(body) = body {
@@ -74,44 +87,62 @@ fn request(port: u16, method: &str, path: &str, body: Option<&[u8]>) -> Option<V
         head.push_str(&format!("Content-Length: {}\r\n", body.len()));
     }
     head.push_str("\r\n");
-    stream.write_all(head.as_bytes()).ok()?;
+    stream
+        .write_all(head.as_bytes())
+        .map_err(|error| format!("write {method} {path} to 127.0.0.1:{port}: {error}"))?;
     if let Some(body) = body {
-        stream.write_all(body).ok()?;
+        stream.write_all(body).map_err(|error| {
+            format!("write the {method} {path} body to 127.0.0.1:{port}: {error}")
+        })?;
     }
     let mut response = Vec::new();
-    stream.read_to_end(&mut response).ok()?;
-    Some(response)
+    stream
+        .read_to_end(&mut response)
+        .map_err(|error| format!("read {method} {path} from 127.0.0.1:{port}: {error}"))?;
+    Ok(response)
 }
 
 /// One HTTP/1.1 GET carrying HTTP Basic credentials.
-fn admin_get(port: u16, path: &str) -> Option<Vec<u8>> {
+fn admin_get(port: u16, path: &str) -> Transport {
     let credential =
         base64::engine::general_purpose::STANDARD.encode(format!("admin:{ADMIN_PASSWORD}"));
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).map_err(|error| {
+        format!("connect to the admin listener on 127.0.0.1:{port} for GET {path}: {error}")
+    })?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| format!("set the read timeout on 127.0.0.1:{port}: {error}"))?;
     write!(
         stream,
         "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Basic {credential}\r\n\
          Connection: close\r\n\r\n"
     )
-    .ok()?;
+    .map_err(|error| format!("write GET {path} to 127.0.0.1:{port}: {error}"))?;
     let mut response = Vec::new();
-    stream.read_to_end(&mut response).ok()?;
-    Some(response)
+    stream
+        .read_to_end(&mut response)
+        .map_err(|error| format!("read GET {path} from 127.0.0.1:{port}: {error}"))?;
+    Ok(response)
 }
 
 /// The same request with no credential, to prove the gate is real.
-fn admin_get_unauthenticated(port: u16, path: &str) -> Option<Vec<u8>> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+fn admin_get_unauthenticated(port: u16, path: &str) -> Transport {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).map_err(|error| {
+        format!("connect to the admin listener on 127.0.0.1:{port} for an unauthenticated GET {path}: {error}")
+    })?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| format!("set the read timeout on 127.0.0.1:{port}: {error}"))?;
     write!(
         stream,
         "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
     )
-    .ok()?;
+    .map_err(|error| format!("write GET {path} to 127.0.0.1:{port}: {error}"))?;
     let mut response = Vec::new();
-    stream.read_to_end(&mut response).ok()?;
-    Some(response)
+    stream
+        .read_to_end(&mut response)
+        .map_err(|error| format!("read GET {path} from 127.0.0.1:{port}: {error}"))?;
+    Ok(response)
 }
 
 /// Split a raw response into its status line plus headers, and its body.
@@ -123,47 +154,609 @@ fn split(response: &[u8]) -> (String, String) {
     }
 }
 
-fn start_proxy(root: &Path, config: &Path, port: u16) -> Child {
-    let mut child = Command::new(binary())
-        .arg("serve")
-        .arg(config)
-        .env_remove("SB_CONFIG_FILE")
-        .env("SBPROXY_ENGINE_OWNERSHIP_DIR", root.join("ownership"))
+/// 45s rather than the 20s its sibling federation test uses. Both spawn
+/// a full proxy, and this file was observed hitting exactly 20s on a
+/// machine that was still compiling the rest of the workspace. A startup
+/// deadline that a busy machine can trip is a flake, not a signal: the
+/// thing under test is what the proxy serves, not how fast it boots.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// How many times a lost port is worth re-drawing before giving up.
+///
+/// A loopback port handed out by the kernel is only reserved until this
+/// test drops the listener, and every other process test on the machine
+/// is drawing from the same range. Losing one is ordinary and says
+/// nothing about the proxy, so it is redrawn rather than reported.
+/// Losing five in a row is not ordinary and is reported.
+const PORT_ATTEMPTS: usize = 5;
+
+/// What the child writes when a listener cannot take the port it was
+/// handed.
+///
+/// Two spellings, because the runtime has two. Every other process test
+/// in this workspace that has to recognize this condition carries both
+/// (`chargeback_admin_wire.rs`, `classifier_hook_egress.rs`,
+/// `generated_response_large_body.rs`), and `listener_startup.rs`, whose
+/// whole subject is the public listener collision, requires both as
+/// well. A detector narrower than those is a detector that reports an
+/// ordinary redraw as a hard failure.
+///
+/// The two listeners report the same errno and are alike in nothing
+/// else. The public bind is fatal: the process prints to stderr and
+/// exits. The admin bind is not: `spawn_admin_server` logs at error
+/// through `tracing`, which this binary writes to **stdout**, and then
+/// the process goes on serving without an admin plane for the rest of
+/// its life. So the failure this test actually trips over is the quiet
+/// one, on the stream the test used to send to `/dev/null`, which is
+/// most of why it was opaque. Both streams are captured and both are
+/// searched.
+const ADDRESS_IN_USE_MARKERS: [&str; 2] = ["address already in use", "address in use"];
+
+/// Longest marker, so a scan that spans two reads carries enough of the
+/// previous one to match across the seam. Derived rather than written
+/// down, so adding a third spelling cannot leave the overlap short.
+const LONGEST_MARKER: usize = {
+    let first = ADDRESS_IN_USE_MARKERS[0].len();
+    let second = ADDRESS_IN_USE_MARKERS[1].len();
+    if first > second {
+        first
+    } else {
+        second
+    }
+};
+
+/// A running proxy and the two ports it actually took.
+///
+/// The ports come back from the start rather than going in, because a
+/// collision is resolved by redrawing them: the caller cannot hold a
+/// port that the start may have had to abandon.
+struct Proxy {
+    child: Child,
+    child_reaped: bool,
+    port: u16,
+    admin_port: u16,
+    output: ChildOutput,
+}
+
+/// Both of the child's output streams, drained on their own threads.
+///
+/// Drained rather than left in the pipes for two reasons. The readiness
+/// loop below has to read them while the child is still running, to
+/// tell a lost port from a slow boot without waiting out the whole
+/// deadline. And a child that fills a 64 KB pipe buffer blocks in
+/// `write` forever when nobody is reading, which would turn a noisy
+/// boot into a hang; the old `Stdio::null()` on stdout avoided that by
+/// throwing away the stream the admin bind failure is written to.
+struct ChildOutput {
+    /// Retained bytes, for a panic message. Bounded, and bounded at the
+    /// **front**: the interesting line is the last one the child wrote,
+    /// so a full buffer drops the oldest bytes rather than refusing the
+    /// newest.
+    buffer: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    /// Set by whichever pump sees a marker, so detection never depends
+    /// on what survived the cap. The bind failure is logged at the end
+    /// of a boot, which is exactly the part a front-filling buffer
+    /// discards, so a chatty boot used to blind the detector at the
+    /// moment it mattered.
+    lost_a_port: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    readers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl ChildOutput {
+    /// Cap on what is retained for the transcript.
+    const CAP: usize = 256 * 1024;
+
+    /// How long `finish` waits for a pump to end before giving up on it.
+    ///
+    /// A pump ends when its pipe closes, which is when the last holder
+    /// of the write end exits. That is normally the child, but a
+    /// descendant that inherited the handle would keep it open, and an
+    /// unbounded join on a path that is already failing turns a panic
+    /// with a message into a hang with none.
+    const JOIN_GRACE: Duration = Duration::from_secs(5);
+
+    fn drain(stdout: std::process::ChildStdout, stderr: std::process::ChildStderr) -> Self {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let lost_a_port = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let readers = vec![
+            Self::pump(
+                Box::new(stdout),
+                std::sync::Arc::clone(&buffer),
+                std::sync::Arc::clone(&lost_a_port),
+            ),
+            Self::pump(
+                Box::new(stderr),
+                std::sync::Arc::clone(&buffer),
+                std::sync::Arc::clone(&lost_a_port),
+            ),
+        ];
+        Self {
+            buffer,
+            lost_a_port,
+            readers,
+        }
+    }
+
+    fn pump(
+        mut pipe: Box<dyn std::io::Read + Send>,
+        sink: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        lost_a_port: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 8192];
+            // The tail of the previous read, lowercased, so a marker
+            // split across two reads still matches.
+            let mut carry: Vec<u8> = Vec::new();
+            loop {
+                let read = match pipe.read(&mut chunk) {
+                    Ok(0) => return,
+                    Ok(read) => read,
+                    Err(error) => {
+                        // Not the same thing as EOF, and the difference
+                        // matters: a stream that stopped early leaves a
+                        // partial transcript, and a reader who cannot
+                        // see that will read the absence of a line as
+                        // evidence the child never wrote it.
+                        let note =
+                            format!("\n[test harness: reading this stream failed: {error}]\n");
+                        let mut held = sink.lock().unwrap_or_else(|e| e.into_inner());
+                        Self::append(&mut held, note.as_bytes());
+                        return;
+                    }
+                };
+                let mut scan = carry.clone();
+                scan.extend(chunk[..read].iter().map(|b| b.to_ascii_lowercase()));
+                let scanned = String::from_utf8_lossy(&scan);
+                if ADDRESS_IN_USE_MARKERS
+                    .iter()
+                    .any(|marker| scanned.contains(marker))
+                {
+                    lost_a_port.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                let keep = scan.len().saturating_sub(LONGEST_MARKER.saturating_sub(1));
+                carry = scan[keep..].to_vec();
+                let mut held = sink.lock().unwrap_or_else(|e| e.into_inner());
+                Self::append(&mut held, &chunk[..read]);
+            }
+        })
+    }
+
+    /// Append, dropping from the front rather than refusing at the back.
+    fn append(held: &mut Vec<u8>, bytes: &[u8]) {
+        held.extend_from_slice(bytes);
+        if held.len() > Self::CAP {
+            let excess = held.len() - Self::CAP;
+            held.drain(..excess);
+        }
+    }
+
+    fn snapshot(&self) -> String {
+        let held = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
+        String::from_utf8_lossy(&held).into_owned()
+    }
+
+    /// True once the child has said it could not take a port. Either
+    /// listener, either stream, either spelling: see
+    /// [`ADDRESS_IN_USE_MARKERS`].
+    ///
+    /// Reads one atomic. The readiness loop calls this every 50ms for up
+    /// to 45 seconds, and the previous version cloned the whole buffer
+    /// and lowercased the clone on each of those ~900 passes, which on a
+    /// full buffer is hundreds of megabytes of churn contending with the
+    /// two pumps.
+    fn lost_a_port(&self) -> bool {
+        self.lost_a_port.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Everything the readers retained, once they have ended or the
+    /// grace has passed.
+    fn finish(mut self) -> String {
+        let deadline = Instant::now() + Self::JOIN_GRACE;
+        let mut abandoned = 0usize;
+        for reader in self.readers.drain(..) {
+            while !reader.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if reader.is_finished() {
+                let _ = reader.join();
+            } else {
+                abandoned += 1;
+            }
+        }
+        let mut text = self.snapshot();
+        if abandoned > 0 {
+            text.push_str(&format!(
+                "\n[test harness: {abandoned} of the child's streams were still open after \
+                 {}s, so this transcript may be short; something still holds the write end]\n",
+                Self::JOIN_GRACE.as_secs()
+            ));
+        }
+        text
+    }
+}
+
+/// True once the origin's ordinary route answers with an HTTP response.
+///
+/// The origin's ordinary route, not a licensing endpoint: both licensing
+/// halves share one per-source budget, and a readiness loop that spent
+/// it would leave the walkthrough below testing an exhausted bucket
+/// rather than the flow.
+///
+/// An HTTP status line rather than merely a read that did not error.
+/// `read_to_end` reports `Ok(0)` for a socket that was accepted and
+/// closed without a byte on it, which the previous `is_some()` check
+/// counted as ready.
+fn serves_public_plane(port: u16) -> bool {
+    request(port, "GET", "/", None).is_ok_and(|raw| raw.starts_with(b"HTTP/1.1"))
+}
+
+/// True once the admin listener answers `/admin/licensing` at all.
+///
+/// This is the check the old readiness loop did not have, and its
+/// absence is the whole flake. The two listeners come up independently:
+/// `run` binds the public one, and only afterwards spawns the thread
+/// that builds its own runtime, builds a probe HTTP client, and finally
+/// binds the admin port inside a spawned task. Nothing orders the
+/// second against the first, so a proxy can serve the public plane
+/// while the admin port is still refusing connections. Step 8 is the
+/// first line in this file to touch that port, which is why the race
+/// always surfaced there, and why a nextest retry did not absorb it:
+/// the retry runs on the same loaded machine and loses the same race.
+///
+/// The status line and nothing else. An earlier version of this also
+/// required `enabled: true` from the parsed body, which is exactly what
+/// step 8 asserts, and that made step 8's assertions unreachable: any
+/// state where they would fail is a state where this never returns
+/// true, so a bridge reporting `enabled: false` came out as a 45 second
+/// "did not serve" with neither the status nor the body in the message,
+/// instead of `enabled was false`. Waiting on the answer is also a
+/// retry wrapped around an assertion, spelled as readiness.
+///
+/// A 200 is the whole of what readiness needs here, because the defect
+/// this closes is a refused connection. The route's own contents are
+/// step 8's to judge, once.
+///
+/// Narrowing it is safe rather than merely cheaper, and the ordering is
+/// why: `reload::load_pipeline` runs at `server/lifecycle.rs:3555`,
+/// before `prepare_listeners` at `:3964` and long before the admin
+/// thread is spawned at `:4358`. The pipeline is therefore published
+/// before the admin port can bind, so an answer from this route already
+/// carries the bridge. Waiting on `enabled: true` never proved anything
+/// a 200 did not; it only moved step 8's failure into this loop's
+/// timeout.
+fn serves_admin_plane(port: u16) -> AdminProbe {
+    match admin_get(port, "/admin/licensing") {
+        Ok(raw) if raw.starts_with(b"HTTP/1.1 200") => AdminProbe::Serving,
+        Ok(_) => AdminProbe::Answered,
+        Err(_) => AdminProbe::Unreachable,
+    }
+}
+
+/// What one probe of the admin plane cost and learned.
+///
+/// Split three ways because only one of the three spends anything. The
+/// admin rate limiter is always on and defaults to 240 requests per
+/// minute per IP, and `/admin/licensing` is not on its exemption list,
+/// which covers only static console assets. A probe that is refused at
+/// connect never reaches the limiter, so polling a port that is not yet
+/// bound is free and can stay fast. A probe that gets an answer has
+/// spent one, so a plane that answers something other than 200 has to
+/// be asked slowly or the readiness loop exhausts in twelve seconds the
+/// budget it is waiting on, and every later probe gets a 429 it can
+/// never recover from.
+enum AdminProbe {
+    /// A 200. Readiness is satisfied.
+    Serving,
+    /// An answer, but not a 200. Cost one request against the limiter.
+    Answered,
+    /// Refused, reset, or timed out. Cost nothing.
+    Unreachable,
+}
+
+/// Boot the shipped binary on a fresh pair of loopback ports and wait
+/// until both planes this test drives are serving.
+///
+/// `config_for` renders the `sb.yml` for a given public and admin port.
+/// It is a closure rather than a written file because a collision is
+/// resolved by redrawing both ports, and the configuration names them.
+fn start_proxy(root: &Path, config_for: impl Fn(u16, u16) -> String) -> Proxy {
+    let mut lost = Vec::new();
+    for attempt in 0..PORT_ATTEMPTS {
+        // Both reservations are held at once and released together.
+        // Taken one at a time, with the first released before the second
+        // is asked for, the kernel is free to hand the same port back
+        // twice: the proxy then binds it as its public listener, the
+        // admin bind fails with the address in use, and every admin
+        // request in this test lands on the public plane.
+        let public_reservation =
+            TcpListener::bind("127.0.0.1:0").expect("reserve an ephemeral port");
+        let admin_reservation =
+            TcpListener::bind("127.0.0.1:0").expect("reserve an ephemeral admin port");
+        let port = public_reservation
+            .local_addr()
+            .expect("read the reserved address")
+            .port();
+        let admin_port = admin_reservation
+            .local_addr()
+            .expect("read the reserved admin address")
+            .port();
+        let config = root.join(format!("sb-{attempt}.yml"));
+        std::fs::write(&config, config_for(port, admin_port)).expect("write the process config");
+        // Released as late as possible. Nothing can close the window
+        // between a reservation ending and the child's own bind, since
+        // the child takes its ports from a file, so the window is kept
+        // as narrow as it can be and a lost draw is redrawn below.
+        drop(public_reservation);
+        drop(admin_reservation);
+        let mut command = Command::new(binary());
+        command
+            .arg("serve")
+            .arg(&config)
+            .env_remove("SB_CONFIG_FILE")
+            .env(
+                "SBPROXY_ENGINE_OWNERSHIP_DIR",
+                root.join(format!("ownership-{attempt}")),
+            )
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // Its own process group, so the teardown can take down whatever
+        // the proxy spawned rather than only the proxy itself. The same
+        // move `sbproxy-config/src/source.rs:522` makes for its `git`
+        // children, and for the same reason.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.process_group(0);
+        }
+        let mut child = command.spawn().expect("start sbproxy");
+        let output = ChildOutput::drain(
+            child.stdout.take().expect("sbproxy stdout is piped"),
+            child.stderr.take().expect("sbproxy stderr is piped"),
+        );
+        match wait_until_serving(&mut child, &output, port, admin_port) {
+            Startup::Serving => {
+                return Proxy {
+                    child,
+                    child_reaped: false,
+                    port,
+                    admin_port,
+                    output,
+                }
+            }
+            Startup::LostAPort => {
+                let _ = child.kill();
+                let _ = child.wait();
+                lost.push(format!("attempt {attempt}: {port}/{admin_port}"));
+            }
+            Startup::Exited => {
+                let _ = child.wait();
+                // Re-checked on the completed transcript rather than on
+                // the snapshot the loop happened to see. The child
+                // writes its bind failure and exits immediately after,
+                // so a reader thread that had not drained the pipe yet
+                // when `try_wait` observed the exit would turn a lost
+                // port into a hard failure. `finish` joins the readers,
+                // so what it returns is everything the child ever said.
+                let transcript = output.finish();
+                let lowered = transcript.to_ascii_lowercase();
+                if ADDRESS_IN_USE_MARKERS
+                    .iter()
+                    .any(|marker| lowered.contains(marker))
+                {
+                    lost.push(format!("attempt {attempt}: {port}/{admin_port}"));
+                    continue;
+                }
+                panic!("sbproxy exited before serving the CoMP manifest: {transcript}");
+            }
+            Startup::TimedOut => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "sbproxy did not serve both the CoMP manifest on {port} and \
+                     /admin/licensing on {admin_port} within {}s: {}",
+                    STARTUP_TIMEOUT.as_secs(),
+                    output.finish()
+                );
+            }
+        }
+    }
+    panic!(
+        "sbproxy lost a loopback port to another process on every attempt: {}",
+        lost.join("; ")
+    );
+}
+
+impl Drop for Proxy {
+    /// Kill and reap the child on every path that unwinds or returns.
+    ///
+    /// Not "whatever ended the test", which is what this said and could
+    /// not deliver. `Drop` runs on a normal return and on a panic
+    /// unwind, and both of those are now covered where before only the
+    /// happy path was. It cannot run when the harness itself is killed
+    /// outright, and no amount of care here changes that: a SIGKILL to
+    /// this process leaves the proxy reparented to init, which is the
+    /// likeliest explanation for the orphan from this test found alive
+    /// in another worktree after a day and a half. That orphan is
+    /// evidence for the cost of leaking, not for what this `Drop` can
+    /// prevent.
+    ///
+    /// What leaking costs is the reason to close the paths that can be
+    /// closed: an orphan holds both its loopback ports for as long as it
+    /// lives, so a leak on one failure raises the odds of the port
+    /// collision that fails the next run.
+    ///
+    /// The teardown at the end of the test is now this, and only this,
+    /// so there is one owner rather than a happy path that cleans up and
+    /// a failure path that does not.
+    fn drop(&mut self) {
+        // Read before reaping: once `wait` returns, the pid is free to
+        // be recycled, and signalling a recycled pid's group would hit
+        // an unrelated process.
+        // A transport-failure diagnostic may have already reaped the child.
+        #[cfg(unix)]
+        if let Some(mut command) = self.group_cleanup_command() {
+            let _ = command.status();
+        }
+        // Also handles platforms without process groups or a failed command.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Proxy {
+    #[cfg(unix)]
+    fn group_cleanup_command(&self) -> Option<Command> {
+        (!self.child_reaped).then(|| process_group_kill_command(self.child.id()))
+    }
+}
+
+#[cfg(unix)]
+fn process_group_kill_command(pid: u32) -> Command {
+    let mut command = Command::new("/bin/kill");
+    // procps can parse an unseparated negative PID by its first digit:
+    // -123 becomes -1, which signals every process we may kill.
+    command
+        .arg("-KILL")
+        .arg("--")
+        .arg(format!("-{pid}"))
         .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+#[cfg(unix)]
+#[test]
+fn process_group_cleanup_separates_the_negative_pid_from_options() {
+    let command = process_group_kill_command(12345);
+    assert_eq!(command.get_program(), "/bin/kill");
+    assert_eq!(
+        command.get_args().collect::<Vec<_>>(),
+        ["-KILL", "--", "-12345"]
+    );
+    // Do not execute a regressed SIGKILL command: it could kill the runner.
+}
+
+#[cfg(unix)]
+#[test]
+fn transport_failure_does_not_signal_a_reaped_process_group() {
+    use std::os::unix::process::CommandExt as _;
+
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .process_group(0)
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("start sbproxy");
-    // 45s rather than the 20s its sibling federation test uses. Both
-    // spawn a full proxy, and this file was observed hitting exactly 20s
-    // on a machine that was still compiling the rest of the workspace.
-    // A startup deadline that a busy machine can trip is a flake, not a
-    // signal: the thing under test is what the proxy serves, not how
-    // fast it boots.
-    let deadline = Instant::now() + Duration::from_secs(45);
+        .expect("spawn exited diagnostic fixture");
+    let output = ChildOutput::drain(
+        child.stdout.take().expect("fixture stdout"),
+        child.stderr.take().expect("fixture stderr"),
+    );
+    child.wait().expect("fixture exits before the diagnostic");
+    let mut proxy = Proxy {
+        child,
+        child_reaped: false,
+        port: 0,
+        admin_port: 0,
+        output,
+    };
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        expect_response(&mut proxy, Err("connection refused".into()), "fixture");
+    }));
+    let cleanup_disabled = proxy.group_cleanup_command().is_none();
+    // Keep this regression safe even if the diagnostic stops marking reaping.
+    proxy.child_reaped = true;
+    assert!(
+        failure.is_err(),
+        "the transport failure must still be reported"
+    );
+    assert!(
+        cleanup_disabled,
+        "a reaped PID must not be signalled as a group"
+    );
+}
+
+/// Why a startup stopped.
+enum Startup {
+    /// Both planes answer.
+    Serving,
+    /// A listener could not take the port it was handed, so the draw is
+    /// worth repeating. Not a failure of anything this test covers.
+    LostAPort,
+    /// The child is gone.
+    Exited,
+    /// Neither of the above inside [`STARTUP_TIMEOUT`].
+    TimedOut,
+}
+
+fn wait_until_serving(
+    child: &mut Child,
+    output: &ChildOutput,
+    port: u16,
+    admin_port: u16,
+) -> Startup {
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
     loop {
-        if child.try_wait().expect("poll sbproxy").is_some() {
-            let output = child.wait_with_output().expect("collect sbproxy output");
-            panic!(
-                "sbproxy exited before serving the CoMP manifest: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+        // Checked before the child's own status: an admin bind that lost
+        // its port is logged and then survived, so waiting for an exit
+        // that never comes would spend the whole deadline on a condition
+        // one line of the captured output already settles. That line is
+        // on stdout, not stderr, which is the distinction the first cut
+        // of this fix got wrong.
+        if output.lost_a_port() {
+            return Startup::LostAPort;
         }
-        // Poll the origin's ordinary route, not a licensing endpoint.
-        // Both licensing halves now share one per-source budget, and a
-        // readiness loop that spent it would leave the walkthrough below
-        // testing an exhausted bucket rather than the flow.
-        if request(port, "GET", "/", None).is_some() {
-            return child;
+        if child.try_wait().expect("poll sbproxy").is_some() {
+            return Startup::Exited;
+        }
+        let mut answered_without_serving = false;
+        if serves_public_plane(port) {
+            match serves_admin_plane(admin_port) {
+                AdminProbe::Serving => return Startup::Serving,
+                AdminProbe::Answered => answered_without_serving = true,
+                AdminProbe::Unreachable => {}
+            }
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let output = child.wait_with_output().expect("collect timed-out sbproxy");
+            return Startup::TimedOut;
+        }
+        // A probe that was answered spent one of the 240 the admin
+        // limiter allows per minute, so it is asked once a second rather
+        // than twenty times. A refused one spent nothing and keeps the
+        // fast cadence, which is the case this loop exists for.
+        std::thread::sleep(if answered_without_serving {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_millis(50)
+        });
+    }
+}
+
+/// Unwrap a transport attempt, saying what the proxy was doing when it
+/// failed.
+///
+/// A refused connection and a dead proxy are the same errno from the
+/// socket's side, and the second is the one worth knowing: it means the
+/// process exited and wrote the reason to its output. Reporting only the
+/// errno is how a connection refused by an admin listener that was not
+/// up yet read as a licensing bug for two CI rounds.
+fn expect_response(proxy: &mut Proxy, attempt: Transport, what: &str) -> Vec<u8> {
+    match attempt {
+        Ok(raw) => raw,
+        Err(error) => {
+            let fate = match proxy.child.try_wait() {
+                Ok(Some(status)) => {
+                    proxy.child_reaped = true;
+                    format!("the proxy had already exited with {status}")
+                }
+                Ok(None) => "the proxy was still running".to_string(),
+                Err(error) => format!("the proxy's status could not be read: {error}"),
+            };
             panic!(
-                "sbproxy did not serve the CoMP manifest: {}",
-                String::from_utf8_lossy(&output.stderr)
+                "{what}: {error}; {fate}. proxy output:\n{}",
+                proxy.output.snapshot()
             );
         }
-        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -241,15 +834,7 @@ fn security_boundary_a_configured_origin_sells_licenses_and_refuses_the_rest() {
     let buyer = SigningKey::from_bytes(&BUYER_SEED);
     let buyer_public =
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buyer.verifying_key().to_bytes());
-    let reserved = TcpListener::bind("127.0.0.1:0").expect("reserve ephemeral port");
-    let port = reserved.local_addr().expect("reserved address").port();
-    drop(reserved);
-    let reserved = TcpListener::bind("127.0.0.1:0").expect("reserve ephemeral admin port");
-    let admin_port = reserved.local_addr().expect("reserved address").port();
-    drop(reserved);
-    let config = root.join("sb.yml");
-    std::fs::write(
-        &config,
+    let mut proxy = start_proxy(&root, |port, admin_port| {
         format!(
             r#"proxy:
   http_bind_port: {port}
@@ -302,15 +887,17 @@ origins:
         - kid: buyer-acme-001
           public_key: "{buyer_public}"
 "#
-        ),
-    )
-    .expect("write process config");
-
-    let mut child = start_proxy(&root, &config, port);
+        )
+    });
+    let port = proxy.port;
+    let admin_port = proxy.admin_port;
 
     // --- 1. The manifest, from the config block ---
-    let raw = request(port, "GET", "/.well-known/iab-comp/manifest.json", None)
-        .expect("manifest response");
+    let raw = expect_response(
+        &mut proxy,
+        request(port, "GET", "/.well-known/iab-comp/manifest.json", None),
+        "manifest response",
+    );
     let (head, body) = split(&raw);
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
     let lowered = head.to_ascii_lowercase();
@@ -351,13 +938,16 @@ origins:
         "audience": "marketplace.test",
     })
     .to_string();
-    let raw = request(
-        port,
-        "POST",
-        "/.well-known/iab-comp/quote",
-        Some(quote_body.as_bytes()),
-    )
-    .expect("quote response");
+    let raw = expect_response(
+        &mut proxy,
+        request(
+            port,
+            "POST",
+            "/.well-known/iab-comp/quote",
+            Some(quote_body.as_bytes()),
+        ),
+        "quote response",
+    );
     let (head, body) = split(&raw);
     assert!(head.starts_with("HTTP/1.1 200"), "{head}\n{body}");
     assert!(
@@ -377,8 +967,11 @@ origins:
 
     // --- 3. The redeem, and the token it mints ---
     let redeem = signed_redeem(&quote, &quote.quote_id, "buyer-acme-001", &buyer);
-    let raw = request(port, "POST", "/.well-known/iab-comp/redeem", Some(&redeem))
-        .expect("redeem response");
+    let raw = expect_response(
+        &mut proxy,
+        request(port, "POST", "/.well-known/iab-comp/redeem", Some(&redeem)),
+        "redeem response",
+    );
     let (head, body) = split(&raw);
     assert!(head.starts_with("HTTP/1.1 200"), "{head}\n{body}");
     assert!(
@@ -419,8 +1012,11 @@ origins:
     // --- 4. Fails closed: a key this publisher never onboarded ---
     let stranger = SigningKey::from_bytes(&[0x7Bu8; 32]);
     let forged = signed_redeem(&quote, &quote.quote_id, "buyer-not-onboarded", &stranger);
-    let (head, body) =
-        split(&request(port, "POST", "/.well-known/iab-comp/redeem", Some(&forged)).expect("resp"));
+    let (head, body) = split(&expect_response(
+        &mut proxy,
+        request(port, "POST", "/.well-known/iab-comp/redeem", Some(&forged)),
+        "the refusal of a key this publisher never onboarded",
+    ));
     assert!(head.starts_with("HTTP/1.1 401"), "{head}\n{body}");
     assert!(body.contains("unknown_key"), "{body}");
     assert!(
@@ -435,15 +1031,16 @@ origins:
         "buyer-acme-001",
         &buyer,
     );
-    let (head, body) = split(
-        &request(
+    let (head, body) = split(&expect_response(
+        &mut proxy,
+        request(
             port,
             "POST",
             "/.well-known/iab-comp/redeem",
             Some(&fabricated),
-        )
-        .expect("resp"),
-    );
+        ),
+        "the refusal of a quote_id this publisher never issued",
+    ));
     assert!(head.starts_with("HTTP/1.1 403"), "{head}\n{body}");
     assert!(body.contains("unknown_quote"), "{body}");
     assert!(
@@ -452,15 +1049,16 @@ origins:
     );
 
     // --- 6. Fails closed: a body this endpoint cannot read ---
-    let (head, body) = split(
-        &request(
+    let (head, body) = split(&expect_response(
+        &mut proxy,
+        request(
             port,
             "POST",
             "/.well-known/iab-comp/quote",
             Some(b"{not json"),
-        )
-        .expect("resp"),
-    );
+        ),
+        "the refusal of a body this endpoint cannot read",
+    ));
     assert!(head.starts_with("HTTP/1.1 400"), "{head}\n{body}");
     assert!(body.contains("malformed"), "{body}");
 
@@ -476,7 +1074,11 @@ origins:
         "/.well-known/iab-comp/redeem",
         "/.well-known/iab-comp/quote",
     ] {
-        let (head, body) = split(&request(port, "GET", path, None).expect("resp"));
+        let (head, body) = split(&expect_response(
+            &mut proxy,
+            request(port, "GET", path, None),
+            "the method contract refusal",
+        ));
         assert!(head.starts_with("HTTP/1.1 405"), "{path}: {head}");
         let lowered = head.to_ascii_lowercase();
         assert!(
@@ -490,15 +1092,16 @@ origins:
         assert!(body.contains("method_not_allowed"), "{path}: {body}");
     }
     // The manifest route is the GET one, so POST is its wrong method.
-    let (head, body) = split(
-        &request(
+    let (head, body) = split(&expect_response(
+        &mut proxy,
+        request(
             port,
             "POST",
             "/.well-known/iab-comp/manifest.json",
             Some(b"{}"),
-        )
-        .expect("resp"),
-    );
+        ),
+        "the manifest route's wrong-method refusal",
+    ));
     assert!(head.starts_with("HTTP/1.1 405"), "{head}");
     assert!(body.contains("method_not_allowed"), "{body}");
 
@@ -509,8 +1112,11 @@ origins:
     // `enabled: false` answer would have satisfied both. This is the
     // populated branch, over the wire, on a running proxy, behind the
     // auth gate the route is documented to sit behind.
-    let (head, body) =
-        split(&admin_get(admin_port, "/admin/licensing").expect("admin licensing response"));
+    let (head, body) = split(&expect_response(
+        &mut proxy,
+        admin_get(admin_port, "/admin/licensing"),
+        "admin licensing response",
+    ));
     assert!(head.starts_with("HTTP/1.1 200"), "{head}\n{body}");
     let admin: serde_json::Value = serde_json::from_str(&body).expect("admin body is JSON");
     assert_eq!(admin["enabled"], true, "{body}");
@@ -543,8 +1149,11 @@ origins:
     assert!(!body.contains(token), "{body}");
 
     // The gate itself: the same route with no credential.
-    let (head, _) =
-        split(&admin_get_unauthenticated(admin_port, "/admin/licensing").expect("unauthenticated"));
+    let (head, _) = split(&expect_response(
+        &mut proxy,
+        admin_get_unauthenticated(admin_port, "/admin/licensing"),
+        "the unauthenticated admin licensing response",
+    ));
     assert!(
         head.starts_with("HTTP/1.1 401"),
         "the licensing route must sit behind operator auth: {head}"
@@ -567,8 +1176,11 @@ origins:
     // guaranteed to run out inside the loop whatever the walkthrough
     // above already spent.
     for _ in 0..40 {
-        let (head, body) =
-            split(&request(port, "POST", "/.well-known/olp/token", Some(b"{}")).expect("resp"));
+        let (head, body) = split(&expect_response(
+            &mut proxy,
+            request(port, "POST", "/.well-known/olp/token", Some(b"{}")),
+            "an OLP token mint",
+        ));
         if head.starts_with("HTTP/1.1 200") {
             assert_eq!(
                 refused, 0,
@@ -610,8 +1222,11 @@ origins:
     // which step 10 has already spent, so the very next CoMP call is
     // refused. That shared exhaustion is itself the point: one number
     // governs both halves of one licensing surface.
-    let (head, body) =
-        split(&request(port, "GET", "/.well-known/iab-comp/manifest.json", None).expect("resp"));
+    let (head, body) = split(&expect_response(
+        &mut proxy,
+        request(port, "GET", "/.well-known/iab-comp/manifest.json", None),
+        "the manifest request that shares the origin's budget",
+    ));
     assert!(
         head.starts_with("HTTP/1.1 429"),
         "the CoMP half must share the origin's budget: {head}\n{body}"
@@ -622,7 +1237,8 @@ origins:
         "a 429 a client should back off from carries Retry-After: {head}"
     );
 
-    let _ = child.kill();
-    let _ = child.wait();
+    // Dropped before the directory is removed, so the proxy is gone
+    // before its configuration and ownership directory go with it.
+    drop(proxy);
     let _ = std::fs::remove_dir_all(root);
 }

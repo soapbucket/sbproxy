@@ -134,7 +134,7 @@ curl -sS -u admin:"$ADMIN_PASSWORD" \
 }
 ```
 
-Break the payload on purpose and the refusal names the step that caught it, and confirms nothing was spent:
+Break the payload on purpose and the refusal names the step that caught it and says whether it spent a revision number. Read `revision_consumed` rather than inferring the spend from the code: a validation refusal like this one costs nothing, so it is `false`; `signing_failed` and `internal` are always after the reservation and report `true`; and `store_failed` sits on both sides of it, because the store both reserves the number and persists the bundle:
 
 ```json
 {

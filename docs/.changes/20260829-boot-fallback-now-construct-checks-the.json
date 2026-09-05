@@ -1,0 +1,4 @@
+{
+  "type": "added",
+  "message": "Boot fallback covers a configured document that parses and compiles but whose modules will not construct, which is where most operator typos land. Without the construct check such a document exits fatally with no pin, no boot counter and no ring walk on every restart, even with --config-fallback=last-known-good; it is rescued from the revision ring like any other failure and the pin names the construction error. Neither the flag nor this check has appeared in a release, so they ship together."
+}

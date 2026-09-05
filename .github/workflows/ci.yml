@@ -1,11 +1,11 @@
 name: CI
-# --- Workflow shape (updated 2026-07-31) ---
+# --- Workflow shape (updated 2026-09-05) ---
 # Every lane runs in parallel and `build / test` is a zero-cost aggregator
 # that fails if any lane failed. Branch protection keeps requiring the one
 # `build / test` check; the work underneath it fans out.
 #
 #   changes        (~10 s)  path filter, consumed by every other lane
-#   test           (~9 min) one workspace build -> nextest -> doctests ->
+#   test           (~21 min before combined build) build -> nextest -> doctests ->
 #                           generated-artifact freshness checks
 #   lint           (~4 min) fmt, clippy, rustdoc
 #   guards         (~30 s)  no-compiler guards that must run on docs-only
@@ -21,8 +21,8 @@ name: CI
 #   embed-admin-ui (~6 min) SPA build + the release binary's feature union
 #   build / test   (~5 s)   aggregator; the required status check
 #
-# The dominant cost here is rustc, not test execution: 8763 tests run in
-# about 96 seconds. Two rules keep the rustc bill down.
+# Main run 33318357937 spent 12m43 compiling and 5m49 running 15,954 tests.
+# Two rules keep the rustc bill down.
 #
 #   1. Every cargo invocation inside a job MUST use the same package
 #      selection. Under resolver = "2" the feature union is computed from
@@ -182,7 +182,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # 30m build + 20m tests leave 10m for setup, the remaining checks,
+    # diagnostics, and cache post-steps on a cold or slow runner.
+    timeout-minutes: 60
     permissions:
       contents: read
     steps:
@@ -205,15 +207,19 @@ jobs:
 
       - uses: taiki-e/install-action@nextest
 
-      # One build for the whole lane. `--workspace --exclude sbproxy-e2e` is
-      # the package selection every later cargo call in this job repeats
-      # verbatim, so they all resolve the same feature union and reuse these
-      # artifacts instead of recompiling the graph.
-      #
-      # This also produces target/debug/sbproxy and the generate-* binaries
-      # the freshness checks below exec directly.
-      - name: build workspace
-        run: cargo build --workspace --exclude sbproxy-e2e --locked
+      # Compile normal binaries and test harnesses in one Cargo invocation,
+      # so the scheduler can overlap their work. The old separate builds
+      # took 3m37 + 9m06 on main (run 33318357937), before 5m49 of tests.
+      # Keep the same package selection and test profile as nextest below.
+      # --bins also builds the generators used by the freshness checks.
+      - name: build workspace and test binaries
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/ci-test"
+          /usr/bin/time -v timeout --signal=TERM --kill-after=60s 30m \
+            cargo build --workspace --exclude sbproxy-e2e --locked \
+              --profile test --bins --tests --timings \
+            2>&1 | tee "${RUNNER_TEMP}/ci-test/build.log"
 
       # The bulk of the e2e suite is intentionally OUT OF SCOPE for this
       # job. Those tests spin up the full proxy binary, listen on real
@@ -225,7 +231,29 @@ jobs:
       # cardinality and redaction canaries in the obs-budgets job, and the
       # required offline subset in the e2e-subset job (WOR-2469).
       - name: test (excludes e2e)
-        run: cargo nextest run --workspace --exclude sbproxy-e2e --locked --profile ci
+        shell: bash
+        # Compilation is measured separately above. Keep a process timeout
+        # as well as nextest's per-test timeout: discovery can hang too.
+        # Bash's pipefail preserves failures through tee.
+        run: |
+          /usr/bin/time -v timeout --signal=TERM --kill-after=60s 20m \
+            cargo nextest run --workspace --exclude sbproxy-e2e --locked --profile ci \
+            2>&1 | tee "${RUNNER_TEMP}/ci-test/tests.log"
+
+      # Upload before the filtered Redis runs overwrite nextest's JUnit file.
+      # Failed builds/tests still leave their output when the runner survives;
+      # runner loss can prevent any post-step, including this upload.
+      - name: retain test diagnostics
+        if: always()
+        timeout-minutes: 2
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-test-diagnostics-${{ github.run_attempt }}
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/ci-test/
+            target/cargo-timings/
+            target/nextest/ci/junit.xml
 
       # These tests are #[ignore]d in the default lane because they require a
       # redis-server executable. CI installs Redis above and runs them through
@@ -341,7 +369,7 @@ jobs:
       - name: doctests
         run: cargo test --workspace --exclude sbproxy-e2e --locked --doc
 
-      # These checks exec the binaries produced by the `build workspace` step.
+      # These checks exec the binaries produced by the workspace build step.
       # Left to themselves they run `cargo run -p <crate>`, which re-resolves
       # features for a single package and rebuilds.
       - name: generated artifacts are current

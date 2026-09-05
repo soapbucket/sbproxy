@@ -3962,6 +3962,11 @@ const fn default_publish_subscriber_rate_limit() -> u64 {
     DEFAULT_PUBLISH_SUBSCRIBER_RATE_LIMIT
 }
 
+/// Default for `proxy.config_authority.publish.archive_keep`.
+const fn default_publish_archive_keep() -> usize {
+    crate::config_authority::DEFAULT_ARCHIVE_KEEP
+}
+
 const fn default_publish_total_rate_limit() -> u64 {
     DEFAULT_PUBLISH_TOTAL_RATE_LIMIT
 }
@@ -4034,6 +4039,25 @@ pub struct ConfigAuthorityPublishConfig {
     /// before it answers `429`.
     #[serde(default = "default_publish_total_rate_limit")]
     pub rate_limit_total_per_minute: u64,
+    /// How many earlier revisions the authority keeps so a rollback can
+    /// name one of them.
+    ///
+    /// The authority has always kept the current bundle and the one
+    /// before it, which is enough to undo the last publish. This bounds
+    /// the ring beside those two, which is what lets
+    /// `POST /admin/config-authority/rollback` accept a `to_revision`
+    /// from further back than one step.
+    ///
+    /// This counts revisions a rollback can name, so the revision
+    /// currently being served does not use up a slot and the ring holds
+    /// `archive_keep + 1` files.
+    ///
+    /// Zero keeps no ring and leaves the one-step rollback exactly as it
+    /// was. The maximum is 200. At the maximum, and with a configuration
+    /// document at the 4 MiB wire limit, the ring is bounded at 1.58 GiB
+    /// of disk; a real document makes the default ring cost kilobytes.
+    #[serde(default = "default_publish_archive_keep")]
+    pub archive_keep: usize,
 }
 
 impl ConfigAuthorityPublishConfig {
@@ -4132,6 +4156,11 @@ impl ConfigAuthorityPublishConfig {
             return Err(ConfigAuthorityConfigError::PublishRateLimitInverted {
                 total: self.rate_limit_total_per_minute,
                 per_subscriber: self.rate_limit_per_subscriber_per_minute,
+            });
+        }
+        if self.archive_keep > crate::config_authority::MAX_ARCHIVE_KEEP {
+            return Err(ConfigAuthorityConfigError::PublishArchiveKeep {
+                found: self.archive_keep,
             });
         }
         Ok(())
@@ -4413,6 +4442,12 @@ pub enum ConfigAuthorityConfigError {
         field: &'static str,
         /// Configured value.
         found: u64,
+    },
+    /// `archive_keep` was above the accepted maximum.
+    #[error("proxy.config_authority.publish.archive_keep is {found}; it must be at most {max} (the archive is bounded because every entry is a whole signed configuration on the authority's disk, and at {max} a document at the wire limit already reaches {ceiling} bytes)", max = crate::config_authority::MAX_ARCHIVE_KEEP, ceiling = crate::config_authority::MAX_ARCHIVE_BYTES)]
+    PublishArchiveKeep {
+        /// Configured value.
+        found: usize,
     },
     /// The fleet-wide rate limit was below the per-subscriber limit it is
     /// supposed to bound.

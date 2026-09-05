@@ -1,0 +1,4 @@
+{
+  "type": "fixed",
+  "message": "NATS event ingestion no longer builds an unused HTTP client before connecting to its broker, avoiding TLS initialization and certificate loading delays on the first batch."
+}

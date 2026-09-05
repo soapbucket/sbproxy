@@ -4063,6 +4063,13 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0.0
+        },
+        "archive_keep": {
+          "description": "How many earlier revisions the authority keeps so a rollback can name one of them.\n\nThe authority has always kept the current bundle and the one before it, which is enough to undo the last publish. This bounds the ring beside those two, which is what lets `POST /admin/config-authority/rollback` accept a `to_revision` from further back than one step.\n\nThis counts revisions a rollback can name, so the revision currently being served does not use up a slot and the ring holds `archive_keep + 1` files.\n\nZero keeps no ring and leaves the one-step rollback exactly as it was. The maximum is 200. At the maximum, and with a configuration document at the 4 MiB wire limit, the ring is bounded at 1.58 GiB of disk; a real document makes the default ring cost kilobytes.",
+          "default": 20,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
         }
       },
       "additionalProperties": false

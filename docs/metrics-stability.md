@@ -248,6 +248,9 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_compression_decisions_total` | Counter | `stable` | `beta` | `codec`, `result` | Compression middleware decisions, by codec and outcome. |
 | `sbproxy_compression_ratio` | Histogram | `stable` | `beta` | `codec` | Achieved compression ratio (post_size / pre_size) when compression was applied. |
 | `sbproxy_config_authority_announce_total` | Counter | `stable` | `beta` | `result` | Config revision announcements published to the cluster, by result. |
+| `sbproxy_config_authority_rollback_total` | Counter | `stable` | `beta` | `target`, `result` | Config authority rollback attempts, by target and result. |
+| `sbproxy_operator_config_delivery_total` | Counter | `stable` | `beta` | `state` | Operator config-delivery decisions per reconcile, by state. |
+| `sbproxy_operator_fallback_probes_total` | Counter | `stable` | `beta` | `outcome` | Operator boot-fallback probes against proxy pods, by outcome. |
 | `sbproxy_config_bundle_age_seconds` | Gauge | `stable` | `beta` | none | Seconds since this node received the config bundle it currently serves. |
 | `sbproxy_config_bundle_applied_degraded_total` | Counter | `stable` | `beta` | none | Config bundles applied while at least one subsystem stayed on prior state. |
 | `sbproxy_config_bundle_applied_total` | Counter | `stable` | `beta` | none | Config bundles applied with every subsystem reloaded cleanly. |

@@ -196,6 +196,52 @@ pub struct SBProxyStatus {
     /// applied.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub last_error: String,
+
+    /// Kubernetes-style conditions.
+    ///
+    /// One type today, `ConfigFallbackActive`: `True` while a
+    /// pod owned by this `SBProxy` is serving a configuration its boot
+    /// fallback restored from the node's revision ring rather than the
+    /// document this operator applied. While it is `True` the operator
+    /// stops pushing configuration to this `SBProxy`, because a node
+    /// that rescued itself has not drifted on purpose and reapplying the
+    /// document it could not compile would restart it into the same
+    /// crash loop.
+    ///
+    /// The condition is the operator-visible signal, so an alert can
+    /// fire on "a node in this cluster is running on fallback" without
+    /// scraping the proxy directly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<Condition>,
+}
+
+/// One Kubernetes-style status condition.
+///
+/// Modeled by hand rather than reused from `k8s_openapi`, whose
+/// `metav1.Condition` requires `lastTransitionTime` as a `Time` and does
+/// not derive `JsonSchema` at the pinned feature set. The field names
+/// and semantics match the upstream convention, so `kubectl wait
+/// --for=condition=ConfigFallbackActive` works.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Condition {
+    /// Condition type, for example `ConfigFallbackActive`.
+    #[serde(rename = "type")]
+    pub type_: String,
+    /// `True`, `False`, or `Unknown`.
+    pub status: String,
+    /// Machine-readable, CamelCase reason for the current status.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+    /// Human-readable detail.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
+    /// RFC 3339 timestamp of the last status change.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub last_transition_time: String,
+    /// `metadata.generation` the condition was computed against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<i64>,
 }
 
 impl SBProxyStatus {

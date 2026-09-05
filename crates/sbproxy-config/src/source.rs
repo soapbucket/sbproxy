@@ -999,8 +999,29 @@ impl GitBinaryCloner {
                     scrub_credentials(full.stderr.trim())
                 )));
             }
+            // A full fetch writes a branch head to `refs/remotes/origin/<name>`,
+            // not to `refs/heads/<name>`, so checking out the pin as
+            // written finds nothing when the pin is a branch ref. A
+            // commit sha and a tag both resolve as written (the tag
+            // because `--tags` above fetched it into `refs/tags/`), so
+            // the pin is tried first and the remote-tracking spelling is
+            // the fallback rather than the rule. Without this, a
+            // development-tier branch pin against any server that
+            // refuses the shallow targeted fetch above fails with
+            // "git checkout: --detach does not take a path argument",
+            // which is the fallback path failing at exactly the job it
+            // exists to do.
+            let target =
+                self.resolve_local_checkout_target(dest, scratch, sha, || remaining(started));
+            let Some(target) = target else {
+                return Err(ConfigSourceError::RevisionMismatch(format!(
+                    "{sha} is not present in {} after a full fetch; the pin names a revision \
+                     this repository does not contain",
+                    redact_repo(request.repo),
+                )));
+            };
             let checkout = self.run(
-                &["checkout", "--quiet", "--detach", sha],
+                &["checkout", "--quiet", "--detach", target.as_str()],
                 Some(dest),
                 scratch,
                 remaining(started),
@@ -1031,6 +1052,58 @@ impl GitBinaryCloner {
             )));
         }
         Ok(())
+    }
+
+    /// Which local revision a full fetch left for `pin`, if any.
+    ///
+    /// Tried in the order that keeps the common cases exact: the pin as
+    /// written (a commit sha, or a tag `--tags` just fetched into
+    /// `refs/tags/`), then the remote-tracking spelling a branch head
+    /// actually lands at. `^{commit}` on both, so a tag object resolves
+    /// to the commit it points at rather than to itself.
+    ///
+    /// Returns the *resolved commit*, never a ref name, so the caller
+    /// checks out the same thing the shallow path would have.
+    fn resolve_local_checkout_target(
+        &self,
+        dest: &Path,
+        scratch: &Path,
+        pin: &str,
+        mut remaining: impl FnMut() -> Duration,
+    ) -> Option<String> {
+        let branch = pin.strip_prefix("refs/heads/").unwrap_or(pin);
+        for candidate in [pin.to_string(), format!("refs/remotes/origin/{branch}")] {
+            // `continue`, not `?`: a failed invocation is this candidate
+            // failing, not the lookup failing. Short-circuiting on the
+            // first error skipped the remote-tracking spelling whenever
+            // the first `rev-parse` timed out, and the caller then
+            // blamed the pin for a timeout with "the pin names a
+            // revision this repository does not contain".
+            let Ok(resolved) = self.run(
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("{candidate}^{{commit}}"),
+                ],
+                Some(dest),
+                scratch,
+                // Recomputed per call, like every other invocation in
+                // `clone_at`: a budget captured once hands the second
+                // lookup time the first already spent.
+                remaining(),
+                None,
+            ) else {
+                continue;
+            };
+            if resolved.success {
+                let sha = resolved.stdout.trim().to_string();
+                if !sha.is_empty() {
+                    return Some(sha);
+                }
+            }
+        }
+        None
     }
 
     /// Require a good signature on the resolved tag or commit.

@@ -208,7 +208,7 @@ notify = "7"
 inventory = "0.3"
 
 # Capability-based filesystem traversal
-cap-std = "4.0.2"
+cap-std = "4.0.3"
 
 # Observability
 # release_max_level_info compile-strips debug!/trace! calls from release
@@ -324,9 +324,9 @@ swc_ecma_visit = "27"
 # wasmtime + wasi-common move in lockstep; bump both together. The version
 # floor is set by the cargo-deny advisory gate, which fails on any
 # unpatched RUSTSEC entry against wasmtime.
-wasmtime = { version = "46.0.2", default-features = false, features = ["cranelift", "runtime", "parallel-compilation"] }
-wasi-common = "46"
-wasmtime-wasi = { version = "46.0.2", default-features = false, features = ["p1"] }
+wasmtime = { version = "46.0.3", default-features = false, features = ["cranelift", "runtime", "parallel-compilation"] }
+wasi-common = "46.0.3"
+wasmtime-wasi = { version = "46.0.3", default-features = false, features = ["p1"] }
 
 # HTTP client
 reqwest = { version = "0.12", features = ["json", "stream", "blocking"] }

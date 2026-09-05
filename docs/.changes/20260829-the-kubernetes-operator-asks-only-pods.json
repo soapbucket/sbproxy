@@ -1,0 +1,4 @@
+{
+  "type": "fixed",
+  "message": "The Kubernetes operator asks only pods its own workload created before it sends them the admin credential, behind the leader fence and with a bounded fan-out, and it re-bounds the reason a pod reports before putting it in a CR condition. The ConfigFallbackActive condition keeps its lastTransitionTime across passes and is written only when it changes, so an SBProxy no longer re-triggers its own reconcile loop, and the Service still reconciles while config delivery is suspended. sbproxy_operator_config_delivery_total and sbproxy_operator_fallback_probes_total make a stopped delivery visible."
+}

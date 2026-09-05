@@ -14,7 +14,7 @@ use k8s_openapi::api::apps::v1::{
 };
 use k8s_openapi::api::core::v1::{
     ConfigMap, ConfigMapVolumeSource, Container, ContainerPort, EmptyDirVolumeSource, EnvVar,
-    EnvVarSource, HTTPGetAction, ObjectFieldSelector, PodSpec, PodTemplateSpec, Probe,
+    EnvVarSource, HTTPGetAction, ObjectFieldSelector, Pod, PodSpec, PodTemplateSpec, Probe,
     ResourceRequirements as K8sResourceRequirements, Secret, SecretKeySelector, Service,
     ServicePort, ServiceSpec, Volume, VolumeMount,
 };
@@ -24,7 +24,7 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::ObjectMeta;
 use kube::Resource;
 
-use crate::crd::{ClusteringSpec, SBProxy, SBProxyConfig, SBProxyStatus};
+use crate::crd::{ClusteringSpec, Condition, SBProxy, SBProxyConfig, SBProxyStatus};
 
 // --- Hot-reload decision ---
 
@@ -1166,6 +1166,322 @@ pub fn check_acme_storage_for_replicas(sbproxy: &SBProxy, config_yaml: &str) -> 
     ))
 }
 
+// --- WOR-2467: boot fallback is local recovery, not drift ---
+
+/// Condition type stamped on `SBProxy.status.conditions` while any of
+/// its pods is serving a configuration its boot fallback restored.
+///
+/// The name is part of the operator's contract: an alert rule and a
+/// `kubectl wait --for=condition=...` both spell it, so it is a constant
+/// rather than a string literal at each call site.
+pub const FALLBACK_CONDITION_TYPE: &str = "ConfigFallbackActive";
+
+/// What `GET /admin/config/fallback` reports for one pod.
+///
+/// Deserialized leniently: an older proxy that predates the `reason`
+/// field still answers the three fields this needs, and an operator who
+/// upgrades the controller first must not have every node read as
+/// undecidable.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct FallbackReport {
+    /// Whether this pod is serving a config its boot fallback restored.
+    #[serde(default)]
+    pub active: bool,
+    /// Ring revision it fell back to.
+    #[serde(default)]
+    pub revision: Option<u64>,
+    /// That revision's content digest.
+    #[serde(default)]
+    pub digest: Option<String>,
+    /// Why the configured document did not boot.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Longest `reason` this operator will carry out of a pod answer.
+///
+/// The node bounds its own reason to 512 characters, but the pod is the
+/// untrusted end of this call: `resp.json()` reads whatever body
+/// arrives, and the value goes straight into a Kubernetes condition
+/// message that `kubectl describe` prints raw. Upstream `metav1`
+/// bounds a condition message at 32768; this is far under it, and
+/// matches what a node that is behaving produces.
+const MAX_REPORTED_REASON_CHARS: usize = 512;
+
+impl FallbackReport {
+    /// The same report with every operator-carried string bounded to
+    /// 512 characters and stripped of control characters.
+    ///
+    /// Applied at the edge, where the value is read, rather than at the
+    /// point it is rendered, so nothing downstream has to remember.
+    #[must_use]
+    pub fn bounded(self) -> Self {
+        Self {
+            reason: self.reason.as_deref().map(bounded_reason),
+            digest: self.digest.as_deref().map(bounded_reason),
+            ..self
+        }
+    }
+}
+
+/// Truncate to 512 characters on a character boundary and replace
+/// control characters, which reach a terminal verbatim through
+/// `kubectl describe`.
+fn bounded_reason(value: &str) -> String {
+    let cleaned: String = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim();
+    match trimmed.char_indices().nth(MAX_REPORTED_REASON_CHARS) {
+        Some((cut, _)) => format!("{}...", &trimmed[..cut]),
+        None => trimmed.to_string(),
+    }
+}
+
+/// One pod's answer, with the pod it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PodFallback {
+    /// Pod name, for the condition message.
+    pub pod: String,
+    /// What that pod reported.
+    pub report: FallbackReport,
+}
+
+/// Whether this pod is one the operator's own workload created.
+///
+/// # Why the label is not enough
+///
+/// `read_fallback_reports` used to select pods by
+/// `app.kubernetes.io/instance=<name>` alone. A label is a value anyone
+/// with pod-create in the namespace can type, so any pod answering
+/// `{"active":true}` on the admin port halted config delivery for the
+/// whole `SBProxy` and was handed the operator's admin credential on
+/// every pass. The label answers "who does this claim to belong to";
+/// the controller owner reference answers "what actually created it".
+///
+/// This checks the controller reference names one of the two workloads
+/// this operator creates: the StatefulSet by exact name in the
+/// clustered shape, or a ReplicaSet whose name is the Deployment's plus
+/// the pod-template hash Kubernetes appends.
+///
+/// # What this cannot see
+///
+/// It is not proof of provenance and must not be described as one.
+/// Kubernetes does not validate `ownerReferences` on create, so a
+/// principal who can already create pods in the namespace can write
+/// whichever reference they like. What this removes is the accidental
+/// case, which is the likely one: a pod that happens to carry the same
+/// instance label. Against a hostile principal the real boundary is
+/// namespace RBAC, and the write gate this now sits behind bounds how
+/// many passes a deposed replica spends probing.
+#[must_use]
+pub fn pod_is_operator_owned(pod: &Pod, deployment: &str, statefulset: &str) -> bool {
+    pod.metadata
+        .owner_references
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|owner| {
+            if owner.controller != Some(true) {
+                return false;
+            }
+            match owner.kind.as_str() {
+                "StatefulSet" => owner.name == statefulset,
+                // Kubernetes names a Deployment's ReplicaSet
+                // `<deployment>-<pod-template-hash>`, so the prefix plus
+                // a non-empty suffix is the whole shape available here.
+                "ReplicaSet" => owner
+                    .name
+                    .strip_prefix(deployment)
+                    .and_then(|rest| rest.strip_prefix('-'))
+                    .is_some_and(|hash| !hash.is_empty()),
+                _ => false,
+            }
+        })
+}
+
+/// The pod, if any, whose fallback pin suspends config reconciliation
+/// for this `SBProxy`.
+///
+/// # Why a suspension and not a refusal
+///
+/// A controller that owns desired state and a node that rescues itself
+/// will fight, and the field's answer to that fight is well documented.
+/// With Argo CD's `selfHeal` enabled a manual `kubectl rollout undo` is
+/// detected as drift and reverted straight back to what Git says; the
+/// documented workflow is not to fight it but to suspend reconciliation
+/// first (`argocd app set <app> --sync-policy none`), act, then update
+/// Git. Argo's own recommended starting posture is `selfHeal: false`,
+/// for the same reason this epic ships `auto_revert` off.
+///
+/// So the answer is a **suspension state the controller reads**, not a
+/// refusal the controller cannot see. Refusing auto-revert on the node
+/// is necessary and not sufficient: it does nothing about a controller
+/// that keeps reapplying the config the node cannot compile.
+///
+/// # Why the pin and not health
+///
+/// **Boot fallback is local recovery, not drift.** A node that could not
+/// compile its configuration and came up on its last good one has not
+/// diverged from desired state on purpose. A controller that reads that
+/// as drift reapplies the broken config and restarts the node into the
+/// same crash loop, which is the failure this epic exists to prevent,
+/// reintroduced one layer up. A pod that is merely unhealthy, with no
+/// pin, has said nothing about its configuration and is reconciled
+/// normally.
+#[must_use]
+pub fn fallback_suspension(pods: &[PodFallback]) -> Option<&PodFallback> {
+    pods.iter().find(|pod| pod.report.active)
+}
+
+/// The `ConfigFallbackActive` condition for `SBProxy.status.conditions`.
+///
+/// Produced in both directions: an alert fires on `status == "True"`,
+/// and the condition has to go back to `"False"` when the node returns
+/// to its configured document rather than lingering as a stale `"True"`
+/// nobody clears.
+///
+/// `last_transition_time` is supplied by the caller rather than read
+/// from the clock here, so the shape is testable.
+#[must_use]
+pub fn fallback_condition(
+    pods: &[PodFallback],
+    observed_generation: Option<i64>,
+    now: &str,
+    previous: Option<&Condition>,
+) -> Condition {
+    let pinned = fallback_suspension(pods);
+    let (status, reason, message) = match pinned {
+        Some(pinned) => (
+            "True",
+            "NodeOnFallbackConfig",
+            format!(
+                "pod {} is serving revision {} from its config revision ring, not the \
+                 configured document; config reconciliation is suspended for this SBProxy \
+                 until the pin is cleared with DELETE /admin/config/fallback. the configured \
+                 document failed with: {}",
+                pinned.pod,
+                pinned
+                    .report
+                    .revision
+                    .map_or_else(|| "unknown".to_string(), |revision| revision.to_string()),
+                pinned
+                    .report
+                    .reason
+                    .as_deref()
+                    .unwrap_or("no reason reported by the node"),
+            ),
+        ),
+        None => (
+            "False",
+            "RunningConfiguredDocument",
+            "no pod reports a boot fallback pin; config reconciliation is live".to_string(),
+        ),
+    };
+    // The timestamp moves only on a real transition. Restamping it
+    // every pass costs two things: the field stops answering "how long
+    // has this node been pinned", which is the one question a condition
+    // timestamp exists for; and because the value genuinely changes,
+    // every pass becomes a real status write that the operator's own
+    // watch re-enqueues, so the object never settles to its requeue
+    // interval and each self-triggered pass re-runs the credentialed
+    // pod fan-out and a full server-side apply.
+    let last_transition_time = match previous {
+        Some(previous)
+            if previous.status == status && !previous.last_transition_time.is_empty() =>
+        {
+            previous.last_transition_time.clone()
+        }
+        _ => now.to_string(),
+    };
+    Condition {
+        type_: FALLBACK_CONDITION_TYPE.to_string(),
+        status: status.to_string(),
+        reason: reason.to_string(),
+        message,
+        last_transition_time,
+        observed_generation,
+    }
+}
+
+/// The `SBProxy`'s current `ConfigFallbackActive` condition, if it has
+/// one.
+#[must_use]
+pub fn current_fallback_condition(sbproxy: &SBProxy) -> Option<&Condition> {
+    sbproxy
+        .status
+        .as_ref()?
+        .conditions
+        .iter()
+        .find(|condition| condition.type_ == FALLBACK_CONDITION_TYPE)
+}
+
+/// The status merge patch that writes `condition`, or `None` when the
+/// CR already carries exactly it.
+///
+/// Returning `None` is the half that keeps the operator from
+/// re-triggering its own watch: a patch whose body is identical to what
+/// is already stored still bumps `resourceVersion` and still wakes the
+/// controller.
+#[must_use]
+pub fn fallback_condition_patch(
+    condition: &Condition,
+    previous: Option<&Condition>,
+) -> Option<serde_json::Value> {
+    if previous == Some(condition) {
+        return None;
+    }
+    // A plain JSON merge patch replaces the whole list. This operator
+    // owns the only condition type on this CR, so writing the list
+    // whole is correct today; a second type would have to merge into
+    // the existing list first.
+    Some(serde_json::json!({ "status": { "conditions": [condition] } }))
+}
+
+/// Refuse a config that arms node-side auto-revert while this operator
+/// owns the document.
+///
+/// `proxy.config_history.soak.auto_revert` lets a node undo a
+/// configuration on its own after a failed soak. Under operator
+/// ownership that is a race the node cannot win: the next reconcile
+/// reapplies the ConfigMap the node just reverted away from, and the two
+/// take turns. Accepting the key and then losing that race is worse than
+/// refusing it, and refusing it quietly is worse still, because nothing
+/// would tell the operator why their setting did nothing.
+///
+/// The owner is named in the error, and so is the path that does work.
+///
+/// Returns `Ok(())` for a document that does not parse, which belongs to
+/// [`validate_config_yaml`] and its more precise message.
+pub fn check_auto_revert_under_operator_ownership(config_yaml: &str) -> Result<(), String> {
+    let Ok(config) = serde_yaml::from_str::<sbproxy_config::ConfigFile>(config_yaml) else {
+        return Ok(());
+    };
+    let Some(history) = config.proxy.config_history.as_ref() else {
+        return Ok(());
+    };
+    if !history.soak.auto_revert {
+        return Ok(());
+    }
+    Err(
+        "proxy.config_history.soak.auto_revert is true, but this SBProxy's configuration is \
+         owned by the sbproxy Kubernetes operator, which reapplies the ConfigMap on every \
+         reconcile. A node that reverts its own config loses that race, and the two take \
+         turns. Set it to false and roll back through the control plane instead: \
+         `sbproxy config authority rollback --to-revision N` for a fleet, or \
+         `POST /admin/config/rollback` on a node this operator does not own. See \
+         docs/config-rollback.md."
+            .to_string(),
+    )
+}
+
 // --- Status patches ---
 //
 // The `SBProxy` status carries two hashes because a reconcile pass has two
@@ -2095,5 +2411,359 @@ mod tests {
             "the pre-apply write already recorded it; re-writing it here would \
              hide a pass that stamped one and not the other"
         );
+    }
+
+    // --- WOR-2467: the fallback pin suspends config delivery ---
+
+    fn pod_on_fallback(name: &str) -> PodFallback {
+        PodFallback {
+            pod: name.to_string(),
+            report: FallbackReport {
+                active: true,
+                revision: Some(7),
+                digest: Some("sha256:abc".to_string()),
+                reason: Some("unknown action type: statik".to_string()),
+            },
+        }
+    }
+
+    fn healthy_pod(name: &str) -> PodFallback {
+        PodFallback {
+            pod: name.to_string(),
+            report: FallbackReport::default(),
+        }
+    }
+
+    #[test]
+    fn a_pinned_pod_suspends_config_delivery_and_an_unpinned_one_does_not() {
+        assert!(fallback_suspension(&[]).is_none(), "no pods, no suspension");
+        assert!(
+            fallback_suspension(&[healthy_pod("a"), healthy_pod("b")]).is_none(),
+            "pods that report no pin are reconciled normally",
+        );
+        let mixed = [healthy_pod("a"), pod_on_fallback("b")];
+        let pinned =
+            fallback_suspension(&mixed).expect("one pinned pod suspends the whole SBProxy");
+        assert_eq!(pinned.pod, "b");
+    }
+
+    /// The suspension is keyed on the pin, never on health. A pod that is
+    /// merely unhealthy has said nothing about its configuration, and
+    /// freezing config delivery for it would mean an unreachable replica
+    /// could stop a fix from reaching the healthy ones.
+    #[test]
+    fn an_unhealthy_pod_with_no_pin_is_reconciled_normally() {
+        let merely_broken = PodFallback {
+            pod: "crashlooping".to_string(),
+            report: FallbackReport {
+                active: false,
+                revision: Some(3),
+                digest: Some("sha256:def".to_string()),
+                reason: None,
+            },
+        };
+        assert!(
+            fallback_suspension(&[merely_broken]).is_none(),
+            "a revision in the report is not a pin; only `active` is",
+        );
+    }
+
+    #[test]
+    fn the_condition_names_the_fallback_revision_and_the_compile_failure() {
+        let condition = fallback_condition(
+            &[pod_on_fallback("edge-0")],
+            Some(4),
+            "2026-08-28T00:00:00Z",
+            None,
+        );
+        assert_eq!(condition.type_, FALLBACK_CONDITION_TYPE);
+        assert_eq!(condition.status, "True");
+        assert_eq!(condition.reason, "NodeOnFallbackConfig");
+        assert_eq!(condition.observed_generation, Some(4));
+        assert_eq!(condition.last_transition_time, "2026-08-28T00:00:00Z");
+        let message = condition.message.as_str();
+        assert!(message.contains("edge-0"), "{message}");
+        assert!(message.contains("revision 7"), "{message}");
+        assert!(
+            message.contains("unknown action type: statik"),
+            "the condition has to say why the configured document failed: {message}",
+        );
+        assert!(
+            message.contains("DELETE /admin/config/fallback"),
+            "and how to resume: {message}",
+        );
+    }
+
+    /// A condition that only ever went True would leave every CR that had
+    /// one bad boot looking permanently broken, and an alert on it firing
+    /// forever.
+    #[test]
+    fn the_condition_clears_when_no_pod_reports_a_pin() {
+        let condition =
+            fallback_condition(&[healthy_pod("edge-0")], None, "2026-08-28T00:00:00Z", None);
+        assert_eq!(condition.status, "False");
+        assert_eq!(condition.reason, "RunningConfiguredDocument");
+        assert_eq!(
+            condition.observed_generation, None,
+            "a CR with no generation gets no observedGeneration rather than a zero",
+        );
+
+        // The same shape with no pods at all: a first pass before any pod
+        // exists must not read as "on fallback".
+        assert_eq!(
+            fallback_condition(&[], None, "2026-08-28T00:00:00Z", None).status,
+            "False",
+        );
+    }
+
+    #[test]
+    fn a_node_missing_its_reason_still_gets_a_condition_that_names_the_pod() {
+        let bare = PodFallback {
+            pod: "edge-9".to_string(),
+            report: FallbackReport {
+                active: true,
+                revision: None,
+                digest: None,
+                reason: None,
+            },
+        };
+        let message = fallback_condition(&[bare], None, "2026-08-28T00:00:00Z", None).message;
+        assert!(message.contains("edge-9"), "{message}");
+        assert!(message.contains("revision unknown"), "{message}");
+        assert!(
+            message.contains("no reason reported by the node"),
+            "{message}"
+        );
+    }
+
+    /// An older proxy that predates the `reason` field still answers the
+    /// three fields the decision needs. Reading its body as undecidable
+    /// would suspend config delivery across a fleet mid-upgrade.
+    #[test]
+    fn a_fallback_body_without_a_reason_field_still_deserializes() {
+        let report: FallbackReport =
+            serde_json::from_str(r#"{"active":true,"revision":3,"digest":"d","suspended":[]}"#)
+                .expect("an older proxy's body still parses");
+        assert!(report.active);
+        assert_eq!(report.revision, Some(3));
+        assert_eq!(report.reason, None);
+    }
+
+    fn pod_named(name: &str, owner_kind: &str, owner_name: &str, controller: bool) -> Pod {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": name,
+                "namespace": "sbproxy",
+                "labels": { "app.kubernetes.io/instance": "edge" },
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1",
+                    "kind": owner_kind,
+                    "name": owner_name,
+                    "uid": "0000-1111",
+                    "controller": controller,
+                }],
+            },
+        }))
+        .expect("pod fixture")
+    }
+
+    /// A label is a value anyone with pod-create in the namespace can
+    /// type, and the operator sends its admin credential to whatever
+    /// answers. The controller owner reference is what actually created
+    /// the pod.
+    #[test]
+    fn only_a_pod_the_operators_own_workload_created_is_probed() {
+        assert!(
+            pod_is_operator_owned(
+                &pod_named("edge-0", "ReplicaSet", "edge-sbproxy-7d9f8c", true),
+                "edge-sbproxy",
+                "edge-sbproxy",
+            ),
+            "a Deployment's ReplicaSet is named <deployment>-<pod-template-hash>",
+        );
+        assert!(
+            pod_is_operator_owned(
+                &pod_named("edge-0", "StatefulSet", "edge-sbproxy", true),
+                "edge-sbproxy",
+                "edge-sbproxy",
+            ),
+            "the clustered shape is owned by the StatefulSet directly",
+        );
+
+        for (pod, why) in [
+            (
+                pod_named("rogue", "ReplicaSet", "attacker-rs", true),
+                "a ReplicaSet this operator did not create",
+            ),
+            (
+                pod_named("rogue", "Job", "edge-sbproxy", true),
+                "an owner kind this operator never creates",
+            ),
+            (
+                pod_named("rogue", "ReplicaSet", "edge-sbproxy-7d9f8c", false),
+                "an owner reference that is not the controller",
+            ),
+            (
+                pod_named("rogue", "ReplicaSet", "edge-sbproxy", true),
+                "the Deployment name with no pod-template hash after it",
+            ),
+            (
+                pod_named("rogue", "ReplicaSet", "edge-sbproxy-evil-x", true),
+                "a name that merely starts with the deployment's",
+            ),
+        ] {
+            // The last case is admitted by the prefix rule on purpose:
+            // Kubernetes owns that name shape, and the check is not a
+            // proof of provenance. What it removes is the accidental
+            // collision, which is the likely case.
+            let owned = pod_is_operator_owned(&pod, "edge-sbproxy", "edge-sbproxy");
+            if why == "a name that merely starts with the deployment's" {
+                assert!(owned, "documented limit of the prefix rule: {why}");
+            } else {
+                assert!(!owned, "must not be probed: {why}");
+            }
+        }
+
+        // A pod with no owner reference at all: the shape a bare
+        // `kubectl run` produces, and the one this closes.
+        let bare: Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "rogue",
+                "labels": { "app.kubernetes.io/instance": "edge" },
+            },
+        }))
+        .expect("pod fixture");
+        assert!(!pod_is_operator_owned(
+            &bare,
+            "edge-sbproxy",
+            "edge-sbproxy"
+        ));
+    }
+
+    /// The timestamp answers "how long has this been pinned", so it
+    /// moves on a transition and not on a pass. Restamping it also made
+    /// every write a real change that the operator's own watch
+    /// re-enqueued.
+    #[test]
+    fn the_condition_timestamp_moves_only_when_the_status_does() {
+        let pinned = [pod_on_fallback("edge-0")];
+        let first = fallback_condition(&pinned, Some(1), "2026-08-28T00:00:00Z", None);
+        assert_eq!(first.last_transition_time, "2026-08-28T00:00:00Z");
+
+        let later = fallback_condition(&pinned, Some(1), "2026-08-28T09:30:00Z", Some(&first));
+        assert_eq!(
+            later.last_transition_time, "2026-08-28T00:00:00Z",
+            "still pinned, so the clock does not restart",
+        );
+
+        let cleared = fallback_condition(
+            &[healthy_pod("edge-0")],
+            Some(1),
+            "2026-08-28T09:30:00Z",
+            Some(&later),
+        );
+        assert_eq!(
+            cleared.last_transition_time, "2026-08-28T09:30:00Z",
+            "the status really changed, so the timestamp does too",
+        );
+    }
+
+    /// An identical patch still bumps `resourceVersion`, which the
+    /// operator's own watch reads as a change. Skipping the write is
+    /// what lets an SBProxy settle to its requeue interval.
+    #[test]
+    fn an_unchanged_condition_is_not_written_back() {
+        let pinned = [pod_on_fallback("edge-0")];
+        let first = fallback_condition(&pinned, Some(1), "2026-08-28T00:00:00Z", None);
+        assert!(
+            fallback_condition_patch(&first, None).is_some(),
+            "a CR with no condition yet has to be written",
+        );
+
+        let again = fallback_condition(&pinned, Some(1), "2026-08-28T09:30:00Z", Some(&first));
+        assert_eq!(
+            fallback_condition_patch(&again, Some(&first)),
+            None,
+            "nothing changed, so nothing is written and the watch does not re-fire",
+        );
+
+        // A spec edit changes observedGeneration, which is a real write.
+        let regenerated =
+            fallback_condition(&pinned, Some(2), "2026-08-28T09:30:00Z", Some(&first));
+        assert!(fallback_condition_patch(&regenerated, Some(&first)).is_some());
+
+        let patch = fallback_condition_patch(&first, None).expect("a patch");
+        assert_eq!(
+            patch["status"]["conditions"][0]["type"],
+            FALLBACK_CONDITION_TYPE,
+        );
+    }
+
+    /// The pod is the untrusted end of the probe, and its `reason` goes
+    /// into a condition message `kubectl describe` prints raw.
+    #[test]
+    fn a_pod_supplied_reason_is_bounded_and_stripped_before_it_reaches_a_condition() {
+        let hostile = FallbackReport {
+            active: true,
+            revision: Some(7),
+            digest: Some("d".repeat(4_000)),
+            reason: Some(format!("line\u{1b}[2Jone\n{}", "x".repeat(10_000))),
+        };
+        let bounded = hostile.bounded();
+        let reason = bounded.reason.expect("a reason");
+        assert_eq!(reason.chars().count(), MAX_REPORTED_REASON_CHARS + 3);
+        assert!(
+            !reason.chars().any(char::is_control),
+            "control characters reach a terminal verbatim through kubectl describe",
+        );
+        assert_eq!(
+            bounded.digest.expect("a digest").chars().count(),
+            MAX_REPORTED_REASON_CHARS + 3,
+        );
+
+        // A well-behaved node's report is unchanged.
+        let ordinary = FallbackReport {
+            active: true,
+            revision: Some(7),
+            digest: Some("sha256:abc".to_string()),
+            reason: Some("unknown action type: statik".to_string()),
+        };
+        assert_eq!(ordinary.clone().bounded(), ordinary);
+    }
+
+    #[test]
+    fn auto_revert_is_refused_under_operator_ownership_and_named_with_its_owner() {
+        let armed =
+            "proxy:\n  config_history:\n    enabled: true\n    soak:\n      auto_revert: true\n";
+        let error = check_auto_revert_under_operator_ownership(armed)
+            .expect_err("auto_revert under operator ownership is a race the node loses");
+        assert!(error.contains("auto_revert"), "{error}");
+        assert!(
+            error.contains("sbproxy Kubernetes operator"),
+            "the refusal names the owner: {error}",
+        );
+        assert!(
+            error.contains("sbproxy config authority rollback --to-revision N")
+                && error.contains("POST /admin/config/rollback"),
+            "and points at the path that does work: {error}",
+        );
+    }
+
+    #[test]
+    fn auto_revert_off_and_absent_blocks_and_unparseable_documents_are_all_allowed() {
+        for allowed in [
+            "proxy: {}\n",
+            "proxy:\n  config_history:\n    enabled: true\n",
+            "proxy:\n  config_history:\n    enabled: true\n    soak:\n      auto_revert: false\n",
+            // Belongs to validate_config_yaml and its more precise message.
+            "\t: [unbalanced\n",
+        ] {
+            check_auto_revert_under_operator_ownership(allowed)
+                .unwrap_or_else(|error| panic!("{allowed:?} must be allowed: {error}"));
+        }
     }
 }

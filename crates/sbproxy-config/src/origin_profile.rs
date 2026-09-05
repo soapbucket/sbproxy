@@ -13,7 +13,7 @@
 //! # The trust boundary has two halves
 //!
 //! **Write side.** [`OriginProfileSpec`] is an allowlist, not a deny
-//! list. `RawOriginConfig` has 52 fields and gains more regularly, so a
+//! list. `RawOriginConfig` has 53 fields and gains more regularly, so a
 //! deny list would make every future field a silent privilege grant to
 //! every project repository, with no review step that would catch it.
 //! Unclassified has to mean forbidden. A field a project may not set is
@@ -2912,7 +2912,7 @@ where
 mod tests {
     use super::*;
 
-    /// The ratchet. `RawOriginConfig` has 52 fields today and gains more
+    /// The ratchet. `RawOriginConfig` has 53 fields today and gains more
     /// regularly; every one of them has to be either a field of
     /// [`OriginProfileSpec`] or an entry in
     /// [`PLATFORM_OWNED_ORIGIN_FIELDS`] with a written reason.
@@ -2932,10 +2932,17 @@ mod tests {
             .map(|(field, _)| (*field).to_string())
             .collect();
 
-        assert!(
-            origin_fields.len() >= 50,
-            "the sweep found only {} origin fields, which means it broke rather than that the \
-             struct shrank",
+        // Pinned exactly, not as a floor. Four prose surfaces state
+        // this number (this module's header, this test's own doc,
+        // `docs/origin-profiles.md` and `docs/configuration.md`), and a
+        // `>=` assertion let all four drift to 52 while the struct held
+        // 53. An exact count makes adding a field a deliberate edit
+        // here, which is the moment to update them.
+        assert_eq!(
+            origin_fields.len(),
+            53,
+            "RawOriginConfig has {} fields; update the count in this test's doc comment, this \
+             module's header, docs/origin-profiles.md and docs/configuration.md",
             origin_fields.len()
         );
 

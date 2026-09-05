@@ -1,0 +1,4 @@
+{
+  "type": "fixed",
+  "message": "A git source or origin_sources entry pinned to a branch ref now checks out on a server that refuses a shallow targeted fetch. The full-fetch fallback checked out the pin as written, which finds nothing for a branch: a full fetch writes the head to refs/remotes/origin/<name>. Commit shas and tags were unaffected."
+}

@@ -588,12 +588,19 @@ struct AuthorityStatusArgs {
     format: OutputFormat,
 }
 
-/// `sbproxy config authority rollback`: republish the previous revision.
+/// `sbproxy config authority rollback`: republish an earlier revision.
 #[derive(clap::Args, Debug)]
 struct AuthorityRollbackArgs {
     /// Admin endpoint and Basic Auth credentials of the authority.
     #[command(flatten)]
     admin: ModelsAdminArgs,
+    /// Republish this archived revision instead of the previous one.
+    ///
+    /// Omit it for the one-step rollback. The revisions available are on
+    /// `sbproxy config authority status` as `archived_revisions`, and a
+    /// refusal lists them too.
+    #[arg(long = "to-revision", value_name = "N")]
+    to_revision: Option<u64>,
     /// Output format.
     #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
@@ -10052,7 +10059,7 @@ fn handle_aggregate_subcommand(args: &AggregateArgs) -> anyhow::Result<i32> {
         Ok(composed) => composed,
         Err(error) => {
             use sbproxy_core::config_aggregator::AggregateError;
-            eprintln!("aggregate: {error}");
+            eprintln!("aggregate: {}", strip_aggregate_prefix(&error.to_string()));
             // Both classes exit 3 because neither published anything.
             // The second line differs because the next action does: a
             // deadline or an unreachable repository leaves the fleet on
@@ -10200,7 +10207,7 @@ fn handle_aggregate_subcommand(args: &AggregateArgs) -> anyhow::Result<i32> {
             Ok(0)
         }
         Err(error) => {
-            eprintln!("aggregate: {error}");
+            eprintln!("aggregate: {}", strip_aggregate_prefix(&error.to_string()));
             eprintln!("aggregate: nothing changed on the authority.");
             Ok(3)
         }
@@ -10258,6 +10265,19 @@ fn report_aggregate_dry_run(
         println!("  {line}");
     }
     2
+}
+
+/// Drop a leading `aggregate: ` the error's own `Display` already
+/// carries.
+///
+/// Several `AggregateError` variants spell the prefix themselves, which
+/// reads correctly in a `tracing` line but doubles here, where this
+/// command prefixes every line it prints: `aggregate: aggregate:
+/// composition refused: ...`. Stripped at the one place both meet
+/// rather than removed from the errors, which are also logged on their
+/// own inside the aggregator loop.
+fn strip_aggregate_prefix(message: &str) -> &str {
+    message.strip_prefix("aggregate: ").unwrap_or(message)
 }
 
 /// The shared JSON summary for the three `aggregate` output shapes.
@@ -10508,14 +10528,25 @@ fn handle_authority_status(args: &AuthorityStatusArgs) -> anyhow::Result<i32> {
 /// taken the revision being undone, which is the opposite of what an
 /// operator wants at that moment.
 ///
+/// `--to-revision N` names an archived revision instead of the previous
+/// one, which is what makes a fleet rollback to a document from several
+/// publishes ago possible. The mechanism is the same either way: the
+/// chosen payload is revalidated and republished under a fresh number.
+///
 /// Exit codes: 0 rolled back, 1 CLI or IO error, 4 the authority refused
-/// (typically no previous revision to return to), 7 unreachable.
+/// (no previous revision to return to, or a `--to-revision` the archive
+/// does not hold), 7 unreachable.
 fn handle_authority_rollback(args: &AuthorityRollbackArgs) -> anyhow::Result<i32> {
+    // No body at all for the one-step rollback, so an older authority that
+    // does not read one behaves exactly as it did.
+    let request_body = args
+        .to_revision
+        .map(|revision| AdminRequestBody::Json(serde_json::json!({ "to_revision": revision })));
     let body = match admin_request_parts(
         &args.admin,
         reqwest::Method::POST,
         sbproxy_core::config_authority::ROLLBACK_PATH,
-        None,
+        request_body,
     )? {
         AdminOutcome::Unreachable(reason) => {
             return Ok(report_admin_unreachable(
@@ -15591,6 +15622,7 @@ proxy:
                 "{:?}",
                 AuthorityRollbackArgs {
                     admin: admin.clone(),
+                    to_revision: Some(41),
                     format: OutputFormat::Text,
                 }
             ),

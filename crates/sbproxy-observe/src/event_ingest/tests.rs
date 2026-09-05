@@ -16,6 +16,16 @@ use super::*;
 use crate::events::EventType;
 use crate::request_event::RequestEvent;
 
+#[test]
+fn nats_worker_does_not_initialize_an_http_client() {
+    let target = IngestTarget::Nats {
+        address: "127.0.0.1:4222".into(),
+        subject_prefix: "events".into(),
+        token: None,
+    };
+    assert!(http_client_for_target(&target).is_none());
+}
+
 /// What the fake broker saw.
 #[derive(Debug, Default)]
 struct Observed {
@@ -852,10 +862,14 @@ impl FakeClickHouse {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_clickhouse_insert_carries_the_documented_statement_headers_and_rows() {
     let warehouse = FakeClickHouse::start(200, "").await;
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("client");
+    let client = http_client_for_target(&IngestTarget::ClickHouse {
+        url: warehouse.url.clone(),
+        database: "sbproxy".into(),
+        table: "request_events".into(),
+        user: Some("writer".into()),
+        password: Some("hunter2".into()),
+    })
+    .expect("ClickHouse requires an HTTP client");
 
     let landed = insert_into_clickhouse(
         &client,

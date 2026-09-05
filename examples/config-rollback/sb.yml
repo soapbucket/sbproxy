@@ -1,0 +1,97 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Config rollback: a change that compiles cleanly, breaks traffic, and
+# does not become the last known good.
+#
+# Compiling is not evidence that a config works. This example is the
+# smallest thing that shows the difference: one origin that forwards to
+# a real upstream, a soak window short enough to watch, and a second
+# copy of this file (sb-broken.yml) that changes nothing but the
+# upstream port. Both compile. Only one of them survives its window.
+#
+# Run:
+#   rm -rf /tmp/sbproxy-config-rollback
+#   sbproxy serve -f sb.yml
+#
+# Then follow README.md in this directory. The whole walkthrough is four
+# commands and takes about a minute.
+#
+# auto_revert is deliberately off, which is the shipped default. The
+# node fails the soak, leaves the last-known-good pointer where it is,
+# and waits for you. README.md shows what changes when you arm it.
+
+# sbproxy-docs:begin
+proxy:
+  http_bind_port: 8080
+
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    # Demo password for local runs. Change before any non-loopback bind.
+    password: demo-change-me
+
+  # The upstream below is on loopback, which the SSRF guard refuses by
+  # default. A real deployment forwards to a private range and says so
+  # here in the same way.
+  extensions:
+    upstream:
+      allow_private_cidrs:
+        - '127.0.0.1/32'
+
+  config_history:
+    enabled: true
+    dir: /tmp/sbproxy-config-rollback
+    keep: 10
+    keep_rejected: 5
+
+    soak:
+      # Short on purpose so a demo session sees a verdict; production
+      # defaults to 120 seconds.
+      window_secs: 20
+      min_requests: 1
+
+      # The signal this example is about. On by default. It reads the
+      # per-target health checks below, so an origin repointed at a
+      # port nothing listens on fails its window even on a node taking
+      # no organic traffic at all.
+      require_upstream_health: true
+
+      # The operator probe, so the window has evidence on a demo box
+      # with no traffic. Without something reporting, every signal
+      # abstains and the verdict is `inconclusive` rather than passed.
+      probe:
+        url: http://127.0.0.1:9090/healthz
+        expect_status: 200
+        interval_secs: 2
+
+      # Off, which is the default. See README.md for what arming it
+      # does, and docs/config-rollback.md for why it ships this way.
+      auto_revert: false
+
+    boot:
+      # Boot on the ring when the config file does not work. Off in
+      # production; on here so the walkthrough can break the file and
+      # watch the node rescue itself.
+      fallback: last_known_good
+      max_attempts: 3
+      success_secs: 5
+
+origins:
+  "api.local":
+    # A load balancer with one target rather than a bare proxy action,
+    # because the soak's upstream-health signal reads per-target health
+    # checks, circuit breakers, and outlier ejections. An origin that
+    # declares none of the three exposes nothing to look at, and the
+    # signal abstains rather than reporting health it never measured.
+    action:
+      type: load_balancer
+      algorithm: round_robin
+      targets:
+        - url: http://127.0.0.1:19701
+          health_check:
+            path: /
+            interval_secs: 2
+            timeout_ms: 500
+            unhealthy_threshold: 2
+            healthy_threshold: 1
+# sbproxy-docs:end

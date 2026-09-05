@@ -763,6 +763,84 @@ fn authority_rollback_reports_the_revision_it_restored_and_the_one_it_replaced()
 }
 
 #[test]
+fn authority_rollback_to_revision_sends_the_named_target_and_relays_the_refusal() {
+    // WOR-2463: the flag has to reach the wire. A `--to-revision` that got
+    // dropped on the way would run the one-step rollback and report
+    // success, rolling the fleet to a document the operator did not name.
+    let (url, fixture) = admin_fixture(
+        "200 OK",
+        &serde_json::json!({
+            "schema_version": 1,
+            "authority_id": "control-plane-test",
+            "key_id": "authority-abc123",
+            "revision": 12,
+            "restored_from_revision": 4,
+            "replaced_revision": 11,
+            "content_digest": "sha256:2c26b46b68ffc68ff99b453c1d3041341340d0d0d0d0d0d0d0d0d0d0d0d0d0d0",
+            "mode": "overlay",
+        }),
+    );
+    let output = run(&[
+        "config",
+        "authority",
+        "rollback",
+        "--to-revision",
+        "4",
+        "--admin-url",
+        &url,
+    ]);
+    let captured = fixture.join().expect("fixture");
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(
+        captured
+            .head
+            .starts_with("POST /admin/config-authority/rollback "),
+        "{}",
+        captured.head
+    );
+    let sent = String::from_utf8_lossy(&captured.body).to_string();
+    assert!(
+        sent.contains("\"to_revision\"") && sent.contains('4'),
+        "the named revision must reach the authority: {sent:?}",
+    );
+    assert!(
+        stdout(&output).contains("revision 4's payload as revision 12"),
+        "{}",
+        stdout(&output)
+    );
+
+    // A refusal names the revisions that are available, so the next
+    // attempt is informed rather than another guess.
+    let (url, fixture) = admin_fixture(
+        "400 Bad Request",
+        &serde_json::json!({
+            "error": "config authority rollback rejected: revision 4 is not in the archive; \
+                      available revisions are 9, 10, 11",
+            "code": "revision_not_archived",
+            "revision_consumed": false,
+            "archived_revisions": [9, 10, 11],
+        }),
+    );
+    let refused = run(&[
+        "config",
+        "authority",
+        "rollback",
+        "--to-revision",
+        "4",
+        "--admin-url",
+        &url,
+    ]);
+    fixture.join().expect("fixture");
+    assert_eq!(code(&refused), 4, "{}", stderr(&refused));
+    assert!(
+        stderr(&refused).contains("revision_not_archived")
+            && stderr(&refused).contains("available revisions are 9, 10, 11"),
+        "{}",
+        stderr(&refused)
+    );
+}
+
+#[test]
 fn subscriber_add_prints_the_credential_once_on_stdout_and_says_so_on_stderr() {
     let credential = "sbca1.0lJ8kQ2vTn5mAqRt.9pQx7Yb2ZmKd3Lw8Rn6Tf1Vc4Hs0Jg5Ee2Aa8Bb1Cc";
     let (url, fixture) = admin_fixture(

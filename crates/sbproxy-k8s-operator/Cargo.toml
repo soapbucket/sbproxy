@@ -86,3 +86,15 @@ rand = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util", "macros"] }
+
+# WOR-2467: the fallback-suspension test drives a real reconcile against
+# a `kube::Client` built over a recording `tower` service, so it can
+# assert that no ConfigMap, Service, Deployment, or StatefulSet write
+# was issued. Pinned to 0.4 because that is the `tower::Service` kube
+# 0.95 itself implements against; a 0.5 service would not satisfy the
+# `Client::new` bound. Already in the lockfile as a kube-client
+# dependency, so this adds no new crate to the tree.
+tower = { version = "0.4", features = ["util"] }
+http = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }

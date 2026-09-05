@@ -1233,6 +1233,32 @@ from tests; this branch adds nothing to either bucket beyond the two already
 recorded above. The gap to main's own 1523 is this branch's own items, counted
 here and not there, for the reasons written against them.
 
+2026-08-28 (WOR-2463, the config-authority archive ring): raised to 325 for
+one item, `ConfigAuthority::rollback_to`. It has a production consumer,
+`dispatch_rollback` in `crates/sbproxy-core/src/config_authority.rs`, which
+is the admin route `POST /admin/config-authority/rollback` and the only way
+an operator reaches it; that call is in the item's own defining file, which
+is the case this count is defined not to see.
+
+Narrowing it to `pub(crate)` would compile, and it is still wrong. The item
+is the sibling of `ConfigAuthority::rollback`, which is `pub` and is reached
+the same way, and the two differ only in whether the caller names a revision.
+An API where "undo the last publish" is public and "go back to Tuesday" is
+crate-private would be a shape nobody chose. The alternative, routing the
+four integration tests that exercise it through `dispatch` instead, would
+push them all onto the process-global authority slot and serialise a file
+that runs in parallel today, which trades a real property for a number.
+
+Unreferenced rises to 1526 in the same change and for the same one item:
+`rollback_to` is named outside its own file only by the integration tests, so
+it lands in both buckets. The three other constants this branch introduced
+(`MAX_ARCHIVE_BYTES`, `MAX_FALLBACK_REASON_CHARS`,
+`FALLBACK_CONDITION_TYPE`) were resolved rather than counted: the first is now
+named by the `archive_keep` validation error in `sbproxy-config/src/types.rs`,
+the second narrowed to a private const with its bound restated in prose, and
+the third is named by the suspension warn log in the operator's `main.rs`,
+which is the line an operator greps before reading the condition.
+
 2026-08-28 (WOR-2668 / WOR-2670 / WOR-2671): test-only 324 -> 323,
 unreferenced 1525 -> 1524. Wiring the new module types through
 sbproxy-core gave production callers to items the scanner had only seen
@@ -1245,6 +1271,17 @@ the ground is not handed back on the next branch.
 predicates and the session wait helper are cfg(test) rather than pub, so
 they leave this bucket and rustc polices them.
 
+2026-08-29 (WOR-2432/2455 closeout, merged with main at c1b393ad): recounted
+against the merged tree. Tests-only 325, unchanged. Unreferenced 1525, which
+is the figure the merge conflicted on: this branch carried 1526 and main
+1524, and neither describes the tree they make together. Main narrowed one
+item this branch does not touch; this branch's own addition
+(`ConfigAuthority::rollback_to`) is still the single item recorded above.
+The re-review round added no `pub` item to either bucket: `consumed_revision`
+on both error types is private, because its only production caller is in the
+same file, and its per-variant test moved into that module rather than
+staying an integration test that would have forced it public.
+
 2026-08-29 (merge of main #1247 into WOR-2668 / WOR-2670 / WOR-2671):
 unreferenced 1524 -> 1523. Both sides of this merge emptied items out of
 this bucket independently, and each recorded 1525 -> 1524 against its own
@@ -1252,3 +1289,24 @@ base, so the merged tree is one lower than either. Neither branch
 narrowed anything to get there; the count is re-derived from the merged
 tree and locked here rather than carried at whichever number was true
 before the merge.
+
+2026-08-29 (WOR-2432/2455 closeout, merged with main at f8b547ff): recounted
+against the merged tree with `scan-pub-item-usage.py --count`, which is the
+only thing that describes a tree neither parent describes. This branch carried
+325/1525 before the merge and main carries 323/1523.
+
+Tests-only 324. That is a **rise of one against main**, and it is the number
+that needs justifying: the one item is `ConfigAuthority::rollback_to`, for the
+reasons recorded above.
+
+Unreferenced 1523, **level with main**. An earlier version of this entry said
+the drop came from giving `FailedCandidate` a constructor. That was wrong, and
+the way it was wrong is worth keeping: the item left the bucket only because a
+comment added in `server/lifecycle.rs` happened to spell its name, and the
+scan is textual by design. Rewording that one comment put the count back to
+1524. A baseline resting on a sentence is not a baseline, so the three items
+involved (`FailedCandidate`, `BootWalkFailure`, `walk_for_bootable`) are now
+`pub(crate)`: `server::lifecycle` is their only consumer and always was, so
+they leave the scanner's universe for a reason the compiler enforces. The
+count is 1523 whether or not any comment names them, which was checked by
+rewording that comment again and re-running the scan.

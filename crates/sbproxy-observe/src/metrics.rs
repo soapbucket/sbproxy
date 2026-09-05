@@ -4340,6 +4340,128 @@ pub fn record_config_authority_announce(result: &'static str) {
     counter.with_label_values(&[result]).inc();
 }
 
+/// Count one operator config-delivery decision on
+/// `sbproxy_operator_config_delivery_total{state}` (WOR-2467).
+///
+/// `sbproxy_operator_reconcile_total{result}` answers "did the pass
+/// finish", and every refusal below finishes cleanly, so it reads `ok`.
+/// This answers the different question an operator actually has:
+/// **is configuration still reaching this SBProxy's pods, and if not,
+/// why.** Every state but `delivered` and `delivered_unowned_skipped`
+/// means a pass completed without the ConfigMap or the workload being
+/// applied. A hot reload records one of the two delivered states and
+/// deliberately skips the workload patch, because advancing the pod
+/// template's config-hash annotation would restart pods the reload just
+/// spared.
+///
+/// `state` is a closed string:
+///
+/// | State | Meaning |
+/// |---|---|
+/// | `delivered` | The ConfigMap and workload were applied this pass. |
+/// | `suspended_on_fallback` | A pod is serving a config its boot fallback restored. Config delivery is suspended until the pin is cleared. |
+/// | `refused_auto_revert` | The referenced config arms `proxy.config_history.soak.auto_revert`, which this operator refuses. Permanent until the config changes. |
+/// | `refused_acme` | A multi-replica SBProxy drives ACME from a pod-local certificate store. |
+/// | `refused_invalid_config` | The referenced `SBProxyConfig` did not validate, or the clustered render failed. |
+/// | `delivered_unowned_skipped` | Delivered by hot reload to every pod this operator's workload created, while one or more pods carrying the same instance label were skipped because it did not create them. They were never sent the admin credential and are not reloaded or restarted by this operator. |
+pub fn record_operator_config_delivery(state: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_operator_config_delivery_total",
+            "Operator config-delivery decisions per reconcile, by state",
+            &["state"],
+        )
+        .ok()
+    });
+    let Some(counter) = counter else {
+        return;
+    };
+    counter.with_label_values(&[state]).inc();
+}
+
+/// Count one operator fallback probe on
+/// `sbproxy_operator_fallback_probes_total{outcome}` (WOR-2467).
+///
+/// The operator asks each proxy pod whether it is serving a
+/// configuration its boot fallback restored, and suspends config
+/// delivery when one says yes. Every other answer is a fail-open, and a
+/// fail-open nobody can see is a suspension that silently stopped
+/// working. The `debug!` lines beside these are compiled out in
+/// release, so this counter is the only production signal.
+///
+/// `outcome` is a closed string:
+///
+/// | Outcome | Meaning |
+/// |---|---|
+/// | `pinned` | The pod reports a boot fallback pin. Config delivery to this SBProxy is suspended. |
+/// | `running_configured` | The pod reports it is on the document it was given. |
+/// | `unreachable` | The request failed. Treated as not pinned. |
+/// | `refused` | The pod answered a non-success status, usually a credential the pod does not accept. Treated as not pinned. |
+/// | `unreadable` | The body did not parse as a fallback report. Treated as not pinned. |
+/// | `unowned` | A pod carried the SBProxy's instance label but was not created by its workload. Not probed, and not sent the admin credential. |
+/// | `budget_exhausted` | The per-pass probe budget was reached; the remaining pods were not asked. |
+pub fn record_operator_fallback_probe(outcome: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_operator_fallback_probes_total",
+            "Operator boot-fallback probes against proxy pods, by outcome",
+            &["outcome"],
+        )
+        .ok()
+    });
+    let Some(counter) = counter else {
+        return;
+    };
+    counter.with_label_values(&[outcome]).inc();
+}
+
+/// Count one config-authority rollback attempt on
+/// `sbproxy_config_authority_rollback_total{target,result}` (WOR-2463).
+///
+/// The node-side `sbproxy_config_apply_total{outcome}` counts what one
+/// node did with a document. This counts what the *authority* was asked
+/// to do with the fleet, which is a different question during an
+/// incident: an operator watching a rollback that reached nobody needs
+/// to know whether the authority refused it or whether the fleet has not
+/// converged yet, and only this series answers the first half.
+///
+/// `target` is a closed string:
+///
+/// | Target | Meaning |
+/// |---|---|
+/// | `previous` | The one-step rollback: republish `previous.json`. |
+/// | `archived` | `to_revision` named a revision from the archive ring. |
+///
+/// `result` is a closed string:
+///
+/// | Result | Meaning |
+/// |---|---|
+/// | `published` | The payload revalidated and went out under a new revision. |
+/// | `refused` | Nothing was published: no target, a revision the ring does not hold, or a payload that no longer validates. The served bundle is untouched. Whether a revision number was spent depends on how far it got, and the code does not answer it: every validation refusal costs nothing, `signing_failed` and `internal` are always past the reservation, and `store_failed` falls on either side of it because the store both reserves the number and persists the bundle. The admin response's `revision_consumed` is the only field that says which. |
+pub fn record_config_authority_rollback(target: &'static str, result: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_config_authority_rollback_total",
+            "Config authority rollback attempts, by target and result",
+            &["target", "result"],
+        )
+        .ok()
+    });
+    let Some(counter) = counter else {
+        return;
+    };
+    counter.with_label_values(&[target, result]).inc();
+}
+
 /// Count one read of the cluster's config-revision announcement on
 /// `sbproxy_config_bundle_gossip_total{outcome}`.
 ///
