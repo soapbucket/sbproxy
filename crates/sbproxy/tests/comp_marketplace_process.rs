@@ -212,6 +212,7 @@ const LONGEST_MARKER: usize = {
 /// port that the start may have had to abandon.
 struct Proxy {
     child: Child,
+    child_reaped: bool,
     port: u16,
     admin_port: u16,
     output: ChildOutput,
@@ -516,6 +517,7 @@ fn start_proxy(root: &Path, config_for: impl Fn(u16, u16) -> String) -> Proxy {
             Startup::Serving => {
                 return Proxy {
                     child,
+                    child_reaped: false,
                     port,
                     admin_port,
                     output,
@@ -590,25 +592,88 @@ impl Drop for Proxy {
         // Read before reaping: once `wait` returns, the pid is free to
         // be recycled, and signalling a recycled pid's group would hit
         // an unrelated process.
-        let pid = self.child.id();
-        if matches!(self.child.try_wait(), Ok(None)) {
-            let _ = self.child.kill();
-        }
-        // The whole group, while the child is still unreaped and so
-        // still holds the pid this group is named by. `kill` above ends
-        // the proxy; this ends anything the proxy started that would
-        // otherwise keep a port.
+        // A transport-failure diagnostic may have already reaped the child.
         #[cfg(unix)]
-        {
-            let _ = Command::new("/bin/kill")
-                .arg("-KILL")
-                .arg(format!("-{pid}"))
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+        if let Some(mut command) = self.group_cleanup_command() {
+            let _ = command.status();
         }
+        // Also handles platforms without process groups or a failed command.
+        let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+impl Proxy {
+    #[cfg(unix)]
+    fn group_cleanup_command(&self) -> Option<Command> {
+        (!self.child_reaped).then(|| process_group_kill_command(self.child.id()))
+    }
+}
+
+#[cfg(unix)]
+fn process_group_kill_command(pid: u32) -> Command {
+    let mut command = Command::new("/bin/kill");
+    // procps can parse an unseparated negative PID by its first digit:
+    // -123 becomes -1, which signals every process we may kill.
+    command
+        .arg("-KILL")
+        .arg("--")
+        .arg(format!("-{pid}"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+#[cfg(unix)]
+#[test]
+fn process_group_cleanup_separates_the_negative_pid_from_options() {
+    let command = process_group_kill_command(12345);
+    assert_eq!(command.get_program(), "/bin/kill");
+    assert_eq!(
+        command.get_args().collect::<Vec<_>>(),
+        ["-KILL", "--", "-12345"]
+    );
+    // Do not execute a regressed SIGKILL command: it could kill the runner.
+}
+
+#[cfg(unix)]
+#[test]
+fn transport_failure_does_not_signal_a_reaped_process_group() {
+    use std::os::unix::process::CommandExt as _;
+
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn exited diagnostic fixture");
+    let output = ChildOutput::drain(
+        child.stdout.take().expect("fixture stdout"),
+        child.stderr.take().expect("fixture stderr"),
+    );
+    child.wait().expect("fixture exits before the diagnostic");
+    let mut proxy = Proxy {
+        child,
+        child_reaped: false,
+        port: 0,
+        admin_port: 0,
+        output,
+    };
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        expect_response(&mut proxy, Err("connection refused".into()), "fixture");
+    }));
+    let cleanup_disabled = proxy.group_cleanup_command().is_none();
+    // Keep this regression safe even if the diagnostic stops marking reaping.
+    proxy.child_reaped = true;
+    assert!(
+        failure.is_err(),
+        "the transport failure must still be reported"
+    );
+    assert!(
+        cleanup_disabled,
+        "a reaped PID must not be signalled as a group"
+    );
 }
 
 /// Why a startup stopped.
@@ -680,7 +745,10 @@ fn expect_response(proxy: &mut Proxy, attempt: Transport, what: &str) -> Vec<u8>
         Ok(raw) => raw,
         Err(error) => {
             let fate = match proxy.child.try_wait() {
-                Ok(Some(status)) => format!("the proxy had already exited with {status}"),
+                Ok(Some(status)) => {
+                    proxy.child_reaped = true;
+                    format!("the proxy had already exited with {status}")
+                }
                 Ok(None) => "the proxy was still running".to_string(),
                 Err(error) => format!("the proxy's status could not be read: {error}"),
             };

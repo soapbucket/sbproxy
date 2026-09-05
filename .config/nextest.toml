@@ -17,21 +17,12 @@ fail-fast = false
 
 # A hung test has to name itself.
 #
-# nextest kills nothing by default: a test that blocks forever holds its
-# thread until the GitHub job's own `timeout-minutes` fires, and a cancelled
-# job uploads no log, so the run that walls tells you only that it walled.
-# That happened twice in a row on one PR and cost two 45-minute rounds
-# before anything could be read off either.
-#
-# 120s is well clear of the slowest test the workspace has: the whole
-# suite is 15,932 tests in 210s locally and 840s on a 4-core runner, and
-# the longest single test in either is under 10s. A test that reaches two
-# minutes is stuck rather than slow.
-#
-# `terminate-after = 2` means two periods, so a stuck test is killed at
-# four minutes and reported by name, with `retries = 1` above still
-# allowing one honest retry. The lane fails, which is the point: the
-# alternative is a cancelled job with no log.
+# Without a per-test termination limit, a stuck test can hold the lane
+# until the job timeout. A recent successful CI run took 349s for the
+# suite, with a process test exceeding 60s, so allow four minutes per
+# attempt rather than relying on local timings to size this limit.
+# `terminate-after = 2` means two 120s periods. The CI retry above allows
+# one further attempt; a persistent hang fails and reports the test name.
 slow-timeout = { period = "120s", terminate-after = 2 }
 
 [profile.ci.junit]
