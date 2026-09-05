@@ -1,6 +1,6 @@
 # Release pipeline for SBproxy.
 #
-# Activates on tags matching v*.*.*. Produces signed binaries (4 platforms),
+# Activates on tags matching v*.*.*. Produces signed binaries (3 platforms),
 # signed multi-arch Docker images on ghcr.io, a CycloneDX SBOM, and SLSA
 # build provenance attestations. All signing is keyless via Sigstore +
 # GitHub OIDC; the expected cert identity for tag vX.Y.Z is documented in
@@ -421,6 +421,7 @@ jobs:
             cargo test -p sbproxy-e2e --test model_cluster_dispatch --locked -- --nocapture
 
   certify-model-host-apple-silicon:
+    needs: build
     # Blocking since the v1.9.0 cycle. The lane's two historical failure
     # modes are both fixed: the pinned llama-server refusing the hosted
     # macos-14 runner (resolved by the runner-compat pin fix) and the
@@ -445,29 +446,45 @@ jobs:
     # certify-model-host.sh defaults to for `serve:`-block deployments,
     # so SB_HOST is pinned to 127.0.0.1 below to match.
     runs-on: macos-14
-    # This candidate spent over 72 minutes in its cold fat-LTO build;
-    # the previous hardware certification then needed another 3 minutes.
-    # The former 75-minute cap could expire before certification finished.
-    timeout-minutes: 120
+    # Certify the exact packaged binary instead of paying for a second
+    # cold fat-LTO build, which exhausted the former 75-minute job limit.
+    # The build matrix keeps its own compile budget; this is hardware time.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
 
-      - uses: ./.github/actions/pinned-toolchain
-
-      - uses: Swatinem/rust-cache@v2
+      - name: download packaged Apple Silicon binary
+        uses: actions/download-artifact@v5
         with:
-          shared-key: certify-model-host-apple-silicon
-          # Retain the dependency build if compilation or certification
-          # fails, so retrying this lane does not start cold again.
-          cache-on-failure: true
+          name: bin-darwin_arm64
+          path: artifacts/apple-release
 
-      # sbproxy-classifier-proto's build script requires protoc; macOS
-      # runners do not ship it, unlike the preprovisioned Linux images.
-      - name: install protoc
-        run: brew install protobuf
-
-      - name: build release binary
-        run: cargo build --release -p sbproxy --locked
+      - name: verify and stage packaged binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd artifacts/apple-release && shasum -a 256 -c sbproxy_darwin_arm64.tar.gz.sha256)
+          mkdir -p target/release
+          tar -xzf artifacts/apple-release/sbproxy_darwin_arm64.tar.gz -C target/release ./sbproxy
+          # The artifact is built on macos-latest and certified on macos-14.
+          # Show its deployment target and libraries before checking it runs.
+          file target/release/sbproxy
+          otool -L target/release/sbproxy
+          otool -l target/release/sbproxy | awk '
+            /LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX/ { remaining = 8 }
+            remaining > 0 { print; remaining-- }
+          '
+          binary_version="$(./target/release/sbproxy --version)"
+          printf '%s\n' "${binary_version}"
+          python3 - "${binary_version}" "${GITHUB_SHA}" <<'PYVERSION'
+          import re, sys
+          match = re.fullmatch(
+              r"sbproxy \S+ \(rev ([0-9a-f]{7,40}), built \d{4}-\d{2}-\d{2}\)",
+              sys.argv[1],
+          )
+          if not match or not sys.argv[2].startswith(match.group(1)):
+              raise SystemExit("packaged binary revision does not match this checkout")
+          PYVERSION
 
       - name: record version metadata
         run: |
