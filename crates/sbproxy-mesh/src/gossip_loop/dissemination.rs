@@ -50,7 +50,7 @@ pub(super) fn apply_updates(
 /// conflict-resolution rules:
 ///
 /// - If the subject is the local node:
-///   - Suspect/Dead: bump our own incarnation and queue a refutation
+///   - Suspect/Dead/Left: bump our own incarnation and queue a refutation
 ///     `Alive(incarnation+1)` for dissemination.
 ///   - Alive: no-op (we always know our own state).
 /// - If the subject is another peer we track:
@@ -70,7 +70,10 @@ pub(super) fn apply_update(
     // --- Self-refutation ---
     if update.node_id == local_node_id && !local_node_id.is_empty() {
         match update.state {
-            PeerStateWire::Suspect | PeerStateWire::Dead => {
+            PeerStateWire::Suspect | PeerStateWire::Dead | PeerStateWire::Left => {
+                // A live process can hear a leave from its previous boot.
+                // The receiver is stopped before our actual graceful leave,
+                // so a leave received here must be refuted like a death rumor.
                 // Bump our own incarnation strictly above what the
                 // rumor claims so the refutation wins under the
                 // ordering rules below. fetch_max is not available on
@@ -105,12 +108,6 @@ pub(super) fn apply_update(
             }
             PeerStateWire::Alive => {
                 // An Alive rumor about ourselves is redundant; skip.
-                MESH_DISSEMINATION_UPDATES_IGNORED
-                    .with_label_values(&[DISSEM_IGNORE_NO_CHANGE])
-                    .inc();
-            }
-            PeerStateWire::Left => {
-                // Our own leave rumor; we already know we are departing.
                 MESH_DISSEMINATION_UPDATES_IGNORED
                     .with_label_values(&[DISSEM_IGNORE_NO_CHANGE])
                     .inc();

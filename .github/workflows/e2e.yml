@@ -52,10 +52,11 @@ jobs:
   e2e:
     name: e2e (workspace)
     runs-on: ubuntu-latest
-    # 45min covered two debug binaries + the suite; the payments release
-    # binary below is fat-LTO (release.yml's build jobs need up to 60min
-    # for the same profile), so this needs real headroom too.
-    timeout-minutes: 75
+    # The 2026-08-31 run spent 57min building the three proxy flavors and
+    # another 7min compiling tests. The 75min cap then cancelled the suite
+    # before it finished. Leave room for the complete test sweep as well as
+    # the payments binary's fat-LTO build, including a cold cache.
+    timeout-minutes: 100
     steps:
       - uses: actions/checkout@v5
 
