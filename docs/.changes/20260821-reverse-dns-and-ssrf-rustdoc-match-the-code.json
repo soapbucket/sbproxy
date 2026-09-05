@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**Three rustdoc claims that the code did not have.** The reverse-DNS verifier's docs said the verdict cache TTL was \"the smaller of the observed PTR / forward TTLs\"; the resolver port returns no TTL at all and the caller passes a fixed value, now documented as the fixed value it is. The same file said the verifier \"never silently falls back to `User-Agent` matching\", while its only production consumer falls through to UA matching for every non-verified verdict, which is now what it says. The SSRF module's caller-status list, which exists so a reviewer can enumerate every path needing dial-time re-validation, named seven call sites and asserted `validate_url_with_allowlist` had none outside the module; the `events:` webhook sink had two it did not name. The list is now nine, split by whether the caller pins the address it validated, and a test fails the build if a new call site lands without being added to it."
-}

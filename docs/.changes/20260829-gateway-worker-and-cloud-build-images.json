@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**Gateway, worker, and Cloud Build images now ship `/var/lib/sbproxy`.** Usage rollups and the keystore can open under the documented default path."
-}

@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**Git-sourced config and extension bundles no longer require a `git` binary.** Fetch prefers `git` on `PATH` and falls back to an in-process clone when it is missing, which is what the official distroless image needs. `verify_signature: true` still requires `git`, because GPG and SSH signature verification are not in the in-process path."
-}

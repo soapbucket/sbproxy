@@ -1,6 +1,6 @@
 # API deprecation
 
-*Last modified: 2026-08-20*
+*Last modified: 2026-09-05*
 
 One origin, four versions of the same API, each at a different point in its lifecycle. A `deprecation:` block on a forward rule stamps the standard announcement headers (`Deprecation` per RFC 9745, `Sunset` per RFC 8594, `Link` relations for the successor and the docs) on exactly the requests that rule matches, counts every hit in `sbproxy_deprecated_requests_total`, and, where configured, retires the route with `410 Gone` once the sunset passes. The actions here are static so the example runs with no upstreams; the same blocks work unchanged on `proxy` actions.
 
@@ -64,14 +64,14 @@ Connection: keep-alive
 ```text
 HTTP/1.1 410 Gone
 content-type: application/json
-content-length: 132
-deprecation: @1577836800
+content-length: <LEN>
+deprecation: @<EPOCH_S>
 sunset: Mon, 01 Jun 2020 00:00:00 GMT
 link: <https://api.local/v2/>; rel="successor-version"
-Date: Thu, 20 Aug 2026 13:49:08 GMT
+Date: <DATE>
 Connection: keep-alive
 
-{"error":"gone","message":"This API has been retired.","successor":"https://api.local/v2/","sunset":"Mon, 01 Jun 2020 00:00:00 GMT"}
+{"error":"gone","message":"This API has been retired.","sunset":"Mon, 01 Jun 2020 00:00:00 GMT","successor":"https://api.local/v2/"}
 ```
 
 ## The successor stays clean

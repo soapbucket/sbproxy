@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "CoMP redeem is bound to the quote it names. An expired quote stays refusable after a later quote request, where the sweep used to remove the row that rejected it, and `accepted_quote_hash` is verified against the quote this publisher issued for that `quote_id`. A `quote_id` the process's ledger has never seen is still admitted, because that ledger is same-process and refusing would break every redeem across a restart; `docs/comp-marketplace.md` names that limit under Honest limits."
-}

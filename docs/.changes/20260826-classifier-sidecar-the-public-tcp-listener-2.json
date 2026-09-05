@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "Classifier sidecar: the public TCP listener can no longer take the whole in-flight frame budget. 4 MiB of the 16 MiB budget is reserved for the admin listener, so unauthenticated sockets that pin their share cannot lock an operator out of `register`, `delete`, and `list`."
-}

@@ -1,4 +1,0 @@
-{
-  "type": "security",
-  "message": "The MCP run-as-user token exchange keeps the pin set its egress authorization resolved and dials only those addresses, so a DNS answer that changes between the check and the connect no longer moves the request. A cross-origin redirect is refused instead of replaying the form body carrying the caller subject token, the token response is read under a 64 KiB ceiling, and the exchange is now armed by the top-level `egress.token_exchange` block, which the only production call site previously bypassed."
-}

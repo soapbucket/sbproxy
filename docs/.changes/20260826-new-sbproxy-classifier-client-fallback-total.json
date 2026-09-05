@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "New `sbproxy_classifier_client_fallback_total{reason}` counts every classifier call the proxy served from its in-process fallback, and the matching warning is held to one line per reason per 60 seconds."
-}

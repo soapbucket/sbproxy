@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**`GET /api/openapi.json` and `.yaml` refresh on every reload.** The\nadmin OpenAPI render is cached, and the cache was keyed on\n`config_revision`, which identifies the set of origins served and\ndeliberately holds still when the behavior behind an unchanged\nhostname changes. So a reload that added an auth block, edited a\nforward rule or set a deprecation left the cache in place and the\nadmin routes served the pre-reload document for the life of the\nprocess. It is keyed on the pipeline generation now, which moves on\nevery swap. The per-host `/.well-known/openapi.json` route was never\naffected; it rebuilds per request. Three docs that described\n`config_revision` as a content hash of the configuration have been\ncorrected to say what it identifies, most importantly\n[docs/metering.md](docs/metering.md), which told buyers to verify a\nsigned receipt's pricing against it."
-}

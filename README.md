@@ -4,7 +4,7 @@
 
 # SBproxy
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-09-05*
 
 <p align="center">
   <a href="https://github.com/soapbucket/sbproxy/actions/workflows/ci.yml"><img src="https://github.com/soapbucket/sbproxy/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>

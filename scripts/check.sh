@@ -730,6 +730,7 @@ step "gate helper self-tests"
 bash "$ROOT/scripts/tests/workspace_bin_test.sh"
 bash "$ROOT/scripts/tests/runner_disk_test.sh"
 bash "$ROOT/scripts/tests/changelog_fragments_test.sh"
+python3 "$ROOT/scripts/tests/release_notes_test.py"
 python3 "$ROOT/scripts/lib/cert_record.py" --self-test
 python3 "$ROOT/scripts/tests/test_cert_record.py"
 python3 "$ROOT/scripts/lib/notice_coverage.py" --self-test
@@ -992,6 +993,11 @@ fi
 if [ "${SBPROXY_SKIP_CARGO:-0}" = "1" ]; then
   note_skip "cargo build/test/doctest/clippy/doc, the generated-artifact checks, and the payments lane (SBPROXY_SKIP_CARGO=1 is a dev-only switch for exercising the script phases; a run with it set is not a gate result)"
 else
+
+if phase_wanted BUILD || phase_wanted TEST; then
+  step "release build metadata regression tests"
+  python3 "$ROOT/scripts/tests/build_revision_test.py"
+fi
 
 # One package selection for every cargo invocation below, which is the
 # invariant ci.yml holds: under resolver = "2" the feature union is

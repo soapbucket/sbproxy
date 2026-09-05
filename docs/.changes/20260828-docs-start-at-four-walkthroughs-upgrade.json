@@ -1,4 +1,0 @@
-{
-  "type": "changed",
-  "message": "**Docs start at four walkthroughs; upgrade.md no longer pins a rotting tag.** [docs/all-traffic-gateway.md](docs/all-traffic-gateway.md) and [docs/getting-started-inbound.md](docs/getting-started-inbound.md) are the hubs. [docs/features.md](docs/features.md) and [docs/comparison.md](docs/comparison.md) are stubs that keep the bound claim rows. [docs/upgrade.md](docs/upgrade.md) points at GitHub releases and documents Restart vs reload, including `proxy.config_history`."
-}

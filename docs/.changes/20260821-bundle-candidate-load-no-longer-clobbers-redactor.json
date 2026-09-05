@@ -1,4 +1,0 @@
-{
-  "type": "security",
-  "message": "**A validate-only bundle load no longer un-redacts the serving config's secrets.** `Candidate::finish` installed the process-wide structured-log field-key denylist at candidate-construction time, so every load that is not an adoption reprogrammed the redactor for the generation still serving: a `/config/publish` dry run carrying no `extensions:` block, a doctor run, or any `CompiledPipeline::from_config` (which loads an empty registry) replaced the live list with its own, and from that moment the serving config emitted its bundles' `secret_vars` in cleartext in every structured log line. The registry now carries its names and the single pipeline publisher installs them, so the denylist moves only when the pipeline that owns it does."
-}

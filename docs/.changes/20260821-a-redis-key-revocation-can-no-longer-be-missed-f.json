@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**A Redis key revocation can no longer be missed for the life of\nthe positive cache.** Key-store mutations ran the record write, the\nrevision bump, and the invalidation publish as three separate\ncommands, so a failure between them could commit a revocation\nwithout ever announcing it; a replica whose pub/sub subscription\ndropped during a revoke missed the message permanently (Redis\npub/sub has no replay) and kept accepting the credential until its\nL1 TTL expired. Mutations now run as one atomic Lua script, so an\nacknowledged change has always published, and the subscriber clears\nits whole local cache on every (re)subscription, after the\nsubscription is live, so a revocation during a gap is covered either\nby the resync or by the stream. A subscription stream that ends now\nreports an error, so the supervising loop resubscribes with backoff\ninstead of treating silence as health."
-}

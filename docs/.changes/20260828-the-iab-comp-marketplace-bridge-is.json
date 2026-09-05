@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "The IAB CoMP marketplace bridge is now a configured proxy surface. `origins.<host>.comp` serves `/.well-known/iab-comp/{manifest.json,quote,redeem}` on that origin: a signed catalog of licensing tiers, a signed price for a requested volume, and a redeem endpoint that exchanges a paid buyer acceptance for an OLP license token signed with the origin's own `olp.signing_key`. `GET /admin/licensing` reports what each configured origin publishes and which quote-signing key is live. See `docs/comp-marketplace.md` and `examples/comp-marketplace/`."
-}

@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**Outlier ejection now restarts the endpoint's measurement window.** The failures that caused an ejection kept counting against the endpoint after it was re-admitted, until `window_secs` expired from the original window start. A recovered endpoint serving four clean requests and then one unrelated 5xx was re-ejected at a 60 % lifetime error rate even though its post-recovery rate was 20 %, on repeat, so a configured 30 s `ejection_duration_secs` behaved as a `window_secs`-long one. Ejection now zeroes the endpoint's counters, so the probe after re-admission is graded only on post-ejection traffic. See [docs/config-stability.md](docs/config-stability.md#outlier-ejection-restarts-the-endpoints-measurement-window)."
-}

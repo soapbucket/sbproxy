@@ -23,6 +23,8 @@ COVERAGE_TEST='key_registry::tests::every_dispatchable_module_declares_whether_i
 # narrower `-p` form resolves different features than the workspace build and
 # recompiles the graph to run one test. Matching the workspace selection makes
 # this reuse whatever the lane already built.
+# Both assertions live in libraries. Restrict targets with --lib so this
+# audit does not discover hundreds of unrelated integration-test binaries.
 #
 # nextest is preferred because it fails when a filter matches nothing, so
 # renaming either test cannot silently turn this gate into a no-op. That
@@ -34,7 +36,7 @@ COVERAGE_TEST='key_registry::tests::every_dispatchable_module_declares_whether_i
 
 if cargo nextest --version >/dev/null 2>&1; then
   expect_tests 2 "config-reader coverage (nextest)" -- \
-    cargo nextest run --workspace --exclude sbproxy-e2e --locked \
+    cargo nextest run --workspace --exclude sbproxy-e2e --locked --lib \
       -E "test(=${READER_TEST}) + test(=${COVERAGE_TEST})"
 else
   expect_tests 1 "$READER_TEST" -- \

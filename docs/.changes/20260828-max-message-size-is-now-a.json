@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "**`max_message_size` is now a first-class key on `websocket`, `load_balancer`, and `ai_proxy`.** Unset keeps the previous 10 MB cap. `0` means unbounded. The cap is keyed on the action, not the origin, so two actions on one host can differ."
-}

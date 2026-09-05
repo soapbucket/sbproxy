@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "**`sbproxy_ai_translation_dropped_total{surface, field}` counts every\nrequest field lost in translation.** `/v1/messages` and\n`/v1/responses` now push a note for each unrepresented top-level\nfield, each dropped content block, and each extension attribute on a\nblock they keep, then emit one aggregated warn per request naming at\nmost eight distinct fields. `surface` uses the same `messages` and\n`responses` values as `sbproxy_ai_surface_requests_total`, so a\ndrop-rate query joins the two. The log line to grep is\n`AI proxy: request fields dropped in translation`, and it carries the\norigin and tenant."
-}

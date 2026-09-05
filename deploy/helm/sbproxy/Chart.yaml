@@ -8,12 +8,12 @@ type: application
 # Chart version. Bump on every chart change. Independent of appVersion:
 # this is the packaging's own semver, so a values or template edit bumps it
 # without the application underneath having moved.
-version: 0.1.2
+version: 0.1.3
 # App version. Tracks the SBproxy release this chart is cut against, which is
 # the workspace version in the root Cargo.toml. `image.tag` defaults to this
 # value, so bumping here is the only edit a release needs; override with
 # `--set image.tag=...` to run a locally built image.
-appVersion: "1.13.0"
+appVersion: "1.14.0"
 keywords:
   - sbproxy
   - proxy

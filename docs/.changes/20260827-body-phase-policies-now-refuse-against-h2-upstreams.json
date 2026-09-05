@@ -1,4 +1,0 @@
-{
-  "type": "security",
-  "message": "**A body-phase policy refusal now holds against an HTTP/2 upstream.** `openapi_validation`, `request_validator`, `content_digest`, `body_threat_protection`, `prompt_injection_v2`'s body scan, and the A2A push-notification check all decide on the buffered request body and refuse by aborting the upstream exchange. Pingora propagates that abort on an HTTP/1.1 upstream and swallows it on an HTTP/2 one, so against an h2 backend the upstream's own answer was forwarded to the client and the refused body counted as admitted. Since every TLS upstream negotiates h2 by default, that was the behavior for any `https://` backend that offers it. The proxy now withholds the upstream response and answers with the policy's configured status and body on both protocols. If you worked around this by pinning a backend to HTTP/1.1, you no longer need to."
-}

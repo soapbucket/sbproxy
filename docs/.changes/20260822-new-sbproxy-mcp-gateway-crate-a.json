@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "New `sbproxy-mcp-gateway` crate: a standalone MCP OAuth 2.1 broker (PKCE, DPoP, mTLS-bound tokens, device-code grant, RFC 8707/8693/7591) plus a resource-server companion, both backed by an in-process store with Redis as the optional multi-replica backend."
-}

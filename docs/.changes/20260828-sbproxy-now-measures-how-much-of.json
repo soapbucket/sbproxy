@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "SBproxy now measures how much of a worker's stack the AI request path uses, warns once per process when it passes three quarters of it, and holds the measurement to a budget that can only fall."
-}

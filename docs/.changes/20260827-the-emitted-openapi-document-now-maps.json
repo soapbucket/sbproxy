@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "The emitted OpenAPI document now maps every auth type the gateway implements, including the three providers WOR-2667 ported. The `api_key` provider previously fell through to a generic placeholder that told clients to send `Authorization` when the origin wanted the header it had configured, and a `noop` origin published a credential requirement it does not have."
-}

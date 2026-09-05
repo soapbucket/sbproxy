@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "An automatic config revert now names the revision it is reverting, so a fix an operator pushed while the revert was in flight is no longer overwritten by a document older than it. A rollback onto the document already running no longer marks that revision as one this node rolled away from, which had been flipping the last known good to `reverted` on the history panel. A rollback whose blast radius cannot be measured now needs the same typed confirmation a restart-class one does, rather than applying straight through. A config revision a soak measured as bad stays the boot walk last resort after an automatic revert annotates it, instead of climbing back to the front. An armed node that decides not to revert now counts `sbproxy_config_apply_total{outcome=\"declined\"}` and publishes a `config_rollback` event with the reason, so a fleet that declined everywhere is no longer indistinguishable from one where no soak failed."
-}

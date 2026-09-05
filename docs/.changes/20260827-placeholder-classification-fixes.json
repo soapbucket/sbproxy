@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**Two `${...}` placeholder forms were misclassified as environment references.** `${}`, which names nothing, lost its closing brace during interpolation and was reported as an unresolved environment reference, which a config-authority subscriber turns into a refusal of the whole bundle. `${request.header.NAME}` and `${attribution.KEY}`, the dotted half of the access-log `custom_fields` vocabulary documented in `docs/access-log.md`, were treated the same way even though `custom_log` resolves both per request and never from the environment. Both now round-trip as the literal text they are."
-}

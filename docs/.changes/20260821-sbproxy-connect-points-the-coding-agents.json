@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "`sbproxy connect` points the coding agents installed on this machine at the gateway, and `sbproxy disconnect` puts them back. It detects Codex, Claude Code, Cursor, Cline, and Copilot; writes `$CODEX_HOME/sbproxy.config.toml` as a Codex profile of its own (never your `config.toml`) through a temp file and a rename, after taking a one-time `.sbproxy.bak` copy; and prints the exports or settings-screen fields for the rest. `disconnect` copies the profile to `<path>.sbproxy.removed` before it unlinks it, so a hand edit made after connecting survives the removal that the `.sbproxy.bak`, which holds the file as it was before the first `connect`, was never going to hold. `--dry-run` shows the unified diff and writes nothing. No credential is read or written: the config names the environment variable each client reads its key from. The four per-editor connect pages collapse into `docs/use-case-connect-coding-agents.md`."
-}

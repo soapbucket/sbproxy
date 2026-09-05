@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "A cascade that never dispatches (credential lock, connect error, posture refusal, emptied price-ceiling, or quota-pool reject) no longer reports a stale selected_provider on routing-decisions rows."
-}

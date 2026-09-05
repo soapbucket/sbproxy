@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "An abandoned streamed AI request now settles what it delivered. The settlement moved into a guard, so a shutdown that drops in-flight streams, an outer timeout, or a panic in the relay bills the tokens the provider already generated instead of refunding every reservation."
-}

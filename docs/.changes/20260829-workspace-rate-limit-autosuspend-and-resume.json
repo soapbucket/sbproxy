@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "Workspace rate-limit AutoSuspend and resume transitions now append to the tamper-evident `audit.sink: chain` file. They previously only hit the `security_audit` tracing target and `/api/audit/recent`."
-}

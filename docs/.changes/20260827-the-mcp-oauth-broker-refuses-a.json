@@ -1,4 +1,0 @@
-{
-  "type": "security",
-  "message": "The MCP OAuth broker refuses a zero `session_ttl_secs`, and a zero `cimd_cache_ttl_secs` when CIMD is enabled, at startup. Either one built a store whose every row expired before the round trip that would read it, so the flow it backed could never complete; the broker booted anyway and rejected every callback."
-}

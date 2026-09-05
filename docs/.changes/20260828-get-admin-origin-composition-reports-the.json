@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "**`GET /admin/origin-composition` reports the aggregator.** The route now carries the configured timings, including `polls_per_hour_per_repo`, and `last_round` on the one node that aggregates: what it decided, which revision it published, how long it took, which entries resolved or fell back to a cached profile, and which repositories are unreachable by name. Four metric families back it: `sbproxy_aggregate_entries{outcome}`, `sbproxy_aggregate_compose_duration_seconds`, `sbproxy_aggregate_published_revision` and `sbproxy_aggregate_rounds_total{outcome}`, with panels on the origins dashboard. The entry name is deliberately not a metric label; fifty entries would be fifty series that churn as the block is edited."
-}

@@ -1,4 +1,0 @@
-{
-  "type": "changed",
-  "message": "**Each `ai_proxy` origin keeps its own price table.** Two origins with different `model_prices` or rate cards no longer clobber each other, `ai.catalog` reads the origin that is handling the request, and a validation-only compile never installs the candidate as the process global."
-}

@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "Refused config candidates are kept under the revision ring with the reason, the refusing stage, the provenance, and the document as written, and read back at `GET /admin/config/rejected`."
-}

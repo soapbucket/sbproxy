@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "A streamed AI response whose provider never sends a `usage` frame is now billed from the assistant text it delivered, counted with the model tokenizer, instead of debiting nothing; `sbproxy_ai_usage_parse_miss_total` marks every stream priced that way."
-}

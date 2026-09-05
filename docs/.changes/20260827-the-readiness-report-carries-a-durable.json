@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "The readiness report carries a `durable_file_modes` component naming what the build enforces on the files its durable sinks write, so the posture is visible where an operator looks rather than only in a startup log line."
-}

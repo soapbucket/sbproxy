@@ -1,4 +1,0 @@
-{
-  "type": "removed",
-  "message": "**The unused convergent secret-reuse scaffolding is gone from `sbproxy-vault`.** `ConvergentFingerprinter` derived a per-installation key, hashed secret values with it, and would have persisted a generated key at a reserved vault path on first run. No configuration key, metric, event, admin surface, or other crate ever reached any of it, so no installation has one of those keys and nothing an operator wrote could have produced one. Deleting it also removes the read-then-write race in its first-run key generation, where two processes starting together would each have generated and stored a different key. Secret-reuse detection was never a shipped capability and this does not remove one."
-}

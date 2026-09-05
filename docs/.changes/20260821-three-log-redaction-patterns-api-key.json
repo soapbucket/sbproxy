@@ -1,4 +1,0 @@
-{
-  "type": "security",
-  "message": "Three log-redaction patterns (`api_key`, a `secret`-labeled 40-char value, and `password`) consumed the key separator along with the value, so a structured log line carrying one of those field names was no longer valid JSON. The field-key denylist runs only on a line that parses, so `prompt`, `messages`, `cookie` and bundle secret vars on that same line were emitted unredacted. All three now preserve the key and separator verbatim and mask only the value."
-}

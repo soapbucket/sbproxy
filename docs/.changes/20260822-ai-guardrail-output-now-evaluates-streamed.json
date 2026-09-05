@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**`ai_guardrail_output` now evaluates streamed model output.** The hook used to run only on a buffered completion, so a `stream: true` client bypassed it. An enforcing output hook holds the stream until close and can replace or refuse the assembled assistant text."
-}

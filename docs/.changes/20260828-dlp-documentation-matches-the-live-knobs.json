@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**DLP documentation matches the live request path.** The policy scans the request URI and headers. `scan_body` defaults true and `body_max_bytes` defaults 16384, but the header-phase policy chain snapshots an empty body, so a secret that appears only in the POST body is not seen. There is no body rewrite. See [docs/configuration.md](docs/configuration.md#dlp) and [examples/dlp-catalog/](examples/dlp-catalog/)."
-}

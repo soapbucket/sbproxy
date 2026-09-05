@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "AI gateway: new `cancel_on_half_close` boolean on the `ai_proxy` action (default `false`). Off, a downstream HTTP/1 half-close is not treated as the client leaving, because RFC 9112 section 9.6 makes it indistinguishable from a client that has finished sending and is waiting to read. On, that half-close cancels the in-flight provider call and the request bills as `client_disconnected`, which is what makes the common HTTP/1 abandonment (a caller whose own deadline fired and closed its socket) reachable. Enable only when your clients never half-close after sending. HTTP/2 stream resets and TCP resets cancel either way."
-}

@@ -1,4 +1,0 @@
-{
-  "type": "breaking",
-  "message": "**A mesh node that exits cleanly now announces `Left` to a fan-out of live peers.** That is a wire break: every node in the cluster must understand the new membership state, so rolling this out means upgrading the whole cluster together. A peer that received the announcement is evicted under `mesh_peer_evicted_total{reason=\"graceful_leave\"}` instead of waiting out the suspect window and `dead_timeout`. `dead_peer_gc_secs` still GCs the routing membership after that, and the admin roster keeps its bounded tombstone."
-}

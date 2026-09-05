@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "An `abtest` variant `url` carrying a path now sends the request to that path, matching what the same URL does on a `proxy` action, instead of dropping it."
-}

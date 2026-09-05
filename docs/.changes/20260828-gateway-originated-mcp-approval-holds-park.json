@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "Gateway-originated MCP approval holds park a high-risk `tools/call` against a content snapshot, not a tool name. The caller is not kept waiting on HTTP: JSON-RPC `-32097` returns `hold_id` immediately. Operators approve or deny via `/api/mcp/approvals`. TrueFoundry is the surveyed SOTA for this gate."
-}

@@ -1,4 +1,0 @@
-{
-  "type": "security",
-  "message": "OpenID Federation JWS verification checks a verifier-owned algorithm allowlist before it resolves the attacker-selected `kid`, and binds the header `alg` to the JWK's own `alg`, `use`, `key_ops`, `kty`, and `crv`. Missing required claims are named explicitly, a future `iat` outside five minutes of leeway is rejected, metadata-policy composition stays monotonic across all seven operators, the trust chain is walked anchor to leaf, and no error string interpolates a URL, a credential, or a transport error."
-}

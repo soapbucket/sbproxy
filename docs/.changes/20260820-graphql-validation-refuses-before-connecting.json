@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**GraphQL validation refuses before connecting upstream.** On a\nvalidated `graphql` origin without `request_modifiers`, an invalid\ndocument now gets its `400` in the request phase, before any upstream\nconnection is attempted; previously validation ran only after the\nconnect, so an invalid query against a down upstream surfaced as a\n`502`. Routes with `request_modifiers` still validate at the\npost-modifier seam, since the modified request is the one the\ncontract holds."
-}

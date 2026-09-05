@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "**Cheap change detection and coalesced publishes.** Polling asks `git ls-remote` which commit a reference points at, in one round trip with no working tree, and clones only when that sha moved. An entry pinned to a full commit sha is never polled, because a sha cannot move; two entries naming one repository at one revision are one fetch; and a round where nothing moved composes nothing, publishes nothing, and leaves every subscriber on its `304`. A debounce window collects a burst of unrelated project merges into one composed document and one published revision, with a ceiling measured from the window's first movement so a continuously-changing entry still publishes. Timings live under `origin_sources.aggregator` with the defaults documented alongside what they cost in requests per hour per repository."
-}

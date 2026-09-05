@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "x402 settle now reads the HTTP status before the body, so only a 2xx response saying `success: false` is an authoritative refusal. A settle answered outside 2xx moves the intent to `NeedsReconciliation` instead of closing it `Terminal`, whatever a foreign error envelope deserializes to."
-}

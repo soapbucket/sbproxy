@@ -592,26 +592,36 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn refuses_work_beyond_running_and_queue_budget() {
-        let admission = Admission::new(1, 0, std::time::Duration::from_secs(1)).unwrap();
+        let admission = Admission::new(1, 0, Duration::from_secs(30)).unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let first = {
             let admission = admission.clone();
             tokio::spawn(async move {
                 admission
-                    .run_blocking("quality", || {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    .run_blocking("quality", move || {
+                        let _ = started_tx.send(());
+                        // Keep the running lease until the refusal is observed.
+                        // Dropping the sender on panic also releases this worker.
+                        let _ = release_rx.recv();
                         Ok::<_, anyhow::Error>(())
                     })
                     .await
             })
         };
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-
-        let error = admission
-            .run_blocking("quality", || Ok::<_, anyhow::Error>(()))
+        tokio::time::timeout(Duration::from_secs(10), started_rx)
             .await
-            .expect_err("queue budget must refuse excess work");
-        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+            .expect("first worker starts before the test deadline")
+            .expect("first worker signals that its lease is held");
+
+        let excess = admission
+            .run_blocking("quality", || Ok::<_, anyhow::Error>(()))
+            .await;
+        // Release and reap the worker before checking either result.
+        drop(release_tx);
         first.await.unwrap().unwrap();
+        let error = excess.expect_err("queue budget must refuse excess work");
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

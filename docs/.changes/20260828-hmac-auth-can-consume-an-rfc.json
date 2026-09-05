@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "**hmac_auth can consume an RFC 9421 nonce for exactly-once replay defense inside the clock-skew window.** Set `nonce_store: memory` (or inject a `NonceStore` the way `bot_auth` does) and the first presentation of a nonce verifies; a replay is `nonce_replay`. A wired store requires a nonce and fails closed on a store error. Omit the key to keep timestamp-window-only replay defense. This config takes no filesystem path."
-}

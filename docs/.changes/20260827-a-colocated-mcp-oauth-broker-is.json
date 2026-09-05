@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "A colocated MCP OAuth broker is visible to an operator. `GET /admin/mcp-oauth` on the proxy admin API reports every `mcp` action carrying an `oauth.broker` block, what each has wired in, and whether a resource server is configured to check the tokens it mints. The broker own `GET {base_path}/admin/status` stays unmounted in process, because that route tree sits on the public MCP origin ahead of the resource-server check; this is the same JSON behind operator auth, matching what `GET /admin/federation` does for the federation half."
-}

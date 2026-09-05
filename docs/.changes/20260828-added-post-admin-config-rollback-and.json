@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "Added `POST /admin/config/rollback` and `sbproxy config rollback`: re-apply any config revision the node already stored, naming a revision, a content digest, or the last known good. A rollback is an ordinary candidate that resolves, compiles, publishes through the same reload transaction, and soaks, so rolling into a second bad config is caught the same way the first one was. It refuses a stale `expected_current` naming both revisions, refuses a lineage break unless forced, refuses a restart-class or breaking change until the caller names the revision back, and appends a new ring entry rather than rewinding, so the rollback is itself in the history. `GET /admin/config/diff` and `sbproxy config diff` render a plan between two stored revisions, or between one and what is running, without touching either."
-}

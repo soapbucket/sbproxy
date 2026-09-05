@@ -1,4 +1,0 @@
-{
-  "type": "breaking",
-  "message": "**An unreadable MCP `tool_quotas[].rate.per` is refused at config load.** A `per:` value outside `ms / s / m / h / d` was never validated anywhere: `per: 1hour` compiled clean, `sbproxy validate` accepted it, and the request path then read the parse failure as \"this tool has no quota\" and let every `tools/call` through with no log line and no counter, so the dashboard showed the quota configured and zero rejections. The `mcp` action now refuses the config naming the policy, the tool, and the string, so a config carrying a typo stops loading rather than loading a quota nothing enforces; the request-path branch survives as a backstop and denies instead of allowing. Grep your configs for `per:` under `tool_quotas` before upgrading, starting with any quota that has never rejected anything. See [docs/config-stability.md](docs/config-stability.md) and [docs/mcp.md](docs/mcp.md)."
-}

@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**The Kubernetes Gateway controller renews its leader Lease and\nfences every write on loss.** Leader election acquired the 15 second\nLease once and returned, so after 15 seconds a standby took it over\nwhile the original leader kept writing `sb.yml` and Gateway API\nstatus, and takeover used force-apply, which lets a non-holder steal\nthe holder field. Leadership is now a lifecycle: the leader renews\nevery 5 seconds, takeover is conditional on the Lease's\n`resourceVersion` so racing standbys see exactly one winner, and a\nleader that cannot renew fences its own config and status writes\nafter 10 seconds, fails readiness, releases the Lease on graceful\nshutdown, and exits so the Deployment restarts it as a standby."
-}

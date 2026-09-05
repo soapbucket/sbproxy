@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "**Cedar MCP policies participate in `sbproxy plan` and `sbproxy cedar replay`, and Confirm parks in the admin queue.** A Cedar-only edit is a named Reload. `cedar replay --against` evaluates a JSONL traffic sample, optionally `--baseline` to preview a change. A Confirm verdict with `approval:` parks, fires `mcp_confirm` on existing alerting channels, and shows at `/admin/ui/mcp-approvals`. Holds still expire fail-closed after 15 minutes."
-}

@@ -1,4 +1,0 @@
-{
-  "type": "security",
-  "message": "**Refused LDAP binds and refused JWE algorithms are visible in release\nbuilds.** Both logged at `debug`, which the release profile's\n`release_max_level_info` compiles out, so the shipped binary recorded\nnothing for a refused credential while the documentation promised the\nlog named the offending algorithm. Raised to `info`. A failed\n`content-digest` body binding now logs at `warn` at all three refusal\nsites; it previously logged at `debug` in one and nowhere in the other\ntwo. No credential is logged at any of them."
-}

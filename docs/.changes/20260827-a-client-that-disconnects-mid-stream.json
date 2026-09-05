@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "A client that disconnects mid-stream now settles on a `client_disconnected` receipt and ticks `sbproxy_ai_stream_post_commit_failures_total{cause=\"client_disconnected\"}`, where the failed relay write previously priced as a delivered sale."
-}

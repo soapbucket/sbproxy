@@ -1,4 +1,0 @@
-{
-  "type": "security",
-  "message": "The MCP OAuth broker canonicalizes IPv4-mapped IPv6 before every private-range check, so the `::ffff:10.0.0.5` spelling of a private address can no longer reach the CIMD fetcher or the OAuth egress client."
-}

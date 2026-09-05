@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "**Routing decision traces: `GET /api/routing-decisions` and the\nadmin console's Routing decisions view.** Every routed request\n(AI dispatch or a load-balanced origin) now records a per-request\ndecision trace: the strategy or operator plan that decided, the\nordered candidates it weighed, the winner, the reason, the fallback\nchain actually traversed, and timing. The record's open `detail`\nmap is additive by design so later explanatory columns land as\nkeys, not schema changes. Bounded in-memory ring sharing\n`proxy.admin.max_log_entries` with the request log; server-side\nfilters by origin, strategy, model (either side of a substitution),\nprovider, and time range. See the routing-decisions sections of\n[docs/admin-api-reference.md](docs/admin-api-reference.md) and\n[docs/admin-ui.md](docs/admin-ui.md)."
-}

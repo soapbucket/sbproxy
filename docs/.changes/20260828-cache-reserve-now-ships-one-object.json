@@ -1,4 +1,0 @@
-{
-  "type": "removed",
-  "message": "Cache Reserve now ships one object-storage backend. `cache_reserve.backend.type: object_store` covers S3, Google Cloud Storage, Azure Blob, a local directory, and any S3-compatible store an `endpoint` names; the separate AWS-SDK `type: s3` backend is retired and refused at config load with the replacement block printed in the error. See `docs/cache-reserve.md` for the field-by-field migration and what happens to KMS envelope encryption."
-}

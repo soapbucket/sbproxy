@@ -1,4 +1,0 @@
-{
-  "type": "breaking",
-  "message": "The S3 Cache Reserve backend refuses to read an object written before this release. Its envelope now binds the ciphertext to a versioned canonical AAD covering bucket, prefix, logical key, object key, and stored metadata, so a moved or renamed object cannot be decrypted in its new place. Objects carrying the previous AAD fail closed with an explicit rewrite-required error rather than being silently accepted; drop the prefix and let it refill."
-}

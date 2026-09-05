@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "The idempotency reference no longer claims a full waiter pool skips the cache: it answers 409 `ledger.idempotency_in_flight` immediately, and only the buffering pool produces `x-sbproxy-idempotency: SKIPPED-POOL-FULL`. `SKIPPED-MULTIPART` is documented as the seventh header value, and the outcome metric now says which requests it counts rather than claiming it sums to the origin request count."
-}

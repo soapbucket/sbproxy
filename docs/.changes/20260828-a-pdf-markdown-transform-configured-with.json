@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "A `pdf_markdown` transform configured with `extract_tables` now warns once at config load rather than on every decoded response, and a successful decode logs at debug rather than info."
-}

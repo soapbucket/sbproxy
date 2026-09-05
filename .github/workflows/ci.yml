@@ -207,6 +207,9 @@ jobs:
 
       - uses: taiki-e/install-action@nextest
 
+      - name: release build metadata regression tests
+        run: python3 scripts/tests/build_revision_test.py
+
       # Compile normal binaries and test harnesses in one Cargo invocation,
       # so the scheduler can overlap their work. The old separate builds
       # took 3m37 + 9m06 on main (run 33318357937), before 5m49 of tests.
@@ -651,6 +654,7 @@ jobs:
         run: |
           python3 scripts/changelog-fragments.py --self-test
           bash scripts/tests/changelog_fragments_test.sh
+          python3 scripts/tests/release_notes_test.py
 
       # WOR-2108. One file per change under docs/.changes/, assembled at
       # release. Refuses a malformed fragment, hand-written content under

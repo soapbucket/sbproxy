@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "A streamed AI response now settles its token usage through one finalizer on every way the stream can end, so a client that hangs up mid-stream is billed for what it received rather than refunded in full, and a clean stream with an exact `usage` frame reaches the access log, the usage sinks and the payment bridge instead of reporting zero."
-}

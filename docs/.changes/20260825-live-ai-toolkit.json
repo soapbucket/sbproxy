@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "Added the bounded live AI toolkit: scoped governed agent workflows, immutable offline-evaluation datasets, stable weighted prompt rollouts, authenticated admin and CLI operations, typed content-safe events, one closed-cardinality Prometheus family, Grafana panels, and no-Redis examples."
-}

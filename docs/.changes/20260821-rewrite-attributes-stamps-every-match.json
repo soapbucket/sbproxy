@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**The `html` transform's `rewrite_attributes` stamps every matching tag.**\nIt used to rewrite the tags that already carried the attribute and stop,\nand when no tag carried it, add it to the first match only, so a page that\nmixed the two came out half-rewritten. One pass now handles both: a tag\nwith the attribute has its value replaced, a tag without it has the\nattribute inserted before the closing `>`, and a self-closing `/` is kept.\nThe attribute match also requires a whitespace boundary, so a `target`\nrewrite no longer fires inside `data-target`, and a configured value\ncontaining `$1` stays literal text."
-}

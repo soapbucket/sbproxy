@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "Added `proxy.notifications`: outbound webhook subscriptions with per-subscription event filters and signing keys, three backed-off delivery attempts, and a durable deadletter queue with paged listing and replay, all on one embedded store. A filter is an exact event name, a family prefix like `key_*` anchored on the separator, or `*`; a wildcard that reaches the per-request lifecycle events needs `allow_firehose: true` in the same call, because one webhook delivery per proxied request is not a rate this worker can serve. A replay drops its record only once the worker has taken the delivery, so a full queue answers `429` with `replayed: false` and keeps it. Like the registry, the block is boot-only and a reload that changes it is refused by name. Manage subscriptions from the new Notifications page in the admin console."
-}

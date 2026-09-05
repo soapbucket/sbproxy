@@ -1,4 +1,0 @@
-{
-  "type": "changed",
-  "message": "The ported MCP OAuth, OpenID Federation, and CoMP marketplace crates no longer end the process on a path an operator cannot recover from. Lock poisoning in the CoMP key manager, revocation denylist, buyer-key registry, quote ledger, and federation entity-configuration cache now recovers the guarded value instead of unwrapping it; a Prometheus family that fails to register is dropped with a warning naming it instead of aborting startup; and the in-memory session store, CIMD cache, DCR cache, and local KV store build without a fallible step."
-}

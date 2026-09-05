@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**Anonymous x402 callers no longer wait on another wallet's stuck payment.** After `/verify` succeeds, the facilitator `payer` is hashed onto the intent. Unidentified requests then match only unattributed rows. The first stall of a never-verified payer stays route-wide."
-}

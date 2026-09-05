@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "A new `https_proxy` action relays a request to its own resolved host, allow-listed by `allowed_hosts`, for wildcard origins that want to narrow which hosts actually get proxied."
-}

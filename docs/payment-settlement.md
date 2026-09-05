@@ -1,6 +1,6 @@
 # Payment settlement
 
-*Last modified: 2026-08-28*
+*Last modified: 2026-09-05*
 
 `proxy.payments` is how SBproxy charges for a request and proves it was
 paid. It is Apache-2.0, it is off unless you configure it, and it holds
@@ -494,12 +494,12 @@ token rides the header the policy configured:
 ```text
 HTTP/1.1 402 Payment Required
 content-type: application/json
-crawler-payment: eyJhbGciOiJFZERTQSIsInR5cCI6InNicHJveHktcXVvdGUrandzIiwia2lkIjoic2Jwcm94eS1wYXltZW50cyJ9.eyJpc3MiOiJzYnByb3h5LXBheW1lbnRzIiwic3ViIjoiX19kZWZhdWx0X18iLCJhdWQiOiJsZWRnZXIiLCJpYXQiOjE3ODU3OTQ4NzksImV4cCI6MTc4NTc5NTE3OSwibm9uY2UiOiJyZXFfMDFrejR0cHJmdDBwZjYyYmszZHJkNzl0cG4iLCJxdW90ZV9pZCI6InF1b3RlXzAxa3o0dHByZnQwcGY2MmJrM2RyZDc5dHBuIiwicm91dGUiOiIvYXJ0aWNsZSIsInNoYXBlIjoicGF5bWVudC1yZXF1aXJlbWVudCIsInByaWNlIjp7ImFtb3VudF9taWNyb3MiOjEwMCwiY3VycmVuY3kiOiJCVEMifSwicmFpbCI6ImxpZ2h0bmluZyIsInJlcXVpcmVtZW50X2lkIjoicmVxXzAxa3o0dHByZnQwcGY2MmJrM2RyZDc5dHBuIiwiZHJhZnRfZGlnZXN0IjoibG13ajVDYjE3bVhkLTFuSHdTX2x4bS12d3VCUk8zTVhzd3RkeEkxc0N5TSIsInJlcXVpcmVtZW50X2RpZ2VzdCI6IkczTE1BWW51LVI2aE9zUk55U2dLdGdwTE1jYTRnRWNUYm9FRG1QTHBzNkkifQ.WAHMWK0keVNhIzPFhKsKYB8IGAtK9wrMfWiSF-IcrCc3P6jYJRwQT3UF3DhcKSM89i27KvicPVKK7xZfn1WcBw
-content-length: 490
-Date: Mon, 03 Aug 2026 22:07:59 GMT
+crawler-payment: <JWS>
+content-length: <LEN>
+Date: <DATE>
 Connection: keep-alive
 
-{"amount_micros":100,"challenge":{"bolt11":"lnbcrt100u1stubinvoiceda627526f303639efa30246f0a15d59c4b463f2b6d2ed318d0f413f641ffe30a","label":"sbproxy-invoice-sbpi_VToGEr88GCbwAYpkLNQj9ld9tG2CBOs6-yRsutLntTk","payment_hash":"da627526f303639efa30246f0a15d59c4b463f2b6d2ed318d0f413f641ffe30a"},"currency":"BTC","error":"payment_required","expires_at_ms":1785795179994,"header":"crawler-payment","rail":"lightning","requirement_id":"req_01kz4tprft0pf62bk3drd79tpn","target":"blog.local/article"}
+{"error":"payment_required","rail":"lightning","requirement_id":"req_<ULID>","amount_micros":100,"currency":"BTC","target":"blog.local/article","header":"crawler-payment","expires_at_ms":<EPOCH_MS>,"challenge":{"bolt11":"lnbcrt<INVOICE>","label":"sbproxy-invoice-sbpi_<INTENT>","payment_hash":"<HEX64>"}}
 ```
 
 The retry before the payment settles. The token authenticates and names a
@@ -530,11 +530,11 @@ cannot pay:
 ```text
 HTTP/1.1 406 Not Acceptable
 content-type: application/json
-content-length: 189
-Date: Mon, 03 Aug 2026 22:08:10 GMT
+content-length: <LEN>
+Date: <DATE>
 Connection: keep-alive
 
-{"error":"no_acceptable_rail","message":"Accept-Payment does not overlap with the settlement rails configured for this route.","supported_rails":["lightning"],"target":"blog.local/article"}
+{"error":"no_acceptable_rail","supported_rails":["lightning"],"target":"blog.local/article","message":"Accept-Payment does not overlap with the settlement rails configured for this route."}
 ```
 
 The whole sequence, with the origin's own hit counter after each step,

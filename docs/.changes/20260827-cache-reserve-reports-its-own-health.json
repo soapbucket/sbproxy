@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "Cache Reserve reports its own health. A `cache.reserve.health` decision record names the backend, state, and a closed reason code on every transition; `sbproxy_cache_reserve_degraded` and `sbproxy_cache_reserve_health_transitions_total` chart it; and `GET /admin/cache` carries a bounded `reserve` object. A reserve that fails to initialize or starts failing at runtime is now visible instead of silently absent, and the health state belongs to its pipeline generation so a config reload cannot leave a stale gauge behind."
-}

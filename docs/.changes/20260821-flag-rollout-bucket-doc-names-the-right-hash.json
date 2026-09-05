@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**`rollout_percent`'s documentation named the wrong hash.** The field doc said a request's bucket is `xxhash(flag_name + key) % 100`; the bucketer is and always was FNV-1a 64-bit over `flag_name`, a `|` separator byte, then `key`. Anyone reproducing the documented formula to preview a canary cohort or audit rollout fairness got different buckets than the proxy computes. The doc now states `fnv1a64(flag_name + \"|\" + key) % 100` and calls out the separator, and a test recomputes the documented formula independently so the two cannot drift again."
-}

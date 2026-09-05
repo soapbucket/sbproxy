@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "**hmac_auth can require body coverage without forcing it on GET.** Set `require_body_digest: true` (or the same key on one entry) and a header-only signature on a request that carries a body is refused with a reason that names the missing `content-digest` coverage and never echoes key material. Bodyless requests stay header-only, matching Apache APISIX `hmac-auth` `validate_request_body`. Default remains false."
-}

@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "The access log records `usage_source` (`measured`, `estimated` or `absent`) beside `tokens_in` and `tokens_out`, so one AI request can be attributed to a provider's own count or to the gateway's estimate. `sbproxy_ai_usage_parse_miss_total` carries the same label."
-}

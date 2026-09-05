@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "POST /admin/config-authority/publish and rollback now report revision_consumed from where the failure happened rather than always false: a validation refusal costs nothing, while a failure past the reservation has spent a number the counter never reissues. The store code covers both sides of the reservation, so revision_consumed rather than the code is what says whether a number went. The Kubernetes operator bounds a fallback probe pass by wall clock as well as pod count, caps the response body it will read from a pod, and refreshes the ConfigFallbackActive condition before it refuses a config that arms auto_revert, so a cleared pin is no longer frozen True on the CR."
-}

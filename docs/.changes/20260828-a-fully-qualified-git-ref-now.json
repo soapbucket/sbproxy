@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**A fully-qualified git ref now resolves.** `git clone --branch` takes a short name and refuses a full ref, so a `source:` or `origin_sources` entry pinned to `refs/tags/v1.4.2` failed with \"Remote branch refs/tags/v1.4.2 not found in upstream origin\". That is the spelling a production-tier `origin_sources` entry is required to use, because git does not tell a tag from a branch by spelling, so a production aggregator could not have resolved a single entry. A revision beginning with `refs/` now takes the same targeted `git init` plus shallow fetch that a bare commit sha takes, which accepts a full ref exactly as written. An annotated tag resolves to the commit a checkout reports rather than to the tag object."
-}

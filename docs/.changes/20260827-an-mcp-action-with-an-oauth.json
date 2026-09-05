@@ -1,4 +1,0 @@
-{
-  "type": "security",
-  "message": "An MCP action with an OAuth `resource_server` now checks the verified token per operation: `tools/call` needs the `mcp.call` scope and every other method needs `mcp.read`, matching the vocabulary `docs/mcp.md` and `examples/mcp-oauth-discovery` publish. The mapping applies only when `oauth.scopes_supported` advertises those names, so a deployment using a scope vocabulary of its own is unaffected and keeps per-operation authorization at its authorization server."
-}

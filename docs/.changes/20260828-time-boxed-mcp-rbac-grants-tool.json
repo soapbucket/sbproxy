@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "Time-boxed MCP RBAC grants (`tool_access[].ttl` plus `grant_ledger.path`) expire unless an operator renews them. An elapsed grant is hidden from `tools/list` and refused on `tools/call` with JSON-RPC `-32098`. Renew with `POST /api/mcp/grants/renew`."
-}

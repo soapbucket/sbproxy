@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "**The AI request span carries `sbproxy.ai.intent`.** The detected intent category was recorded on an undeclared field, which the tracing core dropped, so it reached neither a span exporter nor a trace backend. It now sits on the request span under the same spelling the access log uses."
-}

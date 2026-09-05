@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "The CoMP oversize-body refusal now moves the quote and redeem counters and emits a decision event, from the same shared body every other CoMP response comes from. It was hand-rolled in both transports and wrote neither, so a client looping oversize bodies was indistinguishable from no traffic at all."
-}

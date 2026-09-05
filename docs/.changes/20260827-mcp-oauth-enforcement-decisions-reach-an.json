@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "MCP OAuth enforcement decisions reach an operator: `sbproxy_mcp_gateway_decisions_total` counts the resource-server 401, the per-operation scope refusal and its fail-open twin, the `/authorize` limiter, the session-capacity refusal, the stale AS-metadata fallback, and the consent CSRF refusal, each with a decision log line and a typed audit record."
-}

@@ -1,4 +1,0 @@
-{
-  "type": "security",
-  "message": "OpenID Federation peer fetches run through the governed egress machinery. A peer URL that resolves to a loopback, RFC 1918, link-local, or CGNAT address is refused before any connect whether or not egress is configured, and the dial is pinned to the addresses that check resolved so a rebind between check and connect is refused too. A new `egress.federation` sub-block adds the host, scheme, and port allowlist and per-hop redirect re-authorization, and `federation` joins the fourteen purposes reported by `GET /api/egress` and `sbproxy_egress_refused_total`."
-}

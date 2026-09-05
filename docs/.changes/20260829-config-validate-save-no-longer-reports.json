@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "Config Validate + save no longer reports a missing `source:` block when the editor buffer is invalid YAML for any other reason. A syntax error is reported as a config parse failure, and the editor refuses to submit leftover `[REDACTED]` markers from the load-time secret mask."
-}

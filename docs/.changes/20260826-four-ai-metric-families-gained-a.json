@@ -1,4 +1,0 @@
-{
-  "type": "changed",
-  "message": "**Four AI metric families gained a label value or a label.** `sbproxy_ai_toolkit_operations_total` adds the closed outcome `agent_failed`, which a customer agent rejecting or failing a call now records instead of `internal`; `sbproxy_ai_quality_routing_decisions_total` adds `prompt_too_large` for a prompt refused ahead of the quality hook; and the four chargeback tracker families carry an `origin` label naming the origin whose billing a refusal invalidated. Alerts that match on `outcome=\"internal\"` or aggregate the chargeback families without `origin` need updating."
-}

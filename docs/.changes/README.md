@@ -102,3 +102,6 @@ hand-written content under `## [Unreleased]`, and a commit that edits
 `CHANGELOG.md` without touching this directory in the same diff. A
 release cut passes without a flag, because assembling deletes fragments
 and so touches both.
+
+The 1.14.0 release cut also includes the build-revision metadata fix found
+during its dry run, added to the assembled Fixed section before publication.

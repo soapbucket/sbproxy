@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "Every CoMP response now comes from the crate's shared body on both transports. The oversize refusal and the wrong-method refusal were answered by axum itself on the standalone router (`text/plain`, no `Cache-Control`, no counter, no decision event); both now return the same JSON shape, headers, counter, and event as every other refusal. `GET /admin/licensing` also reports `comp.enabled` on every origin rather than only on origins without a bridge, so one field answers whether a bridge is configured."
-}

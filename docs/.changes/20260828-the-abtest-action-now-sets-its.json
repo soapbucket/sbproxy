@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "The `abtest` action now sets its sticky cookie on a first visit, so a client stays on the variant it was assigned instead of taking a fresh weighted roll on every request."
-}

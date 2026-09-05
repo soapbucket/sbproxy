@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "The events webhook SSRF allowlist now honors `egress.usage_sinks.hosts` when that sub-block is `mode: deny_by_default` and `allow_private` is true, so a private collector listed there can boot and deliver. Without that trio the guard still refuses private addresses."
-}

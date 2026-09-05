@@ -1,4 +1,0 @@
-{
-  "type": "changed",
-  "message": "The customer-managed root of trust liveness probe now round-trips a fixed non-secret value through `transit/encrypt` and `transit/decrypt` instead of reading `transit/keys/<name>`. It therefore needs exactly the grant the credential path needs, `update` on those two paths and nothing more, which is the least-privilege policy now documented in [docs/key-management.md](docs/key-management.md). Against that policy the old key-read probe failed on every interval on a healthy deployment, dropping the data-key cache each time; against a revocation that removed encrypt and decrypt while leaving the key readable, it stayed green and the \"or at the next failed liveness probe\" clause never fired. No working deployment needs a config change: a deployment that could resolve credentials already granted both capabilities."
-}

@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**`type: mock` and `type: beacon` responses declare\n`Content-Length`.** Without it the body was close-delimited, so the\nonly end-of-body signal was the connection closing: a client could\nnot tell a complete body from a killed one, and every mock or beacon\nresponse burned a connection even when it advertised `keep-alive`.\nThat missing header is why the reset above surfaced on the mock path\nfrom roughly 70 KB while `type: static`, which has always declared\nits length, survived to a megabyte. Neither arm declares a length on\n204 or 304, where RFC 9110 section 8.6 forbids it; `type: static` no\nlonger does either."
-}

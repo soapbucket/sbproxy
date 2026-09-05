@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "The proxy can serve its own OpenID Federation entity statement. A new `proxy.federation` block names the entity id, signing key, algorithm, JWKS, statement lifetime, refresh margin, and `authority_hints`, and the public listener answers `GET /.well-known/openid-federation` with the compact JWS. Config compile refuses an http entity id, a missing key reference, an algorithm outside the asymmetric allowlist, an empty JWKS, a refresh margin at or above the lifetime, and an http authority hint."
-}

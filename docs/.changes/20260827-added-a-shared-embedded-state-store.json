@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "Added a shared embedded state store, a `PersistentKv` and `EphemeralKv` pair backed by redb, so subsystems that need durable state get one ACID store rather than a database dependency each. Every operation runs on tokio's blocking pool, since a redb write ends in an fsync and holding an executor thread through one stalls whatever else it was scheduled to run. Metric families across the new modules register without `expect`, so a duplicate or malformed family name logs an error rather than panicking inside whichever request first reached the new code path."
-}

@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "Thirteen metric families the ported MCP OAuth broker, OpenID Federation, and IAB CoMP crates declare are now classified in the metric registry and appear in `docs/metrics-stability.md`. `sbproxy_mcp_gateway_sessions_active` also gained the writer it never had: the in-memory session store updates it on every put, take, and purge, so the dashboard panel reading it stops drawing a flat zero. A deployment on the storage-backed session store still reads zero there, and the catalog entry says so."
-}

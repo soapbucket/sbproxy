@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "docs/config-rollback.md is the operator runbook for a config that broke production: read the history, roll a running node back, boot a dead one on its last known good, and undo a fleet-wide publish at the authority. examples/config-rollback runs the middle of it against a real binary."
-}

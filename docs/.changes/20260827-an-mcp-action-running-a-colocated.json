@@ -1,4 +1,0 @@
-{
-  "type": "security",
-  "message": "An MCP action running a colocated OAuth broker now refuses to compile unless the broker issuer it derives from `external_base_url` and `base_path` is listed in `oauth.resource_server.authorization_servers`. A mismatch previously left the verifier rejecting every token the colocated broker minted. The key half of the same mismatch is refused separately at startup: see the `public_jwk` entry."
-}

@@ -1,4 +1,0 @@
-{
-  "type": "changed",
-  "message": "An `abtest` action and `response_cache` on the same origin are now refused at config load, whether the action is the origin's own or reached through a `forward_rules` entry. The cache lookup runs before the variant is chosen and the variant is not part of the cache key, so a cache hit served one variant's body to clients assigned another."
-}

@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "Provider prompt-cache token counts now reach the attribution metrics. The billing choke point parsed `cached_input` and `cache_creation` off the provider's usage block and then passed literal zeros for them, so a cache hit showed up in dollars, because the cost table already discounts both, and nowhere in tokens. `sbproxy_ai_tokens_attributed_total{direction=\"cache_read\"}` and `{direction=\"cache_write\"}` now carry real numbers. Both are subsets of `direction=\"input\"`, not additions to it, so sum the directions separately rather than folding the label. The usage record also gained a `tokens_cache_write` field beside the existing `tokens_cached`."
-}

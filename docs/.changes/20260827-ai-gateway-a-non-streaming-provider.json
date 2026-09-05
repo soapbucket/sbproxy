@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "AI gateway: a non-streaming provider call is now cancelled when the caller's connection breaks while the model is still generating, instead of running the generation to completion and billing for a response nobody received. The signal is the downstream connection itself and never a timer: a TCP reset or read error on HTTP/1, or an `RST_STREAM` or `GOAWAY` on HTTP/2. A bare HTTP/1 half-close never cancels by default, because RFC 9112 section 9.6 makes it indistinguishable from a client that has simply finished sending; such a client keeps its generation until a write to it fails, unless the origin sets `cancel_on_half_close`. The cancelled call settles on the `client_disconnected` receipt outcome, carries `error.type=client_disconnected` on its span, and is counted on `sbproxy_ai_provider_attempts_total{outcome=\"client_disconnected\"}`."
-}

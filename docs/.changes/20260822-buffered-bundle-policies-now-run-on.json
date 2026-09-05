@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**Buffered bundle policies now run on empty-body requests and on `ai_proxy` origins.** `body_mode: buffered` (the hook default) used to skip GET/HEAD and every AI request, so a deny hook never saw them. Those requests now dispatch against the complete body, including an empty one."
-}

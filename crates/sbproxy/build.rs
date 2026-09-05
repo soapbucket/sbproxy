@@ -1,4 +1,4 @@
-//! Build script that embeds the git short SHA and the UTC build date as
+//! Build script that embeds the git revision and the UTC build date as
 //! compile-time env vars. `main.rs` reads them via `env!()` to produce a
 //! `--version` line of the form:
 //!
@@ -11,7 +11,26 @@
 use std::process::Command;
 
 fn main() {
-    let sha = run("git", &["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    // Release jobs validate their checkout before supplying this revision.
+    // Git lookup can fail inside a job container even after checkout succeeds;
+    // an explicit input must never silently degrade to an unknown revision.
+    println!("cargo:rerun-if-env-changed=SBPROXY_BUILD_REVISION");
+    let sha = match std::env::var("SBPROXY_BUILD_REVISION") {
+        Ok(revision) => {
+            assert!(
+                revision.len() == 40
+                    && revision
+                        .bytes()
+                        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')),
+                "SBPROXY_BUILD_REVISION must be a full 40-character lowercase hexadecimal git SHA"
+            );
+            revision
+        }
+        Err(std::env::VarError::NotPresent) => {
+            run("git", &["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".into())
+        }
+        Err(_) => panic!("SBPROXY_BUILD_REVISION must contain valid UTF-8"),
+    };
     let date = run("date", &["-u", "+%Y-%m-%d"]).unwrap_or_else(|| "unknown".into());
 
     // The year, for the copyright footer in `--help`. Derived from the

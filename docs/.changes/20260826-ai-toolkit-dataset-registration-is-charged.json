@@ -1,4 +1,0 @@
-{
-  "type": "changed",
-  "message": "**AI toolkit dataset registration is charged against a per-scope ceiling.** A scope may hold `max_datasets` x `max_dataset_versions` versions and that many `max_request_bytes` of serialized entries, clamped to the process totals, so a registration past it is refused with `dataset_versions_scope` or `dataset_bytes_scope` rather than reading as the whole process running out. The ceiling is derived from the scope caps alone and does not shrink with the number of origins a gateway compiles."
-}

@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "A new `license_leak` output guardrail scores AI responses against an operator-supplied corpus of licensed documents and blocks, warns, or logs on a confident match."
-}

@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "**New metric `sbproxy_audit_chain_read_total{channel, outcome}`.**\nOne increment per chain walked per viewer read, with an `outcome`\nof `verified`, `broken`, or `unreadable`; a refusal increments all\nfour channels with `denied`, because it refuses all four. A broken\nchain that only a person looking at the console can see is a finding\nnobody is on call for, and a tenant-scoped operator probing a\ndeployment-wide security surface is one whose only other record sits\ninside the chain that operator was refused. Both leave the page:\nalert on\n`increase(sbproxy_audit_chain_read_total{outcome!=\"verified\"}[15m]) > 0`.\nThat rule does not cover a chain file truncated at the tail and read\nafter a restart: the boot re-baselines on what is left, every link\nand signature holds, and the read is `verified`. Pre-restart records\nare covered by `sbproxy audit verify` against an offsite copy."
-}

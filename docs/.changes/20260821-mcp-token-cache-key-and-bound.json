@@ -1,4 +1,0 @@
-{
-  "type": "security",
-  "message": "The MCP run-as-user token cache mixes tenant, scope, and client credential reference into its key, so two federated servers that differ only in `scope`, or one inbound token arriving at two tenants' origins, no longer share a cached credential. The cache is bounded at 4096 entries with LRU eviction, drops expired entries rather than stepping over them, and zeroizes evicted bearer values."
-}

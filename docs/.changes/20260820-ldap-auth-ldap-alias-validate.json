@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "**`ldap_auth` and its `ldap` alias validate clean.** Both were missing\nfrom the OSS auth catalog, so `sbproxy validate` reported that the\ntype \"is not in the OSS catalog (will fail at runtime)\" on every LDAP\nconfig, including this repository's own `examples/auth-ldap/sb.yml`,\nwhich was false. The same omission stopped both names being reserved\nagainst a bundle hook claiming them."
-}

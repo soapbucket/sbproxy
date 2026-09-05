@@ -887,6 +887,9 @@ name: compile-fixture
 version: 1.0.0
 runtime: javascript
 entry: entry.js
+# This fixture tests registry compilation, not the production time budget.
+sandbox:
+  budget_ms: 1000
 hooks:
   - kind: policy
     type: dynamic_compile_policy

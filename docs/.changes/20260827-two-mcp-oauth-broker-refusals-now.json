@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "Two MCP OAuth broker refusals now appear in the metric catalogue that always counted them: an unresolvable `client_id` metadata document on `/authorize` and on `/token`. Both answer a fixed string on the wire, because the detail would name the address a client-chosen URL resolved to, so `sbproxy_mcp_gateway_decisions_total` is the only place their rate is visible. A new guard pins every surface that writes that family against the catalogue entry in both directions, so a refusal cannot stop being counted, or start being counted undocumented, without a test going red."
-}

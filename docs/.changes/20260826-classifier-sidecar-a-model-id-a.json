@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "Classifier sidecar: a model id a validated manifest names but no `--model` loaded now fails with a typed status instead of answering `safe` at score 1.0 or a zero embedding, tenant ids are bounded and character-checked at registration, and normalization refuses past a 4 MiB output ceiling, and a label pattern or normalization rule that compiles past its charged compiled-program budget (48 KiB per pattern, 64 KiB per rule) is refused at registration with a message naming the budget."
-}

@@ -1,4 +1,0 @@
-{
-  "type": "fixed",
-  "message": "The Redis virtual key store, its L2 cache tier, and the shared Redis storage backend now reconnect after their socket dies. A Redis restart, failover, or `CLIENT KILL` used to leave a cached connection that never reconnects, so every later key resolution and every later mesh membership write failed for the life of the process."
-}

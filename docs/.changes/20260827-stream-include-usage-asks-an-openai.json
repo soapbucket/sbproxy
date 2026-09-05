@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "`stream_include_usage` asks an OpenAI-compatible provider to end a stream with a usage frame, by adding `stream_options.include_usage` to the outbound body. Off by default: with it on the caller receives one extra terminal chunk whose `choices` is empty."
-}

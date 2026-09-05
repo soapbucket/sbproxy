@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "New `sbproxy-licensing` crate: IAB CoMP marketplace bridge (manifest, signed quote, redeem), minting license tokens in the OSS OLP wire format on redeem so they verify against an origin's own `/.well-known/olp/introspect`; no Postgres, ClickHouse, or NATS dependency."
-}

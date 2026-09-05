@@ -1,6 +1,6 @@
 # Temporary budget overrides
 
-*Last modified: 2026-08-20*
+*Last modified: 2026-09-05*
 
 A governed key carries a base budget. This example grants a temporary raise
 on top of it through the admin API, watches the raised cap admit a request
@@ -68,7 +68,7 @@ upstream:
 
 ```text
 HTTP/1.1 402 Payment Required
-{"error":{"message":"token limit exceeded: 250 >= 200","scope":"api_key","type":"budget_exceeded"}}
+{"error":{"type":"budget_exceeded","scope":"api_key","message":"token limit exceeded: 250 >= 200"}}
 ```
 
 ## Grant a raise
@@ -84,10 +84,10 @@ reason that lands in the audit trail alongside the grantor:
     "max_tokens": 200
   },
   "budget_override": {
-    "expires_at": "2026-08-20T13:27:02.468813Z",
-    "granted_at": "2026-08-20T13:26:02.468813Z",
-    "granted_by": "admin",
     "max_tokens_increase": 100000,
+    "expires_at": "<RFC3339>",
+    "granted_by": "admin",
+    "granted_at": "<RFC3339>",
     "reason": "launch-day spike"
   },
   "effective_budget": {
@@ -127,10 +127,10 @@ Clear raise action:
     "max_tokens": 200
   },
   "budget_override": {
-    "expires_at": "2026-08-20T13:27:02.468813Z",
-    "granted_at": "2026-08-20T13:26:02.468813Z",
-    "granted_by": "admin",
     "max_tokens_increase": 100000,
+    "expires_at": "<RFC3339>",
+    "granted_by": "admin",
+    "granted_at": "<RFC3339>",
     "reason": "launch-day spike"
   },
   "effective_budget": {
@@ -147,12 +147,12 @@ The grant is in the key audit trail, named after the operator who made it
 ```text
 [
   {
-    "timestamp": "2026-08-20T13:26:02.481190+00:00",
+    "timestamp": "<RFC3339>",
     "channel": "key",
     "kind": "budget_override_grant",
     "actor": "admin",
     "api_key_id": "seed0001",
-    "detail": "key: {\"budget_override\":null} -> {\"budget_override\":{\"expires_at\":\"2026-08-20T13:27:02.468813Z\",\"granted_by\":\"admin\",\"max_cost_usd_increase\":null,\"max_tokens_increase\":100000,\"reason\":\"launch-day spike\"}}"
+    "detail": "key: {\"budget_override\":null} -> {\"budget_override\":{\"max_tokens_increase\":100000,\"max_cost_usd_increase\":null,\"expires_at\":\"<RFC3339>\",\"granted_by\":\"admin\",\"reason\":\"launch-day spike\"}}"
   }
 ]
 ```
@@ -168,7 +168,7 @@ revert anything:
 
 ```text
 HTTP/1.1 402 Payment Required
-{"error":{"message":"token limit exceeded: 500 >= 200","scope":"api_key","type":"budget_exceeded"}}
+{"error":{"type":"budget_exceeded","scope":"api_key","message":"token limit exceeded: 500 >= 200"}}
 ```
 
 An admin read now shows the base budget alone. The read is also what
@@ -194,11 +194,11 @@ audit trail, so the trail holds both ends of the raise's life:
 ```text
 [
   {
-    "timestamp": "2026-08-20T13:27:04.574810+00:00",
+    "timestamp": "<RFC3339>",
     "channel": "key",
     "kind": "budget_override_expire",
     "api_key_id": "seed0001",
-    "detail": "key: {\"budget_override\":{\"expires_at\":\"2026-08-20T13:27:02.468813Z\",\"granted_by\":\"admin\",\"max_cost_usd_increase\":null,\"max_tokens_increase\":100000,\"reason\":\"launch-day spike\"}} -> {\"budget_override\":null}"
+    "detail": "key: {\"budget_override\":{\"max_tokens_increase\":100000,\"max_cost_usd_increase\":null,\"expires_at\":\"<RFC3339>\",\"granted_by\":\"admin\",\"reason\":\"launch-day spike\"}} -> {\"budget_override\":null}"
   }
 ]
 ```

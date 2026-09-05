@@ -1,4 +1,0 @@
-{
-  "type": "added",
-  "message": "A new `abtest` action splits traffic across weighted backend variants, with a sticky cookie pinning a returning client to its first assignment."
-}
