@@ -260,7 +260,31 @@ jobs:
           CARGO_PROFILE_RELEASE_LTO: ${{ matrix.lto }}
           CARGO_BUILD_JOBS: ${{ matrix.build_jobs }}
           RUSTUP_TOOLCHAIN: stable
-        run: cargo build --release --locked --target ${{ matrix.target }} --bin sbproxy --features embed-admin-ui
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Checkout's Git trust configuration is private to its temporary
+          # HOME. Validate this exact mounted checkout explicitly, then pass
+          # its revision to the build script without relying on Git discovery
+          # inside Cargo's job-container environment.
+          checkout_revision="$(git -c safe.directory="${GITHUB_WORKSPACE}" rev-parse HEAD)"
+          if [ "${checkout_revision}" != "${GITHUB_SHA}" ]; then
+            echo "::error::checkout revision differs from the workflow commit"
+            exit 1
+          fi
+          export SBPROXY_BUILD_REVISION="${checkout_revision}"
+          cargo build --release --locked --target ${{ matrix.target }} --bin sbproxy --features embed-admin-ui
+
+      - name: verify release version and revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_version=""
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            expected_version="${GITHUB_REF_NAME#v}"
+          fi
+          bash scripts/check-release-version.sh \
+            "target/${{ matrix.target }}/release/sbproxy" "${GITHUB_SHA}" "${expected_version}"
 
       # Contract: the sbproxy binary itself must still require glibc
       # <= 2.36 so Linux tarballs run on Debian 12. The Docker runtime
@@ -474,17 +498,12 @@ jobs:
             /LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX/ { remaining = 8 }
             remaining > 0 { print; remaining-- }
           '
-          binary_version="$(./target/release/sbproxy --version)"
-          printf '%s\n' "${binary_version}"
-          python3 - "${binary_version}" "${GITHUB_SHA}" <<'PYVERSION'
-          import re, sys
-          match = re.fullmatch(
-              r"sbproxy \S+ \(rev ([0-9a-f]{7,40}), built \d{4}-\d{2}-\d{2}\)",
-              sys.argv[1],
-          )
-          if not match or not sys.argv[2].startswith(match.group(1)):
-              raise SystemExit("packaged binary revision does not match this checkout")
-          PYVERSION
+          expected_version=""
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            expected_version="${GITHUB_REF_NAME#v}"
+          fi
+          bash scripts/check-release-version.sh \
+            ./target/release/sbproxy "${GITHUB_SHA}" "${expected_version}"
 
       - name: record version metadata
         run: |

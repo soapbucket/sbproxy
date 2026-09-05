@@ -3227,6 +3227,10 @@ Render what the next release will say with
 
 ### Fixed
 
+- Release binaries retain their verified source revision instead of reporting
+  `rev unknown`. Packaging checks the executable’s revision against the checkout
+  and its version against the release tag before uploading an artifact.
+
 - **A `failure_posture: closed` transform now fails a `static` or `mock`
   response closed instead of serving it untransformed.** The transform
   chain has reached generated bodies since the response-phase work
