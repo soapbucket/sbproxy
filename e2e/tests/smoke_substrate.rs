@@ -61,22 +61,17 @@ proxy:
     port: {admin_port}
     username: admin
     password: smoke
-observability:
-  tracing:
-    enabled: true
-    exporter: stdout
-    service_name: "sbproxy-smoke"
-    sampling:
-      parent_based: true
-      head_rate: 1.0
-      always_sample_errors: true
-  log:
-    sinks:
-      - name: stdout
-        format: json
-        profile: internal
-  metrics:
-    enabled: true
+# No top-level `observability:` block here. It sat at the top level,
+# where nothing read it, so it was silently dropped for this fixture's
+# whole life; the WOR-2706 misplaced-field refusal then turned that
+# silent drop into a boot failure (WOR-2934). It is deleted rather than
+# re-nested because its keys have no valid home: `metrics.enabled` is
+# in no metrics schema in this workspace, and declaring `log.sinks`
+# under `proxy.observability` would install the sink dispatcher, which
+# is a boot-behavior change these assertions never ran under.
+# `tracing:` was never a field of the observability block either; the
+# real surface is `telemetry:`, and it needs an OTLP endpoint this
+# offline smoke test has no collector for.
 origins:
   "paywalled.localhost":
     policies:

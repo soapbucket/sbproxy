@@ -1,5 +1,5 @@
 # sbproxy (Rust workspace)
-*Last modified: 2026-08-28*
+*Last modified: 2026-09-06*
 
 The active implementation of sbproxy. Cargo workspace with ~20
 crates under `crates/`, an e2e suite under `e2e/`, examples under
@@ -41,12 +41,27 @@ ten-minute build.
 | UI | `cd ui && npm ci && npm run typecheck && npm run test -- --run` |
 | Build | `cargo build --workspace --exclude sbproxy-e2e --locked` |
 | Test | `cargo nextest run --workspace --exclude sbproxy-e2e --locked --profile ci` |
+| Observability budgets | `cargo test --workspace --locked --test cardinality`, then the same for `--test metrics_per_agent` and `--test redaction` |
 | Doctest | `cargo test --workspace --exclude sbproxy-e2e --locked --doc` |
 | Clippy | `cargo clippy --workspace --all-targets -- -D warnings` |
 | Docs | `RUSTDOCFLAGS="-D warnings -D missing_docs" cargo doc --workspace --no-deps --locked` |
 | Payment features (on by default) | `bash scripts/check.sh`; `SBPROXY_CHECK_PAYMENTS=0` skips it |
 
-Two rows in that table are easy to get subtly wrong.
+Three rows in that table are easy to get subtly wrong.
+
+`Observability budgets` is the only row that builds and runs test
+targets from `sbproxy-e2e`. It is not the only wide selection here, the
+`Clippy` and `Docs` rows are `--workspace` with no exclusion too, but
+those lint and document the package rather than linking and running its
+test binaries, which is where the cost is. Covering these three costs
+one build under e2e's wider feature union, and that cost is why the lane
+sat outside the local gate until WOR-2933, where a stale fixture reached
+main behind a green local run. Only a fresh `target/` pays it (2m17 when
+measured); later gates are under a minute. Keep it as three invocations, one per
+target. `scripts/check.sh` and the CI lane both wrap each one in
+`expect_tests '>=1'`, and a single call naming all three would assert
+only that the three together ran something: an emptied `redaction`
+would hide behind cardinality's count.
 
 `-D missing_docs` appears in exactly one other place in this repository,
 `.github/workflows/ci.yml`, and it is the flag that bites. Do not pair
@@ -175,11 +190,28 @@ bypassed and lists the paths.
 
 The local runner is `scripts/check.sh`. The default path mirrors the
 required PR lane's workspace jobs: non-e2e workspace tests in the dev
-profile plus doctests. This keeps the local target directory materially
-smaller than full release/e2e runs. The required e2e subset (see "A
-small e2e subset is required per PR" below) is not in the default path;
-`SBPROXY_CHECK_E2E=1` covers it, as does the five-file command in that
-section.
+profile plus doctests, and the three `observability budgets` targets
+that live in `sbproxy-e2e`. This keeps the local target directory
+materially smaller than full release/e2e runs.
+
+Two of the eleven lanes the required CI aggregator waits on are still
+outside this gate's default path.
+
+The e2e subset (see "A small e2e subset is required per PR" below). The
+five-file command in that section runs exactly it. `SBPROXY_CHECK_E2E=1`
+also runs it, but by selecting the whole `sbproxy-e2e` package, minus
+four files whose proxy binary flavors this gate does not build; those
+are filtered out and reprinted in `SKIPPED PHASES` with the command that
+would enable them. That selection is far wider than the required subset,
+so a failure under the flag is not by itself a required-lane failure:
+everything outside the subset keeps the file-an-issue posture described
+in that section.
+
+And `release feature (embed-admin-ui)`, which runs `cargo check --bin
+sbproxy --features embed-admin-ui --locked` and has no phase here at
+all; run that command directly before a change that can reach the admin
+UI or the binary's feature union. A run that could not reach any other
+phase reprints it in the `SKIPPED PHASES` block.
 
 | Variable | Effect |
 |---|---|
