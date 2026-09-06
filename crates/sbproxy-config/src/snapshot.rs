@@ -286,6 +286,28 @@ pub struct CompiledEgressGates {
 }
 
 /// The complete compiled config: all origins plus host-based routing.
+///
+/// # No `Debug`, by design
+///
+/// The compiled form holds resolved credentials and key material, so it
+/// carries no `Debug` and gets no blanket derive to satisfy a caller
+/// that wants to print it.
+///
+/// That has one consequence worth knowing before you write the test:
+/// `Result::expect_err` and `Result::unwrap_err` both print the `Ok`
+/// value on the wrong branch, so both require `T: Debug` and neither
+/// compiles on a `Result<CompiledConfig, _>`. Production never calls
+/// them, so the workspace build stays green and only the test profile
+/// fails. Write `.err().expect("...")` instead:
+///
+/// ```ignore
+/// let err = compile_config(yaml).err().expect("config must be refused");
+/// ```
+///
+/// Do not carry that form to a type that does implement `Debug`:
+/// `clippy::err_expect` refuses it there and sends you back to
+/// `expect_err`. `scripts/check-expect-err-non-debug.sh` holds the line
+/// for these two types in seconds rather than behind a build.
 #[derive(Clone, Default)]
 pub struct CompiledConfig {
     /// Extension bundle discovery configuration preserved for the pipeline

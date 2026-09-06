@@ -97,6 +97,7 @@ CHECKS=(
   "secret-bearing types do not derive Debug||bash scripts/check-secret-debug-registry.sh"
   "tapes do not render credentials||bash scripts/check-tape-secrets.sh"
   "no env mutation outside test helpers||bash scripts/check-env-mutation.sh"
+  "no expect_err on the non-Debug config and pipeline types||bash scripts/check-expect-err-non-debug.sh"
   "no call site hands tract a model directory||bash scripts/check-onnx-model-loaders.sh"
   "doc drift||bash scripts/check-doc-drift.sh"
   "spec citation hygiene||bash scripts/check-spec-citations.sh"
