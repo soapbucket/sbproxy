@@ -2,7 +2,7 @@
 # WebAssembly response-body transform.
 #
 # Pipes the upstream response body through a sandboxed WASI module
-# (the request body goes in on stdin, whatever the module writes to
+# (the response body goes in on stdin, whatever the module writes to
 # stdout becomes the new response body). Any wasm32-wasi binary works
 # without custom glue; see docs/wasm-development.md for the authoring
 # contract and Rust + TinyGo example modules.

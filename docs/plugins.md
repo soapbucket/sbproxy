@@ -1,23 +1,24 @@
 # Extending SBproxy
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-09-05*
 
 Most custom logic in sbproxy is a config field, not a rebuild. Before reaching for any of the surfaces on this page, check [configuration.md](configuration.md) and [features.md](features.md); a surprising amount of what looks like "I need to write code" is a block someone already shipped.
 
-When it isn't, sbproxy gives you four ways to extend a running gateway without touching Rust or the `sbproxy` binary: CEL, Lua, JavaScript, and WebAssembly. All four load from config, all four hot-reload, and all four are covered in full below. Compiling a linked Rust plugin against `sbproxy-plugin` also exists. It's the last section on this page because it's for organizations building and shipping their own fork of the binary; most deployments don't need it.
+When it isn't, sbproxy supports five extension engines configured from YAML: CEL, Rego, Lua, JavaScript, and WebAssembly. Changes can be applied through configuration reload. Compiling a linked Rust plugin against `sbproxy-plugin` also exists. It's the last section on this page because it's for organizations building and shipping their own fork of the binary; most deployments don't need it.
 
-## The four extension surfaces
+## Extension engines
 
 | Surface | Good for | Detail doc |
 |---|---|---|
 | **CEL** | One-line boolean gates evaluated in microseconds: policy allow/deny expressions, rate-limit keys, WAF persistent-block keys, forward-rule matching, response header rules. No loops, no I/O. | [scripting.md](scripting.md) |
+| **Rego** | Existing OPA policies, request/response header modifiers, and policy or transform extension bundles. Runs in process through Regorus. | [scripting.md](scripting.md#3a-rego-policies), [extension-bundles.md](extension-bundles.md#rego) |
 | **Lua** | Header and JSON body rewriting that needs variables or loops: request/response modifiers, `lua_json` transforms, WAF custom rules. Runs in a fresh sandboxed Luau VM per request. | [scripting.md](scripting.md) |
 | **JavaScript** | Same jobs as Lua, JS-flavored, plus the runtime for hot-loaded extension bundles (see below). Inline scripts get a fresh QuickJS engine per request; bundle hooks run as ES modules in their own sandbox. | [scripting.md](scripting.md), [extension-bundles.md](extension-bundles.md) |
 | **WebAssembly (WASM)** | A language sbproxy has no built-in interpreter for (Rust, TinyGo, AssemblyScript, Zig, Swift, C/C++), stronger isolation than an interpreter gives you, or one compiled artifact reused across origins. Compiled once via Wasmtime; a fresh WASI `Store` per invocation, capped memory and wall clock. | [wasm-development.md](wasm-development.md), [extension-bundles.md](extension-bundles.md) |
 
 Runnable examples for each: [examples/cel-policy](../examples/cel-policy/), [examples/transform-lua](../examples/transform-lua/), [examples/transform-javascript](../examples/transform-javascript/), and [examples/wasm-transform](../examples/wasm-transform/) with modules under [examples/wasm](../examples/wasm/) (Rust and TinyGo).
 
-One more engine exists alongside these four: Rego, via the Regorus interpreter, for teams migrating policies they already wrote for OPA. It's a narrower audience than the four above, so it isn't in the main table, but it's documented in the same place: [scripting.md](scripting.md).
+Cedar also supports policies on federated MCP tool calls, with its own request mapping and confirmation flow. See [Cedar policy](cedar-policy.md) for the current limits and runnable examples.
 
 Reach for CEL first. It's the fastest and the cheapest to reason about. Move to Lua, JavaScript, or WASM only when the logic needs state, loops, or a helper function CEL can't express as one expression.
 
@@ -25,7 +26,7 @@ Reach for CEL first. It's the fastest and the cheapest to reason about. Move to 
 
 Inline scripting attaches to one config field. When you want a self-contained unit of logic, one you can version separately, share across environments, or reload without redeploying the proxy, that's an extension bundle.
 
-A bundle is a directory: a `bundle.yaml` manifest plus one entry file (JavaScript, TypeScript, or a compiled `.wasm` module). Point sbproxy at a directory of them:
+A bundle is a directory: a `bundle.yaml` manifest plus one entry file (JavaScript, TypeScript, Rego, or a compiled `.wasm` module). Point sbproxy at a directory of them:
 
 ```yaml
 extensions:
@@ -58,15 +59,15 @@ Full reference, including the git-source signature and digest model: [extension-
 A bundle's manifest declares one or more hooks, each with a `kind` and a `type` name you reference from `sb.yml` the same way you'd reference a built-in module. Four kinds cover the core request pipeline:
 
 - **action** ships an origin's response itself: it receives the request and config, and returns a status, headers, and body. It's terminal, the same slot a `static` or `proxy` action fills, and (because there's nothing left to fall through to if it fails) it always fails closed.
-- **auth** runs before the action and decides whether the request gets in. It attaches to an origin's `auth:` block, the same slot `jwt` or `api_key` use, and answers `allow` (optionally naming who the request is now authenticated as), `deny`, or `deny_with_headers` (for a `WWW-Authenticate` challenge, for example). Like action, it always fails closed.
+- **auth** runs before the action and decides whether the request gets in. It attaches to an origin's `authentication:` block, the same slot `jwt` or `api_key` use, and answers `allow` (optionally naming who the request is now authenticated as), `deny`, or `deny_with_headers` (for a `WWW-Authenticate` challenge, for example). Like action, it always fails closed.
 - **policy** is an allow/deny gate over the request, the same shape as a built-in policy like rate limiting or a WAF rule, except the decision logic is yours.
-- **transform** rewrites a request or response body. It reads the current body and content type and returns a replacement.
+- **transform** rewrites a response body. It reads the current body and content type and returns a replacement.
 
 A hook never shadows a built-in or a linked plugin of the same name; a built-in with that `type` always wins, and the bundle is only reached when nothing else claims it. Beyond these four, a bundle can also hook narrower events: AI guardrail and tool-call events, AI routing decisions, streaming HTTP filters (Proxy-Wasm), and payment lifecycle events. Those are event-shaped rather than pipeline-shaped and are covered in [extension-bundles.md](extension-bundles.md) alongside [mcp-and-agents.md](mcp-and-agents.md) and [payments.md](payments.md).
 
 For a look at real ones: [examples/extension-bundles/bundles/hello-javascript](../examples/extension-bundles/bundles/hello-javascript/) ships both an action and a transform hook, [examples/extension-bundles/bundles/hmac-auth-javascript](../examples/extension-bundles/bundles/hmac-auth-javascript/) is an auth hook that verifies an HMAC-signed request, and [examples/extension-bundles/bundles/header-policy-typescript](../examples/extension-bundles/bundles/header-policy-typescript/) is a policy hook written in TypeScript.
 
-A bundle hook is a plain JavaScript or TypeScript export, or a WASI module reading stdin and writing stdout, with no Rust trait to implement. The sandbox and the manifest are the whole contract.
+A bundle hook can be a JavaScript or TypeScript export, a WASI module reading stdin and writing stdout, or a Rego rule for policy and transform hooks. The [Rego bundle contract](extension-bundles.md#rego) describes its inputs and return values. The sandbox and the manifest are the whole contract.
 
 ## Advanced: linked Rust plugins
 

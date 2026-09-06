@@ -1,6 +1,6 @@
 # WASM transform development guide
 
-*Last modified: 2026-08-17*
+*Last modified: 2026-09-05*
 
 This guide covers writing WebAssembly modules for sbproxy's `wasm`
 transform. Two minimal example modules live in `examples/wasm/`,
@@ -20,8 +20,11 @@ inside a single language. WASM is the right pick when you want:
   environments without rewriting in the proxy's scripting languages.
 
 WASM transforms run after the upstream response has been buffered
-and replace the response body. They cannot read the request, modify
-headers, or short-circuit the response.
+and replace the response body. With `request_context: true`, a module
+can read the documented per-request context from the
+`SBPROXY_REQUEST_CONTEXT` environment variable. This option leaves
+the stdin body contract unchanged. WASM transforms cannot modify
+headers or short-circuit the response.
 
 ## The contract
 

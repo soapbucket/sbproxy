@@ -2,7 +2,7 @@
 # CEL expression policy.
 #
 # Allows requests only when the `X-Tenant` header equals `acme`. CEL header
-# keys are normalized to lowercase with hyphens converted to underscores,
+# keys are normalized to lowercase with hyphens preserved,
 # so `X-Tenant` is read as `request.headers["x-tenant"]`. Anything else
 # gets a 403 before test.sbproxy.dev is contacted. This is the path to take for
 # custom access control beyond simple IP or key checks.
