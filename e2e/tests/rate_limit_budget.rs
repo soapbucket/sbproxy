@@ -60,14 +60,14 @@ proxy:
     port: {admin_port}
     username: admin
     password: rl-budget
-observability:
-  metrics:
-    enabled: true
-  log:
-    sinks:
-      - name: stdout
-        format: json
-        profile: internal
+# No top-level `observability:` block here. It sat at the top level,
+# where nothing read it, so it was silently dropped for this fixture's
+# whole life; the WOR-2706 misplaced-field refusal then turned that
+# silent drop into a boot failure (WOR-2934). It is deleted rather than
+# re-nested because its keys have no valid home: `metrics.enabled` is
+# in no metrics schema in this workspace, and declaring `log.sinks`
+# under `proxy.observability` would install the sink dispatcher, which
+# is a boot-behavior change these assertions never ran under.
 audit:
   sink: memory
 rate_limits:

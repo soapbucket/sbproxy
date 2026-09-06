@@ -770,10 +770,15 @@ fn wrong_or_unknown_legacy_keys_deny_before_native_fallback() {
 fn minted_denials_emit_secret_free_mode_metrics_and_audit() {
     let upstream = StubUpstream::start().expect("stub upstream");
     let admin_port = free_port();
-    let yaml = format!(
-        "{}\nobservability:\n  log:\n    sinks:\n      - name: stdout\n        format: json\n        profile: internal\n  metrics:\n    enabled: true\n",
-        config(admin_port, upstream.port, "")
-    );
+    // No `observability:` append. It sat at the top level, where nothing
+    // read it, so it was dropped for this test's whole life until the
+    // WOR-2706 misplaced-field refusal turned that into a boot failure
+    // (WOR-2934). Nothing here asserted on it: `metrics.enabled` is in
+    // no metrics schema in this workspace, and the sinks never took
+    // effect, so these assertions have only ever run against the legacy
+    // logging path. Re-nesting them would install the sink dispatcher
+    // and change that.
+    let yaml = config(admin_port, upstream.port, "");
     let harness =
         ProxyHarness::start_with_workspace(&yaml, &[]).expect("proxy with captured logs starts");
     let denied_token = format!("sbp_{}_{}", "f".repeat(16), "deadbeef".repeat(8));
@@ -830,9 +835,16 @@ fn wildcard_access_logs_exclude_custom_native_provider_carriers() {
             "          - openai\n",
             "          - openai\n          - custom\n",
         );
-    let yaml = format!(
-        "{yaml}\naccess_log:\n  enabled: true\n  capture_headers:\n    request: [\"*\"]\nobservability:\n  log:\n    sinks:\n      - name: stdout\n        format: json\n        profile: internal\n"
-    );
+    // No `observability:` append. It sat at the top level, where nothing
+    // read it, so it was dropped for this test's whole life until the
+    // WOR-2706 misplaced-field refusal turned that into a boot failure
+    // (WOR-2934). Nothing here asserted on it: `metrics.enabled` is in
+    // no metrics schema in this workspace, and the sinks never took
+    // effect, so these assertions have only ever run against the legacy
+    // logging path. Re-nesting them would install the sink dispatcher
+    // and change that.
+    let yaml =
+        format!("{yaml}\naccess_log:\n  enabled: true\n  capture_headers:\n    request: [\"*\"]\n");
     let harness =
         ProxyHarness::start_with_workspace(&yaml, &[]).expect("proxy with captured logs starts");
     let canary = "opaque-caller-secret-canary";
@@ -1162,7 +1174,14 @@ fn model_limiter_shares_resolved_identity_across_native_carriers_without_leaking
             "      require: false\n",
             "      require: false\n      provider_hints:\n        - provider: openai\n          header: authorization\n          scheme: \"Bearer \"\n          value_prefix: \"sk-\"\n        - provider: openai\n          header: x-opaque-native-carrier\n          value_prefix: \"opaque-\"\n",
         );
-    let yaml = format!("{yaml}\nobservability:\n  metrics:\n    enabled: true\n");
+    // No `observability:` append. It sat at the top level, where nothing
+    // read it, so it was dropped for this test's whole life until the
+    // WOR-2706 misplaced-field refusal turned that into a boot failure
+    // (WOR-2934). Nothing here asserted on it: `metrics.enabled` is in
+    // no metrics schema in this workspace, and the sinks never took
+    // effect, so these assertions have only ever run against the legacy
+    // logging path. Re-nesting them would install the sink dispatcher
+    // and change that.
     let harness = ProxyHarness::start_with_yaml(&yaml).expect("proxy starts");
 
     assert_eq!(native_ai_request(&harness, model).status().as_u16(), 200);

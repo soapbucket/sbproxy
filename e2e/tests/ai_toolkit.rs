@@ -613,10 +613,14 @@ events:
     - ai_prompt_rollout_selected
   queue_capacity: 32
 
-observability:
-  metrics:
-    enabled: true
-
+# No top-level `observability:` block here. It sat at the top level,
+# where nothing read it, so it was silently dropped for this fixture's
+# whole life; the WOR-2706 misplaced-field refusal then turned that
+# silent drop into a boot failure (WOR-2934). It is deleted rather than
+# re-nested because its keys have no valid home: `metrics.enabled` is
+# in no metrics schema in this workspace, and declaring `log.sinks`
+# under `proxy.observability` would install the sink dispatcher, which
+# is a boot-behavior change these assertions never ran under.
 origins:
   "{ORIGIN_HOST}":
     tenant_id: {ORIGIN_TENANT}

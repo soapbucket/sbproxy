@@ -210,6 +210,45 @@ fn redaction_fixture_floor_no_secret_leaks_through_legacy_redactor() {
 /// is absent. Mirrors the ADR's "marker variant matches the field
 /// type" rule (Authorization gets `[REDACTED:AUTHORIZATION]`, not a
 /// generic marker).
+///
+/// The `observability:` block sits under `proxy:`, which is the only
+/// place `ObservabilityConfig` is read from. It was written at the top
+/// level, where the root `ConfigFile` has no such field but an origin
+/// does, so the WOR-2706 misplaced-field gate read it as a flat
+/// schema-v1 origin block and refused boot rather than dropping it. The
+/// harness reported that as "proxy child exited during startup" and
+/// guessed at a port race, so the compiler's own message on the child's
+/// stderr is the thing to read when this test stops starting.
+///
+/// The sink entries follow `docs/observability.md`: `name` is the
+/// sink's own label and `target` is the channel it subscribes to, which
+/// the old entries conflated by giving both the channel name, and
+/// `otlp` is an `output` type rather than a `format`. The names here
+/// are deliberately not the channel names, so the two stay visibly
+/// distinct.
+///
+/// What the block does and does not do, because the distinction is
+/// easy to get backwards. Declaring any sink is NOT inert: it installs
+/// the sink dispatcher at boot and routes emission away from the legacy
+/// tracing subscriber, which is what `docs/observability.md` means by
+/// the fan-out path lighting up once an operator declares a sink. What
+/// it does not reach is this test's assertions. Capture runs off
+/// `SBPROXY_TEST_FAKE_SINKS=1`, and the capture helper walks its own
+/// hardcoded list of four channel pairs, so the same four buffers are
+/// asserted on whether or not the config names them. The block stays
+/// because the schema's own rustdoc cites this file as the operator
+/// shape it was made to parse, and a fixture that cannot boot documents
+/// nothing.
+///
+/// All four write to stdout because the harness runs offline with no
+/// collector to point an `otlp` output at, and because the assertions
+/// read the capture buffers rather than any real destination. A
+/// deployment would send the trace channel to a collector instead.
+///
+/// One more trap: naming the capture helper's constant here rather than
+/// describing it is enough on its own to move that constant into the
+/// tests-only column of `scripts/scan-pub-item-usage.py`, whose
+/// matching is textual. It cost a red gate once already.
 #[test]
 fn redaction_per_sink_fan_out() {
     let upstream = MockUpstream::start(json!({"ok": true})).expect("start mock upstream");
@@ -217,21 +256,29 @@ fn redaction_per_sink_fan_out() {
         r#"
 proxy:
   http_bind_port: 0
-observability:
-  log:
-    sinks:
-      - name: access_log
-        format: json
-        profile: internal
-      - name: error_log
-        format: json
-        profile: internal
-      - name: audit_log
-        format: json
-        profile: internal
-      - name: trace_exporter
-        format: otlp
-        profile: internal
+  observability:
+    log:
+      sinks:
+        - name: access-stdout
+          target: access_log
+          format: json
+          output: {{ type: stdout }}
+          profile: internal
+        - name: error-stdout
+          target: error_log
+          format: json
+          output: {{ type: stdout }}
+          profile: internal
+        - name: audit-stdout
+          target: audit_log
+          format: json
+          output: {{ type: stdout }}
+          profile: internal
+        - name: traces-stdout
+          target: trace_exporter
+          format: json
+          output: {{ type: stdout }}
+          profile: internal
 origins:
   "redact.localhost":
     action:

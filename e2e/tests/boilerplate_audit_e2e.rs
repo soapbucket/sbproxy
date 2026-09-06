@@ -57,14 +57,29 @@ proxy:
     port: {admin_port}
     username: admin
     password: w4-audit
-observability:
-  log:
-    sinks:
-      - name: stdout
-        format: json
-        profile: internal
-  metrics:
-    enabled: true
+  # This block sat at the top level, where nothing read it, so it was
+  # silently dropped for this fixture's whole life until the WOR-2706
+  # misplaced-field refusal turned that into a boot failure (WOR-2934).
+  # It is re-nested rather than deleted, unlike the sibling fixtures in
+  # rate_limit_budget.rs / ai_toolkit.rs / smoke_substrate.rs, because
+  # `boilerplate_audit_config_compiles` below is a shape lock that
+  # asserts `profile: internal` is in this YAML: something a test
+  # asserts does depend on the block being here.
+  #
+  # `target` and `output` are now required per docs/observability.md,
+  # and the channel is the access log because `stripped_bytes` is an
+  # access-log field. The `metrics: enabled: true` key that rode along
+  # is dropped outright: `enabled` is in no metrics schema in this
+  # workspace, so it has no valid home at any nesting level, and the
+  # metric this file scrapes is on without it.
+  observability:
+    log:
+      sinks:
+        - name: access-stdout
+          target: access_log
+          format: json
+          output: {{ type: stdout }}
+          profile: internal
 origins:
   "stripped.localhost":
     transforms:
