@@ -2,11 +2,13 @@ syntax = "proto3";
 
 // Shared inference contract for the sbproxy classifier sidecar (WOR-704).
 //
-// This proto is the ONLY artifact shared between the OSS minimal sidecar and
-// the enterprise rich sidecar: both implement `InferenceService`, so the
-// proxy speaks to whichever is deployed through one client. It is
-// deliberately self-contained (no imports) and minimal -- the enterprise
-// sidecar adds its own RPCs (Judge, admin, license-leak) as a superset.
+// This proto is the ONLY artifact shared between the minimal sidecar
+// (`sbproxy-classifier-sidecar`) and the rich sidecar
+// (`sbproxy-classifier`), both built from this workspace: each implements
+// `InferenceService`, so the proxy speaks to whichever is deployed through
+// one client. It is deliberately self-contained (no imports) and minimal --
+// the rich sidecar adds its own RPCs (Judge, admin, license-leak) as a
+// superset.
 // proto3 keeps field/RPC additions backward compatible.
 package sbproxy.classifier.v1;
 
@@ -113,8 +115,8 @@ message VersionResponse {
   repeated string models = 2;
 }
 
-// The enterprise-superset RPCs (WOR-2665). `InferenceService` above is the
-// contract both the minimal OSS sidecar and the rich sidecar implement;
+// The rich sidecar's superset RPCs (WOR-2665). `InferenceService` above is
+// the contract both the minimal and the rich sidecar implement;
 // `ClassifierService` is additional surface only the rich sidecar
 // (`sbproxy-classifier`) serves. Kept in the same proto file (rather than a
 // second crate) so one generated client crate can carry both stubs, per the

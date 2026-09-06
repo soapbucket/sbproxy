@@ -5352,8 +5352,8 @@ fn emit_policy_verdict_with_outcome(
     );
     // WOR-75: stamp an exemplar on the policy-evaluation histogram so
     // dashboards can hop from a slow-policy bucket to the originating
-    // trace. The hostname dimension is the request's tenant workspace_id
-    // (this proxy is tenant-scoped); verdict is the closed
+    // trace. The hostname dimension is the request's tenant workspace_id;
+    // verdict is the closed
     // allow/deny/confirm label already on the audit bus.
     sbproxy_observe::metrics::record_policy_evaluation_duration(
         &ctx.workspace_id,

@@ -288,9 +288,15 @@ impl RateLimitBudgetRegistry {
     pub fn check(&self, workspace: &str) -> BudgetDecision {
         let now = self.clock.now();
         let mut map = self.workspaces.lock();
-        // WOR-1691: callers always pass the static "default" key today,
-        // so avoid the per-request `workspace.to_string()` that `entry`
-        // forces; allocate the key only on the first-seen miss.
+        // WOR-1691, WOR-2477: the key is the origin's configured tenant,
+        // so the key set is operator-bounded (one entry per
+        // `proxy.tenants[]`, plus the reserved `__default__` for origins
+        // that name none) and stable once every tenant has been seen. A
+        // request cannot mint a key. `entry` would force an owned
+        // `workspace.to_string()` on every request and discard it on the
+        // hit path, so this pair allocates only on a tenant's first
+        // request. The map holds one `WorkspaceState` per tenant; it is
+        // not a singleton, and it grows to the configured tenant count.
         if !map.contains_key(workspace) {
             map.insert(workspace.to_string(), self.new_state(now));
         }

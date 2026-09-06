@@ -115,8 +115,8 @@ use tract_onnx::prelude::*;
 ///
 /// Operators running a larger custom model can lift this via
 /// [`LoadOptions::with_max_model_bytes`] /
-/// [`LoadOptions::with_max_tokenizer_bytes`]. The default is the same
-/// 200 MB ceiling `sbproxy-classifier` uses.
+/// [`LoadOptions::with_max_tokenizer_bytes`]. The default is the
+/// constant below.
 pub const MAX_MODEL_BYTES_DEFAULT: u64 = 200 * 1024 * 1024;
 
 /// Type alias for the optimised, runnable tract graph held inside

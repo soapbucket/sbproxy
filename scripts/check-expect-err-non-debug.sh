@@ -32,15 +32,26 @@
 # constructors it covers instead of banning a method outright: outside
 # that list, `expect_err` is the right call and clippy enforces it.
 #
+# # Where a statement ends
+#
+# The unit is a statement, not a line, because rustfmt breaks exactly
+# the chain this looks for. Statements are bounded at `;`, and the `;`
+# is looked for in a copy of the line with every string literal and
+# trailing comment removed. That matters more than it sounds: these
+# tests pass YAML as a multi-line raw string, and a CSP header value or
+# a cookie attribute inside one carries semicolons. Bounding on the raw
+# line split the statement at the first of them and the `expect_err`
+# was never paired with its constructor, which is the failure this
+# check exists to catch. `r"`, `r#"` and `r##"` openers are tracked
+# across lines; a plain literal's `\"` escapes are honoured.
+#
 # # What a grep cannot see
 #
-# This matches a statement that names one of the constructors below and
-# then calls `expect_err` / `unwrap_err` on the same statement. It does
-# not resolve types, so it cannot see a test helper that wraps one of
-# those constructors and returns the same `Result` under a local name.
-# Such a helper still fails to compile, just without this check's
-# message in front of it. Widening the constructor list is part of
-# adding a constructor, not a follow-up.
+# It does not resolve types, so it cannot see a test helper that wraps
+# one of the constructors below and returns the same `Result` under a
+# local name. Such a helper still fails to compile, just without this
+# check's message in front of it. Widening the constructor list is part
+# of adding a constructor, not a follow-up.
 #
 # # Usage
 #
@@ -89,6 +100,11 @@ GUARDED_TYPES=(
   "crates/sbproxy-core/src/pipeline.rs:CompiledPipeline"
 )
 
+# `fuzz/` is scanned even though it is deliberately not a workspace
+# member: `fuzz/fuzz_targets/stateful_proxy.rs` calls both guarded
+# constructors, and no lane builds that tree, so a mistake there would
+# surface only to whoever next runs cargo-fuzz.
+#
 # Files permitted to pair a listed constructor with expect_err /
 # unwrap_err in one statement, with the reason each earns it. Empty
 # today: every call site in the tree already uses `.err().expect()`,
@@ -142,17 +158,75 @@ scan_files() {
       start = 0
       bufile = ""
     }
-    FNR == 1 { flush() }
+    # The line with every string literal removed, used only to decide
+    # where a statement ends. A `;` inside a CSP header value or a YAML
+    # fixture is not a statement terminator, and treating it as one
+    # silently splits the chain this check is looking for. `in_raw`
+    # carries a multi-line raw string across records.
+    function strip_strings(line,   out, p, closer, hashes, c, i, n) {
+      out = ""
+      while (length(line) > 0) {
+        if (in_raw) {
+          closer = "\"" raw_hashes
+          p = index(line, closer)
+          if (p == 0) { return out }
+          line = substr(line, p + length(closer))
+          in_raw = 0
+          continue
+        }
+        if (match(line, /r#*"/) == 0) {
+          p = index(line, "\"")
+          if (p == 0) { return out line }
+          out = out substr(line, 1, p - 1)
+          line = substr(line, p + 1)
+          # Walk the plain string literal, honouring backslash escapes.
+          n = length(line)
+          for (i = 1; i <= n; i++) {
+            c = substr(line, i, 1)
+            if (c == "\\") { i++; continue }
+            if (c == "\"") { break }
+          }
+          line = substr(line, i + 1)
+          continue
+        }
+        # A raw string starts before any plain one only if it starts
+        # first; compare positions and take the earlier opener.
+        p = index(line, "\"")
+        if (p > 0 && p < RSTART) {
+          out = out substr(line, 1, p - 1)
+          line = substr(line, p + 1)
+          n = length(line)
+          for (i = 1; i <= n; i++) {
+            c = substr(line, i, 1)
+            if (c == "\\") { i++; continue }
+            if (c == "\"") { break }
+          }
+          line = substr(line, i + 1)
+          continue
+        }
+        out = out substr(line, 1, RSTART - 1)
+        hashes = substr(line, RSTART + 1, RLENGTH - 2)
+        line = substr(line, RSTART + RLENGTH)
+        in_raw = 1
+        raw_hashes = hashes
+      }
+      return out
+    }
+    FNR == 1 { flush(); in_raw = 0 }
     {
       line = $0
-      if (line ~ /^[[:space:]]*\/\//) { next }
-      if (line ~ /^[[:space:]]*$/) {
+      if (!in_raw && line ~ /^[[:space:]]*\/\//) { next }
+      if (!in_raw && line ~ /^[[:space:]]*$/) {
         if (buf != "") { flush() }
         next
       }
       if (buf == "") { start = FNR; bufile = FILENAME }
+      probe = strip_strings(line)
+      # Strings are gone from the probe, so any `//` left in it opens a
+      # real trailing comment; a `;` after that is prose.
+      sub(/\/\/.*$/, "", probe)
       buf = buf " " line
-      if (line ~ /;/) { flush() }
+      if (!in_raw && probe ~ /;/) { flush() }
     }
     END {
       flush()
@@ -205,7 +279,7 @@ run_check() {
       continue
     fi
     files+=("$file")
-  done < <(find crates e2e -name '*.rs' -type f | sort)
+  done < <(find crates e2e fuzz -name '*.rs' -type f | sort)
 
   if ! out="$(scan_files "${files[@]}")"; then
     printf 'expect_err / unwrap_err on a Result whose Ok type has no Debug:\n\n' >&2
@@ -391,6 +465,66 @@ fn refuses() {
 EOF
   expect "an unrelated later statement passes" 0 scan_files "$scratch/two_statements.rs"
 
+  # The shape that got past the first version of this check: a `;`
+  # inside a multi-line raw string used to end the statement early, so
+  # the expect_err was never paired with its constructor.
+  cat >"$scratch/raw_string_semicolon.rs" <<'EOF'
+#[test]
+fn refuses() {
+    let err = compile_config(
+        r#"
+origins:
+  api.test.sbproxy.dev:
+    headers:
+      content-security-policy: "default-src 'self'; script-src 'none'"
+"#,
+    )
+    .expect_err("must be refused");
+}
+EOF
+  expect "a semicolon inside a raw string does not hide the call" 1 \
+    scan_files "$scratch/raw_string_semicolon.rs"
+
+  cat >"$scratch/plain_string_semicolon.rs" <<'EOF'
+#[test]
+fn refuses() {
+    let err = compile_config("set-cookie: a=1; Secure").expect_err("must be refused");
+}
+EOF
+  expect "a semicolon inside a plain string does not hide the call" 1 \
+    scan_files "$scratch/plain_string_semicolon.rs"
+
+  cat >"$scratch/trailing_comment_semicolon.rs" <<'EOF'
+#[test]
+fn refuses() {
+    let err = compile_config(YAML) // csp: default-src 'self'; none
+        .expect_err("must be refused");
+}
+EOF
+  expect "a semicolon in a trailing comment does not hide the call" 1 \
+    scan_files "$scratch/trailing_comment_semicolon.rs"
+
+  # The same raw string on a correct call must still pass, so the
+  # widened statement does not reach forward into the next one.
+  cat >"$scratch/raw_string_ok.rs" <<'EOF'
+#[test]
+fn refuses() {
+    let err = compile_config(
+        r#"
+origins:
+  api.test.sbproxy.dev:
+    headers:
+      content-security-policy: "default-src 'self'; script-src 'none'"
+"#,
+    )
+    .err()
+    .expect("must be refused");
+    let other = WafPolicy::from_config(json).expect_err("must be refused");
+}
+EOF
+  expect "a raw string on a correct call still passes" 0 \
+    scan_files "$scratch/raw_string_ok.rs"
+
   # Rule B: the derive that would invert the advice.
   mkdir -p "$scratch/fixtures"
   cat >"$scratch/fixtures/ok.rs" <<'EOF'
@@ -429,7 +563,7 @@ EOF
     echo "self-test failed: the detector is narrower than the enforcer" >&2
     return 1
   fi
-  echo "self-test passed: 16 fixtures"
+  echo "self-test passed: 20 fixtures"
   return 0
 }
 
