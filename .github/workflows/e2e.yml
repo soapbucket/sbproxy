@@ -30,6 +30,12 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
+  # Match regular CI's debug profiles so this lane can share dependency
+  # caches and retain file/line backtraces without full variable debuginfo.
+  # The previous full-debug E2E cache occupied 4.36 GiB of the 10 GiB
+  # repository budget and used a different key from the required subset.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
   # The payments-featured binary below builds with this workspace's
   # [profile.release] (fat LTO, codegen-units=1). release.yml's
   # aarch64-unknown-linux-gnu leg SIGKILLed under this profile even at
