@@ -1,7 +1,7 @@
 //! Exposed credentials policy.
 //!
-//! Detects exposed credentials in inbound requests. The OSS
-//! implementation ships the **static** provider: operators supply a
+//! Detects exposed credentials in inbound requests. The **static**
+//! provider is the only one that ships: operators supply a
 //! list of leaked passwords (or SHA-1 hashes thereof) and the policy
 //! hashes inbound credentials with SHA-1 before checking the set in
 //! constant time.
@@ -41,20 +41,19 @@ pub enum ExposedCredsAction {
 
 /// Detects exposed credentials in inbound requests.
 ///
-/// Today the OSS implementation ships the **static** provider:
-/// operators supply a list of leaked passwords (or SHA-1 hashes
-/// thereof) and the policy hashes inbound credentials with SHA-1
-/// before checking the set in constant time. Hash-only lists keep
-/// the configured material from leaking through error messages or
-/// process dumps.
+/// The **static** provider is the only one that ships: operators
+/// supply a list of leaked passwords (or SHA-1 hashes thereof) and
+/// the policy hashes inbound credentials with SHA-1 before checking
+/// the set in constant time. Hash-only lists keep the configured
+/// material from leaking through error messages or process dumps.
 ///
-/// Credentials are extracted from `Authorization: Basic <b64>`. The
-/// HIBP k-anonymity provider lives behind a separate enterprise
-/// adapter (TBD) so the OSS data plane has no outbound dependency.
+/// Credentials are extracted from `Authorization: Basic <b64>`. No
+/// provider queries an exposure service over the network, so the
+/// data plane takes on no outbound dependency for this check.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExposedCredsPolicy {
-    /// Source of the exposure list. Today only `static` is recognised
-    /// in OSS; enterprise extends this with `hibp`.
+    /// Source of the exposure list. `static` is the only value
+    /// recognised; any other is refused at config load.
     #[serde(default = "default_exposed_creds_provider")]
     pub provider: String,
     /// Action to take on a match. Default is `tag`.
@@ -97,7 +96,7 @@ impl ExposedCredsPolicy {
         let mut policy: Self = serde_json::from_value(value)?;
         if policy.provider != "static" {
             anyhow::bail!(
-                "exposed_credentials provider {:?} not recognised in OSS; only `static` is supported (HIBP lives in the enterprise build)",
+                "exposed_credentials provider {:?} is not recognised; `static` is the only provider that ships",
                 policy.provider
             );
         }
