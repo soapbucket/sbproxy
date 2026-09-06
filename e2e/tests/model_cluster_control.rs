@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
-use std::net::{TcpListener, UdpSocket};
+use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -266,7 +266,7 @@ proxy:
   model_host:
     authority: file_managed
     catalog_file: "{catalog_path}"
-    handoff_timeout_ms: 10000
+    handoff_timeout_ms: 30000
     cache:
       directory: "{cache_dir}"
     engines:
@@ -709,15 +709,67 @@ fn partitioned_worker_is_called_out(
         })
 }
 
-fn wait_for_tcp_port_to_release(port: u16, label: &str) {
+// A bind probes address availability, which can also be affected by another
+// socket using the port. Shutdown needs to prove that the listener is gone.
+// Only an explicit refusal proves closure; a timeout or other error does not.
+fn tcp_listener_closed(port: u16) -> std::io::Result<()> {
+    let address = ([127, 0, 0, 1], port).into();
+    match TcpStream::connect_timeout(&address, Duration::from_millis(100)) {
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => Ok(()),
+        Err(error) => Err(error),
+        Ok(_) => Err(std::io::Error::other("listener still accepts connections")),
+    }
+}
+
+#[test]
+fn tcp_shutdown_probe_distinguishes_listening_and_closed_sockets() -> Result<()> {
+    use std::io::Write;
+
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    listener.set_nonblocking(true)?;
+    assert!(tcp_listener_closed(port).is_err());
+    // Consume the successful probe before exercising a real server-side close.
+    drop(listener.accept()?.0);
+    let mut connection = TcpStream::connect(("127.0.0.1", port))?;
+    connection.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let (mut accepted, _) = listener.accept()?;
+    accepted.write_all(b"closed")?;
+    drop(accepted);
+    drop(listener);
+    let mut response = Vec::new();
+    connection.read_to_end(&mut response)?;
+    assert_eq!(response, b"closed");
+    tcp_listener_closed(port)?;
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn tcp_shutdown_probe_accepts_a_bound_socket_without_a_listener() -> Result<()> {
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    socket.set_reuseaddr(false)?;
+    socket.bind(([127, 0, 0, 1], 0).into())?;
+    let address = socket.local_addr()?;
+    // A non-listening socket can prevent rebinding without accepting traffic.
+    // This is the ambiguity in the old shutdown assertion.
+    // Linux refuses this connection; Darwin times it out, which the probe
+    // deliberately does not accept as evidence of closure.
+    assert!(TcpListener::bind(address).is_err());
+    tcp_listener_closed(address.port())?;
+    Ok(())
+}
+
+fn wait_for_tcp_listener_to_close(port: u16, label: &str) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+        let observation = tcp_listener_closed(port);
+        if observation.is_ok() {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "{label} TCP port {port} did not release"
+            "{label} TCP port {port} did not refuse connections: {observation:?}"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -726,15 +778,27 @@ fn wait_for_tcp_port_to_release(port: u16, label: &str) {
 fn wait_for_ports_to_release(nodes: &[NodeSpec]) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let released = nodes.iter().all(|node| {
-            UdpSocket::bind(("127.0.0.1", node.gossip_port)).is_ok()
-                && TcpListener::bind(("127.0.0.1", node.transport_port)).is_ok()
-                && TcpListener::bind(("127.0.0.1", node.admin_port)).is_ok()
+        let observations = nodes
+            .iter()
+            .map(|node| {
+                (
+                    node.node_id,
+                    UdpSocket::bind(("127.0.0.1", node.gossip_port)).map(drop),
+                    tcp_listener_closed(node.transport_port),
+                    tcp_listener_closed(node.admin_port),
+                )
+            })
+            .collect::<Vec<_>>();
+        let released = observations.iter().all(|(_, gossip, transport, admin)| {
+            gossip.is_ok() && transport.is_ok() && admin.is_ok()
         });
         if released {
             return;
         }
-        assert!(Instant::now() < deadline, "cluster ports did not release");
+        assert!(
+            Instant::now() < deadline,
+            "cluster sockets did not close (node, gossip, transport, admin): {observations:?}"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -757,6 +821,11 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
     let root = tempfile::tempdir().context("create cluster fixture")?;
     let catalog_path = write_model_fixture(root.path())?;
     let fake_engine_path = Path::new(env!("CARGO_BIN_EXE_fake_model_engine"));
+    // Worker-b's first replica is the rolling replacement. Keep it unready
+    // until the retained-generation assertion has observed the handoff.
+    let readiness_hold =
+        tempfile::NamedTempFile::new_in(root.path()).context("create rolling readiness hold")?;
+    let readiness_hold_path = readiness_hold.path().to_string_lossy().into_owned();
     let mut node_leases: BTreeMap<&'static str, Vec<PortLease>> = BTreeMap::new();
     let nodes = vec![
         node_spec(
@@ -817,9 +886,19 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
         // WOR-2295 window is the spawn itself rather than the identity
         // provisioning and config validation above.
         drop(node_leases.remove(node.node_id));
+        let process = if node.node_id == "worker-b" {
+            let mut env = NODE_ENV.to_vec();
+            env.push((
+                "SBPROXY_FAKE_ENGINE_READINESS_HOLD_FILE",
+                &readiness_hold_path,
+            ));
+            ProxyHarness::start_with_workspace_shutdown_grace_and_env(config, &[], 1_000, &env)
+        } else {
+            start_node(config)
+        };
         processes.insert(
             node.node_id,
-            start_node(config).with_context(|| format!("start {}", node.node_id))?,
+            process.with_context(|| format!("start {}", node.node_id))?,
         );
     }
 
@@ -895,14 +974,28 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
             )
         })
         .collect::<Vec<_>>();
-    reload_cluster_configs(&client, &nodes, &processes, &rolling_configs)?;
     let rolling_generation = initial_generation + 1;
-    wait_for_one_status(
-        &client,
-        nodes[1].admin_port,
-        Duration::from_secs(15),
-        |status| rolling_handoff_is_waiting(status, rolling_generation, "worker-a", "worker-b"),
-    );
+    let reload_client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(45))
+        .build()
+        .context("build rollout reload client")?;
+    std::thread::scope(|scope| -> Result<()> {
+        // Release readiness before joining the reload even if the assertion
+        // unwinds, so a failed test cannot strand the held replacement.
+        let hold = readiness_hold;
+        let reload = scope
+            .spawn(|| reload_cluster_configs(&reload_client, &nodes, &processes, &rolling_configs));
+        wait_for_one_status(
+            &client,
+            nodes[1].admin_port,
+            Duration::from_secs(15),
+            |status| rolling_handoff_is_waiting(status, rolling_generation, "worker-a", "worker-b"),
+        );
+        hold.close()
+            .context("release rolling replacement readiness")?;
+        reload.join().expect("rolling reload thread")?;
+        Ok(())
+    })?;
     statuses = wait_for_statuses(&client, &all_admin_ports, CONVERGENCE_TIMEOUT, converged);
     assert_eq!(deployment_generation(&statuses[0]), rolling_generation);
     assert_eq!(
@@ -930,10 +1023,6 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
         })
         .collect::<Vec<_>>();
     let retained_stream = retain_managed_stream(&client, &nodes[3], &processes["worker-b"])?;
-    let reload_client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(45))
-        .build()
-        .context("build recreate reload client")?;
     let recreate_generation = rolling_generation + 1;
     std::thread::scope(|scope| -> Result<()> {
         // Keep the stream inside the scope so a failed assertion releases
@@ -1010,7 +1099,7 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
         .terminate_gracefully(Duration::from_secs(5))
         .context("gracefully stop assigned worker")?;
     drop(failed_process);
-    wait_for_tcp_port_to_release(engine_port, "managed engine child");
+    wait_for_tcp_listener_to_close(engine_port, "managed engine child");
     let surviving_admin_ports = nodes
         .iter()
         .filter(|node| node.node_id != failed_node_id)
