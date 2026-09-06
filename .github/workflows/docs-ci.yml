@@ -147,9 +147,9 @@ jobs:
       # workflow's direct push was refused on every run and the corpus
       # went stale while CI stayed green. Rather than hand a bypass
       # credential to a docs generator, regeneration moved to release
-      # prep: a release cannot be cut with a stale corpus, enforced by
-      # release-checks.yml, and the file is allowed to go stale in
-      # between.
+      # prep. The corpus may be stale between releases; release checks
+      # do not enforce its freshness. This PR check validates generated
+      # output only when the branch changes the corpus.
       #
       # So this step no longer forbids the file. It requires that a
       # branch carrying it carries the generator's own output, which is
