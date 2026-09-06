@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-08-30*
+*Last modified: 2026-09-05*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -104,14 +104,17 @@ the very top level of the file only logs a warning, since dropping `id`,
 `config_version`, or `workspace_id` changes nothing about how the proxy
 behaves.
 
-The flat schema-v1 keys that carry origin behavior are the exception.
-`hostname`, `action`, `authentication`, `policies`, `forward_rules`, `cors`,
-`request_modifiers`, `response_modifiers`, `session`, `variables`,
-`allowed_methods`, `force_ssl`, and `ai_proxy` at the top level are refused
-rather than dropped. Go compatibility is deprecated and those keys are not
-translated into `origins:`, so warning about them would boot a proxy with no
-origin configured. See [MIGRATION.md](../MIGRATION.md) for the rewrite and for
-the archived Go binary.
+Origin fields that have no top-level meaning are refused at the root. This includes
+`authentication` and its `auth` alias, `transforms`, `threat_protection`,
+and the other fields accepted under `origins.<hostname>:`. Legacy
+`hostname` and `ai_proxy` keys are also refused there. The error names
+the misplaced keys in your file. Fields valid at both scopes, such as
+`extensions`, keep their top-level meaning.
+
+Move these blocks under the intended origin before deploying. A partially
+migrated config can otherwise serve traffic while dropping the protection
+blocks left at the root. Go compatibility remains deprecated; see
+[MIGRATION.md](../MIGRATION.md#config-file-shape) for the file rewrite.
 
 The smallest runnable file is synced from
 [`examples/basic-proxy/sb.yml`](../examples/basic-proxy/sb.yml). CI compiles
