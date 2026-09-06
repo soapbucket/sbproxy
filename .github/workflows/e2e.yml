@@ -36,17 +36,10 @@ env:
   # repository budget and used a different key from the required subset.
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
-  # The payments-featured binary below builds with this workspace's
-  # [profile.release] (fat LTO, codegen-units=1). release.yml's
-  # aarch64-unknown-linux-gnu leg SIGKILLed under this profile even at
-  # CARGO_BUILD_JOBS=1, but that runner is a smaller/constrained class
-  # (ubuntu-24.04-arm). This job runs on ubuntu-latest, the same class
-  # as release.yml's x86_64-unknown-linux-gnu leg, which has always
-  # built this exact profile fine at full parallelism. A previous fix
-  # here defensively capped this job at CARGO_BUILD_JOBS=1 too, which
-  # instead fully serialized it for no reason and pushed it right up
-  # against its own timeout (confirmed: cancelled building this exact
-  # step at precisely 75min). Left at cargo's default.
+  # All three harness binaries use the dev profile for this functional
+  # sweep. The payments flavor formerly spent 29m21s building with fat
+  # LTO; release-checks.yml and payments-e2e.yml retain optimized
+  # payments coverage with ThinLTO. Keep Cargo's default parallelism.
   # settlement_gate.rs and usage_bridge.rs each start a 4-process
   # cluster; give proxy startup more room than a quiet dev machine
   # needs when the runner is also compiling the payments binary above.
@@ -58,11 +51,14 @@ jobs:
   e2e:
     name: e2e (workspace)
     runs-on: ubuntu-latest
-    # The 2026-08-31 run spent 57min building the three proxy flavors and
-    # another 7min compiling tests. The 75min cap then cancelled the suite
-    # before it finished. Leave room for the complete test sweep as well as
-    # the payments binary's fat-LTO build, including a cold cache.
+    # The former release-profile payments build contributed to a 75min
+    # timeout. Keep cold-build and full-suite headroom while measuring
+    # the dev-profile lane, rather than reducing the test budget as well.
     timeout-minutes: 100
+    env:
+      # Pin both push and manual/scheduled tests to this job's dev build;
+      # the harness otherwise prefers a cached release binary.
+      SBPROXY_E2E_PAYMENTS_BIN: ${{ github.workspace }}/target/payments/debug/sbproxy
     steps:
       - uses: actions/checkout@v5
 
@@ -99,10 +95,14 @@ jobs:
       # binary via ProxyHarness::start_payments_with_yaml_and_env; without
       # this, every test in both files fails with "payments-featured
       # sbproxy binary missing" (WOR-2222 - this lane never built one).
-      # The command and target dir match e2e/src/lib.rs's own error
-      # message exactly.
+      # Use the same dev profile as the other two harness flavors. The
+      # explicit job-level path above also applies to tag-triggered tests.
       - name: build payments-featured sbproxy binary (e2e harness)
-        run: CARGO_TARGET_DIR=target/payments cargo build --release -p sbproxy --features payment-x402,payment-mpp,payment-stripe,payment-lightning-cln --locked
+        run: |
+          # Retire the old cached profile so saving this lane does not
+          # retain both payment builds against the repository cache budget.
+          rm -rf target/payments/release
+          CARGO_TARGET_DIR=target/payments cargo build -p sbproxy --features payment-x402,payment-mpp,payment-stripe,payment-lightning-cln --locked
 
       # Run single-threaded. Each e2e test spawns its own proxy process
       # with a full multi-core tokio runtime, so the default test-thread

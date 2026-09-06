@@ -246,10 +246,12 @@ package selection stay where the rest of CI has it.
 only tests that drive a payment through a real proxy process.
 `challenge_settle_allow_and_replay_refusal` is the one that asserts the
 origin served exactly once for a settled payment and then refused the
-replay. Both files spawn a binary no other lane builds: a release
-`sbproxy` carrying
+replay. Both files spawn a separate `sbproxy` carrying
 `payment-x402,payment-mpp,payment-stripe,payment-lightning-cln`, found
 under `target/payments/` or named by `SBPROXY_E2E_PAYMENTS_BIN`.
+The full `e2e.yml` sweep uses a dev-profile binary, matching its other
+harness flavors. `payments-e2e.yml` and the serial `release-checks.yml`
+lane retain optimized release-profile payments coverage with ThinLTO.
 
 That binary, plus a spawned child on real ports, is why these two files
 are not in the required PR lane.
