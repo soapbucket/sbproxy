@@ -1,0 +1,4 @@
+{
+  "type": "fixed",
+  "message": "**Documentation-only pull requests skip code-gated CI builds as intended.** Combine the code path filter exclusions into one negated pattern while preserving observability and UI filter matching."
+}

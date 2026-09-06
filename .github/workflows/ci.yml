@@ -157,12 +157,11 @@ jobs:
         with:
           filters: |
             code:
-              - '!**.md'
-              - '!docs/**'
-              - '!examples/**'
-              - '!LICENSE'
-              - '!NOTICE'
-              - '!.gitignore'
+              # paths-filter ORs patterns by default. Keep exclusions in one
+              # negated union so one exclusion cannot re-include another.
+              # Inside this union, *.md covers root files and **/*.md nested
+              # files. Retain OR semantics for the positive filters below.
+              - '!{*.md,**/*.md,docs/**,examples/**,LICENSE,NOTICE,.gitignore}'
             observability:
               - 'crates/sbproxy-observe/**'
               - 'crates/sbproxy-modules/src/policy/**'

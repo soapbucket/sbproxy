@@ -1,0 +1,4 @@
+{
+  "type": "fixed",
+  "message": "**Release verification instructions pin the 1.14.0 identity, source revision, and image digest.** Require patched Cosign for binary bundles and explicitly select the published CycloneDX attestation format without disabling verification."
+}

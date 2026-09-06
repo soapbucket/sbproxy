@@ -1,6 +1,6 @@
 # SBproxy Supply Chain
 
-*Last modified: 2026-08-20*
+*Last modified: 2026-09-05*
 
 The long-form companion to `SECURITY.md`, intended for security teams, procurement reviewers, and anyone whose job is to answer the question "can we trust this binary?"
 
@@ -54,45 +54,54 @@ If a signature presents any other identity or issuer, **it is not an official SB
 
 ## 2. End-to-end verification
 
-This is the procedure to verify a release before running the binary in production. It assumes you have the [cosign](https://docs.sigstore.dev/cosign/installation/) CLI, the [GitHub CLI](https://cli.github.com/), and [syft](https://github.com/anchore/syft) installed.
+This is the procedure to verify a release before running the binary in production. It assumes you have [Cosign](https://docs.sigstore.dev/cosign/installation/) 3.1.3 or newer (or patched 2.x, starting at 2.6.5), the [GitHub CLI](https://cli.github.com/), and `jq` installed. Older Cosign versions can bypass certificate identity checks when reading legacy binary bundles; see [GHSA-fx35-mq7g-6g98](https://github.com/sigstore/cosign/security/advisories/GHSA-fx35-mq7g-6g98).
 
 ```bash
-VERSION=1.5.0
+set -euo pipefail
+VERSION=1.14.0
 PLATFORM=linux_amd64                  # or linux_arm64, darwin_arm64
+ARTIFACT="sbproxy_${PLATFORM}.tar.gz"
 TAG="v${VERSION}"
+REVISION=cc263f7ea0bf123c88302c77edd6493bc2a69ce8
+IMAGE_DIGEST=sha256:21a278fb8ee56cc430ea18a5e8796888d034d46e8e59858780d5a8587d7af390
+IMAGE="docker.io/soapbucket/sbproxy@${IMAGE_DIGEST}"
 BASE="https://github.com/soapbucket/sbproxy/releases/download/${TAG}"
 IDENTITY="https://github.com/soapbucket/sbproxy/.github/workflows/release.yml@refs/tags/${TAG}"
 ISSUER="https://token.actions.githubusercontent.com"
 ```
 
+These values pin the 1.14.0 release. For another release, replace the version, expected source commit, and image digest together with values approved by your release policy. Keep the exact tag identity and issuer checks.
+
 ### 2.1 Binary signature
 
 ```bash
-curl -fsSL -o sbproxy.tar.gz        "${BASE}/sbproxy_${PLATFORM}.tar.gz"
-curl -fsSL -o sbproxy.tar.gz.bundle "${BASE}/sbproxy_${PLATFORM}.tar.gz.cosign.bundle"
+curl -fsSL -O "${BASE}/${ARTIFACT}"
+curl -fsSL -O "${BASE}/${ARTIFACT}.sha256"
+curl -fsSL -O "${BASE}/${ARTIFACT}.cosign.bundle"
+shasum -a 256 -c "${ARTIFACT}.sha256"
 
 cosign verify-blob \
-  --bundle sbproxy.tar.gz.bundle \
+  --bundle "${ARTIFACT}.cosign.bundle" \
   --certificate-identity "${IDENTITY}" \
   --certificate-oidc-issuer "${ISSUER}" \
-  sbproxy.tar.gz
+  "${ARTIFACT}"
 ```
 
-A successful verification prints `Verified OK`. The `.cosign.bundle` file contains the certificate, the signature, and the Rekor inclusion proof so that this verification works **without internet egress** to Sigstore (see section 3).
+A successful verification prints `Verified OK`. The checksum checks download integrity; the signature authenticates the archive. The `.cosign.bundle` file contains the certificate, signature, and Rekor verification material. Offline verification also needs bootstrapped Sigstore trust roots (see section 3).
 
 ### 2.2 Container image signature
 
 ```bash
-cosign verify docker.io/soapbucket/sbproxy:${VERSION} \
+cosign verify "${IMAGE}" \
   --certificate-identity "${IDENTITY}" \
   --certificate-oidc-issuer "${ISSUER}"
 ```
 
 This pulls the image manifest, fetches the cosign signature stored in the OCI registry alongside the image, and verifies the certificate chain back to the Sigstore root and the Rekor transparency log entry.
 
-For multi-platform manifests, the verification covers each platform-specific image.
+The signature authenticates the multi-platform index at this digest, which commits to the platform manifests by digest. Verify and deploy the same immutable reference instead of resolving a mutable version tag again.
 
-Container images are published for `v1.2.0` and later; earlier tags shipped binaries only. The same image is also pushed to `ghcr.io/soapbucket/sbproxy` at the same digest.
+Container images are published for `v1.2.0` and later; earlier tags shipped binaries only. The workflow also pushes the same digest to `ghcr.io/soapbucket/sbproxy`. Docker Hub is the public verification path used here; access to the GHCR package depends on its visibility and your registry credentials.
 
 ### 2.3 SBOM
 
@@ -109,25 +118,36 @@ jq '.metadata.component.name, .metadata.component.version, (.components | length
 
 ```bash
 cosign verify-attestation \
+  --new-bundle-format=false \
   --type cyclonedx \
   --certificate-identity "${IDENTITY}" \
   --certificate-oidc-issuer "${ISSUER}" \
-  docker.io/soapbucket/sbproxy:${VERSION} \
+  "${IMAGE}" \
   | jq -r '.payload' | base64 -d | jq '.predicate.metadata.component, (.predicate.components | length)'
 ```
+
+For 1.14.0, the CycloneDX attestation is stored in Cosign's legacy OCI `.att` format alongside GitHub's newer provenance bundle. Cosign 3 defaults to the newer format and can miss the CycloneDX predicate. `--new-bundle-format=false` selects the SBOM's storage format; it keeps signature, certificate identity, issuer, and transparency-log verification enabled. Use this option only for this SBOM command.
 
 The SBOM is in CycloneDX JSON format. It enumerates every Rust crate (with version and license), every binary dependency, and the source tree state at build time. Use it to feed your dependency-tracking system (Dependency-Track, GUAC, in-house) or to grep for a specific CVE-affected package.
 
 ### 2.4 SLSA build provenance
 
 ```bash
-gh attestation verify sbproxy.tar.gz --repo soapbucket/sbproxy
+gh attestation verify "${ARTIFACT}" \
+  --repo soapbucket/sbproxy \
+  --cert-identity "${IDENTITY}" \
+  --cert-oidc-issuer "${ISSUER}" \
+  --source-ref "refs/tags/${TAG}" \
+  --source-digest "${REVISION}" \
+  --deny-self-hosted-runners
 ```
+
+These policy flags require the release workflow, exact tag and source revision, and a GitHub-hosted runner. To verify the container provenance with the same policy, repeat the command with `"oci://${IMAGE}"` in place of `"${ARTIFACT}"`.
 
 This proves that the artifact was produced by a specific workflow run on a specific commit, on a GitHub-hosted runner, with the inputs and environment recorded in the in-toto attestation. The attestation is also visible via the GitHub Attestations API, which is keyed by the artifact's SHA-256 digest:
 
 ```bash
-gh api "/repos/soapbucket/sbproxy/attestations/sha256:$(shasum -a 256 sbproxy.tar.gz | awk '{print $1}')"
+gh api "/repos/soapbucket/sbproxy/attestations/sha256:$(shasum -a 256 "${ARTIFACT}" | awk '{print $1}')"
 ```
 
 A successful provenance verification means the artifact came out of the `release.yml` workflow run associated with the tag. Combined with the signature (section 2.1), it means: the artifact was built by our workflow, and the workflow signed it. Both must be true for trust to hold.
@@ -137,7 +157,7 @@ A successful provenance verification means the artifact came out of the `release
 After cryptographic verification, run the binary itself:
 
 ```bash
-tar xzf sbproxy.tar.gz
+tar xzf "${ARTIFACT}"
 ./sbproxy --version
 ./sbproxy --config /path/to/your/sb.yml --check
 ```
@@ -166,7 +186,7 @@ Refresh the bootstrap every six months or when Sigstore rotates roots (announced
 
 ### 3.2 Offline verification
 
-In the air-gapped environment, restore the trust bundle and run the same verification commands:
+In the air-gapped environment, set the release variables from section 2, restore the trust bundle, and verify the archive:
 
 ```bash
 tar xzf sigstore-trust.tar.gz -C ~
@@ -175,19 +195,19 @@ tar xzf sigstore-trust.tar.gz -C ~
 export TUF_ROOT="${HOME}/.sigstore"
 
 cosign verify-blob \
-  --bundle sbproxy.tar.gz.bundle \
-  --certificate-identity "https://github.com/soapbucket/sbproxy/.github/workflows/release.yml@refs/tags/v1.5.0" \
-  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  --bundle "${ARTIFACT}.cosign.bundle" \
+  --certificate-identity "${IDENTITY}" \
+  --certificate-oidc-issuer "${ISSUER}" \
   --offline \
-  sbproxy.tar.gz
+  "${ARTIFACT}"
 ```
 
-The `--offline` flag tells cosign to use the Rekor inclusion proof embedded in the bundle rather than calling out to the Rekor API. This works because the proof is part of the bundle.
+The `--offline` flag uses the Rekor material embedded in the bundle rather than calling the Rekor API. Legacy bundles carry a signed entry timestamp; newer bundles can carry an inclusion proof.
 
 For SLSA provenance, `gh attestation verify` normally calls the GitHub API. If the verifying machine cannot reach api.github.com, fetch the attestation bundle and the Sigstore trusted root on a connected machine:
 
 ```bash
-gh attestation download sbproxy.tar.gz --repo soapbucket/sbproxy
+gh attestation download "${ARTIFACT}" --repo soapbucket/sbproxy
 # Writes sha256:<digest>.jsonl, named after the artifact digest
 gh attestation trusted-root > trusted-root.jsonl
 ```
@@ -195,8 +215,13 @@ gh attestation trusted-root > trusted-root.jsonl
 Then verify on the air-gapped machine entirely from local files:
 
 ```bash
-gh attestation verify sbproxy.tar.gz \
+gh attestation verify "${ARTIFACT}" \
   --repo soapbucket/sbproxy \
+  --cert-identity "${IDENTITY}" \
+  --cert-oidc-issuer "${ISSUER}" \
+  --source-ref "refs/tags/${TAG}" \
+  --source-digest "${REVISION}" \
+  --deny-self-hosted-runners \
   --bundle "sha256:<digest>.jsonl" \
   --custom-trusted-root trusted-root.jsonl
 ```
