@@ -21,6 +21,25 @@
 # Defaults match the required PR lane: non-e2e workspace tests in the dev
 # profile, plus doctests.
 #
+# One exception, and it is deliberate. The `observability budgets` lane
+# in ci.yml is required and is `--workspace` with no `--exclude
+# sbproxy-e2e`, so its three targets (cardinality, metrics_per_agent,
+# redaction) were invisible here and a stale fixture reached main behind
+# a green local gate (WOR-2933). They now run as their own phase after
+# the nextest lane. A fresh target/ pays one build under e2e's wider
+# feature union for them, 2m17 when measured; later runs are under a
+# minute.
+# The phase's own comment block carries the reasoning and the numbers.
+#
+# What this gate still does NOT cover, of the eleven lanes the required
+# CI aggregator waits on: the `e2e subset (required)` lane
+# (static_action, body_routing, sessions, admin_reload, transform_json),
+# reproduced with the command in CLAUDE.md, or by SBPROXY_CHECK_E2E=1,
+# which reaches it only by selecting the whole package and is therefore
+# much wider than the subset; and `release feature (embed-admin-ui)`,
+# which is `cargo check --bin sbproxy --features embed-admin-ui
+# --locked` and has no phase here at all.
+#
 # Environment:
 #
 #   SBPROXY_RELEASE_TESTS=1              run test binaries in release mode
@@ -999,6 +1018,37 @@ if phase_wanted BUILD || phase_wanted TEST; then
   python3 "$ROOT/scripts/tests/build_revision_test.py"
 fi
 
+# Resolve the sbproxy binary a harness flavor will spawn. Hoisted to
+# top level because two callers need it: the SBPROXY_CHECK_E2E=1 probe
+# below, and the observability budgets phase further down, which must
+# not hand-roll a weaker check (WOR-2933).
+# Resolve one harness flavor the way e2e/src/lib.rs does: the override
+# variable wins when it is set and non-empty, with a relative value
+# anchored at the workspace root; otherwise the first existing
+# candidate wins. Prints the path only when a usable binary exists.
+resolve_e2e_binary() {
+  local var="$1" configured candidate
+  shift
+  configured="${!var:-}"
+  if [ -n "$configured" ]; then
+    case "$configured" in
+      /*) candidate="$configured" ;;
+      *) candidate="$ROOT/$configured" ;;
+    esac
+    if [ -f "$candidate" ]; then
+      printf '%s\n' "$candidate"
+    fi
+    return 0
+  fi
+  for candidate in "$@"; do
+    if [ -f "$ROOT/$candidate" ]; then
+      printf '%s\n' "$ROOT/$candidate"
+      return 0
+    fi
+  done
+  return 0
+}
+
 # One package selection for every cargo invocation below, which is the
 # invariant ci.yml holds: under resolver = "2" the feature union is
 # computed from the selected packages, so a different selection silently
@@ -1053,33 +1103,6 @@ else
   # and it does not touch the `sbproxy-e2e` test group in
   # .config/nextest.toml, which is what keeps settlement_gate off the
   # parallel path it is red on (WOR-2295).
-
-  # Resolve one harness flavor the way e2e/src/lib.rs does: the override
-  # variable wins when it is set and non-empty, with a relative value
-  # anchored at the workspace root; otherwise the first existing
-  # candidate wins. Prints the path only when a usable binary exists.
-  resolve_e2e_binary() {
-    local var="$1" configured candidate
-    shift
-    configured="${!var:-}"
-    if [ -n "$configured" ]; then
-      case "$configured" in
-        /*) candidate="$configured" ;;
-        *) candidate="$ROOT/$configured" ;;
-      esac
-      if [ -f "$candidate" ]; then
-        printf '%s\n' "$candidate"
-      fi
-      return 0
-    fi
-    for candidate in "$@"; do
-      if [ -f "$ROOT/$candidate" ]; then
-        printf '%s\n' "$ROOT/$candidate"
-        return 0
-      fi
-    done
-    return 0
-  }
 
   add_e2e_exclusion() {
     local bin
@@ -1141,7 +1164,7 @@ else
 fi
 
 if ! phase_wanted TEST; then
-  scope_skip TEST "cargo test (the workspace nextest lane)"
+  scope_skip TEST "cargo test (the workspace nextest lane and the observability budgets targets)"
 else
 step "cargo test"
 if cargo nextest --version >/dev/null 2>&1; then
@@ -1175,6 +1198,113 @@ SBPROXY_ALLOW_CARGO_TEST_FALLBACK=1.
 MSG
   exit 1
 fi
+fi
+
+# CI: the required `observability budgets` job in ci.yml.
+#
+# That job is `--workspace` with NO `--exclude sbproxy-e2e`, so not one
+# of its three targets is reachable from the lane above, which drops the
+# package wholesale. Until now this gate could not see the lane at all: a
+# developer ran the full local gate green, pushed, and was told a
+# required lane was red by a crate the gate never compiled. On 2026-09-06
+# that is what happened. `redaction`'s fixture wrote `observability:` at
+# the top level, the WOR-2706 misplaced-field gate started refusing that
+# shape, and the stale fixture reached main (WOR-2933).
+#
+# The cost is a build, and it is the whole reason the lane was never
+# here. sbproxy-e2e widens the feature union past what the selection
+# above resolves, so the graph has to be built once under the wider set.
+# Measured on WOR-2933: 2m17 the first time, on a target/ that carried
+# nothing built under the wider union, then under a minute on later
+# runs (55s, most of it the three harness runs, which each spawn a
+# proxy). Those artifacts survive cleanup-build-artifacts.sh, which
+# prunes churn and leaves the dependency cache, so only a fresh target/
+# pays the build. CI measured the same
+# effect at 3m09 for 179 crates when these tests ran inline on the
+# `test` lane, which is why that job has its own cache key.
+#
+# Two things follow. The package selection below deliberately differs
+# from `test_package_args`, which is the one-selection-per-invocation
+# rule stated at the `test_package_args=` assignment above and in
+# CLAUDE.md's "The same mechanism sets CI's build time", so read this
+# paragraph before assuming it is an oversight. And it is a separate
+# phase rather than a widening of `test_package_args`, because widening
+# that array would move every other cargo phase onto the wider union and
+# pay for it there too.
+#
+# CI gates this job behind its `observability` path filter and this
+# phase does not: it runs whenever the TEST phase runs. Running more
+# locally than CI is the safe direction, and `--scope-to-diff` still
+# narrows it, through TEST rather than through a filter of its own.
+#
+# The three `expect_tests '>=1'` calls are one per target, copied from
+# the CI lane, and the split is load bearing there for the reason its
+# own comment gives: a single call summing three targets asserts only
+# that the three together ran something, so an emptied `redaction` would
+# hide behind cardinality's count and the lane would stay green with the
+# redaction budgets unchecked.
+#
+# These are libtest runs, not nextest, so their counts do not reach the
+# junit file the GATE_EXIT `tests=` number is read from. The
+# `expect_tests:` lines each phase prints carry them instead.
+if ! phase_wanted TEST; then
+  : # scope_skip already reported the TEST phase above.
+elif [ "${SBPROXY_CHECK_E2E:-0}" = "1" ]; then
+  # The nextest lane above already selected the whole sbproxy-e2e
+  # package, these three targets included. Running them again would buy
+  # nothing, and this is coverage rather than a gap, so it does not go
+  # through note_skip. Printed without the `==>` marker because it is
+  # not a phase: it starts no timer, and the marker is what a reader
+  # (and a log diff against `--explain`) counts phases by.
+  printf '\n    observability budgets: covered by the nextest lane above (SBPROXY_CHECK_E2E=1 selected the whole package).\n'
+else
+  step "cargo test (observability budgets, the required e2e lane)"
+  . "$ROOT/scripts/lib/expect-tests.sh"
+
+  # Build the binary the harness spawns, in this phase's own selection
+  # and exactly as the CI lane does. cargo cannot infer that a
+  # sbproxy-e2e test target needs it, so without this the three runs
+  # below would test whatever `sbproxy` happened to be on disk.
+  cargo build --workspace --locked
+
+  # Then pin it, and that part is the point.
+  #
+  # The harness prefers target/release/sbproxy over target/debug/sbproxy
+  # (`proxy_binary_path_for` in e2e/src/lib.rs returns the first path
+  # that exists), while the build above is dev profile and can only
+  # produce the debug one. A release binary left behind by an earlier
+  # `cargo build --release -p sbproxy`, which is the command
+  # e2e/src/lib.rs's own missing-binary hint and docs/troubleshooting.md
+  # both tell people to run, would therefore be spawned in preference to
+  # the binary this gate just built, and the phase would certify last
+  # week's code against today's source while reporting green.
+  # docs/config-authority-drills.md names the same hazard: a stale
+  # target/release/sbproxy is the most common cause of a confusing
+  # failure there, because the drills will happily certify last week's
+  # code. A false green is the exact class this phase exists to close,
+  # so it must not open a second one.
+  #
+  # `resolve_e2e_binary` honors an operator-set SBPROXY_E2E_BIN first,
+  # the way the harness does, and otherwise names the debug binary above.
+  # Release is deliberately not a candidate: this gate never builds one,
+  # so it could only ever be stale here.
+  obs_budgets_bin="$(resolve_e2e_binary SBPROXY_E2E_BIN target/debug/sbproxy)"
+  if [ -z "$obs_budgets_bin" ]; then
+    note_skip "observability budgets (cardinality + metrics_per_agent + redaction): no sbproxy binary at target/debug/sbproxy after the build above, and SBPROXY_E2E_BIN names none. Build it with: cargo build --workspace --locked  -- or point SBPROXY_E2E_BIN at one. This is a required CI lane, so it runs there regardless."
+  else
+    # Exported inside a subshell so the pin cannot leak into the
+    # doctest, clippy, doc, or payments phases that follow.
+    (
+      export SBPROXY_E2E_BIN="$obs_budgets_bin"
+      printf '    harness binary pinned to %s\n' "$SBPROXY_E2E_BIN"
+      expect_tests '>=1' "observability budgets: cardinality" -- \
+        cargo test --workspace --locked --test cardinality
+      expect_tests '>=1' "observability budgets: metrics_per_agent" -- \
+        cargo test --workspace --locked --test metrics_per_agent
+      expect_tests '>=1' "observability budgets: redaction" -- \
+        cargo test --workspace --locked --test redaction
+    )
+  fi
 fi
 
 # nextest does not execute doctests, so they need their own pass.
