@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://mcptest.sh/schema/session-ledger-v1.json",
   "title": "mcptest session ledger (v1)",
-  "description": "One record of the mcptest session ledger: a structured, append-only run record of MCP tool calls keyed to a session, so behavioral eval can assert what an agent did at the tool boundary (which tools, in what order, with what params, given what inputs) instead of parsing a transcript. A ledger file is newline-delimited JSON (NDJSON): exactly one `header` record, then one `tool_call` record per call in call order. This schema validates a single record. OSS (mcptest, SBproxy) emits this artifact; the enterprise tier consumes, aggregates, signs, and governs it.",
+  "description": "One record of the mcptest session ledger: a structured, append-only run record of MCP tool calls keyed to a session, so behavioral eval can assert what an agent did at the tool boundary (which tools, in what order, with what params, given what inputs) instead of parsing a transcript. A ledger file is newline-delimited JSON (NDJSON): exactly one `header` record, then one `tool_call` record per call in call order. This schema validates a single record. mcptest and SBproxy emit this artifact; downstream consumers aggregate, sign, and govern it.",
   "type": "object",
   "oneOf": [
     { "$ref": "#/$defs/header" },
