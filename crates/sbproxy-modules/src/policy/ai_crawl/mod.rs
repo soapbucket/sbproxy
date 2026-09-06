@@ -6,7 +6,7 @@
 //! the policy validates the token through a pluggable [`Ledger`] and allows
 //! the request once.
 //!
-//! The OSS ledger is in-memory: tokens are pre-loaded from config and each
+//! The built-in ledger is in-memory: tokens are pre-loaded from config and each
 //! token spends exactly once (single-use). When the `http-ledger` feature is
 //! enabled, `HttpLedger` talks to a network-callable backend (HMAC-signed,
 //! idempotent, retried, circuit-broken).
@@ -63,9 +63,9 @@ pub struct AiCrawlControlPolicy {
     tarpit_links: usize,
     /// Optional pluggable pricing model. When set, it is consulted
     /// before the static tier table; returning `Some(_)` overrides the
-    /// static price for that request. The OSS build ships no model;
-    /// this is the seam an embedder injects an LM-Tree-style model into
-    /// via [`Self::with_pricing_model`].
+    /// static price for that request. This build ships no model; this
+    /// is the seam an embedder injects an LM-Tree-style model into via
+    /// [`Self::with_pricing_model`].
     pricing_model: Option<Arc<dyn PricingModel>>,
 }
 
@@ -215,9 +215,9 @@ impl AiCrawlControlPolicy {
 
     /// Inject a pluggable [`PricingModel`]. Consulted before the static
     /// tier table on every price resolution; returning `Some(_)`
-    /// overrides the static price. The OSS build never sets one, so
-    /// static tiers and the flat `price:` fallback decide the price as
-    /// before unless an embedder opts in.
+    /// overrides the static price. This build never sets one, so static
+    /// tiers and the flat `price:` fallback decide the price as before
+    /// unless an embedder opts in.
     pub fn with_pricing_model(mut self, model: Arc<dyn PricingModel>) -> Self {
         self.pricing_model = Some(model);
         self
@@ -698,8 +698,8 @@ impl AiCrawlControlPolicy {
             // sub claim: G1.4 resolver chain runs in `stamp_request_context`
             // upstream of policy::check. When the caller threaded a resolved
             // agent_id we land it here so the quote-token's `sub` claim is
-            // honest about who paid; pre-G1.4 callers (and the OSS-default
-            // build that ships without agent-class) pass None and we keep
+            // honest about who paid; pre-G1.4 callers (and a build without
+            // the `agent-class` feature enabled) pass None and we keep
             // the Wave 1 `"unknown"` fallback so the JWS issue path never
             // signs an empty sub.
             let sub_claim = agent_id.unwrap_or("unknown");
@@ -726,9 +726,10 @@ impl AiCrawlControlPolicy {
             // logged (best-effort) but do not abort the response.
             //
             // Thread the real route / rail / currency through; persistence
-            // backends (the enterprise Postgres-backed store) stamp these
-            // on the `quote_tokens` audit row so a recovery query can group
-            // replay attempts by route at the price they were issued at.
+            // backends (an out-of-tree Postgres-backed implementation)
+            // stamp these on the `quote_tokens` audit row so a recovery
+            // query can group replay attempts by route at the price
+            // they were issued at.
             let _ = plan.nonce_store.register_with_context(
                 &issued.claims.nonce,
                 super::quote_token::NonceContext::new(path, rail_name, &price.currency),

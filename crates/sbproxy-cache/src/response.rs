@@ -236,7 +236,7 @@ fn render_fields<'a>(out: &mut String, fields: impl IntoIterator<Item = &'a str>
 /// The key format is:
 /// `v2:<workspace>:<tenant>:<hostname>:<method>:<path>:<identity>:<query-canonical>:<vary-fingerprint>:<config-fingerprint>`
 ///
-/// `workspace` may be empty for the OSS single-tenant path. `tenant` is
+/// `workspace` may be empty for the single-tenant path. `tenant` is
 /// the origin's resolved tenant (`__default__` in a single-tenant
 /// deployment). `identity` is the caller digest from
 /// [`caller_identity`], empty for an uncredentialed request. `query` is

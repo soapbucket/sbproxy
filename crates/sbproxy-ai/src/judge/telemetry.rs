@@ -1,7 +1,7 @@
 //! Prometheus metrics for the judge backend.
 //!
-//! Four metrics are registered, matching the OSS-scoped subset of the
-//! telemetry surface from `docs/policy.md`:
+//! Four metrics are registered, covering the telemetry surface from
+//! `docs/policy.md` that this backend implements:
 //!
 //! | Metric | Type | Labels |
 //! |---|---|---|
@@ -11,8 +11,9 @@
 //! | `sbproxy_judge_budget_exhausted_total` | counter | `tenant` |
 //!
 //! The `template` label (per-policy template id) and the
-//! `calibration_delta` metric are intentionally absent; both belong
-//! to the enterprise router, not the OSS judge.
+//! `calibration_delta` metric are intentionally absent: this backend
+//! has no multi-provider routing or calibration tracking to attach
+//! them to.
 //!
 //! Metrics are registered once on first access via [`std::sync::LazyLock`]
 //! against the default Prometheus registry. The same pattern is used

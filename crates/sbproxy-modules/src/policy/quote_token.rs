@@ -339,10 +339,11 @@ pub const MAX_IAT_SKEW: Duration = Duration::from_secs(5 * 60);
 
 /// Stateless verifier for compact-JWS quote tokens.
 ///
-/// Holds the JWKS (kid -> public key map) and a [`NonceStore`] that
-/// guarantees single-use redemption. The verifier itself is sync because the
-/// proxy hot path is sync per the layering ADR; the nonce-store implementation
-/// can be in-memory (OSS) or Postgres-backed (enterprise).
+/// Holds the JWKS (kid -> public key map) and a [`NonceStore`] that guarantees
+/// single-use redemption. The verifier itself is sync because the proxy hot
+/// path is sync per the layering ADR; the nonce-store implementation can be
+/// in-memory or Postgres-backed, via an out-of-tree `NonceStore`
+/// implementation.
 pub struct QuoteTokenVerifier {
     public_keys: HashMap<String, VerifyingKey>,
     nonce_store: Arc<dyn NonceStore>,
@@ -661,11 +662,11 @@ impl NonceError {
 
 /// Issuance metadata threaded through [`NonceStore::register_with_context`].
 ///
-/// Backends that persist nonces (the enterprise Postgres-backed store writes
-/// to the `quote_tokens` table) use these fields as audit-trail dimensions
-/// so a recovery query can answer "which routes saw what replay attempts at
-/// what price". The OSS [`InMemoryNonceStore`] ignores them; replay
-/// protection only needs the nonce string.
+/// Backends that persist nonces (an out-of-tree Postgres-backed `NonceStore`
+/// implementation writes to the `quote_tokens` table) use these fields as
+/// audit-trail dimensions so a recovery query can answer "which routes saw
+/// what replay attempts at what price". The built-in [`InMemoryNonceStore`]
+/// ignores them; replay protection only needs the nonce string.
 ///
 /// The fields are borrowed because every issuer call site already owns the
 /// strings (route is the request path, rail is the configured rail name,
@@ -766,9 +767,9 @@ pub trait NonceStore: Send + Sync + std::fmt::Debug + 'static {
     /// backends can stamp the route / rail / currency dimensions on the
     /// audit row.
     ///
-    /// The default impl forwards to [`NonceStore::register`] and discards
-    /// the context. Implementations that care about the context (the
-    /// enterprise Postgres-backed store) override this method directly.
+    /// The default impl forwards to [`NonceStore::register`] and discards the
+    /// context. Implementations that care about the context (an out-of-tree
+    /// Postgres-backed implementation) override this method directly.
     fn register_with_context(
         &self,
         nonce: &str,

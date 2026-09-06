@@ -11,7 +11,7 @@
 //!   `confirm`) is an assertion. A mismatch is a failed case.
 //! - **Diff:** the same samples run against a baseline evaluator and a
 //!   proposed evaluator. A row whose label changed is a policy-change
-//!   preview, the analogue of enterprise `sbproxy-policy diff`.
+//!   preview.
 //!
 //! Samples never carry argument values. The live hook evaluates against
 //! an empty Cedar context, so a recorded argument set would not change

@@ -1,4 +1,4 @@
-//! Agent-class resolver and the OSS policy that wraps it.
+//! Agent-class resolver and the policy that wraps it.
 //!
 //! The resolver chain is:
 //!
@@ -10,8 +10,8 @@
 //! 6. None of the above => emit `human`.
 //!
 //! The resolver is split from the `RequestContext` so the same
-//! resolution logic feeds the OSS request pipeline, the enterprise
-//! webhook envelope, and offline analyses (e.g. log replay).
+//! resolution logic feeds the request pipeline and offline
+//! analyses (e.g. log replay).
 //!
 //! # The `agent_class` policy
 //!

@@ -3,7 +3,7 @@
 
 //! # sbproxy-storage
 //!
-//! A small storage abstraction shared by the OSS mesh and the key plane.
+//! A small storage abstraction shared by the mesh and the key plane.
 //!
 //! ## The trait shapes
 //!

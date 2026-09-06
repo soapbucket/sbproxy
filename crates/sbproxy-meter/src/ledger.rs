@@ -59,11 +59,12 @@
 //! proportional to the number of entries the file has ever carried; rotate
 //! it if that matters.
 //!
-//! ## OSS seam
+//! ## Extension seam
 //!
 //! This ships the chain, signing, and local verification. Anchoring
-//! receipts to an external transparency log or a portal is an enterprise
-//! extension via the plugin trait registry; it consumes the same entries.
+//! receipts to an external transparency log or a portal is an
+//! out-of-tree extension via the plugin trait registry; it consumes
+//! the same entries.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::de::DeserializeOwned;

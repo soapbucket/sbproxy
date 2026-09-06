@@ -3,11 +3,10 @@
 //! Port of `sbproxy-enterprise-ai::intent_detection` (WOR-2672). The
 //! request path calls out to an external classifier sidecar via
 //! [`crate::hooks::IntentDetectionHook`], dispatched from
-//! `crate::server::ai_dispatch`. When no hook is registered (the
-//! common OSS case) or the hook declines to decide (fail-open path on
-//! RPC error, timeout, or an unreachable sidecar), callers fall back to
-//! the local keyword heuristic in this module so intent detection never
-//! goes silent.
+//! `crate::server::ai_dispatch`. When no hook is registered (the common
+//! case) or the hook declines to decide (fail-open path on RPC error,
+//! timeout, or an unreachable sidecar), callers fall back to the local
+//! keyword heuristic in this module so intent detection never goes silent.
 //!
 //! A stock SBproxy process installs a sidecar-backed implementation when
 //! `proxy.classifier_hooks.intent` is configured. The hook is lazy, bounded
@@ -64,7 +63,7 @@ impl std::fmt::Display for IntentCategory {
 //
 // We keep the local enum for backward compatibility (`Display`, existing
 // callers, re-export in `lib.rs`) and add lossless conversions to/from the
-// OSS hook enum so the async path can return either shape without churn.
+// core hook enum so the async path can return either shape without churn.
 
 impl From<core_hooks::IntentCategory> for IntentCategory {
     fn from(v: core_hooks::IntentCategory) -> Self {
@@ -165,11 +164,11 @@ pub fn detect_intent(prompt: &str) -> IntentCategory {
 /// Async detection path that prefers the classifier sidecar hook and falls
 /// back to [`detect_intent_heuristic`] on `None`.
 ///
-/// Returns the OSS [`core_hooks::IntentCategory`] shape so the result can
+/// Returns the [`core_hooks::IntentCategory`] shape so the result can
 /// flow straight into request-path code that speaks the hook vocabulary.
 /// Use `.into()` to convert to the local [`IntentCategory`] if needed.
 ///
-/// - Hook missing (OSS build): runs the heuristic.
+/// - Hook missing (none configured): runs the heuristic.
 /// - Hook present but returns `None` (RPC failure / fail-open): runs the
 ///   heuristic.
 /// - Hook returns `Some(category)`: that category is used.

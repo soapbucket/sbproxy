@@ -258,8 +258,8 @@ impl IdempotencyCache for InMemoryIdempotencyCache {
 
 // --- KVStore-backed backend (Redis or any other store) ---
 
-/// [`IdempotencyCache`] backed by any `KVStore` implementation. In OSS
-/// deployments this is typically Redis (via `RedisKVStore` from
+/// [`IdempotencyCache`] backed by any `KVStore` implementation. Most
+/// deployments use Redis here (via `RedisKVStore` from
 /// `sbproxy-platform`); in single-instance deployments operators may
 /// point this at the embedded redb store.
 ///

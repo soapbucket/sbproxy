@@ -46,11 +46,11 @@
 //!   the artifact (32 bytes), so memory stays bounded regardless of
 //!   model size.
 //!
-//! The trust model is OPERATOR-trusted: the OSS crate ships no vendor
-//! key. Operators that want signatures supply their own key and rotate
-//! it themselves. See `docs/adr-classifier-supply-chain-oss.md` for the
-//! reasoning and how this differs from the enterprise vendor-trusted
-//! path.
+//! The trust model is OPERATOR-trusted: this crate ships no vendor
+//! key, and there is no vendor-trusted alternative to fall back on.
+//! Operators that want signatures supply their own key and rotate it
+//! themselves. `docs/classifier-sidecar.md` records what this port
+//! leaves out, Ed25519 model-signing included.
 //!
 //! # Threading
 //!
@@ -116,7 +116,7 @@ use tract_onnx::prelude::*;
 /// Operators running a larger custom model can lift this via
 /// [`LoadOptions::with_max_model_bytes`] /
 /// [`LoadOptions::with_max_tokenizer_bytes`]. The default is the same
-/// 200 MB ceiling the enterprise classifier uses.
+/// 200 MB ceiling `sbproxy-classifier` uses.
 pub const MAX_MODEL_BYTES_DEFAULT: u64 = 200 * 1024 * 1024;
 
 /// Type alias for the optimised, runnable tract graph held inside

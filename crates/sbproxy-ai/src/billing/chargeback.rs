@@ -11,7 +11,7 @@
 //! workspace: &WorkspaceId, kind: UsageKind, amount: f64)`, three
 //! partial-amount calls per request) and persisted workspace totals to a
 //! `HashKv` backend for cross-replica summing. Neither type exists in
-//! this OSS tree: `sbproxy-enterprise-bootstrap` and
+//! this tree: `sbproxy-enterprise-bootstrap` and
 //! `sbproxy-enterprise-storage` are dropped outright per WOR-2661's
 //! sequencing, and the port's own scope is storage-free.
 //!

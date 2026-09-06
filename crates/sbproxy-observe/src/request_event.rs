@@ -63,7 +63,7 @@ pub struct RequestEvent {
     /// Set when this request is a retry, replay, or sub-call inside an
     /// agent pattern. The portal reconstructs trees client-side.
     ///
-    /// Reserved contract field: the OSS proxy never sets it today
+    /// Reserved contract field: the proxy never sets it today
     /// because no agent-pattern source exists on the request context.
     /// Session linkage (`session_id` / `parent_session_id`) is the
     /// live hierarchy mechanism.
@@ -71,7 +71,7 @@ pub struct RequestEvent {
     pub parent_request_id: Option<Ulid>,
 
     /// Tenant key. Required in multi-tenant deployments; defaults to
-    /// `"default"` in OSS single-tenant deployments.
+    /// `"default"` in single-tenant deployments.
     pub workspace_id: String,
 
     /// Origin-scoped tenant label from the proxy config

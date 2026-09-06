@@ -1116,7 +1116,7 @@ fn verify_optional_sha256(digest: Option<&str>, bytes: &[u8]) -> Result<()> {
 /// agent fields if needed, and write the transformed JSON to stdout.
 ///
 /// The function is intentionally narrow: it builds the JSON shape
-/// that the OSS proxy passes today. Callers who need a different
+/// that this proxy passes today. Callers who need a different
 /// shape can construct it directly and call [`WasmRuntime::execute`].
 //
 // Argument count exceeds the 7-arg clippy lint by two; each agent_*

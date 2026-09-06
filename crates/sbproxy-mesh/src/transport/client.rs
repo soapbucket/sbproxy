@@ -8,7 +8,7 @@
 //!
 //! [`TransportClientPool`] caches `Arc<PeerClient>` instances keyed by
 //! target identity plus `host:port` when enrolled mTLS is active. Callers (the [`crate::state::distributed_cache::DistributedCache`]
-//! routing layer and the enterprise-AI semantic cache adapter) ask the pool
+//! routing layer and the AI gateway's semantic cache adapter) ask the pool
 //! for a client instead of constructing one directly, so every outbound
 //! request for a given peer reuses the same TCP connection.
 //!

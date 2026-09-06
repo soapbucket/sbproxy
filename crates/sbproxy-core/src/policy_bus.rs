@@ -13,7 +13,7 @@
 //! decision family. One queue for both, for the reasons
 //! [`crate::policy_bus::AuditRecord`] sets out.
 //!
-//! In OSS the consumer is a stub that drops events to stderr as
+//! By default the consumer is a stub that drops events to stderr as
 //! JSON-lines; this is sufficient for local dev and gives operators
 //! a way to inspect decisions without provisioning a NATS cluster.
 //! An extension can replace the stub with a NATS-backed audit-chain
@@ -88,7 +88,7 @@ pub enum AuditRecord {
 }
 
 impl AuditRecord {
-    /// Stderr line prefix the OSS drain stub stamps for this record.
+    /// Stderr line prefix the default drain stub stamps for this record.
     ///
     /// `policy_verdict_event` is load bearing rather than cosmetic:
     /// operators filter the stub's stderr on it with `grep` and `jq`,
@@ -108,7 +108,7 @@ impl AuditRecord {
 /// Sender half of the audit bus.
 pub type PolicyBus = mpsc::Sender<AuditRecord>;
 
-/// Receiver half of the audit bus. The OSS stub
+/// Receiver half of the audit bus. The default stub
 /// consumes this; an extension can wrap it with a NATS bridge.
 pub type PolicyVerdictReceiver = mpsc::Receiver<AuditRecord>;
 
@@ -168,11 +168,10 @@ pub fn global_bus() -> Option<PolicyBus> {
 
 /// Upper bound on a single serialized audit line.
 ///
-/// The OSS [`PolicyVerdictEvent`] is already bounded by construction (the
-/// inbound request id is capped upstream at 256 bytes and the OSS payload
-/// carries no request-header or response-body context, which are
-/// optional fields), so an oversized line is not reachable on that arm
-/// today.
+/// The [`PolicyVerdictEvent`] is already bounded by construction (the
+/// inbound request id is capped upstream at 256 bytes and the payload
+/// carries no request-header or response-body context, which are optional
+/// fields), so an oversized line is not reachable on that arm today.
 ///
 /// The decision arm bounds the field that carries untrusted text:
 /// `DecisionAudit::reason` is a `RedactedReason`, capped at 512 bytes by
@@ -200,7 +199,7 @@ fn encode_record(record: &AuditRecord) -> Result<String, serde_json::Error> {
     }
 }
 
-/// Spawn the OSS drain stub that prints every record to stderr as
+/// Spawn the default drain stub that prints every record to stderr as
 /// a JSON line.
 ///
 /// The output format matches the on-wire shape of each record kind, so
@@ -214,7 +213,7 @@ pub async fn drain_to_stderr(mut rx: PolicyVerdictReceiver) {
     while let Some(record) = rx.recv().await {
         match encode_record(&record) {
             Ok(line) => {
-                // Stderr is the audit-event channel for the OSS
+                // Stderr is the audit-event channel for the default
                 // stub. Operators who want a different sink wrap
                 // the stub binary or replace this consumer at the
                 // policy-bus extension point. We deliberately use
@@ -542,7 +541,7 @@ mod tests {
     #[test]
     fn audit_line_is_bounded_and_marked_when_oversized() {
         // WOR-609: an event whose serialization exceeds the cap collapses to a
-        // bounded, still-valid-JSON marker stamped truncated:true. (The OSS
+        // bounded, still-valid-JSON marker stamped truncated:true. (The
         // event is bounded in practice; we force the condition with a
         // pathological request id to exercise the guard.)
         let record = AuditRecord::PolicyVerdict(PolicyVerdictEvent::new(

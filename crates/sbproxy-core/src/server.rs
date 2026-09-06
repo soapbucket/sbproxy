@@ -1249,9 +1249,9 @@ fn request_caller_identity(
 
 /// Build the canonical response-cache key for a request.
 ///
-/// `workspace` is the empty string in OSS / single-tenant mode; the
-/// enterprise crate populates it. `tenant` is the serving origin's
-/// resolved tenant. `config_fp` is the serving origin's
+/// `workspace` is the empty string in single-tenant mode; a
+/// multi-tenant deployment populates it. `tenant` is the serving
+/// origin's resolved tenant. `config_fp` is the serving origin's
 /// [`cache_config_fingerprint`]. The result is the colon-delimited
 /// shape documented at the top of `sbproxy_cache::response`.
 ///
@@ -5204,9 +5204,9 @@ struct PolicyVerdictCtx {
     ///
     /// Nothing in this workspace populates `CompiledOrigin::workspace_id`
     /// today, so this is the empty string in every deployment. It stays
-    /// because the enterprise audit binding distinguishes workspace from
-    /// tenant through a lookup the OSS proxy does not own. Do not reach
-    /// for it as a tenant: [`Self::tenant`] is the populated one.
+    /// because downstream audit consumers distinguish workspace from tenant
+    /// through a lookup this proxy does not own. Do not reach for it as a
+    /// tenant: [`Self::tenant`] is the populated one.
     workspace_id: String,
     /// Origin the decision is being made on.
     ///
@@ -5352,8 +5352,8 @@ fn emit_policy_verdict_with_outcome(
     );
     // WOR-75: stamp an exemplar on the policy-evaluation histogram so
     // dashboards can hop from a slow-policy bucket to the originating
-    // trace. The hostname dimension is the request's tenant
-    // workspace_id (the OSS tenant proxy); verdict is the closed
+    // trace. The hostname dimension is the request's tenant workspace_id
+    // (this proxy is tenant-scoped); verdict is the closed
     // allow/deny/confirm label already on the audit bus.
     sbproxy_observe::metrics::record_policy_evaluation_duration(
         &ctx.workspace_id,

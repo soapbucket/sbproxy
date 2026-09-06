@@ -40,7 +40,7 @@
 //! store-wide revision counter. It is not a general-purpose KV
 //! abstraction, and this module does not implement (or feature-gate)
 //! a Postgres backend; WOR-221's durable, content-hash-indexed,
-//! quarantine-aware design stays enterprise-only, reachable later as
+//! quarantine-aware design is out of scope here, reachable later as
 //! an opt-in [`PolicyStore`] implementor for operators who already run
 //! Postgres and want it. Nothing here requires one.
 

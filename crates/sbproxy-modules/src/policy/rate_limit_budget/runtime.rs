@@ -288,9 +288,9 @@ impl RateLimitBudgetRegistry {
     pub fn check(&self, workspace: &str) -> BudgetDecision {
         let now = self.clock.now();
         let mut map = self.workspaces.lock();
-        // WOR-1691: OSS always passes the static "default" key, so avoid
-        // the per-request `workspace.to_string()` that `entry` forces;
-        // allocate the key only on the first-seen miss.
+        // WOR-1691: callers always pass the static "default" key today,
+        // so avoid the per-request `workspace.to_string()` that `entry`
+        // forces; allocate the key only on the first-seen miss.
         if !map.contains_key(workspace) {
             map.insert(workspace.to_string(), self.new_state(now));
         }

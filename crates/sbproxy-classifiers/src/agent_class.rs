@@ -191,8 +191,8 @@ fn is_kebab_id(s: &str) -> bool {
 /// Stable identifier emitted by the resolver. Either one of the three
 /// reserved sentinels (`human`, `anonymous`, `unknown`) or a catalog
 /// `id`. Stored as a `Cow`-like string but kept as `String` for the
-/// OSS surface; the small allocation per request is amortised against
-/// the per-request HTTP work.
+/// public surface; the small allocation per request is amortised
+/// against the per-request HTTP work.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct AgentId(pub String);
 

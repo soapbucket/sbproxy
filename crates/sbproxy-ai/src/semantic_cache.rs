@@ -133,7 +133,7 @@ impl SemanticCache {
     }
 }
 
-// --- WOR-796: embedding-similarity cache (OSS) ---
+// --- WOR-796: embedding-similarity cache ---
 
 pub mod config;
 pub mod identity;

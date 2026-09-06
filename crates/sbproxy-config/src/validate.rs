@@ -20,10 +20,9 @@
 //!   (WOR-2227). Plan time adds nothing there and does not look.
 //! * [`unknown-type`](validate#unknown-types): an `action`,
 //!   `authentication`, `policies[*]`, or `transforms[*]` `type:`
-//!   discriminator that names a module not registered in the OSS
-//!   built-in catalogs (`KNOWN_ACTION_TYPES`, ...). Operators
-//!   running enterprise builds with extra plugins can extend the
-//!   catalogs through [`ValidationOptions`].
+//!   discriminator that names a module not registered in the
+//!   built-in catalogs (`KNOWN_ACTION_TYPES`, ...). A linked plugin
+//!   crate can extend the catalogs through [`ValidationOptions`].
 //!
 //! Two smaller rules cover the `proxy:` and `update:` blocks:
 //! `update-zero-check-interval`, and `unknown-acme-storage-backend`
@@ -75,9 +74,8 @@ pub struct PlanFinding {
 
 /// Caller-supplied catalog overrides. The default
 /// (`ValidationOptions::default()`) uses the in-tree built-in
-/// catalogs in [`KNOWN_ACTION_TYPES`] etc; enterprise builds that
-/// link extra plugin crates can extend the lists by inserting names
-/// here.
+/// catalogs in [`KNOWN_ACTION_TYPES`] etc; a linked plugin crate
+/// can extend the lists by inserting names here.
 #[derive(Debug, Clone, Default)]
 pub struct ValidationOptions {
     /// Extra action `type:` names to treat as known.
@@ -101,7 +99,7 @@ pub struct ValidationOptions {
 // missing one is a `unknown-*-type` warning at plan time, which is
 // noisy but not unsafe.
 
-/// Built-in OSS action `type:` names. Mirrors the match arms in
+/// Built-in action `type:` names. Mirrors the match arms in
 /// `sbproxy_modules::compile_action`.
 pub const KNOWN_ACTION_TYPES: &[&str] = &[
     "proxy",
@@ -123,7 +121,7 @@ pub const KNOWN_ACTION_TYPES: &[&str] = &[
     "noop",
 ];
 
-/// Built-in OSS auth `type:` names. Mirrors `sbproxy_modules::compile_auth`.
+/// Built-in auth `type:` names. Mirrors `sbproxy_modules::compile_auth`.
 /// Unknown auth types are downgraded to `Warn` because the modules
 /// crate falls through to the inventory-based plugin registry at
 /// runtime; the plan-time validator does not see those registrations.
@@ -153,7 +151,7 @@ pub const KNOWN_AUTH_TYPES: &[&str] = &[
     "noop",
 ];
 
-/// Built-in OSS policy `type:` names. Mirrors `sbproxy_modules::compile_policy`,
+/// Built-in policy `type:` names. Mirrors `sbproxy_modules::compile_policy`,
 /// plus `owasp_api_top10` (WOR-2491): a pseudo-policy consumed and
 /// removed by `sbproxy_config::owasp_api_pack::expand_owasp_pack`
 /// before an origin's policies ever reach `compile_policy`'s
@@ -208,7 +206,7 @@ pub const KNOWN_POLICY_TYPES: &[&str] = &[
     "owasp_api_top10",
 ];
 
-/// Built-in OSS transform `type:` names. Mirrors `sbproxy_modules::compile_transform`.
+/// Built-in transform `type:` names. Mirrors `sbproxy_modules::compile_transform`.
 pub const KNOWN_TRANSFORM_TYPES: &[&str] = &[
     "json",
     "json_projection",
@@ -688,13 +686,13 @@ fn check_unknown_types(
                     out.push(PlanFinding {
                         // `Warn` because compile_auth falls through to
                         // the inventory plugin registry at runtime; an
-                        // unknown name here may resolve in an enterprise
-                        // build with extra plugins linked in.
+                        // unknown name here may resolve if a plugin
+                        // crate is linked in.
                         severity: Severity::Warn,
                         rule_id: "unknown-auth-type".to_string(),
                         path,
                         message: format!(
-                            "origin '{host}' uses auth type '{t}' which is not in the OSS catalog (will fail at runtime if no plugin registers it)"
+                            "origin '{host}' uses auth type '{t}' which is not in the built-in catalog (will fail at runtime if no plugin registers it)"
                         ),
                     });
                 }

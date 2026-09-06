@@ -61,7 +61,7 @@ use crate::errors::{FederationError, FederationResult};
 use crate::WELL_KNOWN_FEDERATION_PATH;
 
 /// Default per-request timeout for federation fetches. Pinned to
-/// match the OSS gateway's 30s outbound timeout; an operator that
+/// match the gateway's 30s outbound timeout; an operator that
 /// needs a tighter bound can wrap [`ReqwestFederationFetcher`].
 pub const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 

@@ -119,7 +119,7 @@ pub enum McpPolicyDenialKind {
     Deny,
     /// A [`PolicyDecision::Confirm`] that PR β's dispatcher currently
     /// answers with a denial rather than parking it for approval (no
-    /// `PendingConfirmStore` in OSS yet).
+    /// `PendingConfirmStore` yet).
     Confirm,
 }
 
@@ -2763,8 +2763,8 @@ impl McpFederation {
     /// Backward-compatible wrapper around
     /// [`Self::call_tool_with_policy`] for callers that have not yet
     /// threaded the agent identity / workspace / correlation context
-    /// through. The hook still runs against the empty defaults, so an
-    /// enterprise hook that policies on the tool name alone still
+    /// through. The hook still runs against the empty defaults, so a
+    /// registered hook that policies on the tool name alone still
     /// fires; hooks that require an agent id observe `None` and treat
     /// the call as anonymous.
     pub async fn call_tool(
@@ -2937,7 +2937,7 @@ impl McpFederation {
     /// value to the policy hooks. Existing callers stay on the
     /// `_with_policy` shim and lose no behaviour; new callers that
     /// have extracted the cause from the inbound JSON-RPC envelope
-    /// surface it here so an enterprise hook can audit which UI
+    /// surface it here so a registered hook can audit which UI
     /// element triggered the call.
     pub async fn call_tool_with_policy_and_cause(
         &self,
@@ -3096,12 +3096,12 @@ impl McpFederation {
 
         // PR β: walk registered policy hooks in registration order
         // and take the first non-Allow verdict. With at most one
-        // enterprise hook installed (the default until PR γ lands the
-        // verdict combiner), this collapses to "call the first hook
-        // and use its verdict". When every hook returns Allow we still
+        // hook installed (the default until PR γ lands the verdict
+        // combiner), this collapses to "call the first hook and use
+        // its verdict". When every hook returns Allow we still
         // forward, which matches the no-hook-installed case where the
-        // OSS default no-op produces Allow. When no hooks are
-        // registered at all, the federation falls through to the
+        // default no-op produces Allow. When no hooks are registered
+        // at all, the federation falls through to the
         // [`default_no_op_hook`] and Allow is returned.
         //
         // WOR-2454: after an operator approval is consumed, Confirm
@@ -5225,7 +5225,7 @@ fn tool_advertises_streaming(tool: &serde_json::Value) -> bool {
 /// PR β walks this list and takes the first non-Allow verdict. PR γ
 /// will replace this iteration with a verdict combiner that aggregates
 /// every hook's output. Falling through to [`default_no_op_hook`] when
-/// no hooks register keeps the OSS-only build returning
+/// no hooks register keeps this build returning
 /// [`PolicyDecision::Allow`] for every tool call.
 fn registered_hooks_or_default() -> Vec<Arc<dyn McpPolicyHook>> {
     let hooks = mcp_policy_hooks();
@@ -10062,8 +10062,8 @@ mod tests {
         }
     }
 
-    /// With no enterprise hook registered, the OSS-only build falls
-    /// through to `default_no_op_hook` and Allow is always returned.
+    /// With no hook registered, this build falls through to
+    /// `default_no_op_hook` and Allow is always returned.
     /// We use an `unknown_tool` so the call fails on tool resolution
     /// rather than on transport; that lets us pin "no hook short-circuit"
     /// without spawning a mock upstream.

@@ -50,7 +50,7 @@ const DEFAULT_SHUTDOWN_GRACE_MS: u64 = 30_000;
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "sbproxy-k8s-operator",
-    about = "OSS Kubernetes operator for sbproxy. Reconciles SBProxy + SBProxyConfig CRDs.",
+    about = "Kubernetes operator for sbproxy. Reconciles SBProxy + SBProxyConfig CRDs.",
     version
 )]
 struct Cli {

@@ -39,8 +39,7 @@
 //!
 //! * No client authentication on /par. Public clients with PKCE
 //!   are the broker's primary use case; adding mTLS / private-key-jwt
-//!   here belongs in a future slice once enterprise deployments
-//!   request it.
+//!   here belongs in a future slice once operators request it.
 //! * No request_object (signed JWT) support per RFC 9101. We accept
 //!   plain form-encoded parameters only; signing the request is
 //!   the next step beyond PAR and not P0 for the broker.

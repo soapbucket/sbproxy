@@ -616,7 +616,7 @@ impl WafPolicy {
         // accordingly).
         //
         // The subscriber's background task is lazy-spawned on the
-        // first request that reaches this branch, since OSS config
+        // first request that reaches this branch, since config
         // compile runs before Pingora's Tokio runtime exists. Once
         // started, the call is a no-op (`std::sync::Once`).
         if let Some(sub) = &self.feed_subscriber {

@@ -37,11 +37,12 @@
 //! chain head and the dedup set, so an at-least-once delivery of an event
 //! carrying a `request_id` collapses to exactly-once.
 //!
-//! ## OSS seam
+//! ## Extension seam
 //!
 //! This ships the chain, signing, and local verification. Anchoring
-//! receipts to an external transparency log or a portal is an enterprise
-//! extension via the plugin trait registry; it consumes the same entries.
+//! receipts to an external transparency log or a portal is not
+//! implemented here; an out-of-tree `UsageSink` implementation can
+//! consume the same entries to add it.
 //!
 //! ## Reconciling against a provider's own usage export (WOR-2476)
 //!

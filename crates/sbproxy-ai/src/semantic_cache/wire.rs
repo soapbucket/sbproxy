@@ -37,7 +37,7 @@ use super::CachedHttpResponse;
 
 /// Current semantic-cache wire and keyspace version.
 ///
-/// Version 2 starts an independent OSS format that cannot read or overwrite
+/// Version 2 starts an independent format that cannot read or overwrite
 /// an older experimental version 1 namespace.
 pub const SEMANTIC_CACHE_SCHEMA_VERSION: u16 = 2;
 

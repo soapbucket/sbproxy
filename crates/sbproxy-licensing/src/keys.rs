@@ -4,15 +4,15 @@
 //! `KeyManager` across three token surfaces (OLP, CAP, and CoMP) with
 //! per-protocol kid namespacing so a token minted for one could never
 //! be replayed as another. Two of those three surfaces already ship
-//! OSS-side with their own, more capable implementations: the OLP
-//! issuer and verifier live in `crates/sbproxy-modules/src/olp.rs`
-//! (mint, verify, JWK publication, RFC 7662 introspection, RFC 7009
-//! revocation), and the CAP verifier lives in
-//! `crates/sbproxy-modules/src/auth/cap.rs`. Porting a second,
-//! disconnected copy of either would have shipped a namespace this
-//! crate never uses, so the namespace concept is dropped: this
-//! `KeyManager` signs exactly one thing, a CoMP quote, under the
-//! `comp-<rotation_id>` kid.
+//! elsewhere in this workspace with their own, more capable
+//! implementations: the OLP issuer and verifier live in
+//! `crates/sbproxy-modules/src/olp.rs` (mint, verify, JWK
+//! publication, RFC 7662 introspection, RFC 7009 revocation), and the
+//! CAP verifier lives in `crates/sbproxy-modules/src/auth/cap.rs`.
+//! Porting a second, disconnected copy of either would have shipped
+//! a namespace this crate never uses, so the namespace concept is
+//! dropped: this `KeyManager` signs exactly one thing, a CoMP quote,
+//! under the `comp-<rotation_id>` kid.
 //!
 //! Key derivation still mirrors the audit crate's HKDF approach so an
 //! operator rotates one master key and the CoMP signing key inherits

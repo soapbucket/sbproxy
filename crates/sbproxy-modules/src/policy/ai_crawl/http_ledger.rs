@@ -38,8 +38,8 @@ pub struct HttpLedgerConfig {
     /// HMAC key bytes. Loaded from `SBPROXY_LEDGER_HMAC_KEY_FILE`
     /// in the binary; tests pass raw bytes.
     pub key: Vec<u8>,
-    /// Workspace tenant key. `default` in OSS, the customer
-    /// workspace id in enterprise.
+    /// Workspace tenant key. Defaults to `default`; a multi-tenant
+    /// deployment sets the operator's real workspace id.
     pub workspace_id: String,
     /// Agent identifier from the agent-class taxonomy. Older
     /// callers forward `unknown` until the resolver lands; widening

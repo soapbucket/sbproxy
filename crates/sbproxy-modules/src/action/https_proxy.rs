@@ -2,25 +2,25 @@
 //! requested host.
 //!
 //! Ported from `sbproxy-enterprise-modules::action::https_proxy`
-//! (WOR-2671). The source modeled an HTTP `CONNECT` tunnel: a client
-//! asks to reach an arbitrary host, and the action either tunnels the
-//! connection (host allow-listed) or refuses it. OSS's Pingora pipeline
-//! has no `CONNECT`/raw-tunnel support (it is a message-based HTTP
-//! reverse proxy, not a byte-tunneling forward proxy), so this action
-//! is not a literal port of the tunnel mechanics.
+//! (WOR-2671). The source modeled an HTTP `CONNECT` tunnel: a client asks
+//! to reach an arbitrary host, and the action either tunnels the connection
+//! (host allow-listed) or refuses it. This proxy's Pingora pipeline has no
+//! `CONNECT`/raw-tunnel support (it is a message-based HTTP reverse proxy,
+//! not a byte-tunneling forward proxy), so this action is not a literal
+//! port of the tunnel mechanics.
 //!
-//! What ports directly is the decision the source action makes: given
-//! the host a client is trying to reach, is it on the allow-list? OSS
+//! What ports directly is the decision the source action makes: given the
+//! host a client is trying to reach, is it on the allow-list? This proxy
 //! already resolves "the host a client is trying to reach" for every
-//! request, as `RequestContext::hostname` (the inbound `Host` header
-//! used to route to an origin). This action reuses that resolution:
-//! when the origin's `Host` is allow-listed, the request is relayed
-//! onward unchanged (same host, same TLS, no config-time upstream URL,
-//! matching the source's "tunnel to whatever was asked for" shape);
-//! when it is not, the request is refused with `403` (the source's
-//! `ActionOutcome::Responded` deny path). This makes the most sense on
-//! a wildcard origin (`"*.internal.io"`) that wants to relay only a
-//! named subset of the hosts the wildcard would otherwise match.
+//! request, as `RequestContext::hostname` (the inbound `Host` header used
+//! to route to an origin). This action reuses that resolution: when the
+//! origin's `Host` is allow-listed, the request is relayed onward unchanged
+//! (same host, same TLS, no config-time upstream URL, matching the source's
+//! "tunnel to whatever was asked for" shape); when it is not, the request
+//! is refused with `403` (the source's `ActionOutcome::Responded` deny
+//! path). This makes the most sense on a wildcard origin
+//! (`"*.internal.io"`) that wants to relay only a named subset of the hosts
+//! the wildcard would otherwise match.
 use serde::Deserialize;
 
 /// Configuration for the guarded HTTPS reverse-proxy action.

@@ -1085,8 +1085,8 @@ mod tests {
     }
 
     /// Revoking the customer's grant stops decryption, rather than merely
-    /// making it slower. This is the whole enterprise claim: the vendor's
-    /// copy becomes unreadable.
+    /// making it slower. That is the whole point of a customer-managed
+    /// root: the vendor's copy becomes unreadable.
     #[tokio::test]
     async fn revoking_the_external_grant_stops_the_envelope_opening() {
         let root = StubRoot::new("stub/root-b");

@@ -69,8 +69,8 @@ pub mod redact;
 /// P0 `RequestEvent` envelope shared by the four streams.
 pub mod request_event;
 /// Generic transport adapter: a global sink for
-/// completed `RequestEvent` values. Default no-op; enterprise
-/// registers a NATS-backed implementation.
+/// completed `RequestEvent` values. Default no-op; an out-of-tree
+/// deployment can register its own `RequestEventSink` implementation.
 pub mod request_sink;
 /// WOR-1186 session ledger: per-tool-call run records emitted from the
 /// live MCP traffic path, conforming to the canonical mcptest

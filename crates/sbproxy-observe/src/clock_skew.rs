@@ -14,7 +14,7 @@
 //!
 //! The SNTP client is a minimal RFC 4330 implementation: 48-byte
 //! request, 48-byte response, transmit timestamp at offset 40. It
-//! intentionally avoids pulling a third-party SNTP crate so the OSS
+//! intentionally avoids pulling a third-party SNTP crate so the
 //! dependency surface stays narrow.
 
 use std::net::SocketAddr;

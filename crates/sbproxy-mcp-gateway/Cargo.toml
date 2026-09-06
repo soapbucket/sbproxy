@@ -56,11 +56,10 @@ sbproxy-security = { workspace = true }
 # passthrough paths can treat them as literal response material.
 sbproxy-vault = { workspace = true }
 
-# Per-crate axum pin: axum is not a workspace dependency because this
-# is the only OSS crate that mounts an axum router directly (the rest
-# of the workspace's request path is Pingora-based). If a second crate
-# ever needs axum, promote this to workspace.dependencies so both pins
-# move together.
+# Per-crate axum pin: axum is not a workspace dependency because this is the
+# only crate in this workspace that mounts an axum router directly (the rest of
+# the workspace's request path is Pingora-based). If a second crate ever needs
+# axum, promote this to workspace.dependencies so both pins move together.
 axum = { version = "0.7", default-features = false, features = ["http1", "tokio", "query", "matched-path", "json", "form"] }
 tower = { version = "0.4", features = ["util"] }
 

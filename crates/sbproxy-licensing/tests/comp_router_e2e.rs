@@ -271,13 +271,13 @@ async fn comp_redeem_token_is_accepted_by_the_oss_olp_verifier() {
     assert_eq!(parsed.expires_in, 3600);
 
     // This is the CoMP-to-OLP integration seam: the token returned by the
-    // marketplace must be accepted by the OSS verifier an origin already
+    // marketplace must be accepted by the verifier an origin already
     // uses for its `/.well-known/olp/introspect` endpoint.
     let origin_signer = OlpTokenSigner::from_seed_bytes([0x88u8; 32], "olp-2026-q2-001");
     let verifier = OlpTokenVerifier::new(origin_signer.verifying_key(), origin_signer.kid());
     let claims = verifier
         .verify(&parsed.license_token, 0)
-        .expect("CoMP bridge token must satisfy the OSS OLP wire contract");
+        .expect("CoMP bridge token must satisfy the OLP wire contract");
     assert_eq!(claims.iss, "https://api.example.com");
     assert_eq!(claims.sub, parsed.agent_id);
     assert_eq!(claims.aud, "api.example.com");

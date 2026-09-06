@@ -21,7 +21,7 @@ struct ChainOutcome {
     verdicts: Vec<VerdictTag>,
     /// Header pairs accumulated onto
     /// `RequestContext::policy_response_headers` by
-    /// AllowWithHeaders verdicts and the OSS Confirm bridge.
+    /// AllowWithHeaders verdicts and the Confirm bridge.
     headers: Vec<(String, String)>,
     /// Reducer state at the end of the run; `first_consumed`
     /// flips on the first Confirm.
@@ -77,7 +77,7 @@ fn rule_one_deny_short_circuits_rest_of_chain() {
 }
 
 /// Rule 2: when no Deny fires, the first Confirm in chain order
-/// wins. The OSS bridge stamps `X-Policy-Confirm` once via the
+/// wins. The bridge stamps `X-Policy-Confirm` once via the
 /// AllowWithHeaders mechanism; later AllowWithHeaders verdicts
 /// still accumulate onto the response.
 #[test]

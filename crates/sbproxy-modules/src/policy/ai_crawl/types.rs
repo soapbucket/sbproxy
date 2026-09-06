@@ -294,7 +294,7 @@ pub enum Rail {
     Mpp,
     /// Lightning Network rail. Settled by an external
     /// BillingRail impl which registers the canonical name `"lightning"`.
-    /// The OSS enum carries the variant so policy decisions and
+    /// The enum carries the variant so policy decisions and
     /// `Accept-Payment` negotiation can reference the rail without
     /// depending on the rail crate.
     Lightning,
@@ -398,7 +398,7 @@ impl LedgerError {
 /// Pluggable validator for `Crawler-Payment` tokens.
 ///
 /// Implementations mark the token spent on success so a single token
-/// authorises a single request. See [`InMemoryLedger`] (OSS default) and
+/// authorises a single request. See [`InMemoryLedger`] (default) and
 /// `HttpLedger` (enabled by the `http-ledger` feature).
 ///
 /// This stays a trait rather than an enum: the implementation is selected
@@ -630,7 +630,7 @@ pub fn parse_crawler_price_header(value: &str) -> Option<Money> {
 /// pricing model is the motivating example) in place of, or layered
 /// over, the static `tiers:` table.
 ///
-/// This is intentionally only the seam: the OSS build ships no learned
+/// This is intentionally only the seam: this build ships no learned
 /// model. When a policy is configured without a model the static tier
 /// table and the flat `price:` fallback decide the price exactly as
 /// before. An embedder injects a model through
@@ -1428,7 +1428,7 @@ pub struct LedgerYamlConfig {
     #[serde(default, alias = "hmac_key_hex")]
     pub key_hex: Option<String>,
     /// Workspace tenant id stamped on the redeem envelope. Defaults
-    /// to `default` (matches the OSS resolver default).
+    /// to `default` (matches the resolver default).
     #[serde(default = "default_workspace_id")]
     pub workspace_id: String,
     /// Header the proxy uses to carry the per-request idempotency

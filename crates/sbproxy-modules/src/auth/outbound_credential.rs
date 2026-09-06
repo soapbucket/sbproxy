@@ -15,9 +15,9 @@
 //! - **`vault_secret`**: a static secret resolved from the vault and
 //!   formatted as an authorization header.
 //!
-//! See `docs/adr-outbound-credential-resolver.md` for the OSS vs
-//! enterprise line and `docs/outbound-dpop.md` for RFC 9449 sender
-//! constraint configuration.
+//! See `docs/configuration.md`'s `outbound_credential` section for
+//! the field reference and `docs/outbound-dpop.md` for RFC 9449
+//! sender constraint configuration.
 
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};

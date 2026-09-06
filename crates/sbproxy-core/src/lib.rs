@@ -258,17 +258,16 @@ pub mod model_runtime {
 pub mod pipeline;
 /// Policy verdict audit event bus.
 ///
-/// Bounded mpsc channel + drain stub for the OSS scope; enterprise
-/// extends the consumer with a NATS-backed audit-chain subscriber
+/// Bounded mpsc channel + drain stub by default; an extension can
+/// replace the consumer with a NATS-backed audit-chain subscriber
 /// that hash-chains and KMS-signs Merkle roots downstream. See
 /// `docs/events.md`.
 pub mod policy_bus;
 /// Chain reducer + Plugin verdict translation.
 ///
-/// Multi-policy resolution rules from
-/// `docs/policy.md` (Deny wins, first Confirm
-/// wins via the OSS bridge, AllowWithHeaders accumulate). Lives
-/// in its own module so the helpers can be exercised by
+/// Multi-policy resolution rules from `docs/policy.md` (Deny wins,
+/// first Confirm wins via the bridge, AllowWithHeaders accumulate).
+/// Lives in its own module so the helpers can be exercised by
 /// integration tests in `crates/sbproxy-core/tests/`.
 pub mod policy_dispatch;
 /// Bounded observability and fail-closed/degraded decision state for an

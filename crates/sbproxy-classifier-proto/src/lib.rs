@@ -3,11 +3,10 @@
 //!
 //! This crate is nothing but the compiled, self-contained `classifier.proto`
 //! contract: the tonic clients the proxy and `sbproxy-classifier-client` use,
-//! and the tonic servers the OSS minimal sidecar (`InferenceService` only)
-//! and the enterprise rich sidecar (`sbproxy-classifier`, both services)
-//! implement. Keeping it as its own crate means the proto is the single
-//! shared artifact between the sidecars without either depending on the
-//! other.
+//! and the tonic servers the minimal sidecar (`InferenceService` only) and the
+//! rich sidecar (`sbproxy-classifier`, both services) implement. Keeping it as
+//! its own crate means the proto is the single shared artifact between the
+//! sidecars without either depending on the other.
 //!
 //! `InferenceService` is the contract both sidecars serve. `ClassifierService`
 //! (WOR-2665) is additional surface only `sbproxy-classifier` serves: a

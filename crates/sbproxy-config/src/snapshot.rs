@@ -364,7 +364,7 @@ pub struct CompiledConfig {
     /// operator did not author the block; the binary startup code
     /// constructs a resolver from defaults in that case. `Some(_)`
     /// carries the catalog selection and resolver tuning. Hosted-feed
-    /// fields remain compatibility-only; the OSS runtime falls back to
+    /// fields remain compatibility-only; the runtime falls back to
     /// the built-in catalog instead of fetching them.
     pub agent_classes: Option<AgentClassesConfig>,
     /// WOR-1130: parsed top-level `rate_limits:` workspace budget +

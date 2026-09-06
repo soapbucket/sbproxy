@@ -1,9 +1,9 @@
 //! Resilient gRPC client for the classifier sidecar `InferenceService`.
 //!
-//! The proxy uses this one client to reach whichever sidecar is deployed:
-//! the minimal OSS sidecar or the enterprise rich sidecar. Both implement
-//! the shared proto. This crate owns the connection, a per-call timeout,
-//! typed errors, and (WOR-705) two transports:
+//! The proxy uses this one client to reach whichever sidecar is deployed: the
+//! minimal sidecar or the rich sidecar. Both implement the shared proto. This
+//! crate owns the connection, a per-call timeout, typed errors, and (WOR-705)
+//! two transports:
 //!
 //! * **TCP**: `http://host:port`. The default for a separately-deployed
 //!   sidecar.

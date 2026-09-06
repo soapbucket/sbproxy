@@ -119,7 +119,8 @@ pub enum Action {
     AbTest(AbTestAction),
     /// Allow-listed HTTPS reverse-proxy relay to the requested host
     /// (WOR-2671). See [`HttpsProxyAction`] for how this adapts the
-    /// source's CONNECT-tunnel semantics to OSS's reverse-proxy model.
+    /// source's CONNECT-tunnel semantics to this proxy's reverse-proxy
+    /// model.
     HttpsProxy(HttpsProxyAction),
     /// Placeholder for future variants - keeps the enum populated.
     Noop,

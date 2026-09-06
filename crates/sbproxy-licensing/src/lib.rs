@@ -1,28 +1,29 @@
 //! IAB Content Authorization Marketplace Protocol (CoMP) bridge.
 //!
 //! This crate implements the parts of `sbproxy-enterprise-licensing`
-//! that have no OSS equivalent: the CoMP marketplace bridge (manifest
-//! discovery, signed quotes, and a redeem-to-license-token endpoint so
-//! AI buyers can integrate against a publisher catalog without
-//! writing publisher-specific code), plus the shared Ed25519 key
-//! manager and per-id revocation store behind it.
+//! that have no equivalent elsewhere in this workspace: the CoMP
+//! marketplace bridge (manifest discovery, signed quotes, and a
+//! redeem-to-license-token endpoint so AI buyers can integrate
+//! against a publisher catalog without writing publisher-specific
+//! code), plus the shared Ed25519 key manager and per-id revocation
+//! store behind it.
 //!
 //! ## What moved, and why
 //!
 //! The enterprise source this crate was ported from also shipped an
 //! OLP issuer and a CAP issuer. Neither is here:
 //!
-//! * **CAP issuance** duplicates nothing OSS-side by itself (the OSS
-//!   `sbproxy-modules::auth::cap` module is a verifier, not an
-//!   issuer), but its handler is inseparable from enterprise-only
-//!   collaborators (an `AgentVerifier` wired to a resolver chain, a
-//!   per-tenant `PolicyStore`) that have no OSS-shaped equivalent to
-//!   plug into, and the parent epic's own disposition scopes this
-//!   port to OLP and CoMP only. Porting it here would have shipped a
+//! * **CAP issuance** duplicates nothing that exists here already
+//!   (`sbproxy-modules::auth::cap` is a verifier, not an issuer), but
+//!   its handler is inseparable from collaborators that only ever
+//!   existed in the enterprise source (an `AgentVerifier` wired to a
+//!   resolver chain, a per-tenant `PolicyStore`) and were never
+//!   ported, and the parent epic's own disposition scopes this port
+//!   to OLP and CoMP only. Porting it here would have shipped a
 //!   standalone, unwired issuer nothing else in the workspace talks
 //!   to.
 //! * **OLP issuance and verification** duplicates a materially more
-//!   complete OSS implementation outright:
+//!   complete implementation that already exists:
 //!   `crates/sbproxy-modules/src/olp.rs` plus
 //!   `crates/sbproxy-core/src/server/request_phase.rs`'s
 //!   `/.well-known/olp/{token,key,introspect,revoke}` wiring already
@@ -34,13 +35,14 @@
 //!   strictly less capable OLP surface.
 //!
 //! Because CoMP's whole job is "hand a paying buyer a license token,"
-//! [`comp::olp_bridge`] mints tokens in the *same wire format* the OSS
-//! OLP issuer already emits (same claim names, same JWS `typ`), so an
-//! operator who points this bridge's signing key at the value they
-//! already configured on `origins.<host>.olp.signing_key` gets a token
-//! their own deployment's `/.well-known/olp/introspect` can verify.
-//! See [`comp::olp_bridge`] for the compatibility contract and why it
-//! is a wire-format match rather than a `sbproxy-modules` dependency.
+//! [`comp::olp_bridge`] mints tokens in the *same wire format* the
+//! existing OLP issuer already emits (same claim names, same JWS
+//! `typ`), so an operator who points this bridge's signing key at
+//! the value they already configured on
+//! `origins.<host>.olp.signing_key` gets a token their own
+//! deployment's `/.well-known/olp/introspect` can verify. See
+//! [`comp::olp_bridge`] for the compatibility contract and why it is
+//! a wire-format match rather than a `sbproxy-modules` dependency.
 //!
 //! ## Storage
 //!

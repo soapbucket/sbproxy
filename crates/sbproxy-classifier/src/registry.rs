@@ -4,7 +4,7 @@
 //! Ported from the enterprise `sbproxy-classifier` crate's `registry.rs`,
 //! dropped to the fields this port serves: a compiled [`Classifier`] (label
 //! patterns) and [`Normalizer`] (regex rules) per tenant. The enterprise
-//! version also carries a `ModelSelectionState` for per-origin overrides of
+//! version also carried a `ModelSelectionState` for per-origin overrides of
 //! named embedding / judge / intent / content-type ONNX models; this port
 //! does not carry the LLM-judge backend or a named-model registry (out of
 //! WOR-2665's scope, see `docs/classifier-sidecar.md`), so there is nothing

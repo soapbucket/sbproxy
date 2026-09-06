@@ -1319,7 +1319,7 @@ pub(super) async fn handle_action(
 
         // WOR-2671: allow-listed HTTPS reverse-proxy relay. See
         // `sbproxy_modules::HttpsProxyAction`'s module doc for how this
-        // adapts the source's CONNECT-tunnel semantics to OSS's
+        // adapts the source's CONNECT-tunnel semantics to this proxy's
         // Host-header-driven reverse-proxy model: the destination is
         // the request's own resolved hostname, not a configured URL, so
         // an allowed request falls through to Pingora's normal proxy
@@ -5885,9 +5885,8 @@ pub(super) async fn handle_mcp_action(
         }
         "resources/read" => {
             // WOR-818: forward to the upstream that owns the URI.
-            // Pass-through only -- the gateway does not enforce
-            // CSP / iframe-sandbox / cache-metadata at this layer;
-            // those validators ship in the enterprise tier.
+            // Pass-through only -- the gateway does not enforce CSP /
+            // iframe-sandbox / cache-metadata at this layer.
             let params = request.params.take().unwrap_or(serde_json::Value::Null);
             let uri = params.get("uri").and_then(|v| v.as_str()).unwrap_or("");
             if uri.is_empty() {
@@ -7560,10 +7559,10 @@ pub(super) async fn handle_mcp_action(
                                 // per-target directive suppressing
                                 // `mcp_audit`, so this clone is paid by
                                 // default on every deployment, not only
-                                // ones with an enterprise subscriber
-                                // attached. The fields built from it and
-                                // emitted below are digests and lengths,
-                                // never verbatim content.
+                                // ones with an audit consumer attached.
+                                // The fields built from it and emitted
+                                // below are digests and lengths, never
+                                // verbatim content.
                                 let mcp_audit_capture = if tracing::enabled!(
                                     target: "mcp_audit",
                                     tracing::Level::INFO
@@ -8358,8 +8357,8 @@ pub(super) async fn handle_mcp_action(
                                 );
 
                                 // WOR-508: bridge the prompt-linked audit
-                                // inputs to the enterprise audit layer over
-                                // the `mcp_audit` tracing target.
+                                // inputs to an out-of-tree audit consumer
+                                // over the `mcp_audit` tracing target.
                                 if let Some(cap) = mcp_audit_capture {
                                     emit_mcp_prompt_audit(
                                         ctx,
@@ -9143,19 +9142,19 @@ struct LedgerCapture {
 /// the captured inputs and the call outcome. Identity (session, agent)
 /// comes off `ctx`; payload redaction happens inside `emit_tool_call`.
 /// WOR-508: inputs captured before `arguments` is moved into the tool
-/// call, used by the enterprise audit layer to build the prompt-linked
-/// audit envelope.
+/// call, used by an out-of-tree audit consumer to build the
+/// prompt-linked audit envelope.
 /// WOR-2473: the `mcp_audit` line this feeds IS emitted under stock
-/// config; the default root filter is `info` and there is no
-/// per-target directive suppressing it, so this capture happens on
-/// every deployment, not only ones with an enterprise subscriber
-/// attached. Because of that, the emission built from this capture
+/// config; the default root filter is `info` and there is no per-target
+/// directive suppressing it, so this capture happens on every
+/// deployment, not only ones with an audit consumer attached.
+/// Because of that, the emission built from this capture
 /// carries digests and lengths only, never verbatim prompt or tool
 /// argument content. Verbatim content is a future explicit opt-in
 /// owned by the MCP evidence work (WOR-2384), not something this
 /// capture ships by default.
 struct McpAuditCapture {
-    /// Canonical JSON of the tool arguments (the enterprise side
+    /// Canonical JSON of the tool arguments (the audit consumer
     /// digests this; the raw value never leaves the process).
     args_json: String,
     /// The originating prompt / reason for the call, from the SEP-1865
@@ -9169,9 +9168,9 @@ struct McpAuditCapture {
 
 /// WOR-508: emit a structured event on the `mcp_audit` tracing target
 /// carrying the prompt-linked tool-call fields an audit subscriber
-/// needs to correlate a call with the prompt that caused it. The OSS
-/// proxy cannot depend on the enterprise audit crate, so the bridge is
-/// a tracing event.
+/// needs to correlate a call with the prompt that caused it. This proxy
+/// cannot depend on an out-of-tree audit crate, so the bridge is a
+/// tracing event.
 /// WOR-2473: this line is emitted under stock config, so the prompt
 /// and tool arguments are represented here only as a SHA-256 digest
 /// prefix and a length; the raw values never reach this event.
@@ -20016,8 +20015,8 @@ allow := false if {
     ///    maps it onto `PolicyDecision::Confirm` rather than a plain
     ///    deny; the confirmation reason text making it all the way to
     ///    the JSON-RPC error is the load-bearing assertion (PR beta of
-    ///    the OSS `McpPolicyHook` contract still surfaces `Confirm` as
-    ///    a refusal; there is no `PendingConfirmStore` in OSS).
+    ///    the `McpPolicyHook` contract still surfaces `Confirm` as
+    ///    a refusal; there is no `PendingConfirmStore` yet).
     /// 4. `wor2587-rbac-denied-tool`: absent from the RBAC allowlist ->
     ///    RBAC denies before Cedar (or the stub upstream) is ever
     ///    reached, proving the reverse direction: registering a Cedar

@@ -1125,7 +1125,7 @@ impl CacheReserveBackend for ObservedCacheReserve {
     }
 }
 
-/// Build the OSS Cache Reserve backend from the YAML config block.
+/// Build the Cache Reserve backend from the YAML config block.
 ///
 /// Returns the optional backend, its admission settings, and a health state
 /// that survives even when construction fails. Failures during construction
@@ -1811,7 +1811,7 @@ impl OriginCacheKeys<'_> {
 
 /// TLS-fingerprint capture mode.
 ///
-/// `passive` and `sidecar` are wire-equivalent today; the OSS path
+/// `passive` and `sidecar` are wire-equivalent today; this path
 /// captures fingerprints exclusively from the sidecar header pattern
 /// because Pingora 0.8 does not surface the raw ClientHello bytes. The
 /// distinct names are reserved so a future native-capture implementation
@@ -3984,7 +3984,7 @@ impl CompiledPipeline {
 
         // --- Cache Reserve cold tier ---
         //
-        // Built from the top-level `cache_reserve:` block. The OSS
+        // Built from the top-level `cache_reserve:` block. The built-in
         // backends (memory / filesystem / redis / object-store / s3) are
         // instantiated here; unknown or extension-provided backends drop
         // through to `None` with a warning so a pipeline lifecycle hook can
