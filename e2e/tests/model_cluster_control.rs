@@ -266,7 +266,7 @@ proxy:
   model_host:
     authority: file_managed
     catalog_file: "{catalog_path}"
-    handoff_timeout_ms: 10000
+    handoff_timeout_ms: 30000
     cache:
       directory: "{cache_dir}"
     engines:
@@ -757,6 +757,11 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
     let root = tempfile::tempdir().context("create cluster fixture")?;
     let catalog_path = write_model_fixture(root.path())?;
     let fake_engine_path = Path::new(env!("CARGO_BIN_EXE_fake_model_engine"));
+    // Worker-b's first replica is the rolling replacement. Keep it unready
+    // until the retained-generation assertion has observed the handoff.
+    let readiness_hold =
+        tempfile::NamedTempFile::new_in(root.path()).context("create rolling readiness hold")?;
+    let readiness_hold_path = readiness_hold.path().to_string_lossy().into_owned();
     let mut node_leases: BTreeMap<&'static str, Vec<PortLease>> = BTreeMap::new();
     let nodes = vec![
         node_spec(
@@ -817,9 +822,19 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
         // WOR-2295 window is the spawn itself rather than the identity
         // provisioning and config validation above.
         drop(node_leases.remove(node.node_id));
+        let process = if node.node_id == "worker-b" {
+            let mut env = NODE_ENV.to_vec();
+            env.push((
+                "SBPROXY_FAKE_ENGINE_READINESS_HOLD_FILE",
+                &readiness_hold_path,
+            ));
+            ProxyHarness::start_with_workspace_shutdown_grace_and_env(config, &[], 1_000, &env)
+        } else {
+            start_node(config)
+        };
         processes.insert(
             node.node_id,
-            start_node(config).with_context(|| format!("start {}", node.node_id))?,
+            process.with_context(|| format!("start {}", node.node_id))?,
         );
     }
 
@@ -895,14 +910,28 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
             )
         })
         .collect::<Vec<_>>();
-    reload_cluster_configs(&client, &nodes, &processes, &rolling_configs)?;
     let rolling_generation = initial_generation + 1;
-    wait_for_one_status(
-        &client,
-        nodes[1].admin_port,
-        Duration::from_secs(15),
-        |status| rolling_handoff_is_waiting(status, rolling_generation, "worker-a", "worker-b"),
-    );
+    let reload_client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(45))
+        .build()
+        .context("build rollout reload client")?;
+    std::thread::scope(|scope| -> Result<()> {
+        // Release readiness before joining the reload even if the assertion
+        // unwinds, so a failed test cannot strand the held replacement.
+        let hold = readiness_hold;
+        let reload = scope
+            .spawn(|| reload_cluster_configs(&reload_client, &nodes, &processes, &rolling_configs));
+        wait_for_one_status(
+            &client,
+            nodes[1].admin_port,
+            Duration::from_secs(15),
+            |status| rolling_handoff_is_waiting(status, rolling_generation, "worker-a", "worker-b"),
+        );
+        hold.close()
+            .context("release rolling replacement readiness")?;
+        reload.join().expect("rolling reload thread")?;
+        Ok(())
+    })?;
     statuses = wait_for_statuses(&client, &all_admin_ports, CONVERGENCE_TIMEOUT, converged);
     assert_eq!(deployment_generation(&statuses[0]), rolling_generation);
     assert_eq!(
@@ -930,10 +959,6 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
         })
         .collect::<Vec<_>>();
     let retained_stream = retain_managed_stream(&client, &nodes[3], &processes["worker-b"])?;
-    let reload_client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(45))
-        .build()
-        .context("build recreate reload client")?;
     let recreate_generation = rolling_generation + 1;
     std::thread::scope(|scope| -> Result<()> {
         // Keep the stream inside the scope so a failed assertion releases

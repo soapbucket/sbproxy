@@ -5,6 +5,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -68,6 +69,7 @@ struct EngineState {
     mode: AtomicU8,
     ready_after_probes: usize,
     ready_probes: AtomicUsize,
+    readiness_hold_file: Option<PathBuf>,
     active_requests: AtomicUsize,
     completion_requests: AtomicUsize,
     cancelled_requests: AtomicUsize,
@@ -80,6 +82,7 @@ impl EngineState {
             mode: AtomicU8::new(mode as u8),
             ready_after_probes,
             ready_probes: AtomicUsize::new(0),
+            readiness_hold_file: None,
             active_requests: AtomicUsize::new(0),
             completion_requests: AtomicUsize::new(0),
             cancelled_requests: AtomicUsize::new(0),
@@ -330,7 +333,12 @@ fn handle_connection(mut stream: TcpStream, state: Arc<EngineState>) -> std::io:
     }
     if request.method == "GET" && request.path == "/health" {
         let probe = state.ready_probes.fetch_add(1, Ordering::SeqCst) + 1;
-        if probe <= state.ready_after_probes {
+        if probe <= state.ready_after_probes
+            || state
+                .readiness_hold_file
+                .as_ref()
+                .is_some_and(|path| path.exists())
+        {
             return write_json(
                 &mut stream,
                 "503 Service Unavailable",
@@ -415,10 +423,10 @@ fn main() -> std::io::Result<()> {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0);
-    serve(
-        listener,
-        Arc::new(EngineState::new(FaultMode::Normal, ready_after_probes)),
-    )
+    let mut state = EngineState::new(FaultMode::Normal, ready_after_probes);
+    state.readiness_hold_file =
+        std::env::var_os("SBPROXY_FAKE_ENGINE_READINESS_HOLD_FILE").map(PathBuf::from);
+    serve(listener, Arc::new(state))
 }
 
 #[cfg(test)]
@@ -431,9 +439,13 @@ struct TestEngine {
 #[cfg(test)]
 impl TestEngine {
     fn start(mode: FaultMode) -> std::io::Result<Self> {
+        Self::start_with_state(EngineState::new(mode, 0))
+    }
+
+    fn start_with_state(state: EngineState) -> std::io::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?;
-        let state = Arc::new(EngineState::new(mode, 0));
+        let state = Arc::new(state);
         let server_state = Arc::clone(&state);
         let thread = thread::spawn(move || serve(listener, server_state));
         Ok(Self {
@@ -467,6 +479,35 @@ impl Drop for TestEngine {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn readiness_remains_held_until_observer_releases_file() {
+        let hold = tempfile::NamedTempFile::new().expect("create readiness hold");
+        let mut state = EngineState::new(FaultMode::Normal, 2);
+        state.readiness_hold_file = Some(hold.path().to_path_buf());
+        let engine = TestEngine::start_with_state(state).expect("start held engine");
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .expect("build readiness client");
+        let url = format!("http://{}/health", engine.address());
+        // Exhaust the probe delay: readiness must still wait for the observer.
+        for _ in 0..5 {
+            assert_eq!(
+                client.get(&url).send().expect("probe held engine").status(),
+                503
+            );
+        }
+        hold.close().expect("release readiness hold");
+        assert_eq!(
+            client
+                .get(&url)
+                .send()
+                .expect("probe released engine")
+                .status(),
+            200
+        );
+    }
 
     #[test]
     fn fake_engine_streams_usage_and_observes_disconnect() {
