@@ -197,3 +197,98 @@ fn the_refusal_names_only_the_behavior_keys_not_the_metadata() {
         );
     }
 }
+
+#[test]
+fn every_origin_field_and_alias_is_refused_at_the_root() {
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../../../schemas/sb-config.schema.json"))
+            .expect("the checked-in schema parses");
+    let origin_fields = schema["definitions"]["RawOriginConfig"]["properties"]
+        .as_object()
+        .expect("the schema includes origin properties");
+    let root_fields = schema["properties"]
+        .as_object()
+        .expect("the schema includes root properties");
+    let mut keys: Vec<&str> = origin_fields
+        .keys()
+        .filter(|key| !root_fields.contains_key(*key))
+        .map(String::as_str)
+        .collect();
+    // JSON Schema contains canonical fields, not Serde aliases or legacy
+    // fields whose modern representation is an origin-map key/action type.
+    keys.extend(["auth", "session_config", "hostname", "ai_proxy"]);
+    let mut accepted = Vec::new();
+    for key in keys {
+        match sbproxy_config::compile_config(&format!("{key}: null\n")) {
+            Ok(_) => accepted.push(key),
+            Err(error) => assert_eq!(refused_keys(&format!("{error:#}")), [key]),
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "origin fields were silently discarded at the root: {accepted:?}"
+    );
+}
+
+#[test]
+fn partially_migrated_security_blocks_are_all_named_in_the_refusal() {
+    let yaml = r#"
+config_version: 2
+auth:
+  type: api_key
+  api_keys: [legacy-key]
+transforms:
+  - type: lua
+    script: "return nil"
+threat_protection:
+  enabled: true
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+    let error = sbproxy_config::compile_config(yaml)
+        .err()
+        .expect("misplaced protections must not compile into an unprotected origin");
+    assert_eq!(
+        refused_keys(&format!("{error:#}")),
+        ["auth", "threat_protection", "transforms"]
+    );
+}
+
+#[test]
+fn misplaced_origin_fields_are_refused_independently_of_case() {
+    for key in [
+        "AUTH",
+        "Threat_Protection",
+        "Transforms",
+        "Hostname",
+        "AI_PROXY",
+    ] {
+        let error = sbproxy_config::compile_config(&format!("{key}: null\n"))
+            .err()
+            .unwrap_or_else(|| panic!("misplaced {key} must be refused"));
+        assert_eq!(refused_keys(&format!("{error:#}")), [key]);
+    }
+}
+
+#[test]
+fn descriptive_metadata_and_real_root_fields_still_compile() {
+    for key in [
+        "config_version",
+        "id",
+        "workspace_id",
+        "version",
+        "environment",
+        "tags",
+        "debug",
+    ] {
+        let yaml = format!(
+            "{key}: null\nextensions: {{}}\norigins:\n  api.example.com:\n    action:\n      type: proxy\n      url: https://test.sbproxy.dev\n"
+        );
+        let compiled = sbproxy_config::compile_config(&yaml)
+            .unwrap_or_else(|error| panic!("metadata {key} must only warn: {error:#}"));
+        assert_eq!(compiled.origins.len(), 1);
+    }
+}

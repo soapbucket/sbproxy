@@ -1,6 +1,6 @@
 # Migrating from v0.1.x (Go) to v1.0 (Rust)
 
-*Last modified: 2026-08-30*
+*Last modified: 2026-09-05*
 
 SBproxy v1.0 replaces the Go implementation with a Rust rewrite built on Cloudflare's Pingora. This document covers what changes for operators upgrading from a v0.1.x Go binary to a v1.0 Rust binary.
 
@@ -11,7 +11,7 @@ and later.
 
 ## TL;DR
 
-- Your `sb.yml` field names carry over, but the file's *shape* may not. A v0.1.x config that declared its single origin at the top level (`hostname:`, `action:`, `authentication:`, ...) is refused by v1.0 and has to be rewritten under `origins:`. See [Config file shape](#config-file-shape) below.
+- Your `sb.yml` field names carry over, but the file's *shape* may not. A v0.1.x config that declared its single origin at the top level (`hostname:`, `action:`, `authentication:`, ...) must be rewritten under `origins:`. v1.14.0 rejects thirteen legacy root keys; the next release also rejects the other misplaced origin fields. See [Config file shape](#config-file-shape) below.
 - The install command and binary name are unchanged (`sbproxy`, `brew install sbproxy`, `soapbucket/sbproxy:latest`).
 - A handful of v0.1.x flags were renamed or removed in v1.0. See `Breaking changes` below.
 - Performance improves substantially (3x throughput, 3-4x lower p99 on the AI path) with no config changes required.
@@ -51,16 +51,18 @@ These are additive and do not require config changes:
 
 Go compatibility is deprecated. v1.0 does not translate the flat v0.1.x file shape, and it never did.
 
-A v0.1.x config could describe a single origin by putting that origin's blocks at the top level of the file: `hostname`, `action`, `authentication`, `policies`, `forward_rules`, `cors`, `request_modifiers`, `response_modifiers`, `session`, `variables`, `allowed_methods`, `force_ssl`, `ai_proxy`. v1.0 reads origin behavior only from `origins.<hostname>:`. It has no field for any of those keys at the top level and no rewrite step that moves them.
+A v0.1.x config could describe a single origin by putting `hostname`, `action`, `authentication`, and other origin blocks at the top level. The Rust line reads these blocks under `origins.<hostname>:`.
 
-Through v1.13 such a file compiled anyway: each top-level key was dropped with one warning, the proxy booted with no origin at all and answered 404 for the hostname the file declared, and `sbproxy validate` reported the same file as valid. An operator who believed they had authentication and IP allow-listing deployed with neither. That is now a refusal. `serve`, `validate`, and hot reload all fail with an error naming the dropped keys and pointing here.
+Through v1.13, the compiler dropped flat origin blocks with a warning. v1.14.0 rejects thirteen legacy keys, but still accepts misplaced fields such as `auth`, `transforms`, and `threat_protection`. The next release extends the refusal to every misplaced field and alias accepted by an origin, including those three. Fields with a valid top-level meaning keep that meaning. It also keeps the legacy `hostname` and `ai_proxy` refusals.
+
+This matters for a partially migrated file: a valid `origins:` block can serve traffic while authentication or protection blocks left at the root are dropped. `serve`, `validate`, and hot reload reject the misplaced blocks in the next release and name them in the error.
 
 Two ways forward:
 
 - **Rewrite the file.** Nest the origin's blocks under `origins:` keyed by the hostname the file used to declare at the top level. Nothing inside the blocks changes.
 
   ```yaml
-  # v0.1.x (refused by v1.0)
+  # v0.1.x (refused by v1.14.0 and later)
   hostname: api.example.com
   action:
     type: proxy
@@ -94,7 +96,7 @@ Descriptive leftovers are unaffected. A v1.0 config that still carries `config_v
 ## Recommended upgrade procedure
 
 1. **Read `CHANGELOG.md`** for the full list of changes between your starting v0.1.x version and v1.0.0.
-2. **Stage v1.0 alongside v0.1.x** in a non-production environment. Point a copy of your `sb.yml` at the v1.0 binary and run `sbproxy validate sb.yml`. Address any validation errors. A flat v0.1.x file fails here, naming the top-level keys it would have dropped; rewrite it as [Config file shape](#config-file-shape) describes before going further.
+2. **Stage the target Rust release alongside v0.1.x** in a non-production environment. Run that binary's `sbproxy validate sb.yml` against a copy of your configuration. Move origin blocks under `origins:` as [Config file shape](#config-file-shape) describes, even when an older validator accepts them. Validation through v1.13 does not catch the flat shape, and v1.14.0 only catches thirteen legacy root keys.
 3. **Run a smoke test** against a small percentage of real traffic. Observe `/metrics` on the data-plane listener and `/api/health/targets` on the admin listener for regressions in 4xx/5xx rates or upstream latency.
 4. **Verify signed binary** before promoting to production. v1.0 ships with cosign signatures and an SBOM; see `SUPPLY-CHAIN.md` for the verification commands.
 5. **Promote to production** once smoke is clean.

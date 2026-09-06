@@ -1,0 +1,4 @@
+{
+  "type": "fixed",
+  "message": "Reject origin fields and aliases such as auth, transforms, and threat_protection at the config root, where v1.14.0 dropped them even when a partially migrated origin was serving traffic."
+}

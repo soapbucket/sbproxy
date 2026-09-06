@@ -1,6 +1,6 @@
 # Config stability tiers
 
-*Last modified: 2026-08-28*
+*Last modified: 2026-09-05*
 
 This page defines the stability tiers and applies them to representative or
 high-impact configuration leaves. It also lists the current reviewed
@@ -168,6 +168,7 @@ surface that does the job. Boot and reload both refuse the document.
 
 | Key | Why it is refused | What to use instead |
 |---|---|---|
+| Misplaced origin fields or aliases at the config root, including `auth`, `transforms`, and `threat_protection` | These fields belong under an origin. v1.14.0 dropped names outside its thirteen-key legacy refusal, so a partially migrated origin could serve traffic without the misplaced blocks. | Move the keys named in the error under `origins.<hostname>:`. See [MIGRATION.md](../MIGRATION.md#config-file-shape). |
 | `origins.*.action.context_overflow` (`ai_proxy`) | Never a field on the AI handler and never read by anything. The decision layer behind it (error, fall back to a larger model, truncate) had no caller in the life of the tree, and the AI gateway guide described the block as ignored, which left operators free to write it. | A `window_fit` lever under `compression.levers`, or the `resilience.llm_aware.context_compress` shorthand, to fit the prompt in place. To reroute it to a larger-window model instead, name that provider in `context_window_fallbacks:` on the action. |
 | `origins.*.action.sticky` (`load_balancer`) | No affinity cookie was ever issued. | `algorithm: ring_hash` keyed on `cookie`, `header`, `ip`, or `uri`. |
 | `transforms[].allowed_hosts` (`type: wasm`) | Never enforced, and unenforceable: WASM modules have no network surface at all here, so the allowlist described a boundary nothing checked. | Keep the reaching on the proxy side. Gate the origin with an `expression` policy, or route the callout through an origin the proxy controls. The key returns as an enforced one if a host callout ever lands. |
