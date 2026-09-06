@@ -129,7 +129,7 @@
       ]
     },
     "agent_classes": {
-      "description": "Top-level agent-class catalog selection and resolver tuning. When unset, the binary constructs a resolver from the embedded default catalog (so per-agent metric labels keep firing); operators set this block to provide an inline catalog or change the rDNS / bot-auth / cache settings. Hosted-feed fields remain parseable for compatibility but are not fetched by the OSS runtime.",
+      "description": "Top-level agent-class catalog selection and resolver tuning. When unset, the binary constructs a resolver from the embedded default catalog (so per-agent metric labels keep firing); operators set this block to provide an inline catalog or change the rDNS / bot-auth / cache settings. Hosted-feed fields remain parseable for compatibility but the runtime does not fetch them.",
       "default": null,
       "anyOf": [
         {
@@ -4094,7 +4094,7 @@
       "additionalProperties": false
     },
     "SecretsConfig": {
-      "description": "Top-level secrets management configuration.\n\nThe live surface is [`SecretsConfig::backends`], selected by provider URI references. The legacy single-backend and rotation fields remain parseable for compatibility but are not consumed by the OSS runtime.",
+      "description": "Top-level secrets management configuration.\n\nThe live surface is [`SecretsConfig::backends`], selected by provider URI references. The legacy single-backend and rotation fields remain parseable for compatibility but are not consumed by the runtime.",
       "type": "object",
       "properties": {
         "backend": {
@@ -4151,7 +4151,7 @@
       "additionalProperties": false
     },
     "HashiCorpSecretsConfig": {
-      "description": "Legacy HashiCorp Vault connection settings.\n\nThe OSS resolver consumes the `hashicorp` variant in [`SecretsConfig::backends`], not this compatibility block.",
+      "description": "Legacy HashiCorp Vault connection settings.\n\nThe resolver consumes the `hashicorp` variant in [`SecretsConfig::backends`], not this compatibility block.",
       "type": "object",
       "required": [
         "addr"
@@ -5647,7 +5647,7 @@
           ]
         },
         "key_introspection": {
-          "description": "Reserved caller-introspection switch. The OSS runtime does not install `GET /api/v1/key`; retained for config compatibility.",
+          "description": "Reserved caller-introspection switch. The runtime does not install `GET /api/v1/key`; retained for config compatibility.",
           "default": false,
           "type": "boolean"
         },
@@ -8531,7 +8531,7 @@
           "format": "double"
         },
         "reset": {
-          "description": "Reserved reset-window hint. It is accepted but not parsed or enforced by the OSS runtime.",
+          "description": "Reserved reset-window hint. It is accepted but not parsed or enforced by the runtime.",
           "default": null,
           "type": [
             "string",
@@ -12941,7 +12941,7 @@
       "type": "object",
       "properties": {
         "catalog": {
-          "description": "Catalog source. `builtin` (default) loads the embedded YAML and `inline` loads `entries`. The compatibility values `hosted-feed` and `merged` currently warn and fall back to the embedded defaults; the OSS runtime does not fetch `hosted_feed.url`.",
+          "description": "Catalog source. `builtin` (default) loads the embedded YAML and `inline` loads `entries`. The compatibility values `hosted-feed` and `merged` currently warn and fall back to the embedded defaults; the runtime does not fetch `hosted_feed.url`.",
           "default": "builtin",
           "type": "string"
         },
@@ -12951,7 +12951,7 @@
           "items": true
         },
         "hosted_feed": {
-          "description": "Compatibility-only hosted-feed configuration. It remains parseable but the OSS runtime does not fetch or merge it.",
+          "description": "Compatibility-only hosted-feed configuration. It remains parseable but the runtime does not fetch or merge it.",
           "default": null,
           "anyOf": [
             {
@@ -12979,18 +12979,18 @@
       "additionalProperties": false
     },
     "HostedFeedConfig": {
-      "description": "Hosted-feed source for the agent-class catalog.\n\nReserved so YAML written against the `hosted-feed` or `merged` shapes parses cleanly. The OSS runtime does not fetch, refresh, or verify this feed; selecting either catalog value warns and falls back to the embedded defaults.",
+      "description": "Hosted-feed source for the agent-class catalog.\n\nReserved so YAML written against the `hosted-feed` or `merged` shapes parses cleanly. The runtime does not fetch, refresh, or verify this feed; selecting either catalog value warns and falls back to the embedded defaults.",
       "type": "object",
       "required": [
         "url"
       ],
       "properties": {
         "url": {
-          "description": "Reserved feed URL. It is accepted but not fetched or validated by the OSS runtime.",
+          "description": "Reserved feed URL. It is accepted but not fetched or validated by the runtime.",
           "type": "string"
         },
         "bootstrap_keys": {
-          "description": "Reserved bootstrap public keys. They are accepted but no signature verification is installed in the OSS runtime.",
+          "description": "Reserved bootstrap public keys. They are accepted but no signature verification is installed in the runtime.",
           "default": [],
           "type": "array",
           "items": {
@@ -13029,7 +13029,7 @@
       "type": "object",
       "properties": {
         "workspace_default": {
-          "description": "Budget applied to the default workspace (the only workspace in the OSS single-tenant build; enterprise multi-tenant resolves a per-tenant budget).",
+          "description": "Budget applied to every workspace. There is no per-workspace override: the registry builds one budget from this block and tracks each workspace's usage against it.",
           "default": {
             "http_rps_sustained": 1000,
             "http_rps_burst": 2000,
