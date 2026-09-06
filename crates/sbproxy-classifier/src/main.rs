@@ -26,7 +26,7 @@
 //!
 //! This binary is a sidecar process a deployment must run and keep running
 //! to use it. Per WOR-2661's no-external-store rule (extended to sidecar
-//! processes), nothing in this OSS workspace may depend on it being up.
+//! processes), nothing in this workspace may depend on it being up.
 //! **This binary itself has no fallback story** because a sidecar cannot
 //! degrade itself; the fallback lives one layer up, in the client:
 //! `sbproxy-classifier-client`'s `FallbackClassifier` degrades to the

@@ -458,8 +458,8 @@ fn compile_policy_with_optional_registry(
         "agent_class" => Ok(Policy::AgentClass(
             crate::policy::agent_class::AgentClassPolicy::from_config(config.clone())?,
         )),
-        // Wave 7 / A7.2 A2A protocol policy. Always compiled into the
-        // OSS build (the parser surface is feature-gated, but the
+        // Wave 7 / A7.2 A2A protocol policy. Always compiled into
+        // the binary (the parser surface is feature-gated, but the
         // policy module enforces route-level limits regardless of
         // whether parsing produced a populated context).
         "a2a" => Ok(Policy::A2A(crate::policy::a2a::A2APolicy::from_config(
@@ -1738,12 +1738,12 @@ hooks:
         names
     }
 
-    /// The OSS auth catalog must name every type `compile_auth`
+    /// The auth catalog must name every type `compile_auth`
     /// compiles, and nothing it does not.
     ///
     /// `sbproxy_config::validate::KNOWN_AUTH_TYPES` does two jobs, and a
     /// missing entry breaks both. `sbproxy validate` warns that an
-    /// unlisted type "is not in the OSS catalog (will fail at
+    /// unlisted type "is not in the catalog (will fail at
     /// runtime)", which is false for a type this function compiles;
     /// `ldap_auth` shipped that way, so the repo's own
     /// `examples/auth-ldap/sb.yml` drew a warning it did not deserve.

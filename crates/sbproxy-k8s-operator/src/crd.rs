@@ -1,4 +1,4 @@
-//! CRD type definitions for the sbproxy OSS operator.
+//! CRD type definitions for the sbproxy Kubernetes operator.
 //!
 //! Two custom resources are defined under the `sbproxy.dev` API group at
 //! version `v1alpha1`:

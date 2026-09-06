@@ -26,8 +26,8 @@
 //! pass over a directory at config-load time, and no network or git
 //! plumbing is invoked from here. Revision-mode validation against a
 //! real git Repo is best-effort and is delegated to the caller through
-//! [`RevisionResolver`]; the OSS default ([`NoopRevisionResolver`])
-//! treats every revision as resolvable so the OSS plan surface stays
+//! [`RevisionResolver`]; the default ([`NoopRevisionResolver`])
+//! treats every revision as resolvable so the plan surface stays
 //! self-contained.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -84,7 +84,7 @@ pub struct ListingMetadata {
     /// path for findings emitted against this Listing is
     /// `listings.<name>`.
     pub name: String,
-    /// Free-form label map. The OSS proxy does not interpret labels;
+    /// Free-form label map. The proxy does not interpret labels;
     /// they are carried for downstream consumers (the hosted-Catalog
     /// surface, the k8s controller, etc.).
     #[serde(default)]
@@ -205,7 +205,7 @@ pub enum RevisionMode {
 /// Auth strategies a Listing advertises.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ListingAuth {
-    /// Strategy names matching the OSS auth catalog (`api_key`, `jwt`,
+    /// Strategy names matching the auth catalog (`api_key`, `jwt`,
     /// `bearer`, ...). Plan validation checks that every entry is a
     /// subset of, or compatible with, the underlying Resource's
     /// `authentication.type`.
@@ -242,7 +242,7 @@ pub struct ListingPaidTier {
     /// cent per call.
     #[serde(default)]
     pub price_micros: Option<u64>,
-    /// ISO 4217 currency code. The OSS proxy does not enforce the
+    /// ISO 4217 currency code. The proxy does not enforce the
     /// list; downstream Catalog surfaces will.
     #[serde(default)]
     pub currency: Option<String>,
@@ -417,9 +417,9 @@ pub fn load_listing_file(path: &Path) -> Result<Listing, ListingLoadError> {
 /// `metadata.name` for O(1) lookup at plan / apply time.
 ///
 /// The registry is intentionally a thin wrapper over a `HashMap` so
-/// the OSS surface stays small. Future enterprise consumers (the
-/// hosted-Catalog surface, the k8s controller) can extend with a
-/// reverse index or a watcher channel without touching this struct.
+/// the surface stays small. Future consumers (the hosted-Catalog
+/// surface, the k8s controller) can extend with a reverse index or
+/// a watcher channel without touching this struct.
 #[derive(Debug, Default, Clone)]
 pub struct ListingRegistry {
     inner: HashMap<String, LoadedListing>,
@@ -493,7 +493,7 @@ impl ListingRegistry {
 /// The [`Listing`] schema includes three pinning modes (`pin`,
 /// `track-branch`, `tag`). Validating those modes for real requires
 /// either git plumbing or an out-of-band index of the Repo, which the
-/// OSS proxy does not assume is present. This trait lets a caller
+/// proxy does not assume is present. This trait lets a caller
 /// inject a real resolver (the k8s controller, the hosted-Catalog
 /// surface) without dragging the dependency into `sbproxy-config`.
 pub trait RevisionResolver {
@@ -506,9 +506,9 @@ pub trait RevisionResolver {
     fn tag_exists(&self, tag: &str) -> bool;
 }
 
-/// OSS-default resolver that treats every revision as resolvable.
+/// Default resolver that treats every revision as resolvable.
 ///
-/// This keeps the OSS plan surface self-contained: the validator
+/// This keeps the plan surface self-contained: the validator
 /// still checks that each Listing names a known Resource and that the
 /// auth strategies are compatible, but the existence-of-revision
 /// check is a no-op until a real resolver is plugged in. A future
@@ -571,7 +571,7 @@ impl RevisionResolver for StaticRevisionResolver {
 ///    same Repo. `origins/<hostname>` is checked against the
 ///    `ConfigFile.origins` map. `mcp/<name>` and `docs/<name>` are
 ///    accepted as forward-compatible kinds with a warning when the
-///    underlying Resource cannot be located in the OSS surface.
+///    underlying Resource cannot be located.
 /// 2. For `revision: { mode: pin }`, the SHA must exist (per the
 ///    [`RevisionResolver`]).
 /// 3. For `revision: { mode: track-branch }`, the branch must exist.
@@ -580,7 +580,7 @@ impl RevisionResolver for StaticRevisionResolver {
 ///    underlying Resource's `authentication.type` field. We accept the
 ///    strategy when (a) the Resource has no auth, or (b) the
 ///    Resource's auth type is in the strategy list, or (c) the
-///    strategy is in the OSS-known auth catalog (forward-compatible
+///    strategy is in the known auth catalog (forward-compatible
 ///    fallback).
 /// 6. `spec.status` must be one of `draft` / `published` / `retired`.
 ///    Other values surface as `unknown-listing-status` warnings.
@@ -680,7 +680,7 @@ fn validate_one<R: RevisionResolver>(
             }
             Some((kind, _)) if kind == "mcp" || kind == "docs" => {
                 // Forward-compatible: there is no first-class `mcp`
-                // or `docs` Resource map in the OSS schema yet, so we
+                // or `docs` Resource map in the schema yet, so we
                 // accept the reference but warn once so an operator
                 // sees the missing wiring.
                 findings.push(PlanFinding {
@@ -688,7 +688,7 @@ fn validate_one<R: RevisionResolver>(
                     rule_id: "forward-compatible-listing-resource".to_string(),
                     path: format!("{entry_path}.ref"),
                     message: format!(
-                        "listing '{name}' references '{}' which is not yet validated by the OSS schema",
+                        "listing '{name}' references '{}' which is not yet validated by the schema",
                         res.reference
                     ),
                 });

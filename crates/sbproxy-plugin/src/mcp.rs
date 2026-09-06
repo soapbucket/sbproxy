@@ -26,8 +26,8 @@
 //! [`McpPolicyHookEntry`]. The federation layer iterates registered
 //! entries through [`mcp_policy_hooks`] and dispatches the first
 //! matching hook. When no hooks register, [`default_no_op_hook`]
-//! returns [`PolicyDecision::Allow`] so the OSS-only build forwards
-//! every `tools/call` unchanged.
+//! returns [`PolicyDecision::Allow`] so the proxy forwards every
+//! `tools/call` unchanged.
 //!
 //! ## Verdict semantics (PR β)
 //!
@@ -68,8 +68,8 @@ pub struct McpToolCallCtx<'a> {
     /// than "any".
     pub agent_id: Option<&'a str>,
     /// Logical name of the upstream MCP server that owns the requested
-    /// tool. Matches `McpServerConfig.name` in the OSS federation
-    /// crate. Always populated.
+    /// tool. Matches `McpServerConfig.name` in the federation crate.
+    /// Always populated.
     pub mcp_server: &'a str,
     /// Tool name from the JSON-RPC `tools/call` params (post tool
     /// resolution, before any server-prefix rewriting). Always
@@ -86,8 +86,8 @@ pub struct McpToolCallCtx<'a> {
     /// purely diagnostic.
     pub correlation_id: &'a str,
     /// Workspace id for multi-tenant policy lookup. Empty string when
-    /// the call site has not threaded one through; the enterprise
-    /// dispatcher (PR ε) treats empty as the default tenant.
+    /// the call site has not threaded one through; a hook that
+    /// dispatches per tenant treats empty as the default tenant.
     pub workspace_id: &'a str,
     /// WOR-818 PR2: OpenAI Apps SDK / SEP-1865 `params.audit.cause`.
     /// When the client carries this string on the inbound
@@ -115,10 +115,9 @@ pub trait McpPolicyHook: Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = PolicyDecision> + Send + 'a>>;
 }
 
-/// Inventory entry registered by enterprise crates so the OSS
-/// federation discovers them at link time without any explicit
-/// registration call. See [`inventory::submit!`] for the registration
-/// shape used by impls.
+/// Inventory entry a hook crate submits so the federation discovers
+/// it at link time without any explicit registration call. See
+/// [`inventory::submit!`] for the registration shape used by impls.
 pub struct McpPolicyHookEntry {
     /// Factory that constructs the hook. Returning an `Arc` keeps the
     /// hook clonable across the federation's iteration without
@@ -267,14 +266,14 @@ pub fn mcp_policy_hooks() -> Vec<Arc<dyn McpPolicyHook>> {
 }
 
 /// Permissive default that returns [`PolicyDecision::Allow`] for every
-/// request. The federation layer uses this when no enterprise hook is
-/// registered so the OSS build forwards every `tools/call` unchanged.
+/// request. The federation layer uses this when no hook is registered,
+/// so the proxy forwards every `tools/call` unchanged.
 pub fn default_no_op_hook() -> Arc<dyn McpPolicyHook> {
     Arc::new(NoOpMcpPolicyHook)
 }
 
 /// Default no-op hook impl. Returns [`PolicyDecision::Allow`] for every
-/// invocation. Exposed publicly so enterprise crates can compose it
+/// invocation. Exposed publicly so a hook crate can compose it
 /// (for example, as a fallback after an inner dispatcher returns
 /// `None`).
 pub struct NoOpMcpPolicyHook;
@@ -294,8 +293,8 @@ mod tests {
     use std::sync::Mutex;
 
     /// The default no-op hook returns `Allow` for any context shape.
-    /// This pins the OSS-only-build contract: with zero enterprise
-    /// crates linked, the federation forwards every `tools/call`.
+    /// This pins the default contract: when no hook decides, the
+    /// federation forwards every `tools/call`.
     #[tokio::test]
     async fn no_op_hook_returns_allow() {
         let hook = default_no_op_hook();
@@ -315,7 +314,7 @@ mod tests {
 
     /// The no-op hook reads every field without panicking even when
     /// the optional fields are `None` / empty. The federation layer
-    /// constructs ctxs with these defaults from OSS call sites that
+    /// constructs ctxs with these defaults from call sites that
     /// have not yet threaded the full identity surface through.
     #[tokio::test]
     async fn no_op_hook_handles_anonymous_caller() {

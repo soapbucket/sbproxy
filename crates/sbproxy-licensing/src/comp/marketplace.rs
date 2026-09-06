@@ -1440,7 +1440,7 @@ mod tests {
         assert_eq!(res.license, "urn:rsl:pay-per-inference:default");
         assert_eq!(res.route_glob, "/api/v1/inference/**");
         // Token shape: three b64url segments separated by dots, and
-        // decodes to the expected TTL via the OSS-format claim names.
+        // decodes to the expected TTL via the wire-format claim names.
         assert_eq!(res.license_token.split('.').count(), 3);
         assert_eq!(expires_in_of(&res.license_token).unwrap(), 3600);
     }

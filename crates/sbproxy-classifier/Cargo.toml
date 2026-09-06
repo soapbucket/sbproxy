@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Shared InferenceService + ClassifierService gRPC contract, and the
-# tract-onnx classification/embedding engine already used by the OSS
+# tract-onnx classification/embedding engine already used by the
 # in-process detectors and the minimal sidecar. Reusing it here (rather
 # than adding a second ONNX runtime such as `ort`) keeps one ONNX engine
 # in the workspace.

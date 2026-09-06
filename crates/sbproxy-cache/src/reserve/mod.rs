@@ -6,7 +6,7 @@
 //!    two [`CacheStore`](crate::CacheStore) implementations into a hot/cold
 //!    pair. It remains the in-process building block when both tiers are
 //!    cheap (memory + filesystem).
-//! 2. The async [`CacheReserveBackend`] trait plus four OSS
+//! 2. The async [`CacheReserveBackend`] trait plus four
 //!    implementations ([`MemoryReserve`], [`FsReserve`], [`RedisReserve`],
 //!    and [`ObjectStoreReserve`]). The trait is the integration point
 //!    for backends that need to perform real I/O. WOR-2673 landed the
@@ -28,7 +28,7 @@
 //!    in-tree backend per vendor SDK.
 //!
 //!    An out-of-tree build can still register its own `impl
-//!    CacheReserveBackend` without re-vendoring the OSS data plane.
+//!    CacheReserveBackend` without re-vendoring this crate's data plane.
 //!
 //! The async trait is independent of `CacheStore`. It carries explicit
 //! [`ReserveMetadata`] so backends can persist content type, vary
@@ -145,11 +145,10 @@ impl ReserveMetadata {
 /// emission outside the backend so the backend itself only has to
 /// answer "store this", "fetch this", "drop this".
 ///
-/// Enterprise note: the OSS proxy never imports an enterprise crate.
-/// Enterprise builds register their backend through
-/// `Arc<dyn CacheReserveBackend>` so this trait is the only stable
-/// surface between the two trees. Renaming or breaking it is a
-/// semver-major change.
+/// The four backends above implement it, and anything else registers
+/// through the same `Arc<dyn CacheReserveBackend>`, so this trait is the
+/// only stable surface for that integration. Renaming or breaking it is
+/// a semver-major change.
 #[async_trait]
 pub trait CacheReserveBackend: Send + Sync {
     /// Persist `value` (and its metadata) under `key`. Returning `Ok`

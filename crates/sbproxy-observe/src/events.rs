@@ -8,19 +8,19 @@ use std::sync::Arc;
 ///
 /// Bound to the audit event bus (see
 /// `crates/sbproxy-core/src/policy_bus.rs`) and consumed asynchronously
-/// per `docs/events.md`. The OSS substrate ships an
-/// in-memory drain stub; the enterprise consumer adds tamper-evident
-/// chaining and KMS-signed Merkle root commits downstream of the bus.
+/// per `docs/events.md`. The default consumer is an in-memory drain
+/// stub; a replacement consumer can add tamper-evident chaining and
+/// KMS-signed Merkle root commits downstream of the bus.
 ///
-/// The OSS payload is intentionally a subset of the full ADR shape:
-/// it carries the fields a regulator-defensible audit trail can be
-/// reconstructed from in the OSS context (request correlation, the
-/// stable verdict tag, and a coarse decision latency). Enterprise
-/// extends the payload with the rendered rationale, judge call
-/// summaries, redacted input contexts, and
-/// W3C trace correlation; those fields are out of scope for OSS so
-/// they are not declared here. The struct is `#[non_exhaustive]` so
-/// adding them later does not break consumers.
+/// This payload is intentionally a subset of the full ADR shape: it
+/// carries only the fields a regulator-defensible audit trail can be
+/// reconstructed from (request correlation, the stable verdict tag,
+/// and a coarse decision latency). The richer record, carrying the
+/// rendered rationale, judge call summaries, and redacted input
+/// contexts, is `DecisionAudit` (see `crate::decision`) on the same
+/// bus; those fields are out of scope for this event so they are not
+/// declared here. The struct is `#[non_exhaustive]` so adding them
+/// later does not break consumers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct PolicyVerdictEvent {
@@ -30,17 +30,17 @@ pub struct PolicyVerdictEvent {
     /// Correlates to the access log entry and any traces.
     pub request_id: String,
     /// Tenant identifier the request belongs to. Empty string in the
-    /// single-tenant OSS default.
+    /// single-tenant default.
     pub tenant_id: String,
     /// Workspace identifier the request belongs to. Empty string in
-    /// the single-tenant OSS default.
+    /// the single-tenant default.
     pub workspace_id: String,
     /// Wall-clock instant the verdict was rendered.
     pub occurred_at: chrono::DateTime<chrono::Utc>,
     /// Stable identifier for the policy that fired.
     ///
-    /// In OSS scope this is the policy_type string from the policy
-    /// (`rate_limit`, `waf`, `ip_filter`, ...).
+    /// This is the policy_type string from the policy (`rate_limit`,
+    /// `waf`, `ip_filter`, ...).
     pub policy_id: String,
     /// Built-in dispatch path versus dynamic-dispatch plugin path.
     pub surface: PolicySurface,
@@ -58,15 +58,14 @@ pub struct PolicyVerdictEvent {
     ///
     /// The full [`sbproxy_plugin::PolicyDecision`] payload (status
     /// code, message, header list, confirm reason, webhook URL,
-    /// expiry) belongs to the enterprise audit envelope and is
-    /// captured there. The OSS event keeps only the tag so dashboards
-    /// and SIEM rules can break down by verdict shape without
-    /// inheriting the cardinality of the full payload.
+    /// expiry) is not captured here. This event keeps only the tag
+    /// so dashboards and SIEM rules can break down by verdict shape
+    /// without inheriting the cardinality of the full payload.
     pub verdict: VerdictTag,
     /// Wall-clock duration from entering the dispatcher to the
     /// verdict being produced, in milliseconds. Coarse on purpose;
-    /// the enterprise event carries a microsecond-resolution
-    /// duration and a histogram-friendly seconds-as-f64 sibling.
+    /// finer-grained latency is tracked separately as a
+    /// seconds-based histogram metric.
     pub decision_latency_ms: u32,
 }
 
@@ -108,19 +107,19 @@ impl PolicyVerdictEvent {
 
 /// Surface a policy decision was rendered on.
 ///
-/// `BuiltIn` covers the 21 built-in OSS policy variants that dispatch
+/// `BuiltIn` covers the 21 built-in policy variants that dispatch
 /// through the enum-arm path in `check_policies`. `Plugin` covers
 /// dynamic-dispatch plugins registered via the
 /// [`sbproxy_plugin::PolicyEnforcer`] trait.
 ///
-/// Marked `#[non_exhaustive]` so future surfaces (CEL, Lua, JS, WASM,
-/// webhook) the enterprise audit binding distinguishes can
-/// extend this enum without breaking external consumers.
+/// Marked `#[non_exhaustive]` so a future surface variant, finer
+/// than `Plugin`, can extend this enum without breaking external
+/// consumers.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
 #[serde(rename_all = "snake_case")]
 pub enum PolicySurface {
-    /// One of the 21 OSS built-in policy enum arms.
+    /// One of the 21 built-in policy enum arms.
     BuiltIn,
     /// A dynamic-dispatch [`sbproxy_plugin::PolicyEnforcer`] impl.
     Plugin,
@@ -138,9 +137,9 @@ impl PolicySurface {
 
 /// Coarse verdict tag carried on a [`PolicyVerdictEvent`].
 ///
-/// Mirrors [`sbproxy_plugin::PolicyDecision`] one-to-one for the OSS
-/// scope: the full payload is captured by the enterprise audit
-/// envelope, the tag here is the dashboard-friendly label.
+/// Mirrors [`sbproxy_plugin::PolicyDecision`] one-to-one: the tag
+/// here is the dashboard-friendly label, and the full payload is
+/// not captured on this event.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
 #[serde(rename_all = "snake_case")]
@@ -150,7 +149,7 @@ pub enum VerdictTag {
     /// Deny with an HTTP status and message.
     Deny,
     /// Hold pending human approval. Routes through `AllowWithHeaders`
-    /// in OSS with `X-Policy-Confirm` stamped on the response.
+    /// with `X-Policy-Confirm` stamped on the response.
     Confirm,
     /// Allow with response-header decoration.
     AllowWithHeaders,

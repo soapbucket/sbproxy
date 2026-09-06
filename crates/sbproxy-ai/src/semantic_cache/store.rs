@@ -1,4 +1,4 @@
-//! Backend-neutral async contract for the OSS semantic cache.
+//! Backend-neutral async contract for the semantic cache.
 //!
 //! Every semantic-cache backend (memory, Redis, mesh) implements the one
 //! [`SemanticCacheStore`] trait defined here. The trait is async so a

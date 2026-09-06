@@ -577,7 +577,7 @@ pub struct ListingScopedIndex {
 /// Per WOR-196 the resolved hostnames come from the Listing's
 /// `spec.resources[].ref` entries (kinds `origins/<hostname>`); other
 /// resource kinds are recorded but do not contribute hostnames for
-/// the OSS surface today.
+/// this surface today.
 ///
 /// Every entry's [`ManifestEntry::serve_base`] is stamped with this
 /// Listing's well-known segment, because that is where the data-plane
@@ -628,7 +628,7 @@ fn listing_serve_base(listing_name: &str) -> String {
 /// Extract the origin hostnames a Listing publishes from its
 /// `spec.resources[].ref` entries. Returns the set of hostnames for
 /// every `origins/<hostname>` reference. Other kinds (`mcp/`,
-/// `docs/`) are skipped: the OSS data plane only serves Agent Skills
+/// `docs/`) are skipped: the data plane only serves Agent Skills
 /// on origin hostnames today.
 fn listing_origin_hostnames(loaded: &LoadedListing) -> Vec<CompactString> {
     let mut out: Vec<CompactString> = Vec::new();

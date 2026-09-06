@@ -8,7 +8,7 @@
 //! a strong signal that the request is from the agent it claims to
 //! be.
 //!
-//! The OSS implementation ships a static directory configured inline
+//! This implementation ships a static directory configured inline
 //! in YAML. Periodic refresh of a hosted directory (JWKS-shaped) is
 //! tracked as a follow-up that wires onto the same `Directory` trait.
 
@@ -351,7 +351,7 @@ impl BotAuthProvider {
     /// is configured with one.
     ///
     /// Falls back to the static [`Self::verify`] path when no
-    /// `Signature-Agent` header is present, preserving the OSS
+    /// `Signature-Agent` header is present, preserving the
     /// inline-agent flow.
     pub async fn verify_async(
         &self,

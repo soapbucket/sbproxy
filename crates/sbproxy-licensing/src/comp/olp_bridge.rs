@@ -1,4 +1,4 @@
-//! Redeem-time bridge into the OSS OLP license-token wire format.
+//! Redeem-time bridge into the OLP license-token wire format.
 //!
 //! The CoMP redeem endpoint's whole job is "a buyer paid, hand them a
 //! license token." Rather than mint a bespoke, disconnected token
@@ -24,12 +24,12 @@
 //! reproducing a small, stable wire format is the cheaper and more
 //! honest coupling.
 //!
-//! One claim from the OSS format is deliberately not reproduced here:
+//! One claim from that format is deliberately not reproduced here:
 //! the WOR-808 PR8 `cnf.jwk` Encrypted Media Standard content-key
 //! binding. A marketplace buyer redeeming a quote has not gone
 //! through the origin's own EMS key-seed configuration, so there is
 //! no content key to bind; a token from this bridge is a plain
-//! license token, exactly as the OSS issuer emits when no
+//! license token, exactly as the existing issuer emits when no
 //! `content_key_seed` is configured.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
@@ -45,9 +45,10 @@ use crate::error::LicensingError;
 /// and one minted by the live proxy are wire-indistinguishable.
 pub const OLP_JWS_TYP: &str = "olp-license+jws";
 
-/// JWS protected header. Field set and order matches the OSS issuer's
-/// internal `OlpHeader` (the header is not part of any public OSS
-/// API; the shape is reproduced from the JSON it serializes to).
+/// JWS protected header. Field set and order matches the existing
+/// issuer's internal `OlpHeader` (the header is not part of any
+/// public API; the shape is reproduced from the JSON it serializes
+/// to).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct OlpBridgeHeader {
     alg: String,
@@ -59,8 +60,8 @@ struct OlpBridgeHeader {
 ///
 /// Field names and semantics match
 /// `sbproxy_modules::olp::OlpLicenseClaims` exactly (`cnf` omitted;
-/// see module docs). A verifier built against the OSS claims struct
-/// deserializes this payload without modification.
+/// see module docs). A verifier built against the existing claims
+/// struct deserializes this payload without modification.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OlpBridgeClaims {
     /// Issuer URL. Matches `OlpConfig::issuer`.
@@ -78,7 +79,7 @@ pub struct OlpBridgeClaims {
     pub exp: u64,
     /// Space-separated RFC 8693 scope tokens. Always the bridge's
     /// configured `default_scope`; this crate has no per-tier scope
-    /// override, matching how the OSS issuer's own
+    /// override, matching how the existing issuer's own
     /// `POST /.well-known/olp/token` handler mints today (it never
     /// sets `IssueRequest::scope_override` either).
     pub scope: String,
@@ -92,9 +93,9 @@ pub struct OlpBridgeClaims {
 /// Mints OLP-wire-compatible license tokens for the CoMP redeem step.
 ///
 /// Configuration mirrors `sbproxy_config::OlpConfig` field-for-field
-/// on purpose: an operator who already runs the OSS `olp:` block on
-/// the origin these tokens will be presented to can copy those same
-/// four values in.
+/// on purpose: an operator who already runs the existing `olp:`
+/// block on the origin these tokens will be presented to can copy
+/// those same four values in.
 pub struct OlpBridgeSigner {
     signing_key: SigningKey,
     kid: String,

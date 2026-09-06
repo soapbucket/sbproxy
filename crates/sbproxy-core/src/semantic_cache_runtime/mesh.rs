@@ -1,4 +1,4 @@
-//! Mesh semantic-cache adapter over the current OSS cluster node.
+//! Mesh semantic-cache adapter over the current cluster node.
 //!
 //! This module is deliberately thin. It owns no gossip loop, no listener,
 //! and no membership of its own: it borrows the process cluster handle's
@@ -251,7 +251,7 @@ pub(crate) async fn require_semantic_mesh_capability(
 type PeerAddr = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
 /// Semantic-cache backend that stores payloads and bucket membership on the
-/// current OSS mesh.
+/// current mesh.
 pub(crate) struct MeshSemanticCacheStore {
     /// Process cluster handle, resampled to fence a moved membership.
     cluster: ClusterHandle,

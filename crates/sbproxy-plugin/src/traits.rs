@@ -374,13 +374,13 @@ pub enum PolicyDecision {
     /// Request is held pending human-in-the-loop approval.
     ///
     /// See `docs/policy.md` for the full design
-    /// contract. The OSS dispatcher routes `Confirm` through the
+    /// contract. The policy dispatcher routes `Confirm` through the
     /// existing [`PolicyDecision::AllowWithHeaders`] mechanism by
     /// forwarding the request with `X-Policy-Confirm: <reason>` stamped
-    /// on the response; OSS does not park the request. The enterprise
-    /// interceptor handles parking before the OSS bridge fires: it
-    /// queues the request for approver review, optionally posts to
-    /// `webhook_url`, and resumes or synthesises a deny on `expires_at`.
+    /// on the response; the dispatcher itself never parks the request.
+    /// `webhook_url` and `expires_at` are validated on that path and
+    /// carried for a hook that does park, such as the Cedar MCP
+    /// `approval:` flow; the dispatcher posts no webhook of its own.
     ///
     /// Marked `#[non_exhaustive]` so future fields (priority, queue
     /// hint, audit binding) can be added without breaking external
@@ -388,8 +388,8 @@ pub enum PolicyDecision {
     #[non_exhaustive]
     Confirm {
         /// Human-readable summary of why approval is required, surfaced
-        /// in the confirmation portal and on the OSS
-        /// `X-Policy-Confirm` header.
+        /// in the confirmation portal and on the `X-Policy-Confirm`
+        /// header.
         reason: String,
         /// URL the proxy posts to when notifying the approver. `None`
         /// falls back to the tenant's default notification channel.
@@ -401,8 +401,7 @@ pub enum PolicyDecision {
 }
 
 impl PolicyDecision {
-    /// Construct a [`PolicyDecision::Confirm`] from the three OSS
-    /// fields.
+    /// Construct a [`PolicyDecision::Confirm`] from its three fields.
     ///
     /// `#[non_exhaustive]` blocks struct-literal construction of
     /// `Confirm` from outside the defining crate. This constructor
@@ -575,7 +574,7 @@ pub struct TransformContext<'a> {
 
 impl<'a> TransformContext<'a> {
     /// Convenience constructor for transforms that do not care about
-    /// hooks (tests, OSS code paths). Equivalent to
+    /// hooks (tests, in-tree call sites). Equivalent to
     /// `TransformContext { origin, hooks: None }`.
     pub fn new(origin: &'a str) -> Self {
         Self {

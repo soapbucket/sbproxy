@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Soap Bucket LLC
 
-//! Trait definitions for the storage shapes the OSS workspace
+//! Trait definitions for the storage shapes this workspace
 //! consumes.
 //!
 //! * [`EphemeralKv`] is the TTL-bounded key/value surface used by

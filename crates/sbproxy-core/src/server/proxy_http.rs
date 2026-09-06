@@ -5149,7 +5149,7 @@ impl ProxyHttp for SbProxy {
         // severity earns, published as a typed `anomaly` decision
         // record, and folded into the per-tenant reputation score that
         // `proxy.anomaly.reputation.deny_below` reads at request time.
-        // `install` registers the built-in detector in the OSS binary,
+        // `install` registers the built-in detector in this binary,
         // so this loop is not empty unless `proxy.anomaly` is off. A
         // plugin can still register a detector of its own, and its
         // verdicts take the same path.
@@ -5587,7 +5587,7 @@ impl ProxyHttp for SbProxy {
         //
         // Every `Policy::Plugin` enforcer that returned
         // `PolicyDecision::AllowWithHeaders` (or whose `Confirm`
-        // verdict the OSS bridge translated to AllowWithHeaders
+        // verdict the bridge translated to AllowWithHeaders
         // with `X-Policy-Confirm` stamped) pushed onto
         // `ctx.policy_response_headers`. Drain the slot here so
         // the headers land on the outgoing response in chain
@@ -9025,7 +9025,7 @@ impl ProxyHttp for SbProxy {
         // approximation of the audio time forwarded. Frame-exact
         // audio metering would require terminating the WebSocket
         // (not transparent forwarding); the duration approximation
-        // is the right OSS-v1 substitute since the session
+        // is the right v1 substitute since the session
         // lifetime IS the audio call.
         if let Some(rd) = take_accepted_realtime_dispatch(&mut ctx.ai_realtime_dispatch, status_u16)
         {
@@ -9179,7 +9179,7 @@ impl ProxyHttp for SbProxy {
         // for "no resolution attempted" (legacy dashboards aggregating
         // by hostname / method / status keep working unchanged).
         //
-        // `payment_rail` is left empty in OSS until the rail-resolver
+        // `payment_rail` is left empty until the rail-resolver
         // lands (the existing `ai_provider` field on the context is
         // close but not the same vocabulary). `content_shape` is the
         // response shape; populating it requires a response-time
@@ -9393,7 +9393,7 @@ impl ProxyHttp for SbProxy {
         // filtered by status / method, then sampled. Each emit produces
         // one JSON line via the `access_log` tracing target. F2.11 will
         // build richer filter and sampling primitives on top of this; F2.12
-        // will introduce enterprise sinks (S3, Kafka, Datadog).
+        // will introduce additional sinks (S3, Kafka, Datadog).
         emit_access_log(session, ctx, status_u16, &method, &hostname, duration);
 
         // WOR-1496: per-attribution AI request outcome. Recorded once
@@ -9527,7 +9527,7 @@ impl ProxyHttp for SbProxy {
         // --- T4.6 envelope dispatch ---
         //
         // Build the terminal RequestEvent and hand it to the
-        // registered RequestEventSink. The OSS default is a no-op
+        // registered RequestEventSink. The default is a no-op
         // sink, so this pays one OnceLock load + an early return when
         // no sink has been wired. `request_events.sink: nats` and
         // `: clickhouse` register the two network sinks in

@@ -3,13 +3,13 @@
 //! This is the piece that makes deploying a classifier sidecar (minimal or
 //! rich) genuinely optional, per WOR-2661's rule that a sidecar process a
 //! deployment must run and keep running is the same category of hard
-//! dependency as an external database: nothing in this OSS workspace may
+//! dependency as an external database: nothing in this workspace may
 //! require one to be up.
 //!
 //! [`FallbackClassifier`] wraps an *optional* [`ClassifierClient`] and a
 //! caller-supplied [`InProcessClassifier`]:
 //!
-//! - No sidecar configured at all (the common OSS case: an operator who
+//! - No sidecar configured at all (the common case: an operator who
 //!   never deploys one): every call goes straight to the in-process
 //!   classifier. No connection is ever attempted.
 //! - A sidecar is configured but unreachable, times out, or returns a
@@ -276,7 +276,7 @@ pub struct FallbackClassifier<F> {
 
 impl<F: InProcessClassifier> FallbackClassifier<F> {
     /// Build a fallback classifier. `sidecar` is `None` when the operator
-    /// has not configured one at all (the common OSS case); `model` is the
+    /// has not configured one at all (the common case); `model` is the
     /// logical model id requested from the sidecar's `Classify` RPC (empty
     /// selects the sidecar's default).
     pub fn new(sidecar: Option<ClassifierClient>, model: impl Into<String>, inprocess: F) -> Self {
@@ -358,7 +358,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_sidecar_configured_uses_in_process_directly() {
-        // The common OSS case: an operator who never deploys a sidecar at
+        // The common case: an operator who never deploys a sidecar at
         // all must still get full classification via the existing
         // in-process path, with no network attempted.
         let calls = Arc::new(AtomicUsize::new(0));

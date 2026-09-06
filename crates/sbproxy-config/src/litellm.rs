@@ -408,7 +408,7 @@ pub fn translate_litellm(input: &str) -> Result<LitellmTranslation> {
     }
 
     // general_settings: master_key / database_url drive proxy auth + the
-    // (enterprise) key store, which have no direct config translation.
+    // LiteLLM key store, which have no direct config translation.
     if cfg.general_settings.master_key.is_some() {
         warn_account(
             &mut warnings,
@@ -425,8 +425,8 @@ pub fn translate_litellm(input: &str) -> Result<LitellmTranslation> {
             &mut warnings,
             &mut key_accounts,
             "general_settings.database_url",
-            "general_settings.database_url maps to the runtime key/spend store \
-             (enterprise); not emitted"
+            "general_settings.database_url is not needed: the runtime key/spend store \
+             is built in (`proxy.key_management.store`); not emitted"
                 .to_string(),
             Disposition::Warned,
         );

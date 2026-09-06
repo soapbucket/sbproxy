@@ -44,7 +44,7 @@ use crate::context::RequestContext;
 /// `workspace_id` feeds the T2.3 / T3.3 budget gate inside the
 /// observe layer (cap on auto-generated session IDs and user IDs per
 /// workspace per window). Pass [`DEFAULT_WORKSPACE_ID`] for
-/// single-tenant OSS deployments.
+/// single-tenant deployments.
 ///
 /// Drop counters from the helpers are not surfaced here; the
 /// dispatching counter wire-up lives in a follow-up slice that hooks
@@ -67,9 +67,9 @@ pub fn capture_dimensions(
 ) {
     // Mint the envelope's ULID alongside the existing UUID-based
     // ctx.request_id. The UUID continues to feed the correlation
-    // header / webhook envelopes / access logs (callers depend on its
-    // 32-hex format); the ULID feeds the capture envelope which the
-    // enterprise ingest pipeline consumes verbatim.
+    // header / webhook envelopes / access logs (callers depend on
+    // its 32-hex format); the ULID feeds the capture envelope
+    // which the configured ingest sink consumes verbatim.
     if ctx.envelope_request_id.is_none() {
         ctx.envelope_request_id = Some(Ulid::new());
     }
@@ -179,17 +179,17 @@ pub fn capture_dimensions(
     );
 }
 
-/// Default workspace identifier used by single-tenant OSS deployments.
-/// Enterprise deployments override this via per-origin config (a
+/// Default workspace identifier used in single-tenant deployments.
+/// Multi-tenant deployments override this via per-origin config (a
 /// follow-up slice plumbs the override through `sb.yml`).
 pub const DEFAULT_WORKSPACE_ID: &str = "default";
 
 /// Build the terminal `RequestEvent` from collected context state and
 /// hand it to the registered [`sbproxy_observe::RequestEventSink`].
 ///
-/// Called from `server::logging` after status, latency, and error
-/// state are known. When no sink has been registered, dispatch is a
-/// no-op (the OSS default); enterprise startup wires a real sink.
+/// Called from `server::logging` after status, latency, and error state
+/// are known. When no sink has been registered, dispatch is a no-op by
+/// default; a configured deployment wires a real sink at startup.
 ///
 /// `error_class` is supplied by the caller when the request
 /// terminated with an error so the consumer can route by failure mode

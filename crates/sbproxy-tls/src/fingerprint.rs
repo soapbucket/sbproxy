@@ -116,7 +116,7 @@ pub struct TlsFingerprint {
     /// but currently leaves the inbound path's value as `None`:
     /// the raw TCP options block is not surfaced by Pingora 0.8's
     /// `Session` abstraction. A future `compute_ja4t` helper will
-    /// ship alongside the listener-level capture (or an enterprise
+    /// ship alongside the listener-level capture (or a configured
     /// sidecar that observes the SYN) so callers can populate the
     /// field without re-walking the FoxIO format.
     //
@@ -132,7 +132,7 @@ pub struct TlsFingerprint {
     //   module and populate the field from the listener's accept
     //   callback in `crates/sbproxy-core/src/server.rs`.
     // - Trusted-proxy header alternative: a SYN-observing sidecar
-    //   (per-deployment, not OSS) can stamp a `X-Sbproxy-JA4T:` header
+    //   (configured per deployment) can stamp a `X-Sbproxy-JA4T:` header
     //   the proxy reads and assigns here. The sidecar's plaintext
     //   header MUST only be honoured on the trusted-proxy CIDR
     //   allowlist (see `TrustedProxyCIDRs` in `request_phase.rs`),

@@ -897,10 +897,10 @@ fn check_threads_agent_id_into_quote_token_sub_claim() {
 
 #[test]
 fn check_falls_back_to_unknown_when_agent_id_is_none() {
-    // Backward-compat: pre-G1.4 callers (and OSS-default builds that
-    // ship without the agent-class feature) pass None and the policy
-    // stamps the Wave 1 `"unknown"` placeholder so the JWS issue path
-    // never signs an empty sub.
+    // Backward-compat: pre-G1.4 callers (and builds without the
+    // `agent-class` feature enabled) pass None and the policy stamps
+    // the Wave 1 `"unknown"` placeholder so the JWS issue path never
+    // signs an empty sub.
     let policy = multi_rail_policy(1000);
     let headers = multi_rail_headers("GPTBot/1.0", Some("x402"), None);
     let AiCrawlDecision::MultiRail { body, .. } =
@@ -931,8 +931,8 @@ fn parse_accept_payment_q_value_ordering() {
 
 #[test]
 fn rail_lightning_serde_roundtrips_lowercase_token() {
-    // The enterprise-side Lightning BillingRail registers itself as
-    // `"lightning"`. The OSS Rail enum's wire form must match exactly
+    // The Lightning rail settlement wires registers itself as
+    // `"lightning"`. The `Rail` enum's wire form must match exactly
     // so multi-rail negotiation and `Accept-Payment` parsing line up.
     let serialised = serde_json::to_string(&Rail::Lightning).unwrap();
     assert_eq!(serialised, "\"lightning\"");

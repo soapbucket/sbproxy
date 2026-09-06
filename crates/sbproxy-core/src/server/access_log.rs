@@ -99,7 +99,7 @@ pub(super) fn agent_class_label(ctx: &RequestContext) -> &'static str {
 /// resolver chain treats as a miss and falls through to UA matching.
 ///
 /// Cache size honors `agent_classes.resolver.cache_size`; the default
-/// (10 000 entries) matches the OSS recommendation in the resolver
+/// (10 000 entries) matches the recommendation in the resolver
 /// docs.
 #[cfg(feature = "agent-class")]
 pub(super) fn install_agent_class_resolver(block: Option<&sbproxy_config::AgentClassesConfig>) {

@@ -485,7 +485,7 @@ const EXEMPT: &[Exemption] = &[
     },
     Exemption {
         file: "crates/sbproxy-federation/src/http_fetcher.rs",
-        reason: "The OpenID Federation trust-chain walk. Nothing in the OSS request path \
+        reason: "The OpenID Federation trust-chain walk. Nothing in the request path \
                  composes a chain today: `proxy.federation` serves this entity's own \
                  statement and does not fetch anyone else's, so there is no request whose \
                  trace these GETs could join. The row moves to INJECTS the day a live \

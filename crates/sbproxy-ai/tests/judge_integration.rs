@@ -1,4 +1,4 @@
-//! Integration tests for the OSS judge backend.
+//! Integration tests for the judge backend.
 //!
 //! The acceptance gate on WOR-202 names four scenarios this file
 //! covers using only the public `JudgeClient` API:

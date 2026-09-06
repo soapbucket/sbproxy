@@ -3,7 +3,7 @@ name = "sbproxy-k8s-operator"
 version.workspace = true
 edition = "2021"
 license.workspace = true
-description = "OSS Kubernetes operator scaffold for sbproxy. Reconciles SBProxy and SBProxyConfig CRDs into Deployments, Services, and ConfigMaps."
+description = "Kubernetes operator scaffold for sbproxy. Reconciles SBProxy and SBProxyConfig CRDs into Deployments, Services, and ConfigMaps."
 publish = false
 
 [lib]

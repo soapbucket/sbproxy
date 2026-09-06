@@ -32,7 +32,7 @@
 //!
 //! [`CompiledPipeline`]: crate::pipeline::CompiledPipeline
 
-/// Thin adapter over the current OSS mesh node and transport, plus the
+/// Thin adapter over the current mesh node and transport, plus the
 /// authenticated live-member capability evidence a mesh binding requires.
 pub(crate) mod mesh;
 /// Async Redis payloads, bounded atomic Lua indexes, health, and purge.

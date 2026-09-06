@@ -113,7 +113,7 @@ object_store = { workspace = true }
 
 # Embedded provider catalog: gzipped YAML at build time, decompressed
 # on first lookup. flate2 is the standard Rust gzip implementation;
-# serde_yaml is already in the workspace via the OSS config crate.
+# serde_yaml is already in the workspace via the `sbproxy-config` crate.
 flate2 = "1"
 serde_yaml.workspace = true
 

@@ -15,9 +15,8 @@
 //! `Policy::Plugin(_)` keeps its original trait object while dynamic
 //! bundle execution metadata is retained beside the compiled enforcer.
 //!
-//! See `docs/policy.md` and
-//! `docs/phase0-oss-implementation-plan.md` Item 1 for the larger
-//! plan.
+//! See `docs/policy.md` for the policy engine this dispatch point
+//! feeds.
 
 pub mod a2a;
 pub mod agent_budget;

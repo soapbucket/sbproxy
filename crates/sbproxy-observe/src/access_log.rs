@@ -281,9 +281,8 @@ pub struct AccessLogEntry {
     pub properties: BTreeMap<String, String>,
 
     // --- Routing + behavior ---
-    /// Tenant / workspace owner. Stays empty for the OSS single-tenant
-    /// default workspace; enterprise multi-tenant deployments stamp
-    /// the resolved tenant.
+    /// Tenant / workspace owner. Stays empty for the single-tenant
+    /// default workspace.
     #[serde(skip_serializing_if = "String::is_empty", default)]
     pub workspace_id: String,
     /// WOR-1053: tenant resolved from `origin.tenant_id`. `__default__`

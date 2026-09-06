@@ -4,7 +4,7 @@
 //! Transport adapter: a generic sink for completed
 //! [`crate::request_event::RequestEvent`] values.
 //!
-//! The OSS build ships a [`NoopSink`] default, a [`LoggingSink`] that
+//! The build ships a [`NoopSink`] default, a [`LoggingSink`] that
 //! emits each event as a structured `tracing` log line, and a
 //! [`FileEventSink`] that appends NDJSON off the request path. Which
 //! one runs is chosen by the top-level `request_events:` config block
@@ -23,7 +23,7 @@
 //!
 //! [`dispatch_request_event`] is the call site used by the request
 //! pipeline (`sbproxy-core::server::logging`). When no sink has been
-//! registered, dispatch is a no-op; OSS users who do not opt in pay
+//! registered, dispatch is a no-op; users who do not opt in pay
 //! nothing.
 //!
 //! ## Drop accounting
@@ -81,7 +81,7 @@ pub trait RequestEventSink: Send + Sync {
     fn publish(&self, event: RequestEvent);
 }
 
-/// The default OSS sink. Drops every event silently. Acts as the
+/// The default sink. Drops every event silently. Acts as the
 /// implicit no-op when no other sink has been registered.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopSink;
@@ -93,7 +93,7 @@ impl RequestEventSink for NoopSink {
 }
 
 /// A sink that emits each event as a single structured `tracing` log
-/// line under the `request_event` target. Useful for OSS deployments
+/// line under the `request_event` target. Useful for deployments
 /// that want event visibility without standing up a broker, and for
 /// debugging the capture path.
 #[derive(Debug, Default, Clone, Copy)]
@@ -270,7 +270,7 @@ pub fn set_request_event_sink(sink: Arc<dyn RequestEventSink>) -> Result<(), &'s
 /// Hand a completed `RequestEvent` to the registered sink, and to the
 /// `events:` egress when one selects its lifecycle type.
 ///
-/// With neither configured (the OSS default) this is two relaxed atomic
+/// With neither configured (the default) this is two relaxed atomic
 /// loads and nothing else.
 ///
 /// The two consumers are deliberately independent. `request_events:` is

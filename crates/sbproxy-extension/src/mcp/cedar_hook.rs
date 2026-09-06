@@ -3,8 +3,8 @@
 
 //! Cedar-backed built-in [`McpPolicyHook`] (WOR-2587).
 //!
-//! [`CedarMcpHook`] is the OSS `McpPolicyHook` implementation backed
-//! by the Cedar policy engine ported in WOR-2585
+//! [`CedarMcpHook`] is the built-in `McpPolicyHook` implementation
+//! backed by the Cedar policy engine ported in WOR-2585
 //! (`crate::cedar::CedarEvaluator`). It runs on the exact seam every
 //! `McpPolicyHook` runs on:
 //! `McpFederation::call_tool_with_upstream_headers_from_snapshot` ->
@@ -37,9 +37,9 @@
 //! ## Entity construction
 //!
 //! Every `tools/call` maps onto the default MCP schema
-//! (`crates/sbproxy-extension/data/mcp-schema.cedar`) the same way the
-//! enterprise WOR-152 translator does, so a workspace can share Cedar
-//! policy text across both tiers:
+//! (`crates/sbproxy-extension/data/mcp-schema.cedar`) the same way
+//! the WOR-152 translator it replaces did, so
+//! existing Cedar policy text keeps working unchanged:
 //!
 //! - principal: `Agent::"<agent_id>"`, or `Agent::"anonymous"` when
 //!   [`McpToolCallCtx::agent_id`] is `None`.
@@ -81,12 +81,12 @@ use crate::cedar::CedarEvaluator;
 
 /// Cedar entity id used for the principal when a `tools/call` carries
 /// no resolved agent identity. Matches the sentinel the enterprise
-/// WOR-152 translator standardised on, so a workspace can write one
-/// `forbid(principal == Agent::"anonymous", ...)` rule that means the
-/// same thing whether Cedar is running OSS or enterprise.
+/// WOR-152 translator standardised on, so a
+/// `forbid(principal == Agent::"anonymous", ...)` rule written
+/// against that convention still means the same thing here.
 const ANONYMOUS_AGENT_ID: &str = "anonymous";
 
-/// Built-in OSS [`McpPolicyHook`] backed by a compiled Cedar policy
+/// Built-in [`McpPolicyHook`] backed by a compiled Cedar policy
 /// set.
 ///
 /// Constructed once at config-load time from a workspace's

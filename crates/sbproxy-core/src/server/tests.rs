@@ -1945,10 +1945,10 @@ async fn hmac_auth_required_content_digest_admits_the_true_digest_and_refuses_th
 
 // --- Auth plugin dispatch tests ---
 //
-// These guard the OSS gap fixed in this commit: the
-// `Auth::Plugin(_)` arm of `check_auth` previously short-circuited
-// to `AuthResult::Allow`, which made every enterprise auth provider
-// (oauth jwks/introspection, biscuit, saml, ext_authz,
+// These guard the gap fixed in this commit: the `Auth::Plugin(_)`
+// arm of `check_auth` previously short-circuited to
+// `AuthResult::Allow`, which made every `Auth::Plugin` auth
+// provider (oauth jwks/introspection, biscuit, saml, ext_authz,
 // mcp_resource_server, ...) inert at request time. The arm now
 // dispatches into the boxed `AuthProvider` and translates the
 // returned `AuthDecision` into an `AuthResult`.
@@ -2725,7 +2725,7 @@ async fn header_bearing_denial_carrying_invalid_proof_reaches_the_suspicious_tie
 async fn plugin_authenticate_error_denies_with_500() {
     // A plugin that returns Err must NOT fall through to Allow;
     // the engine must surface a generic 500 deny so a flaky
-    // enterprise auth provider can never silently pass requests.
+    // plugin auth provider can never silently pass requests.
     let auth = sbproxy_modules::Auth::Plugin(Box::new(ErrorAuthProvider));
     let headers = http::HeaderMap::new();
 
@@ -2912,7 +2912,7 @@ async fn registered_auth_plugin_is_discoverable_by_name() {
 
 #[test]
 fn unknown_auth_plugin_name_is_rejected_at_compile_time() {
-    // Belt-and-braces check on the OSS guarantee: an unknown
+    // Belt-and-braces check on the guarantee: an unknown
     // `type:` value never produces an `Auth::Plugin(...)` at
     // request time. compile_auth errors before the pipeline ever
     // sees it, so `Auth::Plugin(name="<not registered>")` is
@@ -4604,8 +4604,8 @@ async fn anomaly_hook_registry_iterates_registered_hooks() {
 
 #[test]
 fn missing_hooks_are_no_op() {
-    // The pipeline already runs without registered hooks (the OSS
-    // build registers none). This test pins the contract: an empty
+    // The pipeline already runs without registered hooks (by default
+    // none are registered). This test pins the contract: an empty
     // registry returns Vec::new() / None and never panics.
     // Iteration over an empty Vec is a no-op.
     let identity = sbproxy_plugin::identity_hooks();

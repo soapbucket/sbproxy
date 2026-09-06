@@ -2,9 +2,9 @@
 //! return the most likely labels with scores.
 //!
 //! Ported from the enterprise `sbproxy-classifier` crate's `classify.rs`.
-//! The enterprise crate also carries an ONNX backend behind this same
+//! The enterprise crate also carried an ONNX backend behind this same
 //! facade, built on `ort` (Microsoft ONNX Runtime). This port drops that
-//! backend rather than porting it: the rest of this OSS workspace already
+//! backend rather than porting it: the rest of this workspace already
 //! standardizes on the pure-Rust `tract-onnx` runtime via
 //! `sbproxy_classifiers::OnnxClassifier` (used by the in-process detectors
 //! and by the minimal classifier sidecar), and pulling in `ort` as a second

@@ -11,7 +11,7 @@
 //!    binary.
 //! 2. **Embedded `ipinfo.mmdb`**: a build-time-bundled database at
 //!    `data/ipinfo.mmdb`, `include_bytes!`d into the binary. The
-//!    checked-in file in this OSS tree is a zero-byte sentinel; a
+//!    checked-in file in this repository is a zero-byte sentinel; a
 //!    distribution that wants a database ships one by replacing that
 //!    file (see the [IPinfo Lite free dataset](https://ipinfo.io/products/free-ip-database))
 //!    and rebuilding. `embedded_slice_is_a_zero_byte_sentinel` guards
@@ -339,10 +339,10 @@ mod tests {
 
     #[test]
     fn embedded_slice_is_a_zero_byte_sentinel() {
-        // This OSS checkout ships a 0-byte ipinfo.mmdb placeholder.
+        // This checkout ships a 0-byte ipinfo.mmdb placeholder.
         // A distribution that wants real geo data replaces this file
         // and rebuilds; this assertion guards against an accidental
-        // commit of that dataset into the OSS repository.
+        // commit of that dataset into this repository.
         assert_eq!(
             EMBEDDED_IPINFO_MMDB.len(),
             0,

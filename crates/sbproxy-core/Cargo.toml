@@ -221,7 +221,7 @@ bloomfilter.workspace = true
 # CIDR matching for trusted_proxies / X-Forwarded-For trust boundary
 ipnetwork.workspace = true
 
-# Enterprise hook registration (link-time plugin pattern)
+# Hook registration for linked plugin crates (link-time plugin pattern)
 inventory.workspace = true
 
 # Concurrency and data structures

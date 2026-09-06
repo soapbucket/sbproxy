@@ -3,8 +3,8 @@
 //! The [`policy`] submodule holds the [`WafPolicy`] struct itself,
 //! the OWASP-lite paranoia gate, the built-in signature corpus, and
 //! the custom-rule evaluator. The [`feed`] submodule subscribes the
-//! OSS proxy to a signed remote rule feed for hot-loaded signatures;
-//! the publisher side ships separately.
+//! proxy to a signed remote rule feed for hot-loaded signatures; the
+//! publisher side ships separately.
 
 pub mod bundle;
 pub mod feed;

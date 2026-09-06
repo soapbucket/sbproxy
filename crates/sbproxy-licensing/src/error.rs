@@ -4,11 +4,12 @@
 //! The set is scoped to what this crate can actually produce. OLP
 //! license-token *verification* (expiry, audience, route-glob,
 //! license-URN mismatch) is not one of them: that check already runs
-//! OSS-side against the CAP-protected request path (see
-//! `docs/glossary.md`'s OLP entry and `crates/sbproxy-modules/src/olp.rs`),
-//! and this crate only ever mints tokens in that same wire format, it
-//! never verifies one. A variant this crate cannot construct would be
-//! a guard narrower than its name.
+//! elsewhere in this workspace, against the CAP-protected request
+//! path (see `docs/glossary.md`'s OLP entry and
+//! `crates/sbproxy-modules/src/olp.rs`), and this crate only ever
+//! mints tokens in that same wire format, it never verifies one. A
+//! variant this crate cannot construct would be a guard narrower
+//! than its name.
 
 use thiserror::Error;
 

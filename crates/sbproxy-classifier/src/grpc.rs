@@ -11,7 +11,7 @@
 //!
 //! Implemented directly against `sbproxy_classifiers::{OnnxClassifier,
 //! OnnxEmbedder}`, the same tract-ONNX engine `sbproxy-classifier-sidecar`
-//! (the minimal OSS sidecar) uses, loaded from the same `--model` /
+//! (the minimal sidecar) uses, loaded from the same `--model` /
 //! `--embed-model` CLI flags. This is intentionally the thin half: the
 //! minimal sidecar already carries hardened per-RPC admission controls. The
 //! rich sidecar applies the same defense here: shared running/queued budgets
@@ -24,7 +24,7 @@
 //!
 //! `Quality` and `StreamSafety` are genuinely new capability with no
 //! `InferenceService` analog, so they get their own RPCs here. The rest of
-//! the enterprise-superset surface (multi-tenant heuristic classify,
+//! this crate's superset surface (multi-tenant heuristic classify,
 //! register/delete/list, intent/content-type detection) is served over the
 //! TCP MessagePack transport today; see `crate::tcp` and
 //! `docs/classifier-sidecar.md` for why.

@@ -1818,7 +1818,7 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         for key in crate::key_registry::configured_config_only_keys(&raw_yaml) {
             tracing::warn!(
                 config_key = key.path,
-                reason = key.note.unwrap_or("no live OSS consumer"),
+                reason = key.note.unwrap_or("no live consumer"),
                 "config-only key is set and does not activate runtime behavior"
             );
         }
@@ -9444,9 +9444,9 @@ origins:
 
     // --- Wave 5 / G5.1 KYA auth.type tests ---
     //
-    // The OSS config compiler stores `authentication` as an opaque
+    // The config compiler stores `authentication` as an opaque
     // `serde_json::Value`; runtime dispatch happens later in
-    // `sbproxy-modules::compile_auth`. The OSS compiler keeps the
+    // `sbproxy-modules::compile_auth`. The compiler keeps the
     // `kya` provider name reachable so an `sb.yml` carrying
     // `authentication.type: kya` compiles unchanged when a third-party
     // verifier plugin is wired through the `sbproxy-plugin` registry;
@@ -9497,7 +9497,7 @@ origins:
     fn parse_kya_authentication_minimal_compiles() {
         // Minimal config: only the required `type` and `issuers` array.
         // Defaults are filled in by the verifier at
-        // `KyaConfig::validate` time, not by the OSS compiler.
+        // `KyaConfig::validate` time, not by the compiler.
         let yaml = r#"
 origins:
   "kya-min.test":
@@ -9517,7 +9517,7 @@ origins:
     #[test]
     fn parse_kya_authentication_preserves_extra_fields() {
         // Operators may add forward-compat fields (e.g. `audit_sample_rate`)
-        // that the OSS compiler does not type-check. The opaque-value
+        // that the compiler does not type-check. The opaque-value
         // contract requires those fields to round-trip unchanged into
         // the snapshot so the verifier sees them.
         let yaml = r#"

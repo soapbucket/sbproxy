@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license.workspace = true
 publish = false
-description = "Minimal OSS classifier sidecar: serves the shared InferenceService gRPC contract backed by the tract ONNX engine (WOR-704)."
+description = "Minimal classifier sidecar: serves the shared InferenceService gRPC contract backed by the tract ONNX engine (WOR-704)."
 
 [[bin]]
 name = "sbproxy-classifier-sidecar"
