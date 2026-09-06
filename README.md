@@ -101,6 +101,14 @@ target/release/sbproxy --version
 
 [Documentation index](docs/README.md) groups the guides by first run, traffic type, operations, and reference material. The [`examples/`](examples/) directory contains complete configurations. For the configuration schema, use [configuration.md](docs/configuration.md); for the command surface, use [manual.md](docs/manual.md).
 
+## Related projects
+
+- [Homebrew tap](https://github.com/soapbucket/homebrew-tap): Homebrew packaging for SBproxy.
+- [Agentic security demo](https://github.com/soapbucket/agentic-security-demo): a Docker Compose walkthrough of agent detection, signed requests, and agent budgets.
+- [SBproxy Bench](https://github.com/soapbucket/sbproxy-bench): a shared benchmark harness for comparing HTTP proxies and AI gateways.
+- [ADRF specification](https://github.com/soapbucket/adrf-spec): the YAML format and schema for agent-detection rule packs.
+- [Pingora fork](https://github.com/soapbucket/pingora): Soap Bucket's fork of Cloudflare's proxy framework, used by SBproxy.
+
 ## Contributing and license
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the contributor workflow. SBproxy is released under [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) and [TRADEMARKS](TRADEMARKS.md).
