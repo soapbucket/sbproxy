@@ -1,6 +1,6 @@
 # Upgrade SBproxy
 
-*Last modified: 2026-08-30*
+*Last modified: 2026-09-05*
 
 Use this procedure for the Rust v1 release line. Upgrade a test or canary instance before the rest of a fleet, and keep the previous binary or image available until the new process has served traffic.
 
@@ -126,6 +126,8 @@ Release-specific behavior lives in [CHANGELOG.md](../CHANGELOG.md). These surfac
 What follows is not the changelog; it is the subset that changes behavior under an existing config, refuses a config that used to load, or moves a metric label a dashboard might key on. Skipping versions compounds the list: upgrading 1.9.0 to 1.13.0 means reading every section below.
 
 ### Unreleased
+
+- **Misplaced origin fields now reject the config.** v1.14.0 refused thirteen legacy keys at the root but still dropped other origin fields, including `auth`, `transforms`, and `threat_protection`. The refusal now covers every misplaced origin field and YAML alias, along with legacy `hostname` and `ai_proxy`. Run `sbproxy validate` with the target binary and move the named blocks under `origins.<hostname>:`. Metadata such as `id` and `config_version` continues to warn. See [MIGRATION.md](../MIGRATION.md#config-file-shape).
 
 - **For out-of-tree plugin authors only: a linked plugin returning `ActionOutcome::Responded` now gets a `501` on the wire.** The variant is the 0.2 signal that the handler already wrote a response through host state, and no host state a linked `ActionHandler` reaches writes one. HTTP/1.1 and HTTP/2 previously marked the request served and sent nothing, so the client saw an empty exchange and the access log had no status; HTTP/3 already answered `501`. All three now answer `501 Not Implemented` with an `application/json` body carrying the stable `unsupported_action_outcome` reason, tick `sbproxy_errors_total{error_type="unsupported_action_outcome"}`, and publish a `request_error` event. Nothing on the wire worked before, so no functioning deployment changes behavior; return `ActionOutcome::Response { status, headers, body }` instead.
 

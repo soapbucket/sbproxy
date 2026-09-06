@@ -1712,43 +1712,48 @@ fn validate_compression_state_local_path(path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Flat schema-v1 top-level keys that carry a single origin's behavior.
-///
-/// The Go `v0.1.x` line wrote one origin's behavior at the top level of
-/// the file. This line reads origin behavior only from
-/// `origins.<hostname>:` and never translated the flat shape into it,
-/// so each of these used to be dropped with a warning while the proxy
-/// booted with no origin at all.
-///
-/// The evidence is the three archived fixtures under
-/// `crates/sbproxy-config/tests/v1-compat-fixtures/`, which came from
-/// `sbproxy-go`'s own `v0.1.2` `tests/config-compat` suite. Twelve of
-/// the thirteen appear there. `ai_proxy` is the exception and no fixture
-/// exercises it; it is listed because it names an AI gateway origin the
-/// same way the others name a proxy one, so a flat file carrying it
-/// would fail open identically, and a list narrower than the failure it
-/// exists to stop is worse than no list.
-///
-/// The descriptive metadata those same files carry (`config_version`,
-/// `id`, `workspace_id`, `version`, `environment`, `tags`, `debug`) is
-/// deliberately absent: dropping it changes nothing, so it stays on
-/// WOR-1140's warn-on-unknown-top-level-key path, which is unrelated to
-/// the Go deprecation and has to survive it.
-const FLAT_SCHEMA_V1_BEHAVIOR_KEYS: &[&str] = &[
-    "action",
-    "ai_proxy",
-    "allowed_methods",
-    "authentication",
-    "cors",
-    "force_ssl",
-    "forward_rules",
-    "hostname",
-    "policies",
-    "request_modifiers",
-    "response_modifiers",
-    "session",
-    "variables",
-];
+/// Capture the names accepted by Serde without constructing an origin or
+/// parsing field values. The derived list includes aliases as well as fields.
+struct OriginFieldNames<'a>(&'a mut Option<&'static [&'static str]>);
+
+impl<'de> serde::Deserializer<'de> for OriginFieldNames<'_> {
+    type Error = serde::de::value::Error;
+
+    fn deserialize_any<V>(self, _visitor: V) -> std::result::Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        Err(serde::de::Error::custom("expected an origin struct"))
+    }
+
+    fn deserialize_struct<V>(
+        self,
+        _name: &'static str,
+        fields: &'static [&'static str],
+        _visitor: V,
+    ) -> std::result::Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        *self.0 = Some(fields);
+        // Stop before visiting any values; only the static field list is needed.
+        Err(serde::de::Error::custom("origin fields captured"))
+    }
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+        bytes byte_buf option unit unit_struct newtype_struct seq tuple
+        tuple_struct map enum identifier ignored_any
+    }
+}
+
+fn origin_config_field_names() -> Result<&'static [&'static str]> {
+    let mut fields = None;
+    let _ = <RawOriginConfig as serde::Deserialize>::deserialize(OriginFieldNames(&mut fields));
+    // Refuse compilation if the origin stops using deserialize_struct rather
+    // than silently weakening misplaced-field detection after a schema change.
+    fields.context("config compile: cannot inspect origin configuration fields")
+}
 
 /// Compile a raw YAML config string into a `CompiledConfig`.
 ///
@@ -1949,20 +1954,27 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
     //
     // Then the top-level remainder by whether dropping the key changes
     // behavior (WOR-2706). The archived Go `v0.1.x` schema was a flat
-    // single-origin file whose keys all sit at the TOP level, and it is
-    // two different kinds of key at once. `hostname`, `action`,
-    // `authentication`, `policies` and their siblings ARE the origin;
-    // dropping them boots a proxy with nothing configured that answers
-    // 404 for the hostname the file declares, which is why they are
-    // refused rather than warned about. `config_version`, `id`,
-    // `workspace_id` and the rest are descriptive, so they keep WOR-1140's
+    // single-origin file whose keys all sit at the TOP level. Derive the
+    // origin fields and aliases from Serde so partially migrated files cannot
+    // retain misplaced authentication or other protection blocks that would
+    // be dropped. Recognized ConfigFile fields have already been consumed and
+    // keep their root meaning even when an origin accepts the same name.
+    // `config_version`, `id`, `workspace_id` and the rest are descriptive,
+    // so they keep WOR-1140's
     // warning: that behavior predates the Go deprecation, is what catches
     // an ordinary top-level typo, and is unrelated to this split.
     let (nested_unknowns, top_unknowns): (Vec<String>, Vec<String>) =
         unknown_keys.into_iter().partition(|k| k.contains('.'));
-    let (mut flat_v1_behavior, top_unknowns): (Vec<String>, Vec<String>) = top_unknowns
-        .into_iter()
-        .partition(|k| FLAT_SCHEMA_V1_BEHAVIOR_KEYS.contains(&k.as_str()));
+    let origin_fields = origin_config_field_names()?;
+    let (mut flat_v1_behavior, top_unknowns): (Vec<String>, Vec<String>) =
+        top_unknowns.into_iter().partition(|key| {
+            origin_fields
+                .iter()
+                // These legacy names are represented by the origins map key
+                // and an action type, not by modern RawOriginConfig fields.
+                .chain(["hostname", "ai_proxy"].iter())
+                .any(|field| key.eq_ignore_ascii_case(field))
+        });
     if !top_unknowns.is_empty() {
         tracing::warn!(
             keys = %top_unknowns.join(", "),
@@ -1980,8 +1992,8 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
              behavior: {}. The archived Go `v0.1.x` line wrote one origin's behavior at the top \
              level of the file. That shape is deprecated and is not translated: this binary \
              reads origin behavior only from `origins.<hostname>:`, so every key above would be \
-             dropped and the proxy would boot with no origin configured, answering 404 for the \
-             hostname the file declares while `sbproxy validate` called the same file valid. An \
+             dropped and the proxy would boot without those settings, even if other blocks \
+             were already moved into an `origins:` map. An \
              `authentication:` or IP allow-list block lost that way leaves the proxy open, so \
              boot is rejected instead. Move the block under `origins:` as described in \
              `MIGRATION.md`, or keep running the Go binary from the archived \
