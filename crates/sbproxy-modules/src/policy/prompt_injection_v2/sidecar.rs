@@ -2,8 +2,9 @@
 //!
 //! Routes detection to the out-of-process classifier sidecar over gRPC
 //! instead of running ONNX inference inside the proxy. The sidecar is any
-//! out-of-tree implementation of the shared `InferenceService` contract,
-//! from a minimal reference build to a fuller one; this detector owns one
+//! implementation of the shared `InferenceService` contract; this
+//! workspace builds two, `sbproxy-classifier-sidecar` (minimal) and
+//! `sbproxy-classifier` (rich), and this detector owns one
 //! lazily-connected client and maps its response onto the v2 label
 //! vocabulary, reusing the ONNX detector's score cutoffs so the two report
 //! identically. The gRPC channel is built on the first `detect` call, not

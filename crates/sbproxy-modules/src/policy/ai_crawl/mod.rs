@@ -725,11 +725,11 @@ impl AiCrawlControlPolicy {
             // "never seen" from "already consumed". Errors here are
             // logged (best-effort) but do not abort the response.
             //
-            // Thread the real route / rail / currency through; persistence
-            // backends (an out-of-tree Postgres-backed implementation)
-            // stamp these on the `quote_tokens` audit row so a recovery
-            // query can group replay attempts by route at the price
-            // they were issued at.
+            // Thread the real route / rail / currency through; a store
+            // that keeps an audit row stamps these on it so a recovery
+            // query can group replay attempts by route at the price they
+            // were issued at. Neither store here keeps one, so this is the
+            // seam rather than a live write.
             let _ = plan.nonce_store.register_with_context(
                 &issued.claims.nonce,
                 super::quote_token::NonceContext::new(path, rail_name, &price.currency),

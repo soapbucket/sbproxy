@@ -41,8 +41,9 @@
 //!
 //! This ships the chain, signing, and local verification. Anchoring
 //! receipts to an external transparency log or a portal is not
-//! implemented here; an out-of-tree `UsageSink` implementation can
-//! consume the same entries to add it.
+//! implemented. [`crate::usage_sink::UsageSink`] is the seam that would
+//! carry it, and this crate already ships several sinks against it
+//! (`JsonlFileSink`, `WebhookSink`, `LangfuseSink`).
 //!
 //! ## Reconciling against a provider's own usage export (WOR-2476)
 //!

@@ -293,8 +293,8 @@ mod tests {
     use std::sync::Mutex;
 
     /// The default no-op hook returns `Allow` for any context shape.
-    /// This pins the default contract: with no hook crates linked,
-    /// the federation forwards every `tools/call`.
+    /// This pins the default contract: when no hook decides, the
+    /// federation forwards every `tools/call`.
     #[tokio::test]
     async fn no_op_hook_returns_allow() {
         let hook = default_no_op_hook();

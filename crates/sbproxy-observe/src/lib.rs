@@ -68,9 +68,11 @@ pub mod otlp_logs;
 pub mod redact;
 /// P0 `RequestEvent` envelope shared by the four streams.
 pub mod request_event;
-/// Generic transport adapter: a global sink for
-/// completed `RequestEvent` values. Default no-op; an out-of-tree
-/// deployment can register its own `RequestEventSink` implementation.
+/// Generic transport adapter: a global sink for completed
+/// `RequestEvent` values. Dispatch is a no-op until a sink is
+/// installed, and none is by default. This module ships `NoopSink`,
+/// `LoggingSink` and a file sink; the proxy installs one when the
+/// operator selects it.
 pub mod request_sink;
 /// WOR-1186 session ledger: per-tool-call run records emitted from the
 /// live MCP traffic path, conforming to the canonical mcptest

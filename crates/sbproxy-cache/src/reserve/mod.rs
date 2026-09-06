@@ -145,10 +145,10 @@ impl ReserveMetadata {
 /// emission outside the backend so the backend itself only has to
 /// answer "store this", "fetch this", "drop this".
 ///
-/// An out-of-tree implementation registers its backend through
-/// `Arc<dyn CacheReserveBackend>`, so this trait is the only stable
-/// surface for that integration. Renaming or breaking it is a
-/// semver-major change.
+/// The four backends above implement it, and anything else registers
+/// through the same `Arc<dyn CacheReserveBackend>`, so this trait is the
+/// only stable surface for that integration. Renaming or breaking it is
+/// a semver-major change.
 #[async_trait]
 pub trait CacheReserveBackend: Send + Sync {
     /// Persist `value` (and its metadata) under `key`. Returning `Ok`

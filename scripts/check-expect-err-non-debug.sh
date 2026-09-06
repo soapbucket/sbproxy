@@ -45,6 +45,19 @@
 # check exists to catch. `r"`, `r#"` and `r##"` openers are tracked
 # across lines; a plain literal's `\"` escapes are honoured.
 #
+# One shape is known to get past this and is left that way on purpose: a
+# plain (non-raw) string literal spanning several lines. Raw openers are
+# carried across records, plain ones are walked only to end of line, so
+# on a continuation line the closing quote reads as an opening one and a
+# `;` after it ends the statement early. Every guarded call site in the
+# tree today writes single-line strings with `\n` escapes, so this is
+# latent rather than live. Carrying plain literals across records too
+# would mean one stray quote, in a comment or a `'\"'` char literal,
+# swallowing the rest of a file, and this check's failure mode for that
+# is a silent miss, which is the thing it exists to prevent. A fixture
+# is cheaper than a wrong stripper: if a multi-line plain literal ever
+# lands on one of these call sites, handle it then, with a test.
+#
 # # What a grep cannot see
 #
 # It does not resolve types, so it cannot see a test helper that wraps

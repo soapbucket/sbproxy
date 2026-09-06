@@ -931,7 +931,7 @@ fn parse_accept_payment_q_value_ordering() {
 
 #[test]
 fn rail_lightning_serde_roundtrips_lowercase_token() {
-    // An out-of-tree Lightning BillingRail registers itself as
+    // The Lightning rail settlement wires registers itself as
     // `"lightning"`. The `Rail` enum's wire form must match exactly
     // so multi-rail negotiation and `Accept-Payment` parsing line up.
     let serialised = serde_json::to_string(&Rail::Lightning).unwrap();

@@ -8357,8 +8357,8 @@ pub(super) async fn handle_mcp_action(
                                 );
 
                                 // WOR-508: bridge the prompt-linked audit
-                                // inputs to an out-of-tree audit consumer
-                                // over the `mcp_audit` tracing target.
+                                // inputs to a subscriber on the
+                                // `mcp_audit` tracing target.
                                 if let Some(cap) = mcp_audit_capture {
                                     emit_mcp_prompt_audit(
                                         ctx,
@@ -9142,7 +9142,7 @@ struct LedgerCapture {
 /// the captured inputs and the call outcome. Identity (session, agent)
 /// comes off `ctx`; payload redaction happens inside `emit_tool_call`.
 /// WOR-508: inputs captured before `arguments` is moved into the tool
-/// call, used by an out-of-tree audit consumer to build the
+/// call, used by a subscriber on the `mcp_audit` target to build the
 /// prompt-linked audit envelope.
 /// WOR-2473: the `mcp_audit` line this feeds IS emitted under stock
 /// config; the default root filter is `info` and there is no per-target
@@ -9168,9 +9168,9 @@ struct McpAuditCapture {
 
 /// WOR-508: emit a structured event on the `mcp_audit` tracing target
 /// carrying the prompt-linked tool-call fields an audit subscriber
-/// needs to correlate a call with the prompt that caused it. This proxy
-/// cannot depend on an out-of-tree audit crate, so the bridge is a
-/// tracing event.
+/// needs to correlate a call with the prompt that caused it. Nothing in
+/// this workspace subscribes to that target, so the bridge is a tracing
+/// event rather than a direct call.
 /// WOR-2473: this line is emitted under stock config, so the prompt
 /// and tool arguments are represented here only as a SHA-256 digest
 /// prefix and a length; the raw values never reach this event.
