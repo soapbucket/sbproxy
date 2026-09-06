@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
-use std::net::{TcpListener, UdpSocket};
+use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -709,15 +709,67 @@ fn partitioned_worker_is_called_out(
         })
 }
 
-fn wait_for_tcp_port_to_release(port: u16, label: &str) {
+// A bind probes address availability, which can also be affected by another
+// socket using the port. Shutdown needs to prove that the listener is gone.
+// Only an explicit refusal proves closure; a timeout or other error does not.
+fn tcp_listener_closed(port: u16) -> std::io::Result<()> {
+    let address = ([127, 0, 0, 1], port).into();
+    match TcpStream::connect_timeout(&address, Duration::from_millis(100)) {
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => Ok(()),
+        Err(error) => Err(error),
+        Ok(_) => Err(std::io::Error::other("listener still accepts connections")),
+    }
+}
+
+#[test]
+fn tcp_shutdown_probe_distinguishes_listening_and_closed_sockets() -> Result<()> {
+    use std::io::Write;
+
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    listener.set_nonblocking(true)?;
+    assert!(tcp_listener_closed(port).is_err());
+    // Consume the successful probe before exercising a real server-side close.
+    drop(listener.accept()?.0);
+    let mut connection = TcpStream::connect(("127.0.0.1", port))?;
+    connection.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let (mut accepted, _) = listener.accept()?;
+    accepted.write_all(b"closed")?;
+    drop(accepted);
+    drop(listener);
+    let mut response = Vec::new();
+    connection.read_to_end(&mut response)?;
+    assert_eq!(response, b"closed");
+    tcp_listener_closed(port)?;
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn tcp_shutdown_probe_accepts_a_bound_socket_without_a_listener() -> Result<()> {
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    socket.set_reuseaddr(false)?;
+    socket.bind(([127, 0, 0, 1], 0).into())?;
+    let address = socket.local_addr()?;
+    // A non-listening socket can prevent rebinding without accepting traffic.
+    // This is the ambiguity in the old shutdown assertion.
+    // Linux refuses this connection; Darwin times it out, which the probe
+    // deliberately does not accept as evidence of closure.
+    assert!(TcpListener::bind(address).is_err());
+    tcp_listener_closed(address.port())?;
+    Ok(())
+}
+
+fn wait_for_tcp_listener_to_close(port: u16, label: &str) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+        let observation = tcp_listener_closed(port);
+        if observation.is_ok() {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "{label} TCP port {port} did not release"
+            "{label} TCP port {port} did not refuse connections: {observation:?}"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -726,15 +778,27 @@ fn wait_for_tcp_port_to_release(port: u16, label: &str) {
 fn wait_for_ports_to_release(nodes: &[NodeSpec]) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let released = nodes.iter().all(|node| {
-            UdpSocket::bind(("127.0.0.1", node.gossip_port)).is_ok()
-                && TcpListener::bind(("127.0.0.1", node.transport_port)).is_ok()
-                && TcpListener::bind(("127.0.0.1", node.admin_port)).is_ok()
+        let observations = nodes
+            .iter()
+            .map(|node| {
+                (
+                    node.node_id,
+                    UdpSocket::bind(("127.0.0.1", node.gossip_port)).map(drop),
+                    tcp_listener_closed(node.transport_port),
+                    tcp_listener_closed(node.admin_port),
+                )
+            })
+            .collect::<Vec<_>>();
+        let released = observations.iter().all(|(_, gossip, transport, admin)| {
+            gossip.is_ok() && transport.is_ok() && admin.is_ok()
         });
         if released {
             return;
         }
-        assert!(Instant::now() < deadline, "cluster ports did not release");
+        assert!(
+            Instant::now() < deadline,
+            "cluster sockets did not close (node, gossip, transport, admin): {observations:?}"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -1035,7 +1099,7 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
         .terminate_gracefully(Duration::from_secs(5))
         .context("gracefully stop assigned worker")?;
     drop(failed_process);
-    wait_for_tcp_port_to_release(engine_port, "managed engine child");
+    wait_for_tcp_listener_to_close(engine_port, "managed engine child");
     let surviving_admin_ports = nodes
         .iter()
         .filter(|node| node.node_id != failed_node_id)
