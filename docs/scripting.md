@@ -1,8 +1,8 @@
 # SBproxy scripting reference: CEL, Rego, Lua, JavaScript, and WASM
 
-*Last modified: 2026-08-29*
+*Last modified: 2026-09-05*
 
-SBproxy includes five scripting engines for custom logic: CEL (Common Expression Language), Rego (via Regorus), Lua, JavaScript, and WASM. All run in sandboxed environments with access to request context.
+SBproxy includes five scripting engines for custom logic: CEL (Common Expression Language), Rego (via Regorus), Lua, JavaScript, and WASM. The available request context depends on the configuration field; a WASM body transform receives it only with `request_context: true`.
 
 | Engine | Implementation | Best for |
 |--------|----------------|----------|
@@ -66,6 +66,8 @@ CEL expressions that come from `sb.yml` are parsed once, while the config compil
 | `federated_servers[] type: local`, `response:` | Template, JavaScript, or Lua | Shapes the tool result from `ctx = {args, steps}`, in the same sandboxes the response-cache events run in ([mcp-compose.md](mcp-compose.md)) |
 | `tool_versioning` per-version `adapter` | JavaScript | Adapts a caller pinned to an old tool version onto the current contract ([tool-versioning.md](tool-versioning.md)) |
 | Extension AI and payment hooks | JavaScript, envelope WASM, or Proxy-Wasm for AI streaming | Receives provider-neutral, credential-free events through versioned contracts |
+
+For Cedar authorization on federated MCP `tools/call`, including operator confirmation and offline replay, see [Cedar policy](cedar-policy.md). Its entity and context limits differ from the CEL and Rego MCP policies above.
 
 Two AI-gateway surfaces are deliberately not free-form scripting: the `ai_policy` block is a single CEL expression over gateway-computed signals ([ai-policy-cel.md](ai-policy-cel.md)), and guardrails are typed `guardrails: input:` / `output:` blocks (`injection`, `pii`, `jailbreak`, `toxicity`, `schema`, ...) documented in [ai-gateway.md](ai-gateway.md).
 
