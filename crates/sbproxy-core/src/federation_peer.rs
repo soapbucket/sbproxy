@@ -244,7 +244,8 @@ impl FederationPeerVerifier {
     /// Fixed window rather than a token bucket, matching
     /// `RevocationRateLimiter` in the broker: the burst at a window
     /// edge is bounded by twice the rate, and the walks this guards
-    /// are already bounded individually by [`FetchBudget`].
+    /// are already bounded individually by
+    /// [`sbproxy_federation::FetchBudget`].
     fn claim_walk(&self, source: &str) -> bool {
         let mut rates = self
             .walk_rate

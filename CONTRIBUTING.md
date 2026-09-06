@@ -135,7 +135,7 @@ inventory::submit! {
 
 ## Pre-commit gates
 
-Run all five before pushing. Each one mirrors a required CI gate; if any fails locally, CI will fail too.
+Run all six before pushing. Each one mirrors a required CI gate; if any fails locally, CI will fail too.
 
 | Check | Command |
 |---|---|
@@ -143,7 +143,17 @@ Run all five before pushing. Each one mirrors a required CI gate; if any fails l
 | Build | `cargo build --workspace` |
 | Test | `cargo test --workspace --release --tests` |
 | Clippy | `cargo clippy --workspace --all-targets -- -D warnings` |
-| Docs | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items` |
+| Docs | `RUSTDOCFLAGS="-D warnings -D missing_docs" cargo doc --workspace --no-deps --locked` |
+| Docs (private items) | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked --document-private-items` |
+
+The two `Docs` rows are two separate CI steps and neither substitutes for
+the other. `-D missing_docs` belongs to the first and must never be paired
+with `--document-private-items`, which would demand a rustdoc comment on
+every private item in the workspace. `--locked` belongs to both: without
+it `cargo` may rewrite `Cargo.lock` in place, and lockfile drift gets
+quietly repaired instead of reported. Until 2026-09-06 this table listed
+one `Docs` row that matched neither CI step, and no workflow ran the
+private-items pass at all (WOR-2931).
 
 Fix the issue before pushing. Do not paper over with `#[allow(...)]` unless you also write a one-line comment explaining the deliberate exception.
 

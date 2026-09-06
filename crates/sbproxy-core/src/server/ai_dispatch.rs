@@ -1175,7 +1175,7 @@ fn ai_policy_prompt_difficulty(body: &serde_json::Value) -> f64 {
 /// for the AI decision view, or empty when the body carries no messages.
 ///
 /// Parses the chat messages from the body the same lenient way the rest of the
-/// dispatch path does, then delegates to [`sbproxy_ai::prompt_fingerprint`],
+/// dispatch path does, then delegates to [`fn@sbproxy_ai::prompt_fingerprint`],
 /// which never embeds prompt text. Exposed to policy as `ai.prompt.fingerprint`
 /// so a routing policy can key on prompt identity (sticky / cache-affinity
 /// routing) without seeing the prompt.
@@ -18924,7 +18924,7 @@ impl StreamUsageSource {
 /// usage frame had exact numbers in hand and threw them away, refunding
 /// the reservation for work the provider had already done. Splitting the
 /// state out gives [`relay_ai_stream`] a finally shape, where
-/// [`finalize_ai_stream_usage`] runs on every path out of
+/// [`StreamSettleGuard::settle`] runs on every path out of
 /// [`relay_ai_stream_frames`] including the ones that return an error.
 struct StreamAccounting {
     /// Upstream response status. Only 2xx streams are billable.
@@ -20200,7 +20200,7 @@ async fn relay_ai_stream_frames(
     // The post-commit failure counter used to be recorded here, ahead of
     // the close-out writes, because a failed downstream write left this
     // function on `?` and would otherwise have swallowed the upstream
-    // cause. `finalize_ai_stream_usage` records it now: it runs on every
+    // cause. `StreamSettleGuard::settle` records it now: it runs on every
     // exit including that one, so the counter no longer has to be placed
     // ahead of the code that could skip it, and the disconnect itself
     // becomes a cause the operator can select on.

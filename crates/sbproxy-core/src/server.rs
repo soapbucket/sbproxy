@@ -5229,7 +5229,7 @@ struct PolicyVerdictCtx {
     origin: String,
     /// Tenant the decision is attributed to, for the shared family.
     ///
-    /// Deliberately not [`Self::tenant_id`]. That field carries
+    /// Deliberately not [`Self::workspace_id`]. That field carries
     /// `CompiledOrigin::workspace_id`, which nothing in this workspace
     /// ever populates: every construction site sets it to
     /// `CompactString::default()`, so it is the empty string in every

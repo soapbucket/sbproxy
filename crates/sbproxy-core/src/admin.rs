@@ -1520,8 +1520,10 @@ pub(crate) fn install_target_health_metrics_source() {
 /// within its origin, which is the normal case and the readable one.
 /// When an origin configures the same URL more than once, every
 /// colliding row takes the load balancer's own `url#index` identifier
-/// instead, the same string [`sbproxy_modules::action::loadbalancer`]
-/// hands the outlier detector. Two same-URL targets are a real config
+/// instead, the same string `sbproxy_modules::action::loadbalancer`
+/// hands the outlier detector. That name is deliberately not a link:
+/// `action::loadbalancer` is a private module in another crate, so no
+/// path to it resolves from here. Two same-URL targets are a real config
 /// (weighting, or a blue/green pair addressed through one host), and
 /// keying the label on the URL alone collapsed them onto one series:
 /// last write won, an outlier-ejected target read as healthy, and

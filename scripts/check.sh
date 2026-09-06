@@ -60,8 +60,13 @@
 #   SBPROXY_CLEAN_AFTER_BUILD=0          keep all build artifacts after the run
 #   SBPROXY_ALLOW_DIRTY_TREE=1           do not fail on an uncommitted tree
 #   SBPROXY_ALLOW_CARGO_TEST_FALLBACK=1  permit the serial cargo test fallback
-#   SBPROXY_CHECK_PRIVATE_DOCS=1         extra rustdoc pass over private items
-#                                        (stricter than CI; see that phase)
+#   SBPROXY_CHECK_PRIVATE_DOCS=0         skip the rustdoc pass that resolves
+#                                        intra-doc links on private and
+#                                        pub(crate) items. It runs by DEFAULT
+#                                        and mirrors a required CI lane
+#                                        (ci.yml lint, "doc (private items)").
+#                                        Setting this to 0 is reprinted in the
+#                                        SKIPPED PHASES block.
 #   SBPROXY_SKIP_CARGO=1                 dev-only: stop before the first
 #                                        cargo compile phase so the script
 #                                        phases can be exercised end to end
@@ -1322,30 +1327,65 @@ else
   cargo clippy --workspace --all-targets -- -D warnings
 fi
 
+# Two rustdoc passes, both mirroring steps in ci.yml's lint lane.
+#
 # CI: `RUSTDOCFLAGS="-D warnings -D missing_docs" cargo doc --workspace
 # --no-deps --locked`. Matched exactly. `-D missing_docs` exists in
 # exactly one other place in this repository, ci.yml, and it is the flag
 # that bites.
 #
-# Note what is deliberately absent: `--document-private-items`. Combined
-# with `-D missing_docs` it demands rustdoc on private items too, which
-# is strictly stricter than CI and produces failures CI will never
-# report. The private-items pass is available below, on its own, behind
-# an env var.
+# The second pass carries `--document-private-items` and drops
+# `-D missing_docs`, which is the only combination worth running: paired,
+# the two would demand a rustdoc comment on every private item in the
+# workspace, a far larger policy than this repository has adopted. What
+# the second pass adds is rustdoc's default warn-level lint set, denied,
+# over private and `pub(crate)` items. The first pass never visits those
+# items, so nothing written inside one can fail it. Broken and ambiguous
+# intra-doc links are the bulk of what the second pass catches, 25 of the
+# 26 errors it found on `main`, but it is the whole lint set rather than
+# a link check: the 26th was `rustdoc::redundant_explicit_links`, and a
+# bare URL in a `pub(crate)` doc comment fails it as `rustdoc::bare_urls`
+# while passing the first pass.
+#
+# Both passes resolve the default feature union, so neither sees a
+# private item behind a non-default feature. `sbproxy-core`'s
+# `agent-class`, `payments` and `rag` modules are unchecked by either,
+# and ci.yml's payments lane runs no doc pass. That gap is open.
+#
+# It was opt-in until 2026-09-06 and nothing in .github/workflows/ set
+# the variable, so the surface had never been checked on any branch.
+# Twenty-six rustdoc link errors had accumulated on `main` across
+# fourteen files (WOR-2931): twenty-three unresolved intra-doc links, two
+# ambiguous ones, and one redundant explicit target. Three of the
+# twenty-three named a function that exists nowhere in the tree. It runs
+# by default now, and ci.yml's lint lane runs the same command.
 if ! phase_wanted DOC; then
-  scope_skip DOC "cargo doc (rustdoc, -D missing_docs, and the intra-doc link check)"
+  scope_skip DOC "cargo doc (rustdoc, -D missing_docs, and rustdoc's lints over public items) and cargo doc --document-private-items (rustdoc's default warn-level lint set over private and pub(crate) items)"
 else
   step "cargo doc"
   RUSTDOCFLAGS="-D warnings -D missing_docs" cargo doc --workspace --no-deps --locked
-fi
 
-if [ "${SBPROXY_CHECK_PRIVATE_DOCS:-0}" = "1" ]; then
-  # Not a CI lane. Broken intra-doc links in private modules are real
-  # bugs, so the pass has value, but it is opt-in and carries only
-  # `-D warnings` so it cannot manufacture missing_docs failures on
-  # private items that CI does not care about.
-  step "cargo doc (private items, opt-in, NOT a CI lane)"
-  RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked --document-private-items
+  # Same `--workspace` selection as the pass above, so it resolves the
+  # same feature union and reuses that build rather than recompiling the
+  # graph. What it does add is a second full rustdoc pass: the two carry
+  # different RUSTDOCFLAGS, so neither can reuse the other's rustdoc
+  # output and both run in full whenever they alternate. The multiple
+  # depends on whether the pass above had work to do. When both run in
+  # full, which is what CI does because rust-cache does not carry
+  # workspace doc output between runs, this pass is about 1.2 times the
+  # one above and the pair costs about 2.2 times it alone: measured 2m48
+  # and 3m24, and 2m21 and 2m54 on a merged head. On a local tree where
+  # the pass above is a near-no-op the pair looks like 3.5x (31s and 77s,
+  # 39s and 87s); that is the first pass having nothing to redo, not the
+  # CI cost. On by default either way: that is simply what checking this
+  # surface costs, and the CI lane that mirrors it is not the critical
+  # path.
+  if [ "${SBPROXY_CHECK_PRIVATE_DOCS:-1}" = "0" ]; then
+    note_skip "cargo doc --document-private-items (rustdoc's default warn-level lint set over private and pub(crate) items; mostly intra-doc links, but bare URLs and the rest of the set too): SBPROXY_CHECK_PRIVATE_DOCS=0. This is a required CI lane, so it runs there regardless. Run it here with: RUSTDOCFLAGS=\"-D warnings\" cargo doc --workspace --no-deps --locked --document-private-items"
+  else
+    step "cargo doc (private items)"
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked --document-private-items
+  fi
 fi
 
 # CI: ci.yml test lane, "generated artifacts are current". These exec
