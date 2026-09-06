@@ -1,0 +1,4 @@
+{
+  "type": "fixed",
+  "message": "**Cedar documentation describes the current HTTP principal and approval behavior.** Add a runnable tool-call walkthrough, policy precedence, approval API requests, and replay examples; correct Rego bundle, authentication, and WASM context guidance."
+}
