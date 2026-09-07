@@ -45,6 +45,10 @@ const ADMIN_PASSWORD: &str = "process-test-admin-password";
 /// HKDF expands it per rotation label.
 const COMP_MASTER_KEY: &str = "comp-master-key-for-the-process-test-0123456789";
 
+// The first exec of the shipped binary is paid in `common`, outside every
+// wall-clock bound in this file. See `tests/common/mod.rs` (WOR-2946).
+mod common;
+
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_sbproxy")
 }
@@ -460,6 +464,10 @@ enum AdminProbe {
 /// It is a closure rather than a written file because a collision is
 /// resolved by redrawing both ports, and the configuration names them.
 fn start_proxy(root: &Path, config_for: impl Fn(u16, u16) -> String) -> Proxy {
+    // Pay the shipped binary's first-exec cost here, before the
+    // wall-clock bound below starts counting. STARTUP_TIMEOUT exists to
+    // catch a proxy that never serves.
+    common::warm_shipped_binary();
     let mut lost = Vec::new();
     for attempt in 0..PORT_ATTEMPTS {
         // Both reservations are held at once and released together.

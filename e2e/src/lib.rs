@@ -27,7 +27,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -208,6 +208,109 @@ fn configured_binary_path(var: &str) -> Option<PathBuf> {
             }
         }
     })
+}
+
+/// A hang guard for [`warm_proxy_binary`], and deliberately not a budget for
+/// the work it guards. Five times the worst first exec measured for this
+/// class on this hardware (57.2s, under 24 concurrent first-exec workers)
+/// and four orders of magnitude above a warm one. Sized for a warm-up that
+/// has wedged, not for a slow one. See [`warm_proxy_binary`] for why a bound
+/// near the cost would be worse than none.
+const WARM_UP_HANG_GUARD: Duration = Duration::from_secs(300);
+
+/// Above this, [`warm_proxy_binary`] says how long it took, so a suite
+/// killed while sitting in it names what it was waiting on.
+const SLOW_WARM_UP: Duration = Duration::from_secs(2);
+
+/// Pay a proxy binary's first-exec cost once per test process, before any
+/// harness picks a port or starts [`DEFAULT_STARTUP_TIMEOUT`] counting.
+///
+/// macOS assesses a freshly written executable the first time it is exec'd.
+/// The cost lands on whoever **waits** for the process, not on the spawn:
+/// measured apart, `Command::spawn` returns in 0.000-0.001s and the whole
+/// cost falls in the wait. `DEFAULT_STARTUP_TIMEOUT` is therefore spent on
+/// the assessment rather than on the proxy, and it is one deadline shared by
+/// the entire e2e suite, so a fresh `cargo build --release` before a run
+/// hands every test in it the same hazard at once. Measured here: a freshly
+/// linked `sbproxy --version` took 9.311s on an idle machine against 0.021s
+/// on the next run of the same file, and a comparable Mach-O under 24
+/// concurrent first-exec workers took 44.2s median and 57.2s worst. The load
+/// average falls while this happens, because a process blocked on the
+/// assessment is blocked rather than runnable, so nothing in a load check
+/// reveals it.
+///
+/// Called before `pick_free_port` rather than beside the spawn, so a port
+/// reservation is never held across the assessment: that window is the
+/// WOR-2295 race this harness already retries, and widening it by tens of
+/// seconds would trade one flake for another.
+///
+/// Keyed by resolved path, because the three flavors are three different
+/// files and warming one says nothing about the others.
+///
+/// Unbounded except for [`WARM_UP_HANG_GUARD`]. An assessment killed
+/// part-way is charged to the next run of the same file, so a warm-up
+/// bounded near the cost hands that cost straight to the run it exists to
+/// protect. Failures here are deliberately not fatal: a binary that cannot
+/// answer `--version` still gets its real spawn below, whose error names the
+/// actual startup problem rather than the warm-up's.
+///
+/// See `crates/sbproxy/tests/common/mod.rs` for the canonical account
+/// (WOR-2946).
+fn warm_proxy_binary(flavor: ProxyBinaryFlavor) {
+    static WARMED: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+    let bin = proxy_binary_path_for(flavor);
+    if !bin.is_file() {
+        // The caller's own `is_file` check reports this with the build hint.
+        return;
+    }
+    let warmed = WARMED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    // Held across the exec on purpose: concurrent harness starts in this
+    // process would otherwise each pay the assessment, and they would all be
+    // waiting on the same serialized system daemon anyway.
+    let mut warmed = warmed.lock().unwrap_or_else(|error| error.into_inner());
+    if !warmed.insert(bin.clone()) {
+        return;
+    }
+    let started = Instant::now();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let target = bin.clone();
+    std::thread::spawn(move || {
+        // `--version` is answered by clap, which exits before the binary
+        // reads a config or binds anything, so warming has no side effects
+        // and leaves no listener behind.
+        let status = Command::new(&target)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let _ = sender.send(status);
+    });
+    match receiver.recv_timeout(WARM_UP_HANG_GUARD) {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => eprintln!(
+            "warm_proxy_binary: {} could not be executed: {error}",
+            bin.display()
+        ),
+        Err(_) => eprintln!(
+            "warm_proxy_binary: {} did not answer `--version` within {}s. \
+             On macOS the first exec of a freshly written binary blocks while \
+             syspolicyd assesses it, and a wedged daemon turns that into tens \
+             of minutes. Check `ps aux | grep -iE 'syspolicyd|XprotectService'`. \
+             Startup below is now likely to exceed its own deadline (WOR-2946).",
+            bin.display(),
+            WARM_UP_HANG_GUARD.as_secs()
+        ),
+    }
+    let elapsed = started.elapsed();
+    if elapsed >= SLOW_WARM_UP {
+        eprintln!(
+            "warm_proxy_binary: {} --version took {:.1}s \
+             (macOS first-exec assessment; see WOR-2946)",
+            bin.display(),
+            elapsed.as_secs_f64()
+        );
+    }
 }
 
 fn proxy_binary_path_for(flavor: ProxyBinaryFlavor) -> PathBuf {
@@ -402,6 +505,8 @@ impl ProxyHarness {
         shutdown_grace_ms: Option<u64>,
         envs: &[(&str, String)],
     ) -> anyhow::Result<Self> {
+        // Outside the startup deadline and before any port is reserved.
+        warm_proxy_binary(binary);
         for _ in 1..STOLEN_PORT_START_ATTEMPTS {
             let port_reservation = pick_free_port()?;
             let port = port_reservation.local_addr()?.port();
@@ -591,6 +696,8 @@ impl ProxyHarness {
         shutdown_grace_ms: Option<u64>,
         env: &[(&str, &str)],
     ) -> anyhow::Result<Self> {
+        // Outside the startup deadline and before any port is reserved.
+        warm_proxy_binary(ProxyBinaryFlavor::Default);
         // Same WOR-2295 retry contract as `start_with_raw_yaml_using_binary`:
         // a startup failure classified as a port collision re-picks the
         // public port and rebuilds the workspace; everything else surfaces.

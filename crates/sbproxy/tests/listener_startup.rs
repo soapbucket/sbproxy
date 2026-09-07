@@ -6,6 +6,10 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+// The first exec of the shipped binary is paid in `common`, outside every
+// wall-clock bound in this file. See `tests/common/mod.rs` (WOR-2946).
+mod common;
+
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_sbproxy")
 }
@@ -25,6 +29,10 @@ fn temp_dir(label: &str) -> PathBuf {
 
 #[test]
 fn a_configured_bind_address_reaches_the_listener() {
+    // Pay the shipped binary's first-exec cost here, before the
+    // wall-clock bound below starts counting. The 10s deadline
+    // below exists to catch a proxy that never fails its bind.
+    common::warm_shipped_binary();
     // WOR-2199. The only test that can tell the difference between
     // formatting proxy.bind_address into a string and the listener
     // actually binding it. Occupy loopback specifically, configure
@@ -87,6 +95,10 @@ origins:
 
 #[test]
 fn occupied_public_listener_fails_startup_with_address_and_cause() {
+    // Pay the shipped binary's first-exec cost here, before the
+    // wall-clock bound below starts counting. The 10s deadline
+    // below exists to catch a proxy that never exits.
+    common::warm_shipped_binary();
     let occupied = TcpListener::bind("0.0.0.0:0").expect("occupy ephemeral public port");
     let port = occupied.local_addr().expect("occupied address").port();
     let root = temp_dir("collision");
@@ -186,6 +198,10 @@ fn serves_ok(port: u16) -> bool {
 #[cfg(unix)]
 #[test]
 fn sigterm_cleanly_releases_a_prepared_public_listener() {
+    // Pay the shipped binary's first-exec cost here, before the
+    // wall-clock bound below starts counting. The 15s deadlines
+    // below exist to catch a proxy that never binds or never exits.
+    common::warm_shipped_binary();
     let root = temp_dir("sigterm");
     let config = root.join("sb.yml");
     let log_path = root.join("sbproxy.log");
@@ -325,6 +341,10 @@ const STARTUP_WINDOW_HOLD: Duration = Duration::from_secs(8);
 #[cfg(unix)]
 #[test]
 fn sigterm_inside_the_startup_window_exits_cleanly_rather_than_by_signal() {
+    // Pay the shipped binary's first-exec cost here, before the
+    // wall-clock bound below starts counting. The 15s deadlines
+    // below exist to catch a proxy that never binds or never exits.
+    common::warm_shipped_binary();
     // WOR-2452. The companion to
     // `sigterm_cleanly_releases_a_prepared_public_listener`, which waits
     // for the run loop before signalling and therefore only ever

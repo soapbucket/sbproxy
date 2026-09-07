@@ -529,7 +529,49 @@ fn write_hanging_git(dir: &Path) -> PathBuf {
         .permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(&path, permissions).expect("chmod fake git");
+    warm_first_exec(&path);
     path
+}
+
+/// Pay this fixture's first-exec cost here, where nothing is timed.
+///
+/// macOS assesses a freshly written executable the first time it is exec'd,
+/// and this file has just written one. The cost lands on whoever waits for
+/// the process rather than on the spawn, so both tests below inherit it:
+/// `a_fetch_that_hangs_is_killed_at_the_timeout` measures wall clock across
+/// a call that execs this script, and its 30s bound is there to catch a
+/// child that was waited out rather than killed. Measured on an idle
+/// machine a first exec of a freshly written script cost 0.46s against
+/// 0.004s warm, and under 24 concurrent first-exec workers the median was
+/// 3.9s with a 5.1s worst; the same shape has been measured past 26s
+/// elsewhere. The load average will not show it, because a process blocked
+/// on the assessment is blocked rather than runnable.
+///
+/// `a_hanging_fetch_leaves_no_orphaned_grandchild` had the worse version of
+/// the problem: it asserts nothing is left over after the loader's
+/// one-second timeout, and an assessment longer than that second means the
+/// shell is killed before it ever reaches `sleep`, so there is no
+/// grandchild to leak and the assertion passes without testing anything.
+///
+/// `--version` is the warm-up because the fixture answers it and exits
+/// (see the script above); running it any other way starts the ~20s sleep
+/// this fixture exists to orphan. Unbounded on purpose: an assessment
+/// killed part-way is charged to the next run of the same file, so a
+/// bounded warm-up would hand its cost straight to the run it protects.
+/// See `crates/sbproxy/tests/common/mod.rs` for the full account (WOR-2946).
+#[cfg(unix)]
+fn warm_first_exec(path: &Path) {
+    let status = Command::new(path)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("the fake git fixture must be executable");
+    assert!(
+        status.success(),
+        "the fake git fixture must answer --version and exit 0, got {status}"
+    );
 }
 
 /// A hanging fetch must not leave its grandchildren running.
