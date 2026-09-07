@@ -548,7 +548,7 @@ run_example() {
       echo "[examples-smoke] $dir: audit-log on :$admin_port -> OK"
       ;;
     *)
-      echo "[examples-smoke] $dir: audit_check disabled (default until Wave 2 ships /api/audit/recent)"
+      echo "[examples-smoke] $dir: audit_check disabled (default; /api/audit/recent serves only the rate_limit_budget audit ring)"
       ;;
   esac
 

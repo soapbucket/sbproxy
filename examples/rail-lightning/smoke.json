@@ -11,7 +11,7 @@
     "compose file) does not pick it up. The fields above mirror the",
     "30-rail-x402-base-sepolia and 31-rail-mpp-stripe-test schema so",
     "the contract is in one place when a future revision adds a",
-    "Lightning regtest stand-in (mock-cln or mock-phoenixd).",
+    "Lightning regtest stand-in (a mock Core Lightning or LND node).",
     "",
     "expected_multi_rail_kinds is the contract this example pins:",
     "the 402 multi-rail body for /article* MUST include a `lightning`",
