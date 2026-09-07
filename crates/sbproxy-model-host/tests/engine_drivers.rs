@@ -1085,6 +1085,130 @@ async fn llama_provision_prefers_compatible_path_and_release_failures_do_not_fal
     assert_eq!(error.reason(), EngineFailureReason::EngineProvisionFailed);
 }
 
+/// One ordered log of every command the runner issued, so a test can assert
+/// not just that a call happened but that it happened before another one.
+///
+/// `RecordingExecutor` records only `spawn` and leaves `output` on the trait
+/// default, which refuses. That is enough for the launch tests and is exactly
+/// why nothing here could see the provision-time warm-up: a call that returns
+/// `Err` and is deliberately ignored looks identical to a call that was never
+/// made.
+/// One command the runner issued, in the order it issued them.
+#[derive(Clone, Debug)]
+struct RecordedCall {
+    /// Which boundary it came through: `spawn` for a long-running engine,
+    /// `output` for a bounded one-shot, which is what a warm-up uses.
+    boundary: &'static str,
+    executable: PathBuf,
+    arguments: Vec<String>,
+}
+
+#[derive(Clone)]
+struct OrderedExecutor {
+    calls: Arc<Mutex<Vec<RecordedCall>>>,
+    process: Arc<FixtureProcess>,
+}
+
+#[async_trait]
+impl CommandExecutor for OrderedExecutor {
+    async fn spawn(
+        &self,
+        executable: &std::path::Path,
+        arguments: &[String],
+        _environment: &BTreeMap<String, String>,
+        _stderr_tail_lines: usize,
+    ) -> Result<Arc<dyn EngineProcess>, EngineDriverError> {
+        self.calls.lock().unwrap().push(RecordedCall {
+            boundary: "spawn",
+            executable: executable.to_path_buf(),
+            arguments: arguments.to_vec(),
+        });
+        Ok(self.process.clone())
+    }
+
+    async fn output(
+        &self,
+        executable: &std::path::Path,
+        arguments: &[String],
+        _environment: &BTreeMap<String, String>,
+        _timeout: Duration,
+        _max_output_bytes: usize,
+    ) -> Result<CommandOutput, EngineDriverError> {
+        self.calls.lock().unwrap().push(RecordedCall {
+            boundary: "output",
+            executable: executable.to_path_buf(),
+            arguments: arguments.to_vec(),
+        });
+        Ok(CommandOutput {
+            success: true,
+            stdout: "version: 9905".to_string(),
+            stderr: String::new(),
+        })
+    }
+}
+
+/// Provisioning must exec the engine binary once, before anything puts a
+/// deadline on it.
+///
+/// macOS assesses an executable the first time it is exec'd and charges the
+/// cost to whoever waits for it, so a just-downloaded engine handed straight
+/// to `launch` spends `ready_timeout` on the assessment rather than on
+/// loading a model. Measured against the real pinned release: 44.2s median
+/// and 57.2s worst under concurrent first-exec load, against 0.047s warm.
+///
+/// What this pins, exactly: `provision` issues a `--version` command against
+/// the executable it is about to return, and issues no spawn of its own. It
+/// does *not* pin an ordering against `launch`'s spawn, because `launch` is
+/// never called here -- saying otherwise would claim more than the assertions
+/// check. The ordering that matters is structural instead: `provision`
+/// returns before `ensure_ready` is called at all, which
+/// `ProductionPreparedDeployment::start` fixes (WOR-2946).
+#[tokio::test]
+async fn llama_provisioning_warms_the_engine_binary_before_any_deadline_bounded_spawn() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let runner = EngineProcessRunner::new(
+        Arc::new(OrderedExecutor {
+            calls: calls.clone(),
+            process: Arc::new(FixtureProcess {
+                stopped: AtomicBool::new(false),
+            }),
+        }),
+        Arc::new(FixtureProbe { ready: true }),
+    );
+    let driver = LlamaCppDriver::new(runner, llama_source(Some("/usr/bin/llama-server"), true));
+
+    let provisioned = driver
+        .provision(&ProvisionRequest {
+            artifact: resolved(EngineKind::LlamaCpp, ArtifactFormat::Gguf),
+            worker: llama_worker(),
+            provisioning: EngineProvisioning::default(),
+            engine_cache_dir: PathBuf::from("/engines"),
+            job_store: None,
+        })
+        .await
+        .expect("provisioning succeeds");
+
+    let recorded = calls.lock().unwrap().clone();
+    let first = recorded
+        .first()
+        .expect("provisioning issued no command at all");
+    assert_eq!(
+        first.boundary, "output",
+        "the only command provisioning issues must be the warm-up, got {recorded:?}"
+    );
+    assert_eq!(first.executable, provisioned.executable);
+    assert_eq!(
+        first.arguments,
+        vec!["--version".to_string()],
+        "the warm-up must be a flag the engine answers and exits on, so it \
+         binds no port and writes nothing"
+    );
+    assert!(
+        !recorded.iter().any(|call| call.boundary == "spawn"),
+        "provisioning must not spawn a long-running engine: {recorded:?}"
+    );
+}
+
 #[tokio::test]
 async fn llama_cuda_source_build_is_detected_and_provisioned_with_the_exact_pin() {
     let provisioning: EngineProvisioning = serde_yaml::from_str(

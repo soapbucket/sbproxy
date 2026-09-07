@@ -19,16 +19,32 @@ const EXTERNAL_WAIT: Duration = Duration::from_secs(5);
 ///
 /// Two orders of magnitude above `EXTERNAL_WAIT` on purpose: this bounds an
 /// operating-system assessment, not anything this workspace computes.
-const FIRST_EXEC_WAIT: Duration = Duration::from_secs(120);
+///
+/// Raised from 120s (WOR-2946). 120s was 2.1x the worst first exec measured
+/// for this class on this hardware, 57.2s under 24 concurrent first-exec
+/// workers, which is close enough that the guard itself could be what fires
+/// and fail a run for the cost it exists to absorb. This is a hang guard,
+/// not a budget: nothing is gained by sizing it near the cost, and a warm-up
+/// killed part-way is charged to the next run of the same file.
+const FIRST_EXEC_WAIT: Duration = Duration::from_secs(300);
 
 /// Pay the shipped binary's first-exec cost once, on its own thread, with a
-/// deadline.
+/// hang guard.
 ///
-/// On macOS the FIRST exec of a freshly linked Mach-O blocks inside
-/// `posix_spawn` while `syspolicyd` assesses the binary's provenance and
-/// caches the verdict by cdhash. The block is in the PARENT and it happens
-/// before any of the child's own code runs, so it is invisible to every
-/// deadline in this file: they all start counting after `spawn` returns.
+/// On macOS the FIRST exec of a freshly linked Mach-O blocks while
+/// `syspolicyd` assesses the binary's provenance and caches the verdict by
+/// cdhash. The cost lands on whoever **waits** for the process, not on the
+/// spawn. Timed apart on this hardware: `Command::spawn` returned in 0.000s
+/// and the matching `wait()` took 22.3s; the same split holds in Python,
+/// where `Popen` returned in 0.001s.
+///
+/// This comment used to say the block was in the parent inside `posix_spawn`
+/// and was therefore "invisible to every deadline in this file". Measured,
+/// that is false, and it is the kind of wrong that stops the next reader
+/// looking: every deadline in this file wraps a wait, so every one of them
+/// contains the assessment. Warming here is what keeps them out of it, not
+/// where the block happens (WOR-2946).
+///
 /// That is why the two listener tests below stalled for more than thirty
 /// minutes on a cold binary on one machine and then passed in 0.3 seconds on
 /// the retry that found the verdict cached. Nothing in the test was slow;
@@ -42,8 +58,12 @@ const FIRST_EXEC_WAIT: Duration = Duration::from_secs(120);
 /// This never skips anything. On timeout it fails, loudly, with the
 /// diagnosis, and the run that follows it finds a warm cache.
 fn warm_shipped_binary() {
-    static WARM: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    WARM.get_or_init(|| {
+    // Stored, not panicked, inside the initializer: `OnceLock::get_or_init`
+    // leaves the cell uninitialized when its closure panics, so a panic in
+    // there would make every later test in this binary re-enter and wait the
+    // full guard again (WOR-2946).
+    static WARM: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    if let Err(message) = WARM.get_or_init(|| {
         let started = Instant::now();
         let (sender, receiver) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
@@ -56,29 +76,31 @@ fn warm_shipped_binary() {
             let _ = sender.send(status);
         });
         match receiver.recv_timeout(FIRST_EXEC_WAIT) {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
-                panic!("the shipped classifier binary could not be executed at all: {error}")
-            }
-            Err(_) => panic!(
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(error)) => Err(format!(
+                "the shipped classifier binary could not be executed at all: {error}"
+            )),
+            Err(_) => Err(format!(
                 "the shipped classifier binary did not answer `--help` within {}s \
                  (waited {}s).\n\
                  \n\
                  This is almost certainly not a bug in this test. On macOS the first \
-                 exec of a freshly linked binary blocks in posix_spawn while \
-                 syspolicyd assesses its provenance, and a wedged daemon turns that \
-                 into tens of minutes. Confirm it with `ps aux | grep -iE \
-                 'syspolicyd|XprotectService'` (sustained CPU) and `sample <pid>` on \
-                 a stuck child (parked at _dyld_start +0).\n\
+                 exec of a freshly linked binary blocks while syspolicyd assesses \
+                 its provenance, and the cost lands on the wait rather than on the \
+                 spawn. A wedged daemon turns that into tens of minutes. Confirm it \
+                 with `ps aux | grep -iE 'syspolicyd|XprotectService'` (sustained \
+                 CPU) and `sample <pid>` on the stuck child.\n\
                  \n\
                  Clear it with `sudo spctl --global-disable` (no reboot; re-enable \
                  with --global-enable) or by rebooting, then run this test again. \
                  The verdict is cached by cdhash, so the second exec is instant.",
                 FIRST_EXEC_WAIT.as_secs(),
                 started.elapsed().as_secs()
-            ),
+            )),
         }
-    });
+    }) {
+        panic!("{message}");
+    }
 }
 
 #[derive(Debug)]

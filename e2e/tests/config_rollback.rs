@@ -225,6 +225,10 @@ impl Node {
         dir: &Path,
         env: &[(&str, &str)],
     ) -> Self {
+        // Spawned here rather than through `ProxyHarness`, so the harness's
+        // warm-up never runs in this binary and `CONVERGE` below would
+        // otherwise contain the proxy's first exec (WOR-2946).
+        sbproxy_e2e::warm_binary_once(&proxy_binary_path());
         let stdout = dir.join(format!("node-{admin_port}.out"));
         let stderr = dir.join(format!("node-{admin_port}.err"));
         let mut command = Command::new(proxy_binary_path());

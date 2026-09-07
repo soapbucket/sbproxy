@@ -20,6 +20,14 @@ use crate::{
 
 const HEALTH_PATH: &str = "/health";
 
+/// Hang guard for the first-exec warm-up in `provision`, and deliberately not
+/// a budget for it. Five times the worst first exec measured for this exact
+/// artifact (57.2s, under 24 concurrent first-exec workers) and three orders
+/// of magnitude above a warm one (0.047s). See
+/// `EngineProcessRunner::warm_first_exec` for why sizing it near the cost
+/// would be worse than not bounding it at all (WOR-2946).
+const WARM_UP_HANG_GUARD: Duration = Duration::from_secs(300);
+
 /// llama.cpp-specific detection result.
 pub type LlamaDetection = EngineDetection;
 
@@ -402,6 +410,37 @@ impl EngineDriver for LlamaCppDriver {
                 ));
             }
         };
+        // Pay the binary's first-exec cost here, at the end of provisioning,
+        // where nothing is timed. `provision` already downloads and extracts
+        // an 11 MB release over the network, so it has no deadline of its own;
+        // the very next thing that happens is `launch`, which spawns this
+        // executable and polls until `ready_timeout`. Without this the
+        // operating system's one-time assessment of a just-downloaded engine
+        // is charged to a budget sized for loading a model.
+        //
+        // Every acquisition plan above lands here on purpose, not just the
+        // downloaded one: `BuildCuda` produces a freshly linked binary, which
+        // is the same case, and an operator's `Explicit` path can be just as
+        // new. A binary that is already warm costs 0.047s to re-exec.
+        //
+        // Failure is logged and dropped. See
+        // `EngineProcessRunner::warm_first_exec` for why this is best-effort
+        // and for the measurements behind the guard (WOR-2946).
+        if let Err(error) = self
+            .runner
+            .warm_first_exec(&executable, &["--version".to_string()], WARM_UP_HANG_GUARD)
+            .await
+        {
+            // warn, not debug: debug is compiled out of release builds, and
+            // this is the line that explains a readiness timeout an operator
+            // is about to see.
+            tracing::warn!(
+                executable = %executable.display(),
+                %error,
+                "llama.cpp first-exec warm-up did not complete; the launch below \
+                 pays the assessment out of its readiness deadline"
+            );
+        }
         Ok(ProvisionedEngine {
             kind: EngineKind::LlamaCpp,
             executable,

@@ -53,6 +53,10 @@ const ADDRESS_IN_USE_MARKERS: &[&[u8]] = &[b"address already in use", b"address 
 const CLASSIFIER_CONFIG_MARKER: &[u8] = b"classifier_hooks";
 const UNKNOWN_FIELD_MARKER: &[u8] = b"unknown field";
 
+// The first exec of the shipped binary is paid in `common`, outside every
+// wall-clock bound in this file. See `tests/common/mod.rs` (WOR-2946).
+mod common;
+
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_sbproxy")
 }
@@ -1142,6 +1146,10 @@ impl ProxyChild {
         upstream: &OpenAiFixture,
         policy: HookEgressPolicy,
     ) -> Result<Self, String> {
+        // Pay the shipped binary's first-exec cost here, before the
+        // wall-clock bound below starts counting. STARTUP_TIMEOUT exists to
+        // catch a proxy that never serves.
+        common::warm_shipped_binary();
         let token = harness_token();
         for attempt in 0..PORT_ATTEMPTS {
             let reservation = TcpListener::bind("127.0.0.1:0")

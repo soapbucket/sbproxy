@@ -1464,6 +1464,21 @@ pub struct CommandOutput {
     pub stderr: String,
 }
 
+/// Output cap for [`EngineProcessRunner::warm_first_exec`]. A warm-up runs a
+/// version flag and the bytes are discarded, so this only has to be a legal
+/// bound for the shared command boundary.
+const WARM_UP_OUTPUT_LIMIT: usize = 4 * 1024;
+
+/// Above this, [`EngineProcessRunner::warm_first_exec`] logs how long it took.
+///
+/// Well clear of a warm exec (0.047s measured) and nothing else. It is *not*
+/// above an idle first exec, which measured 2.9s median for a downloaded
+/// engine, and that is deliberate: the run that actually pays an assessment is
+/// the run an operator wants named. Every start after it finds the verdict
+/// cached and stays quiet, so this is once per binary per machine, not per
+/// deployment.
+const SLOW_WARM_UP: Duration = Duration::from_secs(2);
+
 /// Readiness probe injected into the process runner for deterministic tests.
 #[async_trait]
 pub trait EngineReadinessProbe: Send + Sync {
@@ -1557,6 +1572,91 @@ impl EngineProcessRunner {
     /// Perform one readiness probe through the injected health boundary.
     pub async fn ready(&self, port: u16, path: &str) -> Result<bool, EngineDriverError> {
         self.probe.ready(port, path).await
+    }
+
+    /// Pay a freshly acquired engine binary's first-exec cost here, before
+    /// any readiness deadline starts counting.
+    ///
+    /// macOS assesses an executable the first time it is exec'd, and the cost
+    /// lands on whoever **waits** for the process rather than on the spawn:
+    /// timed apart, `Command::spawn` returns in 0.000s and the whole cost
+    /// falls in the wait. [`EngineProcessRunner::launch`] spawns and then
+    /// polls readiness until `ready_timeout`, so without this the assessment
+    /// is spent out of a budget sized for loading a model.
+    ///
+    /// Measured against the real pinned llama.cpp release
+    /// (`llama-b9905-bin-macos-arm64`, downloaded, verified, and extracted
+    /// exactly as `llama_release::install_release` does it) on macOS 26.6.2
+    /// arm64: **2.9s median first exec idle, 44.2s median and 57.2s worst
+    /// under 24 concurrent first-exec workers, against 0.047s once warm.**
+    /// The asset is a 33 KB launcher over 27 MB of dylibs and the assessment
+    /// covers the set, which is why it costs an order of magnitude more than
+    /// a small script. Extraction itself is 0.05s, so none of this is I/O.
+    ///
+    /// A copy is not a way out: copying an already-assessed binary paid full
+    /// price under the same load (27.7s median). Neither is watching the load
+    /// average, which *falls* while this is happening, because a process
+    /// blocked on the assessment is blocked rather than runnable.
+    ///
+    /// `arguments` must make the engine exit without doing its work
+    /// (`--version` for llama-server), so warming binds no port and writes
+    /// nothing.
+    ///
+    /// Best-effort by contract. This moves a cost; it is not a gate. An
+    /// engine that cannot answer `--version` still gets its real launch,
+    /// whose error names the actual problem, so the returned `Err` is for
+    /// logging and never for refusing a deployment.
+    ///
+    /// The timeout is a hang guard rather than a budget, and must stay far
+    /// above the cost: an assessment killed part-way is charged to the next
+    /// run of the same file, so a tight warm-up hands its cost straight to
+    /// the launch it exists to protect (WOR-2946).
+    ///
+    /// One cost of not bounding it tightly, stated rather than left to be
+    /// rediscovered: `ProductionPreparedDeployment::start` holds its
+    /// `tokio::Mutex<EngineSupervisor>` across both `provision` and
+    /// `ensure_ready`. In the normal case this changes nothing, because the
+    /// same assessment would otherwise be paid inside `launch` under the same
+    /// guard. In the wedged case it does: a warm-up that runs out the hang
+    /// guard and then a launch that runs out `ready_timeout` takes that
+    /// critical section from about 300s to about 600s, and `health`, `stop`,
+    /// and `reset` for that deployment wait behind it. That is the trade for
+    /// a warm-up that cannot itself become the deadline.
+    pub async fn warm_first_exec(
+        &self,
+        executable: &Path,
+        arguments: &[String],
+        hang_guard: Duration,
+    ) -> Result<(), EngineDriverError> {
+        let started = std::time::Instant::now();
+        let outcome = self
+            .executor
+            .output(
+                executable,
+                arguments,
+                &BTreeMap::new(),
+                hang_guard,
+                WARM_UP_OUTPUT_LIMIT,
+            )
+            .await;
+        let elapsed = started.elapsed();
+        match outcome {
+            Ok(_) => {
+                // Silent below the threshold, because the usual case is
+                // milliseconds. A slow one is worth a line: it is the only
+                // step here that can take a minute, and an operator watching
+                // a deployment sit still deserves to know what it is doing.
+                if elapsed >= SLOW_WARM_UP {
+                    tracing::info!(
+                        executable = %executable.display(),
+                        elapsed_secs = elapsed.as_secs_f64(),
+                        "engine binary first-exec assessment paid before the readiness deadline"
+                    );
+                }
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Run one fixed compatibility command through the shared command boundary.

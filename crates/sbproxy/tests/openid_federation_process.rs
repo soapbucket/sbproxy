@@ -22,6 +22,10 @@ fn base64_url_decode(segment: &str) -> Vec<u8> {
         .expect("compact JWS segment is base64url")
 }
 
+// The first exec of the shipped binary is paid in `common`, outside every
+// wall-clock bound in this file. See `tests/common/mod.rs` (WOR-2946).
+mod common;
+
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_sbproxy")
 }
@@ -55,6 +59,10 @@ fn get(port: u16, path: &str) -> Option<Vec<u8>> {
 }
 
 fn start_proxy(root: &Path, config: &Path, port: u16) -> Child {
+    // Pay the shipped binary's first-exec cost here, before the
+    // wall-clock bound below starts counting. The 20s deadline below
+    // exists to catch a proxy that never serves.
+    common::warm_shipped_binary();
     let mut child = Command::new(binary())
         .arg("serve")
         .arg(config)

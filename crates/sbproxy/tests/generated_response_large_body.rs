@@ -51,6 +51,10 @@ const LARGE_STATIC_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// second.
 const REPEATS: usize = 12;
 
+// The first exec of the shipped binary is paid in `common`, outside every
+// wall-clock bound in this file. See `tests/common/mod.rs` (WOR-2946).
+mod common;
+
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_sbproxy")
 }
@@ -198,6 +202,10 @@ fn serves(port: u16, host: &str) -> bool {
 /// the child's stderr, so a broken config cannot masquerade as sixteen
 /// lost port races.
 fn start_proxy(root: &Path, config_body: &dyn Fn(u16) -> String, host: &str) -> (Child, u16) {
+    // Pay the shipped binary's first-exec cost here, before the
+    // wall-clock bound below starts counting. The 20s deadline below
+    // exists to catch a proxy that never serves.
+    common::warm_shipped_binary();
     for _ in 0..16 {
         let reserved = TcpListener::bind("127.0.0.1:0").expect("reserve ephemeral port");
         let port = reserved.local_addr().expect("reserved address").port();

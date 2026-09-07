@@ -1319,7 +1319,10 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
                     .acquire_llama_release(&tag, accel, sha256.as_deref())
                     .await
                 {
-                    Ok(p) => spec.program = p.to_string_lossy().into_owned(),
+                    Ok(p) => {
+                        warm_acquired_engine(&p).await;
+                        spec.program = p.to_string_lossy().into_owned();
+                    }
                     Err(e) => tracing::warn!(
                         engine = engine_kind.binary_name(),
                         "engine release acquisition failed: {e}; falling back to PATH"
@@ -1331,6 +1334,7 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
                     .acquire_cuda_llama(&tag, &source_sha256)
                     .await
                     .map_err(RuntimeError::Launch)?;
+                warm_acquired_engine(&path).await;
                 spec.program = path.to_string_lossy().into_owned();
             }
             crate::acquire::BinaryAcquirePlan::ProvisionUvx { vllm_version } => {
@@ -1475,9 +1479,6 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
     }
 }
 
-/// Whether the resolved weights are GGUF (so `engine: auto` picks
-/// llama.cpp): a GGUF-style quant name (`Q4_K_M`, `Q5_0`, ...) or a
-/// repo whose name advertises GGUF.
 /// Estimate an engine's reload cost from its VRAM footprint (WOR-1672).
 /// Preemption cost is dominated by reloading the weights, so a bigger
 /// model costs more to bring back; this is a size proxy (roughly
@@ -1486,6 +1487,43 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
 /// dominates the eviction decision.
 fn reload_cost_ms_for(vram_bytes: u64) -> u64 {
     vram_bytes / (1024 * 1024)
+}
+
+/// Exec a just-acquired engine binary once, before `ensure_ready` puts a
+/// readiness deadline on it.
+///
+/// Only the two arms that produce a *new* file on disk call this: a downloaded
+/// release and a freshly linked CUDA build. The PATH and explicit-path arms
+/// are left alone, because an operator's already-installed binary has been
+/// exec'd before and warming it would exec an arbitrary configured path for no
+/// gain.
+///
+/// macOS assesses an executable the first time it is exec'd and charges the
+/// cost to whoever waits for it, so without this the assessment is spent out of
+/// `ProcessEngineLauncher`'s 300s readiness budget rather than out of nothing.
+/// Measured against the real pinned llama.cpp release: 44.2s median and 57.2s
+/// worst under 24 concurrent first-exec workers, 0.047s once warm.
+///
+/// Best-effort and unbounded but for the shared hang guard: this moves a cost
+/// rather than gating anything, and a binary that cannot answer `--version`
+/// still gets its real launch and its real error. See
+/// `EngineProcessRunner::warm_first_exec` (WOR-2946).
+async fn warm_acquired_engine(path: &std::path::Path) {
+    if let Err(error) = crate::EngineProcessRunner::default()
+        .warm_first_exec(
+            path,
+            &["--version".to_string()],
+            std::time::Duration::from_secs(300),
+        )
+        .await
+    {
+        tracing::warn!(
+            executable = %path.display(),
+            %error,
+            "acquired engine first-exec warm-up did not complete; the launch below \
+             pays the assessment out of its readiness deadline"
+        );
+    }
 }
 
 /// Allocate a free loopback port by binding `:0` and releasing it. The
