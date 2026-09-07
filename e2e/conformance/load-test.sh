@@ -168,6 +168,16 @@ if [ ! -x "$SBPROXY_BIN" ]; then
 fi
 log "Using sbproxy binary: $SBPROXY_BIN"
 
+# Exec the binary once here, where nothing is timed (WOR-2943). macOS
+# assesses a freshly linked executable on its first exec, and the cost lands
+# on whoever waits for it. `cargo build --release` relinks this binary, so
+# the proxy's first start below would otherwise pay that inside
+# wait_for_port's 6s deadline (30 x 0.2s) and report "sbproxy did not start
+# on port" for a reason that is not in the proxy at all. Only the exec
+# matters, so the exit status is ignored, and this stays unbounded: an
+# assessment killed part-way is charged to the next run of the same file.
+"$SBPROXY_BIN" --version >/dev/null 2>&1 || true
+
 # ---------------------------------------------------------------------------
 # Step 2: Create sb.yml config
 # ---------------------------------------------------------------------------

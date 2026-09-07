@@ -39,6 +39,25 @@ if [ ! -x "$BIN" ]; then
   echo "error: $BIN not found. Build it first: make build-release" >&2
   exit 1
 fi
+
+# Exec the binary once here, before anything is timed (WOR-2943).
+#
+# macOS assesses a freshly linked executable on its first exec, and the cost
+# lands on whoever waits for that process, not on the spawn. `make tapes`
+# runs build-release immediately before this script, so the binary is always
+# freshly linked, and the first `start_proxy` below would otherwise pay the
+# assessment inside `wait_ready`'s 20s deadline (80 x 0.25s). That deadline
+# would then report "proxy never became ready on port ...", which is a claim
+# about the proxy, and the proxy would be fine. Worse, `wait_ready` failing
+# sends TERM then KILL to a process still inside the assessment, and an
+# assessment interrupted that way is charged to the next run of the same
+# file, so the tape after it inherits the cost.
+#
+# `--version` is answered by clap and exits before any config, listener, or
+# network path. Only the exec matters, so the exit status is ignored, and
+# this stays unbounded on purpose: a bounded warm-up inherits the very
+# defect it exists to remove.
+"$BIN" --version >/dev/null 2>&1 || true
 if [ -f "$ENV_FILE" ]; then
   set -a
   # shellcheck disable=SC1090
