@@ -1093,9 +1093,19 @@ async fn llama_provision_prefers_compatible_path_and_release_failures_do_not_fal
 /// why nothing here could see the provision-time warm-up: a call that returns
 /// `Err` and is deliberately ignored looks identical to a call that was never
 /// made.
+/// One command the runner issued, in the order it issued them.
+#[derive(Clone, Debug)]
+struct RecordedCall {
+    /// Which boundary it came through: `spawn` for a long-running engine,
+    /// `output` for a bounded one-shot, which is what a warm-up uses.
+    boundary: &'static str,
+    executable: PathBuf,
+    arguments: Vec<String>,
+}
+
 #[derive(Clone)]
 struct OrderedExecutor {
-    calls: Arc<Mutex<Vec<(&'static str, PathBuf, Vec<String>)>>>,
+    calls: Arc<Mutex<Vec<RecordedCall>>>,
     process: Arc<FixtureProcess>,
 }
 
@@ -1108,10 +1118,11 @@ impl CommandExecutor for OrderedExecutor {
         _environment: &BTreeMap<String, String>,
         _stderr_tail_lines: usize,
     ) -> Result<Arc<dyn EngineProcess>, EngineDriverError> {
-        self.calls
-            .lock()
-            .unwrap()
-            .push(("spawn", executable.to_path_buf(), arguments.to_vec()));
+        self.calls.lock().unwrap().push(RecordedCall {
+            boundary: "spawn",
+            executable: executable.to_path_buf(),
+            arguments: arguments.to_vec(),
+        });
         Ok(self.process.clone())
     }
 
@@ -1123,10 +1134,11 @@ impl CommandExecutor for OrderedExecutor {
         _timeout: Duration,
         _max_output_bytes: usize,
     ) -> Result<CommandOutput, EngineDriverError> {
-        self.calls
-            .lock()
-            .unwrap()
-            .push(("output", executable.to_path_buf(), arguments.to_vec()));
+        self.calls.lock().unwrap().push(RecordedCall {
+            boundary: "output",
+            executable: executable.to_path_buf(),
+            arguments: arguments.to_vec(),
+        });
         Ok(CommandOutput {
             success: true,
             stdout: "version: 9905".to_string(),
@@ -1144,9 +1156,13 @@ impl CommandExecutor for OrderedExecutor {
 /// loading a model. Measured against the real pinned release: 44.2s median
 /// and 57.2s worst under concurrent first-exec load, against 0.047s warm.
 ///
-/// Asserted by order rather than by presence. "The warm-up ran" is satisfied
-/// by a warm-up that runs after the spawn, which would be worth nothing, and
-/// the whole property is that it comes first (WOR-2946).
+/// What this pins, exactly: `provision` issues a `--version` command against
+/// the executable it is about to return, and issues no spawn of its own. It
+/// does *not* pin an ordering against `launch`'s spawn, because `launch` is
+/// never called here -- saying otherwise would claim more than the assertions
+/// check. The ordering that matters is structural instead: `provision`
+/// returns before `ensure_ready` is called at all, which
+/// `ProductionPreparedDeployment::start` fixes (WOR-2946).
 #[tokio::test]
 async fn llama_provisioning_warms_the_engine_binary_before_any_deadline_bounded_spawn() {
     let calls = Arc::new(Mutex::new(Vec::new()));
@@ -1177,18 +1193,18 @@ async fn llama_provisioning_warms_the_engine_binary_before_any_deadline_bounded_
         .first()
         .expect("provisioning issued no command at all");
     assert_eq!(
-        first.0, "output",
-        "the first command must be the warm-up, got {recorded:?}"
+        first.boundary, "output",
+        "the only command provisioning issues must be the warm-up, got {recorded:?}"
     );
-    assert_eq!(first.1, provisioned.executable);
+    assert_eq!(first.executable, provisioned.executable);
     assert_eq!(
-        first.2,
+        first.arguments,
         vec!["--version".to_string()],
         "the warm-up must be a flag the engine answers and exits on, so it \
          binds no port and writes nothing"
     );
     assert!(
-        !recorded.iter().any(|(kind, _, _)| *kind == "spawn"),
+        !recorded.iter().any(|call| call.boundary == "spawn"),
         "provisioning must not spawn a long-running engine: {recorded:?}"
     );
 }

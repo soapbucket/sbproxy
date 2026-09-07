@@ -16,6 +16,7 @@
 // unused helper in one binary is not dead code in the suite.
 #![allow(dead_code)]
 
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::sync::OnceLock;
@@ -37,9 +38,12 @@ use std::time::{Duration, Instant};
 /// hands its cost straight to the run it exists to protect.
 const WARM_UP_HANG_GUARD: Duration = Duration::from_secs(300);
 
-/// Above this, the warm-up says how long it took. Well clear of a warm exec
-/// (0.021s measured) and of an idle first exec, so a normal run stays quiet
-/// and only a run worth explaining prints.
+/// Above this, the warm-up says how long it took.
+///
+/// Well clear of a warm exec (0.021s measured) and nothing else. It is *not*
+/// above an idle first exec, which measured 9.311s here, and that is the
+/// point: a run that actually paid an assessment is the run worth a line. A
+/// repeat run finds the verdict cached and stays quiet.
 const SLOW_WARM_UP: Duration = Duration::from_secs(2);
 
 /// Pay the shipped `sbproxy` binary's first-exec cost once per test
@@ -72,29 +76,53 @@ const SLOW_WARM_UP: Duration = Duration::from_secs(2);
 /// This never skips anything. On the hang guard it fails, loudly, with the
 /// diagnosis, and the run that follows finds a warm cache.
 pub fn warm_shipped_binary() {
-    static WARM: OnceLock<()> = OnceLock::new();
-    WARM.get_or_init(|| {
-        let started = Instant::now();
-        let (sender, receiver) = mpsc::sync_channel(1);
-        std::thread::spawn(move || {
-            let status = Command::new(env!("CARGO_BIN_EXE_sbproxy"))
-                .arg("--version")
-                // The runner's own environment must not be able to send
-                // this anywhere but clap's version path.
-                .env_remove("SB_CONFIG_FILE")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            let _ = sender.send(status);
-        });
-        match receiver.recv_timeout(WARM_UP_HANG_GUARD) {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
-                panic!("the shipped sbproxy binary could not be executed at all: {error}")
-            }
-            Err(_) => panic!(
-                "the shipped sbproxy binary did not answer `--version` within {}s \
+    // The outcome is stored rather than acted on inside the initializer, and
+    // the panic happens outside it. `OnceLock::get_or_init` leaves the cell
+    // uninitialized when its closure panics, so panicking in there would make
+    // every later test in the binary re-enter and wait the full guard again:
+    // one wedged daemon would cost 300s per test rather than 300s per process.
+    static WARM: OnceLock<Result<(), String>> = OnceLock::new();
+    if let Err(message) = WARM.get_or_init(warm_once) {
+        panic!("{message}");
+    }
+}
+
+/// The exec half of [`warm_shipped_binary`], separated so a test can watch it
+/// run. Returns the diagnosis rather than panicking; see the caller.
+fn warm_once() -> Result<(), String> {
+    warm_executable_once(Path::new(env!("CARGO_BIN_EXE_sbproxy")), "sbproxy")
+}
+
+/// Exec `path` once with `--version`, bounded only by the hang guard.
+///
+/// Takes a path so the helper itself is testable: nothing else here can tell
+/// a warm-up that ran from one that returned.
+pub fn warm_executable_once(path: &Path, what: &str) -> Result<(), String> {
+    let started = Instant::now();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let target = path.to_path_buf();
+    std::thread::spawn(move || {
+        let status = Command::new(&target)
+            .arg("--version")
+            // The runner's own environment must not be able to send
+            // this anywhere but clap's version path.
+            .env_remove("SB_CONFIG_FILE")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let _ = sender.send(status);
+    });
+    match receiver.recv_timeout(WARM_UP_HANG_GUARD) {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            return Err(format!(
+                "the shipped {what} binary could not be executed at all: {error}"
+            ))
+        }
+        Err(_) => {
+            return Err(format!(
+                "the shipped {what} binary did not answer `--version` within {}s \
                  (waited {}s).\n\
                  \n\
                  This is almost certainly not a bug in this test. On macOS the first \
@@ -109,19 +137,22 @@ pub fn warm_shipped_binary() {
                  The verdict is cached by cdhash, so the second exec is instant.",
                 WARM_UP_HANG_GUARD.as_secs(),
                 started.elapsed().as_secs()
-            ),
+            ))
         }
-        let elapsed = started.elapsed();
-        // Silent by default, because the usual case is milliseconds. A slow
-        // one is worth a line: this is the only step here that can take
-        // minutes, and a run killed while sitting in it should say what it
-        // was waiting on rather than looking hung.
-        if elapsed >= SLOW_WARM_UP {
-            eprintln!(
-                "warm_shipped_binary: sbproxy --version took {:.1}s \
+    }
+    let elapsed = started.elapsed();
+    // Silent when the file was already warm, which is the usual case in a
+    // repeat run. Anything above the threshold means a real assessment was
+    // paid, and that is exactly the run worth a line: it is the only step
+    // here that can take a minute, and a run killed while sitting in it
+    // should say what it was waiting on rather than looking hung.
+    if elapsed >= SLOW_WARM_UP {
+        eprintln!(
+            "warm_executable_once: {} --version took {:.1}s \
                  (macOS first-exec assessment; see WOR-2946)",
-                elapsed.as_secs_f64()
-            );
-        }
-    });
+            path.display(),
+            elapsed.as_secs_f64()
+        );
+    }
+    Ok(())
 }

@@ -17,7 +17,7 @@ use std::net::TcpStream;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use sbproxy_e2e::proxy_binary_path;
+use sbproxy_e2e::{proxy_binary_path, warm_binary_once};
 
 /// Grab an ephemeral port by binding to `:0` and releasing it. There
 /// is an inherent race between release and the proxy's rebind, but the
@@ -44,6 +44,10 @@ fn wait_listening(port: u16, timeout: Duration) -> bool {
 #[test]
 fn sigterm_drains_and_exits_cleanly_within_grace() {
     let bin = proxy_binary_path();
+    // This test spawns the proxy itself rather than through `ProxyHarness`,
+    // so the harness's warm-up never runs in this binary. The 20s bound below
+    // would otherwise contain the first exec (WOR-2946).
+    warm_binary_once(&bin);
     assert!(
         bin.is_file(),
         "sbproxy binary missing at {}; run `cargo build -p sbproxy` first",

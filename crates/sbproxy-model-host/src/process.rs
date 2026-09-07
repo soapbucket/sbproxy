@@ -1469,9 +1469,14 @@ pub struct CommandOutput {
 /// bound for the shared command boundary.
 const WARM_UP_OUTPUT_LIMIT: usize = 4 * 1024;
 
-/// Above this, [`EngineProcessRunner::warm_first_exec`] logs how long it
-/// took. Well clear of a warm exec (0.047s measured) and of an idle first
-/// exec, so a normal start stays quiet.
+/// Above this, [`EngineProcessRunner::warm_first_exec`] logs how long it took.
+///
+/// Well clear of a warm exec (0.047s measured) and nothing else. It is *not*
+/// above an idle first exec, which measured 2.9s median for a downloaded
+/// engine, and that is deliberate: the run that actually pays an assessment is
+/// the run an operator wants named. Every start after it finds the verdict
+/// cached and stays quiet, so this is once per binary per machine, not per
+/// deployment.
 const SLOW_WARM_UP: Duration = Duration::from_secs(2);
 
 /// Readiness probe injected into the process runner for deterministic tests.
@@ -1606,6 +1611,17 @@ impl EngineProcessRunner {
     /// above the cost: an assessment killed part-way is charged to the next
     /// run of the same file, so a tight warm-up hands its cost straight to
     /// the launch it exists to protect (WOR-2946).
+    ///
+    /// One cost of not bounding it tightly, stated rather than left to be
+    /// rediscovered: `ProductionPreparedDeployment::start` holds its
+    /// `tokio::Mutex<EngineSupervisor>` across both `provision` and
+    /// `ensure_ready`. In the normal case this changes nothing, because the
+    /// same assessment would otherwise be paid inside `launch` under the same
+    /// guard. In the wedged case it does: a warm-up that runs out the hang
+    /// guard and then a launch that runs out `ready_timeout` takes that
+    /// critical section from about 300s to about 600s, and `health`, `stop`,
+    /// and `reset` for that deployment wait behind it. That is the trade for
+    /// a warm-up that cannot itself become the deadline.
     pub async fn warm_first_exec(
         &self,
         executable: &Path,

@@ -37,6 +37,13 @@ use crate::{
 /// the plain probe path is safe under load, unlike SGLang's.
 const HEALTH_PATH: &str = "/health";
 
+/// Hang guard for the first-exec warm-up in `provision`, and deliberately not
+/// a budget for it. Sized like `llama_driver`'s, which see: five times the
+/// worst first exec measured for a downloaded engine on this hardware (57.2s
+/// under 24 concurrent first-exec workers) and three orders of magnitude above
+/// a warm one (WOR-2946).
+const WARM_UP_HANG_GUARD: Duration = Duration::from_secs(300);
+
 /// Binary lookup and release acquisition boundary used by the
 /// mistral.rs driver. The seam mirrors
 /// [`crate::llama_driver::LlamaBinarySource`] so tests can substitute a
@@ -419,6 +426,25 @@ impl EngineDriver for MistralRsDriver {
                 ));
                 }
             };
+        // The same move `LlamaCppDriver::provision` makes, for the same
+        // reason: this driver's `FetchRelease` arm downloads and extracts a
+        // pinned `mistralrs` release, and `launch` below spawns it under
+        // `ready_timeout`. Provisioning carries no deadline of its own, so the
+        // operating system's one-time assessment is paid here rather than out
+        // of a budget sized for loading a model. Best-effort; see
+        // `EngineProcessRunner::warm_first_exec` (WOR-2946).
+        if let Err(error) = self
+            .runner
+            .warm_first_exec(&executable, &["--version".to_string()], WARM_UP_HANG_GUARD)
+            .await
+        {
+            tracing::warn!(
+                executable = %executable.display(),
+                %error,
+                "mistral.rs first-exec warm-up did not complete; the launch below \
+                 pays the assessment out of its readiness deadline"
+            );
+        }
         Ok(ProvisionedEngine {
             kind: EngineKind::MistralRs,
             executable,

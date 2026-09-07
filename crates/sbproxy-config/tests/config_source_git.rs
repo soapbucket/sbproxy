@@ -547,11 +547,18 @@ fn write_hanging_git(dir: &Path) -> PathBuf {
 /// elsewhere. The load average will not show it, because a process blocked
 /// on the assessment is blocked rather than runnable.
 ///
-/// `a_hanging_fetch_leaves_no_orphaned_grandchild` had the worse version of
-/// the problem: it asserts nothing is left over after the loader's
-/// one-second timeout, and an assessment longer than that second means the
-/// shell is killed before it ever reaches `sleep`, so there is no
-/// grandchild to leak and the assertion passes without testing anything.
+/// Only one of the two tests below needs this, and it is worth saying which,
+/// because the obvious reading is wrong. `load_source_blocking` calls
+/// `GitBinaryCloner::preflight` before it starts any clock, and preflight runs
+/// this fixture as `git --version` with a plain `status()` and no bound at
+/// all, so the assessment was always paid there. That is what makes
+/// `a_hanging_fetch_leaves_no_orphaned_grandchild` safe as written: by the
+/// time the loader's one-second fetch timeout starts, the shell that reaches
+/// `sleep` is a warm second exec, so the grandchild it is asserting about does
+/// get spawned. The test this warm-up actually protects is
+/// `a_fetch_that_hangs_is_killed_at_the_timeout`, whose 30s wall clock is
+/// measured around the whole call and therefore contains preflight's
+/// unbounded first exec.
 ///
 /// `--version` is the warm-up because the fixture answers it and exits
 /// (see the script above); running it any other way starts the ~20s sleep

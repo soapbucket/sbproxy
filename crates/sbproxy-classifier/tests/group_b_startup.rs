@@ -58,8 +58,12 @@ const FIRST_EXEC_WAIT: Duration = Duration::from_secs(300);
 /// This never skips anything. On timeout it fails, loudly, with the
 /// diagnosis, and the run that follows it finds a warm cache.
 fn warm_shipped_binary() {
-    static WARM: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    WARM.get_or_init(|| {
+    // Stored, not panicked, inside the initializer: `OnceLock::get_or_init`
+    // leaves the cell uninitialized when its closure panics, so a panic in
+    // there would make every later test in this binary re-enter and wait the
+    // full guard again (WOR-2946).
+    static WARM: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    if let Err(message) = WARM.get_or_init(|| {
         let started = Instant::now();
         let (sender, receiver) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
@@ -72,29 +76,31 @@ fn warm_shipped_binary() {
             let _ = sender.send(status);
         });
         match receiver.recv_timeout(FIRST_EXEC_WAIT) {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
-                panic!("the shipped classifier binary could not be executed at all: {error}")
-            }
-            Err(_) => panic!(
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(error)) => Err(format!(
+                "the shipped classifier binary could not be executed at all: {error}"
+            )),
+            Err(_) => Err(format!(
                 "the shipped classifier binary did not answer `--help` within {}s \
                  (waited {}s).\n\
                  \n\
                  This is almost certainly not a bug in this test. On macOS the first \
-                 exec of a freshly linked binary blocks in posix_spawn while \
-                 syspolicyd assesses its provenance, and a wedged daemon turns that \
-                 into tens of minutes. Confirm it with `ps aux | grep -iE \
-                 'syspolicyd|XprotectService'` (sustained CPU) and `sample <pid>` on \
-                 a stuck child (parked at _dyld_start +0).\n\
+                 exec of a freshly linked binary blocks while syspolicyd assesses \
+                 its provenance, and the cost lands on the wait rather than on the \
+                 spawn. A wedged daemon turns that into tens of minutes. Confirm it \
+                 with `ps aux | grep -iE 'syspolicyd|XprotectService'` (sustained \
+                 CPU) and `sample <pid>` on the stuck child.\n\
                  \n\
                  Clear it with `sudo spctl --global-disable` (no reboot; re-enable \
                  with --global-enable) or by rebooting, then run this test again. \
                  The verdict is cached by cdhash, so the second exec is instant.",
                 FIRST_EXEC_WAIT.as_secs(),
                 started.elapsed().as_secs()
-            ),
+            )),
         }
-    });
+    }) {
+        panic!("{message}");
+    }
 }
 
 #[derive(Debug)]

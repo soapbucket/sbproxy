@@ -87,6 +87,10 @@ impl Sidecar {
         let endpoint = format!("http://127.0.0.1:{port}");
         let spec = format!("{MODEL_ID}={}:{}", model.display(), tokenizer.display());
         let bin = sidecar_binary_path();
+        // A different shipped binary from the proxy, so the harness's warm-up
+        // does not cover it even in principle: the cache is keyed by path. The
+        // 45s bound below would otherwise contain its first exec (WOR-2946).
+        sbproxy_e2e::warm_binary_once(&bin);
         if !bin.is_file() {
             anyhow::bail!(
                 "classifier sidecar binary missing at {}; run `cargo build --release -p sbproxy-classifier-sidecar` or set {SIDECAR_BIN_ENV}",

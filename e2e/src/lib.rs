@@ -265,10 +265,24 @@ fn warm_proxy_binary(flavor: ProxyBinaryFlavor) {
     warm_binary_once(&bin);
 }
 
-/// The exec half of [`warm_proxy_binary`], taking a path so a test can point
-/// it at a fixture and watch it run. Exactly one exec per distinct path for
-/// the life of the process.
-fn warm_binary_once(bin: &Path) {
+/// Exec `bin` once with `--version`, outside any wall-clock bound, and never
+/// again for that path in this process.
+///
+/// [`ProxyHarness`]'s own constructors call this for you. It is public for the
+/// e2e tests that spawn a binary themselves rather than going through a
+/// `start_*` funnel: those put their own deadline around the wait
+/// (`graceful_shutdown_e2e`'s 20s, `config_rollback`'s `CONVERGE`,
+/// `semantic_cache_sidecar_e2e`'s 45s around a *different* shipped binary),
+/// and that deadline contains the first exec exactly as the harness's did.
+/// Call it before picking a port, so no reservation is held across the
+/// assessment.
+///
+/// Keyed by path, so warming one binary says nothing about another and a
+/// sidecar is covered on the same terms as the proxy.
+///
+/// See `crates/sbproxy/tests/common/mod.rs` for the canonical account
+/// (WOR-2946).
+pub fn warm_binary_once(bin: &Path) {
     static WARMED: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
     let warmed = WARMED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
     // Held across the exec on purpose: concurrent harness starts in this
