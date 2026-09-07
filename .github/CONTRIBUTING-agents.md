@@ -159,15 +159,29 @@ authoritative lint and doc run.
 last line of every run, success or failure, is one quotable line:
 
 ```
-GATE_EXIT=0 tests=15489 failures=0 skipped_phases=0 elapsed=2413s
-GATE_EXIT=100 tests=15489 failures=1 failed_phase=cargo test skipped_phases=2 elapsed=1920s
+GATE_EXIT=0 tests=21981 failures=0 test_lanes=workspace:16020+payments:5961 skipped_phases=0 elapsed=2413s
+GATE_EXIT=100 tests=16020 failures=1 test_lanes=workspace:16020 failed_phase=cargo test skipped_phases=2 elapsed=1920s
 ```
 
 "It was green" cannot tell those two apart, and it hides the `SKIPPED PHASES` block
 completely: a run that stopped at the first cargo phase and a run that finished everything
 both get described the same way. Quote the line, and quote the `SKIPPED PHASES` block with
-it if it is not empty. `tests=not-run` means the test phase never executed, which is a
-different thing from zero failures.
+it if it is not empty. `tests=not-run` means no nextest lane executed, which is a
+different thing from zero failures, and `unparsed` means a lane ran and left no readable
+count.
+
+`tests=` and `failures=` are the whole run's totals, summed across every nextest lane the
+gate ran, and `test_lanes=` names the lanes those totals came from. Read the breakdown
+when you compare two runs: a total that fell because tests were deleted and a total that
+fell because a whole lane stopped running look identical, and only the lane list tells
+them apart. The libtest phases (the observability budgets targets, the doctest pass) write
+no junit and are not in these totals; each prints its own count where it runs.
+
+Both fields used to read the junit file of whichever nextest lane finished last and report
+it as the run's, so a two-lane run of 16020 and 5961 tests said `tests=5961` (WOR-2951,
+fixed 2026-09-07). Every `tests=` figure quoted from a multi-lane run before that date is
+the last lane's count and not the total, so do not compare one against a figure from a
+later run.
 
 **A run with `-p` is not a gate run.** Every cargo phase in `check.sh` is `--workspace`, and
 the payments phase says why in its own comment: narrow the tests, never the packages. A
