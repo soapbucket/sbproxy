@@ -36,6 +36,10 @@ use sbproxy_config::config_bundle::{BundleMode, ConfigBundle, ConfigBundleSigner
 /// output, in every test that supplies it.
 const PASSWORD: &str = "fixture-admin-password";
 
+// The first exec of the shipped binary is paid in `common`, outside every
+// wall-clock bound in this file. See `tests/common/mod.rs` (WOR-2946).
+mod common;
+
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_sbproxy")
 }
@@ -195,6 +199,11 @@ fn one_shot_fixture(
     body: Vec<u8>,
     extra_headers: Vec<String>,
 ) -> (String, std::thread::JoinHandle<Captured>) {
+    // FIXTURE_ACCEPT_TIMEOUT starts inside the thread below, and what it
+    // waits for is the shipped binary's first exec. Pay that here, where
+    // nothing is timed; the bound exists to catch a command that refuses
+    // locally and never connects.
+    common::warm_shipped_binary();
     let listener = TcpListener::bind("127.0.0.1:0").expect("fixture bind");
     let address = listener.local_addr().expect("fixture address");
     let handle = std::thread::spawn(move || {

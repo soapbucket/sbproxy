@@ -10,6 +10,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const ADMIN_FIXTURE_TIMEOUT: Duration = Duration::from_secs(30);
 
+// The first exec of the shipped binary is paid in `common`, outside every
+// wall-clock bound in this file. See `tests/common/mod.rs` (WOR-2946).
+mod common;
+
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_sbproxy")
 }
@@ -72,6 +76,11 @@ fn fixture_admin(
     expected_prefix: &'static str,
     body: &'static str,
 ) -> (String, thread::JoinHandle<()>) {
+    // ADMIN_FIXTURE_TIMEOUT starts inside the thread below, and what it
+    // waits for is the shipped binary's first exec. Pay that here, where
+    // nothing is timed; the bound exists to catch a command that never
+    // contacts the admin fixture.
+    common::warm_shipped_binary();
     let listener = TcpListener::bind("127.0.0.1:0").expect("fixture listener");
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
