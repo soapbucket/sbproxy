@@ -91,7 +91,8 @@
     "smoke runner drives HTTP and `sbproxy plan` is a CLI command; the",
     "README and docs/listings.md capture it directly instead.",
     "",
-    "audit_check stays false until the OSS /api/audit/recent endpoint",
-    "lands."
+    "audit_check stays false: /api/audit/recent serves the",
+    "rate_limit_budget audit ring only, and this example sets no",
+    "rate_limits: block, so that ring is always empty here."
   ]
 }

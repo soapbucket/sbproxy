@@ -14,6 +14,8 @@
     "in-memory projection cache. They are safe to assert as 2xx for",
     "any caller and any Host header.",
     "",
-    "audit_check stays false until the OSS audit endpoint lands."
+    "audit_check stays false: /api/audit/recent serves the",
+    "rate_limit_budget audit ring only, and this example sets no",
+    "rate_limits: block, so that ring is always empty here."
   ]
 }

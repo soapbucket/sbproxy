@@ -12,8 +12,8 @@
 # its TCP + MessagePack port 9400) that this single-policy example does not
 # exercise.
 #
-# Run the rich sidecar (supply your own ONNX model + tokenizer; OSS does
-# not ship weights):
+# Run the rich sidecar (supply your own ONNX model + tokenizer; no
+# weights ship with the binary):
 #   cargo run -p sbproxy-classifier -- \
 #     --listen 127.0.0.1:9500 \
 #     --default-model prompt-injection \

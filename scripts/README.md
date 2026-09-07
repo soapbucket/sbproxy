@@ -316,7 +316,7 @@ Field-by-field:
 | `health_path` | `/healthz` | The path used for the liveness probe. Use `/health` for examples that do not enable the admin listener. |
 | `cases` | `[]` | Preferred assertion format. Each case can assert method, path, request headers, an optional JSON request `body` sent with `curl --data-binary`, expected status, expected response headers as regexes, and `body.type: "jsonShape"` subset matches. Add `requires_env` to skip a case unless one or more env vars are set. |
 | `feature_endpoints` | `[]` | Legacy shorthand. Each entry is a path on the data-plane port that the runner GETs and asserts returns 2xx. |
-| `audit_check` | `false` | When `true`, the runner additionally hits `/api/audit/recent` on the admin port and asserts at least one entry. The OSS in-memory adapter does not ship this endpoint until Wave 2 (R1.2); leave `false` for Wave 1 examples. |
+| `audit_check` | `false` | When `true`, the runner additionally hits `/api/audit/recent` on the admin port and asserts at least one entry. That endpoint serves the `rate_limit_budget` audit ring and nothing else, so leave it `false` unless the example configures `rate_limits:` and drives it past a threshold. |
 
 Legacy fields `port` and `endpoints` are still accepted as aliases
 for `data_plane_port` and `feature_endpoints` respectively.

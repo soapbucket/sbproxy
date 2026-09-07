@@ -7,12 +7,13 @@
 # is mandatory: an unavailable, overloaded, or malformed sidecar can
 # never silently turn a protected request into an unscored allow.
 #
-# The same config works against the minimal OSS sidecar
-# (`sbproxy-classifier-sidecar`) and the richer OSS sidecar;
-# switching between them is a deployment change, not a config change.
+# The same config works against the minimal sidecar
+# (`sbproxy-classifier-sidecar`) and the richer one
+# (`sbproxy-classifier`); switching between them is a deployment
+# change, not a config change.
 #
-# Run the OSS sidecar (supply your own ONNX model + tokenizer; OSS does
-# not ship weights):
+# Run the sidecar (supply your own ONNX model + tokenizer; no
+# weights ship with the binary):
 #   cargo run -p sbproxy-classifier-sidecar -- \
 #     --listen 127.0.0.1:9440 \
 #     --default-model prompt-injection \

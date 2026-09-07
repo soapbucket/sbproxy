@@ -7,8 +7,8 @@
 # (`source: sidecar`), so prompts are embedded on-box: no per-call cost,
 # no prompt egress, low loopback latency.
 #
-# Run the OSS sidecar with an embedding model (supply your own ONNX
-# model + tokenizer; OSS ships no weights):
+# Run the sidecar with an embedding model (supply your own ONNX
+# model + tokenizer; no weights ship with the binary):
 #   cargo run -p sbproxy-classifier-sidecar -- \
 #     --listen 127.0.0.1:9440 \
 #     --embed-model all-MiniLM-L6-v2=/models/minilm/model.onnx:/models/minilm/tokenizer.json

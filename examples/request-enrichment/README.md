@@ -1,6 +1,6 @@
 # GeoIP + User-Agent enrichment
 
-*Last modified: 2026-08-22*
+*Last modified: 2026-09-07*
 
 Two policies, `geoip` and `user_agent_parser`, resolve the client IP and parse the `User-Agent` header into structured data. Neither denies a request: each stamps its result onto `X-*` upstream headers and onto `sbproxy_plugin::RequestContextView` for any registered identity or anomaly hook. See [docs/request-enrichment.md](../../docs/request-enrichment.md).
 
@@ -26,8 +26,8 @@ curl -s -H 'Host: api.local' \
 # "headless_chrome"
 
 # geoip runs with no database configured: no X-Geo-* headers, but the
-# request still reaches the upstream (this OSS build's embedded MMDB
-# is a zero-byte placeholder).
+# request still reaches the upstream (the embedded MMDB is a
+# zero-byte placeholder in this checkout).
 curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: api.local' \
   -H 'X-Real-IP: 8.8.8.8' \
   http://127.0.0.1:8080/get

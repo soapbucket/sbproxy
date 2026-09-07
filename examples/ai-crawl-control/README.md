@@ -1,10 +1,10 @@
 # AI crawl control with Pay Per Crawl
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-09-07*
 
 ![AI crawl control with Pay Per Crawl](../../docs/assets/ai-crawl-control.gif)
 
-The `ai_crawl_control` policy returns HTTP 402 Payment Required to known AI crawler User-Agents that arrive without a `Crawler-Payment` token. The 402 response body explains the price and the header to retry with; the response also stamps a `Crawler-Payment realm=...` challenge. The OSS ledger is in-memory: every token in `valid_tokens` redeems exactly once, after which the policy charges again. Enterprise builds swap in an HTTP-callable ledger that talks to a payments backend. Normal browser User-Agents pass through without paying.
+The `ai_crawl_control` policy returns HTTP 402 Payment Required to known AI crawler User-Agents that arrive without a `Crawler-Payment` token. The 402 response body explains the price and the header to retry with; the response also stamps a `Crawler-Payment realm=...` challenge. The bundled ledger is in-memory: every token in `valid_tokens` redeems exactly once, after which the policy charges again. A `policies[].ledger:` block swaps in the HTTP ledger client, which redeems against a payments backend over HTTPS. Normal browser User-Agents pass through without paying.
 
 ## Run
 
@@ -59,7 +59,7 @@ curl -s -o /dev/null -w "%{http_code}\n" \
 
 - `ai_crawl_control` policy with `price`, `currency`, and configurable challenge `header`
 - `crawler_user_agents` - case-insensitive User-Agent substrings that mark a crawler
-- `valid_tokens` - in-memory single-use ledger for OSS deployments
+- `valid_tokens` - in-memory single-use ledger, used when no `ledger:` block is set
 - HTTP 402 challenge response with `Crawler-Payment realm=...` header and JSON body
 
 ## See also

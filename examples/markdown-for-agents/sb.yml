@@ -154,7 +154,7 @@ origins:
               currency: USD
             paywall_position: top_of_page
 
-        # OSS in-memory ledger seed. Each token redeems exactly once.
+        # In-memory ledger seed. Each token redeems exactly once.
         valid_tokens:
           - token-md-001
           - token-md-002

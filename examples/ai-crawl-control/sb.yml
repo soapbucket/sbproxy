@@ -3,9 +3,9 @@
 #
 # Returns 402 to known AI crawler User-Agents that arrive without
 # a `Crawler-Payment` token. The 402 response includes a JSON body
-# explaining the price and the header to retry with. The OSS ledger
-# is in-memory: every token in `valid_tokens` redeems once, then
-# the policy charges again.
+# explaining the price and the header to retry with. The bundled
+# ledger is in-memory: every token in `valid_tokens` redeems once,
+# then the policy charges again.
 #
 # Run:
 #   make run CONFIG=examples/ai-crawl-control/sb.yml

@@ -11,13 +11,13 @@
     "compose file) does not pick it up. The fields above mirror the",
     "30-rail-x402-base-sepolia and 31-rail-mpp-stripe-test schema so",
     "the contract is in one place when a future revision adds a",
-    "Lightning regtest stand-in (mock-cln or mock-phoenixd).",
+    "Lightning regtest stand-in (a mock Core Lightning or LND node).",
     "",
     "expected_multi_rail_kinds is the contract this example pins:",
     "the 402 multi-rail body for /article* MUST include a `lightning`",
-    "rail entry when the proxy is built with one of the enterprise",
-    "lightning-cln / lightning-lnd / lightning-phoenixd features. The",
-    "OSS-default build emits the `x402` fallback only; the field",
+    "rail entry when the proxy is built with one of the optional",
+    "payment-lightning-cln / payment-lightning-lnd cargo features.",
+    "The default build emits the `x402` fallback only; the field",
     "documents both kinds because the per-tier `rails:` override in",
     "sb.yml lists both.",
     "",
@@ -26,7 +26,8 @@
     "runner asserts 2xx on each declared endpoint. Liveness alone is",
     "the meaningful signal for CI.",
     "",
-    "audit_check stays false until Wave 2 (R1.2) ships the OSS",
-    "/api/audit/recent endpoint."
+    "audit_check stays false: /api/audit/recent serves the",
+    "rate_limit_budget audit ring only, and this example sets no",
+    "rate_limits: block, so that ring is always empty here."
   ]
 }

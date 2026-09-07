@@ -18,6 +18,8 @@
     "schema validation is wired into the licensing-conformance CI",
     "workflow (B4.5) instead.",
     "",
-    "audit_check stays false until the OSS audit endpoint lands."
+    "audit_check stays false: /api/audit/recent serves the",
+    "rate_limit_budget audit ring only, and this example sets no",
+    "rate_limits: block, so that ring is always empty here."
   ]
 }

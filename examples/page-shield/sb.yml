@@ -5,8 +5,8 @@
 # response with the configured directives plus a `report-uri`
 # pointing at the proxy's intake endpoint. Browsers POST violation
 # reports to that endpoint; the proxy logs each report under the
-# `sbproxy::page_shield` tracing target so logpush sinks (or the
-# enterprise connection-monitor) can analyze them.
+# `sbproxy::page_shield` tracing target so the log sink you already
+# run can analyze them.
 #
 # The response-phase policies (page_shield, security_headers, sri,
 # assertion) apply to proxied responses and to generated ones alike:

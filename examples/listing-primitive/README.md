@@ -187,7 +187,7 @@ bash scripts/examples-smoke.sh examples/listing-primitive
 ## What a Listing does not do yet
 
 - **Nothing routes on it.** `accessPlan`, `publish`, and `lifecycle` are recorded and validated, and no request is priced, gated, or rate-limited by them. They are the input a hosted Catalog surface will read.
-- **Revision pins are not checked.** The OSS resolver accepts every SHA, branch, and tag, so `missing-listing-revision-*` cannot fire here. A caller that links a real revision resolver, such as a future controller, gets the strict existence check.
+- **Revision pins are not checked.** The default `NoopRevisionResolver` accepts every SHA, branch, and tag, so `missing-listing-revision-*` cannot fire here. A caller that links a real revision resolver, such as a future controller, gets the strict existence check.
 - **Only the well-known prefix serves artifacts.** A Listing skill's body is reachable under `/.well-known/agent-skills/<listing>/<path>`. The bare `/skills/...` path is served by the top-level `agent_skills:` block, which is a separate surface.
 
 ## Clean up

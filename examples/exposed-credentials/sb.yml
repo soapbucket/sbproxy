@@ -6,11 +6,11 @@
 # stamps the upstream request with a header (`tag` action, the
 # default) or rejects the request outright (`block` action).
 #
-# The OSS provider is `static`: operators ship a list of leaked
-# passwords (or SHA-1 hex hashes thereof) inline in YAML or via
-# `sha1_file`. Hash-only lists keep plaintext passwords out of
-# config, log files, and process memory dumps. The HIBP k-anonymity
-# adapter ships in the enterprise build.
+# `static` is the only provider that ships: operators supply a list
+# of leaked passwords (or SHA-1 hex hashes thereof) inline in YAML
+# or via `sha1_file`. Hash-only lists keep plaintext passwords out
+# of config, log files, and process memory dumps. Any other
+# `provider:` value is refused at config compile.
 #
 # Run:
 #   make run CONFIG=examples/exposed-credentials/sb.yml

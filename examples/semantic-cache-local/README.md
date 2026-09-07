@@ -1,6 +1,6 @@
 # Local embedding semantic cache
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-09-07*
 
 Serves near-duplicate AI prompts from cache, vectorizing prompts on-box via the
 classifier sidecar instead of a paid provider embedding API. No per-call cost,
@@ -9,7 +9,7 @@ no prompt egress, low loopback latency.
 ## Run
 
 Start the sidecar with an embedding model (supply your own ONNX model and
-tokenizer; the OSS build ships no weights):
+tokenizer; no weights ship with the binary):
 
 ```bash
 cargo run -p sbproxy-classifier-sidecar -- \

@@ -1,10 +1,10 @@
 # Meter and monetize AI crawlers
 
-*Last modified: 2026-07-06*
+*Last modified: 2026-09-07*
 
 ![Verify, meter, and charge AI crawlers with Web Bot Auth and HTTP 402](../../docs/assets/use-case-meter-crawlers.gif)
 
-Two gates on one origin. The `bot_auth` provider verifies RFC 9421 HTTP Message Signatures (Web Bot Auth) and turns away unsigned crawlers with 401. The `ai_crawl_control` policy then charges verified crawlers per request: no `crawler-payment` token gets a 402 challenge naming the price, and each seeded token redeems exactly once against the OSS in-memory ledger. The full walkthrough, including the signing helper invocation, is the story doc at [docs/use-case-meter-crawlers.md](../../docs/use-case-meter-crawlers.md).
+Two gates on one origin. The `bot_auth` provider verifies RFC 9421 HTTP Message Signatures (Web Bot Auth) and turns away unsigned crawlers with 401. The `ai_crawl_control` policy then charges verified crawlers per request: no `crawler-payment` token gets a 402 challenge naming the price, and each seeded token redeems exactly once against the in-memory ledger. The full walkthrough, including the signing helper invocation, is the story doc at [docs/use-case-meter-crawlers.md](../../docs/use-case-meter-crawlers.md).
 
 ## Run
 

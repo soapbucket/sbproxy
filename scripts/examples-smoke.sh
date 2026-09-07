@@ -8,8 +8,9 @@
 #   3. Runs each declarative `cases[]` assertion from smoke.json.
 #   4. Hits legacy `feature_endpoints[]` on <data_plane_port>; expects 2xx.
 #   5. Optionally asserts an audit-log entry exists (gated on the
-#      `audit_check` flag in smoke.json; defaults off until Wave 2
-#      lands the OSS admin endpoint).
+#      `audit_check` flag in smoke.json; defaults off because
+#      /api/audit/recent serves the rate_limit_budget audit ring
+#      only, which most examples never fill).
 #   6. `docker compose down -v`.
 #
 # Examples without a docker-compose.yml are skipped silently. Examples
@@ -57,10 +58,11 @@
 #       }
 #     }],
 #     "feature_endpoints": ["/preview/x"], # data-plane GETs to assert 2xx.
-#     "audit_check":       false           # Wave 1 OSS has no audit
-#                                          #   admin endpoint; flip to
-#                                          #   true once Wave 2 ships
-#                                          #   /api/audit/recent.
+#     "audit_check":       false           # only set true when the
+#                                          #   example configures
+#                                          #   rate_limits:, the one
+#                                          #   source /api/audit/recent
+#                                          #   reports.
 #   }
 
 set -euo pipefail
@@ -294,9 +296,11 @@ wait_for_healthz() {
 }
 
 # Asks the proxy admin endpoint for recent audit entries. Returns 0
-# if at least one entry is present; non-zero otherwise. The endpoint
-# does not exist in Wave 1 OSS; gated behind `audit_check: true` in
-# smoke.json. Wave 2 (R1.2) ships /api/audit/recent.
+# if at least one entry is present; non-zero otherwise.
+# /api/audit/recent serves the rate_limit_budget registry's audit
+# ring, so it is empty unless the example configures `rate_limits:`
+# and drives it past a threshold. Gated behind `audit_check: true`
+# in smoke.json, which defaults to false for that reason.
 assert_audit_emitted() {
   local port="$1"
   local body
@@ -544,7 +548,7 @@ run_example() {
       echo "[examples-smoke] $dir: audit-log on :$admin_port -> OK"
       ;;
     *)
-      echo "[examples-smoke] $dir: audit_check disabled (default until Wave 2 ships /api/audit/recent)"
+      echo "[examples-smoke] $dir: audit_check disabled (default; /api/audit/recent serves only the rate_limit_budget audit ring)"
       ;;
   esac
 

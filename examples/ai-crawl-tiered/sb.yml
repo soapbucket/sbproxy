@@ -11,12 +11,14 @@
 #   mock-origin/        - nginx serving fixed article HTML / Markdown
 #   Makefile            - up / down / logs / test convenience targets
 #
-# This example uses the OSS in-memory ledger seeded with three tokens.
+# This example uses the in-memory ledger seeded with three tokens.
 # The mock-ledger service in `docker-compose.yml` is included as a
-# realistic stand-in for the HTTP ledger client (Wave 2). The current
-# OSS build redeems against `valid_tokens`; pointing the policy at the
-# external service is gated behind the `http-ledger` cargo feature
-# (see docs/ai-crawl-control.md for that wiring).
+# realistic stand-in for the HTTP ledger client. With no
+# `policies[].ledger:` block the policy redeems against
+# `valid_tokens`; pointing it at the external service needs that
+# block plus the `http-ledger` cargo feature, which the released
+# `sbproxy` binary already has on by default (see
+# docs/ai-crawl-control.md for that wiring).
 #
 # Run:
 #   cd examples/ai-crawl-tiered
@@ -124,7 +126,7 @@ origins:
             content_shape: html
             paywall_position: top_of_page
 
-        # OSS in-memory ledger seed. Each token redeems exactly once.
+        # In-memory ledger seed. Each token redeems exactly once.
         # Tokens are namespaced by tier purely as a documentation aid;
         # the policy treats any token in this list as valid.
         valid_tokens:

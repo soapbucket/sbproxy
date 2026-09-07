@@ -1,5 +1,5 @@
 # Quote token JWKS verification with replay protection
-*Last modified: 2026-08-01*
+*Last modified: 2026-09-07*
 
 Demonstrates the quote-token JWKS endpoint, end-to-end JWS
 verification, and single-use replay protection.
@@ -214,7 +214,7 @@ The script:
 3. Decodes the JWS header + payload (base64url) and pretty-prints.
 4. Verifies the signature against the published public key using
    `openssl pkeyutl -verify`. Real bytes; no pseudocode.
-5. Documents the redeem and replay paths (the OSS in-memory ledger
+5. Documents the redeem and replay paths (the in-memory ledger
    does not implement the verify-then-redeem handshake; that wiring
    lands with `policies[].ledger:` against an HTTP ledger).
 
@@ -268,9 +268,9 @@ signature path needs the raw 32-byte public key from the JWK `x`
 field wrapped in the SubjectPublicKeyInfo DER prefix (RFC 8410).
 The script handles the wrapping inline.
 
-### Step 5: Redeem (documented; not exercised in OSS)
+### Step 5: Redeem (documented; not exercised here)
 
-The OSS in-memory ledger seeds tokens from `valid_tokens:` in
+The in-memory ledger seeds tokens from `valid_tokens:` in
 `sb.yml`. This example leaves `valid_tokens` empty because the
 quote-token JWS shape is what the example demonstrates, and an
 HTTP-ledger backend (rather than the in-memory list) verifies the
@@ -293,7 +293,7 @@ Build the proxy with the `http-ledger` cargo feature on (the default
 does too) and the redeem path verifies the JWS against the JWKS
 internally.
 
-### Step 6: Replay (documented; not exercised in OSS)
+### Step 6: Replay (documented; not exercised here)
 
 The proxy's [`InMemoryNonceStore`] implements the
 [`NonceStore`] trait used by the verifier. Once a nonce has been
@@ -306,7 +306,7 @@ Content-Type: application/json
 {"error":"ledger.token_already_spent","retryable":false}
 ```
 
-The OSS in-memory ledger does not implement the verify-then-redeem
+The in-memory ledger does not implement the verify-then-redeem
 handshake (the path through the HTTP ledger does); the unit tests
 in `crates/sbproxy-modules/src/policy/quote_token.rs` cover the
 single-use behaviour directly.

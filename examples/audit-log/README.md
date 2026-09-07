@@ -1,6 +1,6 @@
 # audit-log
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-09-07*
 
 Every state-mutating admin call emits an admin-action line and, for a
 config change, a `config_audit` envelope on the structured-log stream.
@@ -76,7 +76,7 @@ because the cardinality cost is high.
 
 ## Where to ship the lines
 
-The OSS structured-log sink is "stdout, JSON, one event per line".
+The structured-log sink is "stdout, JSON, one event per line".
 Production deployments pair that with whatever log shipper they
 already run (Fluent Bit, Vector, OTel Collector). SBproxy also ships
 its own durable, tamper-evident chain (hash-chained, Ed25519-signed,

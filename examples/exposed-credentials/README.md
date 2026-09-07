@@ -1,10 +1,10 @@
 # Exposed credentials
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-09-07*
 
 ![Exposed credentials](../../docs/assets/exposed-credentials.gif)
 
-When a request carries `Authorization: Basic <base64>` whose password matches the configured exposure list, the proxy stamps the upstream request with an `exposed-credential-check` header (`action: tag`, the default) or rejects the request outright (`action: block`). The OSS provider is `static`: operators ship a list of leaked passwords (or SHA-1 hex hashes) inline in YAML or via `sha1_file`. Hash-only lists keep plaintext passwords out of config, log files, and process memory dumps. The HIBP k-anonymity adapter ships in the enterprise build.
+When a request carries `Authorization: Basic <base64>` whose password matches the configured exposure list, the proxy stamps the upstream request with an `exposed-credential-check` header (`action: tag`, the default) or rejects the request outright (`action: block`). `static` is the only provider that ships: operators supply a list of leaked passwords (or SHA-1 hex hashes) inline in YAML or via `sha1_file`. Hash-only lists keep plaintext passwords out of config, log files, and process memory dumps. Any other `provider:` value is refused at config compile.
 
 ## Run
 
