@@ -130,8 +130,6 @@ past capacity" is.
   declined-and-fell-back, `error` for a fault, and neither for an
   expected outcome. An `error` line that fires on a normal path trains
   operators to ignore the channel.
-- **No log line is the only record of a decision.** Logs are lossy and
-  rotate; a decision that matters needs a structured record too.
 - **Per-item log loops are bounded per request.** A warn emitted once
   per element of caller-controlled input hands a single request a
   log-flood primitive. Aggregate: one line per request with a count and
@@ -166,7 +164,9 @@ past capacity" is.
   comparable surface publishes a typed event (`events:`) for its
   refusals, the new surface must too; a decision that exists only in a
   local log or metric is invisible to the pipeline operators actually
-  watch. Absence of the event is a finding, not a follow-up.
+  watch. Logs are lossy and rotate, so a log line is never the only
+  record of a decision that matters. Absence of the event is a finding,
+  not a follow-up.
 - **New observable behavior is scrapeable.** A feature whose activation
   an operator would alert on (a new refusal path, a fallback taken, a
   degradation) needs a counter or gauge from day one; "we can add the
@@ -181,10 +181,10 @@ past capacity" is.
   produce the symptom, one asked for behavior two released contracts
   forbid. Neither is visible in the diff afterwards, so it is the first
   question, not a later one.
-- **Silent no-ops.** A call site that became a no-op where a caller still
-  reasonably expects work to happen.
-- **An early return inside a long function.** The highest-yield check in
-  this section, on the evidence. `request_filter`,
+- **An early return inside a long function.** The silent no-op in the
+  form it actually lands in, and the highest-yield check in this
+  section, on the evidence: a call site becomes a no-op while every
+  caller still reasonably expects work to happen. `request_filter`,
   `response_body_filter`, and `handle_ai_proxy` each run many independent
   stages in sequence, so a `return` added inside one stage silently skips
   every stage below it: mirroring, `on_request` callbacks, forward rules,
@@ -251,7 +251,8 @@ past capacity" is.
   makes it a finding is the answer to "what keeps these two in step":
   when that answer is a person remembering, it is a Major, not a style
   note.
-- **Boolean parameters** at call sites, especially several in a row.
+- **Boolean parameters** at call sites, especially several in a row:
+  two of them transposed compile, run, and mean the opposite thing.
 - **Functions that grew a phase.** A function doing setup, decision, and
   emission, where the decision cannot be tested without the other two.
 - **Comments explaining what rather than why.** The code says what.
@@ -420,6 +421,16 @@ question and the one a green gate answers worst. Every item here
 reports success while doing nothing, which is why none of it shows up
 as a failure anywhere.
 
+Mutation is the standard here and coverage is not. For each behavior a
+change claims, name the line that would have to be wrong for the
+behavior to break, break it, and run the tests: a test that still passes
+does not test that behavior, whatever the coverage number says. An EKU
+check's `!eku.client_auth` arm sat behind a surplus-purpose check that
+every fixture hit first, so it was covered, unreachable, and deletable
+with no test going red. Reading did not find it and coverage could not.
+The first three items below are the ways that standard fails while
+looking rigorous.
+
 - **A test that cannot fail.** For each new assertion, ask whether the
   two sides can differ. An assertion that compares a value with itself
   through an alias proves determinism and nothing else while reading as
@@ -430,14 +441,25 @@ as a failure anywhere.
   assertion on a value the test computed the way the code computes it, a
   `matches!` whose last arm is a catch-all, and an `is_ok()` on a call
   with no `Err` branch.
-- **Mutation is the standard, coverage is not.** For each behavior a
-  change claims, name the line that would have to be wrong for the
-  behavior to break, break it, and run the tests. A test that still
-  passes does not test that behavior whatever the coverage number says.
-  An EKU check's `!eku.client_auth` arm sat behind a surplus-purpose
-  check that every fixture hit first: covered, unreachable, and
-  deletable with no test going red. Reading did not find it and coverage
-  could not.
+- **A mutation that never applied.** A mutation that did not change the
+  file is indistinguishable, in the test output, from one the suite
+  survived, and it is the more likely of the two. Prove the edit landed
+  before drawing anything from it: a diff, a hash, or a compile error is
+  proof, and a script reporting "applied" is not. A battery deleting a
+  condition by `str.replace` matched nothing because `cargo fmt` had
+  since reflowed that condition across two lines, so the edit no-opped,
+  the tests passed, and the arm went into the report as covered when
+  nothing had been mutated at all.
+- **A mutation that stopped biting.** When an arm that used to go red
+  goes quiet after a rewrite, one of two things happened and they are
+  not interchangeable. Either a second check now refuses the bad value
+  downstream, in which case say that out loud and say that the test
+  documents the branch rather than testing it. Or a test was always
+  vacuous and another path was quietly answering for it: dropping escape
+  handling in a JSON walk stayed green because a fallback produced the
+  right answer anyway, and the fix was a shape only the broken path can
+  answer. Assuming the first without checking is how a suite stops
+  testing without anyone deciding to stop.
 - **A check nothing runs.** For every gate, lane, ratchet, or opt-in
   pass a change adds or names, find what invokes it, and for every
   invoker find the check it invokes. Five instances landed in one day: a
