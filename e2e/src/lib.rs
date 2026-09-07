@@ -257,23 +257,30 @@ const SLOW_WARM_UP: Duration = Duration::from_secs(2);
 /// See `crates/sbproxy/tests/common/mod.rs` for the canonical account
 /// (WOR-2946).
 fn warm_proxy_binary(flavor: ProxyBinaryFlavor) {
-    static WARMED: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
     let bin = proxy_binary_path_for(flavor);
     if !bin.is_file() {
         // The caller's own `is_file` check reports this with the build hint.
         return;
     }
+    warm_binary_once(&bin);
+}
+
+/// The exec half of [`warm_proxy_binary`], taking a path so a test can point
+/// it at a fixture and watch it run. Exactly one exec per distinct path for
+/// the life of the process.
+fn warm_binary_once(bin: &Path) {
+    static WARMED: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
     let warmed = WARMED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
     // Held across the exec on purpose: concurrent harness starts in this
     // process would otherwise each pay the assessment, and they would all be
     // waiting on the same serialized system daemon anyway.
     let mut warmed = warmed.lock().unwrap_or_else(|error| error.into_inner());
-    if !warmed.insert(bin.clone()) {
+    if !warmed.insert(bin.to_path_buf()) {
         return;
     }
     let started = Instant::now();
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    let target = bin.clone();
+    let target = bin.to_path_buf();
     std::thread::spawn(move || {
         // `--version` is answered by clap, which exits before the binary
         // reads a config or binds anything, so warming has no side effects
@@ -2348,6 +2355,53 @@ mod tests {
         if std::env::var("SBPROXY_E2E_STARTUP_TIMEOUT_SECS").is_err() {
             assert_eq!(startup_timeout(), DEFAULT_STARTUP_TIMEOUT);
         }
+    }
+
+    /// The warm-up has to actually exec the file, and exactly once.
+    ///
+    /// Without this, deleting the exec from `warm_binary_once` leaves every
+    /// test in the workspace green while the e2e suite quietly goes back to
+    /// spending `DEFAULT_STARTUP_TIMEOUT` on the operating system's first-exec
+    /// assessment. A fixture that records each run is the only thing that can
+    /// tell "warmed" from "returned" (WOR-2946).
+    #[cfg(unix)]
+    #[test]
+    fn warming_execs_the_binary_once_and_never_again() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("fake-proxy");
+        let record = dir.path().join("execs");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf 'ran\\n' >> {}\nexit 0\n",
+                record.display()
+            ),
+        )
+        .expect("write fixture");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fixture");
+
+        warm_binary_once(&script);
+        assert_eq!(
+            std::fs::read_to_string(&record)
+                .expect("the warm-up must have exec'd the fixture")
+                .lines()
+                .count(),
+            1,
+            "the first call must exec the binary exactly once"
+        );
+
+        warm_binary_once(&script);
+        assert_eq!(
+            std::fs::read_to_string(&record)
+                .expect("record")
+                .lines()
+                .count(),
+            1,
+            "a second call for the same path must not exec it again"
+        );
     }
 
     #[test]
