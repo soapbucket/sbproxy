@@ -85,8 +85,50 @@ k8s-operator-smoke: ## Run kind-based Kubernetes operator smoke test
 bench: ## Run benchmark suite (cargo bench)
 	$(CARGO) bench --workspace
 
-e2e: build ## Run the end-to-end test harness
-	cd e2e && ./run-tests.sh
+# `make e2e` is refused, not repaired and not deleted, and the refusal is
+# the load-bearing part.
+#
+# The target that sat here ran `cd e2e && ./run-tests.sh` and has exited
+# 127 on every commit of this repository (WOR-2949). The path is the Go
+# tree's layout, carried into d631e1b37 with the rest of this file;
+# `e2e/run-tests.sh` exists only on sara/v0.1.2-go-final, which is not an
+# ancestor of main. The Rust tree vendors the same catalog one directory
+# down, as e2e/conformance/run-tests.sh.
+#
+# Deleting the rule is worse than leaving it broken. `e2e/` is a real
+# directory, so with no rule and no .PHONY entry make finds a file by
+# that name, prints "Nothing to be done for `e2e'", and exits 0: someone
+# who typed it to run the suite gets a green shell and no tests. 127 at
+# least said something was wrong. Hence a phony rule that fails.
+#
+# The .PHONY entry at the top of this file is what makes it fail. This
+# rule has no prerequisites, so dropping `e2e` from that list restores
+# the silent exit 0 described above with a one-word edit; the old rule
+# was accidentally immune because `e2e: build` named a phony
+# prerequisite. Keep the two together.
+#
+# Not repointed at e2e/conformance/run-tests.sh either. Nothing named
+# `make e2e` in docs/, CONTRIBUTING.md, AGENTS.md, CLAUDE.md, or any
+# workflow, and `make help` never listed it (its awk pattern is
+# `^[a-zA-Z_-]+:`, which no target with a digit matches), which is how a
+# target broken since 2026-05-04 went unreported. A working alias would
+# be a second spelling with no CI lane behind it for the next reader to
+# depend on.
+e2e:
+	@echo 'make e2e is not supported. The conformance harness runs through' >&2
+	@echo 'scripts/run-e2e.sh, which builds the release binary, pins' >&2
+	@echo 'SBPROXY_BIN at it, and execs e2e/conformance/run-tests.sh:' >&2
+	@echo '' >&2
+	@echo '  ./scripts/run-e2e.sh            # the maintained smoke set' >&2
+	@echo '  ./scripts/run-e2e.sh --all      # all 93 historical cases' >&2
+	@echo '  ./scripts/run-e2e.sh 01 14 37   # specific cases' >&2
+	@echo '' >&2
+	@echo 'That suite runs locally only: no workflow invokes it, so nothing' >&2
+	@echo 'reports when it drifts red. The Rust-native suite under e2e/tests' >&2
+	@echo 'is the one CI watches, and the lane that runs per pull request is' >&2
+	@echo 'e2e-subset in .github/workflows/ci.yml, not the whole package.' >&2
+	@echo 'See e2e/conformance/HOW-TO-RUN.md for the two side by side.' >&2
+	@exit 1
 
 # --- Lint / Format -----------------------------------------------------------
 
