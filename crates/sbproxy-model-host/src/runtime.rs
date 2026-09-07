@@ -1479,15 +1479,16 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
     }
 }
 
-/// Whether the resolved weights are GGUF (so `engine: auto` picks
-/// llama.cpp): a GGUF-style quant name (`Q4_K_M`, `Q5_0`, ...) or a
-/// repo whose name advertises GGUF.
 /// Estimate an engine's reload cost from its VRAM footprint (WOR-1672).
 /// Preemption cost is dominated by reloading the weights, so a bigger
 /// model costs more to bring back; this is a size proxy (roughly
 /// milliseconds at ~1 GB/s effective load bandwidth) that the residency
 /// solver uses to break ties among equally-idle models. Recency still
 /// dominates the eviction decision.
+fn reload_cost_ms_for(vram_bytes: u64) -> u64 {
+    vram_bytes / (1024 * 1024)
+}
+
 /// Exec a just-acquired engine binary once, before `ensure_ready` puts a
 /// readiness deadline on it.
 ///
@@ -1523,10 +1524,6 @@ async fn warm_acquired_engine(path: &std::path::Path) {
              pays the assessment out of its readiness deadline"
         );
     }
-}
-
-fn reload_cost_ms_for(vram_bytes: u64) -> u64 {
-    vram_bytes / (1024 * 1024)
 }
 
 /// Allocate a free loopback port by binding `:0` and releasing it. The
