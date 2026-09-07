@@ -40,6 +40,13 @@
 # which is `cargo check --bin sbproxy --features embed-admin-ui
 # --locked` and has no phase here at all.
 #
+# Both of those now call note_skip before the first phase runs, so each
+# appears in the SKIPPED PHASES block with the command that reproduces
+# it, each is counted in `skipped_phases=`, and a run that dies in any
+# phase still reports them. Before that they were admitted only in this
+# header, which a reader looking at the end of a run never sees
+# (WOR-2942).
+#
 # Environment:
 #
 #   SBPROXY_RELEASE_TESTS=1              run test binaries in release mode
@@ -339,6 +346,62 @@ cleanup() {
   return "$rc"
 }
 trap cleanup EXIT
+
+# --- Required CI lanes with no phase in this gate ----------------------
+#
+# Two of the eleven lanes the required `build / test` aggregate waits on
+# have no phase here. The header at the top of this file admits both in
+# prose, which is newer than either lane, but neither called note_skip,
+# so the SKIPPED PHASES block listed neither and the `skipped_phases=`
+# field read 0 on a run where both had gone unrun (WOR-2942).
+# .github/CONTRIBUTING-agents.md tells every contributor to report a gate
+# result by quoting that line rather than calling it green, and the
+# doctrine above note_skip is that "All checks passed" must never be able
+# to hide a lane that never executed. A count of zero satisfied both
+# while two required lanes sat unrun.
+#
+# Recorded here, before the first phase that can fail, and not beside the
+# phases they stand in for. A gate that dies in a scan at 60s or in
+# clippy at 15m still has to report the lanes it never ran, and a block
+# further down would be skipped along with everything else: the same
+# defect one level up. That is not hypothetical. The run that found it
+# died in `make tapes-check` and printed `skipped_phases=0`.
+#
+# Both strings are true at the moment they are printed, which is why
+# neither depends on what a later phase does.
+#
+# The other nine lanes do have a phase here, checked one at a time
+# against ci.yml's `needs:` list while this was written: `test`, `lint`
+# (fmt, clippy, both doc passes, and the ratchets), `guards`,
+# `obs-budgets`, `payments`, `payments-clippy`, `ui`, both halves of
+# `supply-chain` (cargo-deny and the admin UI's npm audit), and
+# `changes`, which is a path filter rather than a check. Where one of
+# those can be turned off (SBPROXY_CHECK_PAYMENTS=0,
+# SBPROXY_CHECK_PRIVATE_DOCS=0, a missing cargo-deny, a missing proxy
+# binary) it already calls note_skip on that path.
+
+note_skip "release feature (embed-admin-ui): nothing in this gate compiles that feature union. It is in no default feature set, so the cargo build, the nextest lane, clippy --all-targets and both doc passes miss it. Run it with: (cd ui && npm ci && npm run build) && cargo check --bin sbproxy --features embed-admin-ui --locked  -- the SPA build first, because include_dir! reads ui/dist at compile time and ui/dist is gitignored, so the check fails inside the macro without it. This is a required CI lane, so it runs there regardless."
+
+# The reproduce command is the CI lane's, not a shorter spelling of it.
+# `--test static_action` builds a test target and no binary, and the
+# harness prefers target/release/sbproxy over target/debug/sbproxy
+# (e2e/src/lib.rs), so without the build and the pin the five files can
+# pass against a stale release proxy nobody rebuilt, which reads as the
+# lane reproduced and is not. The startup timeout is the lane's own value
+# (ci.yml sets it at job level, and e2e/src/lib.rs documents it): a
+# laptop that just finished linking spawns the proxy slowly enough to
+# fail static_action without it, which is a false red on a command
+# printed as the way to check. The pin follows CARGO_TARGET_DIR rather
+# than spelling `target/` because cargo writes there while the harness
+# derives its own search root from CARGO_MANIFEST_DIR and never reads
+# that variable, so the fixed spelling would hand a developer who exports
+# it either a stale binary or a missing-binary error telling them to run
+# the build they just ran.
+if [ "${SBPROXY_CHECK_E2E:-0}" = "1" ]; then
+  note_skip "e2e subset (required), the lane's shape: SBPROXY_CHECK_E2E=1 puts the five files (static_action, body_routing, sessions, admin_reload, transform_json) inside the whole-package sbproxy-e2e selection the test lane runs, so they execute if this run reaches that lane, but never as CI runs them: one cargo call per file, single-threaded, each behind an expect_tests '>=1' floor. An emptied or renamed-away subset file runs zero tests and exits 0 in that selection, and is red in CI. Run the lane's own shape with: cargo build --workspace --locked && SBPROXY_E2E_BIN=\"\${CARGO_TARGET_DIR:-target}/debug/sbproxy\" SBPROXY_E2E_STARTUP_TIMEOUT_SECS=60 cargo test --workspace --locked --test static_action -- --test-threads=1  (and the same for body_routing, sessions, admin_reload, transform_json)."
+else
+  note_skip "e2e subset (required): none of static_action, body_routing, sessions, admin_reload, transform_json runs in this gate, in any form: the test lane excludes the sbproxy-e2e package, and the observability budgets phase selects that package but names only its own three targets in it. Run the lane with: cargo build --workspace --locked && SBPROXY_E2E_BIN=\"\${CARGO_TARGET_DIR:-target}/debug/sbproxy\" SBPROXY_E2E_STARTUP_TIMEOUT_SECS=60 cargo test --workspace --locked --test static_action -- --test-threads=1  (and the same for body_routing, sessions, admin_reload, transform_json). The build and the pin are what ci.yml's lane carries; without them the harness prefers target/release/sbproxy and can spawn a stale one. SBPROXY_CHECK_E2E=1 reaches the five a different way, by selecting the whole package, which is far wider than the subset. This is a required CI lane, so it runs there regardless."
+fi
 
 # --- Parallel batches for the pure-script phases ------------------------
 #
@@ -649,10 +712,18 @@ batch_secret_debug_registry() {
   bash "$ROOT/scripts/check-secret-debug-registry.sh"
 }
 
-# CI: ci.yml guards lane, "every stable metric has somewhere to be seen".
+# CI: ci.yml lint lane, "no new stable metric without a dashboard
+# panel".
 # A metric an operator can be alerted on but cannot look at is a gap the
 # registry cannot see: it knows the family exists, not whether any
 # dashboard draws it. Shrink-only baseline, so the number can only fall.
+#
+# That first line was false until WOR-2939: it named a guards-lane step
+# that did not exist. The only hit `grep -rn metric-visibility .github/`
+# had was the delivery bar in CONTRIBUTING-agents.md, and no workflow
+# named the script at all, so this ratchet was enforced on a laptop and
+# nowhere else while its comment said CI held it. The lint-lane step it
+# now names runs this same script.
 batch_metric_visibility() {
   bash "$ROOT/scripts/check-metric-visibility.sh"
 }
@@ -721,7 +792,7 @@ run_batch "read-only source and doc scans" \
   batch_durable_file_modes "durable sinks create files owner-only" \
   batch_runtime_image_lockstep "runtime images keep /var/lib/sbproxy and debian13" \
   batch_secret_debug_registry "secret-bearing types do not derive Debug" \
-  batch_metric_visibility "every stable metric has a dashboard panel (ratchet)" \
+  batch_metric_visibility "no new stable metric without a dashboard panel (ratchet)" \
   batch_notice_coverage "NOTICE covers Apache-2.0-only crates" \
   batch_secret_resolver_drift "secret-resolver drift (no new ad-hoc secret parsers)" \
   batch_doc_drift "doc drift" \
