@@ -1310,3 +1310,41 @@ involved (`FailedCandidate`, `BootWalkFailure`, `walk_for_bootable`) are now
 they leave the scanner's universe for a reason the compiler enforces. The
 count is 1523 whether or not any comment names them, which was checked by
 rewording that comment again and re-running the scan.
+
+2026-09-07 (WOR-2065, from main e6812f7c): tests-only 324 to 463, unreferenced
+1521 to 2141. Both rises are the detector getting better, not the tree getting
+worse. Nothing was added to `crates/` in this change; every source edit is in
+`scripts/`.
+
+Two things the scan could not see before.
+
+The first is the one the header of `check-pub-item-ratchet.sh` has listed as a
+known blind spot since WOR-2550: a `pub use` line counted as a production
+reference, so an item re-exported by its own crate's facade read as consumed
+by that facade. `collect_definitions` has always skipped those lines, on the
+stated grounds that a re-export names an item rather than defining one. The
+reference pass now skips them on the same grounds, whole statement at a time,
+because rustfmt wraps the wide ones across lines and skipping only the opening
+line left the continuations counting. That is 620 items, and the sample checked
+by hand is representative: `extract_payload_signals`, `RulePack` and
+`JA4_CATBOOST_FEATURE_COUNT` in `sbproxy-agent-detect` each have exactly one
+mention outside their defining file, and in all three it is the `pub use` in
+`lib.rs`. The change is one-directional by construction, since it only ever
+removes a reference, so it can add candidates and never remove one: the
+measured diff is 620 added, 0 removed.
+
+The second is smaller and was pointing the wrong way. A multi-line attribute
+between `#[derive(...)]` and its item erased the recorded derives, because the
+continuation lines are not blank, not comments, and do not begin with `#`, so
+they read as ordinary code. The four Kubernetes CRD spec structs in
+`crates/sbproxy-k8s-controller/src/gateway_api.rs` carry a seven-line
+`#[kube(...)]` in exactly that position. All four lost their `Deserialize` and
+`JsonSchema`, missed the rule that keeps a deserialized type, and were triaged
+`wire-or-delete`, which is the verdict that reads as "delete this". They are
+built by the Kubernetes API server, which is the one caller no reference search
+over this repository can find. They now read `keep`.
+
+No item was deleted or narrowed in this change. The cross-check against the
+optional out-of-tree API consumer is the ticket's precondition for a deletion
+and it was not available to this session, so nothing was cleared for one. The
+count moved because the measurement did.

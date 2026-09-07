@@ -141,5 +141,169 @@ class CfgTestLineRangeTest(unittest.TestCase):
         self.assertEqual(module.cfg_test_line_ranges(lines), [(2, 5)])
 
 
+class DeriveAttributionTest(unittest.TestCase):
+    """Which derives a definition is recorded with.
+
+    The serde/schemars rule is the only thing standing between a
+    deserialized type and a `wire-or-delete` verdict, because the caller
+    that builds one is a YAML document or a Kubernetes API server rather
+    than any Rust reference the scan can find. So the derive list has to
+    survive whatever sits between `#[derive(...)]` and the item.
+    """
+
+    def test_a_multi_line_attribute_does_not_erase_the_derives(self) -> None:
+        """The shape in crates/sbproxy-k8s-controller/src/gateway_api.rs.
+
+        `#[derive(.., Deserialize, .., JsonSchema)]`, then a seven-line
+        `#[kube(...)]`, then the struct. The continuation lines of that
+        attribute are not blank, not comments, and do not start with
+        `#`, so they used to be read as ordinary code and clear the
+        pending derives. All four CRD spec structs in that file lost
+        their `Deserialize`, missed the keep rule, and were triaged as
+        having no consumer at all.
+        """
+        module = _scanner_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            source = repo / "crates" / "fixture" / "src"
+            source.mkdir(parents=True)
+            (source / "lib.rs").write_text(
+                "#[derive(Debug, Clone, Deserialize, JsonSchema)]\n"
+                "#[kube(\n"
+                '    group = "gateway.networking.k8s.io",\n'
+                '    version = "v1",\n'
+                ")]\n"
+                '#[serde(rename_all = "camelCase")]\n'
+                "pub struct GatewaySpec {\n"
+                "    pub field: String,\n"
+                "}\n"
+            )
+
+            definitions = module.collect_definitions(
+                module.rust_files(repo / "crates"), repo
+            )
+
+        self.assertIn("GatewaySpec", definitions)
+        self.assertIn("Deserialize", definitions["GatewaySpec"][0]["derives"])
+        self.assertEqual(
+            module.verdict_for(definitions["GatewaySpec"][0])[0],
+            "keep",
+            "a deserialized type has a caller no reference search can see",
+        )
+
+    def test_an_unbalanced_paren_inside_a_string_does_not_open_an_attribute(self) -> None:
+        """`#[serde(rename = "a(b")]` is balanced Rust and unbalanced text.
+
+        Reading it as unbalanced would keep the accumulator open over
+        every line that follows, dropping the rest of the file's items
+        from the scan, which moves the count DOWN and is the direction
+        that hides work rather than inventing it.
+        """
+        module = _scanner_module()
+        self.assertTrue(module.attribute_is_closed('#[serde(rename = "a(b")]'))
+        self.assertFalse(module.attribute_is_closed("#[kube("))
+
+
+class ReExportIsNotAConsumerTest(unittest.TestCase):
+    """A `pub use` names an item; it does not consume one.
+
+    `collect_definitions` already skips those lines for exactly this
+    reason. `collect_references` counted them as production references,
+    so a module wired to nothing but its own crate's facade read as
+    used and never entered either ratchet bucket (WOR-2550).
+    """
+
+    def _count(self, lib_rs: str, module_rs: str) -> str:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            source = repo / "crates" / "fixture" / "src"
+            source.mkdir(parents=True)
+            (source / "lib.rs").write_text(lib_rs)
+            (source / "inner.rs").write_text(module_rs)
+            completed = subprocess.run(
+                ["python3", str(SCANNER), "--repo", str(repo), "--count", "unreferenced"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        return completed.stdout.strip()
+
+    def test_a_facade_re_export_alone_leaves_the_item_a_candidate(self) -> None:
+        self.assertEqual(
+            self._count(
+                "pub mod inner;\npub use inner::facade_only;\n",
+                "pub fn facade_only() {}\n",
+            ),
+            "1",
+        )
+
+    def test_a_re_export_wrapped_across_lines_is_skipped_whole(self) -> None:
+        """rustfmt wraps a wide `pub use`, so only its first line matches.
+
+        Skipping just that line left the continuation lines counting as
+        production references, which is most of the real ones: the
+        facade lines that hid items in this workspace were mostly
+        wrapped `pub use x::{A, B, C};` blocks.
+        """
+        self.assertEqual(
+            self._count(
+                "pub mod inner;\npub use inner::{\n    facade_only,\n    other,\n};\n",
+                "pub fn facade_only() {}\npub fn other() {}\n",
+            ),
+            "2",
+        )
+
+    def test_a_real_caller_still_counts(self) -> None:
+        """The control. Without it the two above pass on a scanner that
+        counts nothing at all as a reference."""
+        self.assertEqual(
+            self._count(
+                "pub mod inner;\nfn caller() { inner::facade_only(); }\n",
+                "pub fn facade_only() {}\n",
+            ),
+            "0",
+        )
+
+
+class DiscoveryFloorTest(unittest.TestCase):
+    """A scan that found nothing has to say so.
+
+    Every number this scanner prints is "how many of the things I found
+    look unused", so an empty discovery reports zero of everything and a
+    ratchet reading it sees the best result the repository has ever had.
+    """
+
+    def test_an_empty_tree_is_an_error_rather_than_a_clean_report(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "crates").mkdir()
+            completed = subprocess.run(
+                ["python3", str(SCANNER), "--repo", str(repo), "--count", "unreferenced"],
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(completed.returncode, 2, completed.stdout)
+        self.assertEqual(completed.stdout.strip(), "", "a broken run must not print a count")
+        self.assertIn("broken run, not a clean tree", completed.stderr)
+
+    def test_a_tree_with_no_pub_items_is_also_an_error(self) -> None:
+        """Files found, nothing matched. The regex breaking looks like
+        this, and it is not a clean tree either."""
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            source = repo / "crates" / "fixture" / "src"
+            source.mkdir(parents=True)
+            (source / "lib.rs").write_text("fn private_only() {}\n")
+            completed = subprocess.run(
+                ["python3", str(SCANNER), "--repo", str(repo), "--count", "unreferenced"],
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(completed.returncode, 2, completed.stdout)
+        self.assertIn("broken run, not a clean tree", completed.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
