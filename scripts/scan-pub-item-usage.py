@@ -82,7 +82,41 @@ REEXPORT_RE = re.compile(r"^\s*pub\s+use\b")
 # merits, which is where the real signal was in every case that prompted
 # this scan.
 
-DERIVE_RE = re.compile(r"^\s*#\[derive\((?P<derives>[^)]*)\)\]")
+# An attribute can span lines, and one that does used to end the derive
+# it followed. See `collect_definitions` for what that cost.
+ATTR_START_RE = re.compile(r"^\s*#!?\[")
+DERIVE_TEXT_RE = re.compile(r"^#\[derive\((?P<derives>.*)\)\]$", re.DOTALL)
+STRING_LITERAL_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
+
+# An attribute longer than this is not an attribute any more; something
+# about the delimiter counting has gone wrong. Give up rather than
+# swallow the rest of the file, which would silently drop every item
+# below it and move the count DOWN.
+MAX_ATTRIBUTE_LINES = 64
+
+# The same cap for a `pub use` whose `;` never arrives. Running off the
+# end would blank every reference in the rest of the file and inflate
+# the count, which is loud rather than silent, but wrong either way.
+MAX_REEXPORT_LINES = 64
+
+
+def attribute_is_closed(text: str) -> bool:
+    """Whether an accumulated `#[...]` has balanced delimiters.
+
+    String literals are blanked first. `#[serde(rename = "a(b")]` is
+    balanced Rust and unbalanced text, and reading it as unbalanced would
+    keep the accumulator open over everything that follows.
+    """
+    bare = STRING_LITERAL_RE.sub('""', text)
+    return bare.count("[") == bare.count("]") and bare.count("(") == bare.count(")")
+
+
+def derives_in(attribute: str) -> list[str] | None:
+    """The derive list of a whole attribute, or None if it is not a derive."""
+    match = DERIVE_TEXT_RE.match(" ".join(attribute.split()))
+    if not match:
+        return None
+    return [d.strip() for d in match.group("derives").split(",") if d.strip()]
 
 # Names common enough that a word-boundary search says nothing useful.
 # Reporting them would drown the real signal without adding any.
@@ -193,17 +227,75 @@ def collect_definitions(files: list[Path], repo: Path) -> dict[str, list[dict]]:
             continue
         test_ranges = cfg_test_line_ranges(lines)
         pending_derives: list[str] = []
+        attribute: str | None = None
+        attribute_lines = 0
         for lineno, line in enumerate(lines, start=1):
-            derive_match = DERIVE_RE.match(line)
-            if derive_match:
-                pending_derives = [d.strip() for d in derive_match.group("derives").split(",")]
+            stripped = line.strip()
+
+            # Attributes are accumulated whole, because a multi-line one
+            # sitting between `#[derive(...)]` and the item used to erase
+            # the derives: its continuation lines are not blank, not
+            # comments, and do not start with `#`, so they hit the
+            # "some other code, forget the derives" branch below. The
+            # four Kubernetes CRD structs in
+            # `crates/sbproxy-k8s-controller/src/gateway_api.rs` carry
+            # `#[derive(CustomResource, .., Deserialize, .., JsonSchema)]`
+            # followed by a seven-line `#[kube(...)]`, so all four lost
+            # their derives, missed the serde/schemars rule that keeps a
+            # deserialized type, and were triaged `wire-or-delete`. They
+            # are deserialized by the Kubernetes API server, which is the
+            # one caller no Rust reference search can see.
+            if attribute is not None:
+                # A `pub` item is never inside an attribute, so a line that
+                # opens one means the accumulator is already wrong and must
+                # let go here rather than keep eating lines. Without this,
+                # a delimiter the balance test cannot see swallows up to
+                # MAX_ATTRIBUTE_LINES of definitions and every number stays
+                # still: the items leave the scan, so they leave the
+                # inventory and both counts together, and the floor never
+                # moves because the rest of the tree still discovers
+                # plenty. That is the exact shape this ratchet exists to
+                # refuse. `attribute_is_closed` blanks string literals but
+                # not char literals or comments, so `#[foo(sep = '(')]` and
+                # a `//` comment carrying a lone `(` inside a wrapped
+                # attribute both reach it.
+                #
+                # The derives recorded before the runaway attribute started
+                # are kept, because they are still the item's derives and
+                # dropping them is the bug the accumulator was added to fix.
+                # A derive swallowed *inside* the runaway attribute is lost,
+                # which is what origin/main did on the same input.
+                if ITEM_RE.match(line):
+                    attribute = None
+                else:
+                    attribute += " " + stripped
+                    attribute_lines += 1
+                    if attribute_is_closed(attribute):
+                        found = derives_in(attribute)
+                        if found is not None:
+                            pending_derives = found
+                        attribute = None
+                    elif attribute_lines > MAX_ATTRIBUTE_LINES:
+                        attribute = None
+                        pending_derives = []
+                    continue
+
+            if ATTR_START_RE.match(line):
+                if attribute_is_closed(stripped):
+                    found = derives_in(stripped)
+                    if found is not None:
+                        pending_derives = found
+                else:
+                    attribute = stripped
+                    attribute_lines = 1
                 continue
+
             if REEXPORT_RE.match(line):
                 pending_derives = []
                 continue
             match = ITEM_RE.match(line)
             if not match:
-                if line.strip() and not line.strip().startswith(("#", "//", "///")):
+                if stripped and not stripped.startswith("//"):
                     pending_derives = []
                 continue
             # An item defined inside `#[cfg(test)]` is test scaffolding,
@@ -227,6 +319,22 @@ def collect_definitions(files: list[Path], repo: Path) -> dict[str, list[dict]]:
             )
             pending_derives = []
     return definitions
+
+
+# The line `--ratchet-data` puts between its counts and its names.
+ITEM_SEPARATOR = "--- items ---"
+
+
+def inventory_lines(entries: list[dict]) -> list[str]:
+    """The candidate set as sorted `file::name` lines.
+
+    Sorted here rather than by the caller so the committed inventory is a
+    plain redirect of this output, with no second command in the loop
+    that could disagree about collation. A name is defined at most once
+    across the tree (`collect_definitions` drops anything ambiguous), so
+    the keys are unique and the sort is total.
+    """
+    return sorted(f"{entry['file']}::{entry['name']}" for entry in entries)
 
 
 def crate_of(path: Path, repo: Path) -> str:
@@ -257,12 +365,36 @@ def collect_references(
         test_ranges = [] if whole_file_is_tests else cfg_test_line_ranges(lines)
         range_iter = iter(test_ranges)
         current = next(range_iter, None)
+        in_reexport: int | None = None
         for lineno, line in enumerate(lines, start=1):
-            hits = names.intersection(word.findall(line))
             # Advance through the sorted `#[cfg(test)]` spans rather than
-            # rescanning them per line.
+            # rescanning them per line. This runs before any `continue`
+            # below: a skipped line that left the cursor behind would
+            # mis-file every reference after it.
             while current is not None and lineno > current[1]:
                 current = next(range_iter, None)
+
+            # A `pub use` names an item, it does not consume one, which
+            # is already why `collect_definitions` skips those lines. It
+            # counted as a production reference here, so a module wired
+            # to nothing but its own crate's facade read as used and
+            # never entered either ratchet bucket. That is how
+            # `sbproxy-ai/src/multimodal.rs` stayed invisible to both
+            # numbers (WOR-2550), and 122 items sat in the same blind
+            # spot when this was measured. rustfmt wraps a wide
+            # `pub use x::{A, B};` across lines, so the whole statement
+            # is skipped rather than just the line that opens it.
+            if in_reexport is not None:
+                in_reexport += 1
+                if ";" in line or in_reexport > MAX_REEXPORT_LINES:
+                    in_reexport = None
+                continue
+            if REEXPORT_RE.match(line):
+                if ";" not in line:
+                    in_reexport = 0
+                continue
+
+            hits = names.intersection(word.findall(line))
             if not hits:
                 continue
             in_tests = whole_file_is_tests or (
@@ -289,6 +421,23 @@ def external_tree_names(root: Path) -> set[str]:
         except OSError:
             continue
     return found
+
+
+# The workspace's public API surface, named in CLAUDE.md under
+# Conventions: "The public API surface is the following three crates,
+# and only these three." Every `pub` item in one of them is public API
+# by definition, whatever this scan can see about its callers, so the
+# two verdicts that change a signature are both wrong there. `narrow` is
+# wrong because `pub(crate)` on a published crate's item is a breaking
+# change for every downstream user, and it was the advice this scan gave
+# for most of the 250 candidates in these crates. `wire-or-delete` is
+# wrong for the same reason plus one more: an item here can have no
+# in-tree caller and still be the whole point, because the callers are
+# out of this repository by construction.
+#
+# `sbproxy-events` and `sbproxy-proxy` are named in the same section as
+# planned and not yet shipped, so they are deliberately absent.
+PUBLIC_API_CRATES = frozenset({"sbproxy-plugin", "sbproxy-config", "sbproxy-httpkit"})
 
 
 def load_recorded_verdicts(repo: Path) -> dict[str, dict]:
@@ -318,6 +467,14 @@ def verdict_for(item: dict) -> tuple[str, str]:
             "keep",
             "named by the out-of-tree consumer tree; deleting it breaks a build "
             "that does not live in this repository",
+        )
+    if item.get("crate") in PUBLIC_API_CRATES:
+        return (
+            "keep",
+            f"`{item['crate']}` is one of the three crates CLAUDE.md names as the "
+            "public API surface, so this is published API whatever calls it in this "
+            "repository; narrowing or deleting it is a breaking change for consumers "
+            "no scan of this tree can see",
         )
     if item.get("cross_crate_test"):
         where = item["cross_crate_test"][0]
@@ -438,8 +595,18 @@ def main() -> int:
     )
     parser.add_argument(
         "--count",
-        choices=["unreferenced", "tests-only"],
+        choices=["unreferenced", "tests-only", "definitions"],
         help="print one integer and exit, for a CI ratchet",
+    )
+    parser.add_argument(
+        "--ratchet-data",
+        action="store_true",
+        help="every number and name the ratchet needs, from one scan",
+    )
+    parser.add_argument(
+        "--inventory",
+        action="store_true",
+        help="the candidate set as sorted `file::name` lines, for the committed inventory",
     )
     args = parser.parse_args()
 
@@ -449,8 +616,26 @@ def main() -> int:
         print(f"no crates/ directory under {repo}", file=sys.stderr)
         return 2
 
-    all_files = rust_files(crates) + rust_files(repo / "e2e") if (repo / "e2e").is_dir() else rust_files(crates)
-    definitions = collect_definitions(rust_files(crates), repo)
+    source_files = rust_files(crates)
+    all_files = source_files + rust_files(repo / "e2e") if (repo / "e2e").is_dir() else source_files
+
+    # A scan that found nothing has to say so rather than report a clean
+    # tree. Every count this prints is "how many of the things I found
+    # look unused", so a discovery that silently returns an empty set
+    # reports zero of everything, and a ratchet reading those numbers
+    # sees the best result it has ever seen. Both floors below are
+    # existence checks, not thresholds: the caller sets the real floor.
+    if not source_files:
+        print(f"no Rust sources under {crates}", file=sys.stderr)
+        print("The scan found nothing to scan; this is a broken run, not a clean tree.", file=sys.stderr)
+        return 2
+
+    definitions = collect_definitions(source_files, repo)
+    if not definitions:
+        print(f"no `pub` item definitions found in {len(source_files)} files under {crates}", file=sys.stderr)
+        print("The scan found nothing to scan; this is a broken run, not a clean tree.", file=sys.stderr)
+        return 2
+
     production, tests = collect_references(all_files, set(definitions), repo)
 
     external_names = (
@@ -526,8 +711,27 @@ def main() -> int:
     unreferenced.sort(key=lambda d: (d["crate"], d["file"], d["line"]))
     tests_only.sort(key=lambda d: (d["crate"], d["file"], d["line"]))
 
+    if args.count == "definitions":
+        print(sum(len(d) for d in definitions.values()))
+        return 0
+
     if args.count:
         print(len(tests_only if args.count == "tests-only" else unreferenced))
+        return 0
+
+    if args.ratchet_data:
+        # The ratchet used to call this script twice for two integers,
+        # and adding the inventory would have made it four scans of the
+        # same tree. Everything it reads now comes from one.
+        print(f"definitions\t{sum(len(d) for d in definitions.values())}")
+        print(f"tests-only\t{len(tests_only)}")
+        print(f"unreferenced\t{len(unreferenced)}")
+        print(ITEM_SEPARATOR)
+        print("\n".join(inventory_lines(unreferenced)))
+        return 0
+
+    if args.inventory:
+        print("\n".join(inventory_lines(unreferenced)))
         return 0
 
     selected = tests_only if args.tests_only else unreferenced
