@@ -1,5 +1,5 @@
 name: CI
-# --- Workflow shape (updated 2026-09-05) ---
+# --- Workflow shape (updated 2026-09-06) ---
 # Every lane runs in parallel and `build / test` is a zero-cost aggregator
 # that fails if any lane failed. Branch protection keeps requiring the one
 # `build / test` check; the work underneath it fans out.
@@ -10,8 +10,8 @@ name: CI
 #   lint           (~4 min) fmt, clippy, rustdoc
 #   guards         (~30 s)  no-compiler guards that must run on docs-only
 #                           PRs too; the one lane with no path filter
-#   obs-budgets    (~5 min) e2e cardinality + redaction, observability paths only
-#                           (three test targets; see the job for why)
+#   obs-budgets    (~5 min) three e2e targets, cardinality + metrics_per_agent
+#                           + redaction, on every code PR (see the job for why)
 #   e2e-subset     (~6 min) five offline e2e files against a spawned proxy,
 #                           required on every code PR (WOR-2469)
 #   payments       (~8 min) tests under the settlement feature union
@@ -147,7 +147,6 @@ jobs:
       contents: read
     outputs:
       code: ${{ steps.filter.outputs.code }}
-      observability: ${{ steps.filter.outputs.observability }}
       ui: ${{ steps.filter.outputs.ui }}
     steps:
       - uses: actions/checkout@v5
@@ -162,17 +161,6 @@ jobs:
               # Inside this union, *.md covers root files and **/*.md nested
               # files. Retain OR semantics for the positive filters below.
               - '!{*.md,**/*.md,docs/**,examples/**,LICENSE,NOTICE,.gitignore}'
-            observability:
-              - 'crates/sbproxy-observe/**'
-              - 'crates/sbproxy-modules/src/policy/**'
-              # The obs-budgets lane's own test targets. Without these a
-              # PR could rewrite the assertions the lane is named for and
-              # never run the lane that would have checked them, which is
-              # how both files drifted into asserting less than they said.
-              - 'e2e/tests/cardinality.rs'
-              - 'e2e/tests/metrics_per_agent.rs'
-              - 'e2e/tests/redaction.rs'
-              - '.github/workflows/ci.yml'
             ui:
               - 'ui/**'
 
@@ -551,8 +539,10 @@ jobs:
       - name: no hand-rolled secret-reference parsing (WOR-2287)
         run: python3 scripts/check-secret-resolver-drift.py
 
-      # The three ratchets below moved here from the `test` lane on
-      # 2026-08-28. Measured on run 33169288096: they cost 32s, 23s, and
+      # The pub-item, unwrap, and log-url ratchets below moved here from
+      # the `test` lane on 2026-08-28 (the metric-visibility ratchet after
+      # them was never in CI at all; its own block says so). Measured on
+      # run 33169288096: they cost 32s, 23s, and
       # 36s, 91 seconds sitting on the pull request's critical path behind
       # a 197s workspace build and an 842s nextest run they do not need.
       # None of them compiles anything; they are python and grep over the
@@ -609,6 +599,47 @@ jobs:
       # clean tree.
       - name: no new operator URL at a log line (WOR-2629)
         run: bash scripts/check-log-url-ratchet.sh
+
+      # The fourth ratchet of the family, and the only one of the four
+      # that no CI lane has ever run (WOR-2939). `scripts/check.sh` has
+      # called it since it landed, under a comment reading "CI: ci.yml
+      # guards lane" -- a step that did not exist, in a lane that did not
+      # have it. The only hit `grep -rn metric-visibility .github/` had
+      # was the delivery bar in CONTRIBUTING-agents.md, which asks for the
+      # script to stay green without anything running it. So the baseline
+      # was held on whichever laptop happened to run the local gate, and
+      # it is sitting exactly on its floor (242 uncovered families against
+      # a baseline of 242), which is the state where the next family with
+      # no panel merges with nothing to say so.
+      #
+      # The step is named for what it enforces and not for what the
+      # ratchet is aiming at, because 242 stable families have no panel
+      # today and a check called "every stable metric has somewhere to be
+      # seen" would read, green, as a promise those 242 break.
+      # What runs: the script's own 14 fixtures first (a detector that
+      # stopped detecting cannot read as a clean tree), then a failure if
+      # the count of `stable` families named in no dashboard query rises
+      # above the committed baseline in
+      # scripts/metric-visibility-baseline.count. A family covered only by
+      # a recording rule, a wildcard, a template variable, or the admin
+      # console still counts as uncovered; the scanner's module header
+      # carries that list.
+      #
+      # In this lane rather than a lane of its own for the same reason as
+      # the three above: it is grep and python over dashboard JSON and
+      # crates/sbproxy-observe/src/metric_registry.rs, 0.8s locally, and a
+      # reviewer reading one ratchet failure wants the others' counts in
+      # the same log. Every input it reads sits inside this lane's
+      # `changes.outputs.code` filter: the dashboard trees
+      # (dashboards/grafana, deploy/dashboards,
+      # crates/sbproxy-observe/dashboards, deploy/helm/sbproxy/dashboards),
+      # deploy/alerts for the marks on --list, the registry, and its own
+      # scanner and baseline under scripts/. That filter excludes only
+      # markdown, docs/, examples/, LICENSE, NOTICE and .gitignore, so
+      # nothing that can move the count lands on a run where this lane is
+      # skipped.
+      - name: no new stable metric without a dashboard panel (WOR-2939)
+        run: bash scripts/check-metric-visibility.sh
 
 
       - name: clippy
@@ -885,7 +916,55 @@ jobs:
   obs-budgets:
     name: observability budgets
     needs: changes
-    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.observability == 'true'
+    # The broad `code` filter, the same one `e2e-subset` and `payments`
+    # carry, and no longer the `observability` path list this lane was
+    # gated on (crates/sbproxy-observe, crates/sbproxy-modules/src/policy,
+    # the lane's three test files, and this workflow). That list is
+    # deleted above, because this lane was its only reader.
+    #
+    # It did not name crates/sbproxy-core, and e2e/tests/redaction.rs
+    # states why that matters in its own module header: the fake sink
+    # buffers live in `sbproxy_observe::fake_sinks`, but the admin debug
+    # routes the test reads them back through are in sbproxy-core's
+    # request phase. `capture_fake_sink_event` in
+    # crates/sbproxy-core/src/server.rs builds the envelope and hands it
+    # to `fake_sinks::capture_all_sinks`, and the debug routes the test
+    # drives to reset and read those buffers are in
+    # crates/sbproxy-core/src/server/request_phase.rs. Neither file is
+    # named by any pattern the old filter carried, so half of what this
+    # lane asserts sat outside the paths that made it run.
+    #
+    # The aggregate at the bottom of this file counts `skipped` as
+    # success, deliberately and documented there, so a redaction
+    # regression confined to sbproxy-core would not have failed this
+    # lane. It would have skipped it, and merged behind a green required
+    # check. No such regression is known to have shipped; what is
+    # demonstrated is the mechanism, by deleting the body capture in
+    # server.rs and watching `--test redaction` fail while the old filter
+    # left the lane skipped for that same file. This workflow argues
+    # against exactly this at `e2e-subset` and at `payments`, and this was
+    # the one lane still carrying the narrow filter (WOR-2938).
+    #
+    # What the wider filter costs, measured on a laptop rather than a
+    # runner, so read the shape and not the seconds. From an empty
+    # target/: `cargo build --workspace --locked` 3m28, then the three
+    # targets 70s, 26s and 2s, most of which is compiling their test
+    # binaries. Warm, the three in sequence are 2.65s (1.05, 1.33, 0.90
+    # separately). WOR-2933 measured about 12s for the same three; this
+    # tree is faster and the number that matters is the same either way,
+    # which is that the tests are not the bill.
+    #
+    # The bill is the job: on a pull request that touches no
+    # observability path this lane now spends a runner on a checkout, an
+    # `e2e` cache restore and a workspace build. `e2e-subset` already
+    # spends one on exactly those pull requests, from the same cache key
+    # and the same `cargo build --workspace --locked`, and the two run in
+    # parallel, so what widening adds is a second runner's minutes rather
+    # than critical path while obs-budgets stays inside e2e-subset's
+    # wall clock. A docs-only pull request still skips both, because
+    # `code` excludes markdown, docs/, examples/, LICENSE, NOTICE and
+    # .gitignore.
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -910,9 +989,12 @@ jobs:
 
       # Cardinality + redaction regressions are easy to break silently
       # (a new label sneaks in, the limiter overflows into __other__,
-      # a redactor regex misses a new shape). This canary runs only when
-      # observability or policy code changed. `--test <name>` selects these
-      # three targets out of the 170 under e2e/tests.
+      # a redactor regex misses a new shape). This canary runs on every
+      # code pull request, per the block on the job above; it ran only on
+      # observability and policy paths until WOR-2938. `--test <name>`
+      # selects these three targets by name out of every target under
+      # e2e/tests, which is where the count that used to sit in this
+      # sentence went stale.
       #
       # metrics_per_agent is the cardinality half that needs a process.
       # It lowers hostname_cap in config, drives 250 distinct hostnames
