@@ -1,13 +1,13 @@
 # Code review rubric
 
-*Last modified: 2026-08-20*
+*Last modified: 2026-09-06*
 
 The checklist an automated reviewer runs against a branch before it
 becomes a PR, and the shape its output takes so the result can be pasted
 into the PR body as a note.
 
-Nine categories: security, concurrency, logging, metrics, correctness,
-code smell, Rust practices, tests, and docs.
+Ten categories: security, concurrency, logging, metrics, correctness,
+code smell, Rust practices, tests, docs, and verification quality.
 
 This exists because the mechanical gates in `CLAUDE.md` answer "does it
 compile, lint, and pass" and cannot answer "is this going to be a
@@ -78,6 +78,27 @@ past capacity" is.
 - **Denial of service.** Unbounded allocation, unbounded loop counts,
   unbounded retained buffers, or a cap that is checked after the
   allocation rather than before.
+- **A number from an untrusted source is clamped at both ends.** A
+  count, a size, a duration, or an index reported by an origin, a guest,
+  a hook, or a backend is an input, and every arithmetic result derived
+  from it inherits its range. A backend-reported token count with no
+  ceiling, against a balance with no floor, produced
+  `Retry-After: 1106804644422573056` and wedged that identity for the
+  process lifetime. Say what the maximum is, what the minimum is, and
+  what the code does at each; `saturating_*` is not a clamp when the
+  saturated value is itself served to a caller.
+- **A test that pins an exploitable behavior as correct.** Read each new
+  test's assertion as a hostile client's goal and ask whether that
+  client would want it to be true.
+  `a_stream_dropped_before_its_end_refunds_in_full` polls a chunk that
+  already carries the real token count, drops the stream, and asserts a
+  full refund, so a client that reads every frame and then closes gets
+  the generation for free. The test did not miss the hole, it pinned it
+  as the contract, which is why the next reader will defend it.
+- **What the change moves into reach.** Name the attacker set before and
+  after: a value only an operator could set that a request, a tenant, a
+  guest, or an upstream can now set is the finding, whether or not
+  today's handling of it is safe.
 
 ## 2. Concurrency and async
 
@@ -127,12 +148,12 @@ past capacity" is.
   to catch.
 - **Label values go through the cardinality limiter.** A hand-built
   label is how a tenant id, request id, or path turns into an unbounded
-  series set. Run ids, task ids, and trace ids are never labels.
+  series set. Run ids, task ids, and trace ids are never labels, and a
+  histogram multiplies whatever label set it carries by its bucket
+  count.
 - **Label arity matches the declaration.** Prometheus panics at runtime
   on a mismatch, and the panic is in whichever request happened to hit
   the new code path first.
-- **Histograms do not carry high-cardinality labels.** A histogram
-  multiplies its label set by its bucket count.
 - **Tenant attribution is present** on anything an operator would need
   to break down per customer, and the single-tenant default still
   produces the series it produced before.
@@ -153,6 +174,13 @@ past capacity" is.
 
 ## 5. Correctness and behavior change
 
+- **The change's premise is checked, not assumed.** A ticket, a bug
+  report, or a commit message states a cause; reproduce the symptom from
+  that cause before reviewing the fix for it. Two tickets on one day
+  were wrong at the premise: one named a cause that provably could not
+  produce the symptom, one asked for behavior two released contracts
+  forbid. Neither is visible in the diff afterwards, so it is the first
+  question, not a later one.
 - **Silent no-ops.** A call site that became a no-op where a caller still
   reasonably expects work to happen.
 - **An early return inside a long function.** The highest-yield check in
@@ -179,6 +207,23 @@ past capacity" is.
 - **Fallbacks are reachable and correct.** A decline path that is the
   common case must be the cheapest to express and must not be
   implemented as an error.
+- **A remedy terminates.** An error, a retry hint, a backoff, or a
+  refusal has to name something the caller can do that ends the
+  condition. A `Retry-After` no client will outlive is not a remedy, and
+  neither is a message naming a config key that does not exist. Say what
+  the caller does next, and check that doing it works.
+- **A guarantee is only as wide as its quantifier.** A doc comment, a
+  type name, or a test name states its rule over some set. Name that
+  set, then name the set a reader will assume, and when they differ the
+  wording is the defect even if the code is right. A comment promising
+  "outermost `usage` objects only" was written about a `usage` nested
+  inside another `usage`; it said nothing about one nested inside a
+  `tool_use` argument, which is where the hole was.
+- **A case handled in one consumer and not its sibling.** When a change
+  teaches one parser, filter, hook, or code path about a shape, list
+  every other reader of that same shape and check each by name. The
+  sibling is usually one directory over and was usually written by the
+  same hand on the same day, which is exactly why it is not re-read.
 - **A feature that only fires from `response_filter` does nothing for
   actions that never reach that hook, and the config gives the
   operator no way to tell.** Anything that injects behavior from
@@ -199,8 +244,13 @@ past capacity" is.
 
 - **Invariants held by convention.** `[0]` after a comment saying the
   vector is never empty, when the type could have made it non-empty.
-- **Duplicated vocabulary.** A second enum, label set, or error type
-  describing something the codebase already names.
+  Worse with no comment at all: an invariant nothing states is one the
+  next reader breaks without knowing they broke it.
+- **Duplicated vocabulary.** A second enum, label set, error type, or
+  string table describing something the codebase already names. What
+  makes it a finding is the answer to "what keeps these two in step":
+  when that answer is a person remembering, it is a Major, not a style
+  note.
 - **Boolean parameters** at call sites, especially several in a row.
 - **Functions that grew a phase.** A function doing setup, decision, and
   emission, where the decision cannot be tested without the other two.
@@ -209,13 +259,26 @@ past capacity" is.
   where the changed thing is easy to get wrong and impossible to spot.
 - **Dead scaffolding.** Types, variants, or fields with no production
   consumer and no ticket, which read as capability that does not exist.
+  The `pub-item-ratchet` finds an item whose only consumer is a test; it
+  cannot find an item with a real production caller that nothing ever
+  executes, which is the more expensive half and the one that reads as
+  finished work. Unreferenced and unexercised are different findings,
+  and section 10 is how to tell them apart.
 
 ## 7. Rust practices
 
 - **`as` casts that can truncate, wrap, or lose precision.** Prefer
   `try_from` with a real error, or saturate explicitly and say so.
-- **Needless allocation on a hot path**, especially `to_string()` or
-  `clone()` where a borrow would do.
+- **An `#[expect]` or `#[allow]` whose reason the change invalidated.**
+  A reasonless attribute is a lint's job and `#[expect]` fails to
+  compile once the exception stops being needed, so the only question
+  left is the one no lint asks: is the reason still true? An
+  `#[expect(cast_possible_truncation, reason = "...")]` whose reason
+  read "a retry-after in seconds fits u64 for any deficit a real cap
+  produces" was written when a deficit could not exceed capacity, and a
+  later change made the deficit unbounded without revisiting the
+  sentence. Read every reason in or adjacent to the diff as a claim
+  about today's code.
 - **`#[must_use]`** on builders and on anything returning a value that
   is meaningless to discard.
 - **`#[non_exhaustive]`** on public enums and structs that will grow.
@@ -229,8 +292,10 @@ past capacity" is.
 
 ## 8. Tests
 
-- **Would the test fail without the fix?** A test that passes on both
-  sides of the change is documentation, not a test.
+- **Would the test fail without the fix?** Revert the fix, run the test,
+  and watch it go red. A test that passes on both sides of the change is
+  documentation, not a test. Section 10 is the general form of this
+  question, for the behaviors a change did not come with a fix for.
 - **The seam is tested by name.** Coverage of a function is not proof it
   is wired; the call site is the thing that regresses.
 - **Failure modes are tested**, not only the happy path, and especially
@@ -239,6 +304,22 @@ past capacity" is.
   process-wide counter passes alone and fails under a parallel runner.
 - **Fixtures match the shipped surface.** A test config that no operator
   could write proves nothing about the config operators do write.
+- **Cleanup survives a failing assertion.** A test that spawns a child,
+  binds a port, or takes any other OS handle holds something a panic
+  does not release: `std::process::Child` has no `Drop` that kills. An
+  assertion between the spawn and the `kill()` leaks a live server
+  holding a port on every failing run, and the next run then fails for a
+  different reason. Put the assertions after the cleanup or put the
+  handle behind a guard whose `Drop` does it. A rewrite that lifts an
+  assertion undoes this silently, so read the order in the diff, not
+  just the lines.
+- **A timed bound that contains a first.** A deadline around an
+  operation the machine has never performed measures the operation plus
+  the machine's one-time work. macOS scans a freshly written executable
+  on first exec, measured between 1.0 s and 19.4 s on one machine, so a
+  3 s bound around a first launch fails for a reason that appears
+  nowhere in the test and gets blamed on whatever else changed. Do the
+  first run outside the bound, or bound something that is not a first.
 
 ## 9. Docs and examples
 
@@ -272,16 +353,14 @@ more than missing code because it is trusted.
   nothing about what a live request through it returns. A 2026-08-16
   pass that booted all 203 shipped examples with the real binary and
   replayed every documented curl found more than a dozen genuine
-  runtime bugs that every static check had missed clean: response
-  bodies documented as `text/plain` that are actually
-  `application/json` (auth-api-key, cel-policy, ddos-protection, csrf,
-  auth-bearer, ip-filter, request-validator, and others, independently,
-  each time), and examples pointing a backend at `127.0.0.1` with no
+  runtime bugs that every static check had missed clean, in two
+  recurring shapes: a response body documented as `text/plain` that is
+  actually `application/json` (eight examples, each found separately),
+  and a backend pointed at `127.0.0.1` with no
   `proxy.extensions.upstream.allow_private_cidrs`, so the SSRF guard
-  502s the walkthrough before the documented feature ever runs
-  (upstream-retries, grpc-h2c, retry-on-status, keys-inbound-headers,
-  json-schema). Neither class is visible from the config alone; both
-  need a live request.
+  502s the walkthrough before the documented feature ever runs (five
+  examples). Neither class is visible from the config alone; both need a
+  live request.
 - **Does a documented field parse but do something else?** The failure
   above the one people look for. A key can be accepted, warned about at
   load, and then quietly do less than the doc says. `dlp` takes
@@ -312,7 +391,7 @@ more than missing code because it is trusted.
   goes stale silently.
 - **The dated header is updated** when the content changes, since it is
   the only signal a reader has about staleness.
-- **US English, no em-dashes**, per the workspace convention. Fix the
+- **US English, no em dashes**, per the workspace convention. Fix the
   source string for anything generated rather than the generated page.
 
 Two traps worth knowing before you automate any of this.
@@ -329,10 +408,65 @@ metric that was never emitted, because each sentence is telling the
 reader it is not there. A checker will flag both. Read the sentence
 before you fix it.
 
-Worth stating plainly: a doc correction found while reviewing unrelated
-code is worth making and worth calling out in the PR, not silently
-folding in. The next person to read that page should be able to see when
-it was last true.
+A doc correction found while reviewing unrelated code is worth making
+and worth naming in the PR rather than folding in silently, so the next
+reader can see when the page was last true.
+
+## 10. Verification quality
+
+Everything above asks whether the code is right. This asks whether
+anything would notice if it stopped being right, which is a different
+question and the one a green gate answers worst. Every item here
+reports success while doing nothing, which is why none of it shows up
+as a failure anywhere.
+
+- **A test that cannot fail.** For each new assertion, ask whether the
+  two sides can differ. An assertion that compares a value with itself
+  through an alias proves determinism and nothing else while reading as
+  if it guarded an invariant: `issue_leaf()` against
+  `issue_leaf_with(Contract)`, written to prove the generator does not
+  change the contract profile, where `issue_leaf()` is defined as
+  calling `issue_leaf_with(Contract)`. The same shape hides in an
+  assertion on a value the test computed the way the code computes it, a
+  `matches!` whose last arm is a catch-all, and an `is_ok()` on a call
+  with no `Err` branch.
+- **Mutation is the standard, coverage is not.** For each behavior a
+  change claims, name the line that would have to be wrong for the
+  behavior to break, break it, and run the tests. A test that still
+  passes does not test that behavior whatever the coverage number says.
+  An EKU check's `!eku.client_auth` arm sat behind a surplus-purpose
+  check that every fixture hit first: covered, unreachable, and
+  deletable with no test going red. Reading did not find it and coverage
+  could not.
+- **A check nothing runs.** For every gate, lane, ratchet, or opt-in
+  pass a change adds or names, find what invokes it, and for every
+  invoker find the check it invokes. Five instances landed in one day: a
+  required CI lane with no local phase, a local phase in no CI lane, an
+  env-gated pass nothing sets, a ratchet whose comment named a lane that
+  does not exist, and a gate reporting zero skipped phases while two
+  required lanes never ran.
+- **A skip that reads as a pass.** A lane behind a path filter reports
+  success when it does not run, so it is greenest exactly when it is not
+  looking. For any lane a change leans on, check that the filter matches
+  the paths that break it, and say what the report looks like on the run
+  where it is skipped.
+- **A claim of coverage, counted.** A PASS column, a doc sentence, a
+  comment, or a gate's own output that asserts more than the code does.
+  Count what the sentence claims against what runs: a column reading "is
+  section 10.1's leaf profile" where three of its clauses were checked,
+  a line saying "one required lane is still outside the default path"
+  where two were, and a comment claiming model-emitted text cannot forge
+  a count, true of text blocks and false of tool arguments. Enforcement
+  is part of the claim: four documents described required checks in
+  repositories that had no branch protection at all, so every lane was
+  advisory and no document said so.
+- **A measurement whose method invalidates it.** A number in a comment,
+  a doc, or a PR body carries its method, and the method has to produce
+  the thing being measured. First-exec cost was measured by copying an
+  already-executed binary; a copy with identical contents can skip the
+  scan, so the figure came out about thirteen times low, and relinking
+  is the only method that produces a first. Ask what makes each run the
+  thing being measured, and whether the setup destroys it.
 
 ## Output format
 
