@@ -60,6 +60,9 @@ past capacity" is.
   Lua) returning a payload that is then used without revalidating it
   against the same limits the original passed. A hook must not be able
   to enlarge a body past `max_buffer_bytes` by returning a bigger one.
+  Name that set before and after the change: a value only an operator
+  could set that a request, a tenant, a guest, or an upstream can now
+  set is the finding, whether or not today's handling of it is safe.
 - **Cross-tenant isolation.** Anything keyed, cached, pooled, or memoized
   without tenant identity mixed in **by the host**, not by the caller and
   never by operator-supplied logic. A policy may narrow a key; it must
@@ -89,16 +92,12 @@ past capacity" is.
   saturated value is itself served to a caller.
 - **A test that pins an exploitable behavior as correct.** Read each new
   test's assertion as a hostile client's goal and ask whether that
-  client would want it to be true.
-  `a_stream_dropped_before_its_end_refunds_in_full` polls a chunk that
-  already carries the real token count, drops the stream, and asserts a
-  full refund, so a client that reads every frame and then closes gets
-  the generation for free. The test did not miss the hole, it pinned it
-  as the contract, which is why the next reader will defend it.
-- **What the change moves into reach.** Name the attacker set before and
-  after: a value only an operator could set that a request, a tenant, a
-  guest, or an upstream can now set is the finding, whether or not
-  today's handling of it is safe.
+  client would want it to be true. A test named for a stream dropped
+  before its end, polling a chunk that already carries the real token
+  count and then asserting a full refund, describes a client that reads
+  every frame and closes for free. The test did not miss the hole, it
+  pinned it as the contract, which is why the next reader will defend
+  it.
 
 ## 2. Concurrency and async
 
@@ -181,10 +180,13 @@ past capacity" is.
   produce the symptom, one asked for behavior two released contracts
   forbid. Neither is visible in the diff afterwards, so it is the first
   question, not a later one.
-- **An early return inside a long function.** The silent no-op in the
-  form it actually lands in, and the highest-yield check in this
-  section, on the evidence: a call site becomes a no-op while every
-  caller still reasonably expects work to happen. `request_filter`,
+- **Silent no-ops.** A call site that still compiles and still runs but
+  no longer does the work its caller expects: a default flipped off, a
+  condition inverted, an impl emptied, a hook that never fires for one
+  action type. The next bullet is the form it takes most often here,
+  and not the only one.
+- **An early return inside a long function.** The highest-yield check in
+  this section, on the evidence. `request_filter`,
   `response_body_filter`, and `handle_ai_proxy` each run many independent
   stages in sequence, so a `return` added inside one stage silently skips
   every stage below it: mirroring, `on_request` callbacks, forward rules,
@@ -270,18 +272,24 @@ past capacity" is.
 
 - **`as` casts that can truncate, wrap, or lose precision.** Prefer
   `try_from` with a real error, or saturate explicitly and say so.
-- **An `#[expect]` or `#[allow]` whose reason the change invalidated.**
-  A reasonless attribute is a lint's job and `#[expect]` fails to
-  compile once the exception stops being needed, so the only question
-  left is the one no lint asks: is the reason still true? An
-  `#[expect(cast_possible_truncation, reason = "...")]` whose reason
-  read "a retry-after in seconds fits u64 for any deficit a real cap
+- **`#[allow]` without a reason, and a reason the change invalidated.**
+  This workspace has no `[workspace.lints]` block and clippy runs bare,
+  so nothing refuses a reasonless attribute and nothing reports one that
+  has stopped being needed. Both questions are the reviewer's. A new
+  suppression says why in the attribute, and `#[expect]` is the better
+  spelling because it fails to compile once the exception lapses. Where
+  a reason exists, ask what no tool asks: is it still true? One reading
+  "a retry-after in seconds fits u64 for any deficit a real cap
   produces" was written when a deficit could not exceed capacity, and a
-  later change made the deficit unbounded without revisiting the
-  sentence. Read every reason in or adjacent to the diff as a claim
-  about today's code.
+  later change made the deficit unbounded. Read every reason in or near
+  the diff as a claim about today's code.
 - **`#[must_use]`** on builders and on anything returning a value that
   is meaningless to discard.
+- **Allocation on the request path.** A `to_string()` or a `clone()`
+  that runs once per request is multiplied by the request rate. The
+  severity table's Minor is the needless allocation *off* the hot path;
+  this is the other one, and in a proxy it is the one worth the line.
+  Say which path an allocation is on before sizing the finding.
 - **`#[non_exhaustive]`** on public enums and structs that will grow.
 - **Trait contracts honored.** A deliberate deviation (a `Write` impl
   that reports a full write while dropping bytes) needs a comment saying
@@ -305,22 +313,19 @@ past capacity" is.
   process-wide counter passes alone and fails under a parallel runner.
 - **Fixtures match the shipped surface.** A test config that no operator
   could write proves nothing about the config operators do write.
-- **Cleanup survives a failing assertion.** A test that spawns a child,
-  binds a port, or takes any other OS handle holds something a panic
-  does not release: `std::process::Child` has no `Drop` that kills. An
-  assertion between the spawn and the `kill()` leaks a live server
-  holding a port on every failing run, and the next run then fails for a
-  different reason. Put the assertions after the cleanup or put the
-  handle behind a guard whose `Drop` does it. A rewrite that lifts an
-  assertion undoes this silently, so read the order in the diff, not
-  just the lines.
+- **Cleanup survives a failing assertion.** A test that spawns a child
+  or binds a port holds something a panic does not release:
+  `std::process::Child` has no `Drop` that kills. An assertion between
+  the spawn and the `kill()` leaks a live server holding a port on every
+  failing run, and the next run fails for a different reason. Put the
+  assertions after the cleanup, or the handle behind a guard whose
+  `Drop` does it. A rewrite that lifts an assertion undoes this
+  silently, so read the order.
 - **A timed bound that contains a first.** A deadline around an
   operation the machine has never performed measures the operation plus
-  the machine's one-time work. macOS scans a freshly written executable
-  on first exec, measured between 1.0 s and 19.4 s on one machine, so a
-  3 s bound around a first launch fails for a reason that appears
+  the machine's one-time work, so it fails for a reason that appears
   nowhere in the test and gets blamed on whatever else changed. Do the
-  first run outside the bound, or bound something that is not a first.
+  first run outside the bound.
 
 ## 9. Docs and examples
 
@@ -356,8 +361,9 @@ more than missing code because it is trusted.
   replayed every documented curl found more than a dozen genuine
   runtime bugs that every static check had missed clean, in two
   recurring shapes: a response body documented as `text/plain` that is
-  actually `application/json` (eight examples, each found separately),
-  and a backend pointed at `127.0.0.1` with no
+  actually `application/json` (seven examples named in that pass and
+  others besides, each found separately), and a backend pointed at
+  `127.0.0.1` with no
   `proxy.extensions.upstream.allow_private_cidrs`, so the SSRF guard
   502s the walkthrough before the documented feature ever runs (five
   examples). Neither class is visible from the config alone; both need a
@@ -428,45 +434,32 @@ does not test that behavior, whatever the coverage number says. An EKU
 check's `!eku.client_auth` arm sat behind a surplus-purpose check that
 every fixture hit first, so it was covered, unreachable, and deletable
 with no test going red. Reading did not find it and coverage could not.
-The first three items below are the ways that standard fails while
-looking rigorous.
+The first two items below are the ways that standard fails while
+looking rigorous. And when an arm that used to go red goes quiet, say
+which happened: a second check now refuses the value downstream, or a
+test was always vacuous and another path was answering for it.
 
 - **A test that cannot fail.** For each new assertion, ask whether the
   two sides can differ. An assertion that compares a value with itself
   through an alias proves determinism and nothing else while reading as
-  if it guarded an invariant: `issue_leaf()` against
-  `issue_leaf_with(Contract)`, written to prove the generator does not
-  change the contract profile, where `issue_leaf()` is defined as
-  calling `issue_leaf_with(Contract)`. The same shape hides in an
-  assertion on a value the test computed the way the code computes it, a
-  `matches!` whose last arm is a catch-all, and an `is_ok()` on a call
-  with no `Err` branch.
-- **A mutation that never applied.** A mutation that did not change the
-  file is indistinguishable, in the test output, from one the suite
-  survived, and it is the more likely of the two. Prove the edit landed
-  before drawing anything from it: a diff, a hash, or a compile error is
-  proof, and a script reporting "applied" is not. A battery deleting a
-  condition by `str.replace` matched nothing because `cargo fmt` had
-  since reflowed that condition across two lines, so the edit no-opped,
-  the tests passed, and the arm went into the report as covered when
-  nothing had been mutated at all.
-- **A mutation that stopped biting.** When an arm that used to go red
-  goes quiet after a rewrite, one of two things happened and they are
-  not interchangeable. Either a second check now refuses the bad value
-  downstream, in which case say that out loud and say that the test
-  documents the branch rather than testing it. Or a test was always
-  vacuous and another path was quietly answering for it: dropping escape
-  handling in a JSON walk stayed green because a fallback produced the
-  right answer anyway, and the fix was a shape only the broken path can
-  answer. Assuming the first without checking is how a suite stops
-  testing without anyone deciding to stop.
+  if it guarded an invariant: a helper checked against the same helper
+  with its profile argument spelled out, where the short form is defined
+  as calling the long one. The same shape hides in an assertion on a
+  value the test computed the way the code does, a `matches!` whose last
+  arm is a catch-all, and an `is_ok()` on a call with no `Err` branch.
+- **A mutation that never applied.** In the test output it is
+  indistinguishable from one the suite survived, and it is the more
+  likely of the two. Prove the edit landed before drawing anything from
+  it: a diff, a hash, or a compile error is proof, and a script
+  reporting "applied" is not. A battery deleting a condition by
+  `str.replace` matched nothing because `cargo fmt` had reflowed that
+  condition across two lines, so the arm went into the report as covered
+  with nothing mutated.
 - **A check nothing runs.** For every gate, lane, ratchet, or opt-in
   pass a change adds or names, find what invokes it, and for every
-  invoker find the check it invokes. Five instances landed in one day: a
-  required CI lane with no local phase, a local phase in no CI lane, an
-  env-gated pass nothing sets, a ratchet whose comment named a lane that
-  does not exist, and a gate reporting zero skipped phases while two
-  required lanes never ran.
+  invoker find the check it invokes. Five instances landed in one day,
+  among them a required CI lane with no local phase and a gate reporting
+  `skipped_phases=0` while two required lanes never ran.
 - **A skip that reads as a pass.** A lane behind a path filter reports
   success when it does not run, so it is greenest exactly when it is not
   looking. For any lane a change leans on, check that the filter matches
@@ -474,21 +467,12 @@ looking rigorous.
   where it is skipped.
 - **A claim of coverage, counted.** A PASS column, a doc sentence, a
   comment, or a gate's own output that asserts more than the code does.
-  Count what the sentence claims against what runs: a column reading "is
-  section 10.1's leaf profile" where three of its clauses were checked,
-  a line saying "one required lane is still outside the default path"
-  where two were, and a comment claiming model-emitted text cannot forge
-  a count, true of text blocks and false of tool arguments. Enforcement
-  is part of the claim: four documents described required checks in
-  repositories that had no branch protection at all, so every lane was
-  advisory and no document said so.
-- **A measurement whose method invalidates it.** A number in a comment,
-  a doc, or a PR body carries its method, and the method has to produce
-  the thing being measured. First-exec cost was measured by copying an
-  already-executed binary; a copy with identical contents can skip the
-  scan, so the figure came out about thirteen times low, and relinking
-  is the only method that produces a first. Ask what makes each run the
-  thing being measured, and whether the setup destroys it.
+  Count what the sentence claims against what runs: a PASS column read
+  "is section 10.1's leaf profile" where three of its clauses were
+  checked. Enforcement is part of the claim, so check that too: four
+  documents described required checks in repositories with no branch
+  protection at all, so every lane was advisory and no document said
+  so.
 
 ## Output format
 
