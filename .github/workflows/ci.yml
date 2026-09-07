@@ -411,6 +411,10 @@ jobs:
           # is the only lane that sees its failing path, which is the
           # path a green gate never exercises (WOR-2945).
           bash scripts/tests/check_sh_skip_summary_test.sh
+          # The other half of that line: tests= and failures= summed
+          # across every nextest lane rather than read off whichever
+          # lane wrote junit.xml last (WOR-2951).
+          bash scripts/tests/check_sh_test_counts_test.sh
           python3 scripts/lib/cert_record.py --self-test
           python3 scripts/tests/test_cert_record.py
           python3 scripts/lib/notice_coverage.py --self-test

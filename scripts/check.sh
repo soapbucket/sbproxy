@@ -316,6 +316,128 @@ print_skip_summary() {
   printf '\033[1;33m========================================================\033[0m\n'
 }
 
+# --- Test-lane counts, one per lane ------------------------------------
+#
+# Every nextest lane in this file runs `--profile ci`, and that profile
+# writes ONE file, `target/nextest/ci/junit.xml`. The second lane
+# overwrites the first. cleanup used to read that file once at exit, so
+# `tests=` reported the LAST lane's count and presented it as the run's:
+# a green run of 16020 tests and then 5961 reported `tests=5961`
+# (WOR-2951).
+#
+# That is worse than an undercount, in the way that matters for a number
+# people quote. It stays plausible, so nothing about the line looks
+# wrong, and it is not monotone in what ran: a run that lost the
+# workspace lane entirely reports the same 5961 as a run that executed
+# both. Comparing two runs to see whether coverage moved is exactly the
+# comparison that cannot see a lane disappear.
+#
+# So the counts are taken per lane, as each lane finishes, rather than
+# once at exit. `run_test_lane` is the only way a test lane should be
+# invoked here:
+#
+#   - the junit file is deleted BEFORE the lane, so a lane that writes
+#     none of its own (the serial `cargo test` fallback, or a nextest
+#     killed before it reports) cannot be credited with the previous
+#     lane's file;
+#   - it is read AFTER the lane, on the failure path as well as the
+#     success path, because a lane that goes red still ran its tests;
+#   - nothing is read at exit, so the numbers no longer depend on the
+#     file surviving until the trap, and a junit left behind by an
+#     EARLIER run under SBPROXY_CLEAN_AFTER_BUILD=0 can no longer be
+#     reported as this run's work.
+#
+# `tests=` and `failures=` stay single numbers: comparable between two
+# runs without arithmetic, and monotone in the lanes that ran, which is
+# the property the old field did not have. `test_lanes=` carries what a
+# total alone cannot, which lanes contributed and how much each
+# contributed, so a lane that stops running is named rather than
+# absorbed into a slightly smaller total. Both are load bearing. A bare
+# total says the number moved and not which lane moved it; a bare
+# `16020+5961` leaves the lanes unnamed and makes every comparison
+# mental arithmetic.
+#
+# Scope, stated because a count is only as wide as its quantifier.
+#
+# In it: every lane this file puts through `run_test_lane`, which is
+# both nextest lanes and both of their serial `cargo test` fallbacks. A
+# fallback writes no junit, so it lands in `test_lanes=` as `unparsed`
+# rather than as a number, which is the line saying a lane ran and could
+# not be counted.
+#
+# Not in it: the libtest phases, which write no junit at all (the three
+# observability budgets targets and the doctest pass), and
+# scripts/check-config-readers.sh's two-test nextest run, which IS a
+# nextest lane this gate runs. It stays out only because it omits
+# `--profile ci` and .config/nextest.toml configures junit under
+# `[profile.ci.junit]` alone, so it writes to target/nextest/default/
+# instead. That is a property of that script's flags, not of this
+# accounting: a lane that starts passing `--profile ci` has to be
+# wrapped here too. Each of those prints its own count where it runs.
+#
+# And the total is EXECUTIONS, not distinct tests. The payments lane
+# selects sbproxy-billing, sbproxy-core and sbproxy-modules out of the
+# same workspace the first lane already ran, compiled under the
+# settlement feature union, so nearly all of its tests are the first
+# lane's tests run a second time with different features. On the
+# measured run that is 16023 + 5961 = 21984 executions, and the skip
+# message on the payments phase below puts the payment-gated tests, the
+# ones no other lane compiles at all, at about 217. Compare `tests=`
+# against another run of this gate, never against a CI lane's own junit
+# count.
+GATE_TESTS_TOTAL=0
+GATE_FAILURES_TOTAL=0
+GATE_TEST_LANES=''
+GATE_TEST_LANES_RUN=0
+GATE_TEST_LANES_PARSED=0
+
+# One resolver for the path, so the delete and the read cannot disagree
+# about which file a lane wrote.
+junit_path() {
+  printf '%s' "${CARGO_TARGET_DIR:-$ROOT/target}/nextest/ci/junit.xml"
+}
+
+# Add one finished lane to the run totals. A lane that ran and left no
+# readable junit is recorded as `unparsed`, not as zero: those are
+# different answers and only one of them is honest, which is the same
+# distinction scripts/lib/expect-tests.sh draws for the same reason.
+record_test_lane() {
+  local label="$1" junit head_bytes tests failures
+  junit="$(junit_path)"
+  tests=''
+  failures=''
+  if [ -f "$junit" ]; then
+    head_bytes="$(head -c 4000 "$junit" 2>/dev/null || true)"
+    tests="$(printf '%s' "$head_bytes" | tr ' ' '\n' \
+      | sed -n 's/^tests="\([0-9]*\)"$/\1/p' | head -1)"
+    failures="$(printf '%s' "$head_bytes" | tr ' ' '\n' \
+      | sed -n 's/^failures="\([0-9]*\)"$/\1/p' | head -1)"
+  fi
+  GATE_TEST_LANES_RUN=$((GATE_TEST_LANES_RUN + 1))
+  if [ -n "$tests" ] && [ -n "$failures" ]; then
+    GATE_TESTS_TOTAL=$((GATE_TESTS_TOTAL + tests))
+    GATE_FAILURES_TOTAL=$((GATE_FAILURES_TOTAL + failures))
+    GATE_TEST_LANES_PARSED=$((GATE_TEST_LANES_PARSED + 1))
+    GATE_TEST_LANES="${GATE_TEST_LANES}${GATE_TEST_LANES:++}${label}:${tests}"
+  else
+    GATE_TEST_LANES="${GATE_TEST_LANES}${GATE_TEST_LANES:++}${label}:unparsed"
+  fi
+}
+
+# Run one test lane under $1 as its name, and count it whatever it exits
+# with. `|| rc=$?` suppresses errexit for the lane alone, so the count is
+# taken before the script dies; `return "$rc"` hands the failure back
+# unchanged, and errexit applies at the call site exactly as it did when
+# the lane was written there directly.
+run_test_lane() {
+  local label="$1" rc=0
+  shift
+  rm -f "$(junit_path)" 2>/dev/null || true
+  "$@" || rc=$?
+  record_test_lane "$label" || true
+  return "$rc"
+}
+
 # Runs on every exit path, success or failure, and its last act is the
 # one line a gate result should ever be quoted as.
 #
@@ -325,11 +447,13 @@ print_skip_summary() {
 # the run actually produced, the phase it died in when it died, and how
 # many phases did not run. Quote that line.
 #
-# The counts come from the junit file nextest's ci profile writes, read
-# BEFORE cleanup-build-artifacts.sh prunes target/nextest, which is why
-# this is the first thing the function does. Every step here tolerates
-# its own failure: a cleanup trap that errors would mask the exit code it
-# exists to report.
+# The counts come from the per-lane accounting above rather than from a
+# file read here. They used to be whichever lane wrote junit.xml last,
+# which on a two-lane run was never the run's total (WOR-2951). Nothing
+# in this function touches target/nextest any more, so the ordering
+# against cleanup-build-artifacts.sh no longer matters to the numbers.
+# Every step here tolerates its own failure: a cleanup trap that errors
+# would mask the exit code it exists to report.
 #
 # It also prints the SKIPPED PHASES block when the run failed. That block
 # is emitted at the end of the script, which a failing phase never
@@ -340,18 +464,22 @@ print_skip_summary() {
 # reported a count and withheld the report.
 cleanup() {
   local rc=$?
-  local junit tests failures head_bytes
-  junit="${CARGO_TARGET_DIR:-$ROOT/target}/nextest/ci/junit.xml"
+  local tests failures lanes
+  # No lane ran, no lane produced a readable count, and a real total are
+  # three different things, and the line says which. `not-run` is no
+  # lane at all; `unparsed` is a lane that ran and left nothing to read,
+  # which is what the serial `cargo test` fallback produces.
   tests='not-run'
   failures='not-run'
-  if [ -f "$junit" ]; then
-    head_bytes="$(head -c 4000 "$junit" 2>/dev/null || true)"
-    tests="$(printf '%s' "$head_bytes" | tr ' ' '\n' \
-      | sed -n 's/^tests="\([0-9]*\)"$/\1/p' | head -1)"
-    failures="$(printf '%s' "$head_bytes" | tr ' ' '\n' \
-      | sed -n 's/^failures="\([0-9]*\)"$/\1/p' | head -1)"
-    tests="${tests:-unparsed}"
-    failures="${failures:-unparsed}"
+  lanes='none'
+  if [ "${GATE_TEST_LANES_PARSED:-0}" -gt 0 ]; then
+    tests="$GATE_TESTS_TOTAL"
+    failures="$GATE_FAILURES_TOTAL"
+    lanes="$GATE_TEST_LANES"
+  elif [ "${GATE_TEST_LANES_RUN:-0}" -gt 0 ]; then
+    tests='unparsed'
+    failures='unparsed'
+    lanes="$GATE_TEST_LANES"
   fi
 
   if [ -n "${BATCH_DIR:-}" ]; then
@@ -376,12 +504,12 @@ cleanup() {
   fi
 
   if [ "$rc" = "0" ]; then
-    printf '\nGATE_EXIT=%s tests=%s failures=%s skipped_phases=%s elapsed=%ss\n' \
-      "$rc" "$tests" "$failures" "${SKIPPED_COUNT:-0}" \
+    printf '\nGATE_EXIT=%s tests=%s failures=%s test_lanes=%s skipped_phases=%s elapsed=%ss\n' \
+      "$rc" "$tests" "$failures" "$lanes" "${SKIPPED_COUNT:-0}" \
       "$(( $(date +%s) - GATE_STARTED ))"
   else
-    printf '\nGATE_EXIT=%s tests=%s failures=%s failed_phase=%s skipped_phases=%s elapsed=%ss\n' \
-      "$rc" "$tests" "$failures" "${STEP_LABEL:-unknown}" "${SKIPPED_COUNT:-0}" \
+    printf '\nGATE_EXIT=%s tests=%s failures=%s test_lanes=%s failed_phase=%s skipped_phases=%s elapsed=%ss\n' \
+      "$rc" "$tests" "$failures" "$lanes" "${STEP_LABEL:-unknown}" "${SKIPPED_COUNT:-0}" \
       "$(( $(date +%s) - GATE_STARTED ))"
   fi
   return "$rc"
@@ -904,6 +1032,12 @@ bash "$ROOT/scripts/lib/expect-tests.sh" --self-test
 # the failing path it covers is the path no green run ever exercises.
 # The fourth case mutates the fix out and requires the old symptom back.
 bash "$ROOT/scripts/tests/check_sh_skip_summary_test.sh"
+# The other half of that line: `tests=` and `failures=` summed across
+# every nextest lane rather than read off whichever lane wrote junit.xml
+# last. Three of its cases mutate the fix back out and require the old
+# symptom to reappear: one per accumulator, and one on the delete that
+# stops a lane inheriting the previous lane's file.
+bash "$ROOT/scripts/tests/check_sh_test_counts_test.sh"
 
 # Serial: the test_doc_generators module binds listeners and has
 # leaked one on port 18091 before; nothing that opens a port runs
@@ -1305,7 +1439,7 @@ if ! phase_wanted TEST; then
 else
 step "cargo test"
 if cargo nextest --version >/dev/null 2>&1; then
-  cargo nextest run "${nextest_args[@]}"
+  run_test_lane workspace cargo nextest run "${nextest_args[@]}"
 elif [ "${SBPROXY_ALLOW_CARGO_TEST_FALLBACK:-0}" = "1" ]; then
   note_skip "nextest test lane (SBPROXY_ALLOW_CARGO_TEST_FALLBACK=1 ran serial 'cargo test' instead; this is not the lane CI runs)"
   if [ -n "$e2e_exclusion" ]; then
@@ -1316,7 +1450,7 @@ elif [ "${SBPROXY_ALLOW_CARGO_TEST_FALLBACK:-0}" = "1" ]; then
     # rather than hiding them behind a stale allow-list.
     note_skip "e2e binary-flavor filtering (no nextest, and 'cargo test' cannot express a filterset, so the tests named above ran and will fail on their missing binary rather than being skipped)"
   fi
-  cargo test "${cargo_test_args[@]}"
+  run_test_lane workspace-serial cargo test "${cargo_test_args[@]}"
 else
   cat >&2 <<'MSG'
 
@@ -1381,9 +1515,10 @@ fi
 # hide behind cardinality's count and the lane would stay green with the
 # redaction budgets unchecked.
 #
-# These are libtest runs, not nextest, so their counts do not reach the
-# junit file the GATE_EXIT `tests=` number is read from. The
-# `expect_tests:` lines each phase prints carry them instead.
+# These are libtest runs, not nextest, so they write no junit file and
+# are not in the GATE_EXIT `tests=` total, which sums the nextest lanes
+# and names them in `test_lanes=`. The `expect_tests:` lines each phase
+# prints carry these counts instead.
 if ! phase_wanted TEST; then
   : # scope_skip already reported the TEST phase above.
 elif [ "${SBPROXY_CHECK_E2E:-0}" = "1" ]; then
@@ -1593,7 +1728,8 @@ else
   # wearing a different hat.
   step "cargo test (payment settlement features)"
   if cargo nextest --version >/dev/null 2>&1; then
-    cargo nextest run --workspace --exclude sbproxy-e2e --locked --profile ci \
+    run_test_lane payments \
+      cargo nextest run --workspace --exclude sbproxy-e2e --locked --profile ci \
       --features "$payment_features" \
       -E 'package(sbproxy-billing) + package(sbproxy-core) + package(sbproxy-modules)'
   else
@@ -1604,7 +1740,8 @@ else
     # package selection and therefore the feature union, so this runs the
     # whole selection rather than narrowing it wrong.
     note_skip "payment test narrowing (no nextest, so the serial fallback ran the whole workspace selection instead of the three payment-gated crates)"
-    cargo test --workspace --exclude sbproxy-e2e --locked --features "$payment_features"
+    run_test_lane payments-serial \
+      cargo test --workspace --exclude sbproxy-e2e --locked --features "$payment_features"
   fi
 fi
 
