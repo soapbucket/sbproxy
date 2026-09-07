@@ -401,6 +401,23 @@ def external_tree_names(root: Path) -> set[str]:
     return found
 
 
+# The workspace's public API surface, named in CLAUDE.md under
+# Conventions: "The public API surface is the following three crates,
+# and only these three." Every `pub` item in one of them is public API
+# by definition, whatever this scan can see about its callers, so the
+# two verdicts that change a signature are both wrong there. `narrow` is
+# wrong because `pub(crate)` on a published crate's item is a breaking
+# change for every downstream user, and it was the advice this scan gave
+# for most of the 250 candidates in these crates. `wire-or-delete` is
+# wrong for the same reason plus one more: an item here can have no
+# in-tree caller and still be the whole point, because the callers are
+# out of this repository by construction.
+#
+# `sbproxy-events` and `sbproxy-proxy` are named in the same section as
+# planned and not yet shipped, so they are deliberately absent.
+PUBLIC_API_CRATES = frozenset({"sbproxy-plugin", "sbproxy-config", "sbproxy-httpkit"})
+
+
 def load_recorded_verdicts(repo: Path) -> dict[str, dict]:
     """Human verdicts that override the class rule.
 
@@ -428,6 +445,14 @@ def verdict_for(item: dict) -> tuple[str, str]:
             "keep",
             "named by the out-of-tree consumer tree; deleting it breaks a build "
             "that does not live in this repository",
+        )
+    if item.get("crate") in PUBLIC_API_CRATES:
+        return (
+            "keep",
+            f"`{item['crate']}` is one of the three crates CLAUDE.md names as the "
+            "public API surface, so this is published API whatever calls it in this "
+            "repository; narrowing or deleting it is a breaking change for consumers "
+            "no scan of this tree can see",
         )
     if item.get("cross_crate_test"):
         where = item["cross_crate_test"][0]

@@ -265,6 +265,49 @@ class ReExportIsNotAConsumerTest(unittest.TestCase):
         )
 
 
+class PublicApiCrateTest(unittest.TestCase):
+    """The three crates CLAUDE.md names as the public API surface.
+
+    Every `pub` item in one of them is published API whatever this scan
+    can see about its callers, so the two verdicts that change a
+    signature are both wrong there.
+    """
+
+    def _verdict(self, crate: str) -> tuple[str, str]:
+        module = _scanner_module()
+        return module.verdict_for(
+            {
+                "name": "thing",
+                "kind": "fn",
+                "crate": crate,
+                "file": f"crates/{crate}/src/lib.rs",
+                "used_in_own_file": 3,
+                "derives": [],
+            }
+        )
+
+    def test_a_public_api_crate_item_is_never_narrowed(self) -> None:
+        """`pub(crate)` on a published crate's item is a breaking change,
+        and in-file use was making this scan advise exactly that."""
+        for crate in ("sbproxy-plugin", "sbproxy-config", "sbproxy-httpkit"):
+            with self.subTest(crate=crate):
+                verdict, why = self._verdict(crate)
+                self.assertEqual(verdict, "keep")
+                self.assertIn("public API surface", why)
+
+    def test_an_internal_crate_with_the_same_shape_still_narrows(self) -> None:
+        """The control. Without it the test above passes on a scanner
+        that returns `keep` for everything."""
+        self.assertEqual(self._verdict("sbproxy-mesh")[0], "narrow")
+
+    def test_the_planned_crates_are_not_treated_as_shipped(self) -> None:
+        """CLAUDE.md names sbproxy-events and sbproxy-proxy as planned and
+        not yet shipped, and says not to advertise them as available."""
+        module = _scanner_module()
+        self.assertNotIn("sbproxy-events", module.PUBLIC_API_CRATES)
+        self.assertNotIn("sbproxy-proxy", module.PUBLIC_API_CRATES)
+
+
 class DiscoveryFloorTest(unittest.TestCase):
     """A scan that found nothing has to say so.
 
