@@ -1,6 +1,6 @@
 # scripts/
 
-*Last modified: 2026-08-28*
+*Last modified: 2026-09-07*
 
 Helper scripts that wrap the day-to-day dev loop and the CI runners
 the GitHub workflows invoke. Run from the repository root unless a
@@ -18,9 +18,9 @@ script's header says otherwise.
 | `check-attribute-placement.py` | Refuse an attribute that cannot apply to the item under it: `#[test]` on a `static`, a `const`, a `use`, or a function taking arguments, and `#[ignore]` or `#[should_panic]` on a function carrying no test attribute. Parses rather than greps, and reads every cfg rather than only the ones a lane compiles. | local + `.github/workflows/ci.yml` (guards) |
 | `lib/expect-tests.sh` | `expect_tests <count> <label> -- <command>`. Assert how many tests a filtered selection actually ran, because `cargo test`, `--exact` and `--ignored` all exit 0 when the filter matches nothing. | sourced by the scripts and workflows that name individual tests |
 | `cleanup-build-artifacts.sh` | Prune generated docs, nextest output, incremental dirs, and transient logs without deleting dependency build outputs. | local + CI |
-| `run-e2e.sh` | Build the Rust proxy and run the maintained HTTP conformance smoke set. | local + CI |
-| `run-all-e2e.sh` | Build the Rust proxy and audit all 93 cases in the historical HTTP catalog. | local + CI |
-| `build-e2e.sh` | Just the proxy build step (release profile). | shared by other runners |
+| `run-e2e.sh` | Build the Rust proxy and run the maintained HTTP conformance smoke set. | local only; no workflow invokes it |
+| `run-all-e2e.sh` | Build the Rust proxy and audit all 93 cases in the historical HTTP catalog. | local only; no workflow invokes it |
+| `build-e2e.sh` | Just the proxy build step (release profile). | local only; `run-e2e.sh` does its own build and never calls this, whose one caller is the quick start in `e2e/conformance/README.md` |
 | `perf-compare.sh` | Two-bench delta comparison between branches. | nightly bench |
 | `generate-certs.sh` | Mint a local CA + leaf cert for TLS tests. | local only |
 | `install.sh` | One-command install of `sbproxy` from a release archive. | end-user |
