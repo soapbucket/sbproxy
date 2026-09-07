@@ -357,11 +357,34 @@ print_skip_summary() {
 # `16020+5961` leaves the lanes unnamed and makes every comparison
 # mental arithmetic.
 #
-# Scope, stated because a count is only as wide as its quantifier: this
-# is every nextest lane in this gate and nothing else. The libtest runs
-# (the observability budgets targets, the doctest pass, the `cargo test`
-# fallbacks) write no junit and are not in it. Each of those prints its
-# own count where it runs.
+# Scope, stated because a count is only as wide as its quantifier.
+#
+# In it: every lane this file puts through `run_test_lane`, which is
+# both nextest lanes and both of their serial `cargo test` fallbacks. A
+# fallback writes no junit, so it lands in `test_lanes=` as `unparsed`
+# rather than as a number, which is the line saying a lane ran and could
+# not be counted.
+#
+# Not in it: the libtest phases, which write no junit at all (the three
+# observability budgets targets and the doctest pass), and
+# scripts/check-config-readers.sh's two-test nextest run, which IS a
+# nextest lane this gate runs. It stays out only because it omits
+# `--profile ci` and .config/nextest.toml configures junit under
+# `[profile.ci.junit]` alone, so it writes to target/nextest/default/
+# instead. That is a property of that script's flags, not of this
+# accounting: a lane that starts passing `--profile ci` has to be
+# wrapped here too. Each of those prints its own count where it runs.
+#
+# And the total is EXECUTIONS, not distinct tests. The payments lane
+# selects sbproxy-billing, sbproxy-core and sbproxy-modules out of the
+# same workspace the first lane already ran, compiled under the
+# settlement feature union, so nearly all of its tests are the first
+# lane's tests run a second time with different features. On the
+# measured run that is 16023 + 5961 = 21984 executions, and the skip
+# message on the payments phase below puts the payment-gated tests, the
+# ones no other lane compiles at all, at about 217. Compare `tests=`
+# against another run of this gate, never against a CI lane's own junit
+# count.
 GATE_TESTS_TOTAL=0
 GATE_FAILURES_TOTAL=0
 GATE_TEST_LANES=''
@@ -443,9 +466,9 @@ cleanup() {
   local rc=$?
   local tests failures lanes
   # No lane ran, no lane produced a readable count, and a real total are
-  # three different things, and the line says which. `tests=not-run`
-  # keeps meaning what .github/CONTRIBUTING-agents.md says it means: the
-  # test phase never executed.
+  # three different things, and the line says which. `not-run` is no
+  # lane at all; `unparsed` is a lane that ran and left nothing to read,
+  # which is what the serial `cargo test` fallback produces.
   tests='not-run'
   failures='not-run'
   lanes='none'
@@ -1011,8 +1034,9 @@ bash "$ROOT/scripts/lib/expect-tests.sh" --self-test
 bash "$ROOT/scripts/tests/check_sh_skip_summary_test.sh"
 # The other half of that line: `tests=` and `failures=` summed across
 # every nextest lane rather than read off whichever lane wrote junit.xml
-# last. Two of its cases mutate the summing back out and require the
-# WOR-2951 symptom to reappear.
+# last. Three of its cases mutate the fix back out and require the old
+# symptom to reappear: one per accumulator, and one on the delete that
+# stops a lane inheriting the previous lane's file.
 bash "$ROOT/scripts/tests/check_sh_test_counts_test.sh"
 
 # Serial: the test_doc_generators module binds listeners and has

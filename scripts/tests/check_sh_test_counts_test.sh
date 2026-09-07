@@ -32,7 +32,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CHECK="$ROOT/scripts/check.sh"
 TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sbproxy-test-counts-test.XXXXXX")"
-trap 'rm -rf "$TEST_DIR"' EXIT
+# Kept on a red run. Every failure message below names a log inside this
+# directory, and a trap that deletes it unconditionally makes each of
+# those pointers dead on arrival: the one run where somebody follows one
+# is the one run where it is gone.
+trap 'rc=$?; if [ "$rc" = 0 ]; then rm -rf "$TEST_DIR"; else printf "harness kept at %s\n" "$TEST_DIR" >&2; fi' EXIT
 
 fail() {
   printf 'FAIL: %s\n' "$1" >&2
@@ -160,10 +164,15 @@ expect_gate_line one_lane \
 grep -q 'payments' "$TEST_DIR/one_lane.log" \
   && fail 'one_lane: the removed lane is still named in the output'
 
-two_lanes_total="$(sed -n 's/.*tests=\([0-9]*\) .*/\1/p' <<<"$(gate_line two_lanes)")"
-one_lane_total="$(sed -n 's/.*tests=\([0-9]*\) .*/\1/p' <<<"$(gate_line one_lane)")"
-[ "$one_lane_total" -lt "$two_lanes_total" ] \
-  || fail "removing a lane did not lower tests= ($one_lane_total vs $two_lanes_total); the total is not monotone in the lanes that ran"
+# The direction is carried by the two exact-line assertions above and
+# nothing further is added by restating it: 16020 against 21981 is a
+# comparison of two literals this file has already pinned, and an
+# assertion whose two sides cannot differ reads as a guarded invariant
+# while proving nothing. The rubric's own section 10 names that shape,
+# so it does not belong in the file whose subject is section 10. What
+# does the work here is that both lines are asserted whole, so a total
+# that failed to fall, a lane list that kept naming `payments`, or a
+# field that quietly changed shape all fail on the string compare.
 
 # --- 3. a lane that goes red is still counted --------------------------
 # A red lane ran its tests. Reporting tests=not-run for it would be the
@@ -179,6 +188,27 @@ rc="$(run_harness red_lane)"
 [ "$rc" = "100" ] || fail "red_lane: expected exit 100, got $rc"
 expect_gate_line red_lane \
   'GATE_EXIT=100 tests=21981 failures=3 test_lanes=workspace:16020+payments:5961 failed_phase=probe payments lane skipped_phases=0 elapsed='
+
+# --- 3b. failures= is a sum too, not the last lane's -------------------
+# Case 3 cannot see this: with errexit the gate stops at the first red
+# lane, so only one lane ever carries failures and `failures=3` reads
+# the same whether the code sums or assigns. That is exactly why this
+# case exists and why it opts out of errexit with `|| true` on the first
+# lane. It pins the property before the change that would make the shape
+# reachable, which is any change that lets the gate keep going past a
+# red lane. Without it, mutating the failures accumulator to
+# last-lane-wins survives the entire battery, and `failures=` would go
+# back to being the defect this ticket fixed with nothing going red.
+write_harness two_red_lanes head.sh \
+  'step "probe workspace lane"' \
+  'run_test_lane workspace junit_lane 16020 2 100 || true' \
+  'step "probe payments lane"' \
+  'run_test_lane payments junit_lane 5961 3 100'
+
+rc="$(run_harness two_red_lanes)"
+[ "$rc" = "100" ] || fail "two_red_lanes: expected exit 100, got $rc"
+expect_gate_line two_red_lanes \
+  'GATE_EXIT=100 tests=21981 failures=5 test_lanes=workspace:16020+payments:5961 failed_phase=probe payments lane skipped_phases=0 elapsed='
 
 # --- 4. a lane that writes no junit is not credited with the last one --
 # This is the overwrite bug from the other side. The counts are read from
@@ -292,4 +322,23 @@ grep -q 'tests=5 ' "$TEST_DIR/silent_second_no_delete.log" \
 grep -q 'tests=10 ' "$TEST_DIR/silent_second_no_delete.log" \
   || fail 'silent_second_no_delete: expected the silent lane to be credited with the previous lane double-counted'
 
-printf 'check.sh test-count self-test: 7 cases passed (5 behaviors, 2 mutations)\n'
+# 6c. The same mutation on the other accumulator. Case 3b is the only
+# case that can see it, which is the whole reason case 3b is here.
+mutate 'GATE_FAILURES_TOTAL=$((GATE_FAILURES_TOTAL + failures))' \
+       'GATE_FAILURES_TOTAL=$((0 + failures))' \
+       head_last_failures_win.sh
+
+write_harness two_red_lanes_last_wins head_last_failures_win.sh \
+  'step "probe workspace lane"' \
+  'run_test_lane workspace junit_lane 16020 2 100 || true' \
+  'step "probe payments lane"' \
+  'run_test_lane payments junit_lane 5961 3 100'
+
+rc="$(run_harness two_red_lanes_last_wins)"
+[ "$rc" = "100" ] || fail "two_red_lanes_last_wins: expected exit 100, got $rc"
+grep -q 'failures=5' "$TEST_DIR/two_red_lanes_last_wins.log" \
+  && fail 'two_red_lanes_last_wins: the failure total survived a mutation that stops the summing, so case 3b proves nothing'
+grep -q 'failures=3 ' "$TEST_DIR/two_red_lanes_last_wins.log" \
+  || fail 'two_red_lanes_last_wins: expected the WOR-2951 symptom on failures=, the last lane reported as the run'
+
+printf 'check.sh test-count self-test: 9 cases passed (6 behaviors, 3 mutations)\n'

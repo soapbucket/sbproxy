@@ -25,7 +25,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CHECK="$ROOT/scripts/check.sh"
 TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sbproxy-skip-summary-test.XXXXXX")"
-trap 'rm -rf "$TEST_DIR"' EXIT
+# Kept on a red run. The failure messages below name logs inside this
+# directory, and a trap that deletes it unconditionally makes every one
+# of those pointers dead on the single run where somebody follows one.
+trap 'rc=$?; if [ "$rc" = 0 ]; then rm -rf "$TEST_DIR"; else printf "harness kept at %s\n" "$TEST_DIR" >&2; fi' EXIT
 
 fail() {
   printf 'FAIL: %s\n' "$1" >&2
