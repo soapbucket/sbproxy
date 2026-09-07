@@ -435,9 +435,10 @@ check's `!eku.client_auth` arm sat behind a surplus-purpose check that
 every fixture hit first, so it was covered, unreachable, and deletable
 with no test going red. Reading did not find it and coverage could not.
 The first two items below are the ways that standard fails while
-looking rigorous. And when an arm that used to go red goes quiet, say
-which happened: a second check now refuses the value downstream, or a
-test was always vacuous and another path was answering for it.
+looking rigorous. A battery or sweep nobody has seen go red proves
+nothing: point it at a version known to be broken and require it to
+fail. Assert the anchor occurs exactly once before writing, and grep
+for the marker afterwards.
 
 - **A test that cannot fail.** For each new assertion, ask whether the
   two sides can differ. An assertion that compares a value with itself
