@@ -14,11 +14,32 @@ import sys
 import tempfile
 import textwrap
 import threading
+import time
 import unittest
 import unittest.mock
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
+
+# How long the recorder gets to shut down a child that ignores SIGTERM.
+# Named once so the bound and the message that reports it cannot drift.
+SHUTDOWN_BOUND_SECONDS = 8
+
+# A hang guard for warm_first_exec, and deliberately not a budget for the
+# work it guards. The samples in warm_first_exec's docstring are samples of
+# a load-dependent quantity, not a ceiling: the largest seen on this machine
+# on 2026-09-06 was 29.5s, several times the same day's earlier worst. So
+# this is sized for a warm-up that has genuinely wedged, not for a slow one.
+# If it does fire, subprocess.run kills the child and setUp raises
+# TimeoutExpired naming the command: the test errors rather than passing,
+# nothing has been spawned or bound yet, and the temp root is discarded, so
+# the interrupted assessment is charged to no later run.
+WARM_UP_HANG_GUARD_SECONDS = 300
+
+# Above this, a warm-up says how long it took. Well clear of a warm file
+# (milliseconds) and of an idle first exec (about 0.2s), so a normal run
+# stays quiet and only a run worth explaining prints.
+SLOW_WARM_UP_SECONDS = 2.0
 
 
 def write_executable(path: Path, contents: str) -> None:
@@ -84,6 +105,67 @@ class TemporaryRepository(unittest.TestCase):
         shutil.copy2(REPOSITORY / "scripts" / name, target)
         return target
 
+    def warm_first_exec(
+        self,
+        path: Path,
+        *arguments: str,
+        env: dict[str, str] | None = None,
+    ) -> None:
+        """Exec ``path`` once, outside any timed bound, discarding the result.
+
+        macOS assesses a freshly written executable the first time it is
+        exec'd, and the cost lands on whoever waits for the process rather
+        than on the spawn, so every wall-clock bound around that wait
+        contains it. The load average will not show the contention, because
+        a process waiting on the assessment is blocked, not runnable.
+
+        Samples from this machine on 2026-09-06, writing new content each
+        time rather than copying: idle, a first exec cost about 0.2s against
+        0.008s for the second. With 24 workers each writing and exec'ing a
+        new file, the median first exec was 4.5s; later the same day, under
+        another agent's build, single samples reached 29.5s. Treat those as
+        samples of a load-dependent quantity, not as a bound to size against.
+
+        Copying does not dodge it. A copy of an already-executed file cost
+        about half price idle (0.097s against 0.187s) but full price under
+        contention (median 4.7s against 4.5s), so ``copy_script``'s output
+        needs warming exactly as much as a file written from scratch.
+
+        This must not be wrapped in a short timeout. An assessment killed
+        part-way is charged to the *next* run of the same file, so a bounded
+        warm-up hands its cost straight to the run it exists to protect. The
+        only limit here is ``WARM_UP_HANG_GUARD_SECONDS``, which is a hang
+        guard rather than a budget; see its comment for what happens if it
+        fires.
+
+        Callers pass ``arguments`` that make the executable exit without
+        doing its work, so warming has no side effects.
+        """
+        command_env = os.environ.copy()
+        if env:
+            command_env.update(env)
+        started = time.monotonic()
+        subprocess.run(
+            [str(path), *arguments],
+            cwd=self.root,
+            env=command_env,
+            capture_output=True,
+            timeout=WARM_UP_HANG_GUARD_SECONDS,
+            check=False,
+        )
+        elapsed = time.monotonic() - started
+        # Silent by default, because the usual case is milliseconds. A slow
+        # one is worth a line: this is the only step here that can take
+        # minutes, and a gate that gets killed while sitting in it should
+        # say which file it was assessing rather than looking hung.
+        if elapsed >= SLOW_WARM_UP_SECONDS:
+            print(
+                f"warm_first_exec: {path.name} took {elapsed:.1f}s "
+                "(macOS first-exec assessment; see WOR-2943)",
+                file=sys.stderr,
+                flush=True,
+            )
+
     def run_script(
         self,
         name: str,
@@ -125,8 +207,20 @@ class RecordTapesTests(TemporaryRepository):
             import os
             from pathlib import Path
             import signal
+            import sys
 
-            config = Path(__import__("sys").argv[-1])
+            # The real binary answers `--version` from clap and exits, and
+            # record-tapes.sh execs it that way in its preamble to pay the
+            # first-exec assessment outside its own readiness deadline. This
+            # stand-in has to answer the same flag the same way: exit before
+            # reading a config, touching the events file, or binding a port.
+            # The recorder's own calls are `serve -f <config>`, so the exact
+            # match keeps a real invocation from ever landing here.
+            # See TemporaryRepository.warm_first_exec.
+            if sys.argv[1:] == ["--version"]:
+                raise SystemExit(0)
+
+            config = Path(sys.argv[-1])
             port = next(
                 int(line.split(":", 1)[1].strip())
                 for line in config.read_text().splitlines()
@@ -168,6 +262,8 @@ class RecordTapesTests(TemporaryRepository):
             self.bin_dir / "vhs",
             r"""
             #!/usr/bin/env bash
+            # See TemporaryRepository.warm_first_exec.
+            if [ "${1-}" = "--warm-up" ]; then exit 0; fi
             printf '%s\n' "$1" >> "$FAKE_VHS_EVENTS"
             """,
         )
@@ -175,12 +271,40 @@ class RecordTapesTests(TemporaryRepository):
             self.bin_dir / "lsof",
             r"""
             #!/usr/bin/env bash
+            # See TemporaryRepository.warm_first_exec.
+            if [ "${1-}" = "--warm-up" ]; then exit 0; fi
             case "$*" in
               *"tcp:${FAKE_OCCUPIED_PORT}"*)
                 printf '%s\n' "$FAKE_UNRELATED_PID"
                 ;;
             esac
             """,
+        )
+        # Every wall-clock bound in this class contains an exec of one of
+        # these four files, and all four are new on disk as of a moment ago:
+        # three written here, and the recorder itself copied in by
+        # copy_script. Pay each first-exec assessment now, in setUp, where
+        # nothing is timed, so the bounds below measure the recorder rather
+        # than the machine's one-time work.
+        for fake in ("lsof", "vhs"):
+            self.warm_first_exec(self.bin_dir / fake, "--warm-up")
+        # `--version`, not `--warm-up`: this stand-in is warmed the same way
+        # record-tapes.sh warms the real binary, so the two cannot drift.
+        self.warm_first_exec(self.bin_dir / "sbproxy", "--version")
+        # The recorder takes no warm-up flag, and should not grow one for a
+        # test's convenience. A tape name that cannot exist reaches the same
+        # exec and returns at record()'s first check, before it starts a
+        # process, binds a port, or makes a workspace. SBPROXY_BIN has to
+        # point at something executable or the script exits earlier, at its
+        # own preamble; either path warms the file, this one exercises more
+        # of it.
+        self.warm_first_exec(
+            self.root / "scripts" / "record-tapes.sh",
+            "warm-up-no-such-tape",
+            env={
+                "SBPROXY_BIN": str(self.bin_dir / "sbproxy"),
+                "SBPROXY_DEMO_ENV": str(self.root / "no-credentials.env"),
+            },
         )
 
     def recorder_env(
@@ -286,10 +410,12 @@ class RecordTapesTests(TemporaryRepository):
         )
         try:
             try:
-                stdout, stderr = process.communicate(timeout=8)
+                stdout, stderr = process.communicate(
+                    timeout=SHUTDOWN_BOUND_SECONDS
+                )
             except subprocess.TimeoutExpired:
                 process.kill()
-                process.communicate()
+                stdout, stderr = process.communicate()
                 if self.events.exists():
                     for line in self.events.read_text().splitlines():
                         if line.startswith("START "):
@@ -297,7 +423,19 @@ class RecordTapesTests(TemporaryRepository):
                                 os.kill(int(line.split()[2]), 9)
                             except ProcessLookupError:
                                 pass
-                self.fail("recorder waited forever for an owned process to exit")
+                # Say what was observed and stop there. This message used to
+                # read "recorder waited forever for an owned process to
+                # exit", which named a mechanism nobody had measured: the
+                # run that produced it had been killed by a first-exec
+                # evaluation, not by the recorder's shutdown path, and the
+                # message sent its reader to the wrong file. The bound
+                # catches a recorder that does not finish; what stopped it
+                # finishing is for whoever measures it.
+                self.fail(
+                    "recorder did not finish within "
+                    f"{SHUTDOWN_BOUND_SECONDS}s and was killed at the bound; "
+                    f"partial stdout={stdout!r} stderr={stderr!r}"
+                )
             self.assertEqual(process.returncode, 0, stdout + stderr)
             self.assertIsNone(unrelated.poll())
         finally:

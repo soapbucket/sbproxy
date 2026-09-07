@@ -452,6 +452,16 @@ if [[ ! -x "$SBPROXY_BIN" ]]; then
 fi
 echo -e "  ${GREEN}OK${NC} Using sbproxy -> $SBPROXY_BIN"
 
+# Exec the binary once here, where nothing is timed (WOR-2943). macOS
+# assesses a freshly linked executable on its first exec, and the cost lands
+# on whoever waits for it. `cargo build --release` relinks this binary, so
+# the first `start_proxy` below would otherwise pay that inside a 5s
+# readiness deadline (50 x 0.1s) and report "sbproxy failed to start" for a
+# reason that is not in the proxy at all. Only the exec matters, so the exit
+# status is ignored, and this stays unbounded: an assessment killed part-way
+# is charged to the next run of the same file.
+"$SBPROXY_BIN" --version >/dev/null 2>&1 || true
+
 # ---------------------------------------------------------------------------
 # Generate certs
 # ---------------------------------------------------------------------------
