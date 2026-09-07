@@ -204,6 +204,67 @@ class DeriveAttributionTest(unittest.TestCase):
         self.assertFalse(module.attribute_is_closed("#[kube("))
 
 
+class RunawayAttributeTest(unittest.TestCase):
+    """An attribute the balance test cannot close must not eat definitions.
+
+    This is the accumulator's dangerous direction. Losing derives gives an
+    item the wrong verdict; losing the item removes it from the inventory
+    and both counts at once, with the floor unmoved because the rest of
+    the tree still discovers plenty. A guard cannot refuse what it cannot
+    see, so the accumulator has to let go at a definition.
+    """
+
+    def _definitions(self, source: str):
+        module = _scanner_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            src = repo / "crates" / "fixture" / "src"
+            src.mkdir(parents=True)
+            (src / "lib.rs").write_text(source)
+            return module.collect_definitions(module.rust_files(repo / "crates"), repo)
+
+    def test_a_char_literal_delimiter_does_not_swallow_the_items_below_it(self) -> None:
+        """`attribute_is_closed` blanks string literals, not char literals,
+        so the `(` in `'('` never balances and the accumulator runs on.
+
+        Measured before the fix: all three of these left the scan, and
+        `--count definitions` went to zero for the file while the two
+        ratchet counts and the inventory stayed exactly where they were.
+        """
+        definitions = self._definitions(
+            "#[foo(sep = '(')]\n"
+            "pub struct Swallowed {\n"
+            "    pub field: String,\n"
+            "}\n"
+            "pub fn also_swallowed() {}\n"
+            "pub fn survivor() {}\n"
+        )
+        for name in ("Swallowed", "also_swallowed", "survivor"):
+            self.assertIn(name, definitions, f"{name} left the scanner's universe")
+
+    def test_a_comment_carrying_a_lone_paren_does_not_swallow_them_either(self) -> None:
+        """The same hole reached through a comment rather than a literal."""
+        definitions = self._definitions(
+            "#[serde(\n"
+            "    // the opening ( here is prose\n"
+            "    default\n"
+            ")]\n"
+            "pub struct StillSeen {}\n"
+        )
+        self.assertIn("StillSeen", definitions)
+
+    def test_derives_recorded_before_a_runaway_attribute_survive(self) -> None:
+        """Letting go at the item must not undo the fix that added the
+        accumulator: the derives from before it are still the item's."""
+        definitions = self._definitions(
+            "#[derive(Debug, Deserialize)]\n"
+            "#[foo(sep = '(')]\n"
+            "pub struct Kept {}\n"
+        )
+        self.assertIn("Kept", definitions)
+        self.assertIn("Deserialize", definitions["Kept"][0]["derives"])
+
+
 class ReExportIsNotAConsumerTest(unittest.TestCase):
     """A `pub use` names an item; it does not consume one.
 

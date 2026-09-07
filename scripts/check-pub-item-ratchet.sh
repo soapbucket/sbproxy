@@ -107,18 +107,25 @@
 # spot, which is why both baselines below moved up in the change that
 # closed it and not because anything was added to the tree.
 #
-# It is one-directional, unlike its sibling above: it fails when the
-# number goes up and only advises when it goes down. That asymmetry is
-# deliberate, and the measurement behind it is worth writing down rather
-# than asserting. Replaying the scanner over the twenty merges before
-# 1586de4c, the test-only bucket sat at 297 or 298 the whole way, so
-# pinning it exactly costs almost nothing and holds every narrowing. The
-# wider bucket climbed from 1415 to 1441 across the same span, eight of
-# those in one merge, because it is a candidate list rather than a
-# defect list and ordinary feature work adds to it. Failing on a
-# decrease too would put a single-integer file in the path of most
+# This integer was one-directional until the inventory below arrived:
+# it failed when the number went up and only advised when it went down.
+# The measurement behind that asymmetry is still worth having. Replaying
+# the scanner over the twenty merges before 1586de4c, the test-only
+# bucket sat at 297 or 298 the whole way, so pinning it exactly costs
+# almost nothing and holds every narrowing. The wider bucket climbed
+# from 1415 to 1441 across the same span, eight of those in one merge,
+# because it is a candidate list rather than a defect list and ordinary
+# feature work adds to it. The argument against failing on a decrease
+# was that it would put a single-integer file in the path of most
 # branches, and a number bumped on reflex is worse than one that only
 # has to be justified when it grows.
+#
+# The inventory settles that differently and now decides it. It fails in
+# both directions, because a named line is not a number bumped on
+# reflex: an addition is one reviewable line saying which item, and a
+# removal is one line saying which item stopped being a candidate. So
+# the decrease is refused after all, and the reason the old paragraph
+# gave for allowing it no longer applies.
 #
 # Recompute either side against the merged tree rather than keeping
 # a branch's number:
@@ -247,6 +254,23 @@ RATCHET_DATA="$(python3 scripts/scan-pub-item-usage.py --ratchet-data)"
 # Without it, a scanner that walks the wrong directory, or matches
 # nothing, or returns early, reports zero candidates, and every check
 # below reads that as a clean tree and passes.
+#
+# What it catches, stated exactly, because a floor trusted past its
+# reach is worse than none. It fires when discovery loses most of the
+# FILES: dropping everything but the eight files that carry the recorded
+# verdicts leaves 185 definitions, and this refuses that. It does not
+# fire when discovery loses whole CRATES, because the tree is big enough
+# that a fraction of it still clears any floor an honest tree also
+# clears. Keeping only the seven crates the recorded verdicts live in
+# leaves 5447 definitions, above this number, and that run reaches the
+# inventory diff instead, where the bulk-removal branch below is what
+# refuses it. The two together cover both classes; neither covers both
+# on its own.
+#
+# The number cannot be raised much to close that gap. Anything above the
+# smallest crate subset that keeps all 13 recorded verdicts as
+# candidates would have to sit near the real count, and a floor that
+# close to the true number fails on ordinary deletion work.
 DEFINITION_FLOOR=5000
 
 DEFINITIONS="$(printf '%s\n' "$RATCHET_DATA" | awk -F'\t' '$1 == "definitions" { print $2 }')"
@@ -294,11 +318,56 @@ if ! diff -q "$INVENTORY_FILE" "$INVENTORY_ACTUAL" >/dev/null; then
     echo "resolve it; narrowing to pub(crate) is usually the right one." >&2
     echo >&2
   fi
+  # How many entries may leave at once before "an item gained a caller"
+  # stops being the likelier story than "the scan stopped seeing them".
+  # A tenth of the committed set is far above any real cleanup: the
+  # moves recorded in pub-item-ratchet-baseline.txt are single digits,
+  # and this whole branch removed none.
+  INVENTORY_SIZE="$(wc -l < "$INVENTORY_FILE" | tr -d ' ')"
+  REMOVED_COUNT=0
+  [ -n "$REMOVED" ] && REMOVED_COUNT="$(printf '%s\n' "$REMOVED" | wc -l | tr -d ' ')"
+  BULK_REMOVAL_LIMIT=$((INVENTORY_SIZE / 10))
+
   if [ -n "$REMOVED" ]; then
     echo "committed inventory entries that are no longer candidates:" >&2
     printf '%s\n' "$REMOVED" | sed 's/^/  - /' >&2
     echo >&2
-    echo "Ground gained. Drop these lines so it is held." >&2
+  fi
+
+  if [ "$REMOVED_COUNT" -gt "$BULK_REMOVAL_LIMIT" ]; then
+    # The floor above cannot see this. It catches discovery collapsing
+    # far enough to drop below a workspace-sized definition count; a walk
+    # that loses most of crates/ but keeps enough files still clears it,
+    # and then arrives here looking like a very large cleanup. Measured:
+    # keeping only the seven crates that carry the recorded verdicts
+    # leaves 5447 definitions, above the floor, and 1030 of 2141 entries
+    # gone. Telling an author to regenerate at that point is the same
+    # move as telling them to lower a baseline to a broken number, which
+    # is what this script's own header criticises origin/main's
+    # test-only branch for. Run the command and the corrupted set is
+    # committed, after which nothing in it can ever be flagged again.
+    echo "$REMOVED_COUNT of $INVENTORY_SIZE entries left the inventory at once." >&2
+    echo >&2
+    echo "That is too many to be cleanup. An item leaves this set when it" >&2
+    echo "gains a caller or is narrowed, one edit at a time; a whole block" >&2
+    echo "of them leaving usually means the scan stopped seeing the files" >&2
+    echo "rather than that the code changed." >&2
+    echo >&2
+    echo "This scan found $DEFINITIONS pub item definitions. Check that" >&2
+    echo "against the tree before believing the list above: a walk that" >&2
+    echo "loses most of crates/ can still clear the floor of" >&2
+    echo "$DEFINITION_FLOOR and land here." >&2
+    echo >&2
+    echo "Do not regenerate the inventory until you have confirmed the scan" >&2
+    echo "is sound. Regenerating commits whatever it just saw, and an entry" >&2
+    echo "that is not in the file can never be flagged again." >&2
+    exit 1
+  fi
+
+  if [ -n "$REMOVED" ]; then
+    echo "Ground gained, if the scan is sound. Confirm each of these gained" >&2
+    echo "a production caller or was narrowed, rather than that the scan" >&2
+    echo "stopped reaching it, then drop the lines." >&2
     echo >&2
   fi
   echo "Then regenerate, and recompute rather than keeping a branch's file:" >&2
@@ -351,9 +420,18 @@ if [ "$UNREFERENCED" -gt "$UNREFERENCED_BASELINE" ]; then
   exit 1
 fi
 
+# Both branches around this one are now reachable only when this count
+# file and the inventory disagree, because the inventory holds one line
+# per candidate and its diff runs first and fails on any difference in
+# either direction. Nothing keeps the two in step automatically, so a
+# stale-low count reports the upward message for a tree where nothing
+# went up. The inventory is the authority; this integer is the headline
+# a reader wants in the log, and it is kept for that and for the
+# test-only bucket above, which the inventory does not carry.
 if [ "$UNREFERENCED" -lt "$UNREFERENCED_BASELINE" ]; then
   echo "pub items nothing outside their own file names: $UNREFERENCED, below the baseline of $UNREFERENCED_BASELINE."
-  echo "Ground gained. Lower the baseline to hold it:"
+  echo "The inventory above already agreed with the tree, so this is the count"
+  echo "file being stale rather than anything moving. Bring it into step:"
   echo "  printf '%s\\n' $UNREFERENCED > $UNREFERENCED_BASELINE_FILE"
   exit 0
 fi

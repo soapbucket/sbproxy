@@ -246,17 +246,39 @@ def collect_definitions(files: list[Path], repo: Path) -> dict[str, list[dict]]:
             # are deserialized by the Kubernetes API server, which is the
             # one caller no Rust reference search can see.
             if attribute is not None:
-                attribute += " " + stripped
-                attribute_lines += 1
-                if attribute_is_closed(attribute):
-                    found = derives_in(attribute)
-                    if found is not None:
-                        pending_derives = found
+                # A `pub` item is never inside an attribute, so a line that
+                # opens one means the accumulator is already wrong and must
+                # let go here rather than keep eating lines. Without this,
+                # a delimiter the balance test cannot see swallows up to
+                # MAX_ATTRIBUTE_LINES of definitions and every number stays
+                # still: the items leave the scan, so they leave the
+                # inventory and both counts together, and the floor never
+                # moves because the rest of the tree still discovers
+                # plenty. That is the exact shape this ratchet exists to
+                # refuse. `attribute_is_closed` blanks string literals but
+                # not char literals or comments, so `#[foo(sep = '(')]` and
+                # a `//` comment carrying a lone `(` inside a wrapped
+                # attribute both reach it.
+                #
+                # The derives recorded before the runaway attribute started
+                # are kept, because they are still the item's derives and
+                # dropping them is the bug the accumulator was added to fix.
+                # A derive swallowed *inside* the runaway attribute is lost,
+                # which is what origin/main did on the same input.
+                if ITEM_RE.match(line):
                     attribute = None
-                elif attribute_lines > MAX_ATTRIBUTE_LINES:
-                    attribute = None
-                    pending_derives = []
-                continue
+                else:
+                    attribute += " " + stripped
+                    attribute_lines += 1
+                    if attribute_is_closed(attribute):
+                        found = derives_in(attribute)
+                        if found is not None:
+                            pending_derives = found
+                        attribute = None
+                    elif attribute_lines > MAX_ATTRIBUTE_LINES:
+                        attribute = None
+                        pending_derives = []
+                    continue
 
             if ATTR_START_RE.match(line):
                 if attribute_is_closed(stripped):
