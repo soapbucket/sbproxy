@@ -250,6 +250,10 @@ step() {
 # that never executed.
 SKIPPED=''
 SKIPPED_COUNT=0
+# Set by print_skip_summary, read by the cleanup trap, so a run that dies
+# in a phase prints the block once and a run that finishes prints it once.
+# The trap's own comment carries the reasoning.
+SKIP_SUMMARY_PRINTED=0
 
 note_skip() {
   SKIPPED="${SKIPPED}  * $1"$'\n'
@@ -283,7 +287,15 @@ if [ "$SCOPE_TO_DIFF" = "1" ]; then
   printf '    scripts/check.sh --explain shows the decision per changed path.\n'
 fi
 
+# $1, when the caller has one, is the phase the run died in. Without it
+# this block would tell a failing run a new lie in place of the old one:
+# what it lists is the set of phases this gate deliberately turned off,
+# and a run that stopped in clippy also never reached the eight phases
+# below clippy, which nothing here knows about and nothing can list. On
+# the success path the recorded set is the whole unrun set, which is why
+# the argument is optional and the success-path call passes none.
 print_skip_summary() {
+  SKIP_SUMMARY_PRINTED=1
   printf '\n\033[1;33m========================================================\033[0m\n'
   if [ -z "$SKIPPED" ]; then
     printf '\033[1;32mSKIPPED PHASES: none. Every phase in this gate ran.\033[0m\n'
@@ -293,6 +305,13 @@ print_skip_summary() {
     printf '\033[1;33mA skip here is a lane you have not actually checked on\n'
     printf 'this machine. Most of these have a CI lane behind them; do not\n'
     printf 'assume all of them do.\033[0m\n'
+  fi
+  if [ -n "${1:-}" ]; then
+    printf '\033[1;33mThis run STOPPED in: %s\n' "$1"
+    printf 'Every phase after that one also did not run. They are not listed\n'
+    printf 'above: this block holds only the phases the gate turned off, not\n'
+    printf 'the ones a failure cut short. skipped_phases= counts the same\n'
+    printf 'narrower set.\033[0m\n'
   fi
   printf '\033[1;33m========================================================\033[0m\n'
 }
@@ -311,6 +330,14 @@ print_skip_summary() {
 # this is the first thing the function does. Every step here tolerates
 # its own failure: a cleanup trap that errors would mask the exit code it
 # exists to report.
+#
+# It also prints the SKIPPED PHASES block when the run failed. That block
+# is emitted at the end of the script, which a failing phase never
+# reaches, so before WOR-2945 a red gate's only trace of the lanes that
+# had not run was the `skipped_phases=` count: a number with nothing
+# naming the phases and no command to run them. The header above claims
+# "a run that dies in any phase still reports them", and until this it
+# reported a count and withheld the report.
 cleanup() {
   local rc=$?
   local junit tests failures head_bytes
@@ -332,6 +359,20 @@ cleanup() {
   fi
   if [ "${SBPROXY_CLEAN_AFTER_BUILD:-1}" != "0" ]; then
     "$ROOT/scripts/cleanup-build-artifacts.sh" || true
+  fi
+
+  # The block, immediately above the line it explains, on the path that
+  # never got one. Guarded on the flag rather than on rc because the
+  # working-tree guard exits 1 after the end-of-script call has already
+  # printed it, and a second copy would read as two different summaries.
+  #
+  # Only the failure path calls this. A zero exit has already printed the
+  # block from the end of the script, and .github/CONTRIBUTING-agents.md
+  # asks contributors to quote that output verbatim, so it stays exactly
+  # what it was: nothing here runs on a zero exit. Tolerates its own
+  # failure like every other step in this function.
+  if [ "$rc" != "0" ] && [ "${SKIP_SUMMARY_PRINTED:-0}" != "1" ]; then
+    print_skip_summary "${STEP_LABEL:-unknown}" || true
   fi
 
   if [ "$rc" = "0" ]; then
@@ -858,6 +899,11 @@ python3 "$ROOT/scripts/gate-scope.py" --self-test
 python3 "$ROOT/scripts/check-attribute-theft.py" --self-test
 python3 "$ROOT/scripts/check-attribute-placement.py" --self-test
 bash "$ROOT/scripts/lib/expect-tests.sh" --self-test
+# This script's own reporting. Nothing in .github/ runs check.sh, so a
+# regression in what it says about itself has no lane but this one, and
+# the failing path it covers is the path no green run ever exercises.
+# The fourth case mutates the fix out and requires the old symptom back.
+bash "$ROOT/scripts/tests/check_sh_skip_summary_test.sh"
 
 # Serial: the test_doc_generators module binds listeners and has
 # leaked one on port 18091 before; nothing that opens a port runs
@@ -1631,13 +1677,23 @@ check_clean_tree() {
   return 0
 }
 
-step "working tree matches HEAD"
+# One definition, because the guard below has to restore it and two
+# spellings drift the moment somebody rewords the step.
+TREE_GUARD_LABEL='working tree matches HEAD'
+
+step "$TREE_GUARD_LABEL"
 check_clean_tree
 finish_step
 
 print_skip_summary
 
 if [ "$TREE_GUARD_FAILED" = "1" ]; then
+  # finish_step above cleared STEP_LABEL, and the cleanup trap reads that
+  # variable for `failed_phase=`. Without this line the one failure this
+  # script diagnoses and names in prose is the one whose GATE_EXIT line
+  # says `failed_phase=unknown`. Found while checking that the SKIPPED
+  # PHASES block prints once on this path and not twice.
+  STEP_LABEL="$TREE_GUARD_LABEL"
   printf '\n\033[1;31mFAILED: the working tree is dirty (see above).\033[0m\n' >&2
   exit 1
 fi

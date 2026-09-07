@@ -407,6 +407,10 @@ jobs:
         run: |
           bash scripts/tests/workspace_bin_test.sh
           bash scripts/tests/runner_disk_test.sh
+          # check.sh's own reporting. No workflow runs check.sh, so this
+          # is the only lane that sees its failing path, which is the
+          # path a green gate never exercises (WOR-2945).
+          bash scripts/tests/check_sh_skip_summary_test.sh
           python3 scripts/lib/cert_record.py --self-test
           python3 scripts/tests/test_cert_record.py
           python3 scripts/lib/notice_coverage.py --self-test
