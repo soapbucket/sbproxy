@@ -14,7 +14,8 @@
     "rail); none of those are 2xx. The Makefile's `make test` target",
     "covers the negotiation matrix for hands-on validation.",
     "",
-    "audit_check stays false until Wave 2 (R1.2) ships the OSS",
-    "/api/audit/recent endpoint."
+    "audit_check stays false: /api/audit/recent serves the",
+    "rate_limit_budget audit ring only, and this example sets no",
+    "rate_limits: block, so that ring is always empty here."
   ]
 }

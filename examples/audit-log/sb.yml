@@ -1,11 +1,12 @@
 # yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Audit log: every state-mutating admin call emits a typed envelope.
 #
-# The OSS distribution writes audit envelopes to the structured-log
-# stream (same stream as the access log; one JSON object per event).
-# Pair with the log shipper you already run; durable persistence
-# (Postgres, S3, hash-chained verification) is the commercial
-# distribution's job and out of scope here.
+# This config writes audit envelopes to the structured-log stream
+# (same stream as the access log; one JSON object per event). Pair
+# it with the log shipper you already run. SBproxy also ships a
+# durable, hash-chained, Ed25519-signed trail behind `audit.sink:
+# chain`, re-derived offline by `sbproxy audit verify`; that half is
+# out of scope here. See docs/audit-log.md.
 #
 # This config:
 #   1. Boots a small proxied origin so the proxy has something to

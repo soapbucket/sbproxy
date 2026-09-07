@@ -7,9 +7,9 @@
 # gateway verifies the signature against a directory of agent
 # public keys; only agents with valid signatures pass through.
 #
-# OSS ships the inline directory shape below. Periodic refresh of a
-# hosted JWKS-style directory is a follow-up that wires onto the
-# same `Directory` trait.
+# SBproxy ships the inline directory shape below. Periodic refresh
+# of a hosted JWKS-style directory is a follow-up that wires onto
+# the same `Directory` trait.
 #
 # Run:
 #   make run CONFIG=examples/web-bot-auth/sb.yml

@@ -1,10 +1,10 @@
 # prompt-injection-sidecar
 
-Two origins demonstrating the `prompt_injection_v2` policy with the out-of-process `sidecar` detector. The proxy sends each prompt to a sidecar that implements the shared `InferenceService` contract, and the sidecar runs the primary model and returns a label and score. Every sidecar configuration also names a verified in-process ONNX fallback: an unavailable, overloaded, timed-out, or malformed sidecar response is classified locally instead of silently becoming an unscored allow. The `tag.local` origin scores every request at threshold 0.5 and stamps `x-prompt-injection-score` / `x-prompt-injection-label` on the upstream without rejecting anything; `block.local` rejects on an injection verdict at threshold 0.7. The same config works against the minimal OSS sidecar (`sbproxy-classifier-sidecar`) and the richer sidecar (`sbproxy-classifier`); switching between them is a deployment change, not a policy-shape change.
+Two origins demonstrating the `prompt_injection_v2` policy with the out-of-process `sidecar` detector. The proxy sends each prompt to a sidecar that implements the shared `InferenceService` contract, and the sidecar runs the primary model and returns a label and score. Every sidecar configuration also names a verified in-process ONNX fallback: an unavailable, overloaded, timed-out, or malformed sidecar response is classified locally instead of silently becoming an unscored allow. The `tag.local` origin scores every request at threshold 0.5 and stamps `x-prompt-injection-score` / `x-prompt-injection-label` on the upstream without rejecting anything; `block.local` rejects on an injection verdict at threshold 0.7. The same config works against the minimal sidecar (`sbproxy-classifier-sidecar`) and the richer one (`sbproxy-classifier`); switching between them is a deployment change, not a policy-shape change.
 
 ## Run
 
-The OSS build does not ship model weights, so supply an immutable, reviewed ONNX model and tokenizer. The same pair can back the sidecar and the mandatory local fallback. Export its absolute paths and SHA-256 pins before loading the config:
+SBproxy ships no model weights, so supply an immutable, reviewed ONNX model and tokenizer. The same pair can back the sidecar and the mandatory local fallback. Export its absolute paths and SHA-256 pins before loading the config:
 
 ```bash
 export SBPROXY_PROMPT_INJECTION_FALLBACK_MODEL_PATH=/models/model.onnx

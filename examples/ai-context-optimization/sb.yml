@@ -2,7 +2,7 @@
 #
 # Stateless context optimization for marked retrieval text.
 #
-# Start an OSS classifier sidecar with a compatible token model before
+# Start a classifier sidecar with a compatible token model before
 # exercising token_prune. The proxy still starts when the sidecar is absent;
 # that lever fails open and window_fit remains the final bound.
 proxy:

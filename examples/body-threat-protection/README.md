@@ -1,8 +1,8 @@
 # Structural body threat limits
 
-*Last modified: 2026-08-20*
+*Last modified: 2026-09-07*
 
-A request body can attack a service without carrying a single recognizable payload string: a thousand levels of JSON nesting to blow a recursive parser's stack, a million-key object to soak CPU in hash insertion, an XML DTD whose entities expand into gigabytes. The `body_threat_protection` policy refuses these by shape. It bounds JSON nesting depth, entries per object, items per array, key and string lengths, and total container count; for XML it bounds depth, element count, and attributes per element, and refuses any `<!DOCTYPE` outright, which is the guard against billion-laughs entity expansion. Kong sells the equivalent pair of plugins in its Enterprise tier; this ships in OSS.
+A request body can attack a service without carrying a single recognizable payload string: a thousand levels of JSON nesting to blow a recursive parser's stack, a million-key object to soak CPU in hash insertion, an XML DTD whose entities expand into gigabytes. The `body_threat_protection` policy refuses these by shape. It bounds JSON nesting depth, entries per object, items per array, key and string lengths, and total container count; for XML it bounds depth, element count, and attributes per element, and refuses any `<!DOCTYPE` outright, which is the guard against billion-laughs entity expansion. Kong sells the equivalent pair of plugins in its Enterprise tier; SBproxy ships both in the one Apache-2.0 binary.
 
 This example runs two origins with deliberately tight limits: `body.local` in `mode: block` (violations get a 400 naming the limit) and `tap.local` in `mode: tap` (violations are logged and counted, the request proceeds).
 

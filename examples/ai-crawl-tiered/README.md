@@ -1,5 +1,5 @@
 # AI Crawl Control with tiered pricing
-*Last modified: 2026-04-30*
+*Last modified: 2026-09-07*
 
 ![AI Crawl Control with tiered pricing](../../docs/assets/ai-crawl-tiered.gif)
 
@@ -116,7 +116,7 @@ charged tier.
 
 ## Crawler classes
 
-The `crawler_user_agents` list in `sb.yml` is the OSS substring matcher.
+The `crawler_user_agents` list in `sb.yml` is the substring matcher.
 Every entry maps conceptually to an "agent class" the request gets
 bucketed into for downstream metrics + audit. Today the policy
 charges every matched UA at the same tier price; the agent class
@@ -127,10 +127,10 @@ labelling lands as the per-agent metrics surface (see
 
 The `mock-ledger` container is a static stub. It accepts any `POST
 /v1/ledger/redeem` and returns the happy-path JSON used by the e2e
-suite (`e2e/tests/http_ledger.rs::handle_redeem`). The OSS build
-ships an in-memory ledger seeded from `valid_tokens` in `sb.yml`, so
-the proxy in this bundle does not actually call the mock service. The
-mock exists so:
+suite (`e2e/tests/http_ledger.rs::handle_redeem`). This bundle sets
+no `policies[].ledger:` block, so the policy uses the in-memory
+ledger seeded from `valid_tokens` in `sb.yml` and the proxy never
+calls the mock service. The mock exists so:
 
 - Operators can repoint the policy at the mock by enabling the
   `http-ledger` cargo feature and adding a `ledger:` block to the

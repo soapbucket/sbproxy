@@ -84,11 +84,13 @@ origins:
           - PerplexityBot
           - CCBot
 
-        # OSS in-memory ledger seed. Each token redeems exactly once;
+        # In-memory ledger seed. Each token redeems exactly once;
         # the demo issues them by hand, a real deployment issues them
         # from a billing system via the HTTPS ledger client (see
         # docs/ai-crawl-control.md). Settlement on real payment rails
-        # is the enterprise build.
+        # is the `payments` cargo feature plus one rail adapter on
+        # top of it (`payment-x402`, `payment-stripe`,
+        # `payment-lightning-cln`, `payment-lightning-lnd`).
         valid_tokens:
           - demo-tok-001
           - demo-tok-002

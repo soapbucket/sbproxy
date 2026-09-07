@@ -94,6 +94,8 @@
     "end-to-end. The denial cases are evaluated by the policy before",
     "any upstream contact and pass without a live upstream.",
     "",
-    "audit_check stays false until the OSS audit endpoint lands."
+    "audit_check stays false: /api/audit/recent serves the",
+    "rate_limit_budget audit ring only, and this example sets no",
+    "rate_limits: block, so that ring is always empty here."
   ]
 }

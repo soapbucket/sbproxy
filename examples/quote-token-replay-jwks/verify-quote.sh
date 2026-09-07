@@ -129,11 +129,12 @@ fi
 
 # --- Step 5: redeem ------------------------------------------------
 #
-# NOTE: This example uses the in-memory ledger (the OSS default). The
-# in-memory ledger seeds tokens from `valid_tokens:` in sb.yml, which
-# this example leaves empty. The quote token we just verified is NOT
-# in `valid_tokens`, so the in-memory ledger will reject it with a
-# hard error and the proxy will respond 402 again, not 200.
+# NOTE: This example uses the in-memory ledger, the default when no
+# `ledger:` block is set. That ledger seeds tokens from
+# `valid_tokens:` in sb.yml, which this example leaves empty. The
+# quote token we just verified is NOT in `valid_tokens`, so the
+# in-memory ledger will reject it with a hard error and the proxy
+# will respond 402 again, not 200.
 #
 # A real deployment wires `policies[].ledger:` at an HTTP ledger
 # (see docs/ai-crawl-control.md) that knows how to verify the JWS
@@ -148,7 +149,7 @@ echo "    accepts a verified JWS as a valid redemption."
 #
 # In the real flow, a second redeem attempt for the same nonce
 # returns 409 from the InMemoryNonceStore. We document this here for
-# completeness; the OSS in-memory ledger does not implement the
+# completeness; the in-memory ledger does not implement the
 # nonce-store handshake (the verify-only path lives in a future
 # wave), so we do not exercise it from this script.
 echo "==> 6/6 Replay attempt (documented; not executed)"

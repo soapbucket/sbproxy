@@ -91,6 +91,8 @@
     "placeholder; rewrite action.url in sb.yml to a real HTML page",
     "before driving the cases end-to-end.",
     "",
-    "audit_check stays false until the OSS audit endpoint lands."
+    "audit_check stays false: /api/audit/recent serves the",
+    "rate_limit_budget audit ring only, and this example sets no",
+    "rate_limits: block, so that ring is always empty here."
   ]
 }
