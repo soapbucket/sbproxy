@@ -1,12 +1,13 @@
-//! The two [`IdempotencyCache`](super::IdempotencyCache) backends, and
-//! the row format they share.
+//! The two [`IdempotencyCache`] backends, and the row format they
+//! share.
 //!
 //! Split out of the parent module rather than left inline because the
 //! protocol and its implementations are two different things to read.
 //! The parent owns the vocabulary a caller needs ([`EntryState`],
-//! [`TryClaim`], [`IdempotencyClaim`], the trait) and the free
-//! functions the request path calls; this file owns the two places
-//! that satisfy it and the on-the-wire row they agree on.
+//! [`TryClaim`], [`IdempotencyClaim`](super::IdempotencyClaim), the
+//! trait) and the free functions the request path calls; this file
+//! owns the two places that satisfy it and the on-the-wire row they
+//! agree on.
 //!
 //! Everything private to the parent is reachable here, because a child
 //! module can see its ancestors' private items. That is what lets

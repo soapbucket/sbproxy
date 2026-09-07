@@ -22,10 +22,10 @@
 //!
 //! | Signal | Source | Catches |
 //! | -- | -- | -- |
-//! | [`SoakSignal::DegradedSubsystems`] | [`crate::server::ReloadOutcome::degraded`] | A pipeline that published while the key plane, a sink, or the model runtime stayed on prior state. Immediate, no traffic needed. |
-//! | [`SoakSignal::UpstreamHealth`] | The live pipeline's circuit breakers | A config that repointed an origin at a dead address, on a node with almost no traffic. |
-//! | [`SoakSignal::RequestOutcome`] | `sbproxy_requests_total` by status class, plus the upstream retry and timeout counters | A policy that denies everything, an auth block that rejects every caller, a transform that corrupts bodies. |
-//! | [`SoakSignal::OperatorProbe`] | `proxy.config_history.soak.probe`, and the synthetic-transaction driver when it is on | Whatever the operator knows and this proxy does not. |
+//! | [`crate::config_soak::SoakSignal::DegradedSubsystems`] | [`crate::server::ReloadOutcome::degraded`] | A pipeline that published while the key plane, a sink, or the model runtime stayed on prior state. Immediate, no traffic needed. |
+//! | [`crate::config_soak::SoakSignal::UpstreamHealth`] | The live pipeline's circuit breakers | A config that repointed an origin at a dead address, on a node with almost no traffic. |
+//! | [`crate::config_soak::SoakSignal::RequestOutcome`] | `sbproxy_requests_total` by status class, plus the upstream retry and timeout counters | A policy that denies everything, an auth block that rejects every caller, a transform that corrupts bodies. |
+//! | [`crate::config_soak::SoakSignal::OperatorProbe`] | `proxy.config_history.soak.probe`, and the synthetic-transaction driver when it is on | Whatever the operator knows and this proxy does not. |
 //!
 //! # The verdict is three-way, not two
 //!
@@ -38,9 +38,9 @@
 //!
 //! | Signals | Verdict | Effect on the pointer |
 //! | -- | -- | -- |
-//! | Any non-abstaining failure | [`SoakVerdict::Failed`] | Does not move |
-//! | At least one non-abstaining pass, no failures | [`SoakVerdict::Successful`] | Advances |
-//! | Every signal abstained | [`SoakVerdict::Inconclusive`] | Does not move; the entry stays `applied` |
+//! | Any non-abstaining failure | [`sbproxy_config::SoakVerdict::Failed`] | Does not move |
+//! | At least one non-abstaining pass, no failures | [`sbproxy_config::SoakVerdict::Successful`] | Advances |
+//! | Every signal abstained | [`sbproxy_config::SoakVerdict::Inconclusive`] | Does not move; the entry stays `applied` |
 //!
 //! One abstaining signal never fails a soak and never blocks a
 //! promotion. Every signal abstaining is different, and promoting on it
@@ -658,7 +658,7 @@ fn in_flight() -> &'static Mutex<Option<SoakWindow>> {
 /// transaction to publish the restored document. So a verdict reached
 /// at arm time cannot act where it is discovered: it would deadlock
 /// against the lock its own caller is holding. It is left here instead,
-/// and [`drive_verdicts`] picks it up on the supervisor's next tick,
+/// and [`take_pending_verdict`] picks it up on the supervisor's next tick,
 /// outside the lock.
 ///
 /// One slot, last writer wins, because a newer revision supersedes an

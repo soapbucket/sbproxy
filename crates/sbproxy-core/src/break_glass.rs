@@ -8,10 +8,11 @@
 //!
 //! A grant's `scope` is what the requester said they needed and what the
 //! reviewer reads afterwards. It is not compared against the record a
-//! tagged action actually touches: [`tag_action`] matches on the actor and
-//! the grant's state and nothing narrower. Enforcing it would mean a second
-//! authorization model, which is precisely what this is not, so the honest
-//! word for the field is "declared".
+//! tagged action actually touches:
+//! [`crate::break_glass::tag_action`] matches on the actor and the
+//! grant's state and nothing narrower. Enforcing it would mean a second
+//! authorization model, which is precisely what this is not, so the
+//! honest word for the field is "declared".
 //!
 //! # What this is, and what it deliberately is not
 //!

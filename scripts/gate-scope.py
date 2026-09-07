@@ -72,7 +72,7 @@ PHASES = [
     "TEST",  # cargo test (nextest)                   112-668s
     "DOCTEST",  # cargo doctest                       23-41s
     "CLIPPY",  # cargo clippy                         107-212s
-    "DOC",  # cargo doc                               84-146s
+    "DOC",  # cargo doc, public + private items       108-372s
     "GENERATED",  # config schema, readers, metrics   25-29s
     "PAYMENTS",  # payments clippy and test
 ]

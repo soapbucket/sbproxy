@@ -2821,7 +2821,7 @@ where
 /// carrying one reduces to the key name and intersects nothing. That is
 /// not closed here, because reading it would mean interpreting three
 /// languages; it is closed one level up, by
-/// [`opaque_addition_over_a_lock`] refusing such an addition into a list
+/// [`opaque_script_over_a_lock`] refusing such an addition into a list
 /// that holds a lock at all. The same limit applies to any future
 /// modifier field whose value is a program rather than a declaration,
 /// which is why the list it is closed against is a named const

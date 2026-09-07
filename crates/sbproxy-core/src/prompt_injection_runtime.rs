@@ -1,6 +1,7 @@
 //! Runtime observability for an unavailable `prompt_injection_v2` detector.
 //!
-//! The request consumers all funnel through [`record_unavailable`] so metric,
+//! The request consumers all funnel through
+//! [`crate::prompt_injection_runtime::record_unavailable`] so metric,
 //! structured event, bounded admin state, and rate-limited warning labels
 //! cannot drift. Only configured origin identifiers and closed vocabularies
 //! enter the state. Prompt text, classifier endpoints, model paths, bearer

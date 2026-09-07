@@ -5773,8 +5773,9 @@ fn warn_unwired_decision_audit_events(compiled: &sbproxy_config::CompiledConfig)
 /// Whether `event` lands a record on the decision-audit feed under this
 /// config.
 ///
-/// Not the same question as [`DecisionEvent::has_emitter`], and `policy`
-/// is why. That event has always reached the audit bus, but until
+/// Not the same question as
+/// [`sbproxy_observe::decision::DecisionEvent::has_emitter`], and
+/// `policy` is why. That event has always reached the audit bus, but until
 /// `policy_record_format: decision` it arrives as a `PolicyVerdictEvent`
 /// on its own prefix rather than as a decision-audit record, so whether
 /// it counts as wired *here* depends on config rather than on a const

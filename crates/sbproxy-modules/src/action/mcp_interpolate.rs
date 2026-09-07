@@ -203,7 +203,7 @@ pub(crate) fn interpolate_value(
 
 /// [`interpolate_value`] for a field that must remain a string (an
 /// HTTP header value): a whole-string splice of a non-string value is
-/// rendered the same way [`stringify`] renders an embedded one, since
+/// rendered the same way [`stringify()`] renders an embedded one, since
 /// a header can only ever hold text.
 pub(crate) fn interpolate_string(
     template: &str,

@@ -5290,7 +5290,8 @@ fn normalize_request_modifier(val: &serde_json::Value) -> RequestModifierConfig 
 ///    The operator wiring the transform into an origin overrides whoever
 ///    wrote the bundle.
 /// 2. The bundle manifest's declared posture, for a dynamic bundle hook.
-/// 3. The attachment default, which is [`FailureMode::Open`].
+/// 3. The attachment default, which is
+///    [`sbproxy_config::FailureMode::Open`].
 ///
 /// Two and three have to be distinguished by whether the operator wrote
 /// anything, not by the resolved value: `TransformConfig::failure_posture`

@@ -7,11 +7,13 @@
 //!
 //! # One engine, two triggers
 //!
-//! Both triggers reach [`rollback`], and the only difference between
-//! them is the [`RollbackTrigger`] they carry. That is deliberate: the
-//! automatic path must not be able to do anything the operator-driven
-//! path cannot, because the automatic path is the one that acts without
-//! anybody watching. Everything below applies to both.
+//! Both triggers reach [`crate::config_rollback::rollback`], and the
+//! only difference between them is the
+//! [`crate::config_rollback::RollbackTrigger`] they carry. That is
+//! deliberate: the automatic path must not be able to do anything the
+//! operator-driven path cannot, because the automatic path is the one
+//! that acts without anybody watching. Everything below applies to
+//! both.
 //!
 //! # A rollback is an ordinary candidate
 //!
@@ -57,21 +59,22 @@
 //! local file is a pointer rather than the document. Rewriting it would
 //! break the relationship the operator configured. The consequence is
 //! stated in every response
-//! ([`RollbackOutcome::config_file_unchanged`]) rather than left for an
-//! operator to discover: the next filesystem event, SIGHUP, `source:`
-//! poll, or authority bundle re-applies whatever the source of truth
-//! still says, so fixing the source of truth is the second half of the
-//! recovery.
+//! ([`crate::config_rollback::RollbackOutcome::config_file_unchanged`])
+//! rather than left for an operator to discover: the next filesystem
+//! event, SIGHUP, `source:` poll, or authority bundle re-applies
+//! whatever the source of truth still says, so fixing the source of
+//! truth is the second half of the recovery.
 //!
 //! # Optimistic concurrency
 //!
-//! [`RollbackRequest::expected_current`] is the HAProxy Data Plane API's
-//! discipline: it stamps a version onto the configuration and requires
-//! every mutating call to carry the version it expects, erroring on a
-//! mismatch rather than taking last-writer-wins. Two operators reaching
-//! for rollback during the same incident is not hypothetical, and
-//! without this the second one silently undoes the first. Absent is
-//! accepted, so an existing caller keeps working.
+//! [`crate::config_rollback::RollbackRequest::expected_current`] is the
+//! HAProxy Data Plane API's discipline: it stamps a version onto the
+//! configuration and requires every mutating call to carry the version
+//! it expects, erroring on a mismatch rather than taking
+//! last-writer-wins. Two operators reaching for rollback during the
+//! same incident is not hypothetical, and without this the second one
+//! silently undoes the first. Absent is accepted, so an existing caller
+//! keeps working.
 
 use sbproxy_config::{BlastRadius, RevisionEntry};
 

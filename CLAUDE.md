@@ -46,9 +46,10 @@ ten-minute build.
 | Doctest | `cargo test --workspace --exclude sbproxy-e2e --locked --doc` |
 | Clippy | `cargo clippy --workspace --all-targets -- -D warnings` |
 | Docs | `RUSTDOCFLAGS="-D warnings -D missing_docs" cargo doc --workspace --no-deps --locked` |
+| Docs (private items) | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked --document-private-items` |
 | Payment features (on by default) | `bash scripts/check.sh`; `SBPROXY_CHECK_PAYMENTS=0` skips it |
 
-Three rows in that table are easy to get subtly wrong.
+Four rows in that table are easy to get subtly wrong.
 
 `Observability budgets` is the only row that builds and runs test
 targets from `sbproxy-e2e`. It is not the only wide selection here, the
@@ -65,12 +66,58 @@ only that the three together ran something: an emptied `redaction`
 would hide behind cardinality's count.
 
 `-D missing_docs` appears in exactly one other place in this repository,
-`.github/workflows/ci.yml`, and it is the flag that bites. Do not pair
-it with `--document-private-items`: that combination demands rustdoc on
-private items too, which is stricter than CI and produces failures CI
-will never report. If you want the private-items pass anyway, run
-`scripts/check.sh` with `SBPROXY_CHECK_PRIVATE_DOCS=1`, which runs it
-as its own phase under plain `-D warnings`.
+`.github/workflows/ci.yml`, and it is the flag that bites. It belongs to
+the `Docs` row alone. Never add it to `Docs (private items)`: paired
+with `--document-private-items` it demands a rustdoc comment on every
+private item in the workspace, which is a far larger policy than this
+repository has adopted, and it produces failures CI will never report.
+
+The two `Docs` rows are separate passes because they check separate
+surfaces. `Docs` documents public items, so rustdoc's lints only ever
+see those; anything written inside a private or `pub(crate)` item is
+never visited, and a defect there cannot fail that row.
+`Docs (private items)` visits them and applies rustdoc's whole default
+warn-level lint set, denied.
+
+Describe that row as its lint set, not as a link check. Broken and
+ambiguous intra-doc links are the bulk of what it catches in practice,
+25 of the 26 errors it found on `main`, but the 26th was
+`rustdoc::redundant_explicit_links`, and a bare URL in a `pub(crate)`
+doc comment fails this row as `rustdoc::bare_urls` while passing `Docs`.
+A contributor who trips one of the others has to be able to match the
+red lane to what this table told them.
+
+What the second row does not add is `-D missing_docs`, so a private item
+is still not required to carry a rustdoc comment, and it does not widen
+what `Docs` checks on the public surface. What neither row reaches is a
+private item behind a non-default feature: both resolve the default
+feature union, `sbproxy-core` gates modules on `agent-class`, `payments`
+and `rag`, and the `payments` CI lane runs no doc pass. That gap is
+open.
+
+That second pass was opt-in until 2026-09-06 and no workflow set the
+variable, so the surface had never been checked on any branch.
+Twenty-six rustdoc link errors had accumulated on `main` across fourteen
+files (WOR-2931): twenty-three unresolved intra-doc links, two ambiguous
+ones, and one redundant explicit target. Three of the twenty-three named
+a function that exists nowhere in the tree. Both rows run by default
+now, in `scripts/check.sh` and as two steps of ci.yml's `lint` lane,
+which puts them inside the required `build / test` aggregate without a
+new job to wire up.
+`SBPROXY_CHECK_PRIVATE_DOCS=0` skips the private-items phase locally and
+reprints it in the `SKIPPED PHASES` block; CI runs it either way.
+
+It is not free, and the multiple depends on whether `Docs` had work to
+do. The two rows carry different `RUSTDOCFLAGS`, so neither can reuse the
+other's rustdoc output. When both run in full, which is what CI does
+because rust-cache does not carry workspace doc output between runs,
+`Docs (private items)` is about 1.2 times `Docs` and the pair costs about
+2.2 times `Docs` alone: measured 2m48 and 3m24, and 2m21 and 2m54 on a
+merged head. On a local tree where `Docs` is a near-no-op the pair looks
+like 3.5 times instead (31s and 77s, 39s and 87s), which is the first
+pass having nothing to redo rather than a cost CI pays. Quote the
+full-run pair. Either way `lint` is not the critical path, `test` is, so
+the second step adds no wall clock to the PR gate.
 
 `--locked` on the build is equally load bearing. Without it, `cargo
 build` silently rewrites the root `Cargo.lock` in place, and the
@@ -222,7 +269,7 @@ phase reprints it in the `SKIPPED PHASES` block.
 | `SBPROXY_CLEAN_AFTER_BUILD=0` | keep every build artifact after the run |
 | `SBPROXY_ALLOW_DIRTY_TREE=1` | do not fail on an uncommitted working tree |
 | `SBPROXY_ALLOW_CARGO_TEST_FALLBACK=1` | permit the serial `cargo test` fallback |
-| `SBPROXY_CHECK_PRIVATE_DOCS=1` | extra rustdoc pass over private items |
+| `SBPROXY_CHECK_PRIVATE_DOCS=0` | skip the rustdoc pass that resolves intra-doc links on private and `pub(crate)` items (it runs by default) |
 | `SBPROXY_CHECK_CAPTURES=1` | replay every documented command and diff it against the block the doc shows |
 
 Anything the runner could not run is reprinted as a `SKIPPED PHASES`

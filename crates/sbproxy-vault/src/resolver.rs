@@ -19,8 +19,11 @@ use crate::vault_ref::{
 /// Process-wide secret resolver, installed once at binary boot (WOR-1767).
 ///
 /// The `Mutex<Option<..>>` layer (rather than a bare `OnceLock<Arc<..>>`)
-/// exists solely so [`reset_process_resolver_for_test`] can clear it; the
-/// production `install`/`get` contract below is unchanged by it.
+/// exists solely so `reset_process_resolver_for_test` can clear it; the
+/// production `install`/`get` contract below is unchanged by it. That
+/// name is deliberately not a link: the function is behind
+/// `cfg(any(test, feature = "test-support"))`, so it is absent from a
+/// default-feature rustdoc build and no path to it resolves there.
 static PROCESS_RESOLVER: OnceLock<Mutex<Option<Arc<SecretResolver>>>> = OnceLock::new();
 
 fn process_resolver_cell() -> &'static Mutex<Option<Arc<SecretResolver>>> {
